@@ -1,8 +1,11 @@
 //! MLX sparse routed-expert caching over backend-neutral residency plans.
+
 //!
 //! Each logical expert is an atomic disk-planned residency unit. Route ids are
 //! inspected once per routed block, validated before acquisition, coalesced in
 //! deterministic global-id order, and rewritten to a temporary compact bank.
+
+use eredu_checkpoint::WeightQuantization;
 
 use std::{
     collections::BTreeMap,
@@ -23,7 +26,6 @@ use crate::{
             BoundedQuantizationPlan, BoundedQuantizationReport, BoundedQuantizationTarget,
             BoundedQuantizedWeightStore,
         },
-        quantization::WeightQuantization,
         recipe::RecipeDtype,
         store::{TensorSelection, WeightStore},
     },

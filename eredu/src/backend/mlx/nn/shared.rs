@@ -1,11 +1,12 @@
-//! MLX binding for the backend-neutral Llama architecture.
+//! MLX implementation of backend-neutral neural operators.
+
+use eredu_checkpoint::WeightQuantization;
 
 use std::ops::{Deref, DerefMut};
 
-use eredu_architectures::llama;
 use eredu_nn::{
     AttentionCache, Backend, EmbeddingOperator, Error as ComputeError, LinearOperator, LinearSpec,
-    NormalizationOperator, RotaryOperator,
+    NormalizationOperator, RopeValue, RotaryOperator, RotarySpec,
 };
 use safemlx::{
     builder::Builder,
@@ -17,7 +18,6 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use super::model::ModelArgs;
 use crate::backend::mlx::{
     nn::{self as common, tensor::rope::RopeVariant},
     runtime::cache::{
@@ -177,39 +177,34 @@ pub struct MlxBackend;
 
 impl Backend for MlxBackend {
     type Tensor = Array;
-    type Config = ModelArgs;
     type Linear = MlxLinear;
     type Embedding = MlxEmbedding;
     type Normalization = MlxRmsNorm;
     type Rotary = MlxRotary;
     type ParallelContext = Group;
 
-    fn linear(
-        config: &ModelArgs,
-        spec: LinearSpec<'_>,
-        context: &Stream,
-    ) -> Result<MlxLinear, ComputeError> {
+    fn linear(spec: LinearSpec<'_>, context: &Stream) -> Result<MlxLinear, ComputeError> {
         compute(common::linear::unloaded_maybe_quantized_linear(
             spec.input,
             spec.output,
             spec.bias,
-            config.affine_quantization_for(spec.weight_name),
+            spec.quantization,
             context,
         ))
         .map(MlxLinear)
     }
 
     fn embedding(
-        config: &ModelArgs,
         vocabulary: i32,
         dimensions: i32,
-        weight_name: &str,
+        _weight_name: &str,
+        quantization: Option<WeightQuantization>,
         context: &Stream,
     ) -> Result<MlxEmbedding, ComputeError> {
         compute(common::linear::unloaded_maybe_quantized_embedding(
             vocabulary,
             dimensions,
-            config.affine_quantization_for(weight_name),
+            quantization,
             context,
         ))
         .map(MlxEmbedding)
@@ -229,17 +224,26 @@ impl Backend for MlxBackend {
         .map(MlxRmsNorm)
     }
 
-    fn rotary(
-        config: &ModelArgs,
-        dimensions: i32,
-        context: &Stream,
-    ) -> Result<MlxRotary, ComputeError> {
+    fn rotary(spec: RotarySpec<'_>, context: &Stream) -> Result<MlxRotary, ComputeError> {
+        let scaling = spec.scaling.map(|values| {
+            values
+                .iter()
+                .map(|(key, value)| {
+                    let value = match value {
+                        RopeValue::Float(value) => RopeValue::Float(*value),
+                        RopeValue::String(value) => RopeValue::String(value.clone()),
+                        RopeValue::Bool(value) => RopeValue::Bool(*value),
+                    };
+                    (key.clone(), value)
+                })
+                .collect()
+        });
         compute(crate::backend::mlx::nn::tensor::rope::initialize_rope(
-            dimensions,
-            config.rope_theta,
-            config.rope_traditional,
-            &config.rope_scaling,
-            config.max_position_embeddings,
+            spec.dimensions,
+            spec.base,
+            spec.traditional,
+            &scaling,
+            spec.max_positions,
             context,
         ))
         .map(MlxRotary)
@@ -288,6 +292,21 @@ impl Backend for MlxBackend {
             position_offset,
             batch,
             sequence,
+            context,
+        ))
+    }
+
+    fn causal_mask(
+        sequence: i32,
+        offset: i32,
+        window: Option<i32>,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        compute(crate::backend::mlx::nn::tensor::create_causal_mask(
+            sequence,
+            Some(offset),
+            window,
+            None,
             context,
         ))
     }
@@ -359,6 +378,3 @@ macro_rules! impl_attention_cache {
 impl_attention_cache!(ConcatKeyValueCache);
 impl_attention_cache!(SlidingKeyValueCache);
 impl_attention_cache!(PagedKeyValueCache);
-
-/// Shared Llama decoder block specialized for MLX.
-pub type SharedTransformerBlock = llama::TransformerBlock<MlxBackend>;

@@ -1,8 +1,11 @@
 //! Architecture-owned checkpoint contracts for LFM2 and LFM2-MoE.
+
 //!
 //! LFM2 owns its hybrid operator schedule, short-convolution layouts, expert
 //! storage alternatives, aliases, and quantization exclusions here. The
 //! generic checkpoint runtime evaluates the resulting physical constraints.
+
+use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -13,16 +16,15 @@ use super::model::{self, FeedForwardPolicy, ModelArgs, OperatorPolicy};
 use crate::{
     backend::mlx::runtime::checkpoint::{
         contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-        quantization::WeightQuantization,
-        schema::{
-            AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
-            GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
-            SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
-        },
-        store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+        store::{SafetensorsWeightStore, WeightStore},
         validation,
     },
     AttentionPolicy,
+};
+use eredu_checkpoint::schema::{
+    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+    GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+    StoredDtypeConstraint, TensorOperation,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -732,7 +734,7 @@ fn invalid_geometry(detail: String) -> CheckpointValidation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization;
+    use eredu_checkpoint::AffineQuantization;
 
     #[test]
     fn affine_constraints_exclude_runtime_shape_from_packed_storage() {

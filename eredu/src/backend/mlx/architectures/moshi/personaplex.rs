@@ -6,6 +6,8 @@
 //! codec-free; callers provide Mimi/codec tokens and decode emitted tokens with
 //! a codec outside `eredu`.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::path::Path;
 
 use safemlx::{error::Exception, ops::broadcast_to, ops::indexing::TryIndexOp, Array, Stream};
@@ -15,7 +17,6 @@ use crate::{
     backend::mlx::architectures::moshi::model as moshi,
     backend::mlx::error::Error,
     backend::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     core::realtime::{RealtimeError, RealtimeScheduler},
     RealtimeModel, RequestId, WorkId,
 };

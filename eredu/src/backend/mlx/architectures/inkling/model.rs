@@ -6,6 +6,8 @@
 
 #![allow(missing_docs)]
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{
     collections::{BTreeMap, HashMap},
     ops::Range,
@@ -53,7 +55,6 @@ use crate::{
         BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
     backend::mlx::runtime::checkpoint::load::{gguf_metadata, gguf_quantization_configs},
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::runtime::media::input,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{

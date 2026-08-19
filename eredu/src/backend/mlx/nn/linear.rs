@@ -1,11 +1,11 @@
 //! Linear layers, embeddings, and language-model output heads.
 
+use eredu_checkpoint::WeightQuantization;
+
 use safemlx::{
     builder::Builder, error::Exception, module::Module, nn, quantization::MaybeQuantized, Array,
     Dtype, Stream,
 };
-
-use crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization;
 
 /// Builds an initialized untied language-model head.
 pub fn build_lm_head(hidden_size: i32, vocab_size: i32) -> Result<nn::Linear, Exception> {
@@ -87,7 +87,9 @@ pub fn unloaded_maybe_quantized_linear_with_dtype(
                 output_dims,
                 config.group_size(),
                 config.bits(),
-                config.mode(),
+                crate::backend::mlx::runtime::checkpoint::quantization::mlx_quantization_mode(
+                    config,
+                ),
                 bias,
                 stream,
             )?,
@@ -142,7 +144,9 @@ pub fn unloaded_maybe_quantized_embedding_with_dtype(
                 dimensions,
                 config.group_size(),
                 config.bits(),
-                config.mode(),
+                crate::backend::mlx::runtime::checkpoint::quantization::mlx_quantization_mode(
+                    config,
+                ),
                 stream,
             )?,
         )),

@@ -1,5 +1,7 @@
 //! MLX checkpoint materialization after backend-neutral planning.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::path::Path;
 
 use crate::backend::mlx::architectures::{
@@ -10,7 +12,6 @@ use crate::backend::mlx::architectures::{
     inkling::model as inkling,
     kimi_linear::model as kimi_linear,
     lfm2::model as lfm2,
-    llama::model as llama,
     qwen::{
         dense as dense_qwen,
         hybrid::{qwen3_5, qwen3_next},
@@ -37,7 +38,6 @@ pub(crate) fn gguf_eos_token_ids(
 }
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::{structural, MlxModel, Model, ModelLoadOptions},
 };
 
@@ -149,7 +149,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
             let (loaded, eos_token_ids) =
-                crate::backend::mlx::architectures::llama::layerwise::load_llama_gguf_model(
+                crate::integrations::llama_mlx::layerwise::load_llama_gguf_model(
                     &checkpoint,
                     &metadata,
                     options.weight_residency,
@@ -465,7 +465,7 @@ fn materialize_tensor_parallel(
             )?,
         )),
         ModelKind::Llama => Ok(Model::Llama(
-            crate::backend::mlx::architectures::llama::layerwise::load_llama_tensor_parallel_model(
+            crate::integrations::llama_mlx::layerwise::load_llama_tensor_parallel_model(
                 path,
                 execution,
                 build,
@@ -718,7 +718,7 @@ fn materialize_gguf_tensor_parallel(
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
             let (model, eos) =
-                crate::backend::mlx::architectures::llama::layerwise::load_llama_gguf_tensor_parallel_model(
+                crate::integrations::llama_mlx::layerwise::load_llama_gguf_tensor_parallel_model(
                     checkpoint,
                     metadata,
                     residency,
@@ -977,7 +977,7 @@ pub(super) fn materialize_safetensors(
             )?,
         )),
         ModelKind::Llama => Ok(Model::Llama(
-            crate::backend::mlx::architectures::llama::layerwise::load_llama_safetensors_mlx(
+            crate::integrations::llama_mlx::layerwise::load_llama_safetensors_mlx(
                 model_dir,
                 execution.weight_residency(),
                 options.quantization,

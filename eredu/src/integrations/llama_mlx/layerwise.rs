@@ -1,11 +1,14 @@
 //! Unified Llama/Mistral loading across weight-residency policies.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
     sync::Arc,
 };
 
+use eredu_architectures::llama::ModelArgs;
 use safemlx::{
     error::Exception,
     module::Module,
@@ -22,9 +25,6 @@ use crate::core::cache::{
 };
 
 use crate::{
-    backend::mlx::architectures::llama::model::{
-        self as resident, AttentionInput, ModelArgs, TransformerBlock,
-    },
     backend::mlx::error::Error,
     backend::mlx::nn::{
         generation::CausalLm,
@@ -50,7 +50,7 @@ use crate::{
         build_module_binding_plan_with_recipes, populate_module_from_lease,
     },
     backend::mlx::runtime::checkpoint::{
-        quantization::{should_quantize_on_load, WeightQuantization},
+        quantization::should_quantize_on_load,
         store::{GgufWeightStore, WeightStore},
     },
     backend::mlx::runtime::distributed::parallel::{
@@ -59,15 +59,14 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
         open_safetensors_weight_store, ArchitectureAdapter, DenseDiskStreamReport,
-        ExecutionResidency, LayerWeightResidency, LayerwiseForwardState, LayerwiseLoadOptions,
-        LayerwiseModel, LayerwiseModelMetadata, LoadTimeQuantizableAdapter, StaticUnitBindings,
-        WeightResidency,
+        ExecutionResidency, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
+        LayerwiseModelMetadata, LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::manager::{
         ResidencyReport, ResidentUnitLease, WeightBinding,
     },
-    core::cache::LayerCachePolicy,
+    integrations::llama_mlx::model::{self as resident, AttentionInput, TransformerBlock},
 };
 
 const EMBEDDING_UNIT: &str = "llama.static.embedding";
@@ -167,9 +166,7 @@ impl LlamaModel {
 
     /// Returns the canonical cache-relevant architecture identity.
     pub fn prompt_cache_architecture_fingerprint(&self) -> String {
-        crate::backend::mlx::architectures::llama::model::prompt_cache_architecture_fingerprint(
-            self.args(),
-        )
+        eredu_architectures::llama::prompt_cache_architecture_fingerprint(self.args())
     }
 
     /// Returns this rank's exact prompt-cache state layout.
@@ -220,18 +217,11 @@ impl LlamaModel {
     pub fn new_cache(&self) -> LlamaCache {
         let args = self.args();
         LlamaCache::Device(
-            args.attention_schedule
-                .iter()
-                .map(|policy| {
-                    Some(match policy.window() {
-                        Some(window) => ConcatKeyValueCache::new_for_sliding_attention(
-                            i32::try_from(window.get())
-                                .expect("validated Llama attention window fits i32"),
-                        ),
-                        None => ConcatKeyValueCache::new(),
-                    })
-                })
-                .collect(),
+            eredu_architectures::llama::create_caches(args, |_layer, window| match window {
+                Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
+                None => ConcatKeyValueCache::new(),
+            })
+            .expect("validated Llama configuration has a valid cache schedule"),
         )
     }
 
@@ -301,18 +291,13 @@ impl LlamaModel {
         rank: Option<crate::CacheRankIdentity>,
     ) -> Result<LlamaCache, Error> {
         let args = self.args();
-        let caches = args
-            .attention_schedule
-            .iter()
-            .enumerate()
-            .map(|(layer, policy)| {
-                let window = policy.window().map(|window| {
-                    i32::try_from(window.get()).expect("validated Llama attention window fits i32")
-                });
-                PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
-                    .map(Some)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let caches = eredu_architectures::llama::create_caches(args, |layer, window| {
+            PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
+        })
+        .map_err(|error| Exception::custom(error.to_string()))?
+        .into_iter()
+        .map(|cache| cache.transpose())
+        .collect::<Result<Vec<_>, _>>()?;
         Ok(LlamaCache::Paged(caches))
     }
 
@@ -415,37 +400,21 @@ impl LlamaModel {
             .into());
         }
         match cache {
-            LlamaCache::Device(caches) => {
-                validate_cache_policies(caches, &self.args().attention_schedule)?
-            }
-            LlamaCache::Paged(caches) => {
-                validate_cache_policies(caches, &self.args().attention_schedule)?
-            }
+            LlamaCache::Device(caches) => eredu_architectures::llama::validate_caches::<
+                crate::backend::mlx::nn::shared::MlxBackend,
+                _,
+                _,
+            >(self.args(), caches)
+            .map_err(|error| Exception::custom(error.to_string()))?,
+            LlamaCache::Paged(caches) => eredu_architectures::llama::validate_caches::<
+                crate::backend::mlx::nn::shared::MlxBackend,
+                _,
+                _,
+            >(self.args(), caches)
+            .map_err(|error| Exception::custom(error.to_string()))?,
         }
         Ok(())
     }
-}
-
-fn validate_cache_policies<C: KeyValueCache>(
-    caches: &[Option<C>],
-    schedule: &crate::core::attention::LayerSchedule<crate::core::attention::AttentionPolicy>,
-) -> Result<(), Error> {
-    for (layer, (cache, policy)) in caches.iter().zip(schedule.iter()).enumerate() {
-        let cache = cache
-            .as_ref()
-            .ok_or_else(|| Exception::custom(format!("Llama cache is missing layer {layer}")))?;
-        let expected = policy.window().map(|window| {
-            i32::try_from(window.get()).expect("validated Llama attention window fits i32")
-        });
-        if cache.max_size() != expected {
-            return Err(Exception::custom(format!(
-                "Llama cache policy mismatch at layer {layer}: expected {policy:?}, cache window is {:?}",
-                cache.max_size()
-            ))
-            .into());
-        }
-    }
-    Ok(())
 }
 
 impl CausalLm<LlamaCache> for LlamaModel {
@@ -560,13 +529,13 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
     )?;
     let prepared =
         resident::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
-    let gguf_plan =
-        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
+    let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
+        .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
-            resident::translate_gguf_weight_name,
+            eredu_architectures::llama::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
     let adapter = LlamaLayerwiseAdapter::new(prepared.args, stream)?;
@@ -597,13 +566,13 @@ pub(crate) fn load_llama_gguf_model(
 ) -> Result<(LlamaModel, Vec<u32>), Error> {
     let prepared =
         resident::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
-    let gguf_plan =
-        super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
+    let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
+        .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
-            resident::translate_gguf_weight_name,
+            eredu_architectures::llama::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
     let adapter = LlamaLayerwiseAdapter::new(prepared.args, stream)?;
@@ -645,7 +614,7 @@ impl LlamaLayerwiseAdapter {
         let embedding = unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
-            args.affine_quantization_for("model.embed_tokens.weight"),
+            args.weight_quantization_for("model.embed_tokens.weight"),
             stream,
         )?;
         let norm =
@@ -656,7 +625,7 @@ impl LlamaLayerwiseAdapter {
             Some(build_unloaded_maybe_quantized_lm_head_with_quantization(
                 args.hidden_size,
                 args.vocab_size,
-                args.affine_quantization_for("lm_head.weight"),
+                args.weight_quantization_for("lm_head.weight"),
                 stream,
             )?)
         };
@@ -774,14 +743,12 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         &self,
     ) -> Result<crate::backend::mlx::runtime::execution::layerwise::ArchitectureCheckpointPlan, Error>
     {
-        super::checkpoint::safetensors_plan(&self.args)
+        eredu_architectures::llama::safetensors_plan(&self.args)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
             .map(Into::into)
     }
 
-    fn quantization(
-        &self,
-    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
         self.args.weight_quantization()
     }
 
@@ -806,26 +773,16 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
                 local_kv_heads.len()
             )));
         }
-        let layer_layout = crate::LayerSchedule::new(
-            layer_count,
-            self.args
-                .attention_schedule
-                .iter()
-                .zip(local_kv_heads)
-                .map(|(attention, kv_heads)| {
-                    LayerCachePolicy::key_value(*attention, kv_heads, self.args.head_dim)
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| Error::Parallel(error.to_string()))?,
+        let layer_layout = eredu_architectures::llama::cache_layout_with_key_value_heads(
+            &self.args,
+            local_kv_heads,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok(PromptCacheModelIdentity {
             model_family: "llama".into(),
             effective_model_type: self.args.model_type.clone(),
             architecture_fingerprint:
-                crate::backend::mlx::architectures::llama::model::prompt_cache_architecture_fingerprint(
-                    &self.args,
-                ),
+                eredu_architectures::llama::prompt_cache_architecture_fingerprint(&self.args),
             layer_count,
             global_layer_start: 0,
             global_layer_end: layer_count,
@@ -969,26 +926,32 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         let actual = match cache {
             LlamaCache::Device(caches) => {
                 if caches.is_empty() {
-                    *caches = self
-                        .args
-                        .attention_schedule
-                        .iter()
-                        .map(|policy| {
-                            Some(match policy.window() {
-                                Some(window) => ConcatKeyValueCache::new_for_sliding_attention(
-                                    i32::try_from(window.get())
-                                        .expect("validated Llama attention window fits i32"),
-                                ),
+                    *caches =
+                        eredu_architectures::llama::create_caches(&self.args, |_layer, window| {
+                            match window {
+                                Some(window) => {
+                                    ConcatKeyValueCache::new_for_sliding_attention(window)
+                                }
                                 None => ConcatKeyValueCache::new(),
-                            })
+                            }
                         })
-                        .collect();
+                        .map_err(|error| Exception::custom(error.to_string()))?;
                 }
-                validate_cache_policies(caches, &self.args.attention_schedule)?;
+                eredu_architectures::llama::validate_caches::<
+                    crate::backend::mlx::nn::shared::MlxBackend,
+                    _,
+                    _,
+                >(&self.args, caches)
+                .map_err(|error| Exception::custom(error.to_string()))?;
                 caches.len()
             }
             LlamaCache::Paged(caches) => {
-                validate_cache_policies(caches, &self.args.attention_schedule)?;
+                eredu_architectures::llama::validate_caches::<
+                    crate::backend::mlx::nn::shared::MlxBackend,
+                    _,
+                    _,
+                >(&self.args, caches)
+                .map_err(|error| Exception::custom(error.to_string()))?;
                 caches.len()
             }
         };
@@ -1149,7 +1112,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
             self.args.vocab_size as usize,
             self.args.hidden_size,
             self.args
-                .affine_quantization_for("model.embed_tokens.weight"),
+                .weight_quantization_for("model.embed_tokens.weight"),
             context,
             stream,
         )?);
@@ -1157,7 +1120,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
             self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
                 self.args.hidden_size,
                 self.args.vocab_size as usize,
-                self.args.affine_quantization_for("lm_head.weight"),
+                self.args.weight_quantization_for("lm_head.weight"),
                 context,
                 stream,
             )?);

@@ -1,5 +1,8 @@
 //! OpenAI GPT-OSS decoder-only mixture-of-experts implementation.
 
+use eredu_checkpoint::WeightQuantization;
+use eredu_nn::RopeValue;
+
 use std::{collections::HashMap, path::Path};
 
 use safemlx::{
@@ -32,7 +35,7 @@ use crate::{
         generation::CausalLm,
         tensor::{
             create_causal_mask,
-            rope::{initialize_rope, validate_rope_scaling_config, FloatOrString, RopeVariant},
+            rope::{initialize_rope, validate_rope_scaling_config, RopeVariant},
         },
     },
     backend::mlx::runtime::cache::residency::{
@@ -41,7 +44,6 @@ use crate::{
     },
     backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
     backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::runtime::media::input,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::CacheRankIdentity,
@@ -114,7 +116,7 @@ struct ModelArgsSource {
     max_position_embeddings: i32,
     #[serde(default = "default_rope_theta")]
     rope_theta: f32,
-    rope_scaling: Option<HashMap<String, FloatOrString>>,
+    rope_scaling: Option<HashMap<String, RopeValue>>,
     #[serde(default)]
     layer_types: Vec<String>,
     quantization_config: MxFp4Config,
@@ -154,7 +156,7 @@ pub struct ModelArgs {
     /// RoPE base.
     pub rope_theta: f32,
     /// YaRN scaling configuration.
-    pub rope_scaling: Option<HashMap<String, FloatOrString>>,
+    pub rope_scaling: Option<HashMap<String, RopeValue>>,
     /// Authoritative attention behavior in decoder-layer order.
     pub attention_schedule: LayerSchedule<AttentionPolicy>,
     /// Published checkpoint MXFP4 metadata.
@@ -338,9 +340,9 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
                 .into_iter()
                 .map(|(key, value)| {
                     let value = match value {
-                        FloatOrString::Float(value) => format!("f32:{:08x}", value.to_bits()),
-                        FloatOrString::String(value) => format!("string:{value}"),
-                        FloatOrString::Bool(value) => format!("bool:{value}"),
+                        RopeValue::Float(value) => format!("f32:{:08x}", value.to_bits()),
+                        RopeValue::String(value) => format!("string:{value}"),
+                        RopeValue::Bool(value) => format!("bool:{value}"),
                     };
                     format!("{key}={value}")
                 })
@@ -1784,7 +1786,7 @@ fn gguf_optional_string(
 fn gguf_rope_scaling(
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
-) -> Result<Option<HashMap<String, FloatOrString>>, Error> {
+) -> Result<Option<HashMap<String, RopeValue>>, Error> {
     let key = |suffix: &str| format!("{architecture}.rope.scaling.{suffix}");
     let Some(kind) = gguf_optional_string(metadata, &key("type"))? else {
         return Ok(None);
@@ -1798,28 +1800,24 @@ fn gguf_rope_scaling(
         )));
     }
     Ok(Some(HashMap::from([
-        ("rope_type".into(), FloatOrString::String("yarn".into())),
+        ("rope_type".into(), RopeValue::String("yarn".into())),
         (
             "factor".into(),
-            FloatOrString::Float(gguf_f32(metadata, &key("factor"))?),
+            RopeValue::Float(gguf_f32(metadata, &key("factor"))?),
         ),
         (
             "original_max_position_embeddings".into(),
-            FloatOrString::Float(gguf_f32(metadata, &key("original_context_length"))?),
+            RopeValue::Float(gguf_f32(metadata, &key("original_context_length"))?),
         ),
         (
             "beta_fast".into(),
-            FloatOrString::Float(
-                gguf_optional_f32(metadata, &key("yarn_beta_fast"))?.unwrap_or(32.0),
-            ),
+            RopeValue::Float(gguf_optional_f32(metadata, &key("yarn_beta_fast"))?.unwrap_or(32.0)),
         ),
         (
             "beta_slow".into(),
-            FloatOrString::Float(
-                gguf_optional_f32(metadata, &key("yarn_beta_slow"))?.unwrap_or(1.0),
-            ),
+            RopeValue::Float(gguf_optional_f32(metadata, &key("yarn_beta_slow"))?.unwrap_or(1.0)),
         ),
-        ("truncate".into(), FloatOrString::Bool(false)),
+        ("truncate".into(), RopeValue::Bool(false)),
     ])))
 }
 

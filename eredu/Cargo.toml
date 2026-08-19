@@ -146,6 +146,7 @@ safemlx = { workspace = true, features = ["safetensors"], optional = true }
 eredu-core.workspace = true
 eredu-text = { workspace = true, default-features = false }
 eredu-gguf.workspace = true
+eredu-checkpoint.workspace = true
 eredu-nn = { workspace = true, default-features = false }
 eredu-architectures.workspace = true
 

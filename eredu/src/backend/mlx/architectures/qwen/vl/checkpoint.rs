@@ -10,14 +10,13 @@ use crate::{
     backend::mlx::architectures::qwen::dense::{self, checkpoint as dense_checkpoint},
     backend::mlx::runtime::checkpoint::{
         contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-        schema::{
-            CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
-            SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
-            TensorOperation,
-        },
         store::{SafetensorsWeightStore, WeightStore},
         validation,
     },
+};
+use eredu_checkpoint::schema::{
+    CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
+    SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

@@ -1,5 +1,8 @@
 //! Gemma 4 text and multimodal model implementation and SafeTensors/GGUF loaders.
 
+use eredu_checkpoint::{AffineQuantization, WeightQuantization};
+use eredu_nn::RopeValue;
+
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -51,7 +54,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::tensor::{
         create_causal_mask,
-        rope::{initialize_rope, validate_rope_scaling_config, FloatOrString, RopeVariant},
+        rope::{initialize_rope, validate_rope_scaling_config, RopeVariant},
     },
     backend::mlx::nn::{
         self as common,
@@ -71,7 +74,6 @@ use crate::{
     backend::mlx::runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, GgufTensorNames,
     },
-    backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     backend::mlx::runtime::execution::inspection::ActivationObserver,
     backend::mlx::runtime::media::input,
     core::attention::{AttentionPolicy, LayerSchedule},
@@ -361,10 +363,10 @@ pub(super) struct ModelArgsSource {
     pub moe_intermediate_size: Option<i32>,
     #[serde(default)]
     /// Default RoPE scaling configuration.
-    pub rope_scaling: Option<HashMap<String, FloatOrString>>,
+    pub rope_scaling: Option<HashMap<String, RopeValue>>,
     #[serde(default)]
     /// Per-layer-type RoPE parameter overrides.
-    pub rope_parameters: Option<HashMap<String, HashMap<String, FloatOrString>>>,
+    pub rope_parameters: Option<HashMap<String, HashMap<String, RopeValue>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -419,9 +421,9 @@ pub struct ModelArgs {
     /// MoE intermediate size when MoE is present.
     pub moe_intermediate_size: Option<i32>,
     /// Default RoPE scaling configuration.
-    pub rope_scaling: Option<HashMap<String, FloatOrString>>,
+    pub rope_scaling: Option<HashMap<String, RopeValue>>,
     /// Per-attention-kind RoPE parameter overrides.
-    pub rope_parameters: Option<HashMap<String, HashMap<String, FloatOrString>>>,
+    pub rope_parameters: Option<HashMap<String, HashMap<String, RopeValue>>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -989,9 +991,9 @@ impl ModelArgs {
             .and_then(|params| params.get(key))
             .and_then(|params| params.get("rope_theta"))
             .and_then(|value| match value {
-                FloatOrString::Float(v) => Some(*v),
-                FloatOrString::String(s) => s.parse().ok(),
-                FloatOrString::Bool(_) => None,
+                RopeValue::Float(v) => Some(*v),
+                RopeValue::String(s) => s.parse().ok(),
+                RopeValue::Bool(_) => None,
             })
             .unwrap_or(self.rope_theta)
     }
@@ -999,7 +1001,7 @@ impl ModelArgs {
     fn rope_scaling_for_layer(
         &self,
         policy: AttentionPolicy,
-    ) -> Option<HashMap<String, FloatOrString>> {
+    ) -> Option<HashMap<String, RopeValue>> {
         let key = match policy {
             AttentionPolicy::Sliding { .. } => "sliding_attention",
             AttentionPolicy::Full => "full_attention",
@@ -1127,12 +1129,12 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
-fn partial_rotary_dims(head_dim: i32, scaling: &Option<HashMap<String, FloatOrString>>) -> i32 {
+fn partial_rotary_dims(head_dim: i32, scaling: &Option<HashMap<String, RopeValue>>) -> i32 {
     if matches!(
         scaling
             .as_ref()
             .and_then(|scaling| scaling.get("rope_type")),
-        Some(FloatOrString::String(rope_type)) if rope_type == "proportional"
+        Some(RopeValue::String(rope_type)) if rope_type == "proportional"
     ) {
         return head_dim;
     }
@@ -1141,9 +1143,9 @@ fn partial_rotary_dims(head_dim: i32, scaling: &Option<HashMap<String, FloatOrSt
         .as_ref()
         .and_then(|scaling| scaling.get("partial_rotary_factor"))
         .and_then(|value| match value {
-            FloatOrString::Float(v) => Some(*v),
-            FloatOrString::String(s) => s.parse().ok(),
-            FloatOrString::Bool(_) => None,
+            RopeValue::Float(v) => Some(*v),
+            RopeValue::String(s) => s.parse().ok(),
+            RopeValue::Bool(_) => None,
         })
         .unwrap_or(1.0);
     ((head_dim as f32 * partial_factor).round() as i32).clamp(2, head_dim)
@@ -1181,7 +1183,9 @@ fn maybe_quantized_linear_with_config(
                 output_dims,
                 config.group_size(),
                 config.bits(),
-                config.mode(),
+                crate::backend::mlx::runtime::checkpoint::quantization::mlx_quantization_mode(
+                    config,
+                ),
                 false,
                 stream,
             )?,
@@ -1219,7 +1223,9 @@ pub(super) fn maybe_quantized_linear_with_bias(
                 output_dims,
                 config.group_size(),
                 config.bits(),
-                config.mode(),
+                crate::backend::mlx::runtime::checkpoint::quantization::mlx_quantization_mode(
+                    config,
+                ),
                 bias,
                 stream,
             )?,
@@ -2499,7 +2505,10 @@ impl Gemma4Embedding {
         let quantized = quantization.is_some();
         let group_size = quantization.map_or(64, WeightQuantization::group_size);
         let bits = quantization.map_or(4, WeightQuantization::bits);
-        let mode = quantization.map_or(QuantizationMode::Affine, WeightQuantization::mode);
+        let mode = quantization.map_or(
+            QuantizationMode::Affine,
+            crate::backend::mlx::runtime::checkpoint::quantization::mlx_quantization_mode,
+        );
         let packed_dim = quantized_packed_dimension(hidden_size, bits);
         Ok(Self {
             native: None,
@@ -4573,7 +4582,7 @@ pub(crate) fn apply_mmproj_args(
                     .unwrap_or(false),
                 rope_parameters: Some(HashMap::from([(
                     "rope_theta".into(),
-                    FloatOrString::Float(rope_theta),
+                    RopeValue::Float(rope_theta),
                 )])),
                 weight_quantization: None,
             })
@@ -4908,22 +4917,16 @@ pub(crate) fn gemma4_args_from_gguf_catalog(
         (
             "full_attention".into(),
             HashMap::from([
-                (
-                    "rope_type".into(),
-                    FloatOrString::String("proportional".into()),
-                ),
-                ("partial_rotary_factor".into(), FloatOrString::Float(0.25)),
-                ("rope_theta".into(), FloatOrString::Float(full_rope_theta)),
+                ("rope_type".into(), RopeValue::String("proportional".into())),
+                ("partial_rotary_factor".into(), RopeValue::Float(0.25)),
+                ("rope_theta".into(), RopeValue::Float(full_rope_theta)),
             ]),
         ),
         (
             "sliding_attention".into(),
             HashMap::from([
-                ("rope_type".into(), FloatOrString::String("default".into())),
-                (
-                    "rope_theta".into(),
-                    FloatOrString::Float(sliding_rope_theta),
-                ),
+                ("rope_type".into(), RopeValue::String("default".into())),
+                ("rope_theta".into(), RopeValue::Float(sliding_rope_theta)),
             ]),
         ),
     ]));

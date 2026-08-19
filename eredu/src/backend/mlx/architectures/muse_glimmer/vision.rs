@@ -1,5 +1,7 @@
 //! Muse-Glimmer vision tower, layerwise state, and language projection.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::collections::HashMap;
 
 use safemlx::{
@@ -19,11 +21,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::nn::linear::unloaded_maybe_quantized_linear,
-    backend::mlx::runtime::{
-        cache::ConcatKeyValueCache, checkpoint::quantization::WeightQuantization,
-    },
+    backend::mlx::error::Error, backend::mlx::nn::linear::unloaded_maybe_quantized_linear,
+    backend::mlx::runtime::cache::ConcatKeyValueCache,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

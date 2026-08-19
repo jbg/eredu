@@ -1,9 +1,12 @@
 //! Architecture-owned checkpoint contracts for Nemotron-H.
+
 //!
 //! Nemotron-H owns its hybrid layer schedule, public/runtime aliases, MTP
 //! geometry, routed-expert storage alternatives, and GGUF name catalog here.
 //! The generic checkpoint runtime only evaluates the resulting physical
 //! constraints and remains unaware of recurrent, expert, and MTP semantics.
+
+use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -13,14 +16,13 @@ use serde_json::Value;
 use super::model::{self, LayerPolicy, ModelArgs};
 use crate::backend::mlx::runtime::checkpoint::{
     contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-    quantization::WeightQuantization,
-    schema::{
-        AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
-        GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-        StoredDtypeConstraint, TensorOperation,
-    },
-    store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+    store::{SafetensorsWeightStore, WeightStore},
     validation,
+};
+use eredu_checkpoint::schema::{
+    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+    GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+    StoredDtypeConstraint, TensorOperation,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -452,10 +454,7 @@ fn add_safe_moe(
                 id: "packed".into(),
                 discriminator_keys: packed
                     .iter()
-                    .filter(|tensor| {
-                        tensor.role
-                            == crate::backend::mlx::runtime::checkpoint::schema::TensorRole::Tensor
-                    })
+                    .filter(|tensor| tensor.role == eredu_checkpoint::schema::TensorRole::Tensor)
                     .map(|tensor| tensor.key.clone())
                     .collect(),
                 tensors: packed,
@@ -464,10 +463,7 @@ fn add_safe_moe(
                 id: "split".into(),
                 discriminator_keys: split
                     .iter()
-                    .filter(|tensor| {
-                        tensor.role
-                            == crate::backend::mlx::runtime::checkpoint::schema::TensorRole::Tensor
-                    })
+                    .filter(|tensor| tensor.role == eredu_checkpoint::schema::TensorRole::Tensor)
                     .map(|tensor| tensor.key.clone())
                     .collect(),
                 tensors: split,

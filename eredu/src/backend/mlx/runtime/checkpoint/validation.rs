@@ -1,19 +1,21 @@
 //! Deterministic header-only evaluation of declarative checkpoint plans.
 
+use eredu_checkpoint::StoredDtype;
+
 use std::collections::{BTreeMap, BTreeSet};
 
+use eredu_checkpoint::schema::{
+    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+    GgufTypeConstraint, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+    StoredDtypeConstraint, TensorRequirement, TensorRole,
+};
 use safemlx::ops::{GgufCheckpoint, GgufType};
 
 use super::{
     contract::{
         missing, shape_mismatch, CheckpointIssue, CheckpointIssueKind, CheckpointValidation,
     },
-    schema::{
-        AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
-        GgufTypeConstraint, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-        StoredDtypeConstraint, TensorRequirement, TensorRole,
-    },
-    store::{SafetensorsWeightStore, StoredDtype, WeightMetadata, WeightStore, WeightStoreError},
+    store::{SafetensorsWeightStore, WeightMetadata, WeightStore, WeightStoreError},
 };
 
 /// The single physical layout selected from an architecture checkpoint plan.
@@ -575,7 +577,7 @@ fn constraint_present<E, T: Constraint<E>>(
 
 fn discriminator_present<E, T: Constraint<E>>(
     catalog: &BTreeMap<String, PhysicalMetadata<E>>,
-    variant: &super::schema::LayoutVariant<T>,
+    variant: &eredu_checkpoint::schema::LayoutVariant<T>,
     key: &str,
 ) -> bool {
     variant
@@ -738,7 +740,7 @@ fn metadata_failure(name: &str, error: WeightStoreError) -> CheckpointIssue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::mlx::runtime::checkpoint::schema::{LayoutVariant, TensorOperation};
+    use eredu_checkpoint::schema::{LayoutVariant, TensorOperation};
 
     fn safe(
         key: &str,

@@ -1,7 +1,10 @@
 //! Canonical checkpoint bindings for unloaded module parameter trees.
+
 //!
 //! These helpers keep checkpoint-name expansion, shape validation, byte
 //! accounting, and resident-lease assignment independent of model families.
+
+use eredu_checkpoint::WeightQuantization;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -15,15 +18,14 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding_plan::{
         BindingPlan, BindingPlanError, PlannedBinding,
     },
+    backend::mlx::runtime::checkpoint::load::{
+        load_array_quantized_strict, StrictLoadConfig, StrictLoadReport,
+    },
     backend::mlx::runtime::checkpoint::recipe::{
         DerivedWeightRecipe, RecipeDtype, WeightRecipeError,
     },
     backend::mlx::runtime::checkpoint::store::{
         TensorSelection, WeightMaterialization, WeightReadPolicy, WeightStore, WeightStoreError,
-    },
-    backend::mlx::runtime::checkpoint::{
-        load::{load_array_quantized_strict, StrictLoadConfig, StrictLoadReport},
-        quantization::WeightQuantization,
     },
     backend::mlx::runtime::residency::manager::{ResidentUnitLease, WeightBinding},
 };

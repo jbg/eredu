@@ -12,72 +12,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use safemlx::{
-    native_quantization::NativeQuantizationFormat,
-    ops::{self, GgufEndian, GgufType},
-    Array, Stream,
-};
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use safemlx::{ops, Array, Stream};
 use serde_json::{json, Value};
 
+use eredu_checkpoint::{AffineQuantization, WeightQuantization};
+
 use crate::{backend::mlx::error::Error, backend::mlx::runtime::checkpoint::load as weights};
-
-/// MLX affine quantization settings stored in `config.json`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AffineQuantization {
-    /// Number of adjacent input values sharing one scale and bias.
-    pub group_size: i32,
-    /// Packed bit width for each weight value.
-    pub bits: i32,
-    /// Quantization mode. Eredu's MLX backend supports `affine` checkpoints.
-    #[serde(default = "default_affine_mode")]
-    pub mode: AffineQuantizationMode,
-}
-
-impl Default for AffineQuantization {
-    fn default() -> Self {
-        Self {
-            group_size: 64,
-            bits: 4,
-            mode: AffineQuantizationMode::Affine,
-        }
-    }
-}
-
-impl AffineQuantization {
-    /// Creates and validates an affine quantization configuration.
-    pub fn new(group_size: i32, bits: i32) -> Result<Self, Error> {
-        let config = Self {
-            group_size,
-            bits,
-            mode: AffineQuantizationMode::Affine,
-        };
-        config.validate()?;
-        Ok(config)
-    }
-
-    /// Validates settings supported by MLX packed affine operations.
-    pub fn validate(&self) -> Result<(), Error> {
-        if self.mode != AffineQuantizationMode::Affine {
-            return Err(Error::Quantization(
-                "only MLX affine quantization is currently supported".into(),
-            ));
-        }
-        if self.group_size != 16 && (self.group_size <= 0 || self.group_size % 32 != 0) {
-            return Err(Error::Quantization(format!(
-                "group_size must be 16 or a positive multiple of 32, got {}",
-                self.group_size
-            )));
-        }
-        if !matches!(self.bits, 2 | 3 | 4 | 5 | 6 | 8) {
-            return Err(Error::Quantization(format!(
-                "bits must be one of 2, 3, 4, 5, 6, or 8, got {}",
-                self.bits
-            )));
-        }
-        Ok(())
-    }
-}
 
 /// Resolves an on-load request against checkpoint quantization metadata.
 ///
@@ -121,179 +61,13 @@ pub(crate) fn gguf_affine_quantization(
         if i64::from(packed_columns) * 32
             == i64::from(scale_columns) * i64::from(group_size) * i64::from(bits)
         {
-            return AffineQuantization::new(group_size, bits);
+            return Ok(AffineQuantization::new(group_size, bits)?);
         }
     }
 
     Err(Error::Quantization(format!(
         "GGUF quantized tensor {weight_name:?} has unsupported weight/scales shapes {weight_shape:?} and {scales_shape:?}"
     )))
-}
-
-fn default_affine_mode() -> AffineQuantizationMode {
-    AffineQuantizationMode::Affine
-}
-
-/// Quantization mode serialized using MLX's lowercase spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AffineQuantizationMode {
-    /// Per-group scale-and-bias affine quantization.
-    Affine,
-}
-
-/// Weight encoding requested for load-time quantization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WeightQuantization {
-    /// MLX affine integer quantization.
-    Affine(AffineQuantization),
-    /// Microscaling FP4 with E2M1 values and E8M0 scales.
-    MxFp4,
-    /// Checkpoint-native GGML quantization blocks.
-    GgufIQuant {
-        /// Native-executable GGML tensor encoding.
-        ggml_type: GgufType,
-        /// Byte order declared by the containing GGUF file.
-        endian: GgufEndian,
-    },
-}
-
-impl WeightQuantization {
-    /// MXFP4 group size fixed by the format.
-    pub const MXFP4_GROUP_SIZE: i32 = 32;
-    /// MXFP4 packed value width fixed by the format.
-    pub const MXFP4_BITS: i32 = 4;
-
-    /// Returns the group size passed to MLX.
-    pub fn group_size(self) -> i32 {
-        match self {
-            Self::Affine(config) => config.group_size,
-            Self::MxFp4 => Self::MXFP4_GROUP_SIZE,
-            Self::GgufIQuant { ggml_type, .. } => {
-                ggml_type.block_and_bytes().expect("native GGML type").0 as i32
-            }
-        }
-    }
-
-    /// Returns the packed value width passed to MLX.
-    pub fn bits(self) -> i32 {
-        match self {
-            Self::Affine(config) => config.bits,
-            Self::MxFp4 => Self::MXFP4_BITS,
-            Self::GgufIQuant { ggml_type, .. } => {
-                ggml_type.block_and_bytes().expect("native GGML type").1 as i32
-            }
-        }
-    }
-
-    /// Returns the corresponding typed MLX execution mode.
-    pub fn mode(self) -> ops::QuantizationMode {
-        match self {
-            Self::Affine(_) => ops::QuantizationMode::Affine,
-            Self::MxFp4 => ops::QuantizationMode::MxFp4,
-            Self::GgufIQuant { .. } => {
-                panic!("native GGML blocks execute through checkpoint-native kernels")
-            }
-        }
-    }
-
-    /// Returns whether the encoding stores affine quantization biases.
-    pub const fn has_biases(self) -> bool {
-        matches!(self, Self::Affine(_))
-    }
-
-    /// Validates the selected encoding.
-    pub fn validate(self) -> Result<(), Error> {
-        match self {
-            Self::Affine(config) => config.validate(),
-            Self::MxFp4 => Ok(()),
-            Self::GgufIQuant { ggml_type, .. } => {
-                NativeQuantizationFormat::from_ggml_type(ggml_type)
-                    .map(|_| ())
-                    .ok_or_else(|| {
-                        Error::Quantization(format!(
-                            "{ggml_type:?} has no checkpoint-native execution support"
-                        ))
-                    })
-            }
-        }
-    }
-
-    /// Returns checkpoint-native GGML block metadata when present.
-    pub const fn gguf_iquant(self) -> Option<(GgufType, GgufEndian)> {
-        match self {
-            Self::GgufIQuant { ggml_type, endian } => Some((ggml_type, endian)),
-            _ => None,
-        }
-    }
-}
-
-impl From<AffineQuantization> for WeightQuantization {
-    fn from(value: AffineQuantization) -> Self {
-        Self::Affine(value)
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct WeightQuantizationMetadata {
-    group_size: i32,
-    bits: i32,
-    #[serde(default = "default_weight_quantization_mode")]
-    mode: String,
-}
-
-fn default_weight_quantization_mode() -> String {
-    "affine".to_string()
-}
-
-impl Serialize for WeightQuantization {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        WeightQuantizationMetadata {
-            group_size: self.group_size(),
-            bits: self.bits(),
-            mode: match self {
-                Self::Affine(_) => "affine",
-                Self::MxFp4 => "mxfp4",
-                Self::GgufIQuant { .. } => {
-                    return Err(serde::ser::Error::custom(
-                        "checkpoint-native GGML IQ metadata is not serializable",
-                    ))
-                }
-            }
-            .into(),
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for WeightQuantization {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let metadata = WeightQuantizationMetadata::deserialize(deserializer)?;
-        match metadata.mode.as_str() {
-            "affine" => AffineQuantization::new(metadata.group_size, metadata.bits)
-                .map(Self::Affine)
-                .map_err(de::Error::custom),
-            "mxfp4"
-                if metadata.group_size == Self::MXFP4_GROUP_SIZE
-                    && metadata.bits == Self::MXFP4_BITS =>
-            {
-                Ok(Self::MxFp4)
-            }
-            "mxfp4" => Err(de::Error::custom(format!(
-                "MXFP4 requires group_size=32 and bits=4, got group_size={} bits={}",
-                metadata.group_size, metadata.bits
-            ))),
-            mode => Err(de::Error::custom(format!(
-                "unsupported quantization mode {mode:?}"
-            ))),
-        }
-    }
 }
 
 /// Tensor selection and output-sharding options for checkpoint conversion.
@@ -425,7 +199,7 @@ pub fn quantize_tensor(
         &matrix,
         config.group_size(),
         config.bits(),
-        config.mode(),
+        mlx_quantization_mode(config),
         stream,
     )?;
     let restore_shape = |array: Array, last_dim: i32| -> Result<Array, Error> {
@@ -447,6 +221,16 @@ pub fn quantize_tensor(
             .map(|biases| restore_shape(biases, group_dims))
             .transpose()?,
     })
+}
+
+pub(crate) fn mlx_quantization_mode(config: WeightQuantization) -> ops::QuantizationMode {
+    match config {
+        WeightQuantization::Affine(_) => ops::QuantizationMode::Affine,
+        WeightQuantization::MxFp4 => ops::QuantizationMode::MxFp4,
+        WeightQuantization::GgufIQuant { .. } => {
+            panic!("checkpoint-native GGML blocks cannot be produced by dense quantization")
+        }
+    }
 }
 
 /// Summary returned after converting and saving a checkpoint directory.

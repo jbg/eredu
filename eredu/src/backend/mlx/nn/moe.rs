@@ -1,5 +1,7 @@
 //! Mixture-of-experts routing and packed expert implementations.
 
+use eredu_checkpoint::WeightQuantization;
+
 use safemlx::{
     error::Exception,
     macros::ModuleParameters,
@@ -17,9 +19,7 @@ use safemlx::{
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::runtime::checkpoint::quantization::{
-        quantize_tensor, QuantizedTensor, WeightQuantization,
-    },
+    backend::mlx::runtime::checkpoint::quantization::{quantize_tensor, QuantizedTensor},
     backend::mlx::runtime::execution::inspection::ActivationObserver,
 };
 
@@ -114,7 +114,9 @@ pub fn packed_grouped_linear_with_options(
             true,
             quantization.group_size(),
             quantization.bits(),
-            quantization.mode(),
+            crate::backend::mlx::runtime::checkpoint::quantization::mlx_quantization_mode(
+                quantization,
+            ),
             stream,
         )?
         .reshape(&[routes, out_features], stream);
@@ -132,7 +134,7 @@ pub fn packed_grouped_linear_with_options(
         quantization.group_size(),
         quantization.bits(),
         sorted_indices,
-        quantization.mode(),
+        crate::backend::mlx::runtime::checkpoint::quantization::mlx_quantization_mode(quantization),
         stream,
     )?
     .reshape(&[routes, out_features], stream)
@@ -408,7 +410,10 @@ impl TopKRouter {
             },
             group_size: affine.map_or(0, WeightQuantization::group_size),
             bits: affine.map_or(0, WeightQuantization::bits),
-            mode: affine.map_or(QuantizationMode::Affine, WeightQuantization::mode),
+            mode: affine.map_or(
+                QuantizationMode::Affine,
+                crate::backend::mlx::runtime::checkpoint::quantization::mlx_quantization_mode,
+            ),
             iquant: quantization.filter(|q| matches!(q, WeightQuantization::GgufIQuant { .. })),
         })
     }

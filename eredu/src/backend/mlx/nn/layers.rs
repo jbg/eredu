@@ -1,5 +1,7 @@
 //! Activation functions and feed-forward layers.
 
+use eredu_checkpoint::WeightQuantization;
+
 use safemlx::{
     builder::Builder,
     error::Exception,
@@ -11,10 +13,7 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use crate::{
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
-    backend::mlx::runtime::execution::inspection::ActivationObserver,
-};
+use crate::backend::mlx::runtime::execution::inspection::ActivationObserver;
 
 use super::linear::unloaded_maybe_quantized_linear;
 

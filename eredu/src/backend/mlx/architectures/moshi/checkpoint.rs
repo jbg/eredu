@@ -1,8 +1,11 @@
 //! Architecture-owned checkpoint contract for native Moshi MLX weights.
+
 //!
 //! Moshi owns the physical tensor names, temporal/depth geometry, and
 //! quantization companion declarations here. Generic checkpoint code only
 //! evaluates the resulting declarative plan.
+
+use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
 use std::path::{Path, PathBuf};
 
@@ -11,14 +14,12 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::{
         contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-        quantization::WeightQuantization,
-        schema::{
-            CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-            StoredDtypeConstraint,
-        },
-        store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+        store::{SafetensorsWeightStore, WeightStore},
         validation,
     },
+};
+use eredu_checkpoint::schema::{
+    CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
 };
 
 pub(crate) fn validate_safetensors_path(
@@ -348,7 +349,7 @@ fn invalid_geometry(detail: String) -> CheckpointValidation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization;
+    use eredu_checkpoint::AffineQuantization;
 
     fn args() -> ModelArgs {
         serde_json::from_value(serde_json::json!({

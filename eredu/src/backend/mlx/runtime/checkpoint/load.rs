@@ -1,3 +1,7 @@
+use eredu_checkpoint::AffineQuantization;
+
+use eredu_checkpoint::WeightQuantization;
+
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -18,9 +22,7 @@ use safetensors::SafeTensors;
 use serde::Deserialize;
 
 use crate::backend::mlx::error::Error;
-use crate::backend::mlx::runtime::checkpoint::quantization::{
-    quantize_tensor, AffineQuantization, WeightQuantization,
-};
+use crate::backend::mlx::runtime::checkpoint::quantization::quantize_tensor;
 
 pub(crate) fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadataValue> {
     checkpoint
@@ -1334,6 +1336,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use eredu_checkpoint::{AffineQuantization, WeightQuantization};
     use eredu_gguf::{Endian, GgmlType, TensorInput, Writer, WriterOptions};
     use safemlx::{
         macros::ModuleParameters, module::Param, quantization::MaybeQuantized, Array, Device,
@@ -1342,9 +1345,7 @@ mod tests {
 
     use crate::{
         backend::mlx::nn::linear::unloaded_maybe_quantized_linear,
-        backend::mlx::runtime::checkpoint::quantization::{
-            quantize_tensor, AffineQuantization, WeightQuantization,
-        },
+        backend::mlx::runtime::checkpoint::quantization::quantize_tensor,
     };
 
     use super::{

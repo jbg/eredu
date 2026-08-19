@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use eredu_nn::RopeValue;
 use safemlx::macros::ModuleParameters;
 use safemlx::{
     builder::Builder,
@@ -15,7 +16,6 @@ use safemlx::{
     },
     Array, Stream,
 };
-use serde::Deserialize;
 
 use crate::backend::mlx::error::Error;
 
@@ -30,27 +30,11 @@ pub enum FloatOrStr<'a> {
     Bool(bool),
 }
 
-// TODO: check if additional serde attributes are needed
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-/// Deserialized RoPE scaling-config value.
-pub enum FloatOrString {
-    /// Numeric floating-point value.
-    Float(f32),
-    /// String value, used by config fields such as `rope_type`.
-    String(String),
-    /// Boolean scaling option.
-    Bool(bool),
-}
-
-impl FloatOrString {
-    /// Borrows the value without allocating.
-    pub fn borrowed(&self) -> FloatOrStr<'_> {
-        match self {
-            FloatOrString::Float(f) => FloatOrStr::Float(*f),
-            FloatOrString::String(s) => FloatOrStr::Str(s),
-            FloatOrString::Bool(value) => FloatOrStr::Bool(*value),
-        }
+fn borrowed(value: &RopeValue) -> FloatOrStr<'_> {
+    match value {
+        RopeValue::Float(f) => FloatOrStr::Float(*f),
+        RopeValue::String(s) => FloatOrStr::Str(s),
+        RopeValue::Bool(value) => FloatOrStr::Bool(*value),
     }
 }
 
@@ -60,15 +44,12 @@ impl FloatOrString {
 /// are also valid for non-numeric fields. This function should only be called for keys that
 /// are expected to hold numeric values.
 fn get_numeric_from_config(
-    config: &HashMap<String, FloatOrString>,
+    config: &HashMap<String, RopeValue>,
     key: &str,
 ) -> Result<f32, Exception> {
-    match config
-        .get(key)
-        .map(FloatOrString::borrowed)
-        .ok_or_else(|| {
-            Exception::custom(format!(r#"key "{key}" is not found in scaling config"#))
-        })? {
+    match config.get(key).map(borrowed).ok_or_else(|| {
+        Exception::custom(format!(r#"key "{key}" is not found in scaling config"#))
+    })? {
         FloatOrStr::Float(f) => Ok(f),
         FloatOrStr::Str(s) => s
             .parse::<f32>()
@@ -83,7 +64,7 @@ fn get_numeric_from_config(
 /// unsupported mode is reported as an architecture error rather than reaching
 /// backend construction.
 pub(crate) fn validate_rope_scaling_config(
-    scaling_config: &Option<HashMap<String, FloatOrString>>,
+    scaling_config: &Option<HashMap<String, RopeValue>>,
 ) -> Result<(), Error> {
     let Some(config) = scaling_config else {
         return Ok(());
@@ -91,7 +72,7 @@ pub(crate) fn validate_rope_scaling_config(
     let Some(rope_type) = config.get("type").or_else(|| config.get("rope_type")) else {
         return Ok(());
     };
-    let FloatOrString::String(rope_type) = rope_type else {
+    let RopeValue::String(rope_type) = rope_type else {
         return Err(Error::UnsupportedArchitecture(
             "RoPE scaling field type or rope_type must be a string".into(),
         ));
@@ -583,7 +564,7 @@ pub fn initialize_rope(
     dims: i32,
     base: f32, // rope_theta
     traditional: bool,
-    scaling_config: &Option<HashMap<String, FloatOrString>>,
+    scaling_config: &Option<HashMap<String, RopeValue>>,
     _max_position_embeddings: i32,
     stream: &Stream,
 ) -> Result<RopeVariant, Exception> {
@@ -595,7 +576,7 @@ pub fn initialize_rope(
             config
                 .get("type")
                 .or_else(|| config.get("rope_type"))
-                .map(FloatOrString::borrowed)
+                .map(borrowed)
         })
         .unwrap_or(FloatOrStr::Str("default"));
 
@@ -670,7 +651,7 @@ pub fn initialize_rope(
                 .map(|value| value.unwrap_or(default))
         };
         let truncate = match config.get("truncate") {
-            Some(FloatOrString::Bool(value)) => *value,
+            Some(RopeValue::Bool(value)) => *value,
             Some(_) => {
                 return Err(Exception::custom(
                     "YaRN truncate must be a boolean when provided",
@@ -705,14 +686,14 @@ mod tests {
 
     use super::{
         initialize_rope, proportional_frequency_values, proportional_rotary_dims,
-        validate_rope_scaling_config, yarn_frequency_values, FloatOrString,
+        validate_rope_scaling_config, yarn_frequency_values, RopeValue,
     };
     use crate::backend::mlx::error::Error;
 
-    fn longrope_config() -> Option<HashMap<String, FloatOrString>> {
+    fn longrope_config() -> Option<HashMap<String, RopeValue>> {
         Some(HashMap::from([(
             "rope_type".into(),
-            FloatOrString::String("longrope".into()),
+            RopeValue::String("longrope".into()),
         )]))
     }
 

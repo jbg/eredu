@@ -1,3 +1,5 @@
+use eredu_checkpoint::WeightQuantization;
+
 use safemlx::{
     error::Exception,
     macros::ModuleParameters,
@@ -14,8 +16,6 @@ use safemlx::{
 use serde::Deserialize;
 
 use super::multimodal::{maybe_quantized_linear_bias, Gemma4ClippedLinear};
-use crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization;
-
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Gemma4AudioConfig {
     pub hidden_size: i32,

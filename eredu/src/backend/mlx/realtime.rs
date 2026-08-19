@@ -1,5 +1,7 @@
 //! MLX implementation of backend-neutral realtime loading and execution.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::path::Path;
 
 use eredu_core::{
@@ -25,10 +27,7 @@ use crate::{
     },
     backend::mlx::error::Error,
     backend::mlx::runtime::{
-        checkpoint::{
-            artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
-            quantization::WeightQuantization,
-        },
+        checkpoint::artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
         generation::sampler::DefaultSampler,
     },
     backend::mlx::{ensure_replicated_load_options, ModelLoadOptions},
@@ -819,10 +818,7 @@ mod tests {
             MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &explicit)
         );
 
-        explicit.quantization = Some(
-            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::default()
-                .into(),
-        );
+        explicit.quantization = Some(eredu_checkpoint::AffineQuantization::default().into());
         assert_ne!(
             MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &implicit),
             MlxRealtimeExecutionIdentity::new(RealtimeModelKind::Moshi, &explicit)

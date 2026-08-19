@@ -1,5 +1,8 @@
 //! Gemma 4 assistant draft-model support for multi-token prediction.
 
+use eredu_checkpoint::WeightQuantization;
+use eredu_nn::RopeValue;
+
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use safemlx::{
@@ -25,12 +28,10 @@ use crate::{
     },
     backend::mlx::error::Error,
     backend::mlx::nn as common,
-    backend::mlx::nn::tensor::rope::FloatOrString,
     backend::mlx::runtime::checkpoint::load::{
         gguf_affine_configs, gguf_metadata, load_gguf_strict, load_safetensors_quantized_strict,
         load_safetensors_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::ModelLoadOptions,
     core::attention::{AttentionPolicy, LayerSchedule},
 };
@@ -757,22 +758,16 @@ fn gemma4_assistant_config_from_gguf(
         (
             "full_attention".into(),
             HashMap::from([
-                (
-                    "rope_type".into(),
-                    FloatOrString::String("proportional".into()),
-                ),
-                ("partial_rotary_factor".into(), FloatOrString::Float(0.25)),
-                ("rope_theta".into(), FloatOrString::Float(full_rope_theta)),
+                ("rope_type".into(), RopeValue::String("proportional".into())),
+                ("partial_rotary_factor".into(), RopeValue::Float(0.25)),
+                ("rope_theta".into(), RopeValue::Float(full_rope_theta)),
             ]),
         ),
         (
             "sliding_attention".into(),
             HashMap::from([
-                ("rope_type".into(), FloatOrString::String("default".into())),
-                (
-                    "rope_theta".into(),
-                    FloatOrString::Float(sliding_rope_theta),
-                ),
+                ("rope_type".into(), RopeValue::String("default".into())),
+                ("rope_theta".into(), RopeValue::Float(sliding_rope_theta)),
             ]),
         ),
     ]));
@@ -898,6 +893,7 @@ fn translate_gguf_weight_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use eredu_checkpoint::{AffineQuantization, WeightQuantization};
     use std::sync::Arc;
 
     use std::{
@@ -911,11 +907,7 @@ mod tests {
         Array, Device, DeviceType, ExecutionContext,
     };
 
-    use crate::{
-        backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
-        backend::mlx::ModelLoadOptions,
-        core::attention::AttentionPolicy,
-    };
+    use crate::{backend::mlx::ModelLoadOptions, core::attention::AttentionPolicy};
 
     const CONFIG: &str = r#"{
       "model_type":"gemma4_assistant",

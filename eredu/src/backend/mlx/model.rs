@@ -21,7 +21,6 @@ use crate::backend::mlx::architectures::{
     inkling::model as inkling,
     kimi_linear::model as kimi_linear,
     lfm2::model as lfm2,
-    llama::model as llama,
     muse_glimmer,
     nemotron_h::model as nemotron_h,
     qwen::{
@@ -64,7 +63,7 @@ pub enum Model {
     /// Thinking Machines Lab Inkling multimodal model.
     Inkling(crate::backend::mlx::architectures::inkling::layerwise::InklingLayerwiseModel),
     /// Llama-compatible dense model.
-    Llama(crate::backend::mlx::architectures::llama::layerwise::LlamaModel),
+    Llama(crate::integrations::llama_mlx::layerwise::LlamaModel),
     /// Meta Muse-Glimmer dense multimodal model.
     MuseGlimmer(crate::backend::mlx::architectures::muse_glimmer::layerwise::LayerwiseDecoder),
     /// Liquid AI LFM2/LFM2.5 model.
@@ -737,7 +736,9 @@ impl Model {
     pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Exception> {
         match self {
             Self::Gemma4(model) => Ok(gemma4::prompt_cache_architecture_fingerprint(model.args())),
-            Self::Llama(model) => Ok(llama::prompt_cache_architecture_fingerprint(model.args())),
+            Self::Llama(model) => {
+                Ok(eredu_architectures::llama::prompt_cache_architecture_fingerprint(model.args()))
+            }
             Self::DeepSeekV3(model) => Ok(deepseek_v3::prompt_cache_architecture_fingerprint(
                 model.args(),
             )),
@@ -1279,7 +1280,7 @@ pub enum ModelCache {
     /// Per-layer key/value caches whose bounds follow the model schedule.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
     /// Unified Llama cache used by bounded layer execution.
-    Llama(crate::backend::mlx::architectures::llama::layerwise::LlamaCache),
+    Llama(crate::integrations::llama_mlx::layerwise::LlamaCache),
     /// Qwen3-VL key/value cache and multimodal position state.
     Qwen3Vl(qwen3_vl::Cache),
     /// Qwen3-VL-MoE key/value cache and multimodal position state.

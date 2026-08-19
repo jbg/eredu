@@ -9,6 +9,7 @@ members = [
     "eredu",
     "eredu-core",
     "eredu-text",
+    "eredu-checkpoint",
     "eredu-nn",
     "eredu-architectures",
     "eredu-codec",
@@ -36,6 +37,7 @@ safemlx-internal-macros = { version = "0.1.1", path = "safemlx-internal-macros" 
 eredu = { version = "0.4.1", path = "eredu" }
 eredu-core = { version = "0.1.0", path = "eredu-core" }
 eredu-text = { version = "0.1.4", path = "eredu-text", default-features = false }
+eredu-checkpoint = { version = "0.1.0", path = "eredu-checkpoint" }
 eredu-nn = { version = "0.1.0", path = "eredu-nn", default-features = false }
 eredu-architectures = { version = "0.1.0", path = "eredu-architectures" }
 eredu-codec = { version = "0.1.0", path = "eredu-codec", default-features = false }

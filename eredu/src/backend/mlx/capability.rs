@@ -2,12 +2,14 @@
 
 use std::{collections::BTreeMap, num::NonZeroU8};
 
+use eredu_architectures::llama::ModelArgs as LlamaModelArgs;
 use eredu_core::{
     estimate_runtime_state, AvailableMemory, CacheStateStrategy, CapabilityError,
     EstimationCompleteness, GrowingState, InputModalities, InputTokenCount, ModelCapabilities,
     ModelCapabilityBackend, ModelRuntime, ObservationKind, Observed, PhysicalMemorySemantics,
     RuntimeStateEstimate, SlidingWindowLayerCount, StateLayout, StaticMemoryReport,
 };
+use eredu_nn::RopeValue;
 use safemlx::{Array, Stream};
 
 use super::{MlxBackend, MlxModelInput, MlxModelSession, Model};
@@ -20,13 +22,11 @@ use crate::{
         inkling::model as inkling,
         kimi_linear::model as kimi_linear,
         lfm2::model as lfm2,
-        llama::model as llama,
         muse_glimmer,
         nemotron_h::model as nemotron_h,
         qwen::dense as dense_qwen,
         qwen::hybrid::qwen3_5::{self, LayerPolicy as QwenHybridLayerPolicy},
     },
-    backend::mlx::nn::rope::FloatOrString,
     backend::mlx::runtime::media::input::{self, InputPayload, Modality},
     core::attention::AttentionPolicy,
     core::residency::MemoryTier,
@@ -75,20 +75,17 @@ fn estimate_mlx_runtime_state(
     )
 }
 
-fn config_number(
-    config: &std::collections::HashMap<String, FloatOrString>,
-    key: &str,
-) -> Option<f32> {
+fn config_number(config: &std::collections::HashMap<String, RopeValue>, key: &str) -> Option<f32> {
     match config.get(key) {
-        Some(FloatOrString::Float(value)) => Some(*value),
-        Some(FloatOrString::String(value)) => value.parse().ok(),
-        Some(FloatOrString::Bool(_)) | None => None,
+        Some(RopeValue::Float(value)) => Some(*value),
+        Some(RopeValue::String(value)) => value.parse().ok(),
+        Some(RopeValue::Bool(_)) | None => None,
     }
 }
 
 fn context_from_rope(
     effective: i32,
-    rope: Option<&std::collections::HashMap<String, FloatOrString>>,
+    rope: Option<&std::collections::HashMap<String, RopeValue>>,
 ) -> Result<(Observed<u64>, Observed<u64>), CapabilityError> {
     let effective = positive(effective, "max_position_embeddings")?;
     let original =
@@ -239,7 +236,7 @@ type Spec = (
     StateLayout,
 );
 
-fn llama_spec(args: &llama::ModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
+fn llama_spec(args: &LlamaModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
     let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
     let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
     let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
@@ -321,7 +318,7 @@ fn dense_qwen_spec(
     multimodal: bool,
 ) -> Result<Spec, CapabilityError> {
     let mut spec = llama_spec(
-        &llama::ModelArgs {
+        &LlamaModelArgs {
             model_type: args.model_type.clone(),
             hidden_size: args.hidden_size,
             num_hidden_layers: args.num_hidden_layers,
@@ -2488,7 +2485,6 @@ pub fn available_memory() -> Result<AvailableMemory, CapabilityError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::mlx::architectures::llama::model as llama;
     use safemlx::{Device, DeviceType};
     use serde_json::json;
 
@@ -2716,8 +2712,8 @@ mod tests {
         assert_eq!(estimate.growing[0].scalars_per_position, 16);
     }
 
-    fn tiny_llama(kv_heads: i32, sliding_window: Option<i32>) -> llama::ModelArgs {
-        llama::ModelArgs {
+    fn tiny_llama(kv_heads: i32, sliding_window: Option<i32>) -> LlamaModelArgs {
+        LlamaModelArgs {
             model_type: "mistral".into(),
             hidden_size: 32,
             num_hidden_layers: 2,
@@ -3392,17 +3388,16 @@ mod tests {
 
     #[test]
     fn context_scaling_distinguishes_native_and_effective_limits() {
-        let linear =
-            std::collections::HashMap::from([("factor".into(), FloatOrString::Float(4.0))]);
+        let linear = std::collections::HashMap::from([("factor".into(), RopeValue::Float(4.0))]);
         let (native, effective) = context_from_rope(2_048, Some(&linear)).unwrap();
         assert_eq!(native.value(), Some(&2_048));
         assert_eq!(effective.value(), Some(&8_192));
 
         let yarn = std::collections::HashMap::from([
-            ("factor".into(), FloatOrString::Float(40.0)),
+            ("factor".into(), RopeValue::Float(40.0)),
             (
                 "original_max_position_embeddings".into(),
-                FloatOrString::Float(4_096.0),
+                RopeValue::Float(4_096.0),
             ),
         ]);
         let (native, effective) = context_from_rope(163_840, Some(&yarn)).unwrap();

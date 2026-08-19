@@ -1,5 +1,7 @@
 //! Text-decoder bounded layer execution for Thinking Machines Lab Inkling.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{
     collections::{BTreeMap, HashMap},
     ops::Range,
@@ -52,8 +54,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     backend::mlx::runtime::checkpoint::{
-        quantization::{should_quantize_on_load, WeightQuantization},
-        recipe::DerivedWeightRecipe,
+        quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,

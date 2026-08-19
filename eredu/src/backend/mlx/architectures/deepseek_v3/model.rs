@@ -5,6 +5,9 @@
 //! attention, while decode keeps only normalized latent KV and the rotary key
 //! component in the cache.
 
+use eredu_checkpoint::WeightQuantization;
+use eredu_nn::RopeValue;
+
 use std::{collections::HashMap, path::Path};
 
 use safemlx::{
@@ -50,7 +53,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::tensor::{
         create_causal_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
+        rope::{initialize_rope, RopeVariant},
     },
     backend::mlx::runtime::cache::residency::{
         open_prompt_cache, CacheBlockArrays, CacheResidencyManager, CacheResidencyPolicy,
@@ -60,7 +63,6 @@ use crate::{
         BlockwiseAttentionAccumulator, CompressedLatentCache, KeyValueAttentionBlock,
     },
     backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
     core::attention::LayerSchedule,
     core::cache::CacheRankIdentity,
@@ -170,20 +172,20 @@ fn default_float_one() -> f32 {
 }
 
 impl YarnConfig {
-    fn rope_config(&self) -> HashMap<String, FloatOrString> {
+    fn rope_config(&self) -> HashMap<String, RopeValue> {
         HashMap::from([
-            ("type".into(), FloatOrString::String(self.r#type.clone())),
-            ("factor".into(), FloatOrString::Float(self.factor)),
+            ("type".into(), RopeValue::String(self.r#type.clone())),
+            ("factor".into(), RopeValue::Float(self.factor)),
             (
                 "original_max_position_embeddings".into(),
-                FloatOrString::Float(self.original_max_position_embeddings as f32),
+                RopeValue::Float(self.original_max_position_embeddings as f32),
             ),
-            ("beta_fast".into(), FloatOrString::Float(self.beta_fast)),
-            ("beta_slow".into(), FloatOrString::Float(self.beta_slow)),
-            ("mscale".into(), FloatOrString::Float(self.mscale)),
+            ("beta_fast".into(), RopeValue::Float(self.beta_fast)),
+            ("beta_slow".into(), RopeValue::Float(self.beta_slow)),
+            ("mscale".into(), RopeValue::Float(self.mscale)),
             (
                 "mscale_all_dim".into(),
-                FloatOrString::Float(self.mscale_all_dim),
+                RopeValue::Float(self.mscale_all_dim),
             ),
         ])
     }

@@ -1,5 +1,7 @@
 //! Bounded layer execution for Moshi and PersonaPlex realtime token models.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{collections::BTreeMap, path::Path};
 
 use safemlx::{
@@ -23,8 +25,7 @@ use crate::{
     },
     backend::mlx::runtime::checkpoint::store::{TensorSelection, WeightStore},
     backend::mlx::runtime::checkpoint::{
-        quantization::{should_quantize_on_load, WeightQuantization},
-        recipe::DerivedWeightRecipe,
+        quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,

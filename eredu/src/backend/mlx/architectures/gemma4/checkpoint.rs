@@ -1,5 +1,7 @@
 //! Architecture-owned checkpoint contracts for Gemma 4 text and media weights.
 
+use eredu_checkpoint::{StoredDtype, WeightQuantization};
+
 use std::collections::HashMap;
 
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
@@ -12,14 +14,13 @@ use super::{
 };
 use crate::backend::mlx::runtime::checkpoint::{
     contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-    quantization::WeightQuantization,
-    schema::{
-        AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
-        GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-        StoredDtypeConstraint, TensorOperation,
-    },
-    store::{SafetensorsWeightStore, StoredDtype},
+    store::SafetensorsWeightStore,
     validation,
+};
+use eredu_checkpoint::schema::{
+    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+    GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+    StoredDtypeConstraint, TensorOperation,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]

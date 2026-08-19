@@ -1,9 +1,12 @@
 //! Architecture-owned checkpoint contracts for Muse Glimmer.
+
 //!
 //! Muse Glimmer owns its multimodal SafeTensors catalog, text-only GGUF
 //! catalog, sibling vision-projector GGUF catalog, source aliases, geometry,
 //! and affine companion constraints here. Generic checkpoint code evaluates
 //! those physical declarations without knowing about text or vision models.
+
+use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -16,14 +19,12 @@ use serde_json::Value;
 use super::{vision::VisionConfig, DecoderConfig};
 use crate::backend::mlx::runtime::checkpoint::{
     contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-    quantization::WeightQuantization,
-    schema::{
-        CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
-        SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
-        TensorOperation,
-    },
-    store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+    store::{SafetensorsWeightStore, WeightStore},
     validation,
+};
+use eredu_checkpoint::schema::{
+    CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
+    SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
 };
 
 pub(crate) fn validate_safetensors(

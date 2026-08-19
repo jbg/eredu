@@ -1,5 +1,7 @@
 //! Shared DeepSeek-V4 decoder layers.
 
+use eredu_checkpoint::WeightQuantization;
+
 use safemlx::{
     error::Exception, macros::ModuleParameters, module::Param, nn, ops::indexing::take, Array,
     Dtype, Stream,
@@ -13,7 +15,6 @@ use crate::{
         layers::silu,
         moe::{PackedSwiGluExperts, TopKRouter, TopKRouterConfig, TopKRouterScoreFunction},
     },
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
 };
 
 use super::model::ModelArgs;

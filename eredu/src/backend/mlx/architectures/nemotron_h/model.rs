@@ -1,5 +1,7 @@
 //! Nemotron-H configuration parsing, runtime blocks, and strict checkpoint loading.
 
+use eredu_checkpoint::{AffineQuantization, WeightQuantization};
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     num::NonZeroU32,
@@ -51,7 +53,6 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
     backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
-    backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     backend::mlx::runtime::media::input,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{

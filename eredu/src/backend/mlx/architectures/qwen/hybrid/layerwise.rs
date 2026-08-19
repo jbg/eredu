@@ -1,5 +1,7 @@
 //! Shared bounded layer execution for Qwen3-Next and Qwen3.5 text models.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
@@ -57,7 +59,7 @@ use crate::{
     },
     backend::mlx::runtime::checkpoint::{
         binding_plan::{BindingPlan, PlannedBinding},
-        quantization::{should_quantize_on_load, WeightQuantization},
+        quantization::should_quantize_on_load,
         recipe::DerivedWeightRecipe,
     },
     backend::mlx::runtime::distributed::parallel::{
@@ -3382,9 +3384,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
             .map(Into::into)
     }
 
-    fn quantization(
-        &self,
-    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
         self.args.quantization
     }
 

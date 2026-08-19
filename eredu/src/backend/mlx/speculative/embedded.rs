@@ -1,5 +1,7 @@
 //! MLX executor adapter for checkpoint-embedded prediction heads.
 
+use eredu_checkpoint::WeightQuantization;
+
 use eredu_core::{SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission};
 use safemlx::{
     distributed::{self, Group},
@@ -106,9 +108,8 @@ impl<S: SpeculativeSampler> SpeculativeSampler for DistributedEmbeddedMtpSampler
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::parallel::VocabParallelLmHead,
-    backend::mlx::runtime::{
-        checkpoint::quantization::WeightQuantization,
-        distributed::parallel::{ParallelBuildContext, ParallelExecutionContext},
+    backend::mlx::runtime::distributed::parallel::{
+        ParallelBuildContext, ParallelExecutionContext,
     },
 };
 

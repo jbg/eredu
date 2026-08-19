@@ -1,5 +1,8 @@
 //! Liquid AI LFM2/LFM2.5 dense and mixture-of-experts text models.
 
+use eredu_checkpoint::WeightQuantization;
+use eredu_nn::RopeValue;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
@@ -40,7 +43,7 @@ use crate::{
         parallel::forward_row_parallel,
         tensor::{
             create_attention_mask,
-            rope::{initialize_rope, FloatOrString, RopeVariant},
+            rope::{initialize_rope, RopeVariant},
             AttentionMask,
         },
     },
@@ -53,7 +56,6 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
     },
     backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::runtime::media::input,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
@@ -219,7 +221,7 @@ struct ModelArgsSource {
     #[serde(default)]
     rope_theta: Option<f32>,
     #[serde(default)]
-    rope_parameters: Option<HashMap<String, FloatOrString>>,
+    rope_parameters: Option<HashMap<String, RopeValue>>,
     #[serde(default)]
     moe_intermediate_size: i32,
     #[serde(default)]
@@ -339,7 +341,7 @@ impl ModelArgsSource {
                     }
                 }
                 if let Some(rope_type) = parameters.get("rope_type") {
-                    let FloatOrString::String(rope_type) = rope_type else {
+                    let RopeValue::String(rope_type) = rope_type else {
                         return Err(Error::UnsupportedArchitecture(
                             "LFM2 rope_parameters.rope_type must be \"default\"".into(),
                         ));
@@ -351,15 +353,13 @@ impl ModelArgsSource {
                     }
                 }
                 let nested = match parameters.get("rope_theta") {
-                    Some(FloatOrString::Float(value)) => Some(*value),
-                    Some(FloatOrString::String(value)) => {
-                        Some(value.parse::<f32>().map_err(|_| {
-                            Error::UnsupportedArchitecture(format!(
-                                "LFM2 rope_parameters.rope_theta {value:?} is not a float"
-                            ))
-                        })?)
-                    }
-                    Some(FloatOrString::Bool(_)) => {
+                    Some(RopeValue::Float(value)) => Some(*value),
+                    Some(RopeValue::String(value)) => Some(value.parse::<f32>().map_err(|_| {
+                        Error::UnsupportedArchitecture(format!(
+                            "LFM2 rope_parameters.rope_theta {value:?} is not a float"
+                        ))
+                    })?),
+                    Some(RopeValue::Bool(_)) => {
                         return Err(Error::UnsupportedArchitecture(
                             "LFM2 rope_parameters.rope_theta must be a float".into(),
                         ));

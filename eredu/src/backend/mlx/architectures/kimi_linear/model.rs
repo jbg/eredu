@@ -1,5 +1,7 @@
 //! Kimi Linear hybrid KDA/MLA causal language model.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
@@ -54,10 +56,7 @@ use crate::{
             },
             CompressedLatentCache,
         },
-        checkpoint::{
-            load::{gguf_quantization_configs, GgufTensorNames},
-            quantization::WeightQuantization,
-        },
+        checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
         execution::inspection::{ActivationObserver, MoeRoutingObservation},
         media::input as runtime_input,
     },

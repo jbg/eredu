@@ -41,7 +41,7 @@ pub enum Error {
 
     /// Invalid unified Llama model configuration or cache usage.
     #[error(transparent)]
-    LlamaModel(#[from] crate::backend::mlx::architectures::llama::layerwise::LlamaModelError),
+    LlamaModel(#[from] crate::integrations::llama_mlx::layerwise::LlamaModelError),
 
     /// Invalid or failed layerwise model execution.
     #[error(transparent)]
@@ -143,6 +143,12 @@ pub enum Error {
     /// Boxed error used for third-party loader failures.
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl From<eredu_checkpoint::Error> for Error {
+    fn from(error: eredu_checkpoint::Error) -> Self {
+        Self::Quantization(error.to_string())
+    }
 }
 
 impl From<eredu_core::TopologyError> for Error {

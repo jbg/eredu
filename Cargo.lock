@@ -847,6 +847,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "eredu-architectures",
+ "eredu-checkpoint",
  "eredu-core",
  "eredu-gguf",
  "eredu-nn",
@@ -876,8 +877,22 @@ dependencies = [
 name = "eredu-architectures"
 version = "0.1.0"
 dependencies = [
+ "eredu-checkpoint",
  "eredu-core",
+ "eredu-gguf",
  "eredu-nn",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eredu-checkpoint"
+version = "0.1.0"
+dependencies = [
+ "eredu-gguf",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -943,7 +958,9 @@ dependencies = [
 name = "eredu-nn"
 version = "0.1.0"
 dependencies = [
+ "eredu-checkpoint",
  "safemlx",
+ "serde",
  "smallvec",
  "thiserror",
 ]

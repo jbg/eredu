@@ -1,4 +1,5 @@
 //! Reusable expert-parallel assignment, routing, and exchange infrastructure.
+
 //!
 //! Pure expert parallelism keeps ordinary model state replicated and partitions
 //! only routed expert banks. [`crate::backend::mlx::runtime::distributed::expert::dispatch_replicated`]
@@ -6,6 +7,8 @@
 //! token layout: ranks compact only routes owned by their experts and all-sum
 //! the resulting token buffer. Sharded-token dispatch uses compact native or
 //! topology-routed variable-count all-to-all payload exchange.
+
+use eredu_checkpoint::WeightQuantization;
 
 use std::{
     path::{Path, PathBuf},
@@ -49,9 +52,7 @@ use crate::{
     },
     backend::mlx::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
     backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
-    backend::mlx::runtime::checkpoint::quantization::{
-        should_quantize_on_load, WeightQuantization,
-    },
+    backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load,
     backend::mlx::runtime::checkpoint::store::{
         GgufWeightStore, SafetensorsWeightStore, WeightStore,
     },

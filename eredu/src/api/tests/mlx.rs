@@ -1,18 +1,20 @@
+use eredu_checkpoint::AffineQuantization;
+
+use eredu_checkpoint::WeightQuantization;
+
 use super::*;
 
 use crate::api::{LoadedModel, PreparedChatInput, PreparedChatMtpBatchRequest, SpeculativeDraft};
 use crate::backend::mlx::architectures::gemma4::model as gemma4;
+use crate::integrations::llama_mlx::model as llama;
 use crate::{
     backend::mlx::architectures::{
         gpt_oss::model as gpt_oss,
-        llama::model as llama,
         qwen::dense as dense_qwen,
         qwen::{hybrid::qwen3_5, vl::model as qwen3_vl},
     },
     backend::mlx::error::Error,
-    backend::mlx::runtime::checkpoint::quantization::{
-        AffineQuantization, CheckpointQuantizationOptions, WeightQuantization,
-    },
+    backend::mlx::runtime::checkpoint::quantization::CheckpointQuantizationOptions,
     backend::mlx::runtime::execution::inspection::ActivationRecorder,
     backend::mlx::runtime::generation::sampler::{ConstrainedSampler, DefaultSampler},
     backend::mlx::runtime::media::input,

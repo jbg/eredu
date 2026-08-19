@@ -1,28 +1,30 @@
 //! Declarative physical checkpoint schemas.
 
+#![allow(missing_docs)]
+
 use std::collections::BTreeSet;
 
-use safemlx::ops::GgufType;
+use eredu_gguf::GgmlType as GgufType;
 
-use super::store::StoredDtype;
+use crate::StoredDtype;
 
 /// Whether a physical tensor must be present in the selected layout.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) enum TensorRequirement {
+pub enum TensorRequirement {
     Required,
     Optional,
 }
 
 /// How failures for a constraint are classified.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) enum TensorRole {
+pub enum TensorRole {
     Tensor,
     Companion,
 }
 
 /// Declarative SafeTensors storage constraint.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum StoredDtypeConstraint {
+pub enum StoredDtypeConstraint {
     Exact(StoredDtype),
     OneOf(Vec<StoredDtype>),
     /// Repository-supported floating storage: F16, BF16, or F32.
@@ -30,7 +32,7 @@ pub(crate) enum StoredDtypeConstraint {
 }
 
 impl StoredDtypeConstraint {
-    pub(crate) fn accepts(&self, actual: &StoredDtype) -> bool {
+    pub fn accepts(&self, actual: &StoredDtype) -> bool {
         match self {
             Self::Exact(expected) => expected == actual,
             Self::OneOf(expected) => expected.contains(actual),
@@ -51,23 +53,23 @@ impl StoredDtypeConstraint {
 
 /// One physical SafeTensors tensor.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct SafetensorsTensorConstraint {
-    pub(crate) key: String,
+pub struct SafetensorsTensorConstraint {
+    pub key: String,
     /// Alternative physical names for the same logical tensor.
-    pub(crate) aliases: Vec<String>,
-    pub(crate) shape: Vec<usize>,
+    pub aliases: Vec<String>,
+    pub shape: Vec<usize>,
     /// Additional accepted physical shapes with equivalent runtime semantics.
-    pub(crate) alternate_shapes: Vec<Vec<usize>>,
+    pub alternate_shapes: Vec<Vec<usize>>,
     /// Accept any physical shape with this many elements. `shape` remains the
     /// canonical shape used by loading recipes.
-    pub(crate) element_count: Option<usize>,
-    pub(crate) dtype: StoredDtypeConstraint,
-    pub(crate) requirement: TensorRequirement,
-    pub(crate) role: TensorRole,
+    pub element_count: Option<usize>,
+    pub dtype: StoredDtypeConstraint,
+    pub requirement: TensorRequirement,
+    pub role: TensorRole,
 }
 
 impl SafetensorsTensorConstraint {
-    pub(crate) fn required(
+    pub fn required(
         key: impl Into<String>,
         shape: impl Into<Vec<usize>>,
         dtype: StoredDtypeConstraint,
@@ -84,25 +86,22 @@ impl SafetensorsTensorConstraint {
         }
     }
 
-    pub(crate) fn optional(mut self) -> Self {
+    pub fn optional(mut self) -> Self {
         self.requirement = TensorRequirement::Optional;
         self
     }
 
-    pub(crate) fn with_aliases(
-        mut self,
-        aliases: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
+    pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.aliases = aliases.into_iter().map(Into::into).collect();
         self
     }
 
-    pub(crate) fn with_element_count(mut self, element_count: usize) -> Self {
+    pub fn with_element_count(mut self, element_count: usize) -> Self {
         self.element_count = Some(element_count);
         self
     }
 
-    pub(crate) fn with_alternate_shapes(
+    pub fn with_alternate_shapes(
         mut self,
         shapes: impl IntoIterator<Item = impl Into<Vec<usize>>>,
     ) -> Self {
@@ -110,7 +109,7 @@ impl SafetensorsTensorConstraint {
         self
     }
 
-    pub(crate) fn companion(mut self) -> Self {
+    pub fn companion(mut self) -> Self {
         self.role = TensorRole::Companion;
         self
     }
@@ -118,7 +117,7 @@ impl SafetensorsTensorConstraint {
 
 /// Generic GGUF operation classes supported by runtime kernels.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub(crate) enum TensorOperation {
+pub enum TensorOperation {
     Matrix,
     Vector,
     Dense,
@@ -128,12 +127,12 @@ pub(crate) enum TensorOperation {
 
 /// Declarative GGUF physical encoding constraint.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum GgufTypeConstraint {
+pub enum GgufTypeConstraint {
     OperationClass(TensorOperation),
 }
 
 impl GgufTypeConstraint {
-    pub(crate) fn accepts(&self, actual: GgufType) -> bool {
+    pub fn accepts(&self, actual: GgufType) -> bool {
         match self {
             Self::OperationClass(operation) => gguf_encoding_supported(*operation, actual),
         }
@@ -143,7 +142,7 @@ impl GgufTypeConstraint {
 }
 
 /// Generic mapping from a numerical operation to accepted GGUF encodings.
-pub(crate) fn gguf_encoding_supported(operation: TensorOperation, encoding: GgufType) -> bool {
+pub fn gguf_encoding_supported(operation: TensorOperation, encoding: GgufType) -> bool {
     match operation {
         TensorOperation::Vector | TensorOperation::Dense => {
             matches!(encoding, GgufType::F32 | GgufType::F16 | GgufType::Bf16)
@@ -167,24 +166,24 @@ pub(crate) fn gguf_encoding_supported(operation: TensorOperation, encoding: Gguf
 
 /// One physical GGUF tensor.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct GgufTensorConstraint {
-    pub(crate) key: String,
+pub struct GgufTensorConstraint {
+    pub key: String,
     /// Alternative physical names for the same logical tensor.
-    pub(crate) aliases: Vec<String>,
-    pub(crate) shape: Vec<usize>,
+    pub aliases: Vec<String>,
+    pub shape: Vec<usize>,
     /// Additional accepted physical shapes for encodings with equivalent
     /// runtime semantics (for example, flattened and singleton-axis kernels).
-    pub(crate) alternate_shapes: Vec<Vec<usize>>,
+    pub alternate_shapes: Vec<Vec<usize>>,
     /// Accept any physical shape with this many elements. `shape` remains the
     /// canonical shape used by loading recipes.
-    pub(crate) element_count: Option<usize>,
-    pub(crate) encoding: GgufTypeConstraint,
-    pub(crate) requirement: TensorRequirement,
-    pub(crate) role: TensorRole,
+    pub element_count: Option<usize>,
+    pub encoding: GgufTypeConstraint,
+    pub requirement: TensorRequirement,
+    pub role: TensorRole,
 }
 
 impl GgufTensorConstraint {
-    pub(crate) fn required(
+    pub fn required(
         key: impl Into<String>,
         shape: impl Into<Vec<usize>>,
         encoding: GgufTypeConstraint,
@@ -201,15 +200,12 @@ impl GgufTensorConstraint {
         }
     }
 
-    pub(crate) fn with_aliases(
-        mut self,
-        aliases: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
+    pub fn with_aliases(mut self, aliases: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.aliases = aliases.into_iter().map(Into::into).collect();
         self
     }
 
-    pub(crate) fn with_alternate_shapes(
+    pub fn with_alternate_shapes(
         mut self,
         shapes: impl IntoIterator<Item = impl Into<Vec<usize>>>,
     ) -> Self {
@@ -217,7 +213,7 @@ impl GgufTensorConstraint {
         self
     }
 
-    pub(crate) fn with_element_count(mut self, element_count: usize) -> Self {
+    pub fn with_element_count(mut self, element_count: usize) -> Self {
         self.element_count = Some(element_count);
         self
     }
@@ -225,30 +221,30 @@ impl GgufTensorConstraint {
 
 /// One mutually exclusive physical layout.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct LayoutVariant<T> {
-    pub(crate) id: String,
-    pub(crate) tensors: Vec<T>,
-    pub(crate) discriminator_keys: Vec<String>,
+pub struct LayoutVariant<T> {
+    pub id: String,
+    pub tensors: Vec<T>,
+    pub discriminator_keys: Vec<String>,
 }
 
 /// A required or optional group of mutually exclusive layouts.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct AlternativeLayoutGroup<T> {
-    pub(crate) id: String,
-    pub(crate) required: bool,
-    pub(crate) variants: Vec<LayoutVariant<T>>,
+pub struct AlternativeLayoutGroup<T> {
+    pub id: String,
+    pub required: bool,
+    pub variants: Vec<LayoutVariant<T>>,
 }
 
 /// Exact-catalog policy applied after selecting layouts.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct CatalogPolicy {
-    pub(crate) strict: bool,
-    pub(crate) explicitly_allowed_keys: BTreeSet<String>,
-    pub(crate) allowed_prefixes: Vec<String>,
+pub struct CatalogPolicy {
+    pub strict: bool,
+    pub explicitly_allowed_keys: BTreeSet<String>,
+    pub allowed_prefixes: Vec<String>,
 }
 
 impl CatalogPolicy {
-    pub(crate) fn strict() -> Self {
+    pub fn strict() -> Self {
         Self {
             strict: true,
             explicitly_allowed_keys: BTreeSet::new(),
@@ -256,7 +252,7 @@ impl CatalogPolicy {
         }
     }
 
-    pub(crate) fn non_strict() -> Self {
+    pub fn non_strict() -> Self {
         Self {
             strict: false,
             ..Self::strict()
@@ -271,7 +267,7 @@ impl CatalogPolicy {
 
 /// Invalid or ambiguous declarative plan.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum CheckpointPlanError {
+pub enum CheckpointPlanError {
     #[error("checkpoint plan identity must not be empty")]
     EmptyIdentity,
     #[error("checkpoint plan contains an empty {kind} id")]
@@ -565,15 +561,15 @@ fn normalize_plan<T: PhysicalConstraint>(
 macro_rules! checkpoint_plan {
     ($name:ident, $constraint:ty) => {
         #[derive(Debug, Clone, Eq, PartialEq)]
-        pub(crate) struct $name {
-            pub(crate) identity: String,
-            pub(crate) common_tensors: Vec<$constraint>,
-            pub(crate) layout_groups: Vec<AlternativeLayoutGroup<$constraint>>,
-            pub(crate) catalog_policy: CatalogPolicy,
+        pub struct $name {
+            pub identity: String,
+            pub common_tensors: Vec<$constraint>,
+            pub layout_groups: Vec<AlternativeLayoutGroup<$constraint>>,
+            pub catalog_policy: CatalogPolicy,
         }
 
         impl $name {
-            pub(crate) fn new(
+            pub fn new(
                 identity: impl Into<String>,
                 mut common_tensors: Vec<$constraint>,
                 mut layout_groups: Vec<AlternativeLayoutGroup<$constraint>>,

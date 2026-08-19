@@ -19,7 +19,6 @@ use crate::backend::mlx::{
         inkling::{checkpoint as inkling_checkpoint, model as inkling},
         kimi_linear::checkpoint as kimi_linear_checkpoint,
         lfm2::checkpoint as lfm2_checkpoint,
-        llama::checkpoint as llama_checkpoint,
         moshi::personaplex_checkpoint,
         muse_glimmer::checkpoint as muse_glimmer_checkpoint,
         nemotron_h::checkpoint as nemotron_h_checkpoint,
@@ -31,6 +30,7 @@ use crate::backend::mlx::{
     error::Error,
     runtime::checkpoint::store::SafetensorsWeightStore,
 };
+use crate::integrations::llama_mlx::checkpoint as llama_checkpoint;
 
 pub(crate) use crate::backend::mlx::runtime::checkpoint::contract::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,

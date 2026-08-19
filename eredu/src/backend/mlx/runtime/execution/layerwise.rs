@@ -5,6 +5,8 @@
 //! windows, and synchronization. Model-family behavior is supplied by an
 //! [`crate::backend::mlx::runtime::execution::layerwise::ArchitectureAdapter`].
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Range,
@@ -30,7 +32,6 @@ use crate::{
         BoundedQuantizationPlan, BoundedQuantizationReport, BoundedQuantizationTarget,
         BoundedQuantizedWeightStore,
     },
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::runtime::checkpoint::recipe::RecipeDtype,
     backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
     backend::mlx::runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
@@ -57,15 +58,11 @@ pub type SharedWeightStore = Arc<dyn WeightStore + Send + Sync>;
 /// Opaque architecture-owned SafeTensors contract consumed by the generic
 /// execution engine before it asks an adapter for any runtime binding.
 pub struct ArchitectureCheckpointPlan {
-    plan: crate::backend::mlx::runtime::checkpoint::schema::SafetensorsCheckpointPlan,
+    plan: eredu_checkpoint::schema::SafetensorsCheckpointPlan,
 }
 
-impl From<crate::backend::mlx::runtime::checkpoint::schema::SafetensorsCheckpointPlan>
-    for ArchitectureCheckpointPlan
-{
-    fn from(
-        plan: crate::backend::mlx::runtime::checkpoint::schema::SafetensorsCheckpointPlan,
-    ) -> Self {
+impl From<eredu_checkpoint::schema::SafetensorsCheckpointPlan> for ArchitectureCheckpointPlan {
+    fn from(plan: eredu_checkpoint::schema::SafetensorsCheckpointPlan) -> Self {
         Self { plan }
     }
 }
@@ -1503,8 +1500,7 @@ impl Drop for DenseStreamGroupGuard {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LayerwiseModelMetadata {
     model_type: String,
-    quantization:
-        Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization>,
+    quantization: Option<eredu_checkpoint::WeightQuantization>,
     layer_count: usize,
     static_device_bytes: u64,
     residency: ExecutionResidency,
@@ -1570,9 +1566,7 @@ impl LayerwiseModelMetadata {
         &self.model_type
     }
     /// Returns checkpoint-native packed quantization metadata, if present.
-    pub const fn quantization(
-        &self,
-    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
+    pub const fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
         self.quantization
     }
     /// Returns the decoder layer count.
@@ -1983,9 +1977,7 @@ pub trait ArchitectureAdapter: Sized {
     fn safetensors_checkpoint_plan(&self) -> Result<ArchitectureCheckpointPlan, Error>;
 
     /// Model-wide checkpoint quantization, when one uniform encoding exists.
-    fn quantization(
-        &self,
-    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
         None
     }
 

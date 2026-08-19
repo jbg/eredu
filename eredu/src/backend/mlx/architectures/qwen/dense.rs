@@ -7,6 +7,9 @@ pub(crate) mod checkpoint;
 #[path = "dense/layerwise.rs"]
 pub mod layerwise;
 
+use eredu_checkpoint::WeightQuantization;
+use eredu_nn::RopeValue;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
@@ -35,7 +38,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::tensor::{
         create_causal_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
+        rope::{initialize_rope, RopeVariant},
     },
     backend::mlx::nn::{
         self as common,
@@ -57,7 +60,6 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
     backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
     backend::mlx::runtime::media::input,
     core::attention::{AttentionPolicy, LayerSchedule},
@@ -120,7 +122,7 @@ pub struct DecoderConfig {
     /// Whether logits use tied input embeddings.
     pub tie_word_embeddings: bool,
     /// Optional RoPE scaling configuration.
-    pub rope_scaling: Option<HashMap<String, FloatOrString>>,
+    pub rope_scaling: Option<HashMap<String, RopeValue>>,
     /// Attention activation. Dense Qwen text checkpoints use SiLU.
     pub hidden_act: String,
     /// Inference checkpoints must not request attention dropout.
@@ -171,7 +173,7 @@ struct DecoderConfigSource {
     #[serde(default)]
     head_dim: i32,
     tie_word_embeddings: bool,
-    rope_scaling: Option<HashMap<String, FloatOrString>>,
+    rope_scaling: Option<HashMap<String, RopeValue>>,
     #[serde(default = "default_hidden_act")]
     hidden_act: String,
     #[serde(default)]
@@ -296,9 +298,9 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &DecoderConfig) -> Str
                 .iter()
                 .map(|(key, value)| {
                     let value = match value {
-                        FloatOrString::Float(value) => format!("f32:{:08x}", value.to_bits()),
-                        FloatOrString::String(value) => format!("string:{value}"),
-                        FloatOrString::Bool(value) => format!("bool:{value}"),
+                        RopeValue::Float(value) => format!("f32:{:08x}", value.to_bits()),
+                        RopeValue::String(value) => format!("string:{value}"),
+                        RopeValue::Bool(value) => format!("bool:{value}"),
                     };
                     format!("{key}={value}")
                 })
@@ -2812,7 +2814,7 @@ fn validate_rope_scaling(args: &DecoderConfig) -> Result<(), Error> {
         .get("rope_type")
         .or_else(|| config.get("type"))
         .and_then(|value| match value {
-            FloatOrString::String(value) => Some(value.as_str()),
+            RopeValue::String(value) => Some(value.as_str()),
             _ => None,
         })
         .ok_or_else(|| {
@@ -2847,8 +2849,8 @@ fn validate_rope_scaling(args: &DecoderConfig) -> Result<(), Error> {
     }
     let numeric = |key: &str| {
         config.get(key).and_then(|value| match value {
-            FloatOrString::Float(value) if value.is_finite() => Some(*value),
-            FloatOrString::String(value) => value.parse::<f32>().ok().filter(|v| v.is_finite()),
+            RopeValue::Float(value) if value.is_finite() => Some(*value),
+            RopeValue::String(value) => value.parse::<f32>().ok().filter(|v| v.is_finite()),
             _ => None,
         })
     };
@@ -3129,7 +3131,7 @@ fn qwen2_gguf_sliding_config(
 fn gguf_rope_scaling(
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
-) -> Result<Option<HashMap<String, FloatOrString>>, Error> {
+) -> Result<Option<HashMap<String, RopeValue>>, Error> {
     let scaling_type_key = format!("{architecture}.rope.scaling.type");
     let Some(scaling_type) = gguf_optional_string(metadata, &scaling_type_key)? else {
         return Ok(None);
@@ -3146,9 +3148,9 @@ fn gguf_rope_scaling(
             Ok(Some(HashMap::from([
                 (
                     "rope_type".to_string(),
-                    FloatOrString::String("linear".to_string()),
+                    RopeValue::String("linear".to_string()),
                 ),
-                ("factor".to_string(), FloatOrString::Float(factor)),
+                ("factor".to_string(), RopeValue::Float(factor)),
             ])))
         }
         "yarn" => {
@@ -3180,16 +3182,16 @@ fn gguf_rope_scaling(
             Ok(Some(HashMap::from([
                 (
                     "rope_type".to_string(),
-                    FloatOrString::String("yarn".to_string()),
+                    RopeValue::String("yarn".to_string()),
                 ),
-                ("factor".to_string(), FloatOrString::Float(factor)),
+                ("factor".to_string(), RopeValue::Float(factor)),
                 (
                     "original_max_position_embeddings".to_string(),
-                    FloatOrString::Float(original),
+                    RopeValue::Float(original),
                 ),
-                ("beta_fast".to_string(), FloatOrString::Float(beta_fast)),
-                ("beta_slow".to_string(), FloatOrString::Float(beta_slow)),
-                ("truncate".to_string(), FloatOrString::Bool(false)),
+                ("beta_fast".to_string(), RopeValue::Float(beta_fast)),
+                ("beta_slow".to_string(), RopeValue::Float(beta_slow)),
+                ("truncate".to_string(), RopeValue::Bool(false)),
             ])))
         }
         other => Err(Error::UnsupportedArchitecture(format!(

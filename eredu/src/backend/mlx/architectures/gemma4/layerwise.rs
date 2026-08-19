@@ -1,5 +1,7 @@
 //! Text-decoder bounded layer execution for Gemma 4 checkpoints.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::Range,
@@ -51,7 +53,7 @@ use crate::{
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::{
-        quantization::{should_quantize_on_load, WeightQuantization},
+        quantization::should_quantize_on_load,
         recipe::DerivedWeightRecipe,
         store::{GgufWeightStore, TensorSelection, WeightStore},
     },
@@ -2543,9 +2545,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         .map(Into::into)
     }
 
-    fn quantization(
-        &self,
-    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
         self.args.weight_quantization()
     }
 

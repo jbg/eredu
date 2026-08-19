@@ -1,5 +1,7 @@
 //! Lossless external DFlash assistant released with Muse-Glimmer-30B.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{collections::HashMap, path::Path};
 
 use safemlx::{
@@ -26,13 +28,10 @@ use crate::{
         linear::unloaded_maybe_quantized_linear,
         tensor::{rope::initialize_rope, scaled_dot_product_attention},
     },
-    backend::mlx::runtime::checkpoint::{
-        load::{
-            gguf_metadata, gguf_quantization_configs, load_gguf_strict,
-            load_safetensors_quantized_strict, load_safetensors_strict, StrictLoadConfig,
-            StrictLoadReport,
-        },
-        quantization::WeightQuantization,
+    backend::mlx::runtime::checkpoint::load::{
+        gguf_metadata, gguf_quantization_configs, load_gguf_strict,
+        load_safetensors_quantized_strict, load_safetensors_strict, StrictLoadConfig,
+        StrictLoadReport,
     },
     backend::mlx::ModelLoadOptions,
 };

@@ -1,5 +1,7 @@
 //! Architecture-owned checkpoint contracts for the DeepSeek-V4 family.
 
+use eredu_checkpoint::StoredDtype;
+
 use std::collections::HashMap;
 
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
@@ -8,13 +10,12 @@ use serde_json::Value;
 use super::model::{self, ModelArgs};
 use crate::backend::mlx::runtime::checkpoint::{
     contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-    schema::{
-        CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
-        SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
-        TensorOperation,
-    },
-    store::{SafetensorsWeightStore, StoredDtype},
+    store::SafetensorsWeightStore,
     validation,
+};
+use eredu_checkpoint::schema::{
+    CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
+    SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]

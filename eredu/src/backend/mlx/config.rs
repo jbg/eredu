@@ -1,7 +1,8 @@
 //! MLX model materialization options.
 
+use eredu_checkpoint::WeightQuantization;
+
 use crate::backend::mlx::error::Error;
-use crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization;
 use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;
 
 use super::MlxParallelContext;
@@ -114,10 +115,11 @@ pub(crate) fn ensure_replicated_load_options(options: ModelLoadOptions) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use eredu_checkpoint::WeightQuantization;
+
     use super::ModelLoadOptions;
-    use crate::backend::mlx::runtime::{
-        checkpoint::quantization::WeightQuantization,
-        execution::layerwise::{LayerwiseLoadOptions, WeightResidency},
+    use crate::backend::mlx::runtime::execution::layerwise::{
+        LayerwiseLoadOptions, WeightResidency,
     };
 
     #[test]

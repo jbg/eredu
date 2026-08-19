@@ -10,7 +10,7 @@
 //! materialize as a `u8` runtime array.
 //!
 //! Aliases and packed/split/fused choices are represented as mutually
-//! exclusive [`schema::AlternativeLayoutGroup`] variants. Companion tensors
+//! exclusive `eredu_checkpoint::schema::AlternativeLayoutGroup` variants. Companion tensors
 //! are ordinary constraints supplied by the architecture; validation contains
 //! no companion naming convention. Architecture adapters feed the same
 //! physical plan to structural admission and its [`binding_plan::BindingPlan`]
@@ -34,8 +34,6 @@ pub mod load;
 pub mod quantization;
 /// Composable checkpoint-derived weight recipes.
 pub mod recipe;
-/// Declarative checkpoint constraints and layout alternatives.
-pub(crate) mod schema;
 /// Persistent lazy checkpoint tensor storage.
 pub mod store;
 /// Header-only SafeTensors and GGUF plan evaluation.

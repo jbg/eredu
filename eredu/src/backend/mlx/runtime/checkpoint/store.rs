@@ -6,6 +6,8 @@
 //! consumer stream without blocking the host, or synchronize the exact
 //! materialization before taking its independently owned output.
 
+use eredu_checkpoint::StoredDtype;
+
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet},
@@ -34,73 +36,27 @@ use safetensors::{
 };
 use serde::{de::MapAccess, Deserialize, Deserializer};
 
-/// Backend-neutral description of a checkpoint's stored scalar encoding.
-#[derive(Debug, Clone, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum StoredDtype {
-    /// Boolean values.
-    Bool,
-    /// Unsigned 8-bit integers.
-    U8,
-    /// Signed 8-bit integers.
-    I8,
-    /// Signed 16-bit integers.
-    I16,
-    /// Unsigned 16-bit integers.
-    U16,
-    /// IEEE half-precision floating point.
-    F16,
-    /// Brain floating point.
-    BF16,
-    /// Signed 32-bit integers.
-    I32,
-    /// Unsigned 32-bit integers.
-    U32,
-    /// IEEE single-precision floating point.
-    F32,
-    /// IEEE double-precision floating point.
-    F64,
-    /// Signed 64-bit integers.
-    I64,
-    /// Unsigned 64-bit integers.
-    U64,
-    /// Complex values with two 32-bit floating-point components.
-    C64,
-    /// Encoded FP8 E4M3 bytes. This is not an ordinary integer execution dtype.
-    F8E4M3,
-    /// Packed FP4 E2M1 values, two logical scalars per byte.
-    F4,
-    /// Unsigned E8M0 scale bytes used by MX formats.
-    F8E8M0,
-    /// Encoded FP8 E5M2 bytes.
-    F8E5M2,
-    /// Another safetensors encoding not represented by a named variant.
-    Other(String),
-}
-
-impl From<Dtype> for StoredDtype {
-    fn from(value: Dtype) -> Self {
-        match value {
-            Dtype::BOOL => Self::Bool,
-            Dtype::U8 => Self::U8,
-            Dtype::I8 => Self::I8,
-            Dtype::I16 => Self::I16,
-            Dtype::U16 => Self::U16,
-            Dtype::F16 => Self::F16,
-            Dtype::BF16 => Self::BF16,
-            Dtype::I32 => Self::I32,
-            Dtype::U32 => Self::U32,
-            Dtype::F32 => Self::F32,
-            Dtype::F64 => Self::F64,
-            Dtype::I64 => Self::I64,
-            Dtype::U64 => Self::U64,
-            Dtype::C64 => Self::C64,
-            Dtype::F8_E4M3 => Self::F8E4M3,
-            Dtype::F4 => Self::F4,
-            Dtype::F8_E8M0 => Self::F8E8M0,
-            Dtype::F8_E5M2 => Self::F8E5M2,
-            other => Self::Other(format!("{other:?}")),
-        }
+fn stored_dtype_from_safetensors(value: Dtype) -> StoredDtype {
+    match value {
+        Dtype::BOOL => StoredDtype::Bool,
+        Dtype::U8 => StoredDtype::U8,
+        Dtype::I8 => StoredDtype::I8,
+        Dtype::I16 => StoredDtype::I16,
+        Dtype::U16 => StoredDtype::U16,
+        Dtype::F16 => StoredDtype::F16,
+        Dtype::BF16 => StoredDtype::BF16,
+        Dtype::I32 => StoredDtype::I32,
+        Dtype::U32 => StoredDtype::U32,
+        Dtype::F32 => StoredDtype::F32,
+        Dtype::F64 => StoredDtype::F64,
+        Dtype::I64 => StoredDtype::I64,
+        Dtype::U64 => StoredDtype::U64,
+        Dtype::C64 => StoredDtype::C64,
+        Dtype::F8_E4M3 => StoredDtype::F8E4M3,
+        Dtype::F4 => StoredDtype::F4,
+        Dtype::F8_E8M0 => StoredDtype::F8E8M0,
+        Dtype::F8_E5M2 => StoredDtype::F8E5M2,
+        other => StoredDtype::Other(format!("{other:?}")),
     }
 }
 
@@ -719,7 +675,7 @@ impl GgufWeightStoreBuilder {
     pub(crate) fn add_checkpoint<F>(
         self,
         checkpoint: GgufCheckpoint,
-        plan: &crate::backend::mlx::runtime::checkpoint::schema::GgufCheckpointPlan,
+        plan: &eredu_checkpoint::schema::GgufCheckpointPlan,
         translate: F,
     ) -> Result<Self, WeightStoreError>
     where
@@ -892,7 +848,7 @@ impl GgufWeightStore {
     /// Creates a single-checkpoint store with an explicit cached-reader bound.
     pub(crate) fn new_with_max_mapped_shards<F>(
         checkpoint: GgufCheckpoint,
-        plan: &crate::backend::mlx::runtime::checkpoint::schema::GgufCheckpointPlan,
+        plan: &eredu_checkpoint::schema::GgufCheckpointPlan,
         translate: F,
         max_mapped_shards: usize,
     ) -> Result<Self, WeightStoreError>
@@ -1997,7 +1953,7 @@ impl WeightLease {
         if !is_supported_execution_dtype(info.dtype) {
             return Err(WeightStoreError::UnsupportedStoredDtype {
                 key: self.key.clone(),
-                dtype: info.dtype.into(),
+                dtype: stored_dtype_from_safetensors(info.dtype),
             });
         }
         let payload_start = shard
@@ -2119,7 +2075,7 @@ impl WeightLease {
         if !is_supported_execution_dtype(info.dtype) {
             return Err(WeightStoreError::UnsupportedStoredDtype {
                 key: self.key.clone(),
-                dtype: info.dtype.into(),
+                dtype: stored_dtype_from_safetensors(info.dtype),
             });
         }
 
@@ -2864,7 +2820,7 @@ fn metadata_for_parts(
     Ok(WeightMetadata {
         name: key.to_string(),
         shape: shape.to_vec(),
-        stored_dtype: dtype.into(),
+        stored_dtype: stored_dtype_from_safetensors(dtype),
         logical_byte_len,
         backing_shard: Some(path.to_path_buf()),
     })
@@ -3134,7 +3090,7 @@ fn select_encoded_safetensors_data(
         if !bits.is_multiple_of(8) {
             return Err(WeightStoreError::UnsupportedStoredDtype {
                 key: key.into(),
-                dtype: dtype.into(),
+                dtype: stored_dtype_from_safetensors(dtype),
             });
         }
         let scalar_bytes = bits / 8;
@@ -3729,7 +3685,7 @@ mod tests {
 
     #[test]
     fn gguf_store_catalog_contains_only_contract_selected_sources() {
-        use crate::backend::mlx::runtime::checkpoint::schema::{
+        use eredu_checkpoint::schema::{
             CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
             TensorOperation,
         };

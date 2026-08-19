@@ -4,6 +4,9 @@
 //! decoder and shared-expert MoE building blocks. This module exposes the
 //! architecture-specific loading API while reusing that implementation.
 
+#[cfg(test)]
+use eredu_checkpoint::AffineQuantization;
+
 use std::path::Path;
 
 #[cfg(test)]
@@ -14,14 +17,11 @@ use safemlx::{
 };
 use tokenizers::Tokenizer;
 
-use crate::backend::mlx::error::Error;
-#[cfg(test)]
-use crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization;
-
 pub use super::qwen3_5::{
     sample, Cache, Generate, LayerCache, LayerPolicy, LinearAttentionCache, Model, ModelArgs,
     ModelInput,
 };
+use crate::backend::mlx::error::Error;
 
 /// Reads and normalizes Qwen3-Next model arguments from `config.json`.
 pub fn get_qwen3_next_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {

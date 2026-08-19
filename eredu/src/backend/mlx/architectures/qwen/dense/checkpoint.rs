@@ -1,5 +1,7 @@
 //! Architecture-owned checkpoint contracts for dense Qwen2/Qwen3 decoders.
 
+use eredu_checkpoint::{StoredDtype, WeightQuantization};
+
 use std::collections::HashMap;
 
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
@@ -8,14 +10,13 @@ use serde_json::Value;
 use super::{config_from_gguf_catalog, config_from_hf_value, DecoderConfig};
 use crate::backend::mlx::runtime::checkpoint::{
     contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-    quantization::WeightQuantization,
-    schema::{
-        AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
-        GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-        StoredDtypeConstraint, TensorOperation,
-    },
-    store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+    store::{SafetensorsWeightStore, WeightStore},
     validation,
+};
+use eredu_checkpoint::schema::{
+    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+    GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+    StoredDtypeConstraint, TensorOperation,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

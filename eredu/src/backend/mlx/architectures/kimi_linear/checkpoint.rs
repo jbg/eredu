@@ -1,8 +1,11 @@
 //! Architecture-owned checkpoint contracts for Kimi Linear.
+
 //!
 //! Kimi Linear owns its alternating KDA/MLA geometry, expert layouts, aliases,
 //! and quantization policy. The generic runtime only evaluates these physical
 //! constraints and materializes architecture-supplied recipes.
+
+use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
 use std::collections::HashMap;
 
@@ -12,14 +15,13 @@ use serde_json::Value;
 use super::model::{self, AttentionKind, FeedForwardPolicy, ModelArgs};
 use crate::backend::mlx::runtime::checkpoint::{
     contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-    quantization::WeightQuantization,
-    schema::{
-        AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
-        GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-        StoredDtypeConstraint, TensorOperation,
-    },
-    store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+    store::{SafetensorsWeightStore, WeightStore},
     validation,
+};
+use eredu_checkpoint::schema::{
+    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+    GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+    StoredDtypeConstraint, TensorOperation,
 };
 
 pub(crate) fn validate_safetensors(
@@ -842,7 +844,7 @@ fn invalid_geometry(detail: String) -> CheckpointValidation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization;
+    use eredu_checkpoint::AffineQuantization;
 
     #[test]
     fn affine_matrix_constraints_keep_packed_storage_and_runtime_geometry_distinct() {
@@ -861,7 +863,7 @@ mod tests {
         assert_eq!(constraints[1].shape, [8, 2]);
         assert_eq!(
             constraints[1].role,
-            crate::backend::mlx::runtime::checkpoint::schema::TensorRole::Companion
+            eredu_checkpoint::schema::TensorRole::Companion
         );
         assert!(constraints[0]
             .aliases

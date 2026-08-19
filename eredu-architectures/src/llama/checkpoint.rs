@@ -5,67 +5,35 @@
 //! exclusions accepted by the Llama-compatible loaders. Generic checkpoint
 //! code only evaluates the resulting declarative constraints.
 
-use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
-use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
-use serde_json::Value;
-
-use super::model::{self, ModelArgs};
-use crate::backend::mlx::runtime::checkpoint::{
-    contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-    quantization::WeightQuantization,
-    schema::{
-        CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
-        SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
-        TensorOperation,
-    },
-    store::{SafetensorsWeightStore, StoredDtype, WeightStore},
-    validation,
+use eredu_checkpoint::schema::{
+    CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
+    SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
 };
+use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
-pub(crate) fn validate_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-) -> CheckpointValidation {
-    let args = match model::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > store.keys().len() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor checkpoint catalog",
-            args.num_hidden_layers,
-            store.keys().len()
-        ));
-    }
-    let plan = match safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(SafetensorsPlanError::Geometry(error)) => return invalid_geometry(error),
-        Err(SafetensorsPlanError::Companion { name, detail }) => {
-            return CheckpointValidation::Invalid(vec![CheckpointIssue {
-                kind: CheckpointIssueKind::CompanionMismatch,
-                detail,
-                tensor_name: Some(name),
-                tensor_type_code: None,
-                metadata_key: Some("quantization_config.quant_method".into()),
-            }]);
-        }
-    };
-    let mut issues = validation_issues(validation::validate_safetensors_plan(store, &plan));
-    let allowed = physical_keys(&plan.common_tensors);
-    for key in store.keys() {
-        if !allowed.contains(&key)
-            && !key.starts_with("rope_freqs.")
-            && !key.ends_with(".rotary_emb.inv_freq")
-        {
-            issues.push(unexpected(&key, "Llama SafeTensors"));
-        }
-    }
-    CheckpointValidation::from_issues(issues)
+use super::ModelArgs;
+
+/// Translates one llama.cpp GGUF tensor name into the canonical HF layout.
+pub fn translate_gguf_weight_name(name: &str) -> String {
+    name.replace("blk.", "model.layers.")
+        .replace("ffn_gate", "mlp.gate_proj")
+        .replace("ffn_down", "mlp.down_proj")
+        .replace("ffn_up", "mlp.up_proj")
+        .replace("attn_q", "self_attn.q_proj")
+        .replace("attn_k", "self_attn.k_proj")
+        .replace("attn_v", "self_attn.v_proj")
+        .replace("attn_output", "self_attn.o_proj")
+        .replace("attn_norm", "input_layernorm")
+        .replace("ffn_norm", "post_attention_layernorm")
+        .replace("token_embd", "model.embed_tokens")
+        .replace("output_norm", "model.norm")
+        .replace("output", "lm_head")
 }
 
-pub(crate) fn safetensors_plan(
+/// Builds the complete SafeTensors catalog expected by this configuration.
+pub fn safetensors_plan(
     args: &ModelArgs,
 ) -> Result<SafetensorsCheckpointPlan, SafetensorsPlanError> {
     let hidden = dimension(args.hidden_size, "hidden size")?;
@@ -162,7 +130,7 @@ fn add_safe(
     operation: TensorOperation,
 ) -> Result<(), SafetensorsPlanError> {
     let quantization = (operation == TensorOperation::Matrix)
-        .then(|| args.affine_quantization_for(name))
+        .then(|| args.weight_quantization_for(name))
         .flatten();
     output.extend(safe_matrix_constraints(name, shape, quantization)?);
     Ok(())
@@ -236,10 +204,18 @@ fn safe(key: impl Into<String>, shape: Vec<usize>) -> SafetensorsTensorConstrain
     SafetensorsTensorConstraint::required(key, shape, StoredDtypeConstraint::Floating)
 }
 
+/// Failure to derive a physically valid SafeTensors catalog.
 #[derive(Debug)]
-pub(crate) enum SafetensorsPlanError {
+pub enum SafetensorsPlanError {
+    /// Model dimensions cannot describe a valid tensor layout.
     Geometry(String),
-    Companion { name: String, detail: String },
+    /// A quantized tensor's required companion layout is invalid.
+    Companion {
+        /// Canonical quantized weight name.
+        name: String,
+        /// Physical-layout mismatch.
+        detail: String,
+    },
 }
 
 impl fmt::Display for SafetensorsPlanError {
@@ -256,61 +232,8 @@ impl From<String> for SafetensorsPlanError {
     }
 }
 
-fn physical_keys(tensors: &[SafetensorsTensorConstraint]) -> BTreeSet<String> {
-    tensors
-        .iter()
-        .flat_map(|tensor| std::iter::once(&tensor.key).chain(&tensor.aliases))
-        .cloned()
-        .collect()
-}
-
-pub(crate) fn validate_gguf(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> CheckpointValidation {
-    if let Err(error) = checkpoint
-        .catalog()
-        .translated_outputs(model::translate_gguf_weight_name)
-    {
-        return CheckpointValidation::Invalid(vec![CheckpointIssue {
-            kind: CheckpointIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let args = match model::model_args_from_gguf_catalog(checkpoint, metadata) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > checkpoint.catalog().physical_tensor_count() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor GGUF catalog",
-            args.num_hidden_layers,
-            checkpoint.catalog().physical_tensor_count()
-        ));
-    }
-    let plan = match gguf_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    let mut issues = validation_issues(validation::validate_gguf_plan(checkpoint, &plan));
-    let allowed = plan
-        .common_tensors
-        .iter()
-        .flat_map(|tensor| std::iter::once(&tensor.key).chain(&tensor.aliases))
-        .collect::<BTreeSet<_>>();
-    for tensor in checkpoint.catalog().tensors() {
-        let name = &tensor.descriptor().name;
-        if !allowed.contains(name) && !name.starts_with("rope_freqs.") {
-            issues.push(unexpected(name, "Llama GGUF"));
-        }
-    }
-    CheckpointValidation::from_issues(issues)
-}
-
-pub(crate) fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
+/// Builds the complete GGUF catalog expected by this configuration.
+pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
     let hidden = dimension(args.hidden_size, "hidden size")?;
     let vocab = dimension(args.vocab_size, "vocabulary size")?;
     let intermediate = dimension(args.intermediate_size, "intermediate size")?;
@@ -439,40 +362,14 @@ fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("Llama {name} geometry overflows"))
 }
 
-fn validation_issues(validation: CheckpointValidation) -> Vec<CheckpointIssue> {
-    match validation {
-        CheckpointValidation::Exact => Vec::new(),
-        CheckpointValidation::Invalid(issues) => issues,
-        CheckpointValidation::Unverified(issue) => vec![issue],
-    }
-}
-
-fn unexpected(name: &str, loader: &str) -> CheckpointIssue {
-    CheckpointIssue {
-        kind: CheckpointIssueKind::UnexpectedTensor,
-        detail: format!("{loader} catalog contains unexpected tensor {name:?}"),
-        tensor_name: Some(name.into()),
-        tensor_type_code: None,
-        metadata_key: None,
-    }
-}
-
-fn invalid_geometry(detail: String) -> CheckpointValidation {
-    CheckpointValidation::Invalid(vec![CheckpointIssue {
-        kind: CheckpointIssueKind::InvalidGeometry,
-        detail,
-        tensor_name: None,
-        tensor_type_code: None,
-        metadata_key: None,
-    }])
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     fn args() -> ModelArgs {
-        model::model_args_from_config_value(&serde_json::json!({
+        crate::llama::model_args_from_config_value(&serde_json::json!({
             "model_type": "llama", "hidden_size": 32, "num_hidden_layers": 1,
             "intermediate_size": 64, "num_attention_heads": 4,
             "num_key_value_heads": 2, "rms_norm_eps": 1e-5, "vocab_size": 32,
@@ -483,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn plans_own_tied_output_and_bias_geometry() {
+    fn plans_output_and_bias_geometry() {
         let mut args = args();
         let plan = safetensors_plan(&args).unwrap();
         let names = plan
@@ -496,10 +393,18 @@ mod tests {
         assert!(names.contains("model.layers.0.mlp.down_proj.bias"));
 
         args.tie_word_embeddings = true;
-        let tied = safetensors_plan(&args).unwrap();
-        assert!(!tied
+        assert!(!safetensors_plan(&args)
+            .unwrap()
             .common_tensors
             .iter()
             .any(|tensor| tensor.key == "lm_head.weight"));
+    }
+
+    #[test]
+    fn translates_gguf_names_without_backend_code() {
+        assert_eq!(
+            translate_gguf_weight_name("blk.3.attn_q.weight"),
+            "model.layers.3.self_attn.q_proj.weight"
+        );
     }
 }

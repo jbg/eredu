@@ -10,7 +10,6 @@ use crate::backend::mlx::architectures::{
     inkling::model as inkling,
     kimi_linear::model as kimi_linear,
     lfm2::model as lfm2,
-    llama::model as llama,
     moshi::personaplex,
     muse_glimmer,
     nemotron_h::model as nemotron_h,
@@ -21,6 +20,7 @@ use crate::backend::mlx::architectures::{
     },
 };
 use crate::backend::mlx::error::Error;
+use crate::integrations::llama_mlx::model as llama;
 
 /// Canonical resolution of a model configuration supported by MLX.
 #[derive(Debug, Clone, Eq, PartialEq)]

@@ -1,22 +1,23 @@
 //! Architecture-owned checkpoint contract for PersonaPlex.
+
 //!
 //! PersonaPlex owns the released PyTorch SafeTensors catalog, temporal and
 //! depth geometry, physical aliases, flattened norm layouts, and affine
 //! companion declarations here. Generic checkpoint code evaluates those
 //! declarations without knowing about realtime audio or codebook models.
 
+use eredu_checkpoint::{StoredDtype, WeightQuantization};
+
 use serde_json::Value;
 
 use super::{model::ModelArgs, personaplex};
 use crate::backend::mlx::runtime::checkpoint::{
     contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-    quantization::WeightQuantization,
-    schema::{
-        CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-        StoredDtypeConstraint,
-    },
-    store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+    store::{SafetensorsWeightStore, WeightStore},
     validation,
+};
+use eredu_checkpoint::schema::{
+    CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
 };
 
 pub(crate) fn validate_safetensors(
@@ -383,7 +384,7 @@ fn invalid_geometry(detail: String) -> CheckpointValidation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization;
+    use eredu_checkpoint::AffineQuantization;
 
     #[test]
     fn released_plan_owns_attention_aliases_and_flattened_norms() {

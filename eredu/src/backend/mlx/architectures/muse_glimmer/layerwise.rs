@@ -1,5 +1,7 @@
 //! Bounded layer execution for the shared Muse-Glimmer decoder.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
@@ -53,8 +55,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     backend::mlx::runtime::checkpoint::{
-        quantization::{should_quantize_on_load, WeightQuantization},
-        recipe::DerivedWeightRecipe,
+        quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
     },
     backend::mlx::runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, register_replicated_module,
@@ -1660,9 +1661,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             .map(Into::into)
     }
 
-    fn quantization(
-        &self,
-    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
         self.args.quantization.or(self.args.quantization_config)
     }
 

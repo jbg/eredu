@@ -1,5 +1,7 @@
 //! Bounded-residency execution for Kimi Linear safetensors and GGUF checkpoints.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Instant};
 
 use safemlx::{
@@ -40,7 +42,7 @@ use crate::{
                 populate_module_from_lease, populate_module_from_lease_excluding,
             },
             binding_plan::{BindingPlan, PlannedBinding},
-            quantization::{should_quantize_on_load, WeightQuantization},
+            quantization::should_quantize_on_load,
             recipe::DerivedWeightRecipe,
             store::{GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend},
         },

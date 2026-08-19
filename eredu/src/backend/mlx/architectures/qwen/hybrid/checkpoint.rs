@@ -1,8 +1,11 @@
 //! Architecture-owned checkpoint contracts for Qwen3.5 and Qwen3-Next.
+
 //!
 //! Normalized geometry, tensor names, aliases, physical layouts, and
 //! quantization exclusions live here. The runtime checkpoint engine remains
 //! architecture-neutral and only evaluates the resulting declarative plan.
+
+use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -14,16 +17,15 @@ use crate::backend::mlx::architectures::qwen::vl::model as qwen3_vl;
 use crate::{
     backend::mlx::runtime::checkpoint::{
         contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-        quantization::WeightQuantization,
-        schema::{
-            AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
-            GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
-            SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
-        },
-        store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+        store::{SafetensorsWeightStore, WeightStore},
         validation,
     },
     core::attention::AttentionPolicy,
+};
+use eredu_checkpoint::schema::{
+    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
+    GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+    StoredDtypeConstraint, TensorOperation,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

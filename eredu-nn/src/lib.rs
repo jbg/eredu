@@ -8,6 +8,8 @@
 
 use std::fmt::Debug;
 
+use eredu_checkpoint::WeightQuantization;
+
 #[cfg(feature = "mlx")]
 mod mlx;
 
@@ -70,6 +72,35 @@ pub struct LinearSpec<'a> {
     pub bias: bool,
     /// Stable checkpoint weight name.
     pub weight_name: &'a str,
+    /// Physical checkpoint encoding selected for this parameter.
+    pub quantization: Option<WeightQuantization>,
+}
+
+/// One backend-neutral RoPE configuration value.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(untagged)]
+pub enum RopeValue {
+    /// Floating-point metadata.
+    Float(f32),
+    /// String metadata.
+    String(String),
+    /// Boolean metadata.
+    Bool(bool),
+}
+
+/// Complete backend-neutral rotary-position construction specification.
+#[derive(Debug, Clone, Copy)]
+pub struct RotarySpec<'a> {
+    /// Rotated head dimensions.
+    pub dimensions: i32,
+    /// Base frequency.
+    pub base: f32,
+    /// Whether adjacent pairs are rotated instead of split halves.
+    pub traditional: bool,
+    /// Maximum configured position count.
+    pub max_positions: i32,
+    /// Optional normalized scaling metadata.
+    pub scaling: Option<&'a std::collections::HashMap<String, RopeValue>>,
 }
 
 /// Backend-native affine projection used by shared architectures.
@@ -131,8 +162,6 @@ pub trait AttentionCache<T: Tensor> {
 pub trait Backend: Sized + 'static {
     /// Backend tensor handle.
     type Tensor: Tensor;
-    /// Backend-specific model construction metadata.
-    type Config: ?Sized;
     /// Native affine projection, including packed quantized variants.
     type Linear: LinearOperator<Self::Tensor>;
     /// Native embedding table.
@@ -146,16 +175,15 @@ pub trait Backend: Sized + 'static {
 
     /// Builds one affine projection.
     fn linear(
-        config: &Self::Config,
         spec: LinearSpec<'_>,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Linear, Error>;
     /// Builds one token embedding table.
     fn embedding(
-        config: &Self::Config,
         vocabulary: i32,
         dimensions: i32,
         weight_name: &str,
+        quantization: Option<WeightQuantization>,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Embedding, Error>;
     /// Builds one RMS normalization operator.
@@ -166,8 +194,7 @@ pub trait Backend: Sized + 'static {
     ) -> Result<Self::Normalization, Error>;
     /// Builds the model's rotary-position operator.
     fn rotary(
-        config: &Self::Config,
-        dimensions: i32,
+        spec: RotarySpec<'_>,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Rotary, Error>;
     /// Applies SiLU using a backend-native implementation.
@@ -193,6 +220,16 @@ pub trait Backend: Sized + 'static {
         scale: f32,
         window: i32,
         position_offset: i32,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error>;
+    /// Builds the backend-native boolean causal mask used for a prefill.
+    ///
+    /// The returned value remains a lazy/backend-owned tensor. Calling this
+    /// method must not synchronize or materialize mask contents on the host.
+    fn causal_mask(
+        sequence: i32,
+        offset: i32,
+        window: Option<i32>,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
     /// Applies a row-parallel projection and its collective reduction.

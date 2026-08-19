@@ -1,8 +1,11 @@
 //! Deterministic checkpoint-derived weight recipes.
+
 //!
 //! Recipes describe the runtime representation of a parameter without tying it
 //! to a single checkpoint key. They are validated from checkpoint metadata and
 //! materialized on the residency source stream before device promotion.
+
+use eredu_checkpoint::StoredDtype;
 
 use std::collections::BTreeSet;
 
@@ -13,8 +16,7 @@ use safemlx::{
 };
 
 use crate::backend::mlx::runtime::checkpoint::store::{
-    PendingWeightMaterialization, StoredDtype, TensorSelection, WeightReadPolicy, WeightStore,
-    WeightStoreError,
+    PendingWeightMaterialization, TensorSelection, WeightReadPolicy, WeightStore, WeightStoreError,
 };
 
 /// Scalar encoding produced by a derived-weight recipe.

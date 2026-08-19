@@ -1,5 +1,7 @@
 //! Checkpoint-format-independent bounded-residency execution for DeepSeek V4.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
@@ -34,7 +36,6 @@ use crate::{
                 populate_module_from_lease_excluding,
             },
             binding_plan::{BindingPlan, PlannedBinding},
-            quantization::WeightQuantization,
             recipe::DerivedWeightRecipe,
             store::{GgufWeightStore, TensorSelection, WeightStore},
         },

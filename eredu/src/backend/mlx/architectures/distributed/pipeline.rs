@@ -1,4 +1,5 @@
 //! Executable pipeline parallelism for decoder-only language models.
+
 //!
 //! A [`crate::backend::mlx::architectures::distributed::pipeline::PipelineModel`] owns one
 //! dependency-safe, balanced contiguous decoder-layer range and the boundary
@@ -8,6 +9,9 @@
 //! by model state.
 //! Multimodal encoder, projection, merge, finalization, and decoder groups use
 //! one validated placement DAG with topology-planned payload routes.
+
+use eredu_architectures::llama::ModelArgs as LlamaModelArgs;
+use eredu_checkpoint::WeightQuantization;
 
 mod placement;
 
@@ -54,7 +58,6 @@ use crate::{
         kimi_linear::model as kimi_linear,
         lfm2::layerwise::Lfm2LayerwiseAdapter,
         lfm2::model as lfm2,
-        llama::model as llama,
         muse_glimmer,
         muse_glimmer::layerwise::{MuseGlimmerLayer, MuseGlimmerLayerwiseAdapter},
         nemotron_h::layerwise::NemotronHLayerwiseAdapter,
@@ -90,9 +93,7 @@ use crate::{
         populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
     },
     backend::mlx::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
-    backend::mlx::runtime::checkpoint::quantization::{
-        quantize_tensor, should_quantize_on_load, WeightQuantization,
-    },
+    backend::mlx::runtime::checkpoint::quantization::{quantize_tensor, should_quantize_on_load},
     backend::mlx::runtime::checkpoint::store::{
         GgufWeightStore, WeightStore, WeightStoreDiagnostics,
     },
@@ -133,6 +134,7 @@ use crate::{
     core::ModelKind,
     core::ParallelCoordinates,
     core::{MtpCapability, MtpCheckpointKind},
+    integrations::llama_mlx::model as llama,
 };
 use eredu_core::MtpStats;
 
@@ -931,8 +933,8 @@ impl PipelineLayerCache {
 }
 
 struct LlamaStage {
-    args: llama::ModelArgs,
-    layer_adapter: crate::backend::mlx::architectures::llama::layerwise::LlamaLayerwiseAdapter,
+    args: LlamaModelArgs,
+    layer_adapter: crate::integrations::llama_mlx::layerwise::LlamaLayerwiseAdapter,
     range: Range<usize>,
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
@@ -2382,9 +2384,7 @@ impl PipelineStageSemantics for LlamaStage {
             topology,
             "llama",
             &self.args.model_type,
-            crate::backend::mlx::architectures::llama::model::prompt_cache_architecture_fingerprint(
-                &self.args,
-            ),
+            eredu_architectures::llama::prompt_cache_architecture_fingerprint(&self.args),
             usize::try_from(self.args.num_hidden_layers)
                 .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
             self.range.clone(),
@@ -8166,15 +8166,13 @@ pub(crate) fn load_pipeline_model_with_options(
                     None,
                     weights_stream,
                 )?;
-                let gguf_plan = crate::backend::mlx::architectures::llama::checkpoint::gguf_plan(
-                    &prepared.args,
-                )
-                .map_err(Error::UnsupportedArchitecture)?;
+                let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
+                    .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedWeightStore =
                     Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                         checkpoint,
                         &gguf_plan,
-                        llama::translate_gguf_weight_name,
+                        eredu_architectures::llama::translate_gguf_weight_name,
                         max_mapped_shards,
                     )?);
                 load_llama_pipeline(
@@ -8890,7 +8888,7 @@ fn pipeline_gguf_architecture(
 }
 
 fn load_llama_pipeline(
-    source_args: llama::ModelArgs,
+    source_args: LlamaModelArgs,
     store: SharedWeightStore,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -8923,11 +8921,10 @@ fn load_llama_pipeline(
         ModelKind::Llama,
         source_args.hidden_size,
     );
-    let binding_adapter =
-        crate::backend::mlx::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(
-            source_args.clone(),
-            stream,
-        )?;
+    let binding_adapter = crate::integrations::llama_mlx::layerwise::LlamaLayerwiseAdapter::new(
+        source_args.clone(),
+        stream,
+    )?;
     let mut stage = LlamaStage::new(target_args.clone(), range, &info, stream)?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
@@ -8946,7 +8943,7 @@ fn load_llama_pipeline(
                 crate::backend::mlx::nn::parallel::VocabParallelEmbedding::unloaded(
                     target_args.vocab_size as usize,
                     target_args.hidden_size,
-                    target_args.affine_quantization_for("model.embed_tokens.weight"),
+                    target_args.weight_quantization_for("model.embed_tokens.weight"),
                     build,
                     stream,
                 )
@@ -8958,7 +8955,7 @@ fn load_llama_pipeline(
                     crate::backend::mlx::nn::parallel::VocabParallelEmbedding::unloaded(
                         target_args.vocab_size as usize,
                         target_args.hidden_size,
-                        target_args.affine_quantization_for("model.embed_tokens.weight"),
+                        target_args.weight_quantization_for("model.embed_tokens.weight"),
                         build,
                         stream,
                     )
@@ -8969,7 +8966,7 @@ fn load_llama_pipeline(
                 crate::backend::mlx::nn::parallel::VocabParallelLmHead::unloaded(
                     target_args.hidden_size,
                     target_args.vocab_size as usize,
-                    target_args.affine_quantization_for("lm_head.weight"),
+                    target_args.weight_quantization_for("lm_head.weight"),
                     build,
                     stream,
                 )
@@ -9194,21 +9191,20 @@ fn load_llama_pipeline(
 
 impl LlamaStage {
     fn new(
-        args: llama::ModelArgs,
+        args: LlamaModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let layer_adapter =
-            crate::backend::mlx::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(
-                args.clone(),
-                stream,
-            )?;
+        let layer_adapter = crate::integrations::llama_mlx::layerwise::LlamaLayerwiseAdapter::new(
+            args.clone(),
+            stream,
+        )?;
         let make_embedding = || {
             linear::unloaded_maybe_quantized_embedding(
                 args.vocab_size,
                 args.hidden_size,
-                args.affine_quantization_for("model.embed_tokens.weight"),
+                args.weight_quantization_for("model.embed_tokens.weight"),
                 stream,
             )
         };
@@ -9231,7 +9227,7 @@ impl LlamaStage {
                 linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
                     args.hidden_size,
                     args.vocab_size,
-                    args.affine_quantization_for("lm_head.weight"),
+                    args.weight_quantization_for("lm_head.weight"),
                     stream,
                 )
             })

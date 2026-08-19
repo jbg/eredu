@@ -1,8 +1,11 @@
 //! DeepSeek-V4 configuration and model components.
+
 //!
 //! The public configuration deliberately describes the architecture rather
 //! than individual repository names.  Flash, Pro, Base, Instruct, MTP, and
 //! fused DSpark checkpoints therefore share one validation path.
+
+use eredu_checkpoint::WeightQuantization;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -46,7 +49,6 @@ use crate::{
         PagedCacheOptions, PromptCacheSnapshotBlock,
     },
     backend::mlx::runtime::checkpoint::load::gguf_quantization_configs,
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::runtime::media::input as runtime_input,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{

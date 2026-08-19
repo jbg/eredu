@@ -1,9 +1,12 @@
 //! Reusable neural-network primitives with explicit tensor-parallel semantics.
+
 //!
 //! These modules do not retain communication groups. Callers borrow a
 //! [`crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext`] for each
 //! operation, allowing the same module
 //! implementation to execute in replicated and tensor-parallel modes.
+
+use eredu_checkpoint::WeightQuantization;
 
 use std::ops::Range;
 
@@ -20,15 +23,12 @@ use safemlx::{
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{convolution::DepthwiseConv1d, layers::silu, linear},
-    backend::mlx::runtime::{
-        checkpoint::quantization::WeightQuantization,
-        distributed::parallel::{
-            aligned_partition_units, partitioned_projection_members,
-            register_partitioned_projection_group, register_projection_module,
-            register_replicated_module, MemberSharding, ParallelBuildContext,
-            ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
-            ParameterRole, ProjectionSharding, ShardingPolicy,
-        },
+    backend::mlx::runtime::distributed::parallel::{
+        aligned_partition_units, partitioned_projection_members,
+        register_partitioned_projection_group, register_projection_module,
+        register_replicated_module, MemberSharding, ParallelBuildContext, ParallelExecutionContext,
+        ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        ProjectionSharding, ShardingPolicy,
     },
     core::balanced_contiguous_range,
 };
@@ -1751,10 +1751,8 @@ mod tests {
     #[test]
     fn row_quantization_requires_local_group_alignment() {
         let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(DeviceType::Cpu, 0));
-        let quantization = WeightQuantization::Affine(
-            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(64, 4)
-                .unwrap(),
-        );
+        let quantization =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap());
         let error = ParallelLinear::unloaded(
             96,
             32,
@@ -1771,10 +1769,8 @@ mod tests {
     #[test]
     fn row_quantization_balances_complete_groups() {
         let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(DeviceType::Cpu, 0));
-        let quantization = WeightQuantization::Affine(
-            crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(64, 4)
-                .unwrap(),
-        );
+        let quantization =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap());
         let first = ParallelLinear::unloaded(
             192,
             32,

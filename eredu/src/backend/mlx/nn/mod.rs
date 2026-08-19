@@ -22,5 +22,7 @@ pub mod moe;
 pub mod parallel;
 /// Rotary position-embedding variants and initialization.
 pub mod rope;
+/// Backend-neutral architecture operators specialized to MLX.
+pub(crate) mod shared;
 /// Shared tensor and attention-mask helpers.
 pub mod tensor;

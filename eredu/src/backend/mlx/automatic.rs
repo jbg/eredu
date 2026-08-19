@@ -1,5 +1,7 @@
 //! MLX observations and plan realization for neutral automatic planning.
 
+use eredu_checkpoint::{AffineQuantization, WeightQuantization};
+
 use std::{fs, path::Path};
 
 use eredu_core::{
@@ -24,7 +26,6 @@ use super::{
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::{
-        checkpoint::quantization::{AffineQuantization, WeightQuantization},
         execution::layerwise::{
             LayerwiseLoadOptions, LayerwiseModelError, NonExpertWeightResidency, WeightResidency,
         },

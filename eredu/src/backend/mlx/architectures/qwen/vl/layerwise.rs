@@ -1,5 +1,7 @@
 //! Shared bounded layer execution for dense and MoE Qwen3-VL models.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
@@ -56,8 +58,7 @@ use crate::{
     },
     backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     backend::mlx::runtime::checkpoint::{
-        quantization::{should_quantize_on_load, WeightQuantization},
-        recipe::DerivedWeightRecipe,
+        quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
@@ -1539,9 +1540,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
             .map(Into::into)
     }
 
-    fn quantization(
-        &self,
-    ) -> Option<crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization> {
+    fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
         self.args
             .text_config
             .quantization

@@ -16,8 +16,6 @@ pub mod inkling;
 pub mod kimi_linear;
 /// LFM2 and LFM2.5 implementations.
 pub mod lfm2;
-/// Llama and Mistral-compatible implementations.
-pub mod llama;
 /// Moshi and PersonaPlex realtime-token implementations.
 pub mod moshi;
 /// Meta Muse-Glimmer dense multimodal implementations.

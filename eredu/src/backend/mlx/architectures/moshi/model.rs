@@ -1,10 +1,13 @@
 //! Moshi temporal/depth language model for pre-tokenized Mimi streams.
+
 //!
 //! Moshi is not a single-stream causal LM, so it deliberately does not
 //! implement [`crate::backend::mlx::nn::generation::CausalLm`]. The input to one temporal step is a
 //! text token plus one token from every delayed audio codebook. The temporal
 //! output predicts text; the depth transformer then predicts generated audio
 //! codebooks autoregressively within the same frame.
+
+use eredu_checkpoint::WeightQuantization;
 
 use std::{collections::HashMap, ops::Range, path::Path};
 
@@ -33,7 +36,6 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::realtime,
     backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache},
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler},
     core::realtime::RealtimeSpeechConfig,
 };
@@ -370,7 +372,9 @@ impl ScaledEmbedding {
                 biases.as_ref(),
                 config.group_size(),
                 config.bits(),
-                config.mode(),
+                crate::backend::mlx::runtime::checkpoint::quantization::mlx_quantization_mode(
+                    config,
+                ),
                 stream,
             )
         } else {
@@ -480,7 +484,9 @@ impl MoshiLinear {
                 true,
                 config.group_size(),
                 config.bits(),
-                config.mode(),
+                crate::backend::mlx::runtime::checkpoint::quantization::mlx_quantization_mode(
+                    config,
+                ),
                 stream,
             )?;
             return match &self.bias.value {

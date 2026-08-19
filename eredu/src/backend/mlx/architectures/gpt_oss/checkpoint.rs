@@ -1,8 +1,11 @@
 //! Architecture-owned checkpoint contracts for GPT-OSS.
+
 //!
 //! GPT-OSS owns the tensor catalog and its native MXFP4 expert geometry here.
 //! The generic checkpoint runtime only evaluates the resulting physical
 //! constraints and never needs to know how GPT-OSS represents expert blocks.
+
+use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
 use std::collections::HashMap;
 
@@ -12,14 +15,12 @@ use serde_json::Value;
 use super::model::{self, ModelArgs};
 use crate::backend::mlx::runtime::checkpoint::{
     contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-    quantization::WeightQuantization,
-    schema::{
-        CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
-        SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
-        TensorOperation,
-    },
-    store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+    store::{SafetensorsWeightStore, WeightStore},
     validation,
+};
+use eredu_checkpoint::schema::{
+    CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
+    SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
 };
 
 pub(crate) fn validate_safetensors(
@@ -541,10 +542,7 @@ mod tests {
             .unwrap();
         assert_eq!(scale.shape, [2, 64, 1]);
         assert_eq!(scale.dtype, StoredDtypeConstraint::Exact(StoredDtype::U8));
-        assert_eq!(
-            scale.role,
-            crate::backend::mlx::runtime::checkpoint::schema::TensorRole::Companion
-        );
+        assert_eq!(scale.role, eredu_checkpoint::schema::TensorRole::Companion);
 
         let gguf = gguf_plan(&args()).unwrap();
         let sinks = gguf

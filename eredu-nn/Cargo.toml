@@ -13,6 +13,8 @@ default = []
 mlx = ["dep:safemlx", "dep:smallvec"]
 
 [dependencies]
+eredu-checkpoint.workspace = true
 safemlx = { workspace = true, optional = true }
 smallvec = { version = "1", optional = true }
+serde.workspace = true
 thiserror.workspace = true

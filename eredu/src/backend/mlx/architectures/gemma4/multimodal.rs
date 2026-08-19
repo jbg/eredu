@@ -1,3 +1,5 @@
+use eredu_checkpoint::WeightQuantization;
+
 use std::ops::Range;
 
 use safemlx::{
@@ -11,8 +13,6 @@ use safemlx::{
 };
 
 use super::model::{maybe_quantized_linear_with_bias, rms_norm_without_scale};
-use crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization;
-
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct Gemma4ClippedLinear {
     pub input_dim: i32,

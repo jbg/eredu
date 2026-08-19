@@ -9,6 +9,10 @@ rust-version.workspace = true
 description = "Backend-neutral text model architectures for Eredu"
 
 [dependencies]
+eredu-checkpoint.workspace = true
 eredu-core.workspace = true
+eredu-gguf.workspace = true
 eredu-nn.workspace = true
-
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

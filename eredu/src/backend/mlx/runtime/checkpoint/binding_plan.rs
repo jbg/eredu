@@ -1,5 +1,8 @@
 //! Declarative runtime targets backed by checkpoint-derived recipes.
 
+#[cfg(test)]
+use eredu_checkpoint::StoredDtype;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
@@ -223,8 +226,8 @@ mod tests {
 
     use super::*;
     use crate::backend::mlx::runtime::checkpoint::store::{
-        StoredDtype, TensorSelection, WeightLease, WeightMetadata, WeightReadPolicy,
-        WeightStoreBackend, WeightStoreDiagnostics, WeightStoreError,
+        TensorSelection, WeightLease, WeightMetadata, WeightReadPolicy, WeightStoreBackend,
+        WeightStoreDiagnostics, WeightStoreError,
     };
 
     struct MetadataStore {

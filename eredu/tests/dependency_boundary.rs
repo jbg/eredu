@@ -62,9 +62,24 @@ fn shared_architectures_do_not_depend_on_accelerator_runtimes() {
     rust_sources(&architecture.join("src"), &mut sources);
     for source in sources {
         let text = std::fs::read_to_string(&source).expect("architecture source must be readable");
+        for forbidden in ["safemlx", "backend::mlx", "integrations::"] {
+            assert!(
+                !text.contains(forbidden),
+                "backend dependency {forbidden:?} leaked into {source:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mlx_neural_operator_binding_is_architecture_agnostic() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("src/backend/mlx/nn/shared.rs"))
+        .expect("MLX neural operator binding must be readable");
+    for forbidden in ["eredu_architectures", "ModelArgs", "llama::", "Llama"] {
         assert!(
-            !text.contains("safemlx"),
-            "backend type leaked into {source:?}"
+            !source.contains(forbidden),
+            "architecture dependency {forbidden:?} leaked into MLX operators"
         );
     }
 }

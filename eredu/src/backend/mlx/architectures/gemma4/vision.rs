@@ -1,3 +1,6 @@
+use eredu_checkpoint::WeightQuantization;
+use eredu_nn::RopeValue;
+
 use safemlx::{
     error::Exception,
     fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask},
@@ -11,10 +14,6 @@ use safemlx::{
 use serde::Deserialize;
 
 use super::{model::rms_norm_without_scale, multimodal::Gemma4ClippedLinear};
-use crate::{
-    backend::mlx::nn::rope::FloatOrString,
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
-};
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Gemma4VisionConfig {
@@ -33,7 +32,7 @@ pub(crate) struct Gemma4VisionConfig {
     #[serde(default)]
     pub standardize: bool,
     #[serde(default)]
-    pub rope_parameters: Option<std::collections::HashMap<String, FloatOrString>>,
+    pub rope_parameters: Option<std::collections::HashMap<String, RopeValue>>,
     #[serde(skip)]
     pub weight_quantization: Option<WeightQuantization>,
 }
@@ -48,9 +47,9 @@ impl Gemma4VisionConfig {
             .as_ref()
             .and_then(|parameters| parameters.get("rope_theta"))
             .and_then(|value| match value {
-                FloatOrString::Float(value) => Some(*value),
-                FloatOrString::String(value) => value.parse().ok(),
-                FloatOrString::Bool(_) => None,
+                RopeValue::Float(value) => Some(*value),
+                RopeValue::String(value) => value.parse().ok(),
+                RopeValue::Bool(_) => None,
             })
             .unwrap_or(100.0)
     }

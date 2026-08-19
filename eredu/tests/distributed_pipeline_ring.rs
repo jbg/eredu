@@ -26,7 +26,6 @@ use eredu::{
     backend::mlx::runtime::generation::sampler::DefaultSampler,
     backend::mlx::runtime::{
         checkpoint::binding::canonical_checkpoint_name,
-        checkpoint::quantization::{AffineQuantization, WeightQuantization},
         media::{input::InputPayload, PreparedModelInput},
     },
     backend::mlx::{
@@ -38,6 +37,7 @@ use eredu::{
     load_model, MtpCapability, MtpCheckpointKind, MtpConfig, PromptCacheDescriptor,
     PromptCacheOptions, PromptCacheTopology,
 };
+use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_gguf::{GgmlType, TensorInput, Writer};
 use safemlx::{
     distributed::{self, Backend},

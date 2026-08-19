@@ -1,5 +1,7 @@
 //! Shared Qwen vision-language encoder building blocks.
 
+use eredu_checkpoint::WeightQuantization;
+
 use std::collections::HashMap;
 
 use safemlx::{
@@ -20,9 +22,7 @@ use serde::Deserialize;
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{layers::silu, linear::unloaded_maybe_quantized_linear},
-    backend::mlx::runtime::{
-        cache::ConcatKeyValueCache, checkpoint::quantization::WeightQuantization,
-    },
+    backend::mlx::runtime::cache::ConcatKeyValueCache,
     core::attention::LayerSchedule,
 };
 
@@ -2152,13 +2152,9 @@ mod tests {
         config.intermediate_size = 32;
         config.num_heads = 4;
         config.out_hidden_size = 32;
-        let format =
-            crate::backend::mlx::runtime::checkpoint::quantization::WeightQuantization::Affine(
-                crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization::new(
-                    32, 8,
-                )
-                .unwrap(),
-            );
+        let format = eredu_checkpoint::WeightQuantization::Affine(
+            eredu_checkpoint::AffineQuantization::new(32, 8).unwrap(),
+        );
         for name in [
             "blocks.0.attn.qkv.weight",
             "blocks.0.attn.proj.weight",

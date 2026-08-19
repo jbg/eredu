@@ -1,5 +1,10 @@
 //! Dense and MoE Qwen3.5 text and vision-language implementation and loader.
 
+#[cfg(test)]
+use eredu_checkpoint::AffineQuantization;
+use eredu_checkpoint::WeightQuantization;
+use eredu_nn::RopeValue;
+
 use safemlx::{
     builder::Builder,
     error::Exception,
@@ -50,7 +55,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::tensor::{
         create_attention_mask,
-        rope::{initialize_rope, validate_rope_scaling_config, FloatOrString, RopeVariant},
+        rope::{initialize_rope, validate_rope_scaling_config, RopeVariant},
         AttentionMask,
     },
     backend::mlx::nn::{
@@ -68,7 +73,6 @@ use crate::{
     backend::mlx::runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, GgufTensorNames,
     },
-    backend::mlx::runtime::checkpoint::quantization::WeightQuantization,
     backend::mlx::runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
     backend::mlx::runtime::media::input as runtime_input,
     core::attention::{AttentionPolicy, LayerSchedule},
@@ -79,8 +83,6 @@ use crate::{
 };
 
 #[cfg(test)]
-use crate::backend::mlx::runtime::checkpoint::quantization::AffineQuantization;
-
 #[cfg(test)]
 use crate::backend::mlx::runtime::checkpoint::load::{
     for_each_safetensor_array, load_array_strict, safetensors_files, StrictLoadConfig,
@@ -670,16 +672,14 @@ fn string_config_value<'a>(
     })
 }
 
-fn rope_config_value(
-    config: Option<HashMap<String, Value>>,
-) -> Option<HashMap<String, FloatOrString>> {
+fn rope_config_value(config: Option<HashMap<String, Value>>) -> Option<HashMap<String, RopeValue>> {
     config.map(|config| {
         config
             .into_iter()
             .filter_map(|(key, value)| {
                 let value = match value {
-                    Value::Number(v) => v.as_f64().map(|v| FloatOrString::Float(v as f32)),
-                    Value::String(s) => Some(FloatOrString::String(s)),
+                    Value::Number(v) => v.as_f64().map(|v| RopeValue::Float(v as f32)),
+                    Value::String(s) => Some(RopeValue::String(s)),
                     _ => None,
                 }?;
                 Some((key, value))
@@ -722,7 +722,7 @@ impl ModelArgs {
             .unwrap_or(1_000_000.0)
     }
 
-    fn rope_config(&self) -> Option<HashMap<String, FloatOrString>> {
+    fn rope_config(&self) -> Option<HashMap<String, RopeValue>> {
         rope_config_value(
             self.rope_parameters
                 .clone()
@@ -1055,9 +1055,10 @@ impl QwenLinear {
             },
             group_size: format.affine().map_or(0, WeightQuantization::group_size),
             bits: format.affine().map_or(0, WeightQuantization::bits),
-            mode: format
-                .affine()
-                .map_or(QuantizationMode::Affine, WeightQuantization::mode),
+            mode: format.affine().map_or(
+                QuantizationMode::Affine,
+                crate::backend::mlx::runtime::checkpoint::quantization::mlx_quantization_mode,
+            ),
             iquant: format.iquant(),
         })
     }
