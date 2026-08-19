@@ -459,6 +459,14 @@ impl CheckpointSource for GgufWeightStore {
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
         WeightStore::diagnostics(self)
     }
+
+    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+        self.unclaimed_checkpoint_keys()
+    }
+
+    fn is_checkpoint_contract_resolved(&self) -> bool {
+        true
+    }
 }
 
 impl ReaderCache {

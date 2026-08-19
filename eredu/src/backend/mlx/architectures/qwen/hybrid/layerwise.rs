@@ -55,9 +55,7 @@ use crate::{
         canonical_checkpoint_name, is_materialized_module_parameter, populate_module_from_lease,
         populate_module_from_lease_excluding, ModuleBindingPlan,
     },
-    backend::mlx::runtime::checkpoint::store::{
-        GgufWeightStore, TensorSelection, WeightStoreBackend,
-    },
+    backend::mlx::runtime::checkpoint::store::{TensorSelection, WeightStoreBackend},
     backend::mlx::runtime::checkpoint::{
         binding_plan::{BindingPlan, PlannedBinding},
         quantization::should_quantize_on_load,
@@ -1397,10 +1395,10 @@ pub(crate) fn qwen_hybrid_gguf_store(
 ) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
     let text_plan = super::checkpoint::gguf_plan(args, checkpoint, variant)
         .map_err(Error::UnsupportedArchitecture)?;
-    let mut builder = GgufWeightStore::builder()
+    let mut builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
         .add_checkpoint(
-            checkpoint.clone(),
+            checkpoint.catalog().clone(),
             &text_plan,
             resident::qwen35_translate_gguf_weight_name,
         )?;
@@ -1416,7 +1414,7 @@ pub(crate) fn qwen_hybrid_gguf_store(
         let projector_plan = super::checkpoint::projector_gguf_plan(vision, args.hidden_size)
             .map_err(Error::UnsupportedArchitecture)?;
         builder =
-            builder.add_checkpoint(mmproj.checkpoint.clone(), &projector_plan, move |name| {
+            builder.add_checkpoint(mmproj.checkpoint.catalog().clone(), &projector_plan, move |name| {
                 let translated =
                     crate::backend::mlx::architectures::qwen::vl::model::translate_qwen3_vl_mmproj_name(
                         name, &deepstack,

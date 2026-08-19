@@ -94,7 +94,9 @@ use crate::{
         populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
     },
     backend::mlx::runtime::checkpoint::quantization::{quantize_tensor, should_quantize_on_load},
-    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, WeightStoreDiagnostics},
+    backend::mlx::runtime::checkpoint::store::{
+        open_gguf_checkpoint_source, WeightStoreDiagnostics,
+    },
     backend::mlx::runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
     backend::mlx::runtime::distributed::expert::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
@@ -8133,13 +8135,12 @@ pub(crate) fn load_pipeline_model_with_options(
                         &prepared.args,
                     )
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore =
-                    Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                        checkpoint,
-                        &gguf_plan,
-                        deepseek_v4::translate_gguf_weight_name,
-                        max_mapped_shards,
-                    )?);
+                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                    checkpoint,
+                    &gguf_plan,
+                    deepseek_v4::translate_gguf_weight_name,
+                    max_mapped_shards,
+                )?);
                 load_deepseek_v4_pipeline(
                     prepared.args,
                     store,
@@ -8160,13 +8161,12 @@ pub(crate) fn load_pipeline_model_with_options(
                 )?;
                 let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore =
-                    Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                        checkpoint,
-                        &gguf_plan,
-                        eredu_architectures::llama::translate_gguf_weight_name,
-                        max_mapped_shards,
-                    )?);
+                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                    checkpoint,
+                    &gguf_plan,
+                    eredu_architectures::llama::translate_gguf_weight_name,
+                    max_mapped_shards,
+                )?);
                 load_llama_pipeline(
                     prepared.args,
                     store,
@@ -8210,13 +8210,12 @@ pub(crate) fn load_pipeline_model_with_options(
                         &prepared.args,
                     )
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore =
-                    Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                        checkpoint,
-                        &gguf_plan,
-                        deepseek_v3::translate_gguf_weight_name,
-                        max_mapped_shards,
-                    )?);
+                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                    checkpoint,
+                    &gguf_plan,
+                    deepseek_v3::translate_gguf_weight_name,
+                    max_mapped_shards,
+                )?);
                 load_deepseek_pipeline(
                     prepared.args,
                     store,
@@ -8288,13 +8287,12 @@ pub(crate) fn load_pipeline_model_with_options(
                         &args, variant,
                     )
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore =
-                    Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                        checkpoint,
-                        &gguf_plan,
-                        move |name| dense_qwen::translate_gguf_weight_name(name, is_moe),
-                        max_mapped_shards,
-                    )?);
+                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                    checkpoint,
+                    &gguf_plan,
+                    move |name| dense_qwen::translate_gguf_weight_name(name, is_moe),
+                    max_mapped_shards,
+                )?);
                 load_dense_qwen_pipeline(
                     args,
                     store,
@@ -8343,13 +8341,12 @@ pub(crate) fn load_pipeline_model_with_options(
                     &prepared.args,
                 )
                 .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore =
-                    Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                        checkpoint,
-                        &gguf_plan,
-                        gpt_oss::translate_gguf_weight_name,
-                        max_mapped_shards,
-                    )?);
+                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                    checkpoint,
+                    &gguf_plan,
+                    gpt_oss::translate_gguf_weight_name,
+                    max_mapped_shards,
+                )?);
                 load_gpt_oss_pipeline(
                     prepared.args,
                     store,
@@ -8369,13 +8366,12 @@ pub(crate) fn load_pipeline_model_with_options(
                 let gguf_plan =
                     crate::backend::mlx::architectures::lfm2::checkpoint::gguf_plan(&prepared.args)
                         .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore =
-                    Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                        checkpoint,
-                        &gguf_plan,
-                        move |name| lfm2::translate_gguf_weight_name(name, is_moe),
-                        max_mapped_shards,
-                    )?);
+                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                    checkpoint,
+                    &gguf_plan,
+                    move |name| lfm2::translate_gguf_weight_name(name, is_moe),
+                    max_mapped_shards,
+                )?);
                 load_lfm2_pipeline(
                     prepared.args,
                     store,
@@ -8399,13 +8395,12 @@ pub(crate) fn load_pipeline_model_with_options(
                         &prepared.args,
                     )
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore =
-                    Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                        checkpoint,
-                        &gguf_plan,
-                        nemotron_h::translate_gguf_weight_name,
-                        max_mapped_shards,
-                    )?);
+                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                    checkpoint,
+                    &gguf_plan,
+                    nemotron_h::translate_gguf_weight_name,
+                    max_mapped_shards,
+                )?);
                 let _ = architecture;
                 load_nemotron_h_pipeline(
                     prepared.args,
@@ -8475,13 +8470,12 @@ pub(crate) fn load_pipeline_model_with_options(
                         &prepared.args,
                     )
                     .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedWeightStore =
-                    Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                        checkpoint,
-                        &gguf_plan,
-                        kimi_linear::translate_gguf_weight_name,
-                        max_mapped_shards,
-                    )?);
+                let store: SharedWeightStore = Arc::new(open_gguf_checkpoint_source(
+                    checkpoint,
+                    &gguf_plan,
+                    kimi_linear::translate_gguf_weight_name,
+                    max_mapped_shards,
+                )?);
                 load_kimi_linear_pipeline(
                     prepared.args,
                     store,

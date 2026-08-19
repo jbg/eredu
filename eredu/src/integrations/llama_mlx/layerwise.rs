@@ -49,7 +49,7 @@ use crate::{
         build_module_binding_plan_with_recipes, populate_module_from_lease,
     },
     backend::mlx::runtime::checkpoint::{
-        quantization::should_quantize_on_load, store::GgufWeightStore,
+        quantization::should_quantize_on_load, store::open_gguf_checkpoint_source,
     },
     backend::mlx::runtime::distributed::parallel::{
         register_replicated_module, ParallelPlanBuilder,
@@ -530,7 +530,7 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
     let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+        Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
             &gguf_plan,
             eredu_architectures::llama::translate_gguf_weight_name,
@@ -567,7 +567,7 @@ pub(crate) fn load_llama_gguf_model(
     let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+        Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
             &gguf_plan,
             eredu_architectures::llama::translate_gguf_weight_name,

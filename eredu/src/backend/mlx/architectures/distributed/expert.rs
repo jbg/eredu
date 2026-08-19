@@ -53,7 +53,9 @@ use crate::{
     backend::mlx::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
     backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
     backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load,
-    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore},
+    backend::mlx::runtime::checkpoint::store::{
+        open_gguf_checkpoint_source, SafetensorsWeightStore,
+    },
     backend::mlx::runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
     backend::mlx::runtime::distributed::topology::{
         load_partition_from_store_on_streams, PlacementPlan, TensorPlacement,
@@ -3455,7 +3457,7 @@ fn load_external_gguf_ep(
             let gguf_plan = crate::backend::mlx::architectures::kimi_linear::checkpoint::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
             let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                std::sync::Arc::new(open_gguf_checkpoint_source(
                     checkpoint.clone(),
                     &gguf_plan,
                     kimi_linear::translate_gguf_weight_name,
@@ -3513,7 +3515,7 @@ fn load_external_gguf_ep(
             let gguf_plan = crate::backend::mlx::architectures::deepseek_v4::checkpoint::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
             let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                std::sync::Arc::new(open_gguf_checkpoint_source(
                     checkpoint.clone(),
                     &gguf_plan,
                     deepseek_v4::translate_gguf_weight_name,
@@ -3577,7 +3579,7 @@ fn load_external_gguf_ep(
             let gguf_plan = crate::backend::mlx::architectures::deepseek_v3::checkpoint::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
             let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                std::sync::Arc::new(open_gguf_checkpoint_source(
                     checkpoint.clone(),
                     &gguf_plan,
                     deepseek_v3::translate_gguf_weight_name,
@@ -3639,7 +3641,7 @@ fn load_external_gguf_ep(
             )
             .map_err(Error::UnsupportedArchitecture)?;
             let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                std::sync::Arc::new(open_gguf_checkpoint_source(
                     checkpoint.clone(),
                     &gguf_plan,
                     |name| dense_qwen::translate_gguf_weight_name(name, true),
@@ -3834,7 +3836,7 @@ fn load_external_gguf_ep(
             let gguf_plan = crate::backend::mlx::architectures::gpt_oss::checkpoint::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
             let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                std::sync::Arc::new(open_gguf_checkpoint_source(
                     checkpoint.clone(),
                     &gguf_plan,
                     gpt_oss::translate_gguf_weight_name,
@@ -3946,7 +3948,7 @@ fn load_external_gguf_ep(
             let gguf_plan = crate::backend::mlx::architectures::lfm2::checkpoint::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
             let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                std::sync::Arc::new(open_gguf_checkpoint_source(
                     checkpoint.clone(),
                     &gguf_plan,
                     |name| lfm2::translate_gguf_weight_name(name, true),
@@ -4000,7 +4002,7 @@ fn load_external_gguf_ep(
             let gguf_plan = crate::backend::mlx::architectures::nemotron_h::checkpoint::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
             let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                std::sync::Arc::new(open_gguf_checkpoint_source(
                     checkpoint.clone(),
                     &gguf_plan,
                     nemotron_h::translate_gguf_weight_name,

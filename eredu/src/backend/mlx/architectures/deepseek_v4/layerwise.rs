@@ -38,7 +38,7 @@ use crate::{
             },
             binding_plan::{BindingPlan, PlannedBinding},
             recipe::{DerivedWeightRecipe, RecipeDtype},
-            store::{GgufWeightStore, TensorSelection},
+            store::{open_gguf_checkpoint_source, TensorSelection},
         },
         execution::layerwise::{
             load_layerwise_model_with_quantization,
@@ -1571,7 +1571,7 @@ pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
     let gguf_plan =
         super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+        Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
             &gguf_plan,
             super::model::translate_gguf_weight_name,
@@ -1641,7 +1641,7 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
     let gguf_plan =
         super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+        Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
             &gguf_plan,
             super::model::translate_gguf_weight_name,

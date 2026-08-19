@@ -1187,7 +1187,7 @@ mod tests {
     use crate::test_utils::SyntheticGguf;
     use crate::{
         backend::mlx::runtime::{
-            checkpoint::store::GgufWeightStore,
+            checkpoint::store::open_gguf_checkpoint_source_for_test,
             residency::manager::{host_capacity_upper_bound_for_bindings, ResidencyManager},
         },
         core::residency::{
@@ -1645,9 +1645,10 @@ mod tests {
             &HashMap::new(),
         );
         let source = Arc::new(
-            GgufWeightStore::new_for_test(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
-                name.to_string()
-            })
+            open_gguf_checkpoint_source_for_test(
+                GgufCheckpoint::open(fixture.path()).unwrap(),
+                |name| name.to_string(),
+            )
             .unwrap(),
         );
         let context = cpu_context();
@@ -1698,9 +1699,10 @@ mod tests {
             &HashMap::new(),
         );
         let source = Arc::new(
-            GgufWeightStore::new_for_test(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
-                name.to_string()
-            })
+            open_gguf_checkpoint_source_for_test(
+                GgufCheckpoint::open(fixture.path()).unwrap(),
+                |name| name.to_string(),
+            )
             .unwrap(),
         );
         let context = cpu_context();
@@ -1757,9 +1759,10 @@ mod tests {
             &HashMap::new(),
         );
         let source = Arc::new(
-            GgufWeightStore::new_for_test(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
-                name.to_string()
-            })
+            open_gguf_checkpoint_source_for_test(
+                GgufCheckpoint::open(fixture.path()).unwrap(),
+                |name| name.to_string(),
+            )
             .unwrap(),
         );
         let context = cpu_context();
@@ -1848,9 +1851,10 @@ mod tests {
             &HashMap::new(),
         );
         let source = Arc::new(
-            GgufWeightStore::new_for_test(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
-                name.to_string()
-            })
+            open_gguf_checkpoint_source_for_test(
+                GgufCheckpoint::open(fixture.path()).unwrap(),
+                |name| name.to_string(),
+            )
             .unwrap(),
         );
         let context = cpu_context();

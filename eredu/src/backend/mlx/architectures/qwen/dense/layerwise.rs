@@ -50,7 +50,7 @@ use crate::{
         build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
         populate_module_from_lease, populate_module_from_lease_excluding, ModuleBindingPlan,
     },
-    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection},
+    backend::mlx::runtime::checkpoint::store::{open_gguf_checkpoint_source, TensorSelection},
     backend::mlx::runtime::checkpoint::{
         binding_plan::{BindingPlan, PlannedBinding},
         quantization::should_quantize_on_load,
@@ -879,7 +879,7 @@ pub(crate) fn load_gguf_tensor_parallel_model(
     let gguf_plan =
         super::checkpoint::gguf_plan(&args, variant).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+        Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
             &gguf_plan,
             move |name| resident::translate_gguf_weight_name(name, is_moe),
@@ -916,7 +916,7 @@ pub(crate) fn load_gguf_checkpoint(
     let gguf_plan =
         super::checkpoint::gguf_plan(&args, variant).map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+        Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
             &gguf_plan,
             |name| resident::translate_gguf_weight_name(name, is_moe),

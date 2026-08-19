@@ -53,7 +53,7 @@ use crate::{
         populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
-    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection},
+    backend::mlx::runtime::checkpoint::store::TensorSelection,
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load,
         recipe::{DerivedWeightRecipe, RecipeDtype},
@@ -1263,10 +1263,10 @@ pub(crate) fn inkling_gguf_store(
     max_mapped_shards: usize,
 ) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
     let text_plan = super::checkpoint::gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
-    let mut builder = GgufWeightStore::builder()
+    let mut builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
         .add_checkpoint(
-            checkpoint.clone(),
+            checkpoint.catalog().clone(),
             &text_plan,
             resident::translate_gguf_weight_name,
         )?;
@@ -1274,7 +1274,7 @@ pub(crate) fn inkling_gguf_store(
         let projector_plan =
             super::checkpoint::mmproj_gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
         builder = builder.add_checkpoint(
-            mmproj.checkpoint.clone(),
+            mmproj.checkpoint.catalog().clone(),
             &projector_plan,
             resident::translate_mmproj_weight_name,
         )?;

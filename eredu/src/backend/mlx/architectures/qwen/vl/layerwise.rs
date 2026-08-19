@@ -57,7 +57,7 @@ use crate::{
         build_module_binding_plan_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection},
+    backend::mlx::runtime::checkpoint::store::TensorSelection,
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
     },
@@ -683,9 +683,9 @@ pub(crate) fn qwen3_vl_gguf_store(
         super::checkpoint::projector_gguf_plan(&args.vision_config, args.text_config.hidden_size)
             .map_err(Error::UnsupportedArchitecture)?;
     Ok(Arc::new(
-        GgufWeightStore::builder()
+        eredu_checkpoint::gguf_store::GgufWeightStore::builder()
             .max_cached_readers(max_mapped_shards)?
-            .add_checkpoint(checkpoint.clone(), &text_plan, move |name| {
+            .add_checkpoint(checkpoint.catalog().clone(), &text_plan, move |name| {
                 let name =
                     crate::backend::mlx::architectures::qwen::dense::translate_gguf_weight_name(
                         name, is_moe,
@@ -694,9 +694,11 @@ pub(crate) fn qwen3_vl_gguf_store(
                     .map(|name| format!("model.language_model.{name}"))
                     .unwrap_or(name)
             })?
-            .add_checkpoint(vision_checkpoint.clone(), &vision_plan, move |name| {
-                resident::translate_qwen3_vl_mmproj_name(name, &deepstack)
-            })?
+            .add_checkpoint(
+                vision_checkpoint.catalog().clone(),
+                &vision_plan,
+                move |name| resident::translate_qwen3_vl_mmproj_name(name, &deepstack),
+            )?
             .build()?,
     ))
 }

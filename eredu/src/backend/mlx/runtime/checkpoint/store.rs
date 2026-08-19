@@ -15,10 +15,7 @@ use eredu_checkpoint::{
         GgufLease as NeutralGgufLease, GgufWeightStore as NeutralGgufWeightStore,
         GgufWeightStoreBuilder as NeutralGgufWeightStoreBuilder,
     },
-    store::{
-        CheckpointLease, CheckpointSource, EncodedTensorLease,
-        SafetensorsLease as NeutralSafetensorsLease, TensorReadRequest,
-    },
+    store::{CheckpointLease, EncodedTensorLease, SafetensorsLease as NeutralSafetensorsLease},
     StoredDtype,
 };
 
@@ -37,6 +34,8 @@ use safetensors::tensor::{Dtype, TensorView};
 
 #[cfg(test)]
 use eredu_checkpoint::gguf_store::GgufPhysicalSelection;
+#[cfg(test)]
+use eredu_checkpoint::store::{CheckpointSource, TensorReadRequest};
 #[cfg(test)]
 use safemlx::ops::GgufTensorSelection;
 
@@ -279,140 +278,46 @@ impl MlxParameterMaterializationContext {
     }
 }
 
-/// Builder adapter preserving the MLX loader API while delegating GGUF
-/// inspection and acquisition to the backend-neutral checkpoint crate.
-#[derive(Debug, Default)]
-pub(crate) struct GgufWeightStoreBuilder {
-    inner: NeutralGgufWeightStoreBuilder,
+/// Opens a backend-neutral GGUF source from the MLX checkpoint handle used by
+/// high-level model composition.
+pub(crate) fn open_gguf_checkpoint_source<F>(
+    checkpoint: GgufCheckpoint,
+    plan: &eredu_checkpoint::schema::GgufCheckpointPlan,
+    translate: F,
+    max_cached_readers: usize,
+) -> Result<NeutralGgufWeightStore, WeightStoreError>
+where
+    F: FnMut(&str) -> String,
+{
+    NeutralGgufWeightStoreBuilder::default()
+        .max_cached_readers(max_cached_readers)
+        .map_err(neutral_store_error)?
+        .add_checkpoint(checkpoint.catalog().clone(), plan, translate)
+        .map_err(neutral_store_error)?
+        .build()
+        .map_err(neutral_store_error)
 }
 
-impl GgufWeightStoreBuilder {
-    pub(crate) fn max_cached_readers(mut self, maximum: usize) -> Result<Self, WeightStoreError> {
-        self.inner = self
-            .inner
-            .max_cached_readers(maximum)
-            .map_err(neutral_store_error)?;
-        Ok(self)
-    }
-
-    pub(crate) fn add_checkpoint<F>(
-        mut self,
-        checkpoint: GgufCheckpoint,
-        plan: &eredu_checkpoint::schema::GgufCheckpointPlan,
-        translate: F,
-    ) -> Result<Self, WeightStoreError>
-    where
-        F: FnMut(&str) -> String,
-    {
-        self.inner = self
-            .inner
-            .add_checkpoint(checkpoint.catalog().clone(), plan, translate)
-            .map_err(neutral_store_error)?;
-        Ok(self)
-    }
-
-    #[cfg(test)]
-    fn add_checkpoint_for_test<F>(
-        mut self,
-        checkpoint: GgufCheckpoint,
-        translate: F,
-    ) -> Result<Self, WeightStoreError>
-    where
-        F: FnMut(&str) -> String,
-    {
-        let resolved = eredu_checkpoint::validation::ResolvedCheckpointPlan::for_test(
-            "test GGUF catalog",
-            checkpoint
-                .catalog()
-                .tensors()
-                .map(|tensor| tensor.descriptor().name.clone()),
-        );
-        self.inner = self
-            .inner
-            .add_resolved_checkpoint(checkpoint.catalog().clone(), &resolved, translate)
-            .map_err(neutral_store_error)?;
-        Ok(self)
-    }
-
-    pub(crate) fn build(self) -> Result<GgufWeightStore, WeightStoreError> {
-        Ok(GgufWeightStore {
-            inner: self.inner.build().map_err(neutral_store_error)?,
-        })
-    }
-}
-
-/// MLX materialization adapter over the backend-neutral GGUF store.
-#[derive(Debug, Clone)]
-pub(crate) struct GgufWeightStore {
-    inner: NeutralGgufWeightStore,
-}
-
-impl GgufWeightStore {
-    pub(crate) fn builder() -> GgufWeightStoreBuilder {
-        GgufWeightStoreBuilder::default()
-    }
-
-    pub(crate) fn new_with_max_mapped_shards<F>(
-        checkpoint: GgufCheckpoint,
-        plan: &eredu_checkpoint::schema::GgufCheckpointPlan,
-        translate: F,
-        max_mapped_shards: usize,
-    ) -> Result<Self, WeightStoreError>
-    where
-        F: FnMut(&str) -> String,
-    {
-        Self::builder()
-            .max_cached_readers(max_mapped_shards)?
-            .add_checkpoint(checkpoint, plan, translate)?
-            .build()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_for_test<F>(
-        checkpoint: GgufCheckpoint,
-        translate: F,
-    ) -> Result<Self, WeightStoreError>
-    where
-        F: FnMut(&str) -> String,
-    {
-        Self::builder()
-            .add_checkpoint_for_test(checkpoint, translate)?
-            .build()
-    }
-}
-
-impl CheckpointSource for GgufWeightStore {
-    fn source_keys(&self) -> Vec<String> {
-        CheckpointSource::source_keys(&self.inner)
-    }
-
-    fn source_metadata(
-        &self,
-        key: &str,
-    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
-        CheckpointSource::source_metadata(&self.inner, key)
-    }
-
-    fn acquire_lease(
-        &self,
-        request: TensorReadRequest,
-    ) -> Result<CheckpointLease, eredu_checkpoint::store::StoreError> {
-        CheckpointSource::acquire_lease(&self.inner, request)
-    }
-
-    fn source_diagnostics(
-        &self,
-    ) -> Result<WeightStoreDiagnostics, eredu_checkpoint::store::StoreError> {
-        CheckpointSource::source_diagnostics(&self.inner)
-    }
-
-    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
-        self.inner.unclaimed_checkpoint_keys()
-    }
-
-    fn is_checkpoint_contract_resolved(&self) -> bool {
-        true
-    }
+#[cfg(test)]
+pub(crate) fn open_gguf_checkpoint_source_for_test<F>(
+    checkpoint: GgufCheckpoint,
+    translate: F,
+) -> Result<NeutralGgufWeightStore, WeightStoreError>
+where
+    F: FnMut(&str) -> String,
+{
+    let resolved = eredu_checkpoint::validation::ResolvedCheckpointPlan::for_test(
+        "test GGUF catalog",
+        checkpoint
+            .catalog()
+            .tensors()
+            .map(|tensor| tensor.descriptor().name.clone()),
+    );
+    NeutralGgufWeightStoreBuilder::default()
+        .add_resolved_checkpoint(checkpoint.catalog().clone(), &resolved, translate)
+        .map_err(neutral_store_error)?
+        .build()
+        .map_err(neutral_store_error)
 }
 
 #[cfg(test)]
@@ -1530,17 +1435,30 @@ mod tests {
         let second = dir.path().join("second.gguf");
         write_dense_gguf(&first, "text.weight", 1.0);
         write_dense_gguf(&second, "vision.weight", 2.0);
-        let builder = GgufWeightStore::builder()
-            .add_checkpoint_for_test(GgufCheckpoint::open(first).unwrap(), |_| {
+        let first = GgufCheckpoint::open(first).unwrap();
+        let first_plan = eredu_checkpoint::validation::ResolvedCheckpointPlan::for_test(
+            "first test catalog",
+            ["text.weight"],
+        );
+        let builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
+            .add_resolved_checkpoint(first.catalog().clone(), &first_plan, |_| {
                 "shared.weight".into()
             })
             .unwrap();
+        let second = GgufCheckpoint::open(second).unwrap();
+        let second_plan = eredu_checkpoint::validation::ResolvedCheckpointPlan::for_test(
+            "second test catalog",
+            ["vision.weight"],
+        );
         let error = builder
-            .add_checkpoint_for_test(GgufCheckpoint::open(second).unwrap(), |_| {
+            .add_resolved_checkpoint(second.catalog().clone(), &second_plan, |_| {
                 "shared.weight".into()
             })
             .unwrap_err();
-        assert!(matches!(error, WeightStoreError::Gguf { .. }));
+        assert!(matches!(
+            error,
+            eredu_checkpoint::store::StoreError::Gguf { .. }
+        ));
     }
 
     #[test]
@@ -1548,10 +1466,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         write_dense_gguf(&path, "value.weight", 3.0);
-        let store = GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
-            name.to_string()
-        })
-        .unwrap();
+        let store =
+            open_gguf_checkpoint_source_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+                name.to_string()
+            })
+            .unwrap();
         assert_eq!(store.source_keys(), ["value.weight"]);
         assert_eq!(
             store.source_metadata("value.weight").unwrap().logical_shape,
@@ -1584,8 +1503,9 @@ mod tests {
             CatalogPolicy::non_strict(),
         )
         .unwrap();
-        let store = GgufWeightStore::builder()
-            .add_checkpoint(GgufCheckpoint::open(path).unwrap(), &plan, str::to_string)
+        let checkpoint = GgufCheckpoint::open(path).unwrap();
+        let store = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
+            .add_checkpoint(checkpoint.catalog().clone(), &plan, str::to_string)
             .unwrap()
             .build()
             .unwrap();
@@ -1619,9 +1539,11 @@ mod tests {
                     }],
                 )
                 .unwrap();
-            let store =
-                GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), str::to_string)
-                    .unwrap();
+            let store = open_gguf_checkpoint_source_for_test(
+                GgufCheckpoint::open(path).unwrap(),
+                str::to_string,
+            )
+            .unwrap();
             let metadata = store.source_metadata("bank.weight").unwrap();
             assert_eq!(metadata.logical_shape, [2, block_bytes as usize], "{ty:?}");
             assert_eq!(metadata.stored_dtype, StoredDtype::U8, "{ty:?}");
@@ -1635,10 +1557,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         let values = write_dense_bank_gguf(&path);
-        let store = GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
-            name.to_string()
-        })
-        .unwrap();
+        let store =
+            open_gguf_checkpoint_source_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+                name.to_string()
+            })
+            .unwrap();
         let lease = store
             .acquire(
                 "bank.weight",
@@ -1679,10 +1602,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         write_affine_gguf(&path);
-        let store = GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
-            name.to_string()
-        })
-        .unwrap();
+        let store =
+            open_gguf_checkpoint_source_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+                name.to_string()
+            })
+            .unwrap();
         let error = store
             .acquire(
                 "bank.weight",
@@ -1708,10 +1632,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         write_affine_gguf(&path);
-        let store = GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
-            name.to_string()
-        })
-        .unwrap();
+        let store =
+            open_gguf_checkpoint_source_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+                name.to_string()
+            })
+            .unwrap();
         let stream = cpu_stream();
         let selection = TensorSelection::Range {
             axis: 0,
@@ -1749,10 +1674,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         write_wide_affine_gguf(&path);
-        let store = GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
-            name.to_string()
-        })
-        .unwrap();
+        let store =
+            open_gguf_checkpoint_source_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+                name.to_string()
+            })
+            .unwrap();
         let stream = cpu_stream();
         let weight = store
             .acquire_with_policy(
@@ -1811,10 +1737,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         write_wide_affine_gguf(&path);
-        let store = GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
-            name.to_string()
-        })
-        .unwrap();
+        let store =
+            open_gguf_checkpoint_source_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+                name.to_string()
+            })
+            .unwrap();
         let selection = TensorSelection::Range {
             axis: 1,
             start: 1,
@@ -1870,7 +1797,7 @@ mod tests {
             let path = dir.path().join("model.gguf");
             write_block_gguf(&path, ty, byte_len);
             let store =
-                GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
+                open_gguf_checkpoint_source_for_test(GgufCheckpoint::open(path).unwrap(), |name| {
                     name.to_string()
                 })
                 .unwrap();
