@@ -245,6 +245,12 @@ fn immutable_weight_residency_policy_is_runtime_owned() {
         "pub struct DenseDiskStreamLoadOptions",
         "pub struct DenseTransferSchedule",
         "pub enum LayerWeightResidency",
+        "pub struct ExpertCacheLoadOptions",
+        "pub struct ExpertIdentity",
+        "pub enum ExpertPass",
+        "pub enum NonExpertWeightResidency",
+        "pub enum ExpertWeightResidency",
+        "pub enum WeightResidency",
         "pub enum ExecutionResidency",
     ] {
         assert!(
@@ -256,6 +262,7 @@ fn immutable_weight_residency_policy_is_runtime_owned() {
     for relative in [
         "eredu/src/backend/mlx/runtime/execution/layerwise.rs",
         "eredu/src/backend/mlx/runtime/residency/dense_stream.rs",
+        "eredu/src/backend/mlx/runtime/residency/expert_cache.rs",
     ] {
         let source = std::fs::read_to_string(workspace.join(relative))
             .expect("MLX weight-residency realization must be readable");
@@ -265,6 +272,12 @@ fn immutable_weight_residency_policy_is_runtime_owned() {
             "pending: VecDeque<usize>",
             "ready: VecDeque<DensePreparedTransfer>",
             "pub enum LayerWeightResidency",
+            "pub struct ExpertCacheLoadOptions",
+            "pub struct ExpertIdentity",
+            "pub enum ExpertPass",
+            "pub enum NonExpertWeightResidency",
+            "pub enum ExpertWeightResidency",
+            "pub enum WeightResidency",
             "pub enum ExecutionResidency",
         ] {
             assert!(

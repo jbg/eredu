@@ -33,10 +33,8 @@ pub use config::ModelLoadOptions;
 pub(crate) use distributed::MlxDistributedConfig;
 pub use distributed::MlxDistributedSession;
 pub use runtime::distributed::topology::{PlacementPlan, RankPartition};
-pub use runtime::execution::layerwise::{
-    NonExpertWeightResidency, ParallelModelInfo, WeightResidency,
-};
-pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
+pub use runtime::execution::layerwise::ParallelModelInfo;
+pub use runtime::residency::expert_cache::ExpertCacheReport;
 pub use topology::{DeviceAssignment, MlxParallelContext};
 
 use eredu_core::backend::{

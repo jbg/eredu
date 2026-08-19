@@ -1,13 +1,10 @@
 //! Minimal sparse-cache Ring expert-parallel generation probe for supported MoE models.
 
 use eredu::{
-    backend::mlx::runtime::residency::expert_cache::ExpertCacheLoadOptions,
     backend::mlx::runtime::{generation::sampler::DefaultSampler, media::input},
-    backend::mlx::{
-        DeviceAssignment, MlxBackend, MlxParallelContext, ModelLoadOptions, WeightResidency,
-    },
+    backend::mlx::{DeviceAssignment, MlxBackend, MlxParallelContext, ModelLoadOptions},
     core::{BackendProvider as _, BackendSession as _},
-    load_model,
+    load_model, ExpertCacheLoadOptions, NonExpertWeightResidency, WeightResidency,
 };
 use safemlx::{
     distributed::{self, Backend},
@@ -32,13 +29,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
-    let options = ModelLoadOptions::with_parallel(topology)
-        .with_weight_residency(WeightResidency::with_expert_cache(
-        eredu::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(
-            Default::default(),
+    let options = ModelLoadOptions::with_parallel(topology).with_weight_residency(
+        WeightResidency::with_expert_cache(
+            NonExpertWeightResidency::LayerwiseHost(Default::default()),
+            ExpertCacheLoadOptions::default(),
         ),
-        ExpertCacheLoadOptions::default(),
-    ));
+    );
     let backend = MlxBackend::with_distributed_world(&stream, &weights_stream, &group);
     let model = load_model(&backend, &model_dir, options)?;
     if group.rank() == 0 {

@@ -13,8 +13,7 @@ use eredu::{
     backend::mlx::nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
     backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
     backend::mlx::runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCatalogEntry, ExpertIdentity, ExpertPass,
-        ExpertRouteBatch,
+        ExpertCache, ExpertCatalogEntry, ExpertRouteBatch,
     },
     composition::mlx_architectures::deepseek_v3::model::RoutedExperts,
     composition::mlx_architectures::distributed::expert::{
@@ -23,7 +22,9 @@ use eredu::{
     },
     core::residency::OffloadConfig,
 };
-use eredu_runtime::{OffloadUnit, WeightBinding};
+use eredu_runtime::{
+    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, OffloadUnit, WeightBinding,
+};
 use safemlx::{
     distributed::{self, Backend},
     module::Param,

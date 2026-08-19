@@ -1,6 +1,9 @@
 //! Checkpoint-format-independent bounded-residency execution for DeepSeek V4.
 
-use eredu_runtime::LayerWeightResidency;
+use eredu_runtime::{
+    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, LayerWeightResidency,
+    NonExpertWeightResidency, WeightResidency,
+};
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
@@ -49,8 +52,8 @@ use crate::{
         },
         residency::{
             expert_cache::{
-                ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
-                ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
+                ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
+                ExpertRouteBatch,
             },
             manager::ResidentUnitLease,
         },
@@ -1552,7 +1555,7 @@ pub fn load_deepseek_v4_layerwise_model(
 pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    residency: crate::backend::mlx::runtime::execution::layerwise::WeightResidency,
+    residency: WeightResidency,
     requested_quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1625,8 +1628,7 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV4LayerwiseModel, Vec<u32>), Error> {
-    let residency =
-        crate::backend::mlx::runtime::execution::layerwise::WeightResidency::with_layers(options);
+    let residency = WeightResidency::with_layers(options);
     crate::composition::mlx::structural::validate_gguf(
         crate::core::GgufArchitecture::DeepSeek4,
         checkpoint,
@@ -1711,7 +1713,7 @@ pub(crate) fn load_deepseek_v4_tensor_parallel_model(
 /// Loads V4 with routed experts in independent cache units.
 pub fn load_deepseek_v4_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
+    non_expert: NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     requested_quantization: Option<WeightQuantization>,
     stream: &Stream,

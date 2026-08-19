@@ -1120,10 +1120,10 @@ fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
     write_zero_llama_gguf(&path);
     let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
     let policies = [
-        crate::backend::mlx::runtime::execution::layerwise::WeightResidency::layerwise_host(
+        eredu_runtime::WeightResidency::layerwise_host(
             eredu_runtime::LayerwiseLoadOptions::default(),
         ),
-        crate::backend::mlx::runtime::execution::layerwise::WeightResidency::dense_disk_stream(
+        eredu_runtime::WeightResidency::dense_disk_stream(
             eredu_runtime::DenseDiskStreamLoadOptions::new(1 << 20, 1 << 20, 1, 1).unwrap(),
         ),
     ];

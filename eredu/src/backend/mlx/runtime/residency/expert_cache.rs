@@ -6,7 +6,10 @@
 //! deterministic global-id order, and rewritten to a temporary compact bank.
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_runtime::{OffloadUnit, ResidencyReport, WeightBinding, WeightMaterializationReport};
+use eredu_runtime::{
+    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, OffloadUnit, ResidencyReport,
+    WeightBinding, WeightMaterializationReport,
+};
 
 use std::{
     collections::BTreeMap,
@@ -33,95 +36,13 @@ use crate::{
         ResidencyError, ResidencyManager, ResidentTransfer, ResidentUnitLease,
     },
     core::residency::{
-        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec,
-        ResidencyLedgerError, ResidencyPolicy,
+        MemoryTier, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyLedgerError,
+        ResidencyPolicy,
     },
 };
 
-/// Stable architecture-neutral identity for one layer-local global expert.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ExpertIdentity {
-    /// Zero-based decoder layer identity.
-    pub layer: usize,
-    /// Global expert identity from the model router.
-    pub global_expert: usize,
-}
-
-impl ExpertIdentity {
-    /// Creates one logical expert identity.
-    pub const fn new(layer: usize, global_expert: usize) -> Self {
-        Self {
-            layer,
-            global_expert,
-        }
-    }
-
-    /// Returns the deterministic residency unit identifier.
-    pub fn unit_id(self) -> OffloadUnitId {
-        OffloadUnitId::new(format!(
-            "expert.layer.{:05}.global.{:05}",
-            self.layer, self.global_expert
-        ))
-        .expect("expert unit identifier is non-empty")
-    }
-}
-
-/// Public controls for sparse routed-expert residency.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct ExpertCacheLoadOptions {
-    /// Independent host/device budgets and eviction policy for expert units.
-    pub experts: OffloadConfig,
-    /// Hard maximum bytes for one materialized temporary compact bank.
-    pub compact_bank_scratch_bytes: u64,
-    /// Soft compact-bank target used to split multi-token prefill routing.
-    pub prefill_compact_bank_target_bytes: u64,
-}
-
-impl ExpertCacheLoadOptions {
-    /// Creates strict sparse expert caching options.
-    pub fn new(
-        experts: OffloadConfig,
-        compact_bank_scratch_bytes: u64,
-        prefill_compact_bank_target_bytes: u64,
-    ) -> Result<Self, ExpertCacheError> {
-        if compact_bank_scratch_bytes == 0 {
-            return Err(ExpertCacheError::ZeroScratchLimit);
-        }
-        if prefill_compact_bank_target_bytes == 0 {
-            return Err(ExpertCacheError::ZeroPrefillBankTarget);
-        }
-        if prefill_compact_bank_target_bytes > compact_bank_scratch_bytes {
-            return Err(ExpertCacheError::PrefillBankTargetExceedsScratch {
-                target_bytes: prefill_compact_bank_target_bytes,
-                scratch_bytes: compact_bank_scratch_bytes,
-            });
-        }
-        Ok(Self {
-            experts,
-            compact_bank_scratch_bytes,
-            prefill_compact_bank_target_bytes,
-        })
-    }
-}
-
-impl Default for ExpertCacheLoadOptions {
-    fn default() -> Self {
-        Self {
-            experts: OffloadConfig::default(),
-            compact_bank_scratch_bytes: u64::MAX,
-            prefill_compact_bank_target_bytes: 1 << 30,
-        }
-    }
-}
-
-/// Public execution-path classification for independent cache statistics.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum ExpertPass {
-    /// Prompt processing with more than one input token.
-    Prefill,
-    /// Autoregressive processing of one input token.
-    Decode,
-}
+#[cfg(test)]
+use crate::core::residency::OffloadConfig;
 
 /// One routed hidden-state batch and its layer-local expert assignments.
 #[derive(Debug, Clone, Copy)]
@@ -636,18 +557,7 @@ impl ExpertCache {
         weight_quantization: Option<WeightQuantization>,
         materialization: Option<WeightMaterializationReport>,
     ) -> Result<Self, ExpertCacheError> {
-        if options.compact_bank_scratch_bytes == 0 {
-            return Err(ExpertCacheError::ZeroScratchLimit);
-        }
-        if options.prefill_compact_bank_target_bytes == 0 {
-            return Err(ExpertCacheError::ZeroPrefillBankTarget);
-        }
-        if options.prefill_compact_bank_target_bytes > options.compact_bank_scratch_bytes {
-            return Err(ExpertCacheError::PrefillBankTargetExceedsScratch {
-                target_bytes: options.prefill_compact_bank_target_bytes,
-                scratch_bytes: options.compact_bank_scratch_bytes,
-            });
-        }
+        options.validate()?;
         let mut catalog = BTreeMap::new();
         let mut definitions = Vec::new();
         let mut specs = Vec::new();
@@ -1279,6 +1189,9 @@ impl AcquiredExperts {
 /// Structured sparse expert cache failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ExpertCacheError {
+    /// Backend-neutral routed-expert placement controls were invalid.
+    #[error(transparent)]
+    Policy(#[from] eredu_runtime::WeightResidencyPolicyError),
     /// Bounded expert materialisation failed before cache construction.
     #[error("bounded expert materialisation failed: {source}")]
     Transformation {
@@ -1300,20 +1213,6 @@ pub enum ExpertCacheError {
     EmptyRoutedBank {
         /// Model family reporting the invalid router output.
         architecture: &'static str,
-    },
-    /// Compact-bank scratch accounting was disabled with a zero limit.
-    #[error("sparse expert compact-bank scratch limit must be nonzero")]
-    ZeroScratchLimit,
-    /// Prefill compact-bank chunking was disabled with a zero target.
-    #[error("sparse expert prefill compact-bank target must be nonzero")]
-    ZeroPrefillBankTarget,
-    /// The soft prefill target exceeded the hard scratch limit.
-    #[error("sparse expert prefill compact-bank target {target_bytes} exceeds scratch limit {scratch_bytes}")]
-    PrefillBankTargetExceedsScratch {
-        /// Requested soft prefill target.
-        target_bytes: u64,
-        /// Configured hard scratch limit.
-        scratch_bytes: u64,
     },
     /// One logical expert declared no materialized bytes.
     #[error("expert {identity:?} must contain at least one byte")]
@@ -1774,11 +1673,13 @@ mod tests {
         let experts = OffloadConfig::new(Some(48), Some(0), 1).unwrap();
         assert!(matches!(
             ExpertCacheLoadOptions::new(experts, 64, 0),
-            Err(ExpertCacheError::ZeroPrefillBankTarget)
+            Err(eredu_runtime::WeightResidencyPolicyError::ZeroExpertPrefillBankTarget)
         ));
         assert!(matches!(
             ExpertCacheLoadOptions::new(experts, 64, 65),
-            Err(ExpertCacheError::PrefillBankTargetExceedsScratch { .. })
+            Err(
+                eredu_runtime::WeightResidencyPolicyError::ExpertPrefillBankTargetExceedsScratch { .. }
+            )
         ));
     }
 

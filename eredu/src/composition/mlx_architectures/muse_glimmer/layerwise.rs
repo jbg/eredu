@@ -1,6 +1,9 @@
 //! Bounded layer execution for the shared Muse-Glimmer decoder.
 
-use eredu_runtime::LayerWeightResidency;
+use eredu_runtime::{
+    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, LayerWeightResidency,
+    NonExpertWeightResidency, WeightResidency,
+};
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
@@ -66,12 +69,11 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
         open_safetensors_weight_store, ArchitectureAdapter, LayerwiseForwardState, LayerwiseModel,
-        LoadTimeQuantizableAdapter, SharedWeightStore, StaticUnitBindings, WeightResidency,
+        LoadTimeQuantizableAdapter, SharedWeightStore, StaticUnitBindings,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
-        ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
+        ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch,
     },
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
     core::cache::{
@@ -897,7 +899,7 @@ pub(crate) fn prepare_gguf_pipeline_source(
 /// Loads sparse Qwen3 with independently cached experts and bounded non-expert units.
 pub fn load_qwen3_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
+    non_expert: NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,

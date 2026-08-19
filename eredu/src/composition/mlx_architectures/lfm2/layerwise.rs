@@ -1,6 +1,9 @@
 //! Unified fully resident and bounded layer execution for LFM2/LFM2.5.
 
-use eredu_runtime::LayerWeightResidency;
+use eredu_runtime::{
+    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, LayerWeightResidency,
+    NonExpertWeightResidency, WeightResidency,
+};
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
@@ -62,12 +65,10 @@ use crate::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
-        WeightResidency,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass, ExpertRouteBatch,
+        ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch,
     },
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx_architectures::lfm2::model::{
@@ -794,7 +795,7 @@ pub(crate) fn load_lfm2_sparse_tp_ep_base_with_store(
 /// Loads MoE LFM2 with independently cached experts and bounded non-expert units.
 pub fn load_lfm2_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
+    non_expert: NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,

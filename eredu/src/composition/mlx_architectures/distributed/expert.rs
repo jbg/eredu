@@ -47,8 +47,8 @@ use crate::{
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::input as runtime_input,
     backend::mlx::runtime::residency::expert_cache::{
-        AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
-        ExpertCatalogEntry, ExpertPass, ExpertRouteBatch,
+        AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
+        ExpertRouteBatch,
     },
     backend::mlx::{MlxParallelContext, ModelLoadOptions},
     composition::mlx::speculative::embedded::{
@@ -74,11 +74,12 @@ use crate::{
     core::ModelKind,
     core::{MtpCapability, MtpCheckpointKind, MtpStats},
 };
-use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
-
 #[cfg(test)]
-use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;
-use eredu_runtime::LayerWeightResidency;
+use eredu_runtime::NonExpertWeightResidency;
+use eredu_runtime::{
+    CacheResidencyPolicy, CacheResidencyReport, ExpertCacheLoadOptions, ExpertPass,
+    LayerWeightResidency, PagedCacheOptions, WeightResidency,
+};
 
 use crate::{
     backend::mlx::nn::moe::{quantize_expert_bank, PackedSwiGluExperts},
@@ -3363,8 +3364,7 @@ fn load_gguf_ep(
     if architecture == "deepseek4" {
         let mut structural_options = options;
         structural_options.parallel = None;
-        structural_options.weight_residency =
-            crate::backend::mlx::runtime::execution::layerwise::WeightResidency::fully_resident();
+        structural_options.weight_residency = WeightResidency::fully_resident();
         crate::composition::mlx::structural::validate_gguf(
             crate::core::GgufArchitecture::DeepSeek4,
             checkpoint,
@@ -5168,7 +5168,7 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
             quantization: None,
             parallel: Some(topology),
             weight_residency: WeightResidency::with_expert_cache(
-                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(Default::default()),
+                NonExpertWeightResidency::LayerwiseHost(Default::default()),
                 expert_options,
             ),
         },
@@ -5190,7 +5190,7 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
             quantization: None,
             parallel: Some(topology),
             weight_residency: WeightResidency::with_expert_cache(
-                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::FullyResident,
+                NonExpertWeightResidency::FullyResident,
                 expert_options,
             ),
         },
@@ -5215,7 +5215,7 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
             quantization: None,
             parallel: Some(topology),
             weight_residency: WeightResidency::with_expert_cache(
-                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::DenseDiskStream(dense),
+                NonExpertWeightResidency::DenseDiskStream(dense),
                 expert_options,
             ),
         },
@@ -5258,7 +5258,7 @@ pub(crate) fn assert_rank_owned_quantized_sparse_ep_load(
         ModelLoadOptions::with_quantization(quantization)
             .with_parallel_topology(topology)
             .with_weight_residency(WeightResidency::with_expert_cache(
-                crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency::LayerwiseHost(Default::default()),
+                NonExpertWeightResidency::LayerwiseHost(Default::default()),
                 expert_options,
             )),
         stream,

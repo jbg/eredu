@@ -1,6 +1,9 @@
 //! Shared bounded layer execution for Qwen3-Next and Qwen3.5 text models.
 
-use eredu_runtime::LayerWeightResidency;
+use eredu_runtime::{
+    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, LayerWeightResidency,
+    NonExpertWeightResidency, WeightResidency,
+};
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
@@ -58,12 +61,10 @@ use crate::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
-        WeightResidency,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass, ExpertRouteBatch,
+        ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch,
     },
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx_architectures::qwen::{
@@ -1506,7 +1507,7 @@ fn load_qwen_hybrid_gguf_sparse_with_store(
 /// Loads Qwen3-Next with independently cached experts and bounded non-expert units.
 pub fn load_qwen3_next_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
+    non_expert: NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
@@ -1540,7 +1541,7 @@ pub fn load_qwen3_next_expert_cache_model(
 /// Loads Qwen3.5 MoE with independently cached experts and bounded non-expert units.
 pub fn load_qwen35_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
+    non_expert: NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,

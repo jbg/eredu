@@ -1,6 +1,9 @@
 //! Bounded layer execution for DeepSeek-V3 and DeepSeek-R1 checkpoints.
 
-use eredu_runtime::LayerWeightResidency;
+use eredu_runtime::{
+    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, LayerWeightResidency,
+    NonExpertWeightResidency, WeightResidency,
+};
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
@@ -55,13 +58,11 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
-        NonExpertWeightResidency, StaticUnitBindings, WeightResidency,
+        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
-        ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
+        ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch,
     },
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx_architectures::deepseek_v3::model::{

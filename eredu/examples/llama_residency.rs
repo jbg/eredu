@@ -6,10 +6,10 @@ use clap::Parser;
 use eredu::{
     backend::mlx::nn::generation::sample,
     backend::mlx::runtime::media::input,
-    backend::mlx::{MlxBackend, ModelLoadOptions, WeightResidency},
+    backend::mlx::{MlxBackend, ModelLoadOptions},
     core::residency::{MemoryTier, OffloadConfig, TransferDirection},
     core::{BackendProvider as _, BackendSession as _},
-    load_model, DenseDiskStreamLoadOptions, LayerwiseLoadOptions,
+    load_model, DenseDiskStreamLoadOptions, LayerwiseLoadOptions, WeightResidency,
 };
 use safemlx::{Array, Device, DeviceType, ExecutionContext};
 

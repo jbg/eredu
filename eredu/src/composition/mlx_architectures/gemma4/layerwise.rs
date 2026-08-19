@@ -1,6 +1,6 @@
 //! Text-decoder bounded layer execution for Gemma 4 checkpoints.
 
-use eredu_runtime::LayerWeightResidency;
+use eredu_runtime::{ExpertIdentity, ExpertPass, LayerWeightResidency, WeightResidency};
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
@@ -60,12 +60,11 @@ use crate::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
-        WeightResidency,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
-        ExpertIdentity, ExpertPass, ExpertRouteBatch,
+        ExpertRouteBatch,
     },
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx_architectures::gemma4::{

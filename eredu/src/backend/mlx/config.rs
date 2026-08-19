@@ -3,7 +3,7 @@
 use eredu_checkpoint::WeightQuantization;
 
 use crate::backend::mlx::error::Error;
-use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;
+use eredu_runtime::WeightResidency;
 
 use super::MlxParallelContext;
 
@@ -119,7 +119,7 @@ mod tests {
     use eredu_runtime::LayerwiseLoadOptions;
 
     use super::ModelLoadOptions;
-    use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;
+    use eredu_runtime::WeightResidency;
 
     #[test]
     fn deepseek_v4_quantization_composes_with_nonresident_layers() {

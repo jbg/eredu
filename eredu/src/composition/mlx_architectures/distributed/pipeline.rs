@@ -91,7 +91,7 @@ use crate::{
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
     backend::mlx::runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertPass,
+        ExpertCache, ExpertCacheReport, ExpertCatalogEntry,
     },
     backend::mlx::runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, ResidencyManager,
@@ -138,14 +138,14 @@ use crate::{
     core::ParallelCoordinates,
     core::{MtpCapability, MtpCheckpointKind},
 };
-use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
+use eredu_runtime::{
+    CacheResidencyPolicy, CacheResidencyReport, ExpertCacheLoadOptions, ExpertPass,
+    PagedCacheOptions, WeightResidency,
+};
 
 use eredu_core::MtpStats;
 use eredu_runtime::ExecutionGroupReadySet;
 use eredu_runtime::ResidentLayerGroup;
-
-#[cfg(test)]
-use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;
 
 use safemlx::ops::indexing::TryIndexOp;
 
@@ -8134,8 +8134,7 @@ pub(crate) fn load_pipeline_model_with_options(
         // the pipeline planner below. Whole-model GGUF policy must therefore
         // validate the artifact geometry without reapplying the standalone
         // nonresident-loader restriction.
-        structural_options.weight_residency =
-            crate::backend::mlx::runtime::execution::layerwise::WeightResidency::fully_resident();
+        structural_options.weight_residency = WeightResidency::fully_resident();
         crate::composition::mlx::structural::validate_gguf(
             architecture,
             &checkpoint,

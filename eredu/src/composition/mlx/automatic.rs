@@ -26,12 +26,14 @@ use super::{
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::{
-        execution::layerwise::{LayerwiseModelError, NonExpertWeightResidency, WeightResidency},
-        residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport},
+        execution::layerwise::LayerwiseModelError, residency::expert_cache::ExpertCacheReport,
     },
 };
 use eredu_core::residency::{MemoryTier, OffloadConfig, TransferDirection};
-use eredu_runtime::{DenseDiskStreamLoadOptions, LayerwiseLoadOptions, ResidencyReport};
+use eredu_runtime::{
+    DenseDiskStreamLoadOptions, ExpertCacheLoadOptions, LayerwiseLoadOptions,
+    NonExpertWeightResidency, ResidencyReport, WeightResidency,
+};
 
 /// MLX automatic-planning adapter and whole-session backend factory.
 #[derive(Debug, Clone, Copy, Default)]

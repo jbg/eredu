@@ -1,6 +1,9 @@
 //! Shared bounded layer execution for dense and MoE Qwen3-VL models.
 
-use eredu_runtime::LayerWeightResidency;
+use eredu_runtime::{
+    ExpertCacheLoadOptions, ExpertPass, LayerWeightResidency, NonExpertWeightResidency,
+    WeightResidency,
+};
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
@@ -55,11 +58,10 @@ use crate::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
-        WeightResidency,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass, ExpertRouteBatch,
+        ExpertCache, ExpertCacheReport, ExpertRouteBatch,
     },
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx_architectures::qwen::dense::{
@@ -713,7 +715,7 @@ pub(crate) fn qwen3_vl_gguf_store(
 /// Loads Qwen3-VL-MoE with independently cached experts and bounded non-expert units.
 pub fn load_qwen3_vl_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
+    non_expert: NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,

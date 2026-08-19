@@ -1,6 +1,9 @@
 //! Bounded-residency execution for Kimi Linear safetensors and GGUF checkpoints.
 
-use eredu_runtime::LayerWeightResidency;
+use eredu_runtime::{
+    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, LayerWeightResidency,
+    NonExpertWeightResidency, WeightResidency,
+};
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
@@ -59,13 +62,10 @@ use crate::{
             load_layerwise_model, load_layerwise_model_with_quantization,
             load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
             ArchitectureAdapter, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
-            StaticUnitBindings, WeightResidency,
+            StaticUnitBindings,
         },
         residency::{
-            expert_cache::{
-                ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry,
-                ExpertIdentity, ExpertPass, ExpertRouteBatch,
-            },
+            expert_cache::{ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch},
             manager::ResidentUnitLease,
         },
     },
@@ -826,7 +826,7 @@ pub(crate) fn load_kimi_linear_gguf_layerwise_model(
 /// expert-parallel execution and returns the shared lazy checkpoint store.
 pub fn load_kimi_linear_expert_cache_model(
     model_dir: impl AsRef<Path>,
-    non_expert: crate::backend::mlx::runtime::execution::layerwise::NonExpertWeightResidency,
+    non_expert: NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
