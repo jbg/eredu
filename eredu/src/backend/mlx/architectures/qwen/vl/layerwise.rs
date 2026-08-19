@@ -71,8 +71,10 @@ use crate::{
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
+    backend::mlx::runtime::residency::manager::ResidentUnitLease,
 };
+
+use eredu_runtime::ResidencyReport;
 
 const VISION_STATIC_UNIT: &str = "qwen3_vl.static.vision";
 const EMBEDDING_UNIT: &str = "qwen3_vl.static.embedding";

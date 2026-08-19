@@ -4129,9 +4129,7 @@ fn load_external_gguf_ep(
     }
 }
 
-fn planned_replicated_bytes(
-    report: &crate::backend::mlx::runtime::residency::manager::ResidencyReport,
-) -> Result<usize, Error> {
+fn planned_replicated_bytes(report: &eredu_runtime::ResidencyReport) -> Result<usize, Error> {
     let bytes = report.units().iter().try_fold(0u64, |total, unit| {
         total
             .checked_add(unit.expected_bytes())

@@ -12,7 +12,7 @@
 
 use eredu_architectures::llama::ModelArgs as LlamaModelArgs;
 use eredu_checkpoint::WeightQuantization;
-use eredu_runtime::{OffloadUnit, WeightBinding};
+use eredu_runtime::{OffloadUnit, ResidencyReport, WeightBinding, WeightMaterializationReport};
 
 mod placement;
 
@@ -93,7 +93,6 @@ use crate::{
         binding_bytes, materialize_module_bindings, populate_module_from_arrays_excluding,
         populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
     },
-    backend::mlx::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
     backend::mlx::runtime::checkpoint::quantization::{quantize_tensor, should_quantize_on_load},
     backend::mlx::runtime::checkpoint::store::{
         GgufWeightStore, WeightStore, WeightStoreDiagnostics,
@@ -118,7 +117,7 @@ use crate::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertPass,
     },
     backend::mlx::runtime::residency::manager::{
-        host_capacity_upper_bound_for_bindings, ResidencyManager, ResidencyReport,
+        host_capacity_upper_bound_for_bindings, ResidencyManager,
     },
     backend::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
@@ -252,7 +251,7 @@ pub struct PipelineStageInfo {
     pub checkpoint_diagnostics: Option<WeightStoreDiagnostics>,
     /// Bounded stage-local load-time materialization telemetry, when dense
     /// semantic weights were converted into a packed overlay.
-    pub materialization: Option<BoundedQuantizationReport>,
+    pub materialization: Option<WeightMaterializationReport>,
 }
 
 /// Rank-local ownership projected from the authoritative placed DAG.
@@ -1790,7 +1789,7 @@ struct PipelineLayerStorage {
     units: Vec<OffloadUnitId>,
     execution_offset: usize,
     independent_expert_prefix: Option<&'static str>,
-    materialization: Option<BoundedQuantizationReport>,
+    materialization: Option<WeightMaterializationReport>,
     sample_mlx_memory: bool,
     sample_process_memory: bool,
 }
@@ -7769,7 +7768,7 @@ fn build_pipeline_layer_storage<L, F, B>(
     range: Range<usize>,
     options: PipelineLayerLoadOptions,
     static_device_bytes: u64,
-    materialization: Option<BoundedQuantizationReport>,
+    materialization: Option<WeightMaterializationReport>,
     stream: &Stream,
     weights_stream: &Stream,
     mut make_layer: F,

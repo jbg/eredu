@@ -6,7 +6,7 @@
 //! deterministic global-id order, and rewritten to a temporary compact bank.
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_runtime::{OffloadUnit, WeightBinding};
+use eredu_runtime::{OffloadUnit, ResidencyReport, WeightBinding, WeightMaterializationReport};
 
 use std::{
     collections::BTreeMap,
@@ -24,14 +24,13 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::{
         bounded_quantization::{
-            BoundedQuantizationPlan, BoundedQuantizationReport, BoundedQuantizationTarget,
-            BoundedQuantizedWeightStore,
+            BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
         },
         recipe::RecipeDtype,
         store::{TensorSelection, WeightStore},
     },
     backend::mlx::runtime::residency::manager::{
-        ResidencyError, ResidencyManager, ResidencyReport, ResidentTransfer, ResidentUnitLease,
+        ResidencyError, ResidencyManager, ResidentTransfer, ResidentUnitLease,
     },
     core::residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec,
@@ -207,7 +206,7 @@ pub(crate) struct QuantizedExpertCatalog {
     /// Expert units rebuilt against the packed store.
     pub entries: Vec<ExpertCatalogEntry>,
     /// Deterministic bounded-materialisation telemetry.
-    pub report: BoundedQuantizationReport,
+    pub report: WeightMaterializationReport,
 }
 
 /// Quantizes every floating expert projection through its authoritative
@@ -462,7 +461,7 @@ pub struct ExpertCacheReport {
     pub residency: ResidencyReport,
     /// Bounded load-time expert materialisation telemetry, when the catalog
     /// was transformed from floating checkpoint weights.
-    pub materialization: Option<BoundedQuantizationReport>,
+    pub materialization: Option<WeightMaterializationReport>,
 }
 
 #[derive(Default)]
@@ -492,7 +491,7 @@ pub struct ExpertCache {
     prefill_bank_target: u64,
     statistics: Mutex<ExpertStatistics>,
     weight_quantization: Option<WeightQuantization>,
-    materialization: Option<BoundedQuantizationReport>,
+    materialization: Option<WeightMaterializationReport>,
 }
 
 impl ExpertCache {
@@ -635,7 +634,7 @@ impl ExpertCache {
         source_stream: Stream,
         device_stream: Stream,
         weight_quantization: Option<WeightQuantization>,
-        materialization: Option<BoundedQuantizationReport>,
+        materialization: Option<WeightMaterializationReport>,
     ) -> Result<Self, ExpertCacheError> {
         if options.compact_bank_scratch_bytes == 0 {
             return Err(ExpertCacheError::ZeroScratchLimit);
@@ -1642,7 +1641,7 @@ mod tests {
         assert_eq!(report.owned_bytes, 320);
         assert_eq!(
             report.materialization,
-            Some(BoundedQuantizationReport {
+            Some(WeightMaterializationReport {
                 admitted_working_set_bytes: 320,
                 transformed_weights: 4,
                 source_tiles: 8,

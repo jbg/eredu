@@ -4,11 +4,105 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeCatalog, RecipeError},
-    store::TensorSelection,
+    store::{TensorSelection, WeightStoreDiagnostics},
 };
 use eredu_core::residency::{
-    MemoryTier, OffloadPlan, OffloadUnitId, PrefetchOutcome, ResidencyLedger, UnitResidencyReport,
+    MemoryTier, OffloadPlan, OffloadReport, OffloadUnitId, PrefetchOutcome, ResidencyLedger,
+    UnitResidencyReport,
 };
+
+/// Deterministic telemetry from one bounded weight-materialization pass.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct WeightMaterializationReport {
+    /// Planner ceiling for simultaneously live conversion data.
+    pub admitted_working_set_bytes: u64,
+    /// Number of dense semantic matrices transformed.
+    pub transformed_weights: usize,
+    /// Number of independently evaluated source row tiles.
+    pub source_tiles: usize,
+    /// Largest number of submitted tile completions retained simultaneously.
+    pub peak_in_flight_tiles: usize,
+    /// Total logical dense bytes selected from the source store.
+    pub source_bytes_read: u64,
+    /// Total encoded output bytes written to persistent storage.
+    pub output_bytes: u64,
+    /// Largest conservative conversion working set admitted for one tile.
+    pub peak_planned_working_set_bytes: u64,
+    /// Largest source recipe output tile.
+    pub largest_source_tile_bytes: u64,
+    /// Largest encoded output tile written together.
+    pub largest_output_tile_bytes: u64,
+}
+
+/// Immutable residency-control and checkpoint-storage telemetry snapshot.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ResidencyReport {
+    initialized: bool,
+    offload: OffloadReport,
+    units: Vec<UnitResidencyReport>,
+    active_window: Vec<OffloadUnitId>,
+    weight_store: WeightStoreDiagnostics,
+    materialization: Option<WeightMaterializationReport>,
+}
+
+impl ResidencyReport {
+    /// Creates a report from one coherent controller and storage snapshot.
+    pub fn new(
+        initialized: bool,
+        offload: OffloadReport,
+        units: Vec<UnitResidencyReport>,
+        active_window: Vec<OffloadUnitId>,
+        weight_store: WeightStoreDiagnostics,
+    ) -> Self {
+        Self {
+            initialized,
+            offload,
+            units,
+            active_window,
+            weight_store,
+            materialization: None,
+        }
+    }
+
+    /// Returns whether explicit initialization completed successfully.
+    pub const fn initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Returns the immutable offload telemetry snapshot.
+    pub const fn offload(&self) -> &OffloadReport {
+        &self.offload
+    }
+
+    /// Returns unit states in identifier order.
+    pub fn units(&self) -> &[UnitResidencyReport] {
+        &self.units
+    }
+
+    /// Returns the protected execution window in identifier order.
+    pub fn active_window(&self) -> &[OffloadUnitId] {
+        &self.active_window
+    }
+
+    /// Returns storage diagnostics, distinct from logical residency telemetry.
+    pub const fn weight_store(&self) -> &WeightStoreDiagnostics {
+        &self.weight_store
+    }
+
+    /// Returns bounded load-time materialization telemetry for these units.
+    pub const fn materialization(&self) -> Option<&WeightMaterializationReport> {
+        self.materialization.as_ref()
+    }
+
+    /// Attaches bounded load-time materialization telemetry.
+    pub fn with_materialization(
+        mut self,
+        materialization: Option<WeightMaterializationReport>,
+    ) -> Self {
+        self.materialization = materialization;
+        self
+    }
+}
 
 /// One named checkpoint selection within an atomic resident unit.
 #[derive(Debug, Clone, Eq, PartialEq)]

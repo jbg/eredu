@@ -633,10 +633,7 @@ impl Model {
     }
 
     /// Returns residency telemetry when this model uses bounded layer execution.
-    pub fn residency_report(
-        &self,
-    ) -> Result<Option<crate::backend::mlx::runtime::residency::manager::ResidencyReport>, Error>
-    {
+    pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
         match self {
             Self::DeepSeekV3(model) => Ok(Some(model.residency_report()?)),
             Self::DeepSeekV4(_) => Ok(None),

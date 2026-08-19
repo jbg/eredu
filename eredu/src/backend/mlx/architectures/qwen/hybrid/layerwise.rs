@@ -80,9 +80,11 @@ use crate::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
         ExpertPass, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
+    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     core::attention::AttentionPolicy,
 };
+
+use eredu_runtime::ResidencyReport;
 
 const EMBEDDING_UNIT: &str = "qwen_hybrid.static.embedding";
 const NORM_UNIT: &str = "qwen_hybrid.static.norm";

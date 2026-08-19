@@ -27,8 +27,7 @@ use crate::{
     backend::mlx::residency::sample_allocator_memory,
     backend::mlx::runtime::checkpoint::recipe::{MlxWeightRecipeExt, WeightRecipeError},
     backend::mlx::runtime::checkpoint::store::{
-        PendingWeightMaterialization, WeightReadPolicy, WeightStore, WeightStoreDiagnostics,
-        WeightStoreError,
+        PendingWeightMaterialization, WeightReadPolicy, WeightStore, WeightStoreError,
     },
     core::residency::{
         EvictedResidencyCopy, MemoryTier, OffloadPlan, OffloadReport, OffloadUnitId,
@@ -40,6 +39,7 @@ use eredu_runtime::residency::{
     OffloadUnit, ResidencyController, ResidencyControllerError, ResidencyWindowError,
     ResidencyWindowManager, WeightBinding,
 };
+use eredu_runtime::ResidencyReport;
 
 /// A resident unit that prevents eviction of one tier until it is dropped.
 pub struct ResidentUnitLease {
@@ -388,60 +388,6 @@ pub enum ResidencyError {
     /// Serialized manager state was poisoned by a prior panic.
     #[error("residency manager state is poisoned")]
     StatePoisoned,
-}
-
-/// Immutable manager, telemetry, and store diagnostic snapshot.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ResidencyReport {
-    initialized: bool,
-    offload: OffloadReport,
-    units: Vec<UnitResidencyReport>,
-    active_window: Vec<OffloadUnitId>,
-    weight_store: WeightStoreDiagnostics,
-    materialization: Option<
-        crate::backend::mlx::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
-    >,
-}
-
-impl ResidencyReport {
-    /// Returns whether explicit initialization completed successfully.
-    pub const fn initialized(&self) -> bool {
-        self.initialized
-    }
-    /// Returns the immutable offload telemetry snapshot.
-    pub const fn offload(&self) -> &OffloadReport {
-        &self.offload
-    }
-    /// Returns unit states in identifier order.
-    pub fn units(&self) -> &[UnitResidencyReport] {
-        &self.units
-    }
-    /// Returns the protected execution window in identifier order.
-    pub fn active_window(&self) -> &[OffloadUnitId] {
-        &self.active_window
-    }
-    /// Returns storage diagnostics, distinct from logical residency telemetry.
-    pub const fn weight_store(&self) -> &WeightStoreDiagnostics {
-        &self.weight_store
-    }
-    /// Returns bounded load-time materialization telemetry for these units.
-    pub const fn materialization(
-        &self,
-    ) -> Option<
-        &crate::backend::mlx::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
-    > {
-        self.materialization.as_ref()
-    }
-
-    pub(crate) fn with_materialization(
-        mut self,
-        materialization: Option<
-            crate::backend::mlx::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
-        >,
-    ) -> Self {
-        self.materialization = materialization;
-        self
-    }
 }
 
 /// Serialized, shareable manager for immutable checkpoint weight residency.
@@ -903,14 +849,13 @@ impl ResidencyManager {
     /// Returns an immutable point-in-time residency and storage report.
     pub fn report(&self) -> Result<ResidencyReport, ResidencyError> {
         let (initialized, offload, units, active_window) = self.telemetry_snapshot()?;
-        Ok(ResidencyReport {
+        Ok(ResidencyReport::new(
             initialized,
             offload,
             units,
             active_window,
-            weight_store: self.inner.store.diagnostics()?,
-            materialization: None,
-        })
+            self.inner.store.diagnostics()?,
+        ))
     }
 
     pub(crate) fn telemetry_snapshot(

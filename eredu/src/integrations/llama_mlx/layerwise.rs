@@ -62,9 +62,11 @@ use crate::{
         LayerwiseModelMetadata, LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
     },
     backend::mlx::runtime::media::input,
-    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
+    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     integrations::llama_mlx::model::{self as resident, AttentionInput, TransformerBlock},
 };
+
+use eredu_runtime::ResidencyReport;
 
 const EMBEDDING_UNIT: &str = "llama.static.embedding";
 const NORM_UNIT: &str = "llama.static.norm";

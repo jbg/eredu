@@ -72,8 +72,10 @@ use crate::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
         ExpertPass, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
+    backend::mlx::runtime::residency::manager::ResidentUnitLease,
 };
+
+use eredu_runtime::ResidencyReport;
 
 const EMBEDDING_UNIT: &str = "lfm2.static.embedding";
 const NORM_UNIT: &str = "lfm2.static.norm";

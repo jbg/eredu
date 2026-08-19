@@ -75,9 +75,11 @@ use crate::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
         ExpertIdentity, ExpertPass, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
+    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     core::attention::AttentionPolicy,
 };
+
+use eredu_runtime::ResidencyReport;
 
 const EMBEDDING_UNIT: &str = "gemma4.static.embedding";
 const PER_LAYER_EMBEDDING_UNIT: &str = "gemma4.static.per_layer_embedding";

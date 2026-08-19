@@ -30,8 +30,7 @@ use crate::{
         populate_module_from_lease, ModuleBindingError,
     },
     backend::mlx::runtime::checkpoint::bounded_quantization::{
-        BoundedQuantizationPlan, BoundedQuantizationReport, BoundedQuantizationTarget,
-        BoundedQuantizedWeightStore,
+        BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
     },
     backend::mlx::runtime::checkpoint::recipe::RecipeDtype,
     backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
@@ -40,8 +39,8 @@ use crate::{
         BackgroundLayerPrefetch, DenseDiskStreamLoadOptions, DENSE_TRANSFER_WINDOW,
     },
     backend::mlx::runtime::residency::manager::{
-        host_capacity_upper_bound_for_bindings, ResidencyError, ResidencyManager, ResidencyReport,
-        ResidentTransfer, ResidentUnitLease,
+        host_capacity_upper_bound_for_bindings, ResidencyError, ResidencyManager, ResidentTransfer,
+        ResidentUnitLease,
     },
     core::residency::BackgroundPrefetchReport,
     core::residency::{
@@ -50,7 +49,7 @@ use crate::{
     },
 };
 
-use eredu_runtime::ResidentLayerGroup;
+use eredu_runtime::{ResidencyReport, ResidentLayerGroup, WeightMaterializationReport};
 
 #[cfg(test)]
 use crate::backend::mlx::runtime::checkpoint::store::MemoryWeightStore;
@@ -736,7 +735,7 @@ impl DensePassReport {
 impl DenseDiskStreamReport {
     pub(crate) fn with_materialization(
         mut self,
-        materialization: Option<BoundedQuantizationReport>,
+        materialization: Option<WeightMaterializationReport>,
     ) -> Self {
         self.residency = self.residency.with_materialization(materialization);
         self
@@ -1509,7 +1508,7 @@ pub struct LayerwiseModelMetadata {
     maximum_device_layer_bytes: u64,
     maximum_host_layer_bytes: u64,
     device_layer_capacity: usize,
-    materialization: Option<BoundedQuantizationReport>,
+    materialization: Option<WeightMaterializationReport>,
 }
 
 /// Architecture-neutral information for a rank-local parallel model.
@@ -1601,7 +1600,7 @@ impl LayerwiseModelMetadata {
 
     /// Returns bounded load-time materialization telemetry when dense semantic
     /// weights were converted into a packed disk overlay.
-    pub const fn materialization(&self) -> Option<&BoundedQuantizationReport> {
+    pub const fn materialization(&self) -> Option<&WeightMaterializationReport> {
         self.materialization.as_ref()
     }
 }
@@ -3774,7 +3773,7 @@ fn quantize_layerwise_store<A>(
     target_adapter: &A,
     quantization: WeightQuantization,
     stream: &Stream,
-) -> Result<(SharedWeightStore, BoundedQuantizationReport), Error>
+) -> Result<(SharedWeightStore, WeightMaterializationReport), Error>
 where
     A: ArchitectureAdapter,
 {
@@ -4014,7 +4013,7 @@ pub(crate) fn quantize_pipeline_stage_store<A>(
     selection: PipelineStageQuantizationSelection<'_>,
     quantization: WeightQuantization,
     stream: &Stream,
-) -> Result<(SharedWeightStore, BoundedQuantizationReport), Error>
+) -> Result<(SharedWeightStore, WeightMaterializationReport), Error>
 where
     A: ArchitectureAdapter,
 {

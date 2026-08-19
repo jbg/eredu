@@ -69,8 +69,10 @@ use crate::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
         ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
+    backend::mlx::runtime::residency::manager::ResidentUnitLease,
 };
+
+use eredu_runtime::ResidencyReport;
 
 const EMBEDDING_UNIT: &str = "inkling.static.embedding";
 const EMBED_NORM_UNIT: &str = "inkling.static.embed_norm";

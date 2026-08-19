@@ -24,8 +24,9 @@ pub use parameter::{
 };
 pub use residency::{
     DeviceLayerWindow, OffloadUnit, ResidencyController, ResidencyControllerError,
-    ResidencyDeclarationError, ResidencyWindowError, ResidencyWindowManager, ResidentLayerGroup,
-    ResidentLayerGroupReport, WeightBinding, WeightBindingSelectionError,
+    ResidencyDeclarationError, ResidencyReport, ResidencyWindowError, ResidencyWindowManager,
+    ResidentLayerGroup, ResidentLayerGroupReport, WeightBinding, WeightBindingSelectionError,
+    WeightMaterializationReport,
 };
 
 /// Inspectable architecture/runtime topology without backend-native values.

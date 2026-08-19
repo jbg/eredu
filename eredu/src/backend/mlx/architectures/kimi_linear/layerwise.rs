@@ -63,10 +63,12 @@ use crate::{
                 ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry,
                 ExpertIdentity, ExpertPass, ExpertRouteBatch,
             },
-            manager::{ResidencyReport, ResidentUnitLease},
+            manager::ResidentUnitLease,
         },
     },
 };
+
+use eredu_runtime::ResidencyReport;
 
 use super::model::{
     self as resident, Cache, DecoderLayer, FeedForward, FeedForwardPolicy, ModelArgs,

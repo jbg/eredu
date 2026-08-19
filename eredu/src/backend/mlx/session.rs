@@ -310,10 +310,7 @@ impl<'a> MlxModelSession<'a> {
     }
 
     /// Returns bounded parameter-residency telemetry when available.
-    pub fn residency_report(
-        &self,
-    ) -> Result<Option<crate::backend::mlx::runtime::residency::manager::ResidencyReport>, Error>
-    {
+    pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.residency_report(),
             MlxSessionKind::Pipeline(model, _) => model.parameter_residency_report(),

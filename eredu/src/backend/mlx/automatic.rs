@@ -32,11 +32,11 @@ use crate::{
         residency::{
             dense_stream::DenseDiskStreamLoadOptions,
             expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport},
-            manager::ResidencyReport,
         },
     },
 };
 use eredu_core::residency::{MemoryTier, OffloadConfig, TransferDirection};
+use eredu_runtime::ResidencyReport;
 
 /// MLX automatic-planning adapter and whole-session backend factory.
 #[derive(Debug, Clone, Copy, Default)]

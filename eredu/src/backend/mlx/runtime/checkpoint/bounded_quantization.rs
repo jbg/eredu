@@ -16,6 +16,7 @@
 #[cfg(test)]
 use eredu_checkpoint::AffineQuantization;
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::WeightMaterializationReport;
 
 use std::{
     any::Any,
@@ -204,31 +205,6 @@ impl BoundedQuantizationPlan {
     }
 }
 
-/// Deterministic telemetry from one bounded transformation pass.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct BoundedQuantizationReport {
-    /// Planner ceiling for simultaneously live conversion data. This is the
-    /// larger of the final packed output and the smallest legal semantic row
-    /// tile when a synthetic fixture is smaller than one quantization row.
-    pub admitted_working_set_bytes: u64,
-    /// Number of dense semantic matrices transformed.
-    pub transformed_weights: usize,
-    /// Number of independently evaluated source row tiles.
-    pub source_tiles: usize,
-    /// Largest number of submitted tile completions retained simultaneously.
-    pub peak_in_flight_tiles: usize,
-    /// Total logical dense bytes selected from the source store.
-    pub source_bytes_read: u64,
-    /// Total packed weight, scale, and bias bytes written to disk.
-    pub output_bytes: u64,
-    /// Largest conservative conversion working set admitted for one tile.
-    pub peak_planned_working_set_bytes: u64,
-    /// Largest dense recipe output tile.
-    pub largest_source_tile_bytes: u64,
-    /// Largest packed weight, scale, and bias tile written together.
-    pub largest_output_tile_bytes: u64,
-}
-
 /// A source checkpoint overlaid with disk-backed, load-time-quantized weights.
 ///
 /// The temporary packed store lives as long as this value. Runtime acquisitions
@@ -239,7 +215,7 @@ pub struct BoundedQuantizedWeightStore {
     transformed: SafetensorsWeightStore,
     transformed_keys: BTreeSet<String>,
     materialized_source_keys: BTreeSet<String>,
-    report: BoundedQuantizationReport,
+    report: WeightMaterializationReport,
     _directory: TempDir,
 }
 
@@ -287,9 +263,9 @@ impl BoundedQuantizedWeightStore {
             .prefix("safemlx-bounded-quantization-")
             .tempdir()?;
         let mut index = BTreeMap::<String, String>::new();
-        let mut report = BoundedQuantizationReport {
+        let mut report = WeightMaterializationReport {
             admitted_working_set_bytes: plan.max_working_set_bytes,
-            ..BoundedQuantizationReport::default()
+            ..WeightMaterializationReport::default()
         };
         let mut output_shards = Vec::with_capacity(plan.targets.len());
         let mut allocator_cache = BoundedAllocatorCache::new(plan.max_working_set_bytes);
@@ -336,7 +312,7 @@ impl BoundedQuantizedWeightStore {
     }
 
     /// Returns conversion telemetry captured before runtime materialization.
-    pub const fn report(&self) -> &BoundedQuantizationReport {
+    pub const fn report(&self) -> &WeightMaterializationReport {
         &self.report
     }
 
@@ -589,7 +565,7 @@ fn transform_target(
     output_shards: &mut Vec<OutputShard>,
     pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
     allocator_cache: &mut BoundedAllocatorCache,
-    report: &mut BoundedQuantizationReport,
+    report: &mut WeightMaterializationReport,
 ) -> Result<(), Error> {
     let metadata = target.source.infer(source)?;
     if metadata.shape().len() < 2
@@ -1361,7 +1337,7 @@ mod tests {
 
         assert_eq!(
             transformed.report(),
-            &BoundedQuantizationReport {
+            &WeightMaterializationReport {
                 admitted_working_set_bytes: 320,
                 transformed_weights: 1,
                 source_tiles: 8,

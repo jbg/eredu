@@ -146,10 +146,7 @@ impl MlxRealtimeModel {
     }
 
     /// Returns current residency telemetry for the selected parameter policy.
-    pub fn residency_report(
-        &self,
-    ) -> Result<Option<crate::backend::mlx::runtime::residency::manager::ResidencyReport>, Error>
-    {
+    pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
         match self {
             Self::Moshi(model) | Self::PersonaPlex(model) => model.residency_report().map(Some),
         }

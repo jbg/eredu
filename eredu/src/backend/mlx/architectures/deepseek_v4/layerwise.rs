@@ -51,10 +51,12 @@ use crate::{
                 ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
                 ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
             },
-            manager::{ResidencyReport, ResidentUnitLease},
+            manager::ResidentUnitLease,
         },
     },
 };
+
+use eredu_runtime::ResidencyReport;
 
 use super::{
     attention::AttentionCache,

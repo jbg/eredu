@@ -34,9 +34,11 @@ use crate::{
         LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
     },
     backend::mlx::runtime::generation::sampler::Sampler,
-    backend::mlx::runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
+    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     core::realtime::RealtimeSpeechConfig,
 };
+
+use eredu_runtime::ResidencyReport;
 
 use eredu_runtime::ResidentLayerGroupReport;
 
