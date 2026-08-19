@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, Completion, LayerSchedule};
 use eredu_nn::{
@@ -289,6 +290,10 @@ impl NeuralBackend for FakeBackend {
 #[derive(Debug)]
 struct Done;
 
+static FORK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SUBMIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ORDER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 impl Completion for Done {
     type Error = Infallible;
     fn is_complete(&self) -> Result<bool, Self::Error> {
@@ -304,6 +309,7 @@ impl SubmissionBackend for FakeBackend {
     type OwnedExecutor = ();
     type Completion = Done;
     fn fork_executors(_: &(), count: usize) -> Result<Vec<Self::OwnedExecutor>, Infallible> {
+        FORK_COUNT.fetch_add(1, Ordering::Relaxed);
         Ok(vec![(); count])
     }
     fn submit<'a, I>(_: &(), _: I) -> Result<Self::Completion, Infallible>
@@ -311,9 +317,11 @@ impl SubmissionBackend for FakeBackend {
         FakeTensor: 'a,
         I: IntoIterator<Item = &'a FakeTensor>,
     {
+        SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
         Ok(Done)
     }
     fn order_after(_: &Done, _: &()) -> Result<(), Infallible> {
+        ORDER_COUNT.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
     fn retain_until_complete<T: Send + 'static>(_: &(), _: &Done, _: T) -> Result<(), Infallible> {
@@ -412,12 +420,6 @@ fn runtime_capabilities_compile_and_run_without_mlx() {
     assert_eq!(parameter, host);
     FakeBackend::bind(&mut parameter, FakeTensor(vec![3, 2])).unwrap();
     FakeBackend::retain_until_complete(&(), &transfer, parameter).unwrap();
-
-    let lanes = FakeBackend::fork_executors(&(), 2).unwrap();
-    assert_eq!(lanes.len(), 2);
-    let output = FakeTensor(vec![1, 1]);
-    let completion = FakeBackend::submit(&lanes[0], [&output]).unwrap();
-    FakeBackend::order_after(&completion, &lanes[1]).unwrap();
 }
 
 #[test]
@@ -608,6 +610,9 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
 
 #[test]
 fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
+    FORK_COUNT.store(0, Ordering::Relaxed);
+    SUBMIT_COUNT.store(0, Ordering::Relaxed);
+    ORDER_COUNT.store(0, Ordering::Relaxed);
     let policies = (0..4)
         .map(|_| LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap())
         .collect();
@@ -634,4 +639,7 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
         runtime.architecture().trace,
         vec![(0, 0), (1, 0), (2, 0), (2, 1)]
     );
+    assert_eq!(FORK_COUNT.load(Ordering::Relaxed), 1);
+    assert_eq!(SUBMIT_COUNT.load(Ordering::Relaxed), 4);
+    assert_eq!(ORDER_COUNT.load(Ordering::Relaxed), 5);
 }

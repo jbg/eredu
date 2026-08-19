@@ -349,6 +349,9 @@ fn execution_group_orchestration_is_runtime_owned() {
     assert!(layered.contains("fn group_unit_count"));
     assert!(layered.contains("fn begin_execution_group"));
     assert!(layered.contains("ExecutionGroupSchedule::new"));
+    assert!(layered.contains("B::fork_executors"));
+    assert!(layered.contains("B::order_after"));
+    assert!(layered.contains("B::submit"));
 
     let mlx = std::fs::read_to_string(
         workspace.join("eredu/src/backend/mlx/runtime/execution/layerwise.rs"),

@@ -2,7 +2,9 @@
 
 use eredu_nn::{NeuralBackend, Parameterized};
 
-use crate::{ExecutionGraph, ExecutionGroupSchedule, ExecutionUnitLayout, RuntimeState};
+use crate::{
+    ExecutionGraph, ExecutionGroupSchedule, ExecutionUnitLayout, RuntimeState, SubmissionBackend,
+};
 
 /// Backend-native activation and architecture-owned forward context.
 pub struct LayeredForwardState<T, C> {
@@ -413,12 +415,15 @@ where
     /// Unit acquisition or exact-completion failure.
     #[error("layerwise execution policy failed: {0}")]
     Policy(P),
+    /// Backend-native graph submission or dependency ordering failed.
+    #[error("layerwise backend submission failed: {0}")]
+    Submission(String),
 }
 
 /// Bounded-unit runtime invoking the same architecture lifecycle as resident execution.
 pub struct LayerwiseRuntime<A, B, S, P>
 where
-    B: NeuralBackend,
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as eredu_nn::Tensor>::Context>,
     S: RuntimeState<B>,
     A: LayeredArchitecture<B, S>,
     P: LayerwisePolicy<B, A::Unit>,
@@ -430,7 +435,7 @@ where
 
 impl<A, B, S, P> LayerwiseRuntime<A, B, S, P>
 where
-    B: NeuralBackend,
+    B: SubmissionBackend<Executor = <<B as NeuralBackend>::Tensor as eredu_nn::Tensor>::Context>,
     S: RuntimeState<B>,
     A: LayeredArchitecture<B, S>,
     P: LayerwisePolicy<B, A::Unit>,
@@ -485,10 +490,16 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let layout = ExecutionUnitLayout::new(&graph, counts)?;
+        let executors = B::fork_executors(context, graph.groups().len())
+            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
         let forward = self
             .architecture
             .begin_forward(input, state, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
+        let initial_completion = (graph.groups().len() > 1)
+            .then(|| B::submit(context, [&forward.hidden]))
+            .transpose()
+            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
         self.policy
             .begin(&forward.hidden, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
@@ -496,7 +507,28 @@ where
         let mut forward_context = forward.context;
         let mut schedule = ExecutionGroupSchedule::new(&graph);
         let mut outputs: Vec<Option<B::Tensor>> = vec![None; graph.groups().len()];
+        let mut completions: Vec<Option<B::Completion>> =
+            (0..graph.groups().len()).map(|_| None).collect();
         for &group in graph.execution_order() {
+            let executor = std::borrow::Borrow::borrow(&executors[group]);
+            let group_dependencies = schedule
+                .dependencies(group)
+                .expect("validated execution order contains a known group");
+            if group_dependencies.is_empty() {
+                if let Some(completion) = &initial_completion {
+                    B::order_after(completion, executor)
+                        .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+                }
+            }
+            for &dependency in group_dependencies {
+                B::order_after(
+                    completions[dependency]
+                        .as_ref()
+                        .expect("topological dependency has a completion"),
+                    executor,
+                )
+                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+            }
             let dependencies = schedule
                 .dependencies(group)
                 .expect("validated execution order contains a known group")
@@ -517,7 +549,7 @@ where
                     &dependency_refs,
                     state,
                     &mut forward_context,
-                    context,
+                    executor,
                 )
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             for dependency in schedule
@@ -540,7 +572,7 @@ where
                         .expect("group-local unit belongs to the layout");
                     let mut lease = self
                         .policy
-                        .acquire(ordinal, context)
+                        .acquire(ordinal, executor)
                         .map_err(LayerwiseRuntimeError::Policy)?;
                     hidden = self
                         .architecture
@@ -551,7 +583,7 @@ where
                             &hidden,
                             state,
                             &mut forward_context,
-                            context,
+                            executor,
                         )
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let state_values = state
@@ -567,16 +599,27 @@ where
                             &hidden,
                             state_values,
                             context_values,
-                            context,
+                            executor,
                         )
                         .map_err(LayerwiseRuntimeError::Policy)?;
                 }
             }
             hidden = self
                 .architecture
-                .complete_execution_group(group, &hidden, state, &mut forward_context, context)
+                .complete_execution_group(group, &hidden, state, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             outputs[group] = Some(hidden);
+            if graph.groups().len() > 1 {
+                completions[group] = Some(
+                    B::submit(
+                        executor,
+                        [outputs[group]
+                            .as_ref()
+                            .expect("group output was stored before submission")],
+                    )
+                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
+                );
+            }
             schedule
                 .ordered(group)
                 .expect("started group can be ordered exactly once");
@@ -584,6 +627,10 @@ where
         let hidden = outputs[graph.output()]
             .take()
             .expect("validated graph output completed");
+        if let Some(completion) = &completions[graph.output()] {
+            B::order_after(completion, context)
+                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+        }
         let output = self
             .architecture
             .finish_forward(&hidden, state, &forward_context, context)
@@ -617,10 +664,16 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let layout = ExecutionUnitLayout::new(&graph, counts)?;
+        let executors = B::fork_executors(context, graph.groups().len())
+            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
         let forward = self
             .architecture
             .begin_forward_parallel(input, state, parallel, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
+        let initial_completion = (graph.groups().len() > 1)
+            .then(|| B::submit(context, [&forward.hidden]))
+            .transpose()
+            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
         self.policy
             .begin(&forward.hidden, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
@@ -628,7 +681,28 @@ where
         let mut forward_context = forward.context;
         let mut schedule = ExecutionGroupSchedule::new(&graph);
         let mut outputs: Vec<Option<B::Tensor>> = vec![None; graph.groups().len()];
+        let mut completions: Vec<Option<B::Completion>> =
+            (0..graph.groups().len()).map(|_| None).collect();
         for &group in graph.execution_order() {
+            let executor = std::borrow::Borrow::borrow(&executors[group]);
+            let group_dependencies = schedule
+                .dependencies(group)
+                .expect("validated execution order contains a known group");
+            if group_dependencies.is_empty() {
+                if let Some(completion) = &initial_completion {
+                    B::order_after(completion, executor)
+                        .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+                }
+            }
+            for &dependency in group_dependencies {
+                B::order_after(
+                    completions[dependency]
+                        .as_ref()
+                        .expect("topological dependency has a completion"),
+                    executor,
+                )
+                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+            }
             let dependencies = schedule
                 .dependencies(group)
                 .expect("validated execution order contains a known group")
@@ -650,7 +724,7 @@ where
                     state,
                     &mut forward_context,
                     parallel,
-                    context,
+                    executor,
                 )
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             for dependency in schedule
@@ -673,7 +747,7 @@ where
                         .expect("group-local unit belongs to the layout");
                     let mut lease = self
                         .policy
-                        .acquire(ordinal, context)
+                        .acquire(ordinal, executor)
                         .map_err(LayerwiseRuntimeError::Policy)?;
                     hidden = self
                         .architecture
@@ -685,7 +759,7 @@ where
                             state,
                             &mut forward_context,
                             parallel,
-                            context,
+                            executor,
                         )
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let state_values = state
@@ -701,7 +775,7 @@ where
                             &hidden,
                             state_values,
                             context_values,
-                            context,
+                            executor,
                         )
                         .map_err(LayerwiseRuntimeError::Policy)?;
                 }
@@ -714,10 +788,21 @@ where
                     state,
                     &mut forward_context,
                     parallel,
-                    context,
+                    executor,
                 )
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             outputs[group] = Some(hidden);
+            if graph.groups().len() > 1 {
+                completions[group] = Some(
+                    B::submit(
+                        executor,
+                        [outputs[group]
+                            .as_ref()
+                            .expect("group output was stored before submission")],
+                    )
+                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
+                );
+            }
             schedule
                 .ordered(group)
                 .expect("started group can be ordered exactly once");
@@ -725,6 +810,10 @@ where
         let hidden = outputs[graph.output()]
             .take()
             .expect("validated graph output completed");
+        if let Some(completion) = &completions[graph.output()] {
+            B::order_after(completion, context)
+                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+        }
         let output = self
             .architecture
             .finish_forward_parallel(&hidden, state, &forward_context, parallel, context)
@@ -759,10 +848,16 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let layout = ExecutionUnitLayout::new(&graph, counts)?;
+        let executors = B::fork_executors(context, graph.groups().len())
+            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
         let forward = self
             .architecture
             .begin_forward(input, state, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
+        let initial_completion = (graph.groups().len() > 1)
+            .then(|| B::submit(context, [&forward.hidden]))
+            .transpose()
+            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
         self.policy
             .begin(&forward.hidden, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
@@ -770,7 +865,28 @@ where
         let mut forward_context = forward.context;
         let mut schedule = ExecutionGroupSchedule::new(&graph);
         let mut outputs: Vec<Option<B::Tensor>> = vec![None; graph.groups().len()];
+        let mut completions: Vec<Option<B::Completion>> =
+            (0..graph.groups().len()).map(|_| None).collect();
         for &group in graph.execution_order() {
+            let executor = std::borrow::Borrow::borrow(&executors[group]);
+            let group_dependencies = schedule
+                .dependencies(group)
+                .expect("validated execution order contains a known group");
+            if group_dependencies.is_empty() {
+                if let Some(completion) = &initial_completion {
+                    B::order_after(completion, executor)
+                        .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+                }
+            }
+            for &dependency in group_dependencies {
+                B::order_after(
+                    completions[dependency]
+                        .as_ref()
+                        .expect("topological dependency has a completion"),
+                    executor,
+                )
+                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+            }
             let dependencies = schedule
                 .dependencies(group)
                 .expect("validated execution order contains a known group")
@@ -791,7 +907,7 @@ where
                     &dependency_refs,
                     state,
                     &mut forward_context,
-                    context,
+                    executor,
                 )
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             for dependency in schedule
@@ -818,7 +934,7 @@ where
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let mut lease = self
                         .policy
-                        .acquire(ordinal, context)
+                        .acquire(ordinal, executor)
                         .map_err(LayerwiseRuntimeError::Policy)?;
                     let unit_input = hidden.clone();
                     let output = self
@@ -830,7 +946,7 @@ where
                             &unit_input,
                             state,
                             &mut forward_context,
-                            context,
+                            executor,
                         )
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     hidden = hook(&path, &unit_input, &output)
@@ -849,16 +965,27 @@ where
                             &hidden,
                             state_values,
                             context_values,
-                            context,
+                            executor,
                         )
                         .map_err(LayerwiseRuntimeError::Policy)?;
                 }
             }
             hidden = self
                 .architecture
-                .complete_execution_group(group, &hidden, state, &mut forward_context, context)
+                .complete_execution_group(group, &hidden, state, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             outputs[group] = Some(hidden);
+            if graph.groups().len() > 1 {
+                completions[group] = Some(
+                    B::submit(
+                        executor,
+                        [outputs[group]
+                            .as_ref()
+                            .expect("group output was stored before submission")],
+                    )
+                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
+                );
+            }
             schedule
                 .ordered(group)
                 .expect("started group can be ordered exactly once");
@@ -866,6 +993,10 @@ where
         let hidden = outputs[graph.output()]
             .take()
             .expect("validated graph output completed");
+        if let Some(completion) = &completions[graph.output()] {
+            B::order_after(completion, context)
+                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+        }
         let output = self
             .architecture
             .finish_forward(&hidden, state, &forward_context, context)

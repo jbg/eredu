@@ -1,5 +1,5 @@
 use eredu_architectures::llama::{self, LayeredInput, ModelArgs};
-use eredu_core::{AttentionPolicy, LayerSchedule};
+use eredu_core::{AttentionPolicy, Completion, LayerSchedule};
 use eredu_nn::{
     AttentionCache, AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator,
     LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode,
@@ -8,7 +8,8 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, DeviceState, LayerwiseRuntime, ParameterBackend,
-    ResidentRuntime, ResidentUnitWindow, RuntimeLayerState, RuntimeState, WeightBinding,
+    ResidentRuntime, ResidentUnitWindow, RuntimeLayerState, RuntimeState, SubmissionBackend,
+    WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -396,6 +397,57 @@ impl NeuralBackend for ReferenceBackend {
         context: &(),
     ) -> Result<Self::Tensor, Error> {
         linear.forward(input, context)
+    }
+}
+
+#[derive(Debug)]
+struct ReferenceCompletion;
+
+impl Completion for ReferenceCompletion {
+    type Error = std::convert::Infallible;
+
+    fn is_complete(&self) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    fn wait(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl SubmissionBackend for ReferenceBackend {
+    type Executor = ();
+    type OwnedExecutor = ();
+    type Completion = ReferenceCompletion;
+
+    fn fork_executors(
+        _: &Self::Executor,
+        count: usize,
+    ) -> Result<Vec<Self::OwnedExecutor>, std::convert::Infallible> {
+        Ok(vec![(); count])
+    }
+
+    fn submit<'a, I>(_: &Self::Executor, _: I) -> Result<Self::Completion, std::convert::Infallible>
+    where
+        Self::Tensor: 'a,
+        I: IntoIterator<Item = &'a Self::Tensor>,
+    {
+        Ok(ReferenceCompletion)
+    }
+
+    fn order_after(
+        _: &Self::Completion,
+        _: &Self::Executor,
+    ) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+
+    fn retain_until_complete<T: Send + 'static>(
+        _: &Self::Executor,
+        _: &Self::Completion,
+        _: T,
+    ) -> Result<(), std::convert::Infallible> {
+        Ok(())
     }
 }
 
