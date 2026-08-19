@@ -340,6 +340,28 @@ fn weight_prefetch_execution_is_runtime_owned() {
 }
 
 #[test]
+fn weight_window_policy_is_runtime_owned() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let runtime = std::fs::read_to_string(workspace.join("eredu-runtime/src/residency.rs"))
+        .expect("runtime residency controller must be readable");
+    assert!(runtime.contains("pub fn commit_group_window"));
+    assert!(runtime.contains("pub fn protect_group_window"));
+
+    let mlx = std::fs::read_to_string(
+        workspace.join("eredu/src/backend/mlx/runtime/residency/manager.rs"),
+    )
+    .expect("MLX residency realization must be readable");
+    for runtime_owned in [".set_group_window(", "let mut seen = BTreeSet::new()"] {
+        assert!(
+            !mlx.contains(runtime_owned),
+            "MLX residency realization retained window policy {runtime_owned}"
+        );
+    }
+}
+
+#[test]
 fn llama_hot_path_remains_statically_dispatched_and_device_native() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

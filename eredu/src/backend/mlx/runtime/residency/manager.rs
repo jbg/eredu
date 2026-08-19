@@ -764,18 +764,9 @@ impl ResidencyManager {
                 .wait(state)
                 .map_err(|_| ResidencyError::StatePoisoned)?;
         }
-        state
+        let selected = state
             .control
-            .ledger_mut()
-            .set_group_window(group, active, tier)?;
-        let depth = state.control.ledger_mut().plan().config().prefetch_depth();
-        let mut seen = BTreeSet::new();
-        let selected = upcoming
-            .iter()
-            .filter(|id| seen.insert((*id).clone()))
-            .take(depth)
-            .cloned()
-            .collect::<Vec<_>>();
+            .commit_group_window(group, active, upcoming, tier)?;
         selected
             .into_iter()
             .map(|id| {
@@ -797,15 +788,8 @@ impl ResidencyManager {
         tier: MemoryTier,
     ) -> Result<(), ResidencyError> {
         let mut state = self.lock()?;
-        state.control.ledger_mut().require_initialized()?;
-        for id in active {
-            state.control.ledger_mut().spec(id)?;
-        }
         validate_target(tier, "protect_group_window")?;
-        state
-            .control
-            .ledger_mut()
-            .set_group_window(group, active, tier)?;
+        state.control.protect_group_window(group, active, tier)?;
         Ok(())
     }
 

@@ -359,6 +359,43 @@ impl ResidencyController {
     pub fn ledger_mut(&mut self) -> &mut ResidencyLedger {
         &mut self.ledger
     }
+
+    /// Replaces one protected window and selects unique bounded lookahead in caller order.
+    ///
+    /// A concrete backend calls this after any in-flight copies touching the requested
+    /// units have reached a stable state.
+    pub fn commit_group_window(
+        &mut self,
+        group: &str,
+        active: &[OffloadUnitId],
+        upcoming: &[OffloadUnitId],
+        tier: MemoryTier,
+    ) -> Result<Vec<OffloadUnitId>, eredu_core::residency::ResidencyLedgerError> {
+        self.ledger.require_initialized()?;
+        for id in active.iter().chain(upcoming) {
+            self.ledger.spec(id)?;
+        }
+        self.ledger.set_group_window(group, active, tier)?;
+        let depth = self.ledger.plan().config().prefetch_depth();
+        let mut seen = BTreeSet::new();
+        Ok(upcoming
+            .iter()
+            .filter(|id| seen.insert((*id).clone()))
+            .take(depth)
+            .cloned()
+            .collect())
+    }
+
+    /// Replaces one protected window without selecting or materializing lookahead.
+    pub fn protect_group_window(
+        &mut self,
+        group: &str,
+        active: &[OffloadUnitId],
+        tier: MemoryTier,
+    ) -> Result<(), eredu_core::residency::ResidencyLedgerError> {
+        self.commit_group_window(group, active, &[], tier)
+            .map(|_| ())
+    }
 }
 
 /// Failure while validating a residency control plane.
@@ -995,6 +1032,46 @@ mod tests {
         assert_eq!(controller.units().len(), 1);
         assert_eq!(controller.unit(&id).unwrap().bindings().len(), 2);
         assert!(!controller.ledger().initialized());
+    }
+
+    #[test]
+    fn controller_owns_named_window_and_unique_lookahead_selection() {
+        let ids = ["a", "b", "c"].map(|name| OffloadUnitId::new(format!("layer.{name}")).unwrap());
+        let catalog = Catalog(BTreeMap::from([
+            ("a".into(), metadata("a", vec![1])),
+            ("b".into(), metadata("b", vec![1])),
+            ("c".into(), metadata("c", vec![1])),
+        ]));
+        let units = ids.iter().zip(["a", "b", "c"]).map(|(id, key)| {
+            OffloadUnit::new(
+                id.clone(),
+                [WeightBinding::new("weight", key, TensorSelection::Full, 4).unwrap()],
+            )
+            .unwrap()
+        });
+        let plan = OffloadPlan::new(
+            OffloadConfig::new(None, None, 2).unwrap(),
+            ids.iter().map(|id| {
+                OffloadUnitSpec::new(id.clone(), 4, ResidencyPolicy::Windowed, MemoryTier::Disk)
+                    .unwrap()
+            }),
+        )
+        .unwrap();
+        let mut controller = ResidencyController::new(&catalog, plan, units).unwrap();
+        controller.ledger_mut().mark_initialized();
+        let selected = controller
+            .commit_group_window(
+                "decoder",
+                &[ids[0].clone()],
+                &[ids[1].clone(), ids[1].clone(), ids[2].clone()],
+                MemoryTier::Device,
+            )
+            .unwrap();
+        assert_eq!(selected, vec![ids[1].clone(), ids[2].clone()]);
+        assert_eq!(
+            controller.ledger().active_window(),
+            BTreeSet::from([ids[0].clone()])
+        );
     }
 
     #[test]
