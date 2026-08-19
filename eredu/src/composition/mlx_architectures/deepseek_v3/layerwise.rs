@@ -58,7 +58,7 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        LayerwiseModel, LoadTimeQuantizableAdapter,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -2138,7 +2138,7 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let hidden = self.embedding.forward(input, stream)?;
         let offset = cache.offset();
         let mask = if hidden.dim(1) > 1 && offset > 0 {
@@ -2152,7 +2152,7 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         } else {
             None
         };
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             hidden,
             context: DeepSeekV3ForwardContext {
                 mask,
@@ -2168,7 +2168,7 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.begin_forward(input, cache, execution.stream());
         };
@@ -2185,7 +2185,7 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         } else {
             None
         };
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             hidden,
             context: DeepSeekV3ForwardContext {
                 mask,

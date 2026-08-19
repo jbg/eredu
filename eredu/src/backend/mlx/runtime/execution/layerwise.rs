@@ -439,14 +439,6 @@ impl Drop for DenseStreamGroupGuard {
     }
 }
 
-/// Forward state returned by a generalized architecture adapter.
-pub struct LayerwiseForwardState<C> {
-    /// Initial activation made available to root execution groups.
-    pub hidden: Array,
-    /// Architecture-owned masks, positions, and auxiliary per-forward state.
-    pub context: C,
-}
-
 use eredu_runtime::{ExecutionGraph, ExecutionGroupSchedule};
 
 /// Architecture contract for resident, bounded-residency, and distributed
@@ -568,7 +560,7 @@ pub trait ArchitectureAdapter: Sized {
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error>;
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error>;
 
     /// Embeds or prepares input under an explicit execution context.
     fn begin_forward_with_execution<'a>(
@@ -578,7 +570,7 @@ pub trait ArchitectureAdapter: Sized {
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         self.begin_forward(input, cache, execution.stream())
     }
 
@@ -1781,7 +1773,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             _ => unreachable!("topology and TP group are created together"),
         };
         self.adapter.validate_cache(cache)?;
-        let LayerwiseForwardState {
+        let eredu_runtime::LayeredForwardState {
             hidden: initial_hidden,
             mut context,
         } = self

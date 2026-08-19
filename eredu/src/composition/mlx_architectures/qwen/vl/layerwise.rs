@@ -57,7 +57,7 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        LayerwiseModel, LoadTimeQuantizableAdapter,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -859,7 +859,7 @@ pub(crate) struct Qwen3VlPipelinePrepared {
 /// Opaque prepared state routed between placed Qwen3-VL vision owners.
 pub(crate) struct Qwen3VlPipelineIngressState {
     cache: Cache,
-    forward: LayerwiseForwardState<Qwen3VlForwardContext>,
+    forward: eredu_runtime::LayeredForwardState<Array, Qwen3VlForwardContext>,
 }
 
 /// One temporary unit from either the vision or text group.
@@ -1007,7 +1007,7 @@ impl Qwen3VlLayerwiseAdapter {
         )?;
         Ok(Qwen3VlPipelineIngressState {
             cache: Cache::default(),
-            forward: LayerwiseForwardState {
+            forward: eredu_runtime::LayeredForwardState {
                 hidden,
                 context: Qwen3VlForwardContext {
                     tokens: Array::from_slice(&[] as &[u32], &[1, 0]),
@@ -1364,7 +1364,7 @@ impl Qwen3VlLayerwiseAdapter {
             &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
         >,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<Qwen3VlForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Qwen3VlForwardContext>, Error> {
         input::validate(typed)?;
         let mut token_parts = Vec::new();
         let mut prepared_parts = Vec::new();
@@ -1446,7 +1446,7 @@ impl Qwen3VlLayerwiseAdapter {
             let (hidden, state) = self.vision.begin(&pixels, &grids, stream)?;
             (hidden, Some(state))
         };
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             hidden,
             context: Qwen3VlForwardContext {
                 tokens,
@@ -1469,7 +1469,7 @@ impl Qwen3VlLayerwiseAdapter {
             &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
         >,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<Qwen3VlForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Qwen3VlForwardContext>, Error> {
         let hidden = match (&mut self.parallel_embedding, execution) {
             (Some(embedding), Some(execution)) => embedding.forward(tokens, execution)?,
             _ => self.embedding.forward(tokens, stream)?,
@@ -1492,7 +1492,7 @@ impl Qwen3VlLayerwiseAdapter {
             self.args.text_config.rope_theta,
             &self.args.mrope_section,
         );
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             hidden,
             context: Qwen3VlForwardContext {
                 tokens: tokens.clone(),
@@ -1750,7 +1750,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         match input {
             Qwen3VlInput::Prefill(input) => self.prepare_prefill(input, cache, None, stream),
             Qwen3VlInput::Decode(tokens) => self.prepare_decode(tokens, cache, None, stream),
@@ -1764,7 +1764,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         match input {
             Qwen3VlInput::Prefill(input) => {
                 self.prepare_prefill(input, cache, Some(execution), execution.stream())

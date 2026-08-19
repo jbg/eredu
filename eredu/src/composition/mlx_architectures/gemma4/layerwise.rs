@@ -61,7 +61,7 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        LayerwiseModel, LoadTimeQuantizableAdapter,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -2239,7 +2239,7 @@ pub struct Gemma4ForwardContext {
 /// configured media roots.
 pub(crate) struct Gemma4PipelineIngressState {
     cache: Cache,
-    forward: LayerwiseForwardState<Gemma4ForwardContext>,
+    forward: eredu_runtime::LayeredForwardState<Array, Gemma4ForwardContext>,
 }
 
 /// Decoder-ready tensors produced by Gemma's shared multimodal semantics.
@@ -2366,7 +2366,7 @@ impl Gemma4LayerwiseAdapter {
             .ok_or_else(|| Error::Parallel("Gemma continuation has no payload".into()))?;
         Ok(Gemma4PipelineIngressState {
             cache: Cache::new(&self.args),
-            forward: LayerwiseForwardState {
+            forward: eredu_runtime::LayeredForwardState {
                 hidden,
                 context: Gemma4ForwardContext {
                     per_layer_inputs: None,
@@ -2845,7 +2845,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         if let Gemma4Input::Prefill(typed) = input {
             input::validate(typed)?;
             cache.token_ids.clear();
@@ -2985,7 +2985,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
                 let mask = (hidden.dim(1) > 1)
                     .then(|| create_causal_mask(hidden.dim(1), Some(0), None, None, stream))
                     .transpose()?;
-                return Ok(LayerwiseForwardState {
+                return Ok(eredu_runtime::LayeredForwardState {
                     hidden,
                     context: Gemma4ForwardContext {
                         per_layer_inputs,
@@ -3013,7 +3013,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
                     })
                 })
                 .expect("validated non-empty Gemma 4 input");
-            return Ok(LayerwiseForwardState {
+            return Ok(eredu_runtime::LayeredForwardState {
                 hidden,
                 context: Gemma4ForwardContext {
                     per_layer_inputs: None,
@@ -3051,7 +3051,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
             .then(|| create_causal_mask(hidden.dim(1), Some(position_offset), None, None, stream))
             .transpose()?;
         let per_layer_inputs = self.prepare_per_layer_inputs(tokens, &hidden, stream)?;
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             hidden,
             context: Gemma4ForwardContext {
                 per_layer_inputs,
@@ -3076,7 +3076,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let Some(group) = execution.group() else {
             return self.begin_forward(input, cache, execution.stream());
         };
@@ -3229,7 +3229,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
                 let mask = (hidden.dim(1) > 1)
                     .then(|| create_causal_mask(hidden.dim(1), Some(0), None, None, stream))
                     .transpose()?;
-                return Ok(LayerwiseForwardState {
+                return Ok(eredu_runtime::LayeredForwardState {
                     hidden,
                     context: Gemma4ForwardContext {
                         per_layer_inputs,
@@ -3257,7 +3257,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
                     })
                 })
                 .expect("validated non-empty Gemma 4 input");
-            return Ok(LayerwiseForwardState {
+            return Ok(eredu_runtime::LayeredForwardState {
                 hidden,
                 context: Gemma4ForwardContext {
                     per_layer_inputs: None,
@@ -3299,7 +3299,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
             .transpose()?;
         let per_layer_inputs =
             self.prepare_per_layer_inputs_with_execution(tokens, &hidden, Some(execution), stream)?;
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             hidden,
             context: Gemma4ForwardContext {
                 per_layer_inputs,

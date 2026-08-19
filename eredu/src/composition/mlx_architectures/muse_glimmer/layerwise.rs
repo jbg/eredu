@@ -68,7 +68,7 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, ArchitectureAdapter, LayerwiseForwardState, LayerwiseModel,
+        open_safetensors_weight_store, ArchitectureAdapter, LayerwiseModel,
         LoadTimeQuantizableAdapter, SharedWeightStore,
     },
     backend::mlx::runtime::media::input,
@@ -1125,7 +1125,7 @@ impl MuseGlimmerLayerwiseAdapter {
         )?;
         Ok(MuseGlimmerPipelineIngressState {
             cache: self.pipeline_cache(),
-            forward: LayerwiseForwardState {
+            forward: eredu_runtime::LayeredForwardState {
                 hidden,
                 context: MuseGlimmerForwardContext {
                     mask: None,
@@ -1379,7 +1379,7 @@ pub enum MuseGlimmerAdapterInput<'a> {
 /// across pipeline owners.
 pub(crate) struct MuseGlimmerPipelineIngressState {
     cache: MuseGlimmerLayerwiseCache,
-    forward: LayerwiseForwardState<MuseGlimmerForwardContext>,
+    forward: eredu_runtime::LayeredForwardState<Array, MuseGlimmerForwardContext>,
 }
 
 /// Decoder-facing result of Muse-Glimmer multimodal ingress.
@@ -1828,13 +1828,13 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         input: Self::Input<'a>,
         _cache: &mut Self::Cache,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         match input {
             MuseGlimmerAdapterInput::Decode { inputs, mask } => {
                 let hidden = self.embedding.forward(inputs, stream)?;
                 let hidden =
                     resident::rms_norm_without_scale(&hidden, self.args.rms_norm_eps, stream)?;
-                Ok(LayerwiseForwardState {
+                Ok(eredu_runtime::LayeredForwardState {
                     hidden,
                     context: MuseGlimmerForwardContext {
                         mask: None,
@@ -1857,7 +1857,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         match input {
             MuseGlimmerAdapterInput::Prefill(input) => {
                 self.prepare_multimodal_prefill(input, Some(execution), execution.stream())
@@ -1872,7 +1872,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
                     self.args.rms_norm_eps,
                     execution.stream(),
                 )?;
-                Ok(LayerwiseForwardState {
+                Ok(eredu_runtime::LayeredForwardState {
                     hidden,
                     context: MuseGlimmerForwardContext {
                         mask: None,
@@ -2816,7 +2816,7 @@ impl MuseGlimmerLayerwiseAdapter {
             &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
         >,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<MuseGlimmerForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, MuseGlimmerForwardContext>, Error> {
         input::validate(typed)?;
         let mut parts = Vec::new();
         let mut pixels = Vec::new();
@@ -2890,7 +2890,7 @@ impl MuseGlimmerLayerwiseAdapter {
                 })
                 .collect::<Vec<_>>();
             let hidden = concatenate_axis(&text, 1, stream)?;
-            return Ok(LayerwiseForwardState {
+            return Ok(eredu_runtime::LayeredForwardState {
                 hidden,
                 context: MuseGlimmerForwardContext {
                     mask: None,
@@ -2909,7 +2909,7 @@ impl MuseGlimmerLayerwiseAdapter {
             .as_mut()
             .expect("validated Muse-Glimmer vision modules")
             .begin(&pixels, &grids, stream)?;
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             hidden,
             context: MuseGlimmerForwardContext {
                 mask: None,

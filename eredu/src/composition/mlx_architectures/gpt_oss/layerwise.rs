@@ -58,7 +58,7 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        LayerwiseModel, LoadTimeQuantizableAdapter,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -1161,9 +1161,9 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         input: Self::Input<'a>,
         _cache: &mut Self::Cache,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let hidden = self.embedding.forward(input, stream)?;
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             context: GptOssForwardContext {
                 sequence_length: hidden.dim(1),
             },
@@ -1178,12 +1178,12 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let Some(v) = &mut self.parallel_embedding else {
             return self.begin_forward(input, cache, execution.stream());
         };
         let hidden = v.forward(input, execution)?;
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             context: GptOssForwardContext {
                 sequence_length: hidden.dim(1),
             },

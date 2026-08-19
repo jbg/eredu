@@ -343,6 +343,9 @@ fn execution_group_orchestration_is_runtime_owned() {
         .expect("runtime execution scheduler must be readable");
     assert!(runtime.contains("pub struct ExecutionGroupSchedule"));
     assert!(runtime.contains("remaining_consumers"));
+    let layered = std::fs::read_to_string(workspace.join("eredu-runtime/src/layered.rs"))
+        .expect("runtime layered execution must be readable");
+    assert!(layered.contains("pub struct LayeredForwardState"));
 
     let mlx = std::fs::read_to_string(
         workspace.join("eredu/src/backend/mlx/runtime/execution/layerwise.rs"),
@@ -353,6 +356,7 @@ fn execution_group_orchestration_is_runtime_owned() {
         "let mut remaining_consumers",
         ".consumer_counts()",
         "ArchitectureCheckpointPlan",
+        "pub struct LayerwiseForwardState",
     ] {
         assert!(
             !mlx.contains(runtime_owned),

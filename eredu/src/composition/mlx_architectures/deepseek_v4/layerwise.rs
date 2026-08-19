@@ -47,7 +47,7 @@ use crate::{
         execution::layerwise::{
             load_layerwise_model_with_quantization,
             load_tensor_parallel_layerwise_model_with_quantization, open_safetensors_weight_store,
-            ArchitectureAdapter, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+            ArchitectureAdapter, LayerwiseModel, LoadTimeQuantizableAdapter,
         },
         residency::{
             expert_cache::{
@@ -1090,7 +1090,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         input: Self::Input<'a>,
         _cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let embedded = self
             .static_model
             .model
@@ -1107,7 +1107,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
             ],
             stream,
         )?;
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             hidden,
             context: DeepSeekV4ForwardContext {
                 input_ids: input.clone(),

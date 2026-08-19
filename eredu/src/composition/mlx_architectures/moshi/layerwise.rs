@@ -28,7 +28,7 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, ArchitectureAdapter, LayerwiseForwardState, LayerwiseModel,
+        open_safetensors_weight_store, ArchitectureAdapter, LayerwiseModel,
         LoadTimeQuantizableAdapter,
     },
     backend::mlx::runtime::generation::sampler::Sampler,
@@ -1291,7 +1291,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let (text, audio, depth, forced_text, forced_audio, forced_mask, autoregressive) =
             match input {
                 MoshiLayerwiseInput::TeacherForced {
@@ -1338,7 +1338,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         let hidden = self
             .static_modules
             .temporal_input(&self.args, text, audio, stream)?;
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             context: MoshiForwardContext {
                 temporal_input: hidden.clone(),
                 temporal_output: None,
@@ -1365,7 +1365,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let Some(group) = execution.group() else {
             return self.begin_forward(input, cache, execution.stream());
         };
@@ -1408,7 +1408,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
             group,
             execution.stream(),
         )?;
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             context: MoshiForwardContext {
                 temporal_input: hidden.clone(),
                 temporal_output: None,

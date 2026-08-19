@@ -61,7 +61,7 @@ use crate::{
         execution::layerwise::{
             load_layerwise_model, load_layerwise_model_with_quantization,
             load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-            ArchitectureAdapter, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+            ArchitectureAdapter, LayerwiseModel, LoadTimeQuantizableAdapter,
         },
         residency::{
             expert_cache::{ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch},
@@ -1372,7 +1372,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         input: Self::Input<'a>,
         cache: &mut Self::Cache,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let hidden = self.embedding.forward(input, stream)?;
         let offset = cache.offset();
         let mask = if hidden.dim(1) > 1 && offset > 0 {
@@ -1386,7 +1386,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         } else {
             None
         };
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             hidden,
             context: KimiLinearForwardContext { mask },
         })
@@ -1398,7 +1398,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let Some(v) = &mut self.parallel_embedding else {
             return self.begin_forward(input, cache, execution.stream());
         };
@@ -1415,7 +1415,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         } else {
             None
         };
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             hidden,
             context: KimiLinearForwardContext { mask },
         })

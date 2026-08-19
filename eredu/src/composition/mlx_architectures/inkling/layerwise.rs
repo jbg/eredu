@@ -60,7 +60,7 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        LayerwiseModel, LoadTimeQuantizableAdapter,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -1915,7 +1915,7 @@ pub(crate) struct InklingForwardContext {
 /// configured Inkling vision root.
 pub(crate) struct InklingPipelineIngressState {
     cache: Cache,
-    forward: LayerwiseForwardState<InklingForwardContext>,
+    forward: eredu_runtime::LayeredForwardState<Array, InklingForwardContext>,
 }
 
 impl InklingLayerwiseAdapter {
@@ -2100,7 +2100,7 @@ impl InklingLayerwiseAdapter {
             .ok_or_else(|| Error::Parallel("Inkling continuation has no payload".into()))?;
         Ok(InklingPipelineIngressState {
             cache: Cache::new(&self.args.text_config),
-            forward: LayerwiseForwardState {
+            forward: eredu_runtime::LayeredForwardState {
                 hidden,
                 context: InklingForwardContext {
                     parts: Vec::new(),
@@ -2666,7 +2666,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         input: Self::Input<'a>,
         _cache: &mut Self::Cache,
         stream: &Stream,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let InklingExecutionInput {
             input,
             last_token_only,
@@ -2675,7 +2675,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             let hidden = self
                 .embed_norm
                 .forward(&self.embedding.forward(tokens, stream)?, stream)?;
-            return Ok(LayerwiseForwardState {
+            return Ok(eredu_runtime::LayeredForwardState {
                 hidden,
                 context: InklingForwardContext {
                     parts: Vec::new(),
@@ -2789,7 +2789,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                 .collect::<Vec<_>>();
             let tokens = concatenate_axis(&token_parts, 1, stream)?;
             let hidden = concatenate_axis(&embedding_parts, 1, stream)?;
-            return Ok(LayerwiseForwardState {
+            return Ok(eredu_runtime::LayeredForwardState {
                 hidden,
                 context: InklingForwardContext {
                     parts,
@@ -2813,7 +2813,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                     })
                     .expect("validated non-empty Inkling input")
             });
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             hidden,
             context: InklingForwardContext {
                 parts,
@@ -2833,7 +2833,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.begin_forward(input, _cache, execution.stream());
         };
@@ -2846,7 +2846,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             let hidden = self
                 .embed_norm
                 .forward(&embedding.forward(tokens, execution)?, stream)?;
-            return Ok(LayerwiseForwardState {
+            return Ok(eredu_runtime::LayeredForwardState {
                 hidden,
                 context: InklingForwardContext {
                     parts: Vec::new(),
@@ -2966,7 +2966,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                 .collect::<Vec<_>>();
             let tokens = concatenate_axis(&token_parts, 1, stream)?;
             let hidden = concatenate_axis(&embedding_parts, 1, stream)?;
-            return Ok(LayerwiseForwardState {
+            return Ok(eredu_runtime::LayeredForwardState {
                 hidden,
                 context: InklingForwardContext {
                     parts,
@@ -2988,7 +2988,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                 })
             })
             .expect("validated non-empty Inkling input");
-        Ok(LayerwiseForwardState {
+        Ok(eredu_runtime::LayeredForwardState {
             hidden,
             context: InklingForwardContext {
                 parts,
