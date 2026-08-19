@@ -12,6 +12,7 @@ use eredu_nn::{
     NormalizationSpec, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
     Parameterized, RopeValue, RotaryOperator, RotarySpec,
 };
+use eredu_runtime::ParameterBackend;
 use safemlx::{
     builder::Builder,
     distributed::Group,
@@ -425,6 +426,75 @@ impl Parameterized<Array> for MlxRotary {
 /// Zero-sized MLX backend selector. All calls are statically dispatched.
 #[derive(Debug, Clone, Copy)]
 pub struct MlxBackend;
+
+/// MLX failure while lowering a neutral checkpoint lease or recipe.
+#[derive(Debug, thiserror::Error)]
+pub enum MlxParameterError {
+    /// Encoded lease acquisition or MLX submission failed.
+    #[error(transparent)]
+    Store(#[from] crate::backend::mlx::runtime::checkpoint::store::WeightStoreError),
+    /// A neutral derived-weight recipe could not be lowered.
+    #[error(transparent)]
+    Recipe(#[from] crate::backend::mlx::runtime::checkpoint::recipe::WeightRecipeError),
+    /// Final stream-to-stream weight copy failed.
+    #[error(transparent)]
+    Mlx(#[from] safemlx::error::Exception),
+}
+
+impl ParameterBackend for MlxBackend {
+    type Parameter = Array;
+    type MaterializedWeight = Array;
+    type MaterializationContext =
+        crate::backend::mlx::runtime::checkpoint::store::MlxParameterMaterializationContext;
+    type Materialization = crate::backend::mlx::runtime::checkpoint::store::WeightMaterialization;
+    type ParameterError = MlxParameterError;
+
+    fn materialize(
+        lease: eredu_checkpoint::store::CheckpointLease,
+        context: &Self::MaterializationContext,
+    ) -> Result<Self::Materialization, Self::ParameterError> {
+        Ok(context
+            .weight_lease(lease)?
+            .materialize(context.source_stream(), context.execution_stream())?)
+    }
+
+    fn materialize_recipe(
+        recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+        context: &Self::MaterializationContext,
+    ) -> Result<Self::Materialization, Self::ParameterError> {
+        use crate::backend::mlx::runtime::checkpoint::recipe::MlxWeightRecipeExt;
+
+        let source =
+            crate::backend::mlx::runtime::checkpoint::store::NeutralCheckpointSourceAdapter::new(
+                source, context,
+            );
+        let pending = recipe.prepare_materialization(&source, context.source_stream())?;
+        let (output, sources) = pending.into_parts();
+        let output = if context.source_stream() == context.execution_stream() {
+            output
+        } else {
+            output.copy(context.execution_stream())?
+        };
+        Ok(
+            crate::backend::mlx::runtime::checkpoint::store::WeightMaterialization::submit_retained(
+                output, sources,
+            )?,
+        )
+    }
+
+    fn materialized_weight(materialization: &Self::Materialization) -> &Self::MaterializedWeight {
+        materialization.output()
+    }
+
+    fn bind(
+        parameter: &mut Self::Parameter,
+        weight: Self::MaterializedWeight,
+    ) -> Result<(), Self::ParameterError> {
+        *parameter = weight;
+        Ok(())
+    }
+}
 
 impl NeuralBackend for MlxBackend {
     type Tensor = Array;

@@ -15,7 +15,10 @@ use eredu_checkpoint::{
         GgufLease as NeutralGgufLease, GgufWeightStore as NeutralGgufWeightStore,
         GgufWeightStoreBuilder as NeutralGgufWeightStoreBuilder,
     },
-    store::{EncodedTensorLease, SafetensorsLease as NeutralSafetensorsLease, TensorReadRequest},
+    store::{
+        CheckpointLease, CheckpointSource, EncodedTensorLease,
+        SafetensorsLease as NeutralSafetensorsLease, TensorReadRequest,
+    },
     StoredDtype,
 };
 
@@ -238,12 +241,12 @@ pub enum WeightStoreError {
 ///
 /// Implementations catalog keys without producing execution arrays. An
 /// acquired lease owns the lifetime required for later safe materialization.
-pub trait WeightStore: Any {
+pub trait WeightStore {
     /// Returns the concrete backend identity without consulting mutable diagnostics.
     fn backend(&self) -> WeightStoreBackend;
 
     /// Supports optional backend-specific inspection without making callers concrete.
-    fn as_any(&self) -> &dyn Any;
+    fn as_any(&self) -> Option<&dyn Any>;
 
     /// Returns all catalog keys in deterministic order.
     fn keys(&self) -> Vec<String>;
@@ -312,7 +315,7 @@ fn recipe_tensor_metadata(
     })
 }
 
-impl eredu_checkpoint::recipe::RecipeCatalog for dyn WeightStore {
+impl eredu_checkpoint::recipe::RecipeCatalog for dyn WeightStore + '_ {
     fn tensor_metadata(
         &self,
         key: &str,
@@ -321,7 +324,7 @@ impl eredu_checkpoint::recipe::RecipeCatalog for dyn WeightStore {
     }
 }
 
-impl eredu_checkpoint::recipe::RecipeCatalog for dyn WeightStore + Send + Sync {
+impl eredu_checkpoint::recipe::RecipeCatalog for dyn WeightStore + Send + Sync + '_ {
     fn tensor_metadata(
         &self,
         key: &str,
@@ -368,8 +371,8 @@ impl WeightStore for ContractWeightStore {
         self.source.backend()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
     }
 
     fn keys(&self) -> Vec<String> {
@@ -482,8 +485,8 @@ impl WeightStore for MemoryWeightStore {
         WeightStoreBackend::Memory
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
     }
 
     fn keys(&self) -> Vec<String> {
@@ -567,6 +570,110 @@ fn stored_dtype_for_array(value: &Array) -> StoredDtype {
 #[derive(Debug)]
 struct CachedGgufGroup {
     arrays: Vec<(String, Array)>,
+}
+
+/// MLX stream and lease-coalescing state used for neutral parameter realization.
+#[derive(Debug, Clone)]
+pub struct MlxParameterMaterializationContext {
+    source_stream: Stream,
+    execution_stream: Stream,
+    converted_groups: Arc<
+        Mutex<BTreeMap<eredu_checkpoint::gguf_store::GgufLeaseIdentity, Weak<CachedGgufGroup>>>,
+    >,
+}
+
+impl MlxParameterMaterializationContext {
+    /// Creates a reusable materialization context for one source/execution stream pair.
+    pub fn new(source_stream: &Stream, execution_stream: &Stream) -> Self {
+        Self {
+            source_stream: source_stream.clone(),
+            execution_stream: execution_stream.clone(),
+            converted_groups: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Host/source stream used to create and transform checkpoint arrays.
+    pub const fn source_stream(&self) -> &Stream {
+        &self.source_stream
+    }
+
+    /// Destination stream used for the final execution weight.
+    pub const fn execution_stream(&self) -> &Stream {
+        &self.execution_stream
+    }
+
+    pub(crate) fn weight_lease(
+        &self,
+        lease: CheckpointLease,
+    ) -> Result<WeightLease, WeightStoreError> {
+        WeightLease::from_checkpoint_lease(lease, Arc::clone(&self.converted_groups))
+    }
+}
+
+pub(crate) struct NeutralCheckpointSourceAdapter<'a> {
+    source: &'a dyn CheckpointSource,
+    converted_groups: Arc<
+        Mutex<BTreeMap<eredu_checkpoint::gguf_store::GgufLeaseIdentity, Weak<CachedGgufGroup>>>,
+    >,
+}
+
+impl<'a> NeutralCheckpointSourceAdapter<'a> {
+    pub(crate) fn new(
+        source: &'a dyn CheckpointSource,
+        context: &MlxParameterMaterializationContext,
+    ) -> Self {
+        Self {
+            source,
+            converted_groups: Arc::clone(&context.converted_groups),
+        }
+    }
+}
+
+impl WeightStore for NeutralCheckpointSourceAdapter<'_> {
+    fn backend(&self) -> WeightStoreBackend {
+        self.source
+            .source_diagnostics()
+            .map(|diagnostics| diagnostics.backend)
+            .unwrap_or(WeightStoreBackend::Memory)
+    }
+
+    fn as_any(&self) -> Option<&dyn Any> {
+        None
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.source.source_keys()
+    }
+
+    fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
+        self.source
+            .source_metadata(key)
+            .map(neutral_metadata)
+            .map_err(neutral_store_error)
+    }
+
+    fn acquire_with_policy(
+        &self,
+        key: &str,
+        selection: TensorSelection,
+        policy: WeightReadPolicy,
+    ) -> Result<WeightLease, WeightStoreError> {
+        let lease = self
+            .source
+            .acquire_lease(TensorReadRequest {
+                key: key.into(),
+                selection,
+                policy,
+            })
+            .map_err(neutral_store_error)?;
+        WeightLease::from_checkpoint_lease(lease, Arc::clone(&self.converted_groups))
+    }
+
+    fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError> {
+        self.source
+            .source_diagnostics()
+            .map_err(neutral_store_error)
+    }
 }
 
 /// Builder adapter preserving the MLX loader API while delegating GGUF
@@ -681,8 +788,8 @@ impl WeightStore for GgufWeightStore {
         WeightStoreBackend::Gguf
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
     }
 
     fn is_checkpoint_contract_resolved(&self) -> bool {
@@ -744,8 +851,8 @@ impl WeightStore for SafetensorsWeightStore {
         WeightStoreBackend::Safetensors
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
     }
 
     fn keys(&self) -> Vec<String> {
@@ -992,6 +1099,45 @@ pub struct WeightLease {
 }
 
 impl WeightLease {
+    fn from_checkpoint_lease(
+        lease: CheckpointLease,
+        converted_groups: Arc<
+            Mutex<BTreeMap<eredu_checkpoint::gguf_store::GgufLeaseIdentity, Weak<CachedGgufGroup>>>,
+        >,
+    ) -> Result<Self, WeightStoreError> {
+        let key = lease.metadata().name.clone();
+        let metadata = neutral_metadata(lease.metadata().clone());
+        let selection = lease.selection().clone();
+        let output_shape = lease.output_shape().to_vec();
+        let selected_byte_len = match &lease {
+            CheckpointLease::Safetensors(lease) => {
+                usize::try_from(lease.bounded_read_proof().length_bytes).map_err(|_| {
+                    WeightStoreError::Overflow {
+                        context: format!("selected byte length for tensor {key:?}"),
+                    }
+                })?
+            }
+            CheckpointLease::Gguf(_) => {
+                selected_byte_len(&key, &metadata, &selection, &output_shape)?
+            }
+        };
+        let source = match lease {
+            CheckpointLease::Safetensors(lease) => WeightLeaseSource::Safetensors(lease),
+            CheckpointLease::Gguf(lease) => WeightLeaseSource::Gguf(Box::new(GgufLeaseSource {
+                lease,
+                converted_groups,
+            })),
+        };
+        Ok(Self {
+            key,
+            metadata,
+            selection,
+            output_shape,
+            selected_byte_len,
+            source,
+        })
+    }
+
     /// Returns the logical key pinned by this lease.
     pub fn key(&self) -> &str {
         &self.key

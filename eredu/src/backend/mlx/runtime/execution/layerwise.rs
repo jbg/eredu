@@ -79,7 +79,7 @@ pub(crate) fn resolve_checkpoint_store<A: ArchitectureAdapter>(
     }
     let raw = store
         .as_any()
-        .downcast_ref::<SafetensorsWeightStore>()
+        .and_then(|store| store.downcast_ref::<SafetensorsWeightStore>())
         .ok_or_else(|| {
             Error::UnsupportedArchitecture(format!(
                 "SafeTensors store for {} is not a raw or contract-resolved checkpoint",

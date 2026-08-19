@@ -267,8 +267,8 @@ mod tests {
         fn backend(&self) -> WeightStoreBackend {
             WeightStoreBackend::Memory
         }
-        fn as_any(&self) -> &dyn Any {
-            self
+        fn as_any(&self) -> Option<&dyn Any> {
+            Some(self)
         }
         fn keys(&self) -> Vec<String> {
             self.metadata.keys().cloned().collect()

@@ -111,6 +111,71 @@ pub trait EncodedTensorLease: Send + Sync + 'static {
     fn encoded_bytes(&self) -> Option<&[u8]>;
 }
 
+/// Type-erased neutral lease covering the checkpoint formats supported by Eredu.
+#[derive(Debug, Clone)]
+pub enum CheckpointLease {
+    /// Memory-mapped SafeTensors bytes.
+    Safetensors(SafetensorsLease),
+    /// Lazily read portable GGUF payload.
+    Gguf(crate::gguf_store::GgufLease),
+}
+
+impl EncodedTensorLease for CheckpointLease {
+    fn metadata(&self) -> &TensorMetadata {
+        match self {
+            Self::Safetensors(lease) => lease.metadata(),
+            Self::Gguf(lease) => lease.metadata(),
+        }
+    }
+
+    fn selection(&self) -> &TensorSelection {
+        match self {
+            Self::Safetensors(lease) => lease.selection(),
+            Self::Gguf(lease) => lease.selection(),
+        }
+    }
+
+    fn output_shape(&self) -> &[usize] {
+        match self {
+            Self::Safetensors(lease) => lease.output_shape(),
+            Self::Gguf(lease) => lease.output_shape(),
+        }
+    }
+
+    fn bounded_read_proof(&self) -> &BoundedReadProof {
+        match self {
+            Self::Safetensors(lease) => lease.bounded_read_proof(),
+            Self::Gguf(lease) => lease.bounded_read_proof(),
+        }
+    }
+
+    fn backing_path(&self) -> Option<&Path> {
+        match self {
+            Self::Safetensors(lease) => lease.backing_path(),
+            Self::Gguf(lease) => lease.backing_path(),
+        }
+    }
+
+    fn encoded_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Safetensors(lease) => lease.encoded_bytes(),
+            Self::Gguf(lease) => lease.encoded_bytes(),
+        }
+    }
+}
+
+/// Object-safe cold-path checkpoint source used by generic materializers.
+pub trait CheckpointSource: Send + Sync {
+    /// Returns all logical catalog keys in deterministic order.
+    fn source_keys(&self) -> Vec<String>;
+    /// Returns metadata without reading tensor payloads.
+    fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError>;
+    /// Acquires a format-preserving encoded lease.
+    fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError>;
+    /// Returns deterministic storage diagnostics.
+    fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError>;
+}
+
 /// Persistent checkpoint storage contract with a concrete lease type.
 pub trait WeightStore {
     /// Encoded lease retaining the source lifetime.
@@ -687,6 +752,24 @@ impl WeightStore for SafetensorsWeightStore {
             physical_read_bytes: 0,
             coalesced_group_hits: 0,
         })
+    }
+}
+
+impl CheckpointSource for SafetensorsWeightStore {
+    fn source_keys(&self) -> Vec<String> {
+        WeightStore::keys(self)
+    }
+
+    fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        WeightStore::metadata(self, key)
+    }
+
+    fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+        WeightStore::acquire(self, request).map(CheckpointLease::Safetensors)
+    }
+
+    fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+        WeightStore::diagnostics(self)
     }
 }
 

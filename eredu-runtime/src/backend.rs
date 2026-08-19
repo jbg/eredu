@@ -1,5 +1,9 @@
 //! Narrow capability contracts implemented by execution backends.
 
+use eredu_checkpoint::{
+    recipe::DerivedWeightRecipe,
+    store::{CheckpointLease, CheckpointSource},
+};
 use eredu_core::Completion;
 use eredu_nn::NeuralBackend;
 
@@ -24,8 +28,28 @@ pub trait ParameterBackend: NeuralBackend {
     type Parameter;
     /// Materialized backend-native checkpoint weight.
     type MaterializedWeight;
+    /// Backend context used only while realizing checkpoint parameters.
+    type MaterializationContext: ?Sized;
+    /// In-flight guard retaining encoded sources through exact realization completion.
+    type Materialization;
     /// Backend-specific loading failure.
     type ParameterError: std::error::Error + Send + Sync + 'static;
+
+    /// Lowers one format-preserving encoded lease into a native weight.
+    fn materialize(
+        lease: CheckpointLease,
+        context: &Self::MaterializationContext,
+    ) -> Result<Self::Materialization, Self::ParameterError>;
+
+    /// Lowers a validated neutral recipe directly into a native weight.
+    fn materialize_recipe(
+        recipe: &DerivedWeightRecipe,
+        source: &dyn CheckpointSource,
+        context: &Self::MaterializationContext,
+    ) -> Result<Self::Materialization, Self::ParameterError>;
+
+    /// Borrows the native weight retained by an in-flight materialization.
+    fn materialized_weight(materialization: &Self::Materialization) -> &Self::MaterializedWeight;
 
     /// Binds one materialized weight to its destination parameter.
     fn bind(

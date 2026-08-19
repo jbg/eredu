@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::store::{StoreError, TensorMetadata, TensorSelection, WeightStore};
+use crate::store::{CheckpointSource, StoreError, TensorMetadata, TensorSelection, WeightStore};
 use crate::StoredDtype;
 
 /// Metadata-only catalog used to validate a derived-weight recipe.
@@ -14,6 +14,12 @@ pub trait RecipeCatalog {
 impl<T: WeightStore> RecipeCatalog for T {
     fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
         self.metadata(key)
+    }
+}
+
+impl RecipeCatalog for dyn CheckpointSource + '_ {
+    fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        self.source_metadata(key)
     }
 }
 

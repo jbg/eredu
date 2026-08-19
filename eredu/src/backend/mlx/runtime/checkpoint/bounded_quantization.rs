@@ -351,8 +351,8 @@ impl WeightStore for BoundedQuantizedWeightStore {
         self.source.backend()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
     }
 
     fn keys(&self) -> Vec<String> {

@@ -267,7 +267,41 @@ impl SubmissionBackend for FakeBackend {
 impl ParameterBackend for FakeBackend {
     type Parameter = FakeTensor;
     type MaterializedWeight = FakeTensor;
+    type MaterializationContext = ();
+    type Materialization = FakeTensor;
     type ParameterError = Infallible;
+    fn materialize(
+        lease: eredu_checkpoint::store::CheckpointLease,
+        _: &(),
+    ) -> Result<Self::Materialization, Infallible> {
+        use eredu_checkpoint::store::EncodedTensorLease;
+        Ok(FakeTensor(
+            lease
+                .output_shape()
+                .iter()
+                .map(|dimension| i32::try_from(*dimension).unwrap_or(i32::MAX))
+                .collect(),
+        ))
+    }
+    fn materialize_recipe(
+        recipe: &eredu_checkpoint::recipe::DerivedWeightRecipe,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+        _: &(),
+    ) -> Result<Self::Materialization, Infallible> {
+        let metadata = recipe
+            .infer(source)
+            .expect("fake-backend recipes are validated by the neutral catalog");
+        Ok(FakeTensor(
+            metadata
+                .shape
+                .iter()
+                .map(|dimension| i32::try_from(*dimension).unwrap_or(i32::MAX))
+                .collect(),
+        ))
+    }
+    fn materialized_weight(materialization: &Self::Materialization) -> &Self::MaterializedWeight {
+        materialization
+    }
     fn bind(
         parameter: &mut Self::Parameter,
         weight: Self::MaterializedWeight,

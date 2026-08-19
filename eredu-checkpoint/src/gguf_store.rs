@@ -17,9 +17,10 @@ use eredu_gguf::{
 
 use crate::{
     store::{
-        validate_selection, BoundedReadProof, EncodedTensorLease, ReadPolicy, StoreError,
-        TensorMetadata, TensorReadRequest, TensorSelection, WeightStore, WeightStoreBackend,
-        WeightStoreDiagnostics, DEFAULT_MAX_MAPPED_SHARDS,
+        validate_selection, BoundedReadProof, CheckpointLease, CheckpointSource,
+        EncodedTensorLease, ReadPolicy, StoreError, TensorMetadata, TensorReadRequest,
+        TensorSelection, WeightStore, WeightStoreBackend, WeightStoreDiagnostics,
+        DEFAULT_MAX_MAPPED_SHARDS,
     },
     validation::{resolve_gguf_plan, ResolvedCheckpointPlan},
     StoredDtype,
@@ -439,6 +440,24 @@ impl WeightStore for GgufWeightStore {
                 .coalesced_group_hits
                 .load(Ordering::Relaxed),
         })
+    }
+}
+
+impl CheckpointSource for GgufWeightStore {
+    fn source_keys(&self) -> Vec<String> {
+        WeightStore::keys(self)
+    }
+
+    fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        WeightStore::metadata(self, key)
+    }
+
+    fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+        WeightStore::acquire(self, request).map(CheckpointLease::Gguf)
+    }
+
+    fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+        WeightStore::diagnostics(self)
     }
 }
 
