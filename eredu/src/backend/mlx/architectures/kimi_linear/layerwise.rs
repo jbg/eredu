@@ -45,7 +45,7 @@ use crate::{
             binding_plan::{BindingPlan, PlannedBinding},
             quantization::should_quantize_on_load,
             recipe::DerivedWeightRecipe,
-            store::{GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend},
+            store::{GgufWeightStore, TensorSelection, WeightStoreBackend},
         },
         distributed::parallel::{
             aligned_partition_units, array_parameter_member, partitioned_projection_members,
@@ -498,11 +498,13 @@ impl KimiLinearLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
         self.execution.checkpoint_store()
     }
 
-    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+    pub(crate) fn checkpoint_store_arc(
+        &self,
+    ) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
         self.execution.checkpoint_store_arc()
     }
 
@@ -749,7 +751,7 @@ pub(crate) fn load_kimi_linear_gguf_tensor_parallel_model(
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
     let gguf_plan =
         super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -781,7 +783,7 @@ pub(crate) fn load_kimi_linear_gguf_layerwise_model(
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
     let args = prepared.args;
     let gguf_plan = super::checkpoint::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -873,7 +875,7 @@ pub fn load_kimi_linear_expert_cache_model(
 }
 
 fn load_kimi_linear_sparse_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
@@ -914,7 +916,7 @@ fn load_kimi_linear_sparse_with_store(
 
 /// Builds the streamed nonexpert Kimi execution base used by distributed EP.
 pub(crate) fn load_kimi_linear_sparse_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
@@ -928,7 +930,7 @@ pub(crate) fn load_kimi_linear_sparse_ep_base_with_store(
 
 /// Builds the shared TP-sharded nonexpert base used by combined TP+EP.
 pub(crate) fn load_kimi_linear_sparse_tp_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
@@ -1017,12 +1019,12 @@ impl KimiLinearLayerwiseAdapter {
         &self,
         layer: &DecoderLayer,
         index: usize,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
         let prefix = format!("model.layers.{index}");
         let normalized = normalized_checkpoint_keys(store);
-        let keys = store.keys();
-        let gguf = store.backend() == WeightStoreBackend::Gguf;
+        let keys = store.source_keys();
+        let gguf = store.source_diagnostics()?.backend == WeightStoreBackend::Gguf;
         let mut recipes = BTreeMap::new();
 
         for local_name in layer.parameters().flatten().keys() {
@@ -1164,9 +1166,11 @@ impl LoadTimeQuantizableAdapter for KimiLinearLayerwiseAdapter {
     }
 }
 
-fn normalized_checkpoint_keys(store: &dyn WeightStore) -> BTreeMap<String, String> {
+fn normalized_checkpoint_keys(
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> BTreeMap<String, String> {
     store
-        .keys()
+        .source_keys()
         .into_iter()
         .map(|raw| {
             let runtime = canonical_checkpoint_name(&raw).replace(".block_sparse_moe.", ".mlp.");
@@ -1283,13 +1287,16 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
     fn selected_static_units(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = Vec::new();
@@ -1710,7 +1717,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         _group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let plan = build_module_binding_plan_with_recipes_excluding(
             layer,
@@ -1726,7 +1733,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1744,7 +1751,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1789,10 +1796,13 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         }
     }
 
-    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+    fn additional_consumed_checkpoint_keys(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Vec<String> {
         if self.sparse_expert_cache {
             store
-                .keys()
+                .source_keys()
                 .into_iter()
                 .filter(|key| {
                     key.contains(".mlp.experts.") || key.contains(".block_sparse_moe.experts.")
@@ -2003,14 +2013,14 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
 
 pub(crate) fn kimi_expert_catalog(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     kimi_expert_catalog_for_layers(args, store, 0..args.layer_schedule.len())
 }
 
 pub(crate) fn kimi_expert_catalog_for_layers(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     layers: std::ops::Range<usize>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let normalized = normalized_checkpoint_keys(store);

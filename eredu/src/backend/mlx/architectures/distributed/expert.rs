@@ -53,9 +53,7 @@ use crate::{
     backend::mlx::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
     backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
     backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load,
-    backend::mlx::runtime::checkpoint::store::{
-        GgufWeightStore, SafetensorsWeightStore, WeightStore,
-    },
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore},
     backend::mlx::runtime::distributed::parallel::{ParallelBuildContext, ShardingPolicy},
     backend::mlx::runtime::distributed::topology::{
         load_partition_from_store_on_streams, PlacementPlan, TensorPlacement,
@@ -3456,7 +3454,7 @@ fn load_external_gguf_ep(
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
             let gguf_plan = crate::backend::mlx::architectures::kimi_linear::checkpoint::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
-            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
+            let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
                 std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                     checkpoint.clone(),
                     &gguf_plan,
@@ -3514,7 +3512,7 @@ fn load_external_gguf_ep(
             )?;
             let gguf_plan = crate::backend::mlx::architectures::deepseek_v4::checkpoint::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
-            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
+            let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
                 std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                     checkpoint.clone(),
                     &gguf_plan,
@@ -3578,7 +3576,7 @@ fn load_external_gguf_ep(
             )?;
             let gguf_plan = crate::backend::mlx::architectures::deepseek_v3::checkpoint::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
-            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
+            let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
                 std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                     checkpoint.clone(),
                     &gguf_plan,
@@ -3640,7 +3638,7 @@ fn load_external_gguf_ep(
                 crate::backend::mlx::architectures::qwen::dense::checkpoint::GgufVariant::Qwen3Moe,
             )
             .map_err(Error::UnsupportedArchitecture)?;
-            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
+            let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
                 std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                     checkpoint.clone(),
                     &gguf_plan,
@@ -3835,7 +3833,7 @@ fn load_external_gguf_ep(
             )?;
             let gguf_plan = crate::backend::mlx::architectures::gpt_oss::checkpoint::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
-            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
+            let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
                 std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                     checkpoint.clone(),
                     &gguf_plan,
@@ -3947,7 +3945,7 @@ fn load_external_gguf_ep(
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
             let gguf_plan = crate::backend::mlx::architectures::lfm2::checkpoint::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
-            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
+            let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
                 std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                     checkpoint.clone(),
                     &gguf_plan,
@@ -4001,7 +3999,7 @@ fn load_external_gguf_ep(
                 resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
             let gguf_plan = crate::backend::mlx::architectures::nemotron_h::checkpoint::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
-            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
+            let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
                 std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                     checkpoint.clone(),
                     &gguf_plan,
@@ -4145,7 +4143,7 @@ fn finish_external_ep(
     kind: ModelKind,
     assignment: ExpertAssignment,
     mut architecture: ExpertArchitecture,
-    store: std::sync::Arc<dyn WeightStore + Send + Sync>,
+    store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     entries: Vec<ExpertCatalogEntry>,
     residency: ExternalExpertResidency,
     replicated_parameter_bytes: usize,
@@ -4173,7 +4171,7 @@ fn finish_external_ep(
             weights_stream,
         )?,
     };
-    let opened_checkpoint_shards = store.diagnostics()?.touched_shard_paths;
+    let opened_checkpoint_shards = store.source_diagnostics()?.touched_shard_paths;
     Ok(finish_additional_cached_ep(
         topology,
         kind,
@@ -4222,7 +4220,7 @@ fn load_kimi_linear_external_ep(
     let args = kimi_linear::get_model_args(model_dir)?;
     args.validate()?;
     let assignment = resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
-    let store: std::sync::Arc<dyn WeightStore + Send + Sync> = std::sync::Arc::new(
+    let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> = std::sync::Arc::new(
         SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
     );
     let model = if topology.tensor_parallel_size > 1 {
@@ -4279,7 +4277,7 @@ fn load_deepseek_external_ep(
     args.validate()?;
     let assignment =
         resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
-    let store: std::sync::Arc<dyn WeightStore + Send + Sync> = std::sync::Arc::new(
+    let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> = std::sync::Arc::new(
         SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
     );
     let model = if topology.tensor_parallel_size > 1 {
@@ -4336,7 +4334,7 @@ fn load_deepseek_v4_external_ep(
     let args = deepseek_v4::get_model_args(model_dir)?;
     let assignment =
         resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
-    let store: std::sync::Arc<dyn WeightStore + Send + Sync> = std::sync::Arc::new(
+    let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> = std::sync::Arc::new(
         SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
     );
     let model = if topology.tensor_parallel_size > 1 {
@@ -4398,7 +4396,7 @@ fn load_qwen3_external_ep(
         ));
     }
     let assignment = resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
-    let store: std::sync::Arc<dyn WeightStore + Send + Sync> = std::sync::Arc::new(
+    let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> = std::sync::Arc::new(
         SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
     );
     let model = if topology.tensor_parallel_size > 1 {
@@ -4602,7 +4600,7 @@ fn is_auxiliary_checkpoint_key(kind: ModelKind, key: &str) -> bool {
 }
 
 fn rank_owned_expert_cache(
-    store: std::sync::Arc<dyn WeightStore + Send + Sync>,
+    store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     entries: Vec<ExpertCatalogEntry>,
     assignment: &ExpertAssignment,
     options: ExpertCacheLoadOptions,
@@ -4637,7 +4635,7 @@ fn rank_owned_expert_cache(
 }
 
 fn rank_owned_resident_experts(
-    store: std::sync::Arc<dyn WeightStore + Send + Sync>,
+    store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     entries: Vec<ExpertCatalogEntry>,
     assignment: &ExpertAssignment,
     quantization: Option<WeightQuantization>,
@@ -4711,7 +4709,7 @@ fn finish_additional_cached_ep(
 fn open_external_safetensors_store(
     model_dir: &Path,
     max_mapped_shards: usize,
-) -> Result<std::sync::Arc<dyn WeightStore + Send + Sync>, Error> {
+) -> Result<std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
     Ok(std::sync::Arc::new(
         SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
     ))

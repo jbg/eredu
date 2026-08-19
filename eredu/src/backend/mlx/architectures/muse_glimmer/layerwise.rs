@@ -54,7 +54,7 @@ use crate::{
         populate_module_from_lease, populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
-    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection},
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
     },
@@ -90,13 +90,13 @@ const VISION_PATCH_WEIGHT: &str = "vision_tower.patch_embedder.patch_embedding.w
 
 fn vision_static_bindings(
     vision: &VisionStatic,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<WeightBinding>, Error> {
     let checkpoint_key = format!("model.{VISION_PATCH_WEIGHT}");
     let mut recipes = BTreeMap::new();
     if store
-        .metadata(&checkpoint_key)
-        .is_ok_and(|metadata| metadata.shape.len() == 4)
+        .source_metadata(&checkpoint_key)
+        .is_ok_and(|metadata| metadata.logical_shape.len() == 4)
     {
         recipes.insert(
             VISION_PATCH_WEIGHT.into(),
@@ -411,7 +411,7 @@ impl LayerwiseDecoder {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
         self.execution.checkpoint_store()
     }
 
@@ -848,7 +848,7 @@ fn muse_gguf_store(
     mmproj: Option<&resident::MuseGlimmerMmprojGguf>,
     args: &DecoderConfig,
     max_mapped_shards: usize,
-) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
     let text_plan = super::checkpoint::gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
     let mut builder = GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
@@ -1908,13 +1908,16 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         }
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
     fn selected_static_units(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = Vec::new();
@@ -2313,7 +2316,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         match layer {
             MuseGlimmerLayer::Vision(_) if group == 0 => {
@@ -2343,7 +2346,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -2361,7 +2364,7 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -2388,10 +2391,13 @@ impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
             .collect()
     }
 
-    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+    fn additional_consumed_checkpoint_keys(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Vec<String> {
         if self.sparse_expert_cache {
             store
-                .keys()
+                .source_keys()
                 .into_iter()
                 .filter(|key| key.contains(".mlp.experts."))
                 .collect()
@@ -3072,7 +3078,7 @@ pub(crate) fn qwen_text_layer_bindings(
     layer: &TransformerBlock,
     args: &DecoderConfig,
     prefix: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     external_experts: bool,
 ) -> Result<Vec<WeightBinding>, Error> {
     if external_experts {
@@ -3086,7 +3092,7 @@ pub(crate) fn qwen_text_layer_bindings(
         .build_bindings(store)?);
     }
     let expert_prefix = format!("{prefix}.mlp.experts");
-    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut recipes = BTreeMap::new();
     if keys.contains(&format!("{expert_prefix}.gate_proj"))
         && keys.contains(&format!("{expert_prefix}.up_proj"))
@@ -3162,7 +3168,7 @@ pub(crate) fn qwen_text_layer_bindings(
 
 pub(crate) fn qwen3_expert_catalog(
     args: &DecoderConfig,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     qwen3_expert_catalog_cartesian(args, store, "model.layers", None)
 }
@@ -3174,11 +3180,11 @@ pub(crate) fn qwen3_expert_catalog(
 /// expert caching while avoiding a full expert copy on every TP coordinate.
 pub(crate) fn qwen3_expert_catalog_cartesian(
     args: &DecoderConfig,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     layer_root: &str,
     layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut entries = Vec::new();
     for layer in 0..usize::try_from(args.num_hidden_layers)
         .map_err(|_| Error::UnsupportedArchitecture("Qwen3 layer count is negative".into()))?
@@ -3348,7 +3354,7 @@ pub(crate) fn qwen3_expert_catalog_cartesian(
 fn recipe_binding(
     name: &str,
     recipe: DerivedWeightRecipe,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<WeightBinding, Error> {
     let metadata = recipe.infer(store)?;
     let plan = BindingPlan::new(vec![PlannedBinding {

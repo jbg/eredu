@@ -27,7 +27,7 @@ use crate::{
             BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
         },
         recipe::RecipeDtype,
-        store::{TensorSelection, WeightStore},
+        store::TensorSelection,
     },
     backend::mlx::runtime::residency::manager::{
         ResidencyError, ResidencyManager, ResidentTransfer, ResidentUnitLease,
@@ -202,7 +202,7 @@ impl ExpertCatalogEntry {
 /// Result of replacing dense expert bindings with a disk-backed packed overlay.
 pub(crate) struct QuantizedExpertCatalog {
     /// Store supplying synthetic packed bindings and delegating all other keys.
-    pub store: Arc<dyn WeightStore + Send + Sync>,
+    pub store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     /// Expert units rebuilt against the packed store.
     pub entries: Vec<ExpertCatalogEntry>,
     /// Deterministic bounded-materialisation telemetry.
@@ -212,7 +212,7 @@ pub(crate) struct QuantizedExpertCatalog {
 /// Quantizes every floating expert projection through its authoritative
 /// rank-local semantic recipe and rebuilds the catalog against packed keys.
 pub(crate) fn quantize_expert_catalog(
-    source: Arc<dyn WeightStore + Send + Sync>,
+    source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     entries: Vec<ExpertCatalogEntry>,
     quantization: WeightQuantization,
     max_working_set_bytes: u64,
@@ -265,7 +265,7 @@ pub(crate) fn quantize_expert_catalog(
         source_stream,
     )?);
     let report = transformed.report().clone();
-    let store: Arc<dyn WeightStore + Send + Sync> = transformed;
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = transformed;
     let mut rebuilt = Vec::with_capacity(units.len());
     for (identity, unit) in units {
         let mut bindings = Vec::new();
@@ -379,14 +379,14 @@ fn local_companion_names(weight_name: &str) -> (String, String) {
 fn packed_binding(
     local_name: &str,
     checkpoint_key: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<WeightBinding, Error> {
-    let metadata = store.metadata(checkpoint_key)?;
+    let metadata = store.source_metadata(checkpoint_key)?;
     Ok(WeightBinding::new(
         local_name,
         checkpoint_key,
         TensorSelection::Full,
-        metadata.logical_byte_len as u64,
+        metadata.encoded_byte_len as u64,
     )?)
 }
 
@@ -504,15 +504,15 @@ impl ExpertCache {
         device_stream: Stream,
     ) -> Result<Self, ExpertCacheError>
     where
-        S: WeightStore + Send + Sync + 'static,
+        S: eredu_checkpoint::store::CheckpointSource + 'static,
     {
-        let store: Arc<dyn WeightStore + Send + Sync> = store;
+        let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = store;
         Self::new_shared(store, entries, options, source_stream, device_stream)
     }
 
     /// Creates a cache from an already type-erased checkpoint store.
     pub fn new_shared(
-        store: Arc<dyn WeightStore + Send + Sync>,
+        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
         entries: impl IntoIterator<Item = ExpertCatalogEntry>,
         options: ExpertCacheLoadOptions,
         source_stream: Stream,
@@ -534,7 +534,7 @@ impl ExpertCache {
     /// Creates a cache after boundedly transforming its rank-local semantic
     /// expert recipes into packed checkpoint bindings.
     pub(crate) fn new_quantized_shared(
-        store: Arc<dyn WeightStore + Send + Sync>,
+        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
         entries: Vec<ExpertCatalogEntry>,
         options: ExpertCacheLoadOptions,
         quantization: WeightQuantization,
@@ -572,7 +572,7 @@ impl ExpertCache {
     /// by sparse and resident execution, but resident experts cannot be evicted
     /// and never trigger checkpoint reads during a forward pass.
     pub fn new_resident_shared(
-        store: Arc<dyn WeightStore + Send + Sync>,
+        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
         entries: impl IntoIterator<Item = ExpertCatalogEntry>,
         source_stream: Stream,
         device_stream: Stream,
@@ -593,7 +593,7 @@ impl ExpertCache {
     /// Creates a fully resident cache after boundedly transforming the exact
     /// rank-local expert catalog into its requested packed representation.
     pub(crate) fn new_quantized_resident_shared(
-        store: Arc<dyn WeightStore + Send + Sync>,
+        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
         entries: Vec<ExpertCatalogEntry>,
         quantization: WeightQuantization,
         source_stream: Stream,
@@ -626,7 +626,7 @@ impl ExpertCache {
 
     #[allow(clippy::too_many_arguments)]
     fn new_shared_with_policy(
-        store: Arc<dyn WeightStore + Send + Sync>,
+        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
         entries: impl IntoIterator<Item = ExpertCatalogEntry>,
         options: ExpertCacheLoadOptions,
         policy: ResidencyPolicy,
@@ -1455,6 +1455,7 @@ pub enum ExpertCacheError {
 mod tests {
     use std::sync::Arc;
 
+    use eredu_checkpoint::store::CheckpointSource;
     use safemlx::{
         host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy,
         HostTransferStorageKind,
@@ -1464,8 +1465,7 @@ mod tests {
     use super::*;
     use crate::{
         backend::mlx::runtime::checkpoint::{
-            recipe::DerivedWeightRecipe,
-            store::{SafetensorsWeightStore, TensorSelection},
+            recipe::DerivedWeightRecipe, store::SafetensorsWeightStore,
         },
         core::residency::CacheEvictionPolicy,
     };
@@ -1591,7 +1591,7 @@ mod tests {
             &dir.path().join("model.safetensors"),
         )
         .unwrap();
-        let store: Arc<dyn WeightStore + Send + Sync> =
+        let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
             Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
         let entries = (0..2)
             .map(|expert| {
@@ -1736,7 +1736,7 @@ mod tests {
         assert_eq!(initialized.device_resident_bytes, initialized.owned_bytes);
         assert_eq!(initialized.host_resident_experts, 0);
 
-        let reads_after_load = store.diagnostics().unwrap().physical_reads;
+        let reads_after_load = store.source_diagnostics().unwrap().physical_reads;
         let acquired = cache
             .acquire_route_slice(2, &[2, 0, 2], &[3, 1], ExpertPass::Decode, &stream())
             .unwrap();
@@ -1744,7 +1744,7 @@ mod tests {
         eval([&compact]).unwrap();
 
         assert_eq!(
-            store.diagnostics().unwrap().physical_reads,
+            store.source_diagnostics().unwrap().physical_reads,
             reads_after_load
         );
         let executed = cache.report().unwrap();

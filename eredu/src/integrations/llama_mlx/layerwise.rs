@@ -49,8 +49,7 @@ use crate::{
         build_module_binding_plan_with_recipes, populate_module_from_lease,
     },
     backend::mlx::runtime::checkpoint::{
-        quantization::should_quantize_on_load,
-        store::{GgufWeightStore, WeightStore},
+        quantization::should_quantize_on_load, store::GgufWeightStore,
     },
     backend::mlx::runtime::distributed::parallel::{
         register_replicated_module, ParallelPlanBuilder,
@@ -203,7 +202,7 @@ impl LlamaModel {
     }
 
     /// Returns the persistent checkpoint store used by a layerwise model.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
         self.execution.checkpoint_store()
     }
 
@@ -530,7 +529,7 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
         resident::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
     let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -567,7 +566,7 @@ pub(crate) fn load_llama_gguf_model(
         resident::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
     let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -863,13 +862,16 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         Ok((LlamaCache::Paged(caches), manifest))
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
     fn selected_static_units(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = Vec::new();
@@ -1190,7 +1192,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         _group: usize,
         _index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         Ok(
             build_module_binding_plan_with_recipes(layer, "", store, BTreeMap::new())?
@@ -1207,7 +1209,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {

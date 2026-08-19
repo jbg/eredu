@@ -24,7 +24,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding::{
         build_module_binding_plan_with_recipes, build_module_bindings, populate_module_from_lease,
     },
-    backend::mlx::runtime::checkpoint::store::{TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::store::TensorSelection,
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
     },
@@ -45,11 +45,6 @@ use eredu_runtime::ResidentLayerGroupReport;
 pub use crate::backend::mlx::architectures::moshi::model::{
     GenerationState, GenerationStepWithLogits, ModelArgs, MoshiCache, SampleStepOutput,
     TokenStepOutput,
-};
-
-#[cfg(test)]
-use crate::backend::mlx::runtime::execution::layerwise::{
-    load_layerwise_model, transformed_module_weight_store,
 };
 
 const STATIC_UNIT: &str = "moshi.static";
@@ -138,7 +133,7 @@ impl MoshiLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
         self.execution.checkpoint_store()
     }
 
@@ -1031,25 +1026,6 @@ pub fn load_pytorch_layerwise_model(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn test_model_from_resident(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<MoshiLayerwiseModel, Error> {
-    let adapter = MoshiLayerwiseAdapter::new(model.args.clone(), CheckpointLayout::Native, stream)?;
-    Ok(MoshiLayerwiseModel {
-        execution: load_layerwise_model(
-            transformed_module_weight_store(&model)?,
-            adapter,
-            LayerWeightResidency::FullyResident,
-            stream,
-            weights_stream,
-        )?,
-        artifact_identity: LoadedArtifactIdentity::in_memory(),
-    })
-}
-
 /// Loads PersonaPlex with rank-local temporal and depth transformers.
 pub fn load_personaplex_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
@@ -1275,7 +1251,10 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         }
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         let bindings = match self.layout {
             CheckpointLayout::Native => build_module_bindings(&self.static_modules, "", store)?,
             CheckpointLayout::Pytorch => pytorch_static_bindings(&self.static_modules, store)?,
@@ -1760,7 +1739,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         match self.layout {
             CheckpointLayout::Native => Ok(build_module_bindings(
@@ -1779,7 +1758,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1998,7 +1977,7 @@ fn new_cache(args: &ModelArgs) -> MoshiCache {
 
 fn pytorch_static_bindings(
     module: &MoshiLayerwiseStatic,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<WeightBinding>, Error> {
     let mut recipes = BTreeMap::new();
     for name in module.parameters().flatten().keys() {
@@ -2031,7 +2010,7 @@ fn pytorch_layer_bindings(
     group: usize,
     index: usize,
     depth_count: usize,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<WeightBinding>, Error> {
     let mut recipes = BTreeMap::new();
     for name in module.parameters().flatten().keys() {
@@ -2053,7 +2032,7 @@ fn temporal_recipe(
     name: &str,
     layer: usize,
     module: &MoshiExecutionUnit,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> DerivedWeightRecipe {
     if name == "norm1.weight" || name == "norm2.weight" {
         let norm = name.strip_suffix(".weight").unwrap();
@@ -2067,7 +2046,7 @@ fn temporal_recipe(
     if name == "self_attn.in_proj.weight" {
         let packed = format!("transformer.layers.{layer}.self_attn.in_proj_weight");
         let native = format!("transformer.layers.{layer}.self_attn.in_proj.weight");
-        return source_full(if store.keys().iter().any(|key| key == &packed) {
+        return source_full(if store.source_keys().iter().any(|key| key == &packed) {
             packed
         } else {
             native
@@ -2080,7 +2059,7 @@ fn depth_recipe(
     name: &str,
     slice: usize,
     depth_count: usize,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     module: &MoshiExecutionUnit,
 ) -> Result<DerivedWeightRecipe, Error> {
     if let Some(suffix) = name.strip_prefix("emb.") {
@@ -2113,7 +2092,7 @@ fn depth_recipe(
         let key = if attention == "in_proj.weight" {
             let packed = format!("depformer.layers.{layer}.self_attn.in_proj_weight");
             let native = format!("depformer.layers.{layer}.self_attn.in_proj.weight");
-            if store.keys().iter().any(|key| key == &packed) {
+            if store.source_keys().iter().any(|key| key == &packed) {
                 packed
             } else {
                 native
@@ -2121,7 +2100,7 @@ fn depth_recipe(
         } else {
             format!("depformer.layers.{layer}.self_attn.{attention}")
         };
-        let rows = store.metadata(&key)?.shape[0];
+        let rows = store.source_metadata(&key)?.logical_shape[0];
         if rows % depth_count != 0 {
             return Err(Error::UnsupportedArchitecture(format!(
                 "PersonaPlex tensor {key} cannot be split across {depth_count} codebooks"

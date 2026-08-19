@@ -94,9 +94,7 @@ use crate::{
         populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
     },
     backend::mlx::runtime::checkpoint::quantization::{quantize_tensor, should_quantize_on_load},
-    backend::mlx::runtime::checkpoint::store::{
-        GgufWeightStore, WeightStore, WeightStoreDiagnostics,
-    },
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, WeightStoreDiagnostics},
     backend::mlx::runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
     backend::mlx::runtime::distributed::expert::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
@@ -7547,7 +7545,7 @@ where
 
 fn load_bound_module(
     module: &mut (impl ModuleParameters + ?Sized),
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     bindings: &[WeightBinding],
     quantize_on_load: Option<WeightQuantization>,
     weights_stream: &Stream,
@@ -7567,7 +7565,7 @@ fn load_bound_module(
 #[allow(clippy::too_many_arguments)]
 fn load_bound_module_excluding(
     module: &mut (impl ModuleParameters + ?Sized),
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     bindings: &[WeightBinding],
     quantize_on_load: Option<WeightQuantization>,
     weights_stream: &Stream,
@@ -7634,7 +7632,7 @@ impl PipelineLoadAccumulator {
     fn load<M: ModuleParameters + ?Sized>(
         &mut self,
         module: &mut M,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         bindings: &[WeightBinding],
         quantize_on_load: Option<WeightQuantization>,
         weights_stream: &Stream,
@@ -7660,7 +7658,7 @@ impl PipelineLoadAccumulator {
     fn load_excluding<M: ModuleParameters + ?Sized>(
         &mut self,
         module: &mut M,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         bindings: &[WeightBinding],
         quantize_on_load: Option<WeightQuantization>,
         weights_stream: &Stream,
@@ -7726,7 +7724,7 @@ fn pipeline_static_bindings<'a>(
 fn pipeline_cartesian_static_bindings(
     units: &[StaticUnitBindings],
     role: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
 ) -> Result<Vec<WeightBinding>, Error> {
     let bindings = pipeline_static_bindings(units, role)?.to_vec();
@@ -7752,7 +7750,7 @@ fn selected_pipeline_static_roles(
 /// static modules and never reconstructs a second namespace validator.
 fn pipeline_binding_units<A: ArchitectureAdapter>(
     adapter: &A,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     roles: &[&str],
 ) -> Result<Vec<StaticUnitBindings>, Error> {
     adapter.selected_static_units(store, &|id| {
@@ -7777,7 +7775,11 @@ fn build_pipeline_layer_storage<L, F, B>(
 where
     L: ModuleParameters,
     F: FnMut(usize, &Stream) -> Result<L, Error>,
-    B: FnMut(usize, &L, &dyn WeightStore) -> Result<Vec<WeightBinding>, Error>,
+    B: FnMut(
+        usize,
+        &L,
+        &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<WeightBinding>, Error>,
 {
     let layer_count = range.len();
     let device_depth = match options {
@@ -9130,7 +9132,7 @@ fn load_llama_pipeline(
         }
     }
     let static_device_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.diagnostics()?;
+    let checkpoint_diagnostics = store.source_diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(dense_stream) = dense_stream {
         let streamed_layout = parallel_layout.clone();
@@ -10594,7 +10596,7 @@ fn load_dense_qwen_pipeline(
             })?;
         stage.expert_cache = Some(cache);
     }
-    let checkpoint_diagnostics = store.diagnostics()?;
+    let checkpoint_diagnostics = store.source_diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
@@ -10927,7 +10929,7 @@ fn load_muse_glimmer_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
-    let diagnostics = store.diagnostics()?;
+    let diagnostics = store.source_diagnostics()?;
     info.opened_checkpoint_shards = diagnostics.touched_shard_paths.clone();
     info.checkpoint_diagnostics = Some(diagnostics);
     PipelineModel::from_adapter(topology, info, PipelineStage(stage))
@@ -11325,7 +11327,7 @@ fn load_qwen3_vl_pipeline(
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.diagnostics()?;
+    let checkpoint_diagnostics = store.source_diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
@@ -13013,7 +13015,7 @@ fn load_gpt_oss_pipeline(
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.diagnostics()?;
+    let checkpoint_diagnostics = store.source_diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
@@ -14034,7 +14036,7 @@ fn load_lfm2_pipeline(
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.diagnostics()?;
+    let checkpoint_diagnostics = store.source_diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
@@ -15642,7 +15644,7 @@ fn load_nemotron_h_pipeline(
             stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
         }
     }
-    let checkpoint_diagnostics = store.diagnostics()?;
+    let checkpoint_diagnostics = store.source_diagnostics()?;
     info.opened_checkpoint_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
     PipelineModel::from_adapter(topology, info, PipelineStage(stage))
@@ -17091,7 +17093,7 @@ fn load_qwen_hybrid_pipeline(
             stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
         }
     }
-    let checkpoint_diagnostics = store.diagnostics()?;
+    let checkpoint_diagnostics = store.source_diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
@@ -18393,7 +18395,7 @@ fn load_kimi_linear_pipeline(
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.diagnostics()?;
+    let checkpoint_diagnostics = store.source_diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
@@ -19575,7 +19577,7 @@ fn load_inkling_pipeline(
     }
     let static_bytes =
         loaded.finish_with_default(&mut info, target_args.text_config.weight_dtype())?;
-    let checkpoint_diagnostics = store.diagnostics()?;
+    let checkpoint_diagnostics = store.source_diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
@@ -21333,7 +21335,7 @@ fn load_gemma_pipeline(
     }
 
     let static_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.diagnostics()?;
+    let checkpoint_diagnostics = store.source_diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
@@ -22640,7 +22642,7 @@ fn load_deepseek_pipeline(
         }
     }
     let static_device_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.diagnostics()?;
+    let checkpoint_diagnostics = store.source_diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(dense_stream) = dense_stream {
         let streamed_layout = parallel_layout.clone();
@@ -22906,7 +22908,7 @@ fn load_deepseek_v4_pipeline(
         }
     }
     let static_device_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.diagnostics()?;
+    let checkpoint_diagnostics = store.source_diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(dense_stream) = dense_stream {
         let streamed_layout = parallel_layout.clone();

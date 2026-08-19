@@ -1149,7 +1149,7 @@ fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
         let materialization = model.metadata().materialization().unwrap();
         assert!(materialization.transformed_weights > 0);
         assert!(materialization.output_bytes < materialization.source_bytes_read);
-        let diagnostics = model.checkpoint_store().diagnostics().unwrap();
+        let diagnostics = model.checkpoint_store().source_diagnostics().unwrap();
         assert!(diagnostics.physical_reads > 0);
         assert!(
             diagnostics.physical_read_bytes

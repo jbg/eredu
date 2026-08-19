@@ -56,7 +56,7 @@ use crate::{
         populate_module_from_lease_excluding, ModuleBindingPlan,
     },
     backend::mlx::runtime::checkpoint::store::{
-        GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend,
+        GgufWeightStore, TensorSelection, WeightStoreBackend,
     },
     backend::mlx::runtime::checkpoint::{
         binding_plan::{BindingPlan, PlannedBinding},
@@ -607,11 +607,13 @@ impl QwenHybridLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
         self.execution.checkpoint_store()
     }
 
-    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+    pub(crate) fn checkpoint_store_arc(
+        &self,
+    ) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
         self.execution.checkpoint_store_arc()
     }
 
@@ -1392,7 +1394,7 @@ pub(crate) fn qwen_hybrid_gguf_store(
     variant: super::checkpoint::GgufVariant,
     vision_config: Option<&VisionConfig>,
     max_mapped_shards: usize,
-) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
     let text_plan = super::checkpoint::gguf_plan(args, checkpoint, variant)
         .map_err(Error::UnsupportedArchitecture)?;
     let mut builder = GgufWeightStore::builder()
@@ -1443,7 +1445,7 @@ fn qwen_hybrid_gguf_variant(
 
 #[allow(clippy::too_many_arguments)]
 fn load_qwen_hybrid_gguf_sparse_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     family: QwenHybridFamily,
     modalities: resident::Qwen35Modalities,
@@ -1622,7 +1624,7 @@ fn load_qwen_hybrid_sparse_model(
 
 /// Builds the streamed nonexpert Qwen hybrid execution base used by distributed EP.
 pub(crate) fn load_qwen_hybrid_sparse_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     is_qwen3_next: bool,
     modalities: resident::Qwen35Modalities,
@@ -1651,7 +1653,7 @@ pub(crate) fn load_qwen_hybrid_sparse_ep_base_with_store(
 /// Builds the TP-sharded nonexpert base used by combined Qwen hybrid TP+EP.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load_qwen_hybrid_sparse_tp_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     is_qwen3_next: bool,
     modalities: resident::Qwen35Modalities,
@@ -2130,11 +2132,11 @@ impl QwenHybridLayerwiseAdapter {
         &self,
         module: &impl ModuleParameters,
         prefix: &str,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layer_index: Option<usize>,
     ) -> Result<ModuleBindingPlan, Error> {
         let normalized = normalized_checkpoint_keys(store);
-        let keys = store.keys();
+        let keys = store.source_keys();
         let mut recipes = BTreeMap::new();
 
         if let Some(index) = layer_index {
@@ -2153,7 +2155,7 @@ impl QwenHybridLayerwiseAdapter {
                 )?;
             }
         }
-        if store.backend() == WeightStoreBackend::Gguf {
+        if store.source_diagnostics()?.backend == WeightStoreBackend::Gguf {
             add_qwen_gguf_transform_recipes(
                 &mut recipes,
                 module,
@@ -2199,12 +2201,15 @@ impl QwenHybridLayerwiseAdapter {
         )?)
     }
 
-    fn mtp_binding_plan(&self, store: &dyn WeightStore) -> Result<ModuleBindingPlan, Error> {
+    fn mtp_binding_plan(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<ModuleBindingPlan, Error> {
         let mtp = self.mtp.as_ref().ok_or_else(|| {
             Error::UnsupportedArchitecture("Qwen hybrid model has no MTP module".into())
         })?;
         let normalized = normalized_checkpoint_keys(store);
-        let keys = store.keys();
+        let keys = store.source_keys();
         let mut recipes = BTreeMap::new();
         if self.args.is_moe() {
             for index in 0..self.args.mtp_num_hidden_layers as usize {
@@ -2260,14 +2265,14 @@ fn add_qwen_gguf_transform_recipes(
     recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
     module: &impl ModuleParameters,
     prefix: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     args: &ModelArgs,
     family: QwenHybridFamily,
 ) -> Result<(), Error> {
     let parameters = module.parameters().flatten();
     for local_name in parameters.keys() {
         let source = format!("{prefix}.{local_name}");
-        let Ok(metadata) = store.metadata(&source) else {
+        let Ok(metadata) = store.source_metadata(&source) else {
             continue;
         };
         let expected = parameters[local_name.as_ref()]
@@ -2291,7 +2296,7 @@ fn add_qwen_gguf_transform_recipes(
             };
         }
         if family == QwenHybridFamily::Qwen35 {
-            recipe = qwen35_value_head_recipe(local_name, recipe, &metadata.shape, args)?;
+            recipe = qwen35_value_head_recipe(local_name, recipe, &metadata.logical_shape, args)?;
         }
         if recipe.infer(store)?.shape() != expected {
             recipe = DerivedWeightRecipe::Reshape {
@@ -2400,9 +2405,11 @@ fn qwen35_value_head_recipe(
     Ok(reorder(recipe, axis, head_width, shape.to_vec()))
 }
 
-fn normalized_checkpoint_keys(store: &dyn WeightStore) -> BTreeMap<String, String> {
+fn normalized_checkpoint_keys(
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> BTreeMap<String, String> {
     store
-        .keys()
+        .source_keys()
         .into_iter()
         .map(|raw| {
             let runtime = ["model.language_model.", "language_model.", "model.model."]
@@ -2737,7 +2744,7 @@ fn expert_source(
 
 pub(crate) fn qwen_hybrid_expert_catalog(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let mut prefixes = (0..args.num_hidden_layers as usize)
         .map(|layer| (layer, format!("model.layers.{layer}.mlp.experts")))
@@ -2753,7 +2760,7 @@ pub(crate) fn qwen_hybrid_expert_catalog(
 
 pub(crate) fn qwen_hybrid_pipeline_expert_catalog(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     layers: impl IntoIterator<Item = usize>,
     include_mtp: bool,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
@@ -2774,7 +2781,7 @@ pub(crate) fn qwen_hybrid_pipeline_expert_catalog(
 
 fn qwen_hybrid_expert_catalog_for_prefixes(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     prefixes: impl IntoIterator<Item = (usize, String)>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let normalized = normalized_checkpoint_keys(store);
@@ -2980,7 +2987,7 @@ fn qwen_hybrid_expert_catalog_for_prefixes(
 fn qwen_hybrid_recipe_binding(
     name: &str,
     recipe: DerivedWeightRecipe,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<WeightBinding, Error> {
     let metadata = recipe.infer(store)?;
     let mut bindings = BindingPlan::new(vec![PlannedBinding {
@@ -3468,13 +3475,16 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
     fn selected_static_units(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = Vec::new();
@@ -4163,7 +4173,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
         let bindings = self
@@ -4190,7 +4200,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -4208,7 +4218,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -4256,10 +4266,13 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         }
     }
 
-    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+    fn additional_consumed_checkpoint_keys(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Vec<String> {
         if self.sparse_expert_cache {
             store
-                .keys()
+                .source_keys()
                 .into_iter()
                 .filter(|key| key.contains(".mlp.experts."))
                 .collect()

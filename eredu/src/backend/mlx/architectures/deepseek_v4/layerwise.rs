@@ -38,7 +38,7 @@ use crate::{
             },
             binding_plan::{BindingPlan, PlannedBinding},
             recipe::{DerivedWeightRecipe, RecipeDtype},
-            store::{GgufWeightStore, TensorSelection, WeightStore},
+            store::{GgufWeightStore, TensorSelection},
         },
         execution::layerwise::{
             load_layerwise_model_with_quantization,
@@ -327,7 +327,9 @@ impl DeepSeekV4LayerwiseModel {
         self.execution.residency_report()
     }
 
-    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+    pub(crate) fn checkpoint_store_arc(
+        &self,
+    ) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
         self.execution.checkpoint_store_arc()
     }
 
@@ -607,7 +609,7 @@ impl DeepSeekV4LayerwiseAdapter {
         &self,
         layer: &DecoderLayer,
         index: usize,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
         let root = format!("layers.{index}");
         let mut recipes = BTreeMap::new();
@@ -629,7 +631,7 @@ impl DeepSeekV4LayerwiseAdapter {
 
     fn draft_static_unit(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Option<StaticUnitBindings>, Error> {
         if let Some(mtp) = &self.static_model.mtp {
             return Ok(Some(StaticUnitBindings::new(
@@ -996,7 +998,10 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         )
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         let source = |key: &str| DerivedWeightRecipe::source(key, TensorSelection::Full);
         Ok(vec![
             StaticUnitBindings::new(
@@ -1284,7 +1289,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         _group: usize,
         index: usize,
         layer: &DecoderLayer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let bindings = build_module_binding_plan_with_recipes_excluding(
             layer,
@@ -1301,7 +1306,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &DecoderLayer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1319,7 +1324,7 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1363,10 +1368,13 @@ impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
         Ok(())
     }
 
-    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+    fn additional_consumed_checkpoint_keys(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Vec<String> {
         if self.sparse_expert_cache {
             store
-                .keys()
+                .source_keys()
                 .into_iter()
                 .filter(|key| is_routed_expert_source(key))
                 .collect()
@@ -1562,7 +1570,7 @@ pub(crate) fn load_deepseek_v4_gguf_layerwise_model(
         .resolve_load_time_quantization("DeepSeek V4 GGUF", requested_quantization)?;
     let gguf_plan =
         super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -1632,7 +1640,7 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
     )?;
     let gguf_plan =
         super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -1747,7 +1755,7 @@ pub fn load_deepseek_v4_expert_cache_model(
 
 /// Builds the non-expert V4 base used by pure EP execution.
 pub(crate) fn load_deepseek_v4_sparse_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     requested_quantization: Option<WeightQuantization>,
@@ -1771,7 +1779,7 @@ pub(crate) fn load_deepseek_v4_sparse_ep_base_with_store(
 
 /// Builds the TP-sharded non-expert V4 base used by TP+EP execution.
 pub(crate) fn load_deepseek_v4_sparse_tp_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     requested_quantization: Option<WeightQuantization>,
@@ -1923,7 +1931,7 @@ fn grouped_output_recipe(
     rest: &str,
     root: &str,
     args: &ModelArgs,
-    _store: &dyn WeightStore,
+    _store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<DerivedWeightRecipe, Error> {
     let (group, component) = rest.split_once('.').ok_or_else(|| {
         Error::UnsupportedArchitecture(format!("invalid V4 grouped output parameter {rest:?}"))
@@ -1969,7 +1977,7 @@ fn expert_bank_recipe(
     target_shape: &[i32],
     root: &str,
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Option<DerivedWeightRecipe>, Error> {
     let component = match local {
         "ffn.switch_mlp.gate_up_proj" => Some((true, "weight")),
@@ -1982,7 +1990,7 @@ fn expert_bank_recipe(
         return Ok(None);
     };
     let bank = |projection: &str| format!("{root}.ffn.expert_banks.{projection}.{component}");
-    if store.metadata(&bank("w1")).is_ok() {
+    if store.source_metadata(&bank("w1")).is_ok() {
         let source =
             |projection: &str| DerivedWeightRecipe::source(bank(projection), TensorSelection::Full);
         let recipe = if gate_up {
@@ -2045,7 +2053,7 @@ fn qwen_linear_recipes(
 fn draft_recipes<M: ModuleParameters>(
     module: &M,
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     dspark: bool,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
     let last = args.num_nextn_predict_layers as usize - 1;
@@ -2119,7 +2127,7 @@ fn draft_decoder_recipe(
     target_shape: &[i32],
     root: &str,
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<DerivedWeightRecipe, Error> {
     if let Some(recipe) = expert_bank_recipe(field, target_shape, root, args, store)? {
         return Ok(recipe);
@@ -2135,13 +2143,15 @@ fn draft_decoder_recipe(
 
 pub(crate) fn expert_catalog(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let mut entries = Vec::new();
     for layer in 0..args.num_hidden_layers as usize {
         let root = format!("layers.{layer}.ffn.experts");
         let bank_root = format!("layers.{layer}.ffn.expert_banks");
-        let fused_banks = store.metadata(&format!("{bank_root}.w1.weight")).is_ok();
+        let fused_banks = store
+            .source_metadata(&format!("{bank_root}.w1.weight"))
+            .is_ok();
         for expert in 0..args.n_routed_experts as usize {
             let mut bindings = Vec::new();
             for (name, gate_up, component) in [
@@ -2157,7 +2167,7 @@ pub(crate) fn expert_catalog(
                 };
                 if component == "scale"
                     && args.expert_dtype.as_deref().is_none()
-                    && store.metadata(&scale_probe).is_err()
+                    && store.source_metadata(&scale_probe).is_err()
                 {
                     continue;
                 }
@@ -2241,7 +2251,7 @@ pub(crate) fn expert_catalog(
 fn deepseek_v4_recipe_binding(
     name: &str,
     recipe: DerivedWeightRecipe,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<WeightBinding, Error> {
     let metadata = recipe.infer(store)?;
     let mut bindings = BindingPlan::new(vec![PlannedBinding {

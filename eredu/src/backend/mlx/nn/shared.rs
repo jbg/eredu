@@ -566,11 +566,7 @@ impl ParameterBackend for MlxBackend {
     ) -> Result<Self::Materialization, Self::ParameterError> {
         use crate::backend::mlx::runtime::checkpoint::recipe::MlxWeightRecipeExt;
 
-        let source =
-            crate::backend::mlx::runtime::checkpoint::store::NeutralCheckpointSourceAdapter::new(
-                source, context,
-            );
-        let pending = recipe.prepare_materialization(&source, context.source_stream())?;
+        let pending = recipe.prepare_materialization(source, context)?;
         let (output, sources) = pending.into_parts();
         let output = if context.source_stream() == context.execution_stream() {
             output

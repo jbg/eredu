@@ -27,7 +27,7 @@ use crate::{
     backend::mlx::residency::sample_allocator_memory,
     backend::mlx::runtime::checkpoint::recipe::{MlxWeightRecipeExt, WeightRecipeError},
     backend::mlx::runtime::checkpoint::store::{
-        PendingWeightMaterialization, WeightReadPolicy, WeightStore, WeightStoreError,
+        MlxParameterMaterializationContext, PendingWeightMaterialization, WeightStoreError,
     },
     core::residency::{
         EvictedResidencyCopy, MemoryTier, OffloadPlan, OffloadReport, OffloadUnitId,
@@ -421,15 +421,15 @@ impl ResidencyManager {
         device_stream: Stream,
     ) -> Result<Self, ResidencyError>
     where
-        S: WeightStore + Send + Sync + 'static,
+        S: eredu_checkpoint::store::CheckpointSource + 'static,
     {
-        let store: Arc<dyn WeightStore + Send + Sync> = store;
+        let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = store;
         Self::new_shared(store, plan, units, source_stream, device_stream)
     }
 
     /// Creates a manager from an already type-erased checkpoint store.
     pub fn new_shared(
-        store: Arc<dyn WeightStore + Send + Sync>,
+        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
         plan: OffloadPlan,
         units: impl IntoIterator<Item = OffloadUnit>,
         source_stream: Stream,
@@ -477,6 +477,10 @@ impl ResidencyManager {
                 state: Mutex::new(ManagerState {
                     control,
                     storage,
+                    materialization: MlxParameterMaterializationContext::new(
+                        &source_stream,
+                        &device_stream,
+                    ),
                     source_stream,
                     device_stream,
                 }),
@@ -854,7 +858,10 @@ impl ResidencyManager {
             offload,
             units,
             active_window,
-            self.inner.store.diagnostics()?,
+            self.inner
+                .store
+                .source_diagnostics()
+                .map_err(crate::backend::mlx::runtime::checkpoint::store::neutral_store_error)?,
         ))
     }
 
@@ -920,7 +927,7 @@ impl ResidencyWindowManager for ResidencyManager {
 }
 
 struct ManagerInner {
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     state: Mutex<ManagerState>,
     changed: Condvar,
 }
@@ -928,6 +935,7 @@ struct ManagerInner {
 struct ManagerState {
     control: ResidencyController,
     storage: BTreeMap<OffloadUnitId, UnitStorage>,
+    materialization: MlxParameterMaterializationContext,
     source_stream: Stream,
     device_stream: Stream,
 }
@@ -1005,7 +1013,7 @@ fn internal_id() -> OffloadUnitId {
 
 fn prefetch_locked(
     state: &mut ManagerState,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     id: &OffloadUnitId,
     tier: MemoryTier,
 ) -> Result<PrefetchOutcome, ResidencyError> {
@@ -1022,7 +1030,7 @@ fn prefetch_locked(
 
 fn ensure_resident(
     state: &mut ManagerState,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     id: &OffloadUnitId,
     tier: MemoryTier,
 ) -> Result<bool, ResidencyError> {
@@ -1032,7 +1040,7 @@ fn ensure_resident(
 
 fn ensure_many_resident(
     state: &mut ManagerState,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     ids: &[OffloadUnitId],
     tier: MemoryTier,
     return_transfer: bool,
@@ -1097,7 +1105,13 @@ fn ensure_many_resident(
                     .ok_or(ResidencyError::StatePoisoned)?
                     .bindings()
                     .to_vec();
-                let buffers = materialize_host_buffers(id, store, &bindings, &state.source_stream)?;
+                let buffers = materialize_host_buffers(
+                    id,
+                    store,
+                    &bindings,
+                    &state.source_stream,
+                    &state.materialization,
+                )?;
                 let logical = host_buffers_nbytes(&buffers)?;
                 let planned = state.control.ledger_mut().spec(id)?.bytes();
                 if logical != planned {
@@ -1164,6 +1178,7 @@ fn ensure_many_resident(
                                 &bindings,
                                 &state.source_stream,
                                 &state.device_stream,
+                                &state.materialization,
                                 TransferDirection::DiskToDevice,
                             )
                         }
@@ -1322,16 +1337,17 @@ struct PreparedResidentArrays {
 
 fn materialize_host_buffers(
     id: &OffloadUnitId,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     bindings: &[WeightBinding],
     source_stream: &Stream,
+    context: &MlxParameterMaterializationContext,
 ) -> Result<ResidentHostBuffers, ResidencyError> {
     let mut buffers = BTreeMap::new();
     for binding in bindings {
         let (array, sources) = match binding.recipe() {
             Some(recipe) => {
                 let pending = recipe
-                    .prepare_materialization(store, source_stream)
+                    .prepare_materialization(store, context)
                     .map_err(|source| ResidencyError::Recipe {
                         binding: binding.name().to_owned(),
                         source,
@@ -1339,11 +1355,16 @@ fn materialize_host_buffers(
                 pending.into_parts()
             }
             None => {
-                let lease = store.acquire_with_policy(
-                    binding.checkpoint_key(),
-                    binding.selection().clone(),
-                    WeightReadPolicy::RequireBounded,
-                )?;
+                let lease = store
+                    .acquire_lease(eredu_checkpoint::store::TensorReadRequest {
+                        key: binding.checkpoint_key().to_owned(),
+                        selection: binding.selection().clone(),
+                        policy: eredu_checkpoint::store::ReadPolicy::RequireBounded,
+                    })
+                    .map_err(
+                        crate::backend::mlx::runtime::checkpoint::store::neutral_store_error,
+                    )?;
+                let lease = context.weight_lease(lease)?;
                 let pending = lease.prepare_materialization(source_stream, source_stream)?;
                 (pending.output().clone(), vec![pending])
             }
@@ -1389,10 +1410,11 @@ fn materialize_host_buffers(
 }
 
 fn prepare_from_disk(
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     bindings: &[WeightBinding],
     source_stream: &Stream,
     execution_stream: &Stream,
+    context: &MlxParameterMaterializationContext,
     direction: TransferDirection,
 ) -> Result<PreparedResidentArrays, ResidencyError> {
     let mut arrays = BTreeMap::new();
@@ -1403,12 +1425,13 @@ fn prepare_from_disk(
         loop {
             let prepared = (|| match binding.recipe() {
                 Some(recipe) => {
-                    let pending = recipe
-                        .prepare_materialization(store, source_stream)
-                        .map_err(|source| ResidencyError::Recipe {
-                            binding: binding.name().to_owned(),
-                            source,
-                        })?;
+                    let pending =
+                        recipe
+                            .prepare_materialization(store, context)
+                            .map_err(|source| ResidencyError::Recipe {
+                                binding: binding.name().to_owned(),
+                                source,
+                            })?;
                     let (host, sources) = pending.into_parts();
                     if execution_stream == source_stream {
                         Ok((host, sources, None))
@@ -1423,11 +1446,16 @@ fn prepare_from_disk(
                     }
                 }
                 None => {
-                    let lease = store.acquire_with_policy(
-                        binding.checkpoint_key(),
-                        binding.selection().clone(),
-                        WeightReadPolicy::RequireBounded,
-                    )?;
+                    let lease = store
+                        .acquire_lease(eredu_checkpoint::store::TensorReadRequest {
+                            key: binding.checkpoint_key().to_owned(),
+                            selection: binding.selection().clone(),
+                            policy: eredu_checkpoint::store::ReadPolicy::RequireBounded,
+                        })
+                        .map_err(
+                            crate::backend::mlx::runtime::checkpoint::store::neutral_store_error,
+                        )?;
+                    let lease = context.weight_lease(lease)?;
                     let pending = lease.prepare_materialization(source_stream, execution_stream)?;
                     let output = pending.output().clone();
                     Ok((output, vec![pending], None))
@@ -1606,7 +1634,7 @@ mod tests {
         time::Duration,
     };
 
-    use eredu_checkpoint::store::TensorSelection;
+    use eredu_checkpoint::store::{CheckpointSource, TensorSelection};
     use eredu_runtime::{DeviceLayerWindow, ResidentLayerGroup};
     use safemlx::{
         host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy,
@@ -1886,7 +1914,7 @@ mod tests {
 
         assert_eq!(host_i32(&leases[0], "weight"), [1, 2]);
         assert_eq!(host_i32(&leases[1], "weight"), [3, 4]);
-        let diagnostics = store.diagnostics().unwrap();
+        let diagnostics = store.source_diagnostics().unwrap();
         assert_eq!(diagnostics.currently_mapped_shards, 1);
         assert!(diagnostics.evictions >= 1);
     }

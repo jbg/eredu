@@ -57,7 +57,7 @@ use crate::{
         build_module_binding_plan_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection},
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
     },
@@ -236,11 +236,13 @@ impl Qwen3VlLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
         self.execution.checkpoint_store()
     }
 
-    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+    pub(crate) fn checkpoint_store_arc(
+        &self,
+    ) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
         self.execution.checkpoint_store_arc()
     }
 
@@ -609,7 +611,7 @@ pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
 }
 
 fn load_qwen3_vl_gguf_sparse_execution(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: resident::ModelArgs,
     options: ExpertCacheLoadOptions,
     non_expert: LayerWeightResidency,
@@ -664,7 +666,7 @@ pub(crate) fn qwen3_vl_gguf_store(
     vision_checkpoint: &GgufCheckpoint,
     args: &resident::ModelArgs,
     max_mapped_shards: usize,
-) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
     let deepstack = args.vision_config.deepstack_layers();
     let is_moe = args.text_config.is_moe();
     let text_variant = if is_moe {
@@ -766,7 +768,7 @@ pub fn load_qwen3_vl_expert_cache_model(
 
 /// Builds the streamed nonexpert Qwen3-VL execution base used by distributed EP.
 pub(crate) fn load_qwen3_vl_sparse_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
@@ -785,7 +787,7 @@ pub(crate) fn load_qwen3_vl_sparse_ep_base_with_store(
 
 /// Builds the TP-sharded nonexpert Qwen3-VL-MoE base used by combined TP+EP.
 pub(crate) fn load_qwen3_vl_sparse_tp_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
@@ -1639,9 +1641,12 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         let patch = "model.visual.patch_embed.proj.weight";
-        let vision_recipes = if store.keys().contains(&format!("{patch}.1")) {
+        let vision_recipes = if store.source_keys().contains(&format!("{patch}.1")) {
             BTreeMap::from([(
                 "patch_embed.proj.weight".to_string(),
                 DerivedWeightRecipe::Stack {
@@ -2066,7 +2071,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
         if group == 1 {
@@ -2095,7 +2100,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -2113,7 +2118,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -2163,10 +2168,13 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         }
     }
 
-    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+    fn additional_consumed_checkpoint_keys(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Vec<String> {
         if self.sparse_expert_cache {
             store
-                .keys()
+                .source_keys()
                 .into_iter()
                 .filter(|key| key.contains(".mlp.experts."))
                 .collect()

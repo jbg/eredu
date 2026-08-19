@@ -23,7 +23,6 @@ use eredu_checkpoint::{
 };
 
 use std::{
-    any::Any,
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
@@ -237,336 +236,6 @@ pub enum WeightStoreError {
     },
 }
 
-/// Reusable checkpoint storage contract.
-///
-/// Implementations catalog keys without producing execution arrays. An
-/// acquired lease owns the lifetime required for later safe materialization.
-pub trait WeightStore {
-    /// Returns the concrete backend identity without consulting mutable diagnostics.
-    fn backend(&self) -> WeightStoreBackend;
-
-    /// Supports optional backend-specific inspection without making callers concrete.
-    fn as_any(&self) -> Option<&dyn Any>;
-
-    /// Returns all catalog keys in deterministic order.
-    fn keys(&self) -> Vec<String>;
-
-    /// Returns source keys consumed to synthesize overlay bindings.
-    fn materialized_source_keys(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    /// Returns catalog keys admitted by a non-strict architecture policy but
-    /// not claimed by its selected physical layout.
-    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    /// Returns whether `key` is an authoritative output synthesized by this
-    /// store and must supersede any source-side semantic recipe for the same
-    /// logical parameter.
-    fn is_authoritative_materialized_key(&self, _key: &str) -> bool {
-        false
-    }
-
-    /// Whether this store is already restricted by a resolved architecture
-    /// checkpoint contract.
-    fn is_checkpoint_contract_resolved(&self) -> bool {
-        false
-    }
-
-    /// Returns metadata, loading only the required backend metadata if needed.
-    fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError>;
-
-    /// Acquires and validates a tensor selection under an explicit I/O policy
-    /// while pinning its storage.
-    fn acquire_with_policy(
-        &self,
-        key: &str,
-        selection: TensorSelection,
-        policy: WeightReadPolicy,
-    ) -> Result<WeightLease, WeightStoreError>;
-
-    /// Returns a deterministic snapshot of backend cache diagnostics.
-    fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError>;
-}
-
-fn recipe_tensor_metadata(
-    store: &dyn WeightStore,
-    key: &str,
-) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
-    let metadata = store.metadata(key).map_err(|error| match error {
-        WeightStoreError::UnknownTensor { key } => {
-            eredu_checkpoint::store::StoreError::UnknownTensor { key }
-        }
-        other => eredu_checkpoint::store::StoreError::Internal(other.to_string()),
-    })?;
-    Ok(eredu_checkpoint::store::TensorMetadata {
-        name: metadata.name,
-        logical_shape: metadata.shape.clone(),
-        physical_shape: metadata.shape,
-        stored_dtype: metadata.stored_dtype,
-        encoded_byte_len: u64::try_from(metadata.logical_byte_len).map_err(|_| {
-            eredu_checkpoint::store::StoreError::Overflow {
-                context: format!("recipe metadata byte length for {key:?}"),
-            }
-        })?,
-        backing_shard: metadata.backing_shard,
-    })
-}
-
-impl eredu_checkpoint::recipe::RecipeCatalog for dyn WeightStore + '_ {
-    fn tensor_metadata(
-        &self,
-        key: &str,
-    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
-        recipe_tensor_metadata(self, key)
-    }
-}
-
-impl eredu_checkpoint::recipe::RecipeCatalog for dyn WeightStore + Send + Sync + '_ {
-    fn tensor_metadata(
-        &self,
-        key: &str,
-    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
-        recipe_tensor_metadata(self, key)
-    }
-}
-
-/// A checkpoint store restricted to the exact physical layout selected by an
-/// architecture contract.
-///
-/// This is the only store handed to binding recipes in production loaders.
-/// Consequently validation and materialization cannot choose layouts
-/// independently.
-pub(crate) struct ContractWeightStore {
-    source: Arc<dyn WeightStore + Send + Sync>,
-    contract: eredu_checkpoint::validation::ResolvedCheckpointPlan,
-}
-
-impl ContractWeightStore {
-    pub(crate) fn new(
-        source: Arc<dyn WeightStore + Send + Sync>,
-        contract: eredu_checkpoint::validation::ResolvedCheckpointPlan,
-    ) -> Self {
-        Self { source, contract }
-    }
-
-    fn authorize(&self, key: &str) -> Result<(), WeightStoreError> {
-        if self.contract.source_keys().contains(key)
-            || self.source.is_authoritative_materialized_key(key)
-        {
-            Ok(())
-        } else {
-            Err(WeightStoreError::UnauthorizedTensor {
-                contract: self.contract.identity().into(),
-                key: key.into(),
-            })
-        }
-    }
-}
-
-impl WeightStore for ContractWeightStore {
-    fn backend(&self) -> WeightStoreBackend {
-        self.source.backend()
-    }
-
-    fn as_any(&self) -> Option<&dyn Any> {
-        Some(self)
-    }
-
-    fn keys(&self) -> Vec<String> {
-        self.source
-            .keys()
-            .into_iter()
-            .filter(|key| {
-                self.contract.source_keys().contains(key)
-                    || self.source.is_authoritative_materialized_key(key)
-            })
-            .collect()
-    }
-
-    fn materialized_source_keys(&self) -> Vec<String> {
-        self.source
-            .materialized_source_keys()
-            .into_iter()
-            .filter(|key| self.contract.source_keys().contains(key))
-            .collect()
-    }
-
-    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
-        self.contract.unclaimed_keys().iter().cloned().collect()
-    }
-
-    fn is_authoritative_materialized_key(&self, key: &str) -> bool {
-        self.source.is_authoritative_materialized_key(key)
-    }
-
-    fn is_checkpoint_contract_resolved(&self) -> bool {
-        true
-    }
-
-    fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
-        self.authorize(key)?;
-        self.source.metadata(key)
-    }
-
-    fn acquire_with_policy(
-        &self,
-        key: &str,
-        selection: TensorSelection,
-        policy: WeightReadPolicy,
-    ) -> Result<WeightLease, WeightStoreError> {
-        self.authorize(key)?;
-        self.source.acquire_with_policy(key, selection, policy)
-    }
-
-    fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError> {
-        self.source.diagnostics()
-    }
-}
-
-/// Immutable array-backed store used to hand transformed weights to the
-/// generalized execution engine without serializing an intermediate checkpoint.
-#[derive(Clone)]
-#[cfg(test)]
-pub(crate) struct MemoryWeightStore {
-    arrays: Arc<BTreeMap<String, Array>>,
-    metadata: Arc<BTreeMap<String, WeightMetadata>>,
-    backing: Arc<PathBuf>,
-}
-
-#[cfg(test)]
-impl MemoryWeightStore {
-    pub(crate) fn new(
-        arrays: impl IntoIterator<Item = (String, Array)>,
-    ) -> Result<Self, WeightStoreError> {
-        let arrays = arrays.into_iter().collect::<BTreeMap<_, _>>();
-        if arrays.is_empty() {
-            return Err(WeightStoreError::Overflow {
-                context: "in-memory checkpoint contains no tensors".into(),
-            });
-        }
-        let backing = Arc::new(PathBuf::from("<load-time-transformed-checkpoint>"));
-        let metadata = arrays
-            .iter()
-            .map(|(name, value)| {
-                let shape = value
-                    .shape()
-                    .iter()
-                    .map(|dimension| usize::try_from(*dimension))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| WeightStoreError::Overflow {
-                        context: format!("in-memory shape for tensor {name:?}"),
-                    })?;
-                Ok((
-                    name.clone(),
-                    WeightMetadata {
-                        name: name.clone(),
-                        shape,
-                        stored_dtype: stored_dtype_for_array(value),
-                        logical_byte_len: value.nbytes(),
-                        backing_shard: Some((*backing).clone()),
-                    },
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, WeightStoreError>>()?;
-        Ok(Self {
-            arrays: Arc::new(arrays),
-            metadata: Arc::new(metadata),
-            backing,
-        })
-    }
-}
-
-#[cfg(test)]
-impl WeightStore for MemoryWeightStore {
-    fn backend(&self) -> WeightStoreBackend {
-        WeightStoreBackend::Memory
-    }
-
-    fn as_any(&self) -> Option<&dyn Any> {
-        Some(self)
-    }
-
-    fn keys(&self) -> Vec<String> {
-        self.arrays.keys().cloned().collect()
-    }
-
-    fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
-        self.metadata
-            .get(key)
-            .cloned()
-            .ok_or_else(|| WeightStoreError::UnknownTensor { key: key.into() })
-    }
-
-    fn acquire_with_policy(
-        &self,
-        key: &str,
-        selection: TensorSelection,
-        _policy: WeightReadPolicy,
-    ) -> Result<WeightLease, WeightStoreError> {
-        let metadata = self.metadata(key)?;
-        let output_shape = validate_selection(key, &metadata.shape, &selection)?;
-        let total_elements = metadata.shape.iter().product::<usize>();
-        let selected_elements = output_shape.iter().product::<usize>();
-        let selected_byte_len = metadata
-            .logical_byte_len
-            .checked_mul(selected_elements)
-            .and_then(|bytes| bytes.checked_div(total_elements))
-            .ok_or_else(|| WeightStoreError::Overflow {
-                context: format!("in-memory selection size for tensor {key:?}"),
-            })?;
-        let value = self
-            .arrays
-            .get(key)
-            .cloned()
-            .ok_or_else(|| WeightStoreError::UnknownTensor { key: key.into() })?;
-        Ok(WeightLease {
-            key: key.into(),
-            metadata,
-            selection,
-            output_shape,
-            selected_byte_len,
-            source: WeightLeaseSource::Memory(MemoryLeaseSource {
-                value,
-                backing: Arc::clone(&self.backing),
-            }),
-        })
-    }
-
-    fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError> {
-        Ok(WeightStoreDiagnostics {
-            backend: WeightStoreBackend::Memory,
-            mapping_hits: 0,
-            mapping_misses: 0,
-            evictions: 0,
-            currently_mapped_shards: 0,
-            touched_shard_paths: Vec::new(),
-            physical_reads: 0,
-            physical_read_bytes: 0,
-            coalesced_group_hits: 0,
-        })
-    }
-}
-
-#[cfg(test)]
-fn stored_dtype_for_array(value: &Array) -> StoredDtype {
-    match value.dtype() {
-        safemlx::Dtype::Bool => StoredDtype::Bool,
-        safemlx::Dtype::Uint8 => StoredDtype::U8,
-        safemlx::Dtype::Int8 => StoredDtype::I8,
-        safemlx::Dtype::Int16 => StoredDtype::I16,
-        safemlx::Dtype::Uint16 => StoredDtype::U16,
-        safemlx::Dtype::Float16 => StoredDtype::F16,
-        safemlx::Dtype::Bfloat16 => StoredDtype::BF16,
-        safemlx::Dtype::Int32 => StoredDtype::I32,
-        safemlx::Dtype::Uint32 => StoredDtype::U32,
-        safemlx::Dtype::Float32 => StoredDtype::F32,
-        other => StoredDtype::Other(format!("{other:?}")),
-    }
-}
-
 #[derive(Debug)]
 struct CachedGgufGroup {
     arrays: Vec<(String, Array)>,
@@ -607,72 +276,6 @@ impl MlxParameterMaterializationContext {
         lease: CheckpointLease,
     ) -> Result<WeightLease, WeightStoreError> {
         WeightLease::from_checkpoint_lease(lease, Arc::clone(&self.converted_groups))
-    }
-}
-
-pub(crate) struct NeutralCheckpointSourceAdapter<'a> {
-    source: &'a dyn CheckpointSource,
-    converted_groups: Arc<
-        Mutex<BTreeMap<eredu_checkpoint::gguf_store::GgufLeaseIdentity, Weak<CachedGgufGroup>>>,
-    >,
-}
-
-impl<'a> NeutralCheckpointSourceAdapter<'a> {
-    pub(crate) fn new(
-        source: &'a dyn CheckpointSource,
-        context: &MlxParameterMaterializationContext,
-    ) -> Self {
-        Self {
-            source,
-            converted_groups: Arc::clone(&context.converted_groups),
-        }
-    }
-}
-
-impl WeightStore for NeutralCheckpointSourceAdapter<'_> {
-    fn backend(&self) -> WeightStoreBackend {
-        self.source
-            .source_diagnostics()
-            .map(|diagnostics| diagnostics.backend)
-            .unwrap_or(WeightStoreBackend::Memory)
-    }
-
-    fn as_any(&self) -> Option<&dyn Any> {
-        None
-    }
-
-    fn keys(&self) -> Vec<String> {
-        self.source.source_keys()
-    }
-
-    fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
-        self.source
-            .source_metadata(key)
-            .map(neutral_metadata)
-            .map_err(neutral_store_error)
-    }
-
-    fn acquire_with_policy(
-        &self,
-        key: &str,
-        selection: TensorSelection,
-        policy: WeightReadPolicy,
-    ) -> Result<WeightLease, WeightStoreError> {
-        let lease = self
-            .source
-            .acquire_lease(TensorReadRequest {
-                key: key.into(),
-                selection,
-                policy,
-            })
-            .map_err(neutral_store_error)?;
-        WeightLease::from_checkpoint_lease(lease, Arc::clone(&self.converted_groups))
-    }
-
-    fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError> {
-        self.source
-            .source_diagnostics()
-            .map_err(neutral_store_error)
     }
 }
 
@@ -734,7 +337,6 @@ impl GgufWeightStoreBuilder {
     pub(crate) fn build(self) -> Result<GgufWeightStore, WeightStoreError> {
         Ok(GgufWeightStore {
             inner: self.inner.build().map_err(neutral_store_error)?,
-            converted_groups: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 }
@@ -743,9 +345,6 @@ impl GgufWeightStoreBuilder {
 #[derive(Debug, Clone)]
 pub(crate) struct GgufWeightStore {
     inner: NeutralGgufWeightStore,
-    converted_groups: Arc<
-        Mutex<BTreeMap<eredu_checkpoint::gguf_store::GgufLeaseIdentity, Weak<CachedGgufGroup>>>,
-    >,
 }
 
 impl GgufWeightStore {
@@ -782,122 +381,37 @@ impl GgufWeightStore {
     }
 }
 
-impl WeightStore for GgufWeightStore {
-    fn backend(&self) -> WeightStoreBackend {
-        WeightStoreBackend::Gguf
+impl CheckpointSource for GgufWeightStore {
+    fn source_keys(&self) -> Vec<String> {
+        CheckpointSource::source_keys(&self.inner)
     }
 
-    fn as_any(&self) -> Option<&dyn Any> {
-        Some(self)
+    fn source_metadata(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
+        CheckpointSource::source_metadata(&self.inner, key)
     }
 
-    fn is_checkpoint_contract_resolved(&self) -> bool {
-        true
+    fn acquire_lease(
+        &self,
+        request: TensorReadRequest,
+    ) -> Result<CheckpointLease, eredu_checkpoint::store::StoreError> {
+        CheckpointSource::acquire_lease(&self.inner, request)
     }
 
-    fn keys(&self) -> Vec<String> {
-        eredu_checkpoint::store::WeightStore::keys(&self.inner)
+    fn source_diagnostics(
+        &self,
+    ) -> Result<WeightStoreDiagnostics, eredu_checkpoint::store::StoreError> {
+        CheckpointSource::source_diagnostics(&self.inner)
     }
 
     fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
         self.inner.unclaimed_checkpoint_keys()
     }
 
-    fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
-        eredu_checkpoint::store::WeightStore::metadata(&self.inner, key)
-            .map(neutral_metadata)
-            .map_err(neutral_store_error)
-    }
-
-    fn acquire_with_policy(
-        &self,
-        key: &str,
-        selection: TensorSelection,
-        policy: WeightReadPolicy,
-    ) -> Result<WeightLease, WeightStoreError> {
-        let lease = eredu_checkpoint::store::WeightStore::acquire(
-            &self.inner,
-            TensorReadRequest {
-                key: key.into(),
-                selection: selection.clone(),
-                policy,
-            },
-        )
-        .map_err(neutral_store_error)?;
-        let metadata = neutral_metadata(lease.metadata().clone());
-        let selected_byte_len =
-            selected_byte_len(key, &metadata, &selection, lease.output_shape())?;
-        Ok(WeightLease {
-            key: key.into(),
-            metadata,
-            selection,
-            output_shape: lease.output_shape().to_vec(),
-            selected_byte_len,
-            source: WeightLeaseSource::Gguf(Box::new(GgufLeaseSource {
-                lease,
-                converted_groups: Arc::clone(&self.converted_groups),
-            })),
-        })
-    }
-
-    fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError> {
-        eredu_checkpoint::store::WeightStore::diagnostics(&self.inner).map_err(neutral_store_error)
-    }
-}
-
-impl WeightStore for SafetensorsWeightStore {
-    fn backend(&self) -> WeightStoreBackend {
-        WeightStoreBackend::Safetensors
-    }
-
-    fn as_any(&self) -> Option<&dyn Any> {
-        Some(self)
-    }
-
-    fn keys(&self) -> Vec<String> {
-        eredu_checkpoint::store::WeightStore::keys(self)
-    }
-
-    fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
-        eredu_checkpoint::store::WeightStore::metadata(self, key)
-            .map(neutral_metadata)
-            .map_err(neutral_store_error)
-    }
-
-    fn acquire_with_policy(
-        &self,
-        key: &str,
-        selection: TensorSelection,
-        policy: WeightReadPolicy,
-    ) -> Result<WeightLease, WeightStoreError> {
-        let lease = eredu_checkpoint::store::WeightStore::acquire(
-            self,
-            TensorReadRequest {
-                key: key.into(),
-                selection: selection.clone(),
-                policy,
-            },
-        )
-        .map_err(neutral_store_error)?;
-        let metadata = neutral_metadata(lease.metadata().clone());
-        let selected_byte_len =
-            usize::try_from(lease.bounded_read_proof().length_bytes).map_err(|_| {
-                WeightStoreError::Overflow {
-                    context: format!("selected byte length for tensor {key:?}"),
-                }
-            })?;
-        Ok(WeightLease {
-            key: key.into(),
-            metadata,
-            selection,
-            output_shape: lease.output_shape().to_vec(),
-            selected_byte_len,
-            source: WeightLeaseSource::Safetensors(lease),
-        })
-    }
-
-    fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError> {
-        eredu_checkpoint::store::WeightStore::diagnostics(self).map_err(neutral_store_error)
+    fn is_checkpoint_contract_resolved(&self) -> bool {
+        true
     }
 }
 
@@ -1067,15 +581,6 @@ pub(crate) fn neutral_store_error(error: eredu_checkpoint::store::StoreError) ->
 enum WeightLeaseSource {
     Safetensors(NeutralSafetensorsLease),
     Gguf(Box<GgufLeaseSource>),
-    #[cfg(test)]
-    Memory(MemoryLeaseSource),
-}
-
-#[derive(Debug, Clone)]
-#[cfg(test)]
-struct MemoryLeaseSource {
-    value: Array,
-    backing: Arc<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1179,8 +684,6 @@ impl WeightLease {
                 .lease
                 .backing_path()
                 .expect("GGUF catalog entries always identify their shard"),
-            #[cfg(test)]
-            WeightLeaseSource::Memory(source) => source.backing.as_path(),
         }
     }
 
@@ -1217,10 +720,6 @@ impl WeightLease {
             WeightLeaseSource::Gguf(source) => {
                 self.prepare_gguf(*source, source_stream, execution_stream)
             }
-            #[cfg(test)]
-            WeightLeaseSource::Memory(source) => {
-                self.prepare_memory(source, source_stream, execution_stream)
-            }
         }
     }
 
@@ -1240,66 +739,7 @@ impl WeightLease {
             WeightLeaseSource::Gguf(source) => {
                 self.prepare_gguf(*source, source_stream, source_stream)
             }
-            #[cfg(test)]
-            WeightLeaseSource::Memory(source) => {
-                self.prepare_memory(source, source_stream, source_stream)
-            }
         }
-    }
-
-    #[cfg(test)]
-    fn prepare_memory(
-        self,
-        source: MemoryLeaseSource,
-        source_stream: &Stream,
-        execution_stream: &Stream,
-    ) -> Result<PendingWeightMaterialization, WeightStoreError> {
-        let source_value = source.value;
-        let materialized = match &self.selection {
-            // Transformed stores are created on the execution stream. Keeping
-            // the same immutable array handle avoids a second full model copy
-            // while the residency manager retains its lease.
-            TensorSelection::Full => source_value.clone(),
-            TensorSelection::Range { axis, start, end } => materialize_range(
-                &self.key,
-                source_value.clone(),
-                &self.metadata.shape,
-                *axis,
-                *start,
-                *end,
-                source_stream,
-                execution_stream,
-            )?,
-            TensorSelection::Indices { axis, indices } => materialize_indices(
-                &self.key,
-                &source_value,
-                *axis,
-                indices,
-                source_stream,
-                execution_stream,
-            )?,
-            TensorSelection::Contiguous {
-                offset_elements,
-                shape,
-            } => materialize_contiguous(
-                &self.key,
-                &source_value,
-                *offset_elements,
-                shape,
-                source_stream,
-                execution_stream,
-            )?,
-        };
-        Ok(PendingWeightMaterialization {
-            output: materialized,
-            _source: source_value,
-            _gguf_group: None,
-            lease: Some(self),
-            source_stream: source_stream.clone(),
-            execution_stream: execution_stream.clone(),
-            borrowed_source: false,
-            completed: false,
-        })
     }
 
     fn prepare_borrowed_safetensors(
@@ -1870,10 +1310,7 @@ fn safetensors_dtype_alignment(dtype: Dtype) -> usize {
 mod tests {
     use super::*;
     use eredu_gguf::{GgmlType, TensorInput, Writer};
-    use safemlx::{
-        transforms::{async_eval, async_eval_with_event},
-        Device, DeviceType, Dtype as MlxDtype,
-    };
+    use safemlx::{Device, DeviceType, Dtype as MlxDtype};
     use safetensors::tensor::{serialize_to_file, TensorView};
 
     trait AcquireBoundedForTest {
@@ -1882,162 +1319,44 @@ mod tests {
             key: &str,
             selection: TensorSelection,
         ) -> Result<WeightLease, WeightStoreError>;
+
+        fn acquire_with_policy(
+            &self,
+            key: &str,
+            selection: TensorSelection,
+            policy: WeightReadPolicy,
+        ) -> Result<WeightLease, WeightStoreError>;
     }
 
-    impl<T: WeightStore> AcquireBoundedForTest for T {
+    impl<T: CheckpointSource> AcquireBoundedForTest for T {
         fn acquire(
             &self,
             key: &str,
             selection: TensorSelection,
         ) -> Result<WeightLease, WeightStoreError> {
-            WeightStore::acquire_with_policy(self, key, selection, WeightReadPolicy::RequireBounded)
+            self.acquire_with_policy(key, selection, WeightReadPolicy::RequireBounded)
+        }
+
+        fn acquire_with_policy(
+            &self,
+            key: &str,
+            selection: TensorSelection,
+            policy: WeightReadPolicy,
+        ) -> Result<WeightLease, WeightStoreError> {
+            let lease = self
+                .acquire_lease(TensorReadRequest {
+                    key: key.into(),
+                    selection,
+                    policy,
+                })
+                .map_err(neutral_store_error)?;
+            let stream = cpu_stream();
+            MlxParameterMaterializationContext::new(&stream, &stream).weight_lease(lease)
         }
     }
 
     fn cpu_stream() -> Stream {
         Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
-    }
-
-    #[test]
-    fn memory_store_preserves_catalog_and_materializes_bounded_ranges() {
-        let stream = cpu_stream();
-        let source = Array::from_slice(&[0f32, 1.0, 2.0, 3.0, 4.0, 5.0], &[2, 3]);
-        let store = MemoryWeightStore::new([("matrix".to_string(), source)]).unwrap();
-
-        assert_eq!(store.backend(), WeightStoreBackend::Memory);
-        assert_eq!(store.keys(), ["matrix"]);
-        assert_eq!(store.metadata("matrix").unwrap().shape, [2, 3]);
-        let lease = store
-            .acquire(
-                "matrix",
-                TensorSelection::Range {
-                    axis: 1,
-                    start: 1,
-                    end: 3,
-                },
-            )
-            .unwrap();
-        assert_eq!(lease.output_shape(), [2, 2]);
-        assert_eq!(lease.selected_byte_len(), 4 * std::mem::size_of::<f32>());
-        assert_eq!(
-            lease
-                .materialize(&stream, &stream)
-                .unwrap()
-                .synchronize()
-                .unwrap()
-                .evaluated()
-                .unwrap()
-                .as_slice::<f32>(),
-            &[1.0, 2.0, 4.0, 5.0]
-        );
-        let diagnostics = store.diagnostics().unwrap();
-        assert_eq!(diagnostics.backend, WeightStoreBackend::Memory);
-        assert_eq!(diagnostics.physical_reads, 0);
-    }
-
-    #[test]
-    fn resolved_contract_store_rejects_unselected_physical_sources() {
-        let selected = Array::from_slice(&[1f32], &[1]);
-        let rejected = Array::from_slice(&[2f32], &[1]);
-        let source: Arc<dyn WeightStore + Send + Sync> = Arc::new(
-            MemoryWeightStore::new([
-                ("packed".to_string(), selected),
-                ("split".to_string(), rejected),
-            ])
-            .unwrap(),
-        );
-        let contract = eredu_checkpoint::validation::ResolvedCheckpointPlan::for_test(
-            "test architecture",
-            ["packed"],
-        );
-        let store = ContractWeightStore::new(source, contract);
-
-        assert_eq!(store.keys(), ["packed"]);
-        assert!(matches!(
-            store.metadata("split"),
-            Err(WeightStoreError::UnauthorizedTensor { key, .. }) if key == "split"
-        ));
-    }
-
-    #[test]
-    fn weight_materialization_event_orders_multiple_cpu_consumers() {
-        let source_stream = cpu_stream();
-        let execution_stream = cpu_stream();
-        let consumer_a = cpu_stream();
-        let consumer_b = cpu_stream();
-        let source = Array::ones::<f32>(&[1024, 1024], &source_stream).unwrap();
-        let store = MemoryWeightStore::new([("matrix".to_string(), source)]).unwrap();
-
-        let blocker_lhs = Array::ones::<f32>(&[1024, 1024], &execution_stream).unwrap();
-        let blocker_rhs = Array::ones::<f32>(&[1024, 1024], &execution_stream).unwrap();
-        let blocker = blocker_lhs.matmul(&blocker_rhs, &execution_stream).unwrap();
-        async_eval([&blocker]).unwrap();
-
-        let materialization = store
-            .acquire(
-                "matrix",
-                TensorSelection::Range {
-                    axis: 0,
-                    start: 0,
-                    end: 1,
-                },
-            )
-            .unwrap()
-            .materialize(&source_stream, &execution_stream)
-            .unwrap();
-        materialization.wait_on(&consumer_a).unwrap();
-        materialization.wait_on(&consumer_b).unwrap();
-        let consumed_a = materialization.output().square(&consumer_a).unwrap();
-        let consumed_b = materialization.output().square(&consumer_b).unwrap();
-        let completion_a = async_eval_with_event([&consumed_a]).unwrap();
-        let completion_b = async_eval_with_event([&consumed_b]).unwrap();
-
-        let output = materialization.synchronize().unwrap();
-        assert_eq!(output.shape(), [1, 1024]);
-        completion_a.synchronize().unwrap();
-        completion_b.synchronize().unwrap();
-        assert_eq!(
-            consumed_a.evaluated().unwrap().as_slice::<f32>(),
-            &[1.0; 1024]
-        );
-        assert_eq!(
-            consumed_b.evaluated().unwrap().as_slice::<f32>(),
-            &[1.0; 1024]
-        );
-    }
-
-    #[test]
-    #[ignore = "explicit Metal checkpoint materialization test; run on a Metal host"]
-    fn weight_materialization_metal_handoff_does_not_block_the_host() {
-        let source_stream = cpu_stream();
-        let transfer_stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
-        let consumer_stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
-        let source = Array::ones::<f32>(&[1024, 1024], &source_stream).unwrap();
-        let store = MemoryWeightStore::new([("matrix".to_string(), source)]).unwrap();
-
-        let blocker_lhs = Array::ones::<f32>(&[4096, 4096], &transfer_stream).unwrap();
-        let blocker_rhs = Array::ones::<f32>(&[4096, 4096], &transfer_stream).unwrap();
-        let blocker = blocker_lhs.matmul(&blocker_rhs, &transfer_stream).unwrap();
-        async_eval([&blocker]).unwrap();
-        let materialization = store
-            .acquire(
-                "matrix",
-                TensorSelection::Range {
-                    axis: 0,
-                    start: 0,
-                    end: 1,
-                },
-            )
-            .unwrap()
-            .materialize(&source_stream, &transfer_stream)
-            .unwrap();
-        assert!(!materialization.is_complete().unwrap());
-        materialization.wait_on(&consumer_stream).unwrap();
-        assert!(!materialization.is_complete().unwrap());
-        let consumed = materialization.output().square(&consumer_stream).unwrap();
-        let completion = async_eval_with_event([&consumed]).unwrap();
-        drop(materialization);
-        completion.synchronize().unwrap();
     }
 
     fn write_index(dir: &Path, mappings: &[(&str, &str)]) {
@@ -2201,7 +1520,6 @@ mod tests {
                     })
             }
             WeightLeaseSource::Safetensors(_) => panic!("expected GGUF lease"),
-            WeightLeaseSource::Memory(_) => panic!("expected GGUF lease"),
         }
     }
 
@@ -2234,9 +1552,12 @@ mod tests {
             name.to_string()
         })
         .unwrap();
-        assert_eq!(store.keys(), ["value.weight"]);
-        assert_eq!(store.metadata("value.weight").unwrap().shape, [1]);
-        let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(store.source_keys(), ["value.weight"]);
+        assert_eq!(
+            store.source_metadata("value.weight").unwrap().logical_shape,
+            [1]
+        );
+        let diagnostics = store.source_diagnostics().unwrap();
         assert_eq!(diagnostics.currently_mapped_shards, 0);
         assert!(diagnostics.touched_shard_paths.is_empty());
         assert_eq!(diagnostics.physical_reads, 0);
@@ -2270,11 +1591,12 @@ mod tests {
             .unwrap();
 
         assert!(store.is_checkpoint_contract_resolved());
-        assert_eq!(store.keys(), ["selected.weight"]);
+        assert_eq!(store.source_keys(), ["selected.weight"]);
         assert_eq!(store.unclaimed_checkpoint_keys(), ["unselected.weight"]);
         assert!(matches!(
-            store.metadata("unselected.weight"),
-            Err(WeightStoreError::UnknownTensor { key }) if key == "unselected.weight"
+            store.source_metadata("unselected.weight"),
+            Err(eredu_checkpoint::store::StoreError::UnknownTensor { key })
+                if key == "unselected.weight"
         ));
     }
 
@@ -2300,11 +1622,11 @@ mod tests {
             let store =
                 GgufWeightStore::new_for_test(GgufCheckpoint::open(path).unwrap(), str::to_string)
                     .unwrap();
-            let metadata = store.metadata("bank.weight").unwrap();
-            assert_eq!(metadata.shape, [2, block_bytes as usize], "{ty:?}");
+            let metadata = store.source_metadata("bank.weight").unwrap();
+            assert_eq!(metadata.logical_shape, [2, block_bytes as usize], "{ty:?}");
             assert_eq!(metadata.stored_dtype, StoredDtype::U8, "{ty:?}");
-            assert_eq!(metadata.logical_byte_len, payload.len(), "{ty:?}");
-            assert_eq!(store.keys(), ["bank.weight"], "{ty:?}");
+            assert_eq!(metadata.encoded_byte_len, payload.len() as u64, "{ty:?}");
+            assert_eq!(store.source_keys(), ["bank.weight"], "{ty:?}");
         }
     }
 
@@ -2347,7 +1669,7 @@ mod tests {
             selected.evaluated().unwrap().as_slice::<f32>(),
             &values[8..16]
         );
-        let diagnostics = store.diagnostics().unwrap();
+        let diagnostics = store.source_diagnostics().unwrap();
         assert_eq!(diagnostics.physical_reads, 1);
         assert_eq!(diagnostics.physical_read_bytes, 32);
     }
@@ -2375,7 +1697,7 @@ mod tests {
             WeightStoreError::BoundedSelectionUnavailable { .. }
         ));
         assert!(error.to_string().contains("unquantized F32, F16, or BF16"));
-        let diagnostics = store.diagnostics().unwrap();
+        let diagnostics = store.source_diagnostics().unwrap();
         assert_eq!(diagnostics.physical_reads, 0);
         assert_eq!(diagnostics.physical_read_bytes, 0);
         assert!(diagnostics.touched_shard_paths.is_empty());
@@ -2415,7 +1737,7 @@ mod tests {
         scales.finish().unwrap();
         biases.finish().unwrap();
 
-        let diagnostics = store.diagnostics().unwrap();
+        let diagnostics = store.source_diagnostics().unwrap();
         assert_eq!(diagnostics.backend, WeightStoreBackend::Gguf);
         assert_eq!(diagnostics.physical_reads, 1);
         assert_eq!(diagnostics.physical_read_bytes, 18);
@@ -2478,7 +1800,7 @@ mod tests {
         scales.finish().unwrap();
         biases.finish().unwrap();
 
-        let diagnostics = store.diagnostics().unwrap();
+        let diagnostics = store.source_diagnostics().unwrap();
         assert_eq!(diagnostics.physical_reads, 1);
         assert_eq!(diagnostics.physical_read_bytes, 36);
         assert_eq!(diagnostics.coalesced_group_hits, 2);
@@ -2506,7 +1828,7 @@ mod tests {
             ),
             Err(WeightStoreError::BoundedSelectionUnavailable { .. })
         ));
-        let diagnostics = store.diagnostics().unwrap();
+        let diagnostics = store.source_diagnostics().unwrap();
         assert_eq!(diagnostics.physical_reads, 0);
         assert_eq!(diagnostics.physical_read_bytes, 0);
         assert!(diagnostics.touched_shard_paths.is_empty());
@@ -2524,7 +1846,7 @@ mod tests {
             .synchronize()
             .unwrap();
         assert_eq!(value.shape(), [2, 4]);
-        let diagnostics = store.diagnostics().unwrap();
+        let diagnostics = store.source_diagnostics().unwrap();
         assert_eq!(diagnostics.physical_reads, 1);
         assert_eq!(diagnostics.physical_read_bytes, 72);
     }
@@ -2566,7 +1888,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(gguf_physical_selection(&lease), expected);
             }
-            assert_eq!(store.diagnostics().unwrap().physical_reads, 0);
+            assert_eq!(store.source_diagnostics().unwrap().physical_reads, 0);
         }
     }
 
@@ -2583,9 +1905,9 @@ mod tests {
         );
 
         let store = SafetensorsWeightStore::open(dir.path()).unwrap();
-        assert_eq!(store.keys(), ["a.weight", "z.weight"]);
+        assert_eq!(store.source_keys(), ["a.weight", "z.weight"]);
         assert_eq!(
-            store.diagnostics().unwrap(),
+            store.source_diagnostics().unwrap(),
             WeightStoreDiagnostics {
                 backend: WeightStoreBackend::Safetensors,
                 mapping_hits: 0,
@@ -2623,7 +1945,10 @@ mod tests {
             store.acquire("claimed", TensorSelection::Full),
             Err(WeightStoreError::ContradictoryIndexMapping { .. })
         ));
-        assert_eq!(store.diagnostics().unwrap().currently_mapped_shards, 1);
+        assert_eq!(
+            store.source_diagnostics().unwrap().currently_mapped_shards,
+            1
+        );
     }
 
     #[test]
@@ -2634,9 +1959,15 @@ mod tests {
 
         let directory = SafetensorsWeightStore::open(dir.path()).unwrap();
         let direct = SafetensorsWeightStore::open(&path).unwrap();
-        assert_eq!(directory.keys(), ["a_tensor", "z_tensor"]);
-        assert_eq!(direct.keys(), directory.keys());
-        assert_eq!(directory.diagnostics().unwrap().currently_mapped_shards, 0);
+        assert_eq!(directory.source_keys(), ["a_tensor", "z_tensor"]);
+        assert_eq!(direct.source_keys(), directory.source_keys());
+        assert_eq!(
+            directory
+                .source_diagnostics()
+                .unwrap()
+                .currently_mapped_shards,
+            0
+        );
     }
 
     #[test]
@@ -2695,7 +2026,7 @@ mod tests {
         let first = store.acquire("a_tensor", TensorSelection::Full).unwrap();
         let second = store.acquire("z_tensor", TensorSelection::Full).unwrap();
         assert_eq!(first.backing_shard(), second.backing_shard());
-        let diagnostics = store.diagnostics().unwrap();
+        let diagnostics = store.source_diagnostics().unwrap();
         assert_eq!(diagnostics.currently_mapped_shards, 1);
         assert_eq!(diagnostics.mapping_misses, 1);
         assert_eq!(diagnostics.mapping_hits, 1);
@@ -2733,7 +2064,7 @@ mod tests {
 
         let two = store.acquire("two", TensorSelection::Full).unwrap();
         assert_eq!(two.metadata().shape, [1]);
-        let diagnostics = store.diagnostics().unwrap();
+        let diagnostics = store.source_diagnostics().unwrap();
         assert_eq!(diagnostics.currently_mapped_shards, 1);
         assert_eq!(diagnostics.evictions, 1);
         assert_eq!(diagnostics.touched_shard_paths.len(), 2);
@@ -2935,15 +2266,15 @@ mod tests {
         .unwrap();
         let store = SafetensorsWeightStore::open(dir.path()).unwrap();
         assert_eq!(
-            store.metadata("f16").unwrap().stored_dtype,
+            store.source_metadata("f16").unwrap().stored_dtype,
             StoredDtype::F16
         );
         assert_eq!(
-            store.metadata("bf16").unwrap().stored_dtype,
+            store.source_metadata("bf16").unwrap().stored_dtype,
             StoredDtype::BF16
         );
         assert_eq!(
-            store.metadata("fp8").unwrap().stored_dtype,
+            store.source_metadata("fp8").unwrap().stored_dtype,
             StoredDtype::F8E4M3
         );
         let stream = cpu_stream();
@@ -2987,7 +2318,7 @@ mod tests {
         .unwrap();
         let store = SafetensorsWeightStore::open(dir.path()).unwrap();
         assert_eq!(
-            store.metadata("unsupported").unwrap().stored_dtype,
+            store.source_metadata("unsupported").unwrap().stored_dtype,
             StoredDtype::F8E5M2
         );
         let stream = cpu_stream();

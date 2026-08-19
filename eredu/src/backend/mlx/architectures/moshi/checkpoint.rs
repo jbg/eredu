@@ -12,12 +12,12 @@ use std::path::{Path, PathBuf};
 
 use super::model::ModelArgs;
 use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    backend::mlx::error::Error, backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
 };
 use eredu_checkpoint::schema::{
     CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
 };
+use eredu_checkpoint::store::WeightStore;
 use eredu_checkpoint::validation;
 
 pub(crate) fn validate_safetensors_path(

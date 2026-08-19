@@ -56,7 +56,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load,
         recipe::{recipe_dtype_from_mlx, DerivedWeightRecipe},
-        store::{GgufWeightStore, TensorSelection, WeightStore},
+        store::{GgufWeightStore, TensorSelection},
     },
     backend::mlx::runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, partitioned_projection_members,
@@ -659,11 +659,13 @@ impl Gemma4LayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
         self.execution.checkpoint_store()
     }
 
-    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+    pub(crate) fn checkpoint_store_arc(
+        &self,
+    ) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
         self.execution.checkpoint_store_arc()
     }
 
@@ -1164,7 +1166,7 @@ pub(crate) fn gemma4_gguf_store(
     vision: Option<&Gemma4VisionConfig>,
     audio: Option<&Gemma4AudioConfig>,
     max_mapped_shards: usize,
-) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
     let text_plan = super::checkpoint::gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
     let mut builder = GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
@@ -1187,7 +1189,7 @@ pub(crate) fn gemma4_gguf_store(
 
 /// Builds the non-expert Gemma execution base used by EP and TP+EP.
 pub(crate) fn load_gemma4_sparse_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
@@ -1201,7 +1203,7 @@ pub(crate) fn load_gemma4_sparse_ep_base_with_store(
 
 /// Builds TP-sharded non-expert Gemma execution with external routed experts.
 pub(crate) fn load_gemma4_sparse_tp_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
@@ -1224,7 +1226,7 @@ pub(crate) fn load_gemma4_sparse_tp_ep_base_with_store(
 /// Returns one independently leasable unit for every Gemma routed expert.
 pub(crate) fn gemma4_expert_catalog(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     gemma4_expert_catalog_for_layers(args, store, 0..args.num_hidden_layers as usize, None)
 }
@@ -1232,7 +1234,7 @@ pub(crate) fn gemma4_expert_catalog(
 /// Builds stage-local Gemma expert recipes under an optional TP layout.
 pub(crate) fn gemma4_expert_catalog_for_layers(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     layers: impl IntoIterator<Item = usize>,
     layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
@@ -1244,7 +1246,7 @@ pub(crate) fn gemma4_expert_catalog_for_layers(
         Error::UnsupportedArchitecture("Gemma 4 MoE config has no expert width".into())
     })?)
     .map_err(|_| Error::UnsupportedArchitecture("Gemma 4 expert width is negative".into()))?;
-    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut entries = Vec::new();
     for layer in layers {
         if args.layer_policy(layer).is_none_or(|policy| {
@@ -1342,7 +1344,7 @@ pub(crate) fn gemma4_expert_catalog_for_layers(
 fn gemma_expert_recipe_binding(
     name: &str,
     recipe: DerivedWeightRecipe,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<WeightBinding, Error> {
     let metadata = recipe.infer(store)?;
     let mut bindings = BindingPlan::new(vec![PlannedBinding {
@@ -1709,7 +1711,7 @@ impl Gemma4LayerwiseAdapter {
         &self,
         index: usize,
         layer: &TransformerBlock,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         self.bindings(
             layer,
@@ -1745,7 +1747,7 @@ impl Gemma4LayerwiseAdapter {
         &self,
         index: usize,
         _layer: &TransformerBlock,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1893,10 +1895,10 @@ impl Gemma4LayerwiseAdapter {
         &self,
         module: &impl ModuleParameters,
         prefix: &str,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> BTreeMap<String, DerivedWeightRecipe> {
         let normalized = normalized_checkpoint_keys(store);
-        let keys = store.keys();
+        let keys = store.source_keys();
         let parameters = module.parameters().flatten();
         let mut recipes = BTreeMap::new();
         if let Some(intermediate) = self.args.moe_intermediate_size {
@@ -1965,7 +1967,7 @@ impl Gemma4LayerwiseAdapter {
         &self,
         module: &impl ModuleParameters,
         prefix: &str,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let mut recipes = self.recipes_for(module, prefix, store);
         if self.external_experts && prefix.starts_with("model.language_model.layers.") {
@@ -2089,9 +2091,11 @@ impl Gemma4LayerwiseAdapter {
     }
 }
 
-fn normalized_checkpoint_keys(store: &dyn WeightStore) -> BTreeMap<String, String> {
+fn normalized_checkpoint_keys(
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> BTreeMap<String, String> {
     store
-        .keys()
+        .source_keys()
         .into_iter()
         .map(|raw| {
             let canonical = canonical_checkpoint_name(&raw);
@@ -2664,13 +2668,16 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
     fn selected_static_units(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = Vec::new();
@@ -4019,7 +4026,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -4048,7 +4055,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         self.bindings(layer, &self.layer_checkpoint_prefix(group, index), store)
     }
@@ -4083,10 +4090,13 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         Ok(())
     }
 
-    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+    fn additional_consumed_checkpoint_keys(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Vec<String> {
         if self.external_experts {
             store
-                .keys()
+                .source_keys()
                 .into_iter()
                 .filter(|key| {
                     key.starts_with("model.language_model.layers.")
@@ -4103,7 +4113,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {

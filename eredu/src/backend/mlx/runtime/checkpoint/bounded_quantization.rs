@@ -13,13 +13,15 @@
 //! ordinary residency machinery subsequently sees only the final packed tensor
 //! geometry.
 
-#[cfg(test)]
-use eredu_checkpoint::AffineQuantization;
+use eredu_checkpoint::store::{
+    CheckpointLease, CheckpointSource, StoreError, TensorReadRequest, WeightStoreDiagnostics,
+};
 use eredu_checkpoint::WeightQuantization;
+#[cfg(test)]
+use eredu_checkpoint::{store::WeightStoreBackend, AffineQuantization};
 use eredu_runtime::WeightMaterializationReport;
 
 use std::{
-    any::Any,
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{File, OpenOptions},
     io::{Seek, SeekFrom, Write},
@@ -32,15 +34,16 @@ use safetensors::tensor::{Dtype as SafeDtype, TensorInfo};
 use serde::Serialize;
 use tempfile::TempDir;
 
+#[cfg(test)]
+use crate::backend::mlx::runtime::checkpoint::store::WeightReadPolicy;
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::{
         quantization::quantize_tensor,
         recipe::{DerivedWeightRecipe, MlxWeightRecipeExt, RecipeDtype},
         store::{
-            PendingWeightMaterialization, SafetensorsWeightStore, TensorSelection, WeightLease,
-            WeightMetadata, WeightReadPolicy, WeightStore, WeightStoreBackend,
-            WeightStoreDiagnostics, WeightStoreError,
+            MlxParameterMaterializationContext, PendingWeightMaterialization,
+            SafetensorsWeightStore, TensorSelection,
         },
     },
 };
@@ -211,7 +214,7 @@ impl BoundedQuantizationPlan {
 /// of transformed keys use ordinary bounded SafeTensors leases; all other keys
 /// delegate to the original store.
 pub struct BoundedQuantizedWeightStore {
-    source: Arc<dyn WeightStore + Send + Sync>,
+    source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     transformed: SafetensorsWeightStore,
     transformed_keys: BTreeSet<String>,
     materialized_source_keys: BTreeSet<String>,
@@ -223,7 +226,13 @@ impl std::fmt::Debug for BoundedQuantizedWeightStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BoundedQuantizedWeightStore")
-            .field("backend", &self.source.backend())
+            .field(
+                "backend",
+                &self
+                    .source
+                    .source_diagnostics()
+                    .map(|report| report.backend),
+            )
             .field("transformed_keys", &self.transformed_keys)
             .field("report", &self.report)
             .finish_non_exhaustive()
@@ -240,7 +249,7 @@ impl BoundedQuantizedWeightStore {
     /// A second same-device stream is used only when two minimum tiles fit the
     /// admitted bound.
     pub fn create(
-        source: Arc<dyn WeightStore + Send + Sync>,
+        source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
         plan: BoundedQuantizationPlan,
         conversion_stream: &Stream,
     ) -> Result<Self, Error> {
@@ -251,6 +260,9 @@ impl BoundedQuantizedWeightStore {
         }
         let device = conversion_stream.get_device()?;
         let tile_streams = [conversion_stream.clone(), Stream::new_with_device(&device)];
+        let tile_contexts = tile_streams
+            .each_ref()
+            .map(|stream| MlxParameterMaterializationContext::new(stream, stream));
 
         preflight_source_collisions(source.as_ref(), &plan)?;
         let materialized_source_keys = plan
@@ -278,7 +290,7 @@ impl BoundedQuantizedWeightStore {
                 source.as_ref(),
                 target,
                 &plan,
-                &tile_streams,
+                &tile_contexts,
                 &directory.path().join(&shard_name),
                 &mut output_shards,
                 &mut pending_tiles,
@@ -322,18 +334,10 @@ impl BoundedQuantizedWeightStore {
     }
 }
 
-impl WeightStore for BoundedQuantizedWeightStore {
-    fn backend(&self) -> WeightStoreBackend {
-        self.source.backend()
-    }
-
-    fn as_any(&self) -> Option<&dyn Any> {
-        Some(self)
-    }
-
-    fn keys(&self) -> Vec<String> {
+impl CheckpointSource for BoundedQuantizedWeightStore {
+    fn source_keys(&self) -> Vec<String> {
         self.source
-            .keys()
+            .source_keys()
             .into_iter()
             .chain(self.transformed_keys.iter().cloned())
             .collect::<BTreeSet<_>>()
@@ -363,30 +367,28 @@ impl WeightStore for BoundedQuantizedWeightStore {
         self.source.is_checkpoint_contract_resolved()
     }
 
-    fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
-        if self.is_transformed(key) {
-            self.transformed.metadata(key)
-        } else {
-            self.source.metadata(key)
-        }
-    }
-
-    fn acquire_with_policy(
+    fn source_metadata(
         &self,
         key: &str,
-        selection: TensorSelection,
-        policy: WeightReadPolicy,
-    ) -> Result<WeightLease, WeightStoreError> {
+    ) -> Result<eredu_checkpoint::store::TensorMetadata, StoreError> {
         if self.is_transformed(key) {
-            self.transformed.acquire_with_policy(key, selection, policy)
+            CheckpointSource::source_metadata(&self.transformed, key)
         } else {
-            self.source.acquire_with_policy(key, selection, policy)
+            self.source.source_metadata(key)
         }
     }
 
-    fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError> {
-        let source = self.source.diagnostics()?;
-        let transformed = self.transformed.diagnostics()?;
+    fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+        if self.is_transformed(&request.key) {
+            CheckpointSource::acquire_lease(&self.transformed, request)
+        } else {
+            self.source.acquire_lease(request)
+        }
+    }
+
+    fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+        let source = self.source.source_diagnostics()?;
+        let transformed = CheckpointSource::source_diagnostics(&self.transformed)?;
         let mut touched = source.touched_shard_paths;
         touched.extend(transformed.touched_shard_paths);
         touched.sort();
@@ -557,10 +559,10 @@ impl OutputShard {
 }
 
 fn transform_target(
-    source: &dyn WeightStore,
+    source: &dyn eredu_checkpoint::store::CheckpointSource,
     target: &BoundedQuantizationTarget,
     plan: &BoundedQuantizationPlan,
-    tile_streams: &[Stream; BOUNDED_QUANTIZATION_TILE_BUFFERS],
+    tile_contexts: &[MlxParameterMaterializationContext; BOUNDED_QUANTIZATION_TILE_BUFFERS],
     path: &Path,
     output_shards: &mut Vec<OutputShard>,
     pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
@@ -723,8 +725,9 @@ fn transform_target(
             allocator_cache
                 .prepare_submission(queued_working_set_bytes(pending_tiles)?, tile_peak)?;
 
-            let tile_stream = &tile_streams[report.source_tiles % tile_buffers];
-            let pending = tile_recipe.prepare_borrowed_materialization(source, tile_stream)?;
+            let tile_context = &tile_contexts[report.source_tiles % tile_buffers];
+            let tile_stream = tile_context.source_stream();
+            let pending = tile_recipe.prepare_borrowed_materialization(source, tile_context)?;
             let (dense, source_mappings) = pending.into_parts();
             let quantized = quantize_tensor(&dense, plan.quantization, tile_stream)?;
             let companion_dtype = match target.affine_companion_dtype {
@@ -1107,10 +1110,10 @@ fn write_index(
 }
 
 fn preflight_source_collisions(
-    source: &dyn WeightStore,
+    source: &dyn eredu_checkpoint::store::CheckpointSource,
     plan: &BoundedQuantizationPlan,
 ) -> Result<(), Error> {
-    let source_keys = source.keys().into_iter().collect::<BTreeSet<_>>();
+    let source_keys = source.source_keys().into_iter().collect::<BTreeSet<_>>();
     for target in &plan.targets {
         if source_keys.contains(&target.scales_name) || source_keys.contains(&target.biases_name) {
             return Err(quantization_error(format!(
@@ -1257,13 +1260,20 @@ mod tests {
         (directory, store, values)
     }
 
-    fn materialize(store: &dyn WeightStore, name: &str, stream: &Stream) -> Array {
-        store
-            .acquire_with_policy(
-                name,
-                TensorSelection::Full,
-                WeightReadPolicy::RequireBounded,
-            )
+    fn materialize(
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        name: &str,
+        stream: &Stream,
+    ) -> Array {
+        let lease = store
+            .acquire_lease(TensorReadRequest {
+                key: name.into(),
+                selection: TensorSelection::Full,
+                policy: WeightReadPolicy::RequireBounded,
+            })
+            .unwrap();
+        MlxParameterMaterializationContext::new(stream, stream)
+            .weight_lease(lease)
             .unwrap()
             .materialize(stream, stream)
             .unwrap()
@@ -1355,23 +1365,23 @@ mod tests {
         );
         assert_eq!(
             transformed
-                .metadata("model.proj.weight")
+                .source_metadata("model.proj.weight")
                 .unwrap()
-                .logical_byte_len,
+                .encoded_byte_len,
             256
         );
         assert_eq!(
             transformed
-                .metadata("model.proj.scales")
+                .source_metadata("model.proj.scales")
                 .unwrap()
-                .logical_byte_len,
+                .encoded_byte_len,
             32
         );
         assert_eq!(
             transformed
-                .metadata("model.proj.biases")
+                .source_metadata("model.proj.biases")
                 .unwrap()
-                .logical_byte_len,
+                .encoded_byte_len,
             32
         );
 
@@ -1442,7 +1452,9 @@ mod tests {
                 scales.evaluated().unwrap().as_slice::<u8>(),
                 expected.scales.evaluated().unwrap().as_slice::<u8>()
             );
-            assert!(!transformed.keys().contains(&format!("{name}.biases")));
+            assert!(!transformed
+                .source_keys()
+                .contains(&format!("{name}.biases")));
         }
     }
 
@@ -1479,7 +1491,7 @@ mod tests {
         assert!(error.to_string().contains(
             "requires at least 296 working-set bytes for one row, but the plan permits 295"
         ));
-        let diagnostics = source.diagnostics().unwrap();
+        let diagnostics = source.source_diagnostics().unwrap();
         // Metadata/preflight may map the shard, but no selected payload was
         // converted and no GGUF physical read was issued.
         assert_eq!(diagnostics.physical_reads, 0);
@@ -1604,7 +1616,10 @@ mod tests {
         assert_eq!(transformed.report().source_bytes_read, 2_048);
         assert_eq!(transformed.report().output_bytes, 320);
         assert_eq!(
-            transformed.metadata("model.experts.weight").unwrap().shape,
+            transformed
+                .source_metadata("model.experts.weight")
+                .unwrap()
+                .logical_shape,
             vec![2, 4, 8]
         );
         let expected = quantize_tensor(
@@ -1650,26 +1665,26 @@ mod tests {
 
         assert_eq!(
             transformed
-                .metadata("model.experts.down_proj")
+                .source_metadata("model.experts.down_proj")
                 .unwrap()
-                .shape,
+                .logical_shape,
             vec![2, 4, 8]
         );
         assert_eq!(
             transformed
-                .metadata("model.experts.down_proj_scales")
+                .source_metadata("model.experts.down_proj_scales")
                 .unwrap()
-                .shape,
+                .logical_shape,
             vec![2, 4, 1]
         );
         assert_eq!(
             transformed
-                .metadata("model.experts.down_proj_biases")
+                .source_metadata("model.experts.down_proj_biases")
                 .unwrap()
-                .shape,
+                .logical_shape,
             vec![2, 4, 1]
         );
-        let diagnostics = source.diagnostics().unwrap();
+        let diagnostics = source.source_diagnostics().unwrap();
         assert_eq!(diagnostics.physical_reads, 8);
         assert_eq!(diagnostics.physical_read_bytes, 2_048);
     }
@@ -1714,7 +1729,7 @@ mod tests {
         assert_eq!(transformed.report().source_bytes_read, 512);
         assert_eq!(transformed.report().output_bytes, 80);
         assert_eq!(transformed.report().peak_planned_working_set_bytes, 296);
-        let diagnostics = source.diagnostics().unwrap();
+        let diagnostics = source.source_diagnostics().unwrap();
         assert_eq!(diagnostics.physical_reads, 2);
         assert_eq!(diagnostics.physical_read_bytes, 512);
 
@@ -1760,11 +1775,14 @@ mod tests {
         assert_eq!(transformed.report().source_tiles, 8);
         assert_eq!(transformed.report().source_bytes_read, 2_048);
         assert_eq!(transformed.report().output_bytes, 320);
-        let diagnostics = source.diagnostics().unwrap();
+        let diagnostics = source.source_diagnostics().unwrap();
         assert_eq!(diagnostics.physical_reads, 8);
         assert_eq!(diagnostics.physical_read_bytes, 2_048);
         assert_eq!(
-            transformed.metadata("model.experts.weight").unwrap().shape,
+            transformed
+                .source_metadata("model.experts.weight")
+                .unwrap()
+                .logical_shape,
             vec![2, 4, 8]
         );
         let expected =
@@ -1792,12 +1810,14 @@ mod tests {
         assert_eq!(transformed.report().output_bytes, 272);
         assert_eq!(
             transformed
-                .metadata("model.proj.scales")
+                .source_metadata("model.proj.scales")
                 .unwrap()
                 .stored_dtype,
             eredu_checkpoint::StoredDtype::U8
         );
-        assert!(!transformed.keys().contains(&"model.proj.biases".into()));
+        assert!(!transformed
+            .source_keys()
+            .contains(&"model.proj.biases".into()));
 
         assert_mxfp4_outputs_match_reference(&transformed, &values, &context);
     }
@@ -1842,10 +1862,13 @@ mod tests {
         .unwrap();
         let transformed =
             BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
-        assert_eq!(transformed.backend(), WeightStoreBackend::Gguf);
+        assert_eq!(
+            transformed.source_diagnostics().unwrap().backend,
+            WeightStoreBackend::Gguf
+        );
         assert_eq!(transformed.report().source_tiles, 8);
         assert_eq!(transformed.report().source_bytes_read, 2_048);
-        let diagnostics = transformed.diagnostics().unwrap();
+        let diagnostics = transformed.source_diagnostics().unwrap();
         assert_eq!(diagnostics.physical_reads, 8);
         assert_eq!(diagnostics.physical_read_bytes, 2_048);
 

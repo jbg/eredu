@@ -52,7 +52,7 @@ use crate::{
         populate_module_from_lease, populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
-    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection},
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load,
         recipe::{recipe_dtype_from_mlx, DerivedWeightRecipe},
@@ -433,11 +433,13 @@ impl Lfm2LayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
         self.execution.checkpoint_store()
     }
 
-    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+    pub(crate) fn checkpoint_store_arc(
+        &self,
+    ) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
         self.execution.checkpoint_store_arc()
     }
 
@@ -639,7 +641,7 @@ pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
     let is_moe = prepared.args.model_type == "lfm2_moe";
     let gguf_plan =
         super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -669,7 +671,7 @@ pub(crate) fn load_lfm2_gguf_layerwise_model(
     let args = prepared.args;
     let is_moe = args.model_type == "lfm2_moe";
     let gguf_plan = super::checkpoint::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -702,7 +704,7 @@ pub(crate) fn load_lfm2_gguf_layerwise_model(
 }
 
 fn load_lfm2_gguf_sparse_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
@@ -749,7 +751,7 @@ fn load_lfm2_gguf_sparse_with_store(
 
 /// Builds the streamed nonexpert LFM2 execution base used by distributed EP.
 pub(crate) fn load_lfm2_sparse_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
@@ -763,7 +765,7 @@ pub(crate) fn load_lfm2_sparse_ep_base_with_store(
 
 /// Builds the shared TP-sharded nonexpert base used by combined TP+EP.
 pub(crate) fn load_lfm2_sparse_tp_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
@@ -910,7 +912,7 @@ impl Lfm2LayerwiseAdapter {
     fn split_expert_recipes(
         &self,
         index: usize,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
         if self
             .args
@@ -926,7 +928,7 @@ impl Lfm2LayerwiseAdapter {
             return Ok(BTreeMap::new());
         }
         let runtime_prefix = format!("model.layers.{index}.feed_forward.experts");
-        let keys = store.keys();
+        let keys = store.source_keys();
         if keys.contains(&format!("{runtime_prefix}.gate_up_proj")) {
             return Ok(BTreeMap::new());
         }
@@ -999,12 +1001,12 @@ impl Lfm2LayerwiseAdapter {
 }
 
 fn expert_source(
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     prefix: &str,
     expert: i32,
     projections: &[&str],
 ) -> Result<DerivedWeightRecipe, Error> {
-    let keys = store.keys();
+    let keys = store.source_keys();
     let key = projections
         .iter()
         .map(|projection| format!("{prefix}.{expert}.{projection}.weight"))
@@ -1173,13 +1175,16 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
     fn selected_static_units(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = Vec::new();
@@ -1645,16 +1650,16 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         _group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = format!("model.layers.{index}");
         let mut recipes = self.split_expert_recipes(index, store)?;
         let conv_key = format!("{prefix}.conv.conv.weight");
-        if let Ok(metadata) = store.metadata(&conv_key) {
+        if let Ok(metadata) = store.source_metadata(&conv_key) {
             if let Some(parameter) = layer.parameters().flatten().get("conv.conv.weight") {
                 if let Some(recipe) = lfm2_conv_weight_recipe(
                     &conv_key,
-                    &metadata.shape,
+                    &metadata.logical_shape,
                     parameter.shape(),
                     parameter.dtype(),
                 ) {
@@ -1676,7 +1681,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1694,7 +1699,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1721,10 +1726,13 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
             .collect()
     }
 
-    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+    fn additional_consumed_checkpoint_keys(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Vec<String> {
         if self.sparse_expert_cache {
             store
-                .keys()
+                .source_keys()
                 .into_iter()
                 .filter(|key| key.contains(".feed_forward.experts."))
                 .collect()
@@ -1923,10 +1931,10 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
 
 pub(crate) fn lfm2_expert_catalog(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let keys = store
-        .keys()
+        .source_keys()
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
     let mut entries = Vec::new();
@@ -2094,7 +2102,7 @@ pub(crate) fn lfm2_expert_catalog(
 fn planned_binding(
     name: impl Into<String>,
     recipe: DerivedWeightRecipe,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<PlannedBinding, Error> {
     let metadata = recipe.infer(store)?;
     Ok(PlannedBinding {

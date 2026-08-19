@@ -8,6 +8,7 @@ use std::{
 #[cfg(test)]
 use crate::backend::mlx::resolve_model_config;
 use crate::backend::mlx::structural::{self, GgufArchitectureValidation};
+use eredu_checkpoint::store::WeightStore;
 use eredu_core::{
     ArtifactFormat, ArtifactModality, ArtifactTensorEncoding, GgufArchitecture, InspectionIssue,
     InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
@@ -23,7 +24,7 @@ use crate::{
         gemma4::model as gemma4, inkling::model as inkling, muse_glimmer,
         qwen::vl::model as qwen3_vl,
     },
-    backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
 };
 
 /// Options applied while inspecting a model artifact.
@@ -165,7 +166,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
                         if let Some(shard) = metadata.backing_shard {
                             shards.insert(shard);
                         }
-                        let bytes = metadata.logical_byte_len as u64;
+                        let bytes = metadata.encoded_byte_len;
                         stored_tensor_bytes =
                             stored_tensor_bytes.and_then(|total| total.checked_add(bytes));
                         largest_stored_tensor_bytes = largest_stored_tensor_bytes.max(bytes);
@@ -218,7 +219,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
                 report.requested_load = InspectionReadiness::Invalid;
                 let missing = matches!(
                     error,
-                    crate::backend::mlx::runtime::checkpoint::store::WeightStoreError::MissingShard { .. }
+                    eredu_checkpoint::store::StoreError::MissingShard { .. }
                 );
                 report.issue(
                     if missing {

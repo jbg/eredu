@@ -8,7 +8,7 @@
 pub use eredu_checkpoint::recipe::{
     DerivedWeightRecipe, RecipeDtype, RecipeMetadata as WeightRecipeMetadata,
 };
-use eredu_checkpoint::{recipe::BoundedRecipeSource, store::StoreError};
+use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, TensorReadRequest};
 
 use safemlx::{
     ops::{concatenate_axis, contiguous, stack_axis},
@@ -17,84 +17,9 @@ use safemlx::{
 };
 
 use crate::backend::mlx::runtime::checkpoint::store::{
-    PendingWeightMaterialization, TensorSelection, WeightReadPolicy, WeightStore, WeightStoreError,
+    MlxParameterMaterializationContext, PendingWeightMaterialization, TensorSelection,
+    WeightStoreError,
 };
-
-impl BoundedRecipeSource for dyn WeightStore + '_ {
-    fn verify_bounded_source(
-        &self,
-        key: &str,
-        selection: TensorSelection,
-    ) -> Result<(), StoreError> {
-        verify_bounded_source(self, key, selection)
-    }
-}
-
-impl BoundedRecipeSource for dyn WeightStore + Send + Sync + '_ {
-    fn verify_bounded_source(
-        &self,
-        key: &str,
-        selection: TensorSelection,
-    ) -> Result<(), StoreError> {
-        verify_bounded_source(self, key, selection)
-    }
-}
-
-fn verify_bounded_source(
-    store: &dyn WeightStore,
-    key: &str,
-    selection: TensorSelection,
-) -> Result<(), StoreError> {
-    drop(
-        store
-            .acquire_with_policy(key, selection, WeightReadPolicy::RequireBounded)
-            .map_err(recipe_store_error)?,
-    );
-    Ok(())
-}
-
-fn recipe_store_error(error: WeightStoreError) -> StoreError {
-    match error {
-        WeightStoreError::InvalidMappedShardLimit => StoreError::InvalidMappedShardLimit,
-        WeightStoreError::UnknownTensor { key } => StoreError::UnknownTensor { key },
-        WeightStoreError::UnauthorizedTensor { contract, key } => {
-            StoreError::UnauthorizedTensor { contract, key }
-        }
-        WeightStoreError::MissingShard { path } => StoreError::MissingShard { path },
-        WeightStoreError::MalformedIndex { path, message } => {
-            StoreError::MalformedIndex { path, message }
-        }
-        WeightStoreError::MalformedSafetensors { path, message } => {
-            StoreError::MalformedSafetensors { path, message }
-        }
-        WeightStoreError::UnsafeShardPath { path } => StoreError::UnsafeShardPath { path },
-        WeightStoreError::ContradictoryIndexMapping { key, path } => {
-            StoreError::ContradictoryIndexMapping { key, path }
-        }
-        WeightStoreError::InvalidSelection { key, message } => {
-            StoreError::InvalidSelection { key, message }
-        }
-        WeightStoreError::BoundedSelectionUnavailable { key, message } => {
-            StoreError::BoundedSelectionUnavailable { key, message }
-        }
-        WeightStoreError::Overflow { context } => StoreError::Overflow { context },
-        WeightStoreError::CapacityExhausted {
-            max_mapped_shards,
-            leased_shards,
-        } => StoreError::CapacityExhausted {
-            maximum: max_mapped_shards,
-            leased: leased_shards,
-        },
-        WeightStoreError::Io { path, source } | WeightStoreError::Mmap { path, source } => {
-            StoreError::Io {
-                path,
-                message: source.to_string(),
-            }
-        }
-        WeightStoreError::Gguf { key, message } => StoreError::Gguf { key, message },
-        other => StoreError::Internal(other.to_string()),
-    }
-}
 
 /// Converts an MLX scalar type into the backend-neutral recipe representation.
 pub fn recipe_dtype_from_mlx(value: Dtype) -> RecipeDtype {
@@ -149,31 +74,32 @@ fn mlx_dtype(value: &RecipeDtype) -> Result<Dtype, WeightRecipeError> {
 pub(crate) trait MlxWeightRecipeExt {
     fn materialize(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn CheckpointSource,
         source_stream: &Stream,
     ) -> Result<Array, WeightRecipeError>;
     fn prepare_materialization(
         &self,
-        store: &dyn WeightStore,
-        source_stream: &Stream,
+        store: &dyn CheckpointSource,
+        context: &MlxParameterMaterializationContext,
     ) -> Result<PendingWeightRecipe, WeightRecipeError>;
     fn prepare_borrowed_materialization(
         &self,
-        store: &dyn WeightStore,
-        source_stream: &Stream,
+        store: &dyn CheckpointSource,
+        context: &MlxParameterMaterializationContext,
     ) -> Result<PendingWeightRecipe, WeightRecipeError>;
     fn prepare_materialization_mode(
         &self,
-        store: &dyn WeightStore,
-        source_stream: &Stream,
+        store: &dyn CheckpointSource,
+        context: &MlxParameterMaterializationContext,
         borrow_sources: bool,
     ) -> Result<PendingWeightRecipe, WeightRecipeError>;
     fn materialize_inner(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn CheckpointSource,
         stream: &Stream,
         sources: &mut Vec<PendingWeightMaterialization>,
         borrow_sources: bool,
+        context: &MlxParameterMaterializationContext,
     ) -> Result<Array, WeightRecipeError>;
 }
 
@@ -185,40 +111,43 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
     /// a one-mapping limit without serializing the normal batched path.
     fn materialize(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn CheckpointSource,
         source_stream: &Stream,
     ) -> Result<Array, WeightRecipeError> {
-        self.prepare_materialization(store, source_stream)?.finish()
+        let context = MlxParameterMaterializationContext::new(source_stream, source_stream);
+        self.prepare_materialization(store, &context)?.finish()
     }
 
     /// Schedules a recipe while retaining all mmap-backed source selections.
     fn prepare_materialization(
         &self,
-        store: &dyn WeightStore,
-        source_stream: &Stream,
+        store: &dyn CheckpointSource,
+        context: &MlxParameterMaterializationContext,
     ) -> Result<PendingWeightRecipe, WeightRecipeError> {
-        self.prepare_materialization_mode(store, source_stream, false)
+        self.prepare_materialization_mode(store, context, false)
     }
 
     /// Schedules a recipe whose bounded checkpoint sources may remain borrowed
     /// until the containing output is evaluated.
     fn prepare_borrowed_materialization(
         &self,
-        store: &dyn WeightStore,
-        source_stream: &Stream,
+        store: &dyn CheckpointSource,
+        context: &MlxParameterMaterializationContext,
     ) -> Result<PendingWeightRecipe, WeightRecipeError> {
-        self.prepare_materialization_mode(store, source_stream, true)
+        self.prepare_materialization_mode(store, context, true)
     }
 
     fn prepare_materialization_mode(
         &self,
-        store: &dyn WeightStore,
-        source_stream: &Stream,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        context: &MlxParameterMaterializationContext,
         borrow_sources: bool,
     ) -> Result<PendingWeightRecipe, WeightRecipeError> {
         self.infer(store)?;
         let mut sources = Vec::new();
-        let output = self.materialize_inner(store, source_stream, &mut sources, borrow_sources)?;
+        let source_stream = context.source_stream();
+        let output =
+            self.materialize_inner(store, source_stream, &mut sources, borrow_sources, context)?;
         // Derived recipe outputs are immutable and may be reused across forwards.
         // Detach gathers/transposes into their final row-major representation
         // once here so consumers do not silently repack a full weight on every
@@ -229,18 +158,24 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
 
     fn materialize_inner(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn CheckpointSource,
         stream: &Stream,
         sources: &mut Vec<PendingWeightMaterialization>,
         borrow_sources: bool,
+        context: &MlxParameterMaterializationContext,
     ) -> Result<Array, WeightRecipeError> {
         match self {
             Self::Source { key, selection } => {
-                let lease = store.acquire_with_policy(
-                    key,
-                    selection.clone(),
-                    WeightReadPolicy::RequireBounded,
-                )?;
+                let lease = store
+                    .acquire_lease(TensorReadRequest {
+                        key: key.clone(),
+                        selection: selection.clone(),
+                        policy: ReadPolicy::RequireBounded,
+                    })
+                    .map_err(
+                        crate::backend::mlx::runtime::checkpoint::store::neutral_store_error,
+                    )?;
+                let lease = context.weight_lease(lease)?;
                 let pending = if borrow_sources {
                     lease.prepare_borrowed_materialization(stream)?
                 } else {
@@ -251,7 +186,8 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                 Ok(array)
             }
             Self::Select { input, selection } => {
-                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
+                let array =
+                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
                 match selection {
                     TensorSelection::Full => Ok(array),
                     TensorSelection::Range { axis, start, end } => {
@@ -304,7 +240,8 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                 }
             }
             Self::Concatenate { axis, inputs } => {
-                let arrays = materialize_inputs(inputs, store, stream, sources, borrow_sources)?;
+                let arrays =
+                    materialize_inputs(inputs, store, stream, sources, borrow_sources, context)?;
                 let references = arrays.iter().collect::<Vec<_>>();
                 Ok(concatenate_axis(
                     &references,
@@ -313,7 +250,8 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                 )?)
             }
             Self::Stack { axis, inputs } => {
-                let arrays = materialize_inputs(inputs, store, stream, sources, borrow_sources)?;
+                let arrays =
+                    materialize_inputs(inputs, store, stream, sources, borrow_sources, context)?;
                 let references = arrays.iter().collect::<Vec<_>>();
                 Ok(stack_axis(
                     &references,
@@ -322,7 +260,8 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                 )?)
             }
             Self::Reshape { input, shape } => {
-                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
+                let array =
+                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
                 let shape = shape
                     .iter()
                     .map(|dimension| usize_to_i32(*dimension, "reshape dimension"))
@@ -330,7 +269,8 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                 Ok(array.reshape(&shape, stream)?)
             }
             Self::Transpose { input, axes } => {
-                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
+                let array =
+                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
                 let axes = axes
                     .iter()
                     .map(|axis| usize_to_i32(*axis, "transpose axis"))
@@ -338,7 +278,8 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                 Ok(array.transpose_axes(&axes, stream)?)
             }
             Self::Cast { input, dtype } => {
-                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
+                let array =
+                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
                 Ok(array.as_dtype(mlx_dtype(dtype)?, stream)?)
             }
             Self::View {
@@ -346,7 +287,8 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                 dtype,
                 shape,
             } => {
-                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
+                let array =
+                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
                 let shape = shape
                     .iter()
                     .map(|dimension| usize_to_i32(*dimension, "view dimension"))
@@ -356,7 +298,8 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                     .reshape(&shape, stream)?)
             }
             Self::NegLog { input } => {
-                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
+                let array =
+                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
                 let all_negative = array
                     .lt(Array::from_f32(0.0), stream)?
                     .all(false, stream)?
@@ -367,7 +310,8 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
                 Ok(array.multiply(Array::from_f32(-1.0), stream)?.log(stream)?)
             }
             Self::SubtractOne { input } => {
-                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
+                let array =
+                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
                 Ok(array.subtract(Array::from_f32(1.0), stream)?)
             }
         }
@@ -395,10 +339,11 @@ impl PendingWeightRecipe {
 
 fn materialize_inputs(
     inputs: &[DerivedWeightRecipe],
-    store: &dyn WeightStore,
+    store: &dyn CheckpointSource,
     stream: &Stream,
     sources: &mut Vec<PendingWeightMaterialization>,
     borrow_sources: bool,
+    context: &MlxParameterMaterializationContext,
 ) -> Result<Vec<Array>, WeightRecipeError> {
     let mut pending =
         Vec::<(Array, Vec<PendingWeightMaterialization>)>::with_capacity(inputs.len());
@@ -406,7 +351,13 @@ fn materialize_inputs(
     for input in inputs {
         loop {
             let mut input_sources = Vec::new();
-            match input.materialize_inner(store, stream, &mut input_sources, borrow_sources) {
+            match input.materialize_inner(
+                store,
+                stream,
+                &mut input_sources,
+                borrow_sources,
+                context,
+            ) {
                 Ok(array) => {
                     if detach_remaining && !input_sources.is_empty() {
                         async_eval_with_event([&array])?.synchronize()?;
@@ -780,7 +731,7 @@ mod tests {
             output.evaluated().unwrap().as_slice::<i32>(),
             &[1, 2, 3, 4, 5, 6, 7, 8]
         );
-        let diagnostics = store.diagnostics().unwrap();
+        let diagnostics = store.source_diagnostics().unwrap();
         assert_eq!(diagnostics.currently_mapped_shards, 1);
         assert_eq!(diagnostics.touched_shard_paths.len(), 2);
         assert!(diagnostics.evictions >= 1);

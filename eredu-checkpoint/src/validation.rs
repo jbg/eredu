@@ -28,6 +28,21 @@ pub trait SafetensorsCatalog {
     fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String>;
 }
 
+impl SafetensorsCatalog for dyn crate::store::CheckpointSource + '_ {
+    fn keys(&self) -> Vec<String> {
+        self.source_keys()
+    }
+
+    fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String> {
+        self.source_metadata(key)
+            .map(|metadata| CatalogTensorMetadata {
+                shape: metadata.logical_shape,
+                stored_dtype: metadata.stored_dtype,
+            })
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Stable checkpoint validation categories used by inspection and strict load.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub enum CheckpointIssueKind {
@@ -320,7 +335,7 @@ impl Constraint<GgufType> for GgufTensorConstraint {
 
 /// Validates a SafeTensors store without materializing payloads.
 pub fn validate_safetensors_plan(
-    store: &impl SafetensorsCatalog,
+    store: &(impl SafetensorsCatalog + ?Sized),
     plan: &SafetensorsCheckpointPlan,
 ) -> CheckpointValidation {
     let mut catalog = BTreeMap::new();
@@ -356,7 +371,7 @@ pub fn validate_safetensors_plan(
 
 /// Resolves and validates the one SafeTensors layout that loading may consume.
 pub fn resolve_safetensors_plan(
-    store: &impl SafetensorsCatalog,
+    store: &(impl SafetensorsCatalog + ?Sized),
     plan: &SafetensorsCheckpointPlan,
 ) -> Result<ResolvedCheckpointPlan, CheckpointValidation> {
     let mut catalog = BTreeMap::new();

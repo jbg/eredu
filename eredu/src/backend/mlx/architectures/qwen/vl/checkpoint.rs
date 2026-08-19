@@ -8,12 +8,13 @@ use serde_json::Value;
 use super::{model, vision::VisionConfig};
 use crate::{
     backend::mlx::architectures::qwen::dense::{self, checkpoint as dense_checkpoint},
-    backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
 };
 use eredu_checkpoint::schema::{
     CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
     SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
 };
+use eredu_checkpoint::store::WeightStore;
 use eredu_checkpoint::validation;
 use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 

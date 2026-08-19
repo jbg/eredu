@@ -4,7 +4,10 @@
 //! These helpers keep checkpoint-name expansion, shape validation, byte
 //! accounting, and resident-lease assignment independent of model families.
 
-use eredu_checkpoint::WeightQuantization;
+use eredu_checkpoint::{
+    store::{ReadPolicy, TensorReadRequest},
+    WeightQuantization,
+};
 use eredu_runtime::WeightBinding;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -27,7 +30,8 @@ use crate::{
         WeightRecipeError,
     },
     backend::mlx::runtime::checkpoint::store::{
-        TensorSelection, WeightMaterialization, WeightReadPolicy, WeightStore, WeightStoreError,
+        MlxParameterMaterializationContext, TensorSelection, WeightMaterialization,
+        WeightStoreError,
     },
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
 };
@@ -109,7 +113,7 @@ pub fn full_parameter_names(module: &impl ModuleParameters, prefix: &str) -> Vec
 pub fn build_module_bindings(
     module: &impl ModuleParameters,
     prefix: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
     build_module_bindings_excluding(module, prefix, store, |_| false)
 }
@@ -122,7 +126,7 @@ pub fn build_module_bindings(
 pub fn build_module_bindings_excluding<F>(
     module: &impl ModuleParameters,
     prefix: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     exclude: F,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError>
 where
@@ -139,7 +143,7 @@ where
 pub fn build_module_bindings_with_recipes(
     module: &impl ModuleParameters,
     prefix: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     recipes: BTreeMap<String, DerivedWeightRecipe>,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
     build_module_binding_plan_with_recipes(module, prefix, store, recipes)?.build_bindings(store)
@@ -154,7 +158,7 @@ pub(crate) struct ModuleBindingPlan {
 impl ModuleBindingPlan {
     pub(crate) fn build_bindings(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
         self.plan
             .build_bindings(store)?
@@ -173,7 +177,7 @@ impl ModuleBindingPlan {
 pub(crate) fn build_module_binding_plan_with_recipes(
     module: &impl ModuleParameters,
     prefix: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     recipes: BTreeMap<String, DerivedWeightRecipe>,
 ) -> Result<ModuleBindingPlan, ModuleBindingError> {
     build_module_binding_plan_with_recipes_excluding(module, prefix, store, recipes, |_| false)
@@ -189,16 +193,17 @@ pub(crate) fn build_module_binding_plan_with_recipes(
 /// copied to the execution stream when the streams differ. Mapping-capacity
 /// pressure drains the oldest completion before retrying.
 pub(crate) fn materialize_module_bindings(
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     bindings: &[WeightBinding],
     source_stream: &Stream,
     execution_stream: &Stream,
 ) -> Result<BTreeMap<String, Array>, ModuleBindingError> {
     let mut arrays = BTreeMap::new();
     let mut pending = VecDeque::with_capacity(MODEL_LOAD_MATERIALIZATION_BUFFERS);
+    let context = MlxParameterMaterializationContext::new(source_stream, execution_stream);
     for binding in bindings {
         let materialization = loop {
-            match submit_module_binding(store, binding, source_stream, execution_stream) {
+            match submit_module_binding(store, binding, source_stream, execution_stream, &context) {
                 Ok(materialization) => break materialization,
                 Err(error) if !pending.is_empty() && is_mapping_capacity_error(&error) => {
                     finish_module_binding(&mut pending, &mut arrays)?;
@@ -222,13 +227,14 @@ pub(crate) fn materialize_module_bindings(
 }
 
 fn submit_module_binding(
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     binding: &WeightBinding,
     source_stream: &Stream,
     execution_stream: &Stream,
+    context: &MlxParameterMaterializationContext,
 ) -> Result<WeightMaterialization, ModuleBindingError> {
     if let Some(recipe) = binding.recipe() {
-        let pending = recipe.prepare_materialization(store, source_stream)?;
+        let pending = recipe.prepare_materialization(store, context)?;
         let (source, sources) = pending.into_parts();
         let output = if source_stream == execution_stream {
             source
@@ -239,12 +245,15 @@ fn submit_module_binding(
         };
         Ok(WeightMaterialization::submit_retained(output, sources)?)
     } else {
-        Ok(store
-            .acquire_with_policy(
-                binding.checkpoint_key(),
-                binding.selection().clone(),
-                WeightReadPolicy::RequireBounded,
-            )?
+        let lease = store
+            .acquire_lease(TensorReadRequest {
+                key: binding.checkpoint_key().to_owned(),
+                selection: binding.selection().clone(),
+                policy: ReadPolicy::RequireBounded,
+            })
+            .map_err(crate::backend::mlx::runtime::checkpoint::store::neutral_store_error)?;
+        Ok(context
+            .weight_lease(lease)?
             .materialize(source_stream, execution_stream)?)
     }
 }
@@ -365,7 +374,7 @@ where
 pub(crate) fn build_module_bindings_with_recipes_excluding<F>(
     module: &impl ModuleParameters,
     prefix: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     recipes: BTreeMap<String, DerivedWeightRecipe>,
     exclude: F,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError>
@@ -379,14 +388,14 @@ where
 pub(crate) fn build_module_binding_plan_with_recipes_excluding<F>(
     module: &impl ModuleParameters,
     prefix: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     mut recipes: BTreeMap<String, DerivedWeightRecipe>,
     exclude: F,
 ) -> Result<ModuleBindingPlan, ModuleBindingError>
 where
     F: Fn(&str) -> bool,
 {
-    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let params = module.parameters().flatten();
     let mut local_names = params
         .iter()
@@ -482,7 +491,9 @@ where
             });
         }
 
-        let metadata = store.metadata(&checkpoint_key)?;
+        let metadata = store
+            .source_metadata(&checkpoint_key)
+            .map_err(crate::backend::mlx::runtime::checkpoint::store::neutral_store_error)?;
         let expected_shape = parameter
             .shape()
             .iter()
@@ -492,12 +503,12 @@ where
                 parameter: destination.clone(),
                 shape: parameter.shape().to_vec(),
             })?;
-        if metadata.shape != expected_shape {
+        if metadata.logical_shape != expected_shape {
             return Err(ModuleBindingError::ShapeMismatch {
                 checkpoint_key,
                 parameter: destination,
                 expected: expected_shape,
-                actual: metadata.shape,
+                actual: metadata.logical_shape,
             });
         }
         // Direct checkpoint tensors retain their stored dtype. Some modules

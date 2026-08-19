@@ -5,7 +5,10 @@
 //! windows, and synchronization. Model-family behavior is supplied by an
 //! [`crate::backend::mlx::runtime::execution::layerwise::ArchitectureAdapter`].
 
-use eredu_checkpoint::WeightQuantization;
+use eredu_checkpoint::{
+    store::{CheckpointSource, ResolvedCheckpointSource, WeightStoreBackend},
+    WeightQuantization,
+};
 use eredu_runtime::{OffloadUnit, WeightBinding};
 
 use std::{
@@ -33,7 +36,7 @@ use crate::{
         BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
     },
     backend::mlx::runtime::checkpoint::recipe::RecipeDtype,
-    backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
     backend::mlx::runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
     backend::mlx::runtime::residency::dense_stream::{
         BackgroundLayerPrefetch, DenseDiskStreamLoadOptions, DENSE_TRANSFER_WINDOW,
@@ -51,11 +54,8 @@ use crate::{
 
 use eredu_runtime::{ResidencyReport, ResidentLayerGroup, WeightMaterializationReport};
 
-#[cfg(test)]
-use crate::backend::mlx::runtime::checkpoint::store::MemoryWeightStore;
-
 /// Type-erased checkpoint store accepted by the generalized execution engine.
-pub type SharedWeightStore = Arc<dyn WeightStore + Send + Sync>;
+pub type SharedWeightStore = Arc<dyn CheckpointSource>;
 
 /// Opaque architecture-owned SafeTensors contract consumed by the generic
 /// execution engine before it asks an adapter for any runtime binding.
@@ -74,31 +74,20 @@ pub(crate) fn resolve_checkpoint_store<A: ArchitectureAdapter>(
     adapter: &A,
 ) -> Result<SharedWeightStore, Error> {
     if store.is_checkpoint_contract_resolved()
-        || store.backend()
-            != crate::backend::mlx::runtime::checkpoint::store::WeightStoreBackend::Safetensors
+        || store.source_diagnostics()?.backend != WeightStoreBackend::Safetensors
     {
         return Ok(store);
     }
-    let raw = store
-        .as_any()
-        .and_then(|store| store.downcast_ref::<SafetensorsWeightStore>())
-        .ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
-                "SafeTensors store for {} is not a raw or contract-resolved checkpoint",
-                adapter.model_type()
-            ))
-        })?;
     let plan = adapter.safetensors_checkpoint_plan()?;
-    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(raw, &plan.plan)
-        .map_err(|validation| {
-            Error::UnsupportedArchitecture(format!(
-                "{} checkpoint contract did not resolve: {validation:?}",
-                adapter.model_type()
-            ))
-        })?;
-    Ok(Arc::new(
-        crate::backend::mlx::runtime::checkpoint::store::ContractWeightStore::new(store, resolved),
-    ))
+    let resolved =
+        eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan.plan)
+            .map_err(|validation| {
+                Error::UnsupportedArchitecture(format!(
+                    "{} checkpoint contract did not resolve: {validation:?}",
+                    adapter.model_type()
+                ))
+            })?;
+    Ok(Arc::new(ResolvedCheckpointSource::new(store, resolved)))
 }
 
 pub(crate) fn open_safetensors_weight_store(
@@ -108,38 +97,6 @@ pub(crate) fn open_safetensors_weight_store(
     Ok(Arc::new(
         SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
     ))
-}
-
-/// Captures a completed load-time transformation as an immutable checkpoint.
-///
-/// Quantization changes one dense source tensor into a packed parameter group,
-/// so it cannot be represented as a one-to-one lazy binding. The transformation
-/// is performed once, then this store hands the resulting arrays to the same
-/// generalized residency and execution engine used by native packed artifacts.
-#[cfg(test)]
-pub(crate) fn transformed_module_weight_store(
-    module: &impl ModuleParameters,
-) -> Result<SharedWeightStore, Error> {
-    let mut arrays = BTreeMap::new();
-    let parameters = module.parameters().flatten();
-    for (parameter_name, value) in parameters
-        .iter()
-        .filter(|(name, parameter)| is_materialized_module_parameter(name, parameter, &parameters))
-    {
-        let checkpoint_name =
-            crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
-                parameter_name,
-            );
-        if arrays
-            .insert(checkpoint_name.clone(), (*value).clone())
-            .is_some()
-        {
-            return Err(Error::Quantization(format!(
-                "load-time transformation produced duplicate checkpoint tensor {checkpoint_name:?}"
-            )));
-        }
-    }
-    Ok(Arc::new(MemoryWeightStore::new(arrays)?))
 }
 
 pub(crate) fn validate_gguf_layerwise_source(
@@ -1725,7 +1682,10 @@ pub trait ArchitectureAdapter: Sized {
     }
 
     /// Builds bindings for modules that remain pinned on the execution device.
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error>;
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error>;
 
     /// Builds only static units selected by their stable architecture id.
     ///
@@ -1733,7 +1693,7 @@ pub trait ArchitectureAdapter: Sized {
     /// sharded store, so distributed stages do not open unowned static shards.
     fn selected_static_units(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         Ok(self
@@ -1947,7 +1907,7 @@ pub trait ArchitectureAdapter: Sized {
         group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         Ok(build_module_bindings(
             layer,
@@ -1962,7 +1922,7 @@ pub trait ArchitectureAdapter: Sized {
         group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         _stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1983,7 +1943,7 @@ pub trait ArchitectureAdapter: Sized {
         _group: usize,
         _index: usize,
         _layer: &Self::Layer,
-        _store: &dyn WeightStore,
+        _store: &dyn eredu_checkpoint::store::CheckpointSource,
         _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         _stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -2005,7 +1965,7 @@ pub trait ArchitectureAdapter: Sized {
         group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
@@ -2028,7 +1988,7 @@ pub trait ArchitectureAdapter: Sized {
         group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
         assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
@@ -2055,7 +2015,10 @@ pub trait ArchitectureAdapter: Sized {
     }
 
     /// Returns checkpoint keys consumed by dependent units outside execution groups.
-    fn additional_consumed_checkpoint_keys(&self, _store: &dyn WeightStore) -> Vec<String> {
+    fn additional_consumed_checkpoint_keys(
+        &self,
+        _store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Vec<String> {
         Vec::new()
     }
 
@@ -2701,7 +2664,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     }
 
     /// Returns the persistent backend-neutral checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
         self.store.as_ref()
     }
 
@@ -4132,7 +4095,7 @@ where
 }
 
 fn bounded_quantization_working_set(
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     targets: &[BoundedQuantizationTarget],
     quantization: WeightQuantization,
 ) -> Result<u64, Error> {
@@ -4804,12 +4767,12 @@ fn stored_tensor_selection(
 pub(crate) fn shard_layer_bindings(
     bindings: Vec<WeightBinding>,
     prefix: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
 ) -> Result<Vec<WeightBinding>, Error> {
     use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
 
-    let store_keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+    let store_keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut output = Vec::with_capacity(bindings.len());
     for binding in bindings {
         let canonical_name =
@@ -4913,11 +4876,11 @@ pub(crate) fn shard_layer_bindings(
 fn build_parallel_module_bindings(
     module: &impl ModuleParameters,
     prefix: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
 ) -> Result<Vec<WeightBinding>, Error> {
     use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
-    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let params = module.parameters().flatten();
     let mut names = params
         .iter()
@@ -4949,7 +4912,7 @@ fn build_parallel_module_bindings(
                 .into(),
             );
         };
-        let metadata = store.metadata(&checkpoint_key)?;
+        let metadata = store.source_metadata(&checkpoint_key)?;
         let tensor = layout
             .tensor(&checkpoint_key)
             .or_else(|| layout.tensor(&canonical))
@@ -4973,8 +4936,8 @@ fn build_parallel_module_bindings(
                 .map(|&dim| usize::try_from(dim))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| Error::Parallel(format!("invalid local shape for {destination}")))?;
-            let selection = stored_tensor_selection(tensor, &metadata.shape)?;
-            let mut selected_shape = metadata.shape.clone();
+            let selection = stored_tensor_selection(tensor, &metadata.logical_shape)?;
+            let mut selected_shape = metadata.logical_shape.clone();
             match &selection {
                 TensorSelection::Full => {}
                 TensorSelection::Range { axis, start, end } => {
@@ -5007,13 +4970,13 @@ fn build_parallel_module_bindings(
                 .map(|&dim| usize::try_from(dim))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| Error::Parallel(format!("invalid shape for {destination}")))?;
-            if metadata.shape != expected {
+            if metadata.logical_shape != expected {
                 return Err(Error::Parallel(format!(
                     "unplanned parameter {destination} has checkpoint shape {:?}, runtime expects {:?}",
-                    metadata.shape, expected
+                    metadata.logical_shape, expected
                 )));
             }
-            (TensorSelection::Full, metadata.logical_byte_len as u64)
+            (TensorSelection::Full, metadata.encoded_byte_len as u64)
         };
         bindings.push(WeightBinding::new(
             local_name,
@@ -5053,7 +5016,7 @@ fn add_unit(
 }
 
 fn validate_unused<F>(
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     consumed: &BTreeSet<String>,
     strict: bool,
     ignored: F,
@@ -5065,7 +5028,7 @@ where
         return Ok(());
     }
     let unused = store
-        .keys()
+        .source_keys()
         .into_iter()
         .chain(store.unclaimed_checkpoint_keys())
         .filter(|key| !consumed.contains(key))

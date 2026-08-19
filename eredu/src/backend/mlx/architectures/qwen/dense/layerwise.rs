@@ -50,7 +50,7 @@ use crate::{
         build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
         populate_module_from_lease, populate_module_from_lease_excluding, ModuleBindingPlan,
     },
-    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection},
     backend::mlx::runtime::checkpoint::{
         binding_plan::{BindingPlan, PlannedBinding},
         quantization::should_quantize_on_load,
@@ -277,11 +277,13 @@ impl LayerwiseDecoder {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
         self.execution.checkpoint_store()
     }
 
-    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+    pub(crate) fn checkpoint_store_arc(
+        &self,
+    ) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
         self.execution.checkpoint_store_arc()
     }
 
@@ -876,7 +878,7 @@ pub(crate) fn load_gguf_tensor_parallel_model(
     };
     let gguf_plan =
         super::checkpoint::gguf_plan(&args, variant).map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -913,7 +915,7 @@ pub(crate) fn load_gguf_checkpoint(
     };
     let gguf_plan =
         super::checkpoint::gguf_plan(&args, variant).map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -949,7 +951,7 @@ pub(crate) fn load_gguf_checkpoint(
 /// Loads replicated Qwen3-MoE GGUF parameters for sparse expert-parallel
 /// execution without materializing routed experts.
 fn load_qwen3_gguf_sparse_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: DecoderConfig,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
@@ -995,7 +997,7 @@ fn load_qwen3_gguf_sparse_with_store(
 
 /// Builds the streamed nonexpert Qwen3 execution base used by distributed EP.
 pub(crate) fn load_qwen3_sparse_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: DecoderConfig,
     non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
@@ -1013,7 +1015,7 @@ pub(crate) fn load_qwen3_sparse_ep_base_with_store(
 
 /// Builds the shared TP-sharded nonexpert base used by combined TP+EP.
 pub(crate) fn load_qwen3_sparse_tp_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: DecoderConfig,
     non_expert: impl Into<LayerWeightResidency>,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
@@ -1595,13 +1597,16 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         })
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
     fn selected_static_units(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = Vec::new();
@@ -1940,7 +1945,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         _group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         qwen_text_layer_bindings(
             layer,
@@ -1956,7 +1961,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1974,7 +1979,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -2001,10 +2006,13 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
             .collect()
     }
 
-    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+    fn additional_consumed_checkpoint_keys(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Vec<String> {
         if self.sparse_expert_cache {
             store
-                .keys()
+                .source_keys()
                 .into_iter()
                 .filter(|key| key.contains(".mlp.experts."))
                 .collect()
@@ -2373,7 +2381,7 @@ pub(crate) fn qwen_text_layer_bindings(
     layer: &TransformerBlock,
     args: &DecoderConfig,
     prefix: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     external_experts: bool,
 ) -> Result<Vec<WeightBinding>, Error> {
     Ok(
@@ -2386,7 +2394,7 @@ pub(crate) fn qwen_text_layer_binding_plan(
     layer: &TransformerBlock,
     args: &DecoderConfig,
     prefix: &str,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     external_experts: bool,
 ) -> Result<ModuleBindingPlan, Error> {
     if external_experts {
@@ -2399,7 +2407,7 @@ pub(crate) fn qwen_text_layer_binding_plan(
         )?);
     }
     let expert_prefix = format!("{prefix}.mlp.experts");
-    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut recipes = BTreeMap::new();
     if keys.contains(&format!("{expert_prefix}.gate_proj"))
         && keys.contains(&format!("{expert_prefix}.up_proj"))
@@ -2474,14 +2482,14 @@ pub(crate) fn qwen_text_layer_binding_plan(
 
 pub(crate) fn qwen3_expert_catalog(
     args: &DecoderConfig,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     qwen3_expert_catalog_cartesian(args, store, "model.layers", None)
 }
 
 pub(crate) fn qwen3_expert_catalog_at(
     args: &DecoderConfig,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     layer_root: &str,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     qwen3_expert_catalog_cartesian(args, store, layer_root, None)
@@ -2494,11 +2502,11 @@ pub(crate) fn qwen3_expert_catalog_at(
 /// expert caching while avoiding a full expert copy on every TP coordinate.
 pub(crate) fn qwen3_expert_catalog_cartesian(
     args: &DecoderConfig,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     layer_root: &str,
     layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut entries = Vec::new();
     for layer in 0..usize::try_from(args.num_hidden_layers)
         .map_err(|_| Error::UnsupportedArchitecture("Qwen3 layer count is negative".into()))?
@@ -2668,7 +2676,7 @@ pub(crate) fn qwen3_expert_catalog_cartesian(
 fn recipe_binding(
     name: &str,
     recipe: DerivedWeightRecipe,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<WeightBinding, Error> {
     let metadata = recipe.infer(store)?;
     let mut bindings = BindingPlan::new(vec![PlannedBinding {

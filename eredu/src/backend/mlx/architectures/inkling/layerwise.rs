@@ -53,7 +53,7 @@ use crate::{
         populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
-    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection},
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load,
         recipe::{DerivedWeightRecipe, RecipeDtype},
@@ -564,11 +564,13 @@ impl InklingLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
         self.execution.checkpoint_store()
     }
 
-    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+    pub(crate) fn checkpoint_store_arc(
+        &self,
+    ) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
         self.execution.checkpoint_store_arc()
     }
 
@@ -1259,7 +1261,7 @@ pub(crate) fn inkling_gguf_store(
     mmproj: Option<&resident::InklingMmprojGguf>,
     args: &ModelArgs,
     max_mapped_shards: usize,
-) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
     let text_plan = super::checkpoint::gguf_plan(args).map_err(Error::UnsupportedArchitecture)?;
     let mut builder = GgufWeightStore::builder()
         .max_cached_readers(max_mapped_shards)?
@@ -1281,7 +1283,7 @@ pub(crate) fn inkling_gguf_store(
 }
 
 fn load_inkling_gguf_sparse_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
@@ -1389,7 +1391,7 @@ pub fn load_inkling_expert_cache_model(
 
 /// Builds the streamed nonexpert Inkling execution base used by distributed EP.
 pub(crate) fn load_inkling_sparse_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
@@ -1403,7 +1405,7 @@ pub(crate) fn load_inkling_sparse_ep_base_with_store(
 
 /// Builds the TP-sharded nonexpert Inkling base used by combined TP+EP.
 pub(crate) fn load_inkling_sparse_tp_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
@@ -1631,10 +1633,10 @@ impl InklingLayerwiseAdapter {
         &self,
         module: &impl ModuleParameters,
         prefix: &str,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
         let normalized = normalized_checkpoint_keys(store);
-        let direct = store.keys();
+        let direct = store.source_keys();
         let mut recipes = BTreeMap::new();
         let parameters = module.parameters().flatten();
         for (local_name, parameter) in &parameters {
@@ -1664,7 +1666,7 @@ impl InklingLayerwiseAdapter {
             }
             if direct.contains(&destination) {
                 if destination.contains("_sconv.weight")
-                    && store.metadata(&destination)?.shape.len() == 2
+                    && store.source_metadata(&destination)?.logical_shape.len() == 2
                 {
                     recipes.insert(
                         local_name.to_string(),
@@ -1725,7 +1727,9 @@ impl InklingLayerwiseAdapter {
             let source = DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full);
             recipes.insert(
                 local_name.to_string(),
-                if raw.contains("_sconv.weight") && store.metadata(raw)?.shape.len() == 2 {
+                if raw.contains("_sconv.weight")
+                    && store.source_metadata(raw)?.logical_shape.len() == 2
+                {
                     DerivedWeightRecipe::Reshape {
                         input: Box::new(source),
                         shape: parameter
@@ -1748,9 +1752,11 @@ impl InklingLayerwiseAdapter {
     }
 }
 
-fn normalized_checkpoint_keys(store: &dyn WeightStore) -> BTreeMap<String, String> {
+fn normalized_checkpoint_keys(
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> BTreeMap<String, String> {
     store
-        .keys()
+        .source_keys()
         .into_iter()
         .filter_map(|raw| normalize_checkpoint_key(&raw).map(|runtime| (runtime, raw)))
         .collect()
@@ -2257,7 +2263,7 @@ impl ModuleParameters for InklingLayer {
 fn inkling_w13_recipe(
     destination: &str,
     normalized: &BTreeMap<String, String>,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Option<DerivedWeightRecipe>, Error> {
     for bank in ["moe.experts", "moe.shared_experts"] {
         if let Some(prefix) = destination.strip_suffix(&format!(".{bank}.gate_up_proj")) {
@@ -2310,9 +2316,9 @@ fn inkling_w13_recipe(
     let Some(raw) = normalized.get(&source_runtime) else {
         return Ok(None);
     };
-    let metadata = store.metadata(raw)?;
+    let metadata = store.source_metadata(raw)?;
     let rows = metadata
-        .shape
+        .logical_shape
         .get(axis)
         .copied()
         .ok_or_else(|| Error::UnsupportedArchitecture("Inkling w13 rank is invalid".into()))?;
@@ -2502,13 +2508,16 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
     fn selected_static_units(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = Vec::new();
@@ -3515,7 +3524,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
         let recipes = self.recipes_for_module(layer, &prefix, store)?;
@@ -3553,7 +3562,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -3571,7 +3580,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -3616,10 +3625,13 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         }
     }
 
-    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+    fn additional_consumed_checkpoint_keys(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Vec<String> {
         if self.sparse_expert_cache {
             store
-                .keys()
+                .source_keys()
                 .into_iter()
                 .filter(|key| key.contains(".mlp.experts.") || key.contains(".moe.experts."))
                 .collect()
@@ -3919,7 +3931,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
 
 pub(crate) fn inkling_expert_catalog(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let normalized = normalized_checkpoint_keys(store);
     let text = &args.text_config;
@@ -3957,9 +3969,9 @@ pub(crate) fn inkling_expert_catalog(
         })?;
         let interleaved = gate_up_raw
             .as_ref()
-            .map(|raw| store.metadata(raw))
+            .map(|raw| store.source_metadata(raw))
             .transpose()?
-            .and_then(|metadata| metadata.shape.get(1).copied());
+            .and_then(|metadata| metadata.logical_shape.get(1).copied());
         if gate_up_raw.is_some()
             && !normalized.contains_key(&gate_up_runtime)
             && interleaved.is_none_or(|width| width % 2 != 0)

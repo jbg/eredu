@@ -43,7 +43,7 @@ use crate::{
         populate_module_from_lease, populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
-    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection},
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load,
         recipe::{DerivedWeightRecipe, RecipeDtype},
@@ -264,11 +264,13 @@ impl GptOssLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
         self.execution.checkpoint_store()
     }
 
-    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+    pub(crate) fn checkpoint_store_arc(
+        &self,
+    ) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
         self.execution.checkpoint_store_arc()
     }
 
@@ -490,7 +492,7 @@ pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let gguf_plan =
         super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -519,7 +521,7 @@ pub(crate) fn load_gpt_oss_gguf_layerwise_model(
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let gguf_plan =
         super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -553,7 +555,7 @@ pub(crate) fn load_gpt_oss_gguf_layerwise_model(
 }
 
 fn load_gpt_oss_gguf_sparse_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
@@ -650,7 +652,7 @@ pub fn load_gpt_oss_expert_cache_model(
 
 /// Builds the streamed nonexpert GPT-OSS execution base used by distributed EP.
 pub(crate) fn load_gpt_oss_sparse_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
@@ -664,7 +666,7 @@ pub(crate) fn load_gpt_oss_sparse_ep_base_with_store(
 
 /// Builds the shared TP-sharded nonexpert base used by combined TP+EP.
 pub(crate) fn load_gpt_oss_sparse_tp_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
@@ -765,10 +767,13 @@ impl GptOssLayerwiseAdapter {
     fn layer_recipes(
         &self,
         index: usize,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
         let prefix = format!("model.layers.{index}.mlp.experts");
-        if !store.keys().contains(&format!("{prefix}.gate_proj.weight")) {
+        if !store
+            .source_keys()
+            .contains(&format!("{prefix}.gate_proj.weight"))
+        {
             return Ok(BTreeMap::new());
         }
         let experts = self.args.num_local_experts as usize;
@@ -1066,13 +1071,16 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         ))
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
     fn selected_static_units(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = Vec::new();
@@ -1383,7 +1391,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         _group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = format!("model.layers.{index}");
         Ok(build_module_binding_plan_with_recipes_excluding(
@@ -1401,7 +1409,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1419,7 +1427,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -1446,10 +1454,13 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
             .collect()
     }
 
-    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+    fn additional_consumed_checkpoint_keys(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Vec<String> {
         if self.sparse_expert_cache {
             store
-                .keys()
+                .source_keys()
                 .into_iter()
                 .filter(|key| key.contains(".mlp.experts."))
                 .collect()
@@ -1635,7 +1646,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
 
 pub(crate) fn gpt_oss_expert_catalog(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     gpt_oss_expert_catalog_cartesian(args, store, None)
 }
@@ -1646,13 +1657,15 @@ pub(crate) fn gpt_oss_expert_catalog(
 /// native MXFP4 blocks, E8M0 scales, and biases remain one atomic cache unit.
 pub(crate) fn gpt_oss_expert_catalog_cartesian(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     layout: Option<&crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let mut entries = Vec::new();
     for layer in 0..args.num_hidden_layers as usize {
         let prefix = format!("model.layers.{layer}.mlp.experts");
-        let gguf = store.keys().contains(&format!("{prefix}.gate_proj.weight"));
+        let gguf = store
+            .source_keys()
+            .contains(&format!("{prefix}.gate_proj.weight"));
         for expert in 0..args.num_local_experts as usize {
             let identity = ExpertIdentity::new(layer, expert);
             let mut bindings = Vec::new();

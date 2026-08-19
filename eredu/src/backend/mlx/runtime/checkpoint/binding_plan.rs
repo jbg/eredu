@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     recipe::{DerivedWeightRecipe, RecipeDtype, WeightRecipeError},
-    store::{TensorSelection, WeightStore},
+    store::TensorSelection,
 };
 use crate::backend::mlx::runtime::residency::manager::ResidencyError;
 
@@ -138,7 +138,7 @@ impl BindingPlan {
     /// over the semantic source recipe, matching existing loader behavior.
     pub(crate) fn build_bindings(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, BindingPlanError> {
         let mut output = Vec::with_capacity(self.bindings.len());
         for planned in &self.bindings {
@@ -225,16 +225,16 @@ pub(crate) enum BindingPlanError {
 
 #[cfg(test)]
 mod tests {
-    use std::{any::Any, path::PathBuf};
+    use std::path::PathBuf;
 
     use super::*;
-    use crate::backend::mlx::runtime::checkpoint::store::{
-        TensorSelection, WeightLease, WeightMetadata, WeightReadPolicy, WeightStoreBackend,
-        WeightStoreDiagnostics, WeightStoreError,
+    use eredu_checkpoint::store::{
+        CheckpointLease, CheckpointSource, StoreError, TensorMetadata, TensorReadRequest,
+        WeightStoreBackend, WeightStoreDiagnostics,
     };
 
     struct MetadataStore {
-        metadata: BTreeMap<String, WeightMetadata>,
+        metadata: BTreeMap<String, TensorMetadata>,
         authoritative: BTreeSet<String>,
     }
 
@@ -246,10 +246,11 @@ mod tests {
                     .map(|(key, shape, stored_dtype)| {
                         (
                             key.into(),
-                            WeightMetadata {
+                            TensorMetadata {
                                 name: key.into(),
-                                logical_byte_len: shape.iter().product::<usize>() * 4,
-                                shape,
+                                encoded_byte_len: (shape.iter().product::<usize>() * 4) as u64,
+                                logical_shape: shape.clone(),
+                                physical_shape: shape,
                                 stored_dtype,
                                 backing_shard: None,
                             },
@@ -266,34 +267,27 @@ mod tests {
         }
     }
 
-    impl WeightStore for MetadataStore {
-        fn backend(&self) -> WeightStoreBackend {
-            WeightStoreBackend::Memory
-        }
-        fn as_any(&self) -> Option<&dyn Any> {
-            Some(self)
-        }
-        fn keys(&self) -> Vec<String> {
+    impl CheckpointSource for MetadataStore {
+        fn source_keys(&self) -> Vec<String> {
             self.metadata.keys().cloned().collect()
         }
+
         fn is_authoritative_materialized_key(&self, key: &str) -> bool {
             self.authoritative.contains(key)
         }
-        fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
+
+        fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
             self.metadata
                 .get(key)
                 .cloned()
-                .ok_or_else(|| WeightStoreError::UnknownTensor { key: key.into() })
+                .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
         }
-        fn acquire_with_policy(
-            &self,
-            key: &str,
-            _selection: TensorSelection,
-            _policy: WeightReadPolicy,
-        ) -> Result<WeightLease, WeightStoreError> {
-            Err(WeightStoreError::UnknownTensor { key: key.into() })
+
+        fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+            Err(StoreError::UnknownTensor { key: request.key })
         }
-        fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError> {
+
+        fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
             Ok(WeightStoreDiagnostics {
                 backend: WeightStoreBackend::Memory,
                 mapping_hits: 0,
@@ -470,7 +464,9 @@ mod tests {
             ),
         ];
         for (recipe, shape, dtype) in recipes {
-            let metadata = recipe.infer(&store as &dyn WeightStore).unwrap();
+            let metadata = recipe
+                .infer(&store as &dyn eredu_checkpoint::store::CheckpointSource)
+                .unwrap();
             assert_eq!(metadata.shape(), shape);
             assert_eq!(metadata.dtype(), &dtype);
         }
@@ -503,7 +499,9 @@ mod tests {
             input: Box::new(DerivedWeightRecipe::source("matrix", TensorSelection::Full)),
             shape: vec![3],
         };
-        assert!(invalid.infer(&store as &dyn WeightStore).is_err());
+        assert!(invalid
+            .infer(&store as &dyn eredu_checkpoint::store::CheckpointSource)
+            .is_err());
         assert!(matches!(
             BindingPlan::new(vec![PlannedBinding::direct(
                 "overflow",

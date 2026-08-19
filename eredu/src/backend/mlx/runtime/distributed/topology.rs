@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, TensorReadRequest};
 use eredu_core::{
     balanced_contiguous_range, ParallelAxis, ParallelRankTopology, SubgroupMembership,
 };
@@ -15,7 +16,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
     backend::mlx::runtime::checkpoint::store::{
-        SafetensorsWeightStore, TensorSelection, WeightReadPolicy, WeightStore,
+        MlxParameterMaterializationContext, SafetensorsWeightStore, TensorSelection,
     },
 };
 
@@ -848,7 +849,7 @@ pub fn load_safetensors_partition_on_streams(
 
 /// Selectively loads a rank partition from a reusable checkpoint store.
 pub fn load_partition_from_store(
-    store: &(impl WeightStore + ?Sized),
+    store: &(impl CheckpointSource + ?Sized),
     plan: &PlacementPlan,
     stream: &Stream,
     config: &StrictLoadConfig,
@@ -862,7 +863,7 @@ pub fn load_partition_from_store(
 /// Placement is resolved from catalog metadata before a lease materializes an
 /// array. Remote-only indexed shards are therefore never acquired or mapped.
 pub fn load_partition_from_store_on_streams(
-    store: &(impl WeightStore + ?Sized),
+    store: &(impl CheckpointSource + ?Sized),
     plan: &PlacementPlan,
     source_stream: &Stream,
     execution_stream: &Stream,
@@ -873,8 +874,9 @@ pub fn load_partition_from_store_on_streams(
     let mut report = PartitionReport::default();
     let mut tensors = HashMap::new();
     let mut opened_shards = BTreeSet::new();
+    let context = MlxParameterMaterializationContext::new(source_stream, execution_stream);
 
-    for source in store.keys() {
+    for source in store.source_keys() {
         let SourcePlan::Known { target, tensor } = plan.source_plan(&source, config) else {
             report.unexpected.push(source);
             continue;
@@ -886,11 +888,10 @@ pub fn load_partition_from_store_on_streams(
             continue;
         }
 
-        let metadata = store.metadata(&source)?;
-        let resolved =
-            resolve_placement(&tensor, &metadata.shape, plan.topology).map_err(|error| {
-                Error::Parallel(format!("checkpoint tensor {source} -> {target}: {error}"))
-            })?;
+        let metadata = store.source_metadata(&source)?;
+        let resolved = resolve_placement(&tensor, &metadata.logical_shape, plan.topology).map_err(
+            |error| Error::Parallel(format!("checkpoint tensor {source} -> {target}: {error}")),
+        )?;
         let selection = match resolved {
             ResolvedPlacement::Omit => continue,
             ResolvedPlacement::Materialize => TensorSelection::Full,
@@ -903,12 +904,18 @@ pub fn load_partition_from_store_on_streams(
                 TensorSelection::Indices { axis, indices }
             }
         };
-        let lease =
-            store.acquire_with_policy(&source, selection, WeightReadPolicy::RequireBounded)?;
-        let value = lease
+        let lease = store.acquire_lease(TensorReadRequest {
+            key: source.clone(),
+            selection,
+            policy: ReadPolicy::RequireBounded,
+        })?;
+        if let Some(path) = eredu_checkpoint::store::EncodedTensorLease::backing_path(&lease) {
+            opened_shards.insert(path.to_path_buf());
+        }
+        let value = context
+            .weight_lease(lease)?
             .materialize(source_stream, execution_stream)?
             .synchronize()?;
-        opened_shards.insert(lease.backing_shard().to_path_buf());
         report.loaded.insert(target.clone());
         if tensors.insert(target.clone(), value).is_some() {
             return Err(Error::Parallel(format!(

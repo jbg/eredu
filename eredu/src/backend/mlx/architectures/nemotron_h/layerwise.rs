@@ -51,7 +51,7 @@ use crate::{
         populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
-    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection},
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
     },
@@ -887,11 +887,13 @@ impl NemotronHLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
         self.execution.checkpoint_store()
     }
 
-    pub(crate) fn checkpoint_store_arc(&self) -> Arc<dyn WeightStore + Send + Sync> {
+    pub(crate) fn checkpoint_store_arc(
+        &self,
+    ) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
         self.execution.checkpoint_store_arc()
     }
 
@@ -1446,7 +1448,7 @@ pub(crate) fn load_nemotron_h_gguf_tensor_parallel_model(
         resident::prepare_nemotron_h_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let gguf_plan =
         super::checkpoint::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -1513,7 +1515,7 @@ pub(crate) fn load_nemotron_h_gguf_layerwise_model(
         resident::prepare_nemotron_h_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let args = prepared.args;
     let gguf_plan = super::checkpoint::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
+    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
             &gguf_plan,
@@ -1549,7 +1551,7 @@ pub(crate) fn load_nemotron_h_gguf_layerwise_model(
 }
 
 fn load_nemotron_h_gguf_sparse_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
@@ -1600,7 +1602,7 @@ fn load_nemotron_h_gguf_sparse_with_store(
 
 /// Builds the streamed nonexpert Nemotron-H execution base used by distributed EP.
 pub(crate) fn load_nemotron_h_sparse_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
@@ -1614,7 +1616,7 @@ pub(crate) fn load_nemotron_h_sparse_ep_base_with_store(
 
 /// Builds the shared TP-sharded nonexpert base used by combined TP+EP.
 pub(crate) fn load_nemotron_h_sparse_tp_ep_base_with_store(
-    store: Arc<dyn WeightStore + Send + Sync>,
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     non_expert: impl Into<LayerWeightResidency>,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
@@ -1901,11 +1903,11 @@ impl NemotronHLayerwiseAdapter {
         &self,
         module: &impl ModuleParameters,
         prefix: &str,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layer_index: Option<usize>,
     ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
         let normalized = normalized_checkpoint_keys(store, &self.args)?;
-        let keys = store.keys();
+        let keys = store.source_keys();
         let mut recipes = BTreeMap::new();
 
         let mtp_index = prefix
@@ -2054,7 +2056,7 @@ impl NemotronHLayerwiseAdapter {
 
     fn mtp_recipes(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
         let mtp = self.mtp.as_ref().ok_or_else(|| {
             Error::UnsupportedArchitecture("Nemotron-H model has no MTP module".into())
@@ -2182,12 +2184,12 @@ fn execute_cached_nemotron_experts(
 }
 
 fn normalized_checkpoint_keys(
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     args: &ModelArgs,
 ) -> Result<BTreeMap<String, String>, Error> {
     let mut normalized = BTreeMap::new();
     let mtp_policies = args.mtp_policies()?;
-    for raw in store.keys() {
+    for raw in store.source_keys() {
         if let Some(rest) = raw
             .strip_prefix("mtp.layers.")
             .or_else(|| raw.strip_prefix("model.mtp.layers."))
@@ -2387,13 +2389,16 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
     fn selected_static_units(
         &self,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = Vec::new();
@@ -2939,7 +2944,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         _group: usize,
         index: usize,
         layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = format!("model.layers.{index}");
         let recipes = self.recipes_for_module(layer, &prefix, store, Some(index))?;
@@ -2976,7 +2981,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &crate::backend::mlx::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -2994,7 +2999,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         group: usize,
         index: usize,
         _layer: &Self::Layer,
-        store: &dyn WeightStore,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
@@ -3021,10 +3026,13 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
             .collect()
     }
 
-    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+    fn additional_consumed_checkpoint_keys(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Vec<String> {
         if self.sparse_expert_cache {
             store
-                .keys()
+                .source_keys()
                 .into_iter()
                 .filter(|key| key.contains(".experts."))
                 .collect()
@@ -3180,7 +3188,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
 
 pub(crate) fn nemotron_h_expert_catalog(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let mut entries =
         nemotron_h_expert_catalog_for_layers(args, store, 0..args.num_hidden_layers as usize)?;
@@ -3203,7 +3211,7 @@ pub(crate) fn nemotron_h_expert_catalog(
 
 pub(crate) fn nemotron_h_pipeline_expert_catalog(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     layers: impl IntoIterator<Item = usize>,
     include_mtp: bool,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
@@ -3228,7 +3236,7 @@ pub(crate) fn nemotron_h_pipeline_expert_catalog(
 
 pub(crate) fn nemotron_h_expert_catalog_for_layers(
     args: &ModelArgs,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     layers: impl IntoIterator<Item = usize>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let normalized = normalized_checkpoint_keys(store, args)?;
@@ -3251,7 +3259,7 @@ pub(crate) fn nemotron_h_expert_catalog_for_layers(
 fn nemotron_expert_entries(
     args: &ModelArgs,
     normalized: &BTreeMap<String, String>,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     identity_layer: usize,
     prefix: &str,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
@@ -3320,7 +3328,7 @@ fn nemotron_expert_entries(
 fn nemotron_planned_binding(
     name: &str,
     recipe: DerivedWeightRecipe,
-    store: &dyn WeightStore,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<PlannedBinding, Error> {
     let metadata = recipe.infer(store)?;
     Ok(PlannedBinding {
