@@ -401,7 +401,7 @@ impl LayerWeightResidency {
         }
     }
 
-    fn device_depth(self, layer_count: usize) -> usize {
+    pub(crate) fn device_depth(self, layer_count: usize) -> usize {
         match self {
             Self::FullyResident => layer_count,
             Self::LayerwiseHost(options) => options.offload.prefetch_depth(),
@@ -409,7 +409,7 @@ impl LayerWeightResidency {
         }
     }
 
-    fn offload(self) -> Result<OffloadConfig, Error> {
+    pub(crate) fn offload(self) -> Result<OffloadConfig, Error> {
         match self {
             Self::FullyResident => Ok(OffloadConfig::default()),
             Self::LayerwiseHost(options) => Ok(options.offload),
@@ -425,7 +425,7 @@ impl LayerWeightResidency {
         }
     }
 
-    fn dense(self) -> Option<DenseDiskStreamLoadOptions> {
+    pub(crate) fn dense(self) -> Option<DenseDiskStreamLoadOptions> {
         match self {
             Self::DenseDiskStream(options) => Some(options),
             Self::FullyResident | Self::LayerwiseHost(_) => None,
@@ -441,7 +441,7 @@ impl LayerWeightResidency {
         matches!(self, Self::FullyResident)
     }
 
-    const fn residency(self) -> ExecutionResidency {
+    pub(crate) const fn residency(self) -> ExecutionResidency {
         match self {
             Self::FullyResident => ExecutionResidency::FullyResident,
             Self::LayerwiseHost(_) => ExecutionResidency::LayerwiseHost,
@@ -1456,16 +1456,16 @@ impl Drop for DenseStreamGroupGuard {
 /// Inspectable parameter-residency metadata for a layerwise model.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LayerwiseModelMetadata {
-    model_type: String,
-    quantization: Option<eredu_checkpoint::WeightQuantization>,
-    layer_count: usize,
-    static_device_bytes: u64,
-    residency: ExecutionResidency,
-    layer_parameter_bytes: u64,
-    maximum_device_layer_bytes: u64,
-    maximum_host_layer_bytes: u64,
-    device_layer_capacity: usize,
-    materialization: Option<WeightMaterializationReport>,
+    pub(crate) model_type: String,
+    pub(crate) quantization: Option<eredu_checkpoint::WeightQuantization>,
+    pub(crate) layer_count: usize,
+    pub(crate) static_device_bytes: u64,
+    pub(crate) residency: ExecutionResidency,
+    pub(crate) layer_parameter_bytes: u64,
+    pub(crate) maximum_device_layer_bytes: u64,
+    pub(crate) maximum_host_layer_bytes: u64,
+    pub(crate) device_layer_capacity: usize,
+    pub(crate) materialization: Option<WeightMaterializationReport>,
 }
 
 /// Architecture-neutral information for a rank-local parallel model.
@@ -3842,6 +3842,110 @@ where
     Ok((transformed, report))
 }
 
+/// Builds the shared bounded packed overlay from neutral parameter topologies.
+///
+/// Architecture composition supplies unloaded source and target modules; this
+/// backend capability only inspects their stable parameter slots and recipes.
+pub(crate) fn quantize_parameterized_store<SM, U, SF, TF>(
+    store: SharedWeightStore,
+    source_static: &SM,
+    target_static: &SM,
+    mut source_unit: SF,
+    mut target_unit: TF,
+    unit_count: usize,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<(SharedWeightStore, WeightMaterializationReport), Error>
+where
+    SM: Clone + eredu_nn::Parameterized<Array>,
+    U: eredu_nn::Parameterized<Array>,
+    SF: FnMut(usize, &Stream) -> Result<U, Error>,
+    TF: FnMut(usize, &Stream) -> Result<U, Error>,
+{
+    let mut recipes = BTreeMap::new();
+    let mut collect = |bindings: &[WeightBinding], selected: &BTreeMap<String, RecipeDtype>| {
+        for binding in bindings {
+            let recipe = binding.source_recipe();
+            let metadata = recipe.infer(store.as_ref())?;
+            if !matches!(
+                metadata.dtype(),
+                RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
+            ) || metadata.shape().len() < 2
+            {
+                continue;
+            }
+            let canonical =
+                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                    binding.name(),
+                );
+            let Some(companion_dtype) = selected.get(&canonical).cloned() else {
+                continue;
+            };
+            let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
+            match recipes.entry(target.to_string()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((recipe, companion_dtype));
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get() != &(recipe, companion_dtype) =>
+                {
+                    return Err(Error::Quantization(format!(
+                        "load-time quantization target {target:?} has conflicting semantic recipes"
+                    )));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+        Ok::<(), Error>(())
+    };
+
+    let source_static = crate::backend::mlx::nn::shared::MlxModule::new(source_static.clone());
+    let target_static = crate::backend::mlx::nn::shared::MlxModule::new(target_static.clone());
+    collect(
+        &build_module_bindings(&source_static, "", store.as_ref())?,
+        &packed_weight_companion_dtypes(&target_static),
+    )?;
+    for index in 0..unit_count {
+        let source = crate::backend::mlx::nn::shared::MlxModule::new(source_unit(index, stream)?);
+        let target = crate::backend::mlx::nn::shared::MlxModule::new(target_unit(index, stream)?);
+        collect(
+            &build_module_bindings(&source, "", store.as_ref())?,
+            &packed_weight_companion_dtypes(&target),
+        )?;
+    }
+    if recipes.is_empty() {
+        return Err(Error::Quantization(
+            "neutral parameter topology declared no floating matrix bindings for load-time quantization"
+                .into(),
+        ));
+    }
+    let targets = recipes
+        .into_iter()
+        .map(|(target, (recipe, companion_dtype))| {
+            let target = BoundedQuantizationTarget::from_recipe(target, recipe)?;
+            match quantization {
+                WeightQuantization::Affine(_) => {
+                    target.with_affine_companion_dtype(companion_dtype)
+                }
+                WeightQuantization::MxFp4 => Ok(target),
+                WeightQuantization::GgufIQuant { .. } => unreachable!(
+                    "load-time materialization rejects checkpoint-native GGUF encodings"
+                ),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let working_set_bytes =
+        bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
+    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+        store,
+        BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
+        stream,
+    )?);
+    let report = transformed.report().clone();
+    let transformed: SharedWeightStore = transformed;
+    Ok((transformed, report))
+}
+
 /// Loads an adapter directly or through the shared bounded packed overlay.
 ///
 /// This is the authoritative standalone materialization route for both
@@ -5012,7 +5116,7 @@ fn add_unit(
     Ok(())
 }
 
-fn validate_unused<F>(
+pub(crate) fn validate_unused<F>(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     consumed: &BTreeSet<String>,
     strict: bool,
@@ -5055,7 +5159,7 @@ fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error>
     Ok(largest)
 }
 
-fn validate_host_budget(config: OffloadConfig, required: u64) -> Result<(), Error> {
+pub(crate) fn validate_host_budget(config: OffloadConfig, required: u64) -> Result<(), Error> {
     if let Some(budget) = config.host_budget_bytes() {
         if required > budget {
             return Err(LayerwiseModelError::HostBudgetTooSmall { required, budget }.into());
@@ -5064,7 +5168,7 @@ fn validate_host_budget(config: OffloadConfig, required: u64) -> Result<(), Erro
     Ok(())
 }
 
-fn validate_device_budget(
+pub(crate) fn validate_device_budget(
     config: OffloadConfig,
     static_bytes: u64,
     window_bytes: u64,

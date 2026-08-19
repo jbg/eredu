@@ -1056,6 +1056,16 @@ where
         usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)
     }
 
+    fn unit_path(&self, index: usize) -> Result<String, Self::Error> {
+        let count = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?;
+        if index >= count {
+            return Err(Error::backend(format!(
+                "Llama unit {index} is outside {count} decoder layers"
+            )));
+        }
+        Ok(format!("model.layers.{index}"))
+    }
+
     fn static_modules(&self) -> &Self::StaticModules {
         &self.static_modules
     }

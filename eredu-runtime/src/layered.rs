@@ -49,6 +49,9 @@ where
     /// Returns the total number of ordered execution units.
     fn unit_count(&self) -> Result<usize, Self::Error>;
 
+    /// Returns the stable architecture-owned path of one execution unit.
+    fn unit_path(&self, index: usize) -> Result<String, Self::Error>;
+
     /// Borrows pinned modules for parameter discovery and binding.
     fn static_modules(&self) -> &Self::StaticModules;
 
@@ -107,8 +110,7 @@ where
 {
     architecture: A,
     units: Vec<A::Unit>,
-    state: S,
-    backend: std::marker::PhantomData<fn() -> B>,
+    backend: std::marker::PhantomData<fn() -> (B, S)>,
 }
 
 impl<A, B, S> ResidentRuntime<A, B, S>
@@ -120,7 +122,6 @@ where
     /// Builds every execution unit once and keeps it resident.
     pub fn new(
         architecture: A,
-        state: S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self, A::Error> {
         let count = architecture.unit_count()?;
@@ -130,7 +131,6 @@ where
         Ok(Self {
             architecture,
             units,
-            state,
             backend: std::marker::PhantomData,
         })
     }
@@ -139,27 +139,22 @@ where
     pub fn forward<'a>(
         &mut self,
         input: A::Input<'a>,
+        state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, A::Error> {
-        let mut forward = self
-            .architecture
-            .begin_forward(input, &mut self.state, context)?;
+        let mut forward = self.architecture.begin_forward(input, state, context)?;
         for (index, unit) in self.units.iter_mut().enumerate() {
             forward.hidden = self.architecture.forward_unit(
                 index,
                 unit,
                 &forward.hidden,
-                &mut self.state,
+                state,
                 &mut forward.context,
                 context,
             )?;
         }
-        self.architecture.finish_forward(
-            &forward.hidden,
-            &mut self.state,
-            &forward.context,
-            context,
-        )
+        self.architecture
+            .finish_forward(&forward.hidden, state, &forward.context, context)
     }
 
     /// Borrows the architecture and its pinned parameter topology.
@@ -182,19 +177,9 @@ where
         &mut self.units
     }
 
-    /// Borrows the concrete mutable-state realization.
-    pub const fn state(&self) -> &S {
-        &self.state
-    }
-
-    /// Mutably borrows the concrete mutable-state realization.
-    pub fn state_mut(&mut self) -> &mut S {
-        &mut self.state
-    }
-
     /// Decomposes the runtime without cloning backend-native values.
-    pub fn into_parts(self) -> (A, Vec<A::Unit>, S) {
-        (self.architecture, self.units, self.state)
+    pub fn into_parts(self) -> (A, Vec<A::Unit>) {
+        (self.architecture, self.units)
     }
 }
 
@@ -220,7 +205,7 @@ where
         &mut self,
         index: usize,
         lease: Self::Lease,
-        output: &B::Tensor,
+        output: &'a B::Tensor,
         state_values: StateValues,
         context_values: ContextValues,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
@@ -229,6 +214,13 @@ where
         B::Tensor: 'a,
         StateValues: Iterator<Item = &'a B::Tensor>,
         ContextValues: Iterator<Item = &'a B::Tensor>;
+
+    /// Completes the final output and releases any remaining unit guards.
+    fn finish(
+        &mut self,
+        output: &B::Tensor,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), Self::Error>;
 }
 
 /// Failure from architecture execution or layerwise residency policy.
@@ -258,9 +250,8 @@ where
     P: LayerwisePolicy<B, A::Unit>,
 {
     architecture: A,
-    state: S,
     policy: P,
-    backend: std::marker::PhantomData<fn() -> B>,
+    backend: std::marker::PhantomData<fn() -> (B, S)>,
 }
 
 impl<A, B, S, P> LayerwiseRuntime<A, B, S, P>
@@ -273,19 +264,39 @@ where
     P::Error: std::fmt::Display,
 {
     /// Creates a layerwise runtime from concrete architecture, state, and policy.
-    pub const fn new(architecture: A, state: S, policy: P) -> Self {
+    pub const fn new(architecture: A, policy: P) -> Self {
         Self {
             architecture,
-            state,
             policy,
             backend: std::marker::PhantomData,
         }
+    }
+
+    /// Borrows the concrete architecture instance.
+    pub const fn architecture(&self) -> &A {
+        &self.architecture
+    }
+
+    /// Mutably borrows the concrete architecture instance.
+    pub fn architecture_mut(&mut self) -> &mut A {
+        &mut self.architecture
+    }
+
+    /// Borrows the concrete execution policy for cold-path diagnostics.
+    pub const fn policy(&self) -> &P {
+        &self.policy
+    }
+
+    /// Mutably borrows the concrete execution policy.
+    pub fn policy_mut(&mut self) -> &mut P {
+        &mut self.policy
     }
 
     /// Runs one complete prefill or decode pass with exact unit release points.
     pub fn forward<'a>(
         &mut self,
         input: A::Input<'a>,
+        state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>> {
         let count = self
@@ -294,7 +305,7 @@ where
             .map_err(LayerwiseRuntimeError::Architecture)?;
         let mut forward = self
             .architecture
-            .begin_forward(input, &mut self.state, context)
+            .begin_forward(input, state, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
         for index in 0..count {
             let mut lease = self
@@ -307,13 +318,12 @@ where
                     index,
                     &mut lease,
                     &forward.hidden,
-                    &mut self.state,
+                    state,
                     &mut forward.context,
                     context,
                 )
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            let state_values = self
-                .state
+            let state_values = state
                 .retained_values(index)
                 .map_err(LayerwiseRuntimeError::State)?;
             let context_values = self
@@ -330,14 +340,85 @@ where
                 )
                 .map_err(LayerwiseRuntimeError::Policy)?;
         }
-        self.architecture
-            .finish_forward(&forward.hidden, &mut self.state, &forward.context, context)
-            .map_err(LayerwiseRuntimeError::Architecture)
+        let output = self
+            .architecture
+            .finish_forward(&forward.hidden, state, &forward.context, context)
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        self.policy
+            .finish(&output, context)
+            .map_err(LayerwiseRuntimeError::Policy)?;
+        Ok(output)
     }
 
-    /// Mutably borrows the concrete state realization.
-    pub fn state_mut(&mut self) -> &mut S {
-        &mut self.state
+    /// Runs one pass with statically dispatched unit-boundary observation and
+    /// optional causal intervention.
+    pub fn forward_with_unit_hook<'a, F>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut hook: F,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        F: FnMut(&str, &B::Tensor, &B::Tensor) -> Result<Option<B::Tensor>, A::Error>,
+    {
+        let count = self
+            .architecture
+            .unit_count()
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let mut forward = self
+            .architecture
+            .begin_forward(input, state, context)
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        for index in 0..count {
+            let path = self
+                .architecture
+                .unit_path(index)
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            let mut lease = self
+                .policy
+                .acquire(index, context)
+                .map_err(LayerwiseRuntimeError::Policy)?;
+            let input = forward.hidden.clone();
+            let output = self
+                .architecture
+                .forward_unit(
+                    index,
+                    &mut lease,
+                    &input,
+                    state,
+                    &mut forward.context,
+                    context,
+                )
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            forward.hidden = hook(&path, &input, &output)
+                .map_err(LayerwiseRuntimeError::Architecture)?
+                .unwrap_or(output);
+            let state_values = state
+                .retained_values(index)
+                .map_err(LayerwiseRuntimeError::State)?;
+            let context_values = self
+                .architecture
+                .retained_context_values(&forward.context, index);
+            self.policy
+                .complete(
+                    index,
+                    lease,
+                    &forward.hidden,
+                    state_values,
+                    context_values,
+                    context,
+                )
+                .map_err(LayerwiseRuntimeError::Policy)?;
+        }
+        let output = self
+            .architecture
+            .finish_forward(&forward.hidden, state, &forward.context, context)
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        self.policy
+            .finish(&output, context)
+            .map_err(LayerwiseRuntimeError::Policy)?;
+        Ok(output)
     }
 }
 
@@ -401,7 +482,7 @@ where
         &mut self,
         index: usize,
         lease: Self::Lease,
-        _output: &B::Tensor,
+        _output: &'a B::Tensor,
         _state_values: StateValues,
         _context_values: ContextValues,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
@@ -424,6 +505,14 @@ where
         if slot.replace(lease.unit).is_some() {
             return Err(ResidentUnitWindowError::AlreadyResident { index });
         }
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        _output: &B::Tensor,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), Self::Error> {
         Ok(())
     }
 }

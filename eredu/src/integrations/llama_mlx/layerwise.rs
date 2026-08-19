@@ -1,7 +1,7 @@
 //! Unified Llama/Mistral loading across weight-residency policies.
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_runtime::{CausalModel, RuntimeState, WeightBinding};
+use eredu_runtime::{CausalModel, LayerwiseRuntime, RuntimeState, WeightBinding};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -43,10 +43,12 @@ use crate::{
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, store::open_gguf_checkpoint_source,
     },
-    backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
+    backend::mlx::runtime::execution::generic::{
+        prepare_layerwise_policy, MlxLayerwisePolicy, MlxResidentPolicy, MlxUnitFactory,
+    },
     backend::mlx::runtime::execution::layerwise::{
-        load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, ArchitectureAdapter, DenseDiskStreamReport,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
+        quantize_parameterized_store, ArchitectureAdapter, DenseDiskStreamReport,
         ExecutionResidency, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
         LayerwiseModelMetadata, LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
     },
@@ -63,6 +65,39 @@ const HEAD_UNIT: &str = "llama.static.output";
 
 type AttentionInput<'a, C> = eredu_architectures::llama::AttentionInput<'a, Array, C>;
 type TransformerBlock = MlxModule<eredu_architectures::llama::TransformerBlock<MlxBackend>>;
+type NeutralBlock = eredu_architectures::llama::TransformerBlock<MlxBackend>;
+
+#[derive(Clone)]
+struct LlamaUnitFactory {
+    args: ModelArgs,
+}
+
+impl MlxUnitFactory<NeutralBlock> for LlamaUnitFactory {
+    fn build(&mut self, index: usize, stream: &Stream) -> Result<NeutralBlock, Error> {
+        NeutralBlock::new(&self.args, index, stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+    }
+}
+
+type NeutralArchitecture = eredu_architectures::llama::LayeredModel<MlxBackend>;
+type NeutralResidentRuntime = LayerwiseRuntime<
+    NeutralArchitecture,
+    MlxBackend,
+    MlxKeyValueState,
+    MlxResidentPolicy<NeutralBlock>,
+>;
+type NeutralLayerwiseRuntime = LayerwiseRuntime<
+    NeutralArchitecture,
+    MlxBackend,
+    MlxKeyValueState,
+    MlxLayerwisePolicy<NeutralBlock, LlamaUnitFactory>,
+>;
+
+enum LlamaExecution {
+    Resident(NeutralResidentRuntime),
+    Layerwise(NeutralLayerwiseRuntime),
+    TensorParallel(Box<LayerwiseModel<LlamaLayerwiseAdapter>>),
+}
 
 fn new_transformer_block(
     args: &ModelArgs,
@@ -80,15 +115,127 @@ fn load_model_args(model_dir: &Path) -> Result<ModelArgs, Error> {
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
+fn resolve_llama_safetensors_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    args: &ModelArgs,
+) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
+    if store.is_checkpoint_contract_resolved()
+        || store.source_diagnostics()?.backend
+            != eredu_checkpoint::store::WeightStoreBackend::Safetensors
+    {
+        return Ok(store);
+    }
+    let plan = eredu_architectures::llama::safetensors_plan(args)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
+        .map_err(|validation| {
+            Error::UnsupportedArchitecture(format!(
+                "{} checkpoint contract did not resolve: {validation:?}",
+                args.model_type
+            ))
+        })?;
+    Ok(Arc::new(
+        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
+    ))
+}
+
+fn load_neutral_llama(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    args: ModelArgs,
+    options: LayerWeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+    materialization: Option<eredu_runtime::WeightMaterializationReport>,
+) -> Result<LlamaModel, Error> {
+    let layer_count = usize::try_from(args.num_hidden_layers)
+        .map_err(|_| Error::UnsupportedArchitecture("invalid Llama layer count".into()))?;
+    let mut architecture = NeutralArchitecture::new(args.clone(), stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let factory = LlamaUnitFactory { args: args.clone() };
+    let (policy, mut metadata) = prepare_layerwise_policy(
+        store,
+        architecture.static_modules_mut(),
+        factory,
+        layer_count,
+        options,
+        stream,
+        weights_stream,
+        |key| key.starts_with("rope_freqs.") || key.ends_with(".rotary_emb.inv_freq"),
+    )?;
+    metadata.model_type = args.model_type.clone();
+    metadata.quantization = args.weight_quantization();
+    metadata.materialization = materialization;
+    let execution = if options.is_fully_resident() {
+        LlamaExecution::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        LlamaExecution::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok(LlamaModel {
+        args,
+        metadata,
+        execution,
+    })
+}
+
+fn quantize_neutral_llama_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    source_args: &ModelArgs,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<
+    (
+        Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        ModelArgs,
+        eredu_runtime::WeightMaterializationReport,
+    ),
+    Error,
+> {
+    let mut target_args = source_args.clone();
+    target_args.quantization = Some(quantization);
+    target_args.quantization_config = None;
+    target_args.quantized_weights = None;
+    target_args.quantized_weight_configs = None;
+    let source = NeutralArchitecture::new(source_args.clone(), stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let target = NeutralArchitecture::new(target_args.clone(), stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let count = usize::try_from(source_args.num_hidden_layers)
+        .map_err(|_| Error::UnsupportedArchitecture("invalid Llama layer count".into()))?;
+    let source_unit_args = source_args.clone();
+    let target_unit_args = target_args.clone();
+    let (store, report) = quantize_parameterized_store(
+        store,
+        source.static_modules(),
+        target.static_modules(),
+        move |index, stream| {
+            NeutralBlock::new(&source_unit_args, index, stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        },
+        move |index, stream| {
+            NeutralBlock::new(&target_unit_args, index, stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        },
+        count,
+        quantization,
+        stream,
+    )?;
+    Ok((store, target_args, report))
+}
+
 /// Llama/Mistral causal LM whose execution engine follows its residency policy.
 pub struct LlamaModel {
-    execution: Box<LayerwiseModel<LlamaLayerwiseAdapter>>,
+    args: ModelArgs,
+    metadata: LayerwiseModelMetadata,
+    execution: LlamaExecution,
 }
 
 impl LlamaModel {
     /// Returns normalized model arguments regardless of execution engine.
     pub fn args(&self) -> &ModelArgs {
-        self.execution.adapter().args()
+        &self.args
     }
 
     /// Returns the canonical cache-relevant architecture identity.
@@ -100,44 +247,63 @@ impl LlamaModel {
     pub fn prompt_cache_layer_layout(
         &self,
     ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
-        self.execution.prompt_cache_layer_layout()
+        Ok(self.prompt_cache_model_identity()?.layer_layout)
     }
 
     /// Returns whether all parameters use the eager execution-device engine.
     pub fn is_fully_resident(&self) -> bool {
-        self.execution.metadata().residency() == ExecutionResidency::FullyResident
+        self.metadata.residency() == ExecutionResidency::FullyResident
     }
 
     /// Returns canonical parameter and residency metadata.
     pub fn metadata(&self) -> &LayerwiseModelMetadata {
-        self.execution.metadata()
+        &self.metadata
     }
 
     /// Returns rank-local generalized parallel information when applicable.
     pub fn parallel_info(
         &self,
     ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
-        self.execution.parallel_info()
+        match &self.execution {
+            LlamaExecution::TensorParallel(execution) => execution.parallel_info(),
+            LlamaExecution::Resident(_) | LlamaExecution::Layerwise(_) => None,
+        }
     }
 
     /// Returns logical residency and transfer telemetry for a layerwise model.
     pub fn residency_report(&self) -> Result<Option<ResidencyReport>, Error> {
-        Ok(Some(self.execution.residency_report()?))
+        let report = match &self.execution {
+            LlamaExecution::Resident(execution) => execution.policy().residency_report()?,
+            LlamaExecution::Layerwise(execution) => execution.policy().residency_report()?,
+            LlamaExecution::TensorParallel(execution) => execution.residency_report()?,
+        };
+        Ok(Some(report))
     }
 
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
-        self.execution.dense_stream_report()
+        match &self.execution {
+            LlamaExecution::TensorParallel(execution) => execution.dense_stream_report(),
+            LlamaExecution::Resident(_) | LlamaExecution::Layerwise(_) => Ok(None),
+        }
     }
 
     /// Returns the persistent checkpoint store used by a layerwise model.
     pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
-        self.execution.checkpoint_store()
+        match &self.execution {
+            LlamaExecution::Resident(execution) => execution.policy().checkpoint_store(),
+            LlamaExecution::Layerwise(execution) => execution.policy().checkpoint_store(),
+            LlamaExecution::TensorParallel(execution) => execution.checkpoint_store(),
+        }
     }
 
     /// Returns the number of pinned static leases used by the layerwise engine.
     pub fn static_lease_count(&self) -> usize {
-        self.execution.static_lease_count()
+        match &self.execution {
+            LlamaExecution::Resident(execution) => execution.policy().static_lease_count(),
+            LlamaExecution::Layerwise(execution) => execution.policy().static_lease_count(),
+            LlamaExecution::TensorParallel(execution) => execution.static_lease_count(),
+        }
     }
 
     /// Creates the cache representation required by the model configuration.
@@ -157,7 +323,13 @@ impl LlamaModel {
         match policy {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
             CacheResidencyPolicy::Paged(options) => {
-                self.new_paged_cache(options, None, self.execution.prompt_cache_rank_identity())
+                let rank = match &self.execution {
+                    LlamaExecution::TensorParallel(execution) => {
+                        execution.prompt_cache_rank_identity()
+                    }
+                    LlamaExecution::Resident(_) | LlamaExecution::Layerwise(_) => None,
+                };
+                self.new_paged_cache(options, None, rank)
             }
         }
     }
@@ -171,8 +343,21 @@ impl LlamaModel {
         options: PagedCacheOptions,
         stream: &Stream,
     ) -> Result<(MlxKeyValueState, PromptCacheManifest), Error> {
-        self.execution
-            .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+        let identity = self.prompt_cache_model_identity()?;
+        eredu_core::cache::validate_prompt_cache_model_identity(expected, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let (manager, manifest) = open_prompt_cache(
+            directory.as_ref(),
+            expected,
+            &identity,
+            prefix_token_ids,
+            options,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        let state =
+            self.new_paged_cache_from_manager(manager, identity.topology.cache_rank_identity())?;
+        let _ = stream;
+        Ok((state, manifest))
     }
 
     /// Persists a prefix through the generalized execution contract.
@@ -185,14 +370,13 @@ impl LlamaModel {
         options: &PromptCacheOptions,
         stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
-        self.execution.save_prompt_cache(
-            cache,
-            destination,
-            descriptor,
-            prefix_token_ids,
-            options,
-            stream,
-        )
+        let identity = self.prompt_cache_model_identity()?;
+        eredu_core::cache::validate_prompt_cache_model_identity(&descriptor, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let _ = stream;
+        cache
+            .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+            .map_err(Into::into)
     }
 
     fn new_paged_cache(
@@ -231,8 +415,21 @@ impl LlamaModel {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
-        self.execution
-            .forward(LlamaAdapterInput { inputs, mask: None }, cache, stream)
+        let input = eredu_architectures::llama::LayeredInput {
+            tokens: inputs,
+            mask: None,
+        };
+        match &mut self.execution {
+            LlamaExecution::Resident(execution) => execution
+                .forward(input, cache, stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+            LlamaExecution::Layerwise(execution) => execution
+                .forward(input, cache, stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+            LlamaExecution::TensorParallel(execution) => {
+                execution.forward(LlamaAdapterInput { inputs, mask: None }, cache, stream)
+            }
+        }
     }
 
     /// Runs the canonical execution path with stable per-layer observation points.
@@ -245,12 +442,64 @@ impl LlamaModel {
         observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
-        self.execution.forward_with_observer(
-            LlamaAdapterInput { inputs, mask },
-            cache,
-            stream,
-            observer,
-        )
+        match &mut self.execution {
+            LlamaExecution::TensorParallel(execution) => execution.forward_with_observer(
+                LlamaAdapterInput { inputs, mask },
+                cache,
+                stream,
+                observer,
+            ),
+            LlamaExecution::Resident(execution) => {
+                let output = execution
+                    .forward_with_unit_hook(
+                        eredu_architectures::llama::LayeredInput {
+                            tokens: inputs,
+                            mask,
+                        },
+                        cache,
+                        stream,
+                        |path, input, output| {
+                            observer
+                                .observe(&format!("{path}.input"), input)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                            observer
+                                .observe(&format!("{path}.output"), output)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                            observer
+                                .intervene(&format!("{path}.output"), output)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                    )
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                observer.observe("model.logits", &output)?;
+                Ok(output)
+            }
+            LlamaExecution::Layerwise(execution) => {
+                let output = execution
+                    .forward_with_unit_hook(
+                        eredu_architectures::llama::LayeredInput {
+                            tokens: inputs,
+                            mask,
+                        },
+                        cache,
+                        stream,
+                        |path, input, output| {
+                            observer
+                                .observe(&format!("{path}.input"), input)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                            observer
+                                .observe(&format!("{path}.output"), output)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
+                            observer
+                                .intervene(&format!("{path}.output"), output)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                    )
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                observer.observe("model.logits", &output)?;
+                Ok(output)
+            }
+        }
     }
 
     /// Runs a rank-local tensor-parallel forward pass.
@@ -262,12 +511,17 @@ impl LlamaModel {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
-        self.execution.forward_tensor_parallel(
-            LlamaAdapterInput { inputs, mask: None },
-            cache,
-            group,
-            stream,
-        )
+        match &mut self.execution {
+            LlamaExecution::TensorParallel(execution) => execution.forward_tensor_parallel(
+                LlamaAdapterInput { inputs, mask: None },
+                cache,
+                group,
+                stream,
+            ),
+            LlamaExecution::Resident(_) | LlamaExecution::Layerwise(_) => Err(Error::Parallel(
+                "model was not loaded for tensor-parallel execution".into(),
+            )),
+        }
     }
 
     /// Runs prompt prefill and returns last-token logits.
@@ -300,8 +554,29 @@ impl LlamaModel {
         if self.is_fully_resident() {
             return Ok(false);
         }
-        self.execution.clear_device_group("text_decoder")?;
+        match &self.execution {
+            LlamaExecution::Layerwise(_) => {}
+            LlamaExecution::TensorParallel(execution) => {
+                execution.clear_device_group("text_decoder")?
+            }
+            LlamaExecution::Resident(_) => return Ok(false),
+        }
         Ok(true)
+    }
+
+    fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        let layout = eredu_architectures::llama::state_layout(self.args())
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let identity = eredu_architectures::llama::state_identity(
+            self.args(),
+            &layout,
+            0,
+            PromptCacheTopology::default(),
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        identity
+            .prompt_cache_identity(&layout)
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn validate_cache(&self, cache: &MlxKeyValueState) -> Result<(), Error> {
@@ -367,18 +642,21 @@ pub(crate) fn load_llama_safetensors_mlx(
         })
         .transpose()?
         .flatten();
-    let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
     let store = open_safetensors_weight_store(model_dir, execution_options.max_mapped_shards())?;
-    Ok(LlamaModel {
-        execution: Box::new(load_layerwise_model_with_quantization(
+    let store = resolve_llama_safetensors_store(store, &args)?;
+    if let Some(quantization) = quantize_on_load {
+        let (store, args, report) =
+            quantize_neutral_llama_store(store, &args, quantization, stream)?;
+        return load_neutral_llama(
             store,
-            adapter,
+            args,
             execution_options,
-            quantize_on_load,
             stream,
             weights_stream,
-        )?),
-    })
+            Some(report),
+        );
+    }
+    load_neutral_llama(store, args, execution_options, stream, weights_stream, None)
 }
 
 /// Loads Llama/Mistral through the generalized tensor-parallel execution engine.
@@ -408,16 +686,20 @@ pub(crate) fn load_llama_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     let args = load_model_args(model_dir)?;
-    let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
+    let adapter = LlamaLayerwiseAdapter::new(args.clone(), stream)?;
+    let execution = load_tensor_parallel_layerwise_model(
+        open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
+        adapter,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )?;
+    let metadata = execution.metadata().clone();
     Ok(LlamaModel {
-        execution: Box::new(load_tensor_parallel_layerwise_model(
-            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
-            adapter,
-            options,
-            build,
-            stream,
-            weights_stream,
-        )?),
+        args,
+        metadata,
+        execution: LlamaExecution::TensorParallel(Box::new(execution)),
     })
 }
 
@@ -443,7 +725,8 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
             eredu_architectures::llama::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
-    let adapter = LlamaLayerwiseAdapter::new(prepared.args, stream)?;
+    let args = prepared.args;
+    let adapter = LlamaLayerwiseAdapter::new(args.clone(), stream)?;
     let execution = load_tensor_parallel_layerwise_model(
         store,
         adapter,
@@ -454,7 +737,9 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
     )?;
     Ok((
         LlamaModel {
-            execution: Box::new(execution),
+            args,
+            metadata: execution.metadata().clone(),
+            execution: LlamaExecution::TensorParallel(Box::new(execution)),
         },
         prepared.eos_token_ids,
     ))
@@ -480,26 +765,28 @@ pub(crate) fn load_llama_gguf_model(
             eredu_architectures::llama::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
-    let adapter = LlamaLayerwiseAdapter::new(prepared.args, stream)?;
+    let args = prepared.args;
     if residency.expert_cache().is_some() {
         return Err(Error::UnsupportedArchitecture(
             "independent expert caching is not supported for Llama GGUF checkpoints".into(),
         ));
     }
     let execution_options = residency.layers();
-    Ok((
-        LlamaModel {
-            execution: Box::new(load_layerwise_model_with_quantization(
-                store,
-                adapter,
-                execution_options,
-                quantization,
-                stream,
-                weights_stream,
-            )?),
-        },
-        prepared.eos_token_ids,
-    ))
+    let model = if let Some(quantization) = quantization {
+        let (store, args, report) =
+            quantize_neutral_llama_store(store, &args, quantization, stream)?;
+        load_neutral_llama(
+            store,
+            args,
+            execution_options,
+            stream,
+            weights_stream,
+            Some(report),
+        )?
+    } else {
+        load_neutral_llama(store, args, execution_options, stream, weights_stream, None)?
+    };
+    Ok((model, prepared.eos_token_ids))
 }
 
 /// Llama implementation of the generic layerwise model-family contract.

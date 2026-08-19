@@ -567,7 +567,7 @@ fn load_module<M: Parameterized<ReferenceTensor>>(
 fn shared_llama_runs_prefill_and_decode_without_mlx() {
     let args = tiny_args();
     let layout = llama::state_layout(&args).unwrap();
-    let state = DeviceState::<ReferenceBackend, ReferenceCache>::create(layout, |_, policy| {
+    let mut state = DeviceState::<ReferenceBackend, ReferenceCache>::create(layout, |_, policy| {
         Ok::<_, std::convert::Infallible>(ReferenceCache {
             offset: 0,
             window: policy
@@ -578,7 +578,7 @@ fn shared_llama_runs_prefill_and_decode_without_mlx() {
     })
     .unwrap();
     let architecture = llama::LayeredModel::<ReferenceBackend>::new(args, &()).unwrap();
-    let mut runtime = ResidentRuntime::new(architecture, state, &()).unwrap();
+    let mut runtime = ResidentRuntime::new(architecture, &()).unwrap();
 
     let mut catalog = topology(runtime.architecture().static_modules());
     for unit in runtime.units() {
@@ -622,12 +622,13 @@ fn shared_llama_runs_prefill_and_decode_without_mlx() {
                 tokens: &prefill,
                 mask: None,
             },
+            &mut state,
             &(),
         )
         .unwrap();
     assert_eq!(logits.shape(), &[1, 3, 32]);
-    assert_eq!(runtime.state_mut().layer(0).unwrap().offset(), 3);
-    assert_eq!(runtime.state_mut().layer(1).unwrap().offset(), 3);
+    assert_eq!(state.layer(0).unwrap().offset(), 3);
+    assert_eq!(state.layer(1).unwrap().offset(), 3);
 
     let decode = ReferenceTensor(vec![1, 1]);
     let logits = runtime
@@ -636,25 +637,27 @@ fn shared_llama_runs_prefill_and_decode_without_mlx() {
                 tokens: &decode,
                 mask: None,
             },
+            &mut state,
             &(),
         )
         .unwrap();
     assert_eq!(logits.shape(), &[1, 1, 32]);
-    assert_eq!(runtime.state_mut().layer(0).unwrap().offset(), 4);
-    assert_eq!(runtime.state_mut().layer(1).unwrap().offset(), 4);
+    assert_eq!(state.layer(0).unwrap().offset(), 4);
+    assert_eq!(state.layer(1).unwrap().offset(), 4);
 
-    let (architecture, units, state) = runtime.into_parts();
-    let mut layerwise = LayerwiseRuntime::new(architecture, state, ResidentUnitWindow::new(units));
+    let (architecture, units) = runtime.into_parts();
+    let mut layerwise = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
     let logits = layerwise
         .forward(
             LayeredInput {
                 tokens: &decode,
                 mask: None,
             },
+            &mut state,
             &(),
         )
         .unwrap();
     assert_eq!(logits.shape(), &[1, 1, 32]);
-    assert_eq!(layerwise.state_mut().layer(0).unwrap().offset(), 5);
-    assert_eq!(layerwise.state_mut().layer(1).unwrap().offset(), 5);
+    assert_eq!(state.layer(0).unwrap().offset(), 5);
+    assert_eq!(state.layer(1).unwrap().offset(), 5);
 }
