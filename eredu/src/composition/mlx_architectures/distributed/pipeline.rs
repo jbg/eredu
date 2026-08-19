@@ -84,7 +84,7 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
-        ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, DenseTransferWindow,
+        ArchitectureAdapter, DenseStreamController, DenseTransferWindow,
         LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection, SharedWeightStore,
         StaticUnitBindings,
     },
@@ -138,6 +138,7 @@ use crate::{
     core::ParallelCoordinates,
     core::{MtpCapability, MtpCheckpointKind},
 };
+use eredu_runtime::DenseDiskStreamReport;
 use eredu_runtime::{
     CacheResidencyPolicy, CacheResidencyReport, ExpertCacheLoadOptions, ExpertPass,
     PagedCacheOptions, WeightResidency,

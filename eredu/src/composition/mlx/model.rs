@@ -676,10 +676,7 @@ impl Model {
     /// Returns experimental dense-stream telemetry when enabled.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<
-        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
-        Error,
-    > {
+    ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
         match self {
             Self::DeepSeekV3(model) => model.dense_stream_report(),
             Self::DeepSeekV4(_) => Ok(None),

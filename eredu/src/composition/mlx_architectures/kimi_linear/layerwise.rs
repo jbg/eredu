@@ -516,10 +516,7 @@ impl KimiLinearLayerwiseModel {
     /// Returns disk-stream telemetry when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<
-        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
-        Error,
-    > {
+    ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
         self.execution.dense_stream_report()
     }
 

@@ -142,10 +142,7 @@ impl MlxModel {
     /// Returns dense checkpoint-streaming telemetry when enabled.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<
-        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
-        Error,
-    > {
+    ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
         match &self.inner {
             MlxModelKind::Complete(model) => model.dense_stream_report(),
             MlxModelKind::Pipeline(model) => model.dense_stream_report(),

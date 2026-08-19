@@ -1,6 +1,6 @@
 //! SafeMLX realization of the backend-neutral layerwise unit policy.
 
-use eredu_runtime::{LayerWeightResidency, LayerwiseModelMetadata};
+use eredu_runtime::{DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata};
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -17,9 +17,9 @@ use crate::backend::mlx::{
     runtime::{
         checkpoint::binding::{binding_bytes, build_module_bindings, populate_module_from_lease},
         execution::layerwise::{
-            validate_device_budget, validate_host_budget, validate_unused, DenseDiskStreamReport,
-            DensePreparedTransfer, DenseStreamController, DenseStreamForwardGuard,
-            DenseStreamGroupGuard, DenseTransferWindow, SharedWeightStore,
+            validate_device_budget, validate_host_budget, validate_unused, DensePreparedTransfer,
+            DenseStreamController, DenseStreamForwardGuard, DenseStreamGroupGuard,
+            DenseTransferWindow, SharedWeightStore,
         },
         residency::manager::{
             host_capacity_upper_bound_for_bindings, ResidencyManager, ResidentTransfer,

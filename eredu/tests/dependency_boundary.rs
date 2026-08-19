@@ -291,6 +291,36 @@ fn immutable_weight_residency_policy_is_runtime_owned() {
 }
 
 #[test]
+fn dense_stream_telemetry_is_runtime_owned() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let runtime = std::fs::read_to_string(workspace.join("eredu-runtime/src/dense.rs"))
+        .expect("runtime dense-stream telemetry must be readable");
+    let mlx = std::fs::read_to_string(
+        workspace.join("eredu/src/backend/mlx/runtime/execution/layerwise.rs"),
+    )
+    .expect("MLX layerwise realization must be readable");
+    for runtime_owned in [
+        "pub struct DenseDiskStreamReport",
+        "pub struct DenseCacheMetrics",
+        "pub struct DenseTierResidencyReport",
+        "pub struct DenseExecutionGroupReport",
+        "pub struct DensePassReport",
+        "pub struct DensePassCounterSnapshot",
+    ] {
+        assert!(
+            runtime.contains(runtime_owned),
+            "runtime does not own dense-stream telemetry {runtime_owned}"
+        );
+        assert!(
+            !mlx.contains(runtime_owned),
+            "MLX redefined dense-stream telemetry {runtime_owned}"
+        );
+    }
+}
+
+#[test]
 fn execution_group_orchestration_is_runtime_owned() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

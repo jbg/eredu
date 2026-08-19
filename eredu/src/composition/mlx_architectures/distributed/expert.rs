@@ -789,10 +789,7 @@ impl ExpertParallelModel {
     /// policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<
-        Option<crate::backend::mlx::runtime::execution::layerwise::DenseDiskStreamReport>,
-        Error,
-    > {
+    ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
         match &self.architecture {
             ExpertArchitecture::DeepSeekLayerwise(model) => model.dense_stream_report(),
             ExpertArchitecture::DeepSeekV4Layerwise(model) => model.dense_stream_report(),

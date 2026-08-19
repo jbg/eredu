@@ -10,8 +10,10 @@ use eredu_checkpoint::{
     WeightQuantization,
 };
 use eredu_runtime::{
-    DenseDiskStreamLoadOptions, DenseTransferSchedule, ExecutionResidency, LayerWeightResidency,
-    LayerwiseModelMetadata, OffloadUnit, WeightBinding, WeightResidency, DENSE_TRANSFER_WINDOW,
+    DenseCacheMetrics, DenseDiskStreamLoadOptions, DenseDiskStreamReport,
+    DenseExecutionGroupReport, DensePassCounterSnapshot, DensePassReport, DenseTierResidencyReport,
+    DenseTransferSchedule, ExecutionResidency, LayerWeightResidency, LayerwiseModelMetadata,
+    OffloadUnit, WeightBinding, WeightResidency, DENSE_TRANSFER_WINDOW,
 };
 
 use std::{
@@ -45,10 +47,9 @@ use crate::{
         host_capacity_upper_bound_for_bindings, ResidencyError, ResidencyManager, ResidentTransfer,
         ResidentUnitLease,
     },
-    core::residency::BackgroundPrefetchReport,
     core::residency::{
-        MemoryTier, OffloadConfig, OffloadPlan, OffloadReport, OffloadUnitId, OffloadUnitSpec,
-        ResidencyLedgerError, ResidencyPolicy, TransferDirection,
+        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec,
+        ResidencyLedgerError, ResidencyPolicy,
     },
 };
 use eredu_runtime::PagedCacheOptions;
@@ -130,375 +131,6 @@ pub(crate) fn validate_gguf_layerwise_source(
     Ok(architecture)
 }
 
-/// Stable dense-stream observations combining residency and worker state.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DenseDiskStreamReport {
-    planned_layer_count: usize,
-    planned_layer_bytes: u64,
-    maximum_host_layer_bytes: u64,
-    pinned_static_device_bytes: u64,
-    transfer_stream_index: i32,
-    residency: ResidencyReport,
-    background: BackgroundPrefetchReport,
-    host_layers: DenseTierResidencyReport,
-    device_layers: DenseTierResidencyReport,
-    groups: Vec<DenseExecutionGroupReport>,
-    prefill: DensePassReport,
-    decode: DensePassReport,
-}
-
-/// Cache activity attributed to one logical residency tier.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
-pub struct DenseCacheMetrics {
-    requests: u64,
-    hits: u64,
-    misses: u64,
-    evictions: u64,
-    evicted_bytes: u64,
-}
-
-impl DenseCacheMetrics {
-    /// Returns cache requests targeting the tier.
-    pub const fn requests(self) -> u64 {
-        self.requests
-    }
-    /// Returns requests served by an existing tier copy.
-    pub const fn hits(self) -> u64 {
-        self.hits
-    }
-    /// Returns requests requiring tier materialization.
-    pub const fn misses(self) -> u64 {
-        self.misses
-    }
-    /// Returns copies evicted from the tier.
-    pub const fn evictions(self) -> u64 {
-        self.evictions
-    }
-    /// Returns logical bytes evicted from the tier.
-    pub const fn evicted_bytes(self) -> u64 {
-        self.evicted_bytes
-    }
-
-    fn from_report(report: &OffloadReport, tier: MemoryTier) -> Self {
-        let prefetch = report.tier_prefetch(tier);
-        let evictions = report.tier_evictions(tier);
-        Self {
-            requests: prefetch.requests(),
-            hits: prefetch.hits(),
-            misses: prefetch.misses(),
-            evictions: evictions.count(),
-            evicted_bytes: evictions.bytes(),
-        }
-    }
-
-    fn saturating_delta(self, earlier: Self) -> Self {
-        Self {
-            requests: self.requests.saturating_sub(earlier.requests),
-            hits: self.hits.saturating_sub(earlier.hits),
-            misses: self.misses.saturating_sub(earlier.misses),
-            evictions: self.evictions.saturating_sub(earlier.evictions),
-            evicted_bytes: self.evicted_bytes.saturating_sub(earlier.evicted_bytes),
-        }
-    }
-
-    fn saturating_add(&mut self, other: Self) {
-        self.requests = self.requests.saturating_add(other.requests);
-        self.hits = self.hits.saturating_add(other.hits);
-        self.misses = self.misses.saturating_add(other.misses);
-        self.evictions = self.evictions.saturating_add(other.evictions);
-        self.evicted_bytes = self.evicted_bytes.saturating_add(other.evicted_bytes);
-    }
-}
-
-/// Streamed-layer occupancy and cache history for one tier.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
-pub struct DenseTierResidencyReport {
-    current_layer_count: usize,
-    peak_layer_count: usize,
-    current_layer_bytes: u64,
-    peak_layer_bytes: u64,
-    cache: DenseCacheMetrics,
-}
-
-impl DenseTierResidencyReport {
-    /// Returns currently resident streamed layers.
-    pub const fn current_layer_count(self) -> usize {
-        self.current_layer_count
-    }
-    /// Returns the peak number of simultaneously resident streamed layers.
-    pub const fn peak_layer_count(self) -> usize {
-        self.peak_layer_count
-    }
-    /// Returns current streamed-layer bytes in the tier.
-    pub const fn current_layer_bytes(self) -> u64 {
-        self.current_layer_bytes
-    }
-    /// Returns peak streamed-layer bytes in the tier.
-    pub const fn peak_layer_bytes(self) -> u64 {
-        self.peak_layer_bytes
-    }
-    /// Returns cumulative cache activity for the tier.
-    pub const fn cache(self) -> DenseCacheMetrics {
-        self.cache
-    }
-}
-
-/// Point-in-time occupancy for one named execution stack.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DenseExecutionGroupReport {
-    id: String,
-    planned_layers: usize,
-    planned_bytes: u64,
-    completed_executions: u64,
-    host_layers: usize,
-    host_bytes: u64,
-    peak_host_layers: usize,
-    peak_host_bytes: u64,
-    device_layers: usize,
-    device_bytes: u64,
-    peak_device_layers: usize,
-    peak_device_bytes: u64,
-}
-
-impl DenseExecutionGroupReport {
-    /// Returns the stable execution-group identifier.
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-    /// Returns disk-planned layers in the group.
-    pub const fn planned_layers(&self) -> usize {
-        self.planned_layers
-    }
-    /// Returns logical checkpoint bytes in the group.
-    pub const fn planned_bytes(&self) -> u64 {
-        self.planned_bytes
-    }
-    /// Returns successfully completed executions of this group.
-    pub const fn completed_executions(&self) -> u64 {
-        self.completed_executions
-    }
-    /// Returns current host-resident group layers.
-    pub const fn host_layers(&self) -> usize {
-        self.host_layers
-    }
-    /// Returns current host-resident group bytes.
-    pub const fn host_bytes(&self) -> u64 {
-        self.host_bytes
-    }
-    /// Returns the peak number of host-resident layers observed for the group.
-    pub const fn peak_host_layers(&self) -> usize {
-        self.peak_host_layers
-    }
-    /// Returns peak host-resident layer bytes observed for the group.
-    pub const fn peak_host_bytes(&self) -> u64 {
-        self.peak_host_bytes
-    }
-    /// Returns current device-resident group layers.
-    pub const fn device_layers(&self) -> usize {
-        self.device_layers
-    }
-    /// Returns current device-resident group bytes.
-    pub const fn device_bytes(&self) -> u64 {
-        self.device_bytes
-    }
-    /// Returns the peak number of device-resident layers observed for the group.
-    pub const fn peak_device_layers(&self) -> usize {
-        self.peak_device_layers
-    }
-    /// Returns peak device-resident layer bytes observed for the group.
-    pub const fn peak_device_bytes(&self) -> u64 {
-        self.peak_device_bytes
-    }
-}
-
-/// Cache and logical transfer activity from completed prefill or decode forwards.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
-pub struct DensePassReport {
-    forwards: u64,
-    host_cache: DenseCacheMetrics,
-    device_cache: DenseCacheMetrics,
-    peak_host_layers: usize,
-    peak_host_bytes: u64,
-    peak_device_layers: usize,
-    peak_device_bytes: u64,
-    disk_to_host_bytes: u64,
-    disk_to_device_bytes: u64,
-    host_to_device_bytes: u64,
-}
-
-impl DensePassReport {
-    /// Returns completed forwards in this pass category.
-    pub const fn forwards(self) -> u64 {
-        self.forwards
-    }
-    /// Returns host-cache activity during completed forwards.
-    pub const fn host_cache(self) -> DenseCacheMetrics {
-        self.host_cache
-    }
-    /// Returns device-cache activity during completed forwards.
-    pub const fn device_cache(self) -> DenseCacheMetrics {
-        self.device_cache
-    }
-    /// Returns peak host-resident streamed layers observed during these forwards.
-    pub const fn peak_host_layers(self) -> usize {
-        self.peak_host_layers
-    }
-    /// Returns peak host-resident streamed-layer bytes during these forwards.
-    pub const fn peak_host_bytes(self) -> u64 {
-        self.peak_host_bytes
-    }
-    /// Returns peak device-resident streamed layers observed during these forwards.
-    pub const fn peak_device_layers(self) -> usize {
-        self.peak_device_layers
-    }
-    /// Returns peak device-resident streamed-layer bytes during these forwards.
-    pub const fn peak_device_bytes(self) -> u64 {
-        self.peak_device_bytes
-    }
-    /// Returns logical disk-to-host bytes during completed forwards.
-    pub const fn disk_to_host_bytes(self) -> u64 {
-        self.disk_to_host_bytes
-    }
-    /// Returns logical disk-to-device bytes during completed forwards.
-    pub const fn disk_to_device_bytes(self) -> u64 {
-        self.disk_to_device_bytes
-    }
-    /// Returns logical host-to-device bytes during completed forwards.
-    pub const fn host_to_device_bytes(self) -> u64 {
-        self.host_to_device_bytes
-    }
-}
-
-impl DenseDiskStreamReport {
-    pub(crate) fn with_materialization(
-        mut self,
-        materialization: Option<WeightMaterializationReport>,
-    ) -> Self {
-        self.residency = self.residency.with_materialization(materialization);
-        self
-    }
-
-    /// Returns the number of disk-planned execution units.
-    pub const fn planned_layer_count(&self) -> usize {
-        self.planned_layer_count
-    }
-    /// Returns the logical checkpoint bytes in disk-planned execution units.
-    pub const fn planned_layer_bytes(&self) -> u64 {
-        self.planned_layer_bytes
-    }
-    /// Returns the charged host-transfer capacity of the largest execution unit.
-    pub const fn maximum_host_layer_bytes(&self) -> u64 {
-        self.maximum_host_layer_bytes
-    }
-    /// Returns pinned static parameter bytes outside the streamed-layer totals.
-    pub const fn pinned_static_device_bytes(&self) -> u64 {
-        self.pinned_static_device_bytes
-    }
-    /// Returns the distinct MLX stream used for device weight transfers.
-    pub const fn transfer_stream_index(&self) -> i32 {
-        self.transfer_stream_index
-    }
-    /// Returns the complete logical tier and checkpoint-store report.
-    pub const fn residency(&self) -> &ResidencyReport {
-        &self.residency
-    }
-    /// Returns bounded background worker observations.
-    pub const fn background(&self) -> BackgroundPrefetchReport {
-        self.background
-    }
-    /// Returns streamed host-layer occupancy and cache history.
-    pub const fn host_layers(&self) -> DenseTierResidencyReport {
-        self.host_layers
-    }
-    /// Returns streamed device-layer occupancy and cache history.
-    pub const fn device_layers(&self) -> DenseTierResidencyReport {
-        self.device_layers
-    }
-    /// Returns point-in-time observations for each named execution group.
-    pub fn execution_groups(&self) -> &[DenseExecutionGroupReport] {
-        &self.groups
-    }
-    /// Returns completed prefill activity.
-    pub const fn prefill(&self) -> DensePassReport {
-        self.prefill
-    }
-    /// Returns completed decode activity.
-    pub const fn decode(&self) -> DensePassReport {
-        self.decode
-    }
-    /// Returns completed multi-token forward passes.
-    pub const fn prefill_forwards(&self) -> u64 {
-        self.prefill.forwards
-    }
-    /// Returns completed single-token forward passes.
-    pub const fn decode_forwards(&self) -> u64 {
-        self.decode.forwards
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct DenseCounterSnapshot {
-    host_cache: DenseCacheMetrics,
-    device_cache: DenseCacheMetrics,
-    disk_to_host_bytes: u64,
-    disk_to_device_bytes: u64,
-    host_to_device_bytes: u64,
-}
-
-impl DenseCounterSnapshot {
-    fn from_report(report: &OffloadReport) -> Self {
-        Self {
-            host_cache: DenseCacheMetrics::from_report(report, MemoryTier::Host),
-            device_cache: DenseCacheMetrics::from_report(report, MemoryTier::Device),
-            disk_to_host_bytes: report.transfer(TransferDirection::DiskToHost).bytes(),
-            disk_to_device_bytes: report.transfer(TransferDirection::DiskToDevice).bytes(),
-            host_to_device_bytes: report.transfer(TransferDirection::HostToDevice).bytes(),
-        }
-    }
-
-    fn delta(self, earlier: Self) -> DensePassReport {
-        DensePassReport {
-            forwards: 1,
-            host_cache: self.host_cache.saturating_delta(earlier.host_cache),
-            device_cache: self.device_cache.saturating_delta(earlier.device_cache),
-            peak_host_layers: 0,
-            peak_host_bytes: 0,
-            peak_device_layers: 0,
-            peak_device_bytes: 0,
-            disk_to_host_bytes: self
-                .disk_to_host_bytes
-                .saturating_sub(earlier.disk_to_host_bytes),
-            disk_to_device_bytes: self
-                .disk_to_device_bytes
-                .saturating_sub(earlier.disk_to_device_bytes),
-            host_to_device_bytes: self
-                .host_to_device_bytes
-                .saturating_sub(earlier.host_to_device_bytes),
-        }
-    }
-}
-
-impl DensePassReport {
-    fn accumulate(&mut self, other: Self) {
-        self.forwards = self.forwards.saturating_add(other.forwards);
-        self.host_cache.saturating_add(other.host_cache);
-        self.device_cache.saturating_add(other.device_cache);
-        self.peak_host_layers = self.peak_host_layers.max(other.peak_host_layers);
-        self.peak_host_bytes = self.peak_host_bytes.max(other.peak_host_bytes);
-        self.peak_device_layers = self.peak_device_layers.max(other.peak_device_layers);
-        self.peak_device_bytes = self.peak_device_bytes.max(other.peak_device_bytes);
-        self.disk_to_host_bytes = self
-            .disk_to_host_bytes
-            .saturating_add(other.disk_to_host_bytes);
-        self.disk_to_device_bytes = self
-            .disk_to_device_bytes
-            .saturating_add(other.disk_to_device_bytes);
-        self.host_to_device_bytes = self
-            .host_to_device_bytes
-            .saturating_add(other.host_to_device_bytes);
-    }
-}
-
 #[derive(Debug)]
 struct DensePassState {
     active: Option<DensePassActivity>,
@@ -509,7 +141,7 @@ struct DensePassState {
 #[derive(Debug, Clone, Copy)]
 struct DensePassActivity {
     prefill: bool,
-    start: DenseCounterSnapshot,
+    start: DensePassCounterSnapshot,
     peaks: DensePassReport,
 }
 
@@ -704,10 +336,12 @@ impl DenseStreamController {
                 .into(),
             );
         }
-        active.peaks.peak_host_layers = active.peaks.peak_host_layers.max(host_layers);
-        active.peaks.peak_host_bytes = active.peaks.peak_host_bytes.max(host_bytes);
-        active.peaks.peak_device_layers = active.peaks.peak_device_layers.max(device_layers);
-        active.peaks.peak_device_bytes = active.peaks.peak_device_bytes.max(device_bytes);
+        active.peaks.set_peaks(
+            active.peaks.peak_host_layers().max(host_layers),
+            active.peaks.peak_host_bytes().max(host_bytes),
+            active.peaks.peak_device_layers().max(device_layers),
+            active.peaks.peak_device_bytes().max(device_bytes),
+        );
         Ok(())
     }
 
@@ -750,7 +384,7 @@ impl DenseStreamController {
         }
         state.active = Some(DensePassActivity {
             prefill,
-            start: DenseCounterSnapshot::from_report(&offload),
+            start: DensePassCounterSnapshot::from_report(&offload),
             peaks: DensePassReport::default(),
         });
         Ok(DenseStreamForwardGuard {
@@ -768,7 +402,7 @@ impl DenseStreamController {
             )?;
         }
         let (_, offload, _, _) = manager.telemetry_snapshot()?;
-        let current = DenseCounterSnapshot::from_report(&offload);
+        let current = DensePassCounterSnapshot::from_report(&offload);
         let mut state = self.pass.lock().map_err(|_| {
             crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
         })?;
@@ -778,10 +412,12 @@ impl DenseStreamController {
             ),
         )?;
         let mut delta = current.delta(active.start);
-        delta.peak_host_layers = active.peaks.peak_host_layers;
-        delta.peak_host_bytes = active.peaks.peak_host_bytes;
-        delta.peak_device_layers = active.peaks.peak_device_layers;
-        delta.peak_device_bytes = active.peaks.peak_device_bytes;
+        delta.set_peaks(
+            active.peaks.peak_host_layers(),
+            active.peaks.peak_host_bytes(),
+            active.peaks.peak_device_layers(),
+            active.peaks.peak_device_bytes(),
+        );
         if active.prefill {
             state.prefill.accumulate(delta);
         } else {
@@ -851,14 +487,14 @@ impl DenseStreamController {
             } else {
                 (0, 0)
             };
-            DenseTierResidencyReport {
-                current_layer_count: current.len(),
-                peak_layer_count: residency
+            DenseTierResidencyReport::new(
+                current.len(),
+                residency
                     .offload()
                     .peak_resident_units()
                     .get(tier)
                     .saturating_sub(pinned_count),
-                current_layer_bytes: current
+                current
                     .iter()
                     .map(|unit| match tier {
                         MemoryTier::Host => unit.host_allocated_bytes(),
@@ -866,13 +502,13 @@ impl DenseStreamController {
                         MemoryTier::Disk => 0,
                     })
                     .sum(),
-                peak_layer_bytes: residency
+                residency
                     .offload()
                     .peak_resident_bytes()
                     .get(tier)
                     .saturating_sub(pinned_bytes),
-                cache: DenseCacheMetrics::from_report(residency.offload(), tier),
-            }
+                DenseCacheMetrics::from_report(residency.offload(), tier),
+            )
         };
         let activity = self.group_activity.lock().map_err(|_| {
             crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
@@ -887,58 +523,59 @@ impl DenseStreamController {
                     .filter_map(|id| units.get(id).copied())
                     .collect::<Vec<_>>();
                 let observed = activity.get(&group.id).copied().unwrap_or_default();
-                DenseExecutionGroupReport {
-                    id: group.id.clone(),
-                    planned_layers: group_units.len(),
-                    planned_bytes: group_units.iter().map(|unit| unit.expected_bytes()).sum(),
-                    completed_executions: observed.completed_executions,
-                    host_layers: group_units
+                DenseExecutionGroupReport::new(
+                    group.id.clone(),
+                    group_units.len(),
+                    group_units.iter().map(|unit| unit.expected_bytes()).sum(),
+                    observed.completed_executions,
+                    group_units
                         .iter()
                         .filter(|unit| unit.host_resident())
                         .count(),
-                    host_bytes: group_units
+                    group_units
                         .iter()
                         .filter(|unit| unit.host_resident())
                         .map(|unit| unit.host_allocated_bytes())
                         .sum(),
-                    peak_host_layers: observed.peak_host_layers,
-                    peak_host_bytes: observed.peak_host_bytes,
-                    device_layers: group_units
+                    observed.peak_host_layers,
+                    observed.peak_host_bytes,
+                    group_units
                         .iter()
                         .filter(|unit| unit.device_resident())
                         .count(),
-                    device_bytes: group_units
+                    group_units
                         .iter()
                         .filter(|unit| unit.device_resident())
                         .map(|unit| unit.device_allocated_bytes())
                         .sum(),
-                    peak_device_layers: observed.peak_device_layers,
-                    peak_device_bytes: observed.peak_device_bytes,
-                }
+                    observed.peak_device_layers,
+                    observed.peak_device_bytes,
+                )
             })
             .collect();
         let pass = self.pass.lock().map_err(|_| {
             crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
         })?;
-        Ok(DenseDiskStreamReport {
-            planned_layer_count: self.planned_layer_count,
-            planned_layer_bytes: self.planned_layer_bytes,
-            maximum_host_layer_bytes: self.maximum_host_layer_bytes,
-            pinned_static_device_bytes: self.pinned_static_device_bytes,
-            transfer_stream_index: self.transfer_stream_index,
-            host_layers: tier_report(MemoryTier::Host),
-            device_layers: tier_report(MemoryTier::Device),
-            groups,
-            prefill: pass.prefill,
-            decode: pass.decode,
+        let host_layers = tier_report(MemoryTier::Host);
+        let device_layers = tier_report(MemoryTier::Device);
+        Ok(DenseDiskStreamReport::new(
+            self.planned_layer_count,
+            self.planned_layer_bytes,
+            self.maximum_host_layer_bytes,
+            self.pinned_static_device_bytes,
+            self.transfer_stream_index,
             residency,
-            background: self
-                .background
+            self.background
                 .as_ref()
                 .map(BackgroundLayerPrefetch::report)
                 .transpose()?
                 .unwrap_or_default(),
-        })
+            host_layers,
+            device_layers,
+            groups,
+            pass.prefill,
+            pass.decode,
+        ))
     }
 }
 

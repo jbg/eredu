@@ -9,6 +9,8 @@
 pub mod backend;
 /// Backend-neutral mutable-cache ownership, storage, and admission algorithms.
 pub mod cache;
+/// Backend-neutral dense-stream residency telemetry.
+pub mod dense;
 /// Portable execution-group topology and scheduling state.
 pub mod execution;
 /// Backend-neutral causal-model and token-sampling contracts.
@@ -44,6 +46,10 @@ pub use cache::{
     PagedCacheOptions, PromptCachePersistenceError, PromptCachePublication,
     CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
     PROMPT_CACHE_CURRENT_FILE, PROMPT_CACHE_GENERATIONS_DIRECTORY,
+};
+pub use dense::{
+    DenseCacheMetrics, DenseDiskStreamReport, DenseExecutionGroupReport, DensePassCounterSnapshot,
+    DensePassReport, DenseTierResidencyReport,
 };
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupReadySet,
