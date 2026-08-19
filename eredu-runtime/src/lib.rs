@@ -83,8 +83,8 @@ pub use residency::{
     WeightBinding, WeightBindingSelectionError, WeightMaterializationReport,
 };
 pub use state::{
-    DeviceState, ModelStateIdentity, PagedStatePlan, RuntimeLayerState, RuntimeState, StateError,
-    StateLayout, StateResidencyPlan,
+    DeviceState, LayerRuntimeState, ModelStateIdentity, PagedStatePlan, RuntimeLayerState,
+    RuntimeState, StateError, StateLayout, StateResidencyPlan,
 };
 pub use weight_residency::{
     DenseDiskStreamLoadOptions, DenseTransferSchedule, DenseTransferScheduleError,

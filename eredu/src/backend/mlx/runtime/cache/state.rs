@@ -6,7 +6,8 @@ use eredu_core::cache::{
     LayerCachePolicy, PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
 };
 use eredu_runtime::{
-    CacheResidencyReport, RuntimeLayerState, RuntimeState, StateError, StateLayout,
+    CacheResidencyReport, LayerRuntimeState, RuntimeLayerState, RuntimeState, StateError,
+    StateLayout,
 };
 use safemlx::{error::Exception, Array, Stream};
 
@@ -212,31 +213,35 @@ impl MlxKeyValueState {
 }
 
 impl RuntimeState<MlxBackend> for MlxKeyValueState {
-    type LayerState = MlxKeyValueLayerState;
+    type RetainedValues<'a> = RetainedArrayIter<'a>;
 
     fn layout(&self) -> &StateLayout {
         &self.layout
     }
+
+    fn retained_values(
+        &self,
+        ordinal: usize,
+        _address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        self.layers
+            .get(ordinal)
+            .map(RuntimeLayerState::retained_values)
+            .ok_or(StateError::UnknownLayer {
+                layer: ordinal,
+                count: self.layers.len(),
+            })
+    }
+}
+
+impl LayerRuntimeState<MlxBackend> for MlxKeyValueState {
+    type LayerState = MlxKeyValueLayerState;
 
     fn layer(&mut self, layer: usize) -> Result<&mut Self::LayerState, StateError> {
         let count = self.layers.len();
         self.layers
             .get_mut(layer)
             .ok_or(StateError::UnknownLayer { layer, count })
-    }
-
-    fn retained_values(
-        &self,
-        layer: usize,
-    ) -> Result<<Self::LayerState as RuntimeLayerState<MlxBackend>>::RetainedValues<'_>, StateError>
-    {
-        self.layers
-            .get(layer)
-            .map(RuntimeLayerState::retained_values)
-            .ok_or(StateError::UnknownLayer {
-                layer,
-                count: self.layers.len(),
-            })
     }
 }
 

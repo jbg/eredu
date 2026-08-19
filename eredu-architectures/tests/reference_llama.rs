@@ -7,8 +7,8 @@ use eredu_nn::{
     RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_bindings, DeviceState, LayerwiseRuntime, ParameterBackend,
-    ResidentRuntime, ResidentUnitWindow, RuntimeLayerState, RuntimeState, SubmissionBackend,
+    bind_materialized_unit, materialize_bindings, DeviceState, LayerRuntimeState, LayerwiseRuntime,
+    ParameterBackend, ResidentRuntime, ResidentUnitWindow, RuntimeLayerState, SubmissionBackend,
     WeightBinding,
 };
 

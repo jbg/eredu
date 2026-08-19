@@ -21,8 +21,8 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_projection_group,
-    LayeredArchitecture, LayeredForwardState, MemberSharding, ModelStateIdentity,
-    ParallelPlanError, ParameterGroupSpec, ParameterRole, ProjectionSharding, RuntimeState,
+    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, MemberSharding,
+    ModelStateIdentity, ParallelPlanError, ParameterGroupSpec, ParameterRole, ProjectionSharding,
     StateLayout,
 };
 
@@ -1089,7 +1089,7 @@ impl<B: NeuralBackend> LayeredModel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
     where
-        S: RuntimeState<B>,
+        S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
         let expected = state_layout(&self.args)?;
@@ -1108,7 +1108,7 @@ impl<B: NeuralBackend> LayeredModel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
     where
-        S: RuntimeState<B>,
+        S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
         if state.layout() != expected {
@@ -1148,7 +1148,7 @@ impl<B: NeuralBackend> LayeredModel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        S: RuntimeState<B>,
+        S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
         let cache = state.layer(index).map_err(Error::backend)?;
@@ -1176,7 +1176,7 @@ impl<B: NeuralBackend> LayeredModel<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
-        S: RuntimeState<B>,
+        S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
         let cache = state.layer(index).map_err(Error::backend)?;
@@ -1209,7 +1209,7 @@ impl<B: NeuralBackend> LayeredModel<B> {
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
 where
     B: NeuralBackend,
-    S: RuntimeState<B>,
+    S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
     type Input<'a> = LayeredInput<'a, B::Tensor>;

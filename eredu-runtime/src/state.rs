@@ -127,20 +127,33 @@ pub trait RuntimeLayerState<B: NeuralBackend> {
 
 /// Mutable state realization consumed by generic resident and layerwise engines.
 pub trait RuntimeState<B: NeuralBackend> {
-    /// Concrete monomorphized state passed to one architecture unit.
-    type LayerState: RuntimeLayerState<B>;
+    /// Concrete iterator retaining native values for one execution unit.
+    type RetainedValues<'a>: Iterator<Item = &'a B::Tensor>
+    where
+        Self: 'a,
+        B::Tensor: 'a;
 
     /// Returns the exact layout used to create this realization.
     fn layout(&self) -> &StateLayout;
 
-    /// Mutably borrows one architecture-global layer state.
-    fn layer(&mut self, layer: usize) -> Result<&mut Self::LayerState, StateError>;
-
-    /// Borrows tensors retained by one layer without cloning their handles.
+    /// Borrows tensors retained by one execution unit without cloning handles.
+    ///
+    /// The flat ordinal addresses policy storage while `address` preserves
+    /// architecture-group semantics for composite and shared state.
     fn retained_values(
         &self,
-        layer: usize,
-    ) -> Result<<Self::LayerState as RuntimeLayerState<B>>::RetainedValues<'_>, StateError>;
+        ordinal: usize,
+        address: crate::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError>;
+}
+
+/// Optional capability for architectures with one indexed state per layer.
+pub trait LayerRuntimeState<B: NeuralBackend>: RuntimeState<B> {
+    /// Concrete monomorphized layer state used by the architecture.
+    type LayerState: RuntimeLayerState<B>;
+
+    /// Mutably borrows one architecture-global layer state.
+    fn layer(&mut self, layer: usize) -> Result<&mut Self::LayerState, StateError>;
 }
 
 /// Fully device-resident state with one concrete value per architecture layer.
@@ -176,30 +189,43 @@ where
     B: NeuralBackend,
     L: RuntimeLayerState<B>,
 {
-    type LayerState = L;
+    type RetainedValues<'a>
+        = L::RetainedValues<'a>
+    where
+        Self: 'a,
+        B::Tensor: 'a;
 
     fn layout(&self) -> &StateLayout {
         &self.layout
     }
+
+    fn retained_values(
+        &self,
+        ordinal: usize,
+        _address: crate::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        self.layers
+            .get(ordinal)
+            .map(RuntimeLayerState::retained_values)
+            .ok_or(StateError::UnknownLayer {
+                layer: ordinal,
+                count: self.layers.len(),
+            })
+    }
+}
+
+impl<B, L> LayerRuntimeState<B> for DeviceState<B, L>
+where
+    B: NeuralBackend,
+    L: RuntimeLayerState<B>,
+{
+    type LayerState = L;
 
     fn layer(&mut self, layer: usize) -> Result<&mut Self::LayerState, StateError> {
         let count = self.layers.len();
         self.layers
             .get_mut(layer)
             .ok_or(StateError::UnknownLayer { layer, count })
-    }
-
-    fn retained_values(
-        &self,
-        layer: usize,
-    ) -> Result<<Self::LayerState as RuntimeLayerState<B>>::RetainedValues<'_>, StateError> {
-        self.layers
-            .get(layer)
-            .map(RuntimeLayerState::retained_values)
-            .ok_or(StateError::UnknownLayer {
-                layer,
-                count: self.layers.len(),
-            })
     }
 }
 

@@ -612,7 +612,7 @@ where
                     hook(group, index, &mut forward_context)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let state_values = state
-                        .retained_values(ordinal)
+                        .retained_values(ordinal, address)
                         .map_err(LayerwiseRuntimeError::State)?;
                     let context_values =
                         self.architecture
@@ -811,7 +811,7 @@ where
                     hook(group, index, &mut forward_context)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let state_values = state
-                        .retained_values(ordinal)
+                        .retained_values(ordinal, address)
                         .map_err(LayerwiseRuntimeError::State)?;
                     let context_values =
                         self.architecture
@@ -1005,7 +1005,7 @@ where
                         .map_err(LayerwiseRuntimeError::Architecture)?
                         .unwrap_or(output);
                     let state_values = state
-                        .retained_values(ordinal)
+                        .retained_values(ordinal, address)
                         .map_err(LayerwiseRuntimeError::State)?;
                     let context_values =
                         self.architecture
