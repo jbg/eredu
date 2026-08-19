@@ -1,8 +1,9 @@
 # Completion events
 
-SafeMLX completion events represent one submission of selected lazy MLX graph
-outputs. They let applications observe that submission from the host or order a
-compatible consumer stream without draining unrelated work.
+The `safemlx` implementation crate exposes completion events for one submission
+of selected lazy MLX graph outputs. Eredu's MLX backend uses these events to
+observe a submission from the host or order a compatible consumer stream
+without draining unrelated work.
 
 ## Submission and observation
 

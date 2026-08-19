@@ -34,7 +34,7 @@ pub enum EventBackend {
 /// waits and completed queries return the retained MLX error; a stream wait
 /// poisons dependent work so its later synchronization reports the error.
 ///
-/// `Event` is intentionally neither `Send` nor `Sync`: SafeMLX does not yet
+/// `Event` is intentionally neither `Send` nor `Sync`: the MLX implementation does not yet
 /// expose an upstream MLX guarantee for moving C event handles between host
 /// threads. Streams created and used on one host thread remain the supported
 /// contract.

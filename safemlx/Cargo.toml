@@ -9,7 +9,7 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 documentation = "https://github.com/jbg/safemlx"
-description = "Unofficial Rust wrapper for the MLX machine learning library."
+description = "Low-level MLX execution layer used by the Eredu model runtime"
 readme = "README.md"
 
 [package.metadata.docs.rs]

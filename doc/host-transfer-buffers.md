@@ -62,6 +62,6 @@ let (restored, host) = host.copy_to_array(&stream)?.synchronize()?;
 # Ok::<(), safemlx::error::Exception>(())
 ```
 
-SafeMLX uses frozen buffers for host-resident model weights, expert-cache
-bindings, and sealed live-cache blocks. A residency report charges the buffer's
-physical capacity, not only its logical tensor length.
+Eredu's MLX backend uses frozen buffers for host-resident model weights,
+expert-cache bindings, and sealed live-cache blocks. A residency report charges
+the buffer's physical capacity, not only its logical tensor length.

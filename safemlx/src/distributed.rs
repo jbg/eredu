@@ -195,7 +195,7 @@ impl Group {
             .map_or_else(|| self.native_size(), |logical| logical.global_ranks.len())
     }
 
-    /// Return whether this group uses SafeMLX topology-routed membership.
+    /// Return whether this group uses Eredu topology-routed membership.
     pub fn is_logical(&self) -> bool {
         self.logical.is_some()
     }

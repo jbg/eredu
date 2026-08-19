@@ -1,4 +1,4 @@
-# eredu CLI example
+# Eredu CLI example
 
 This workspace crate is a script-friendly example application for
 `eredu`. It is not distributed as a standalone command-line product.

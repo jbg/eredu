@@ -1,12 +1,13 @@
 # Vendored MLX C
 
 This directory contains the MLX C API used by `safemlx-sys`. MLX C exposes the
-MLX array framework to C and provides the native boundary for the SafeMLX Rust
-bindings.
+MLX array framework to C and provides the native boundary for Eredu's MLX
+implementation.
 
-SafeMLX builds this copy through `safemlx-sys`; Rust applications should not
-configure it separately. Use [`safemlx`](../../../safemlx/) for the safe API or
-[`safemlx-sys`](../../) when direct binding-level access is required.
+Eredu builds this copy through `safemlx-sys`; Rust applications should not
+configure it separately. Use [`eredu`](../../../eredu/) for the model runtime,
+[`safemlx`](../../../safemlx/) for direct MLX operations, or
+[`safemlx-sys`](../../) when binding-level access is required.
 
 The source retains its component license, code of conduct, contribution guide,
 and acknowledgments. Public upstream API documentation is available from the

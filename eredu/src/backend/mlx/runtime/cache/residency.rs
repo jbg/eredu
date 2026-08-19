@@ -3627,7 +3627,7 @@ impl CacheBlockPrefetch {
 /// while lazy consumer graphs retain the arrays they reference. Asynchronous
 /// promotion failures poison the consumer stream and surface when that work is
 /// evaluated. The lease is intentionally neither `Send` nor `Sync` because it
-/// owns SafeMLX's thread-affine [`Event`].
+/// owns `safemlx`'s thread-affine [`Event`].
 pub(crate) struct CacheBlockLease {
     id: CacheBlockId,
     arrays: CacheBlockArrays,

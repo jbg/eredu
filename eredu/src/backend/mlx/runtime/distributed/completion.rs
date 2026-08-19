@@ -1,7 +1,7 @@
 //! Backend-independent completion ownership for distributed operations.
 //!
 //! Distributed MLX primitives are lazy just like ordinary array operations.
-//! This module couples a submitted result with the exact SafeMLX event which
+//! This module couples a submitted result with the exact `safemlx` event which
 //! completes it, so pipeline and collective callers do not need to duplicate
 //! `eval` plus whole-stream synchronization sequences.
 
@@ -24,7 +24,7 @@ use crate::backend::mlx::error::Error;
 /// through [`Self::is_complete`], [`Self::synchronize`], or
 /// [`Self::into_value`].
 ///
-/// This type is intentionally neither `Send` nor `Sync`, matching SafeMLX's
+/// This type is intentionally neither `Send` nor `Sync`, matching `safemlx`'s
 /// thread-affine [`Event`] contract.
 #[derive(Debug)]
 #[must_use = "distributed work has been submitted; retain, wait on, or synchronize its completion"]

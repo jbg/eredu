@@ -371,7 +371,7 @@ pub struct ImmutableHostTransferBuffer {
 
 // SAFETY: the wrapper never exposes mutable access to the allocation. Native
 // operations retain the underlying shared storage, and every FFI entry point
-// is serialized by SafeMLX's runtime lock. Const byte slices obey Rust's shared
+// is serialized by the MLX implementation's runtime lock. Const byte slices obey Rust's shared
 // reference rules for the lifetime of this immutable owner.
 unsafe impl Send for ImmutableHostTransferBuffer {}
 // SAFETY: see the `Send` implementation. All methods available through a

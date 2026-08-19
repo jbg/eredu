@@ -1,12 +1,12 @@
 # safemlx
 
-`safemlx` is a safe Rust interface to the MLX array framework. It provides
-arrays and operations, lazy graph evaluation, transforms, neural-network
-modules, optimizers, quantization helpers, checkpoint I/O, streams, and
-distributed collectives.
+`safemlx` is the low-level MLX implementation used by Eredu's default backend.
+It provides arrays and operations, lazy graph evaluation, transforms,
+neural-network modules, optimizers, quantization helpers, checkpoint I/O,
+streams, and distributed collectives.
 
-Use this crate when you want to build directly on MLX. For a model-oriented
-runtime, use [`eredu`](../eredu/).
+Most applications should use [`eredu`](../eredu/). Depend on this crate
+directly only when building MLX-specific operations or backend components.
 
 ## Features
 
@@ -62,10 +62,10 @@ setup](../doc/platforms.md).
 
 ## Platforms
 
-SafeMLX supports Apple silicon on macOS and selected Apple device targets,
-x86-64 Linux with CPU or CUDA, and native x86-64 Windows with CPU or CUDA.
-Backend prerequisites and application-bundling requirements are documented in
-[Platform setup](../doc/platforms.md).
+Eredu's MLX implementation supports Apple silicon on macOS and selected Apple
+device targets, x86-64 Linux with CPU or CUDA, and native x86-64 Windows with
+CPU or CUDA. Backend prerequisites and application-bundling requirements are
+documented in [Platform setup](../doc/platforms.md).
 
 The minimum supported Rust version is 1.89.
 

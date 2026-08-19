@@ -1,8 +1,8 @@
-# SafeMLX documentation
+# Eredu documentation
 
-This directory contains the user-facing technical documentation shared by the
-workspace crates. Start with the README for the crate you intend to use, then
-follow the relevant guide here.
+This directory contains Eredu's user-facing technical documentation. Most
+applications should start with the [`eredu` crate](../eredu/) and follow the
+relevant model, execution, or platform guide here.
 
 ## Models and applications
 
@@ -21,12 +21,19 @@ follow the relevant guide here.
 - [PersonaPlex quantization evaluation](personaplex-evaluation.md): the audio
   comparison and blinded-listening tools in `safemlx-codec`.
 
-## Core runtime
+## Runtime and backends
 
 - [Language-model backend architecture](backend-architecture.md): the neutral
   core contract, MLX adapter, ownership boundary, and future backend path.
 - [Platform setup](platforms.md): native prerequisites for Apple, Linux, CUDA,
   and Windows builds.
+
+## MLX implementation references
+
+These guides describe lower-level primitives used by Eredu's default backend.
+Applications normally encounter them only when integrating directly with MLX
+execution or implementing backend components.
+
 - [Completion events](completion-events.md): graph submission, host observation,
   and same-device stream dependencies.
 - [Asynchronous device timing](device-timing.md): execution-timeline timestamp

@@ -1,8 +1,9 @@
 # safemlx-codec
 
-`safemlx-codec` provides neural audio codec components built on `safemlx`.
-Codec support is separate from `eredu`, so applications that operate only
-on codec tokens do not need PCM encoding or decoding dependencies.
+`safemlx-codec` is the MLX neural-audio implementation used by Eredu's realtime
+speech models. Applications should normally access it through
+[`eredu`](../eredu/); direct use remains available for codec-only pipelines
+that do not need the model runtime.
 
 ## Mimi
 

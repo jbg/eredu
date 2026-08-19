@@ -11,7 +11,7 @@ get_filename_component(patch_name "${PATCH_FILE}" NAME)
 set(stamp_file ".safemlx-${patch_name}.stamp")
 
 # URL-backed FetchContent sources have no .git directory. When Cargo's build
-# directory is inside a SafeMLX checkout, a plain `git apply` walks up to the
+# directory is inside an Eredu checkout, a plain `git apply` walks up to the
 # parent repository and silently filters every MLX-relative path out. Bind the
 # work tree explicitly so archive and Git-backed sources behave identically.
 get_filename_component(patch_work_tree "." ABSOLUTE)

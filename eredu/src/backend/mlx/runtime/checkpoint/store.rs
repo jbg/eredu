@@ -2558,7 +2558,7 @@ impl PendingWeightMaterialization {
 /// consumers. Dropping an unfinished guard blocks only for this event, never
 /// for an entire stream. Asynchronous backend errors are returned by query or
 /// synchronization. The type is intentionally neither `Send` nor `Sync`
-/// because it owns SafeMLX's thread-affine [`Event`].
+/// because it owns `safemlx`'s thread-affine [`Event`].
 #[must_use = "checkpoint mappings remain retained until this completion is consumed or dropped"]
 pub struct WeightMaterialization {
     output: Array,

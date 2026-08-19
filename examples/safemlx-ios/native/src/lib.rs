@@ -1,4 +1,4 @@
-//! Small C ABI used by the SafeMLX iOS example.
+//! Small C ABI used by the Eredu iOS example.
 
 use std::{
     ffi::{c_char, c_void, CStr, CString},

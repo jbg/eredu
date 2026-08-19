@@ -15,11 +15,11 @@ option(BUILD_SHARED_LIBS "Build mlx C as a shared library" OFF)
 option(MLX_C_BUILD_EXAMPLES "Build examples for mlx C" ON)
 option(MLX_C_USE_SYSTEM_MLX "Use system MLX" OFF)
 option(MLX_C_BUILD_PATCH_TESTS
-       "Build opt-in tests carried by SafeMLX's vendored MLX patches" OFF)
+       "Build opt-in tests carried by Eredu's vendored MLX patches" OFF)
 
 if(MLX_C_BUILD_PATCH_TESTS AND MLX_C_USE_SYSTEM_MLX)
   message(FATAL_ERROR
-          "MLX_C_BUILD_PATCH_TESTS requires SafeMLX's vendored patched MLX")
+          "MLX_C_BUILD_PATCH_TESTS requires Eredu's vendored patched MLX")
 endif()
 
 # ----------------------------- mlx -----------------------------
@@ -114,7 +114,7 @@ if(MLX_C_BUILD_PATCH_TESTS)
       "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*"
     DEPENDS mlx-patch-test-binary
     USES_TERMINAL
-    COMMENT "Running tests carried by SafeMLX's vendored MLX patches")
+    COMMENT "Running tests carried by Eredu's vendored MLX patches")
 endif()
 
 # When MLX is a FetchContent dependency its own install rules are not included

@@ -1,8 +1,8 @@
-# SafeMLX iOS demo
+# Eredu iOS demo
 
 A minimal SwiftUI application that downloads MLX-format SafeTensors model
 repositories from Hugging Face, keeps them in an app-local cache, and streams
-SafeMLX generation to the screen.
+Eredu generation to the screen.
 
 The Xcode project is generated rather than committed. The application has one
 Swift package dependency:
@@ -52,9 +52,9 @@ and decode throughput in tokens per second.
 - `ModelStore` owns the Hugging Face cache index and the screen state.
 - `SafeMLXEngine` wraps a small C ABI exposed by the Rust `staticlib` crate.
 - Each loaded model lives on one dedicated Rust thread. Loading and generation
-  therefore preserve SafeMLX's thread-affine runtime state while Swift remains
+  therefore preserve MLX's thread-affine runtime state while Swift remains
   asynchronous.
-- The bridge uses checkpoint generation defaults, falling back to SafeMLX's
+- The bridge uses checkpoint generation defaults, falling back to Eredu's
   defaults and a 256-token limit when the checkpoint declares no limit.
 - Model weights are fully resident. This is the normal fast path for the small
   mobile models this demo targets.

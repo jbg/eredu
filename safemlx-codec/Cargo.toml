@@ -8,7 +8,7 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Neural audio codec components for safemlx"
+description = "MLX neural audio codec implementation for Eredu"
 
 [features]
 cuda = ["safemlx/cuda"]

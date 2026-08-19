@@ -1,28 +1,29 @@
 # Platform setup
 
-SafeMLX builds a native MLX C library through `safemlx-sys`. The first build
-can take longer because CMake configures and compiles the native dependency.
-The minimum supported Rust version is 1.89.
+Eredu's default MLX backend builds a native MLX C library through its
+`safemlx-sys` implementation crate. The first build can take longer because
+CMake configures and compiles the native dependency. The minimum supported
+Rust version is 1.89.
 
 ## macOS on Apple silicon
 
-The default `safemlx` features enable Accelerate and Metal. Install Xcode or the
-Xcode Command Line Tools and CMake, then build normally:
+The default `eredu` features enable the MLX backend with Accelerate and Metal.
+Install Xcode or the Xcode Command Line Tools and CMake, then build normally:
 
 ```sh
 xcode-select --install
 brew install cmake
-cargo build --release -p safemlx
+cargo build --release -p eredu
 ```
 
 The default desktop target is macOS 14 or newer. MLX uses unified memory: CPU,
 Metal shared, and GPU allocations compete for the same physical RAM even when
-SafeMLX reports separate logical residency tiers.
+Eredu reports separate logical residency tiers.
 
 ## Apple device targets
 
-SafeMLX can cross-build with Accelerate and Metal for Apple silicon devices and
-simulators:
+Eredu's MLX backend can cross-build with Accelerate and Metal for Apple silicon
+devices and simulators:
 
 | Platform | Device target | Apple silicon simulator | Minimum OS |
 | --- | --- | --- | --- |
@@ -34,7 +35,7 @@ Install the target and build on a macOS host with Xcode:
 
 ```sh
 rustup target add aarch64-apple-ios
-cargo build -p safemlx --release --target aarch64-apple-ios
+cargo build -p eredu --release --target aarch64-apple-ios
 ```
 
 Some Xcode installations provide the Metal toolchain as a separate component:
@@ -61,7 +62,7 @@ and BLAS, LAPACK, and LAPACKE development packages. On Ubuntu or Debian:
 sudo apt-get update
 sudo apt-get install git cmake build-essential \
   libblas-dev liblapack-dev liblapacke-dev
-cargo build --release -p safemlx --no-default-features
+cargo build --release -p eredu --no-default-features --features mlx
 ```
 
 ## Linux CUDA
@@ -72,7 +73,7 @@ Install the toolkit and cuDNN according to NVIDIA's packages for the host, then
 build:
 
 ```sh
-cargo build --release -p safemlx --no-default-features --features cuda
+cargo build --release -p eredu --no-default-features --features cuda
 ```
 
 MLX normally detects the local GPU architecture. On a build machine without an
@@ -81,7 +82,7 @@ CMake architecture list:
 
 ```sh
 SAFEMLX_CUDA_ARCHITECTURES=80 \
-  cargo build --release -p safemlx --no-default-features --features cuda
+  cargo build --release -p eredu --no-default-features --features cuda
 ```
 
 The build also honors `CMAKE_CUDA_COMPILER`, `CUDAToolkit_ROOT`,
@@ -93,7 +94,7 @@ NCCL is opt-in because it adds native link requirements. Enable `nccl` and use
 help:
 
 ```sh
-cargo build --release -p safemlx --no-default-features --features nccl
+cargo build --release -p eredu --no-default-features --features nccl
 ```
 
 ## Windows x86-64
@@ -116,12 +117,12 @@ $env:SAFEMLX_CUDA_ARCHITECTURES = "75"
 $env:CMAKE_GENERATOR = "Ninja"
 $env:PATH = "$env:CUDA_PATH\bin;C:\tools\cudnn\bin\x64;$env:PATH"
 
-cargo build --release -p safemlx --no-default-features --features cuda
+cargo build --release -p eredu --no-default-features --features cuda
 ```
 
-SafeMLX builds `mlx` and `mlxc` as DLLs and stages them, along with the fetched
-OpenBLAS DLL, next to Cargo binaries and examples. CUDA and cuDNN DLLs must
-remain discoverable through their configured directories or `PATH`.
+Eredu's MLX backend builds `mlx` and `mlxc` as DLLs and stages them, along with
+the fetched OpenBLAS DLL, next to Cargo binaries and examples. CUDA and cuDNN
+DLLs must remain discoverable through their configured directories or `PATH`.
 
 Common CUDA configuration failures:
 
@@ -148,11 +149,11 @@ forms are:
 
 ```toml
 # Apple defaults
-safemlx = "0.1.3"
+eredu = "0.4"
 
 # Linux or Windows CUDA
-safemlx = { version = "0.1.3", default-features = false, features = ["cuda"] }
+eredu = { version = "0.4", default-features = false, features = ["cuda"] }
 ```
 
-The `eredu-cli` example has its own `cuda` feature, which enables CUDA in
-both `safemlx` and `eredu`.
+The `eredu-cli` example has its own `cuda` feature, which enables CUDA in Eredu
+and its MLX implementation layer.

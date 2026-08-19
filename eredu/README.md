@@ -1,8 +1,9 @@
-# eredu
+# Eredu
 
-`eredu` loads and runs supported text, multimodal, and realtime speech
-models. It provides a backend-generic application API and an optional MLX
-implementation enabled by default.
+Eredu loads and runs supported text, multimodal, and realtime speech models.
+The `eredu` crate is its main application API, covering model inspection,
+loading, planning, chat preparation, generation, and telemetry. The default
+features include the MLX execution implementation.
 
 Use the [model support guide](../doc/model-support.md) to check supported model
 families, checkpoint formats, modalities, and execution capabilities.
