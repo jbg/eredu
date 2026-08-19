@@ -2795,6 +2795,124 @@ where
     Ok((transformed, report))
 }
 
+/// Builds a bounded packed overlay from native module trees and caller-owned
+/// semantic checkpoint bindings.
+///
+/// This is the checkpoint-layout-aware counterpart to
+/// [`quantize_parameterized_store`]. Architecture composition remains
+/// responsible for recipes such as reshapes, slices, and renamed tensors;
+/// the backend only selects packed matrix destinations and materializes the
+/// shared overlay.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantize_module_store_with_bindings<SM, U, SF, TF, SB, UB>(
+    store: SharedCheckpointSource,
+    source_static: &SM,
+    target_static: &SM,
+    mut source_unit: SF,
+    mut target_unit: TF,
+    unit_count: usize,
+    quantization: WeightQuantization,
+    stream: &Stream,
+    static_bindings: SB,
+    mut unit_bindings: UB,
+) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
+where
+    SM: ModuleParameters,
+    U: ModuleParameters,
+    SF: FnMut(usize, &Stream) -> Result<U, Error>,
+    TF: FnMut(usize, &Stream) -> Result<U, Error>,
+    SB: FnOnce(
+        &SM,
+        &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<WeightBinding>, Error>,
+    UB: FnMut(
+        usize,
+        &U,
+        &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<WeightBinding>, Error>,
+{
+    let mut recipes = BTreeMap::new();
+    let mut collect = |bindings: &[WeightBinding], selected: &BTreeMap<String, RecipeDtype>| {
+        for binding in bindings {
+            let recipe = binding.source_recipe();
+            let metadata = recipe.infer(store.as_ref())?;
+            if !matches!(
+                metadata.dtype(),
+                RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
+            ) || metadata.shape().len() < 2
+            {
+                continue;
+            }
+            let canonical =
+                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
+                    binding.name(),
+                );
+            let Some(companion_dtype) = selected.get(&canonical).cloned() else {
+                continue;
+            };
+            let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
+            match recipes.entry(target.to_string()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((recipe, companion_dtype));
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get() != &(recipe, companion_dtype) =>
+                {
+                    return Err(Error::Quantization(format!(
+                        "load-time quantization target {target:?} has conflicting semantic recipes"
+                    )));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+        Ok::<(), Error>(())
+    };
+
+    collect(
+        &static_bindings(source_static, store.as_ref())?,
+        &packed_weight_companion_dtypes(target_static),
+    )?;
+    for index in 0..unit_count {
+        let source = source_unit(index, stream)?;
+        let target = target_unit(index, stream)?;
+        collect(
+            &unit_bindings(index, &source, store.as_ref())?,
+            &packed_weight_companion_dtypes(&target),
+        )?;
+    }
+    if recipes.is_empty() {
+        return Err(Error::Quantization(
+            "native parameter topology declared no floating matrix bindings for load-time quantization"
+                .into(),
+        ));
+    }
+    let targets = recipes
+        .into_iter()
+        .map(|(target, (recipe, companion_dtype))| {
+            let target = BoundedQuantizationTarget::from_recipe(target, recipe)?;
+            match quantization {
+                WeightQuantization::Affine(_) => {
+                    target.with_affine_companion_dtype(companion_dtype)
+                }
+                WeightQuantization::MxFp4 => Ok(target),
+                WeightQuantization::GgufIQuant { .. } => unreachable!(
+                    "load-time materialization rejects checkpoint-native GGUF encodings"
+                ),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let working_set_bytes =
+        bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
+    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+        store,
+        BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
+        stream,
+    )?);
+    let report = transformed.report().clone();
+    let transformed: SharedCheckpointSource = transformed;
+    Ok((transformed, report))
+}
+
 /// Loads an adapter directly or through the shared bounded packed overlay.
 ///
 /// This is the authoritative standalone materialization route for both
