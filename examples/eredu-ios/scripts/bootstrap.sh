@@ -16,4 +16,4 @@ fi
 "$SCRIPT_DIR/build-native.sh"
 cd "$EXAMPLE_DIR"
 xcodegen generate
-echo "Generated $EXAMPLE_DIR/SafeMLXDemo.xcodeproj"
+echo "Generated $EXAMPLE_DIR/EreduDemo.xcodeproj"

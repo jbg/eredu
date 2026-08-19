@@ -1,4 +1,4 @@
-name: SafeMLXDemo
+name: EreduDemo
 options:
   bundleIdPrefix: com.example
   deploymentTarget:
@@ -12,7 +12,7 @@ packages:
     exactVersion: 0.9.0
 
 targets:
-  SafeMLXDemo:
+  EreduDemo:
     type: application
     platform: iOS
     sources:
@@ -20,7 +20,7 @@ targets:
     dependencies:
       - package: HuggingFace
     preBuildScripts:
-      - name: Build SafeMLX native library
+      - name: Build Eredu native library
         path: scripts/build-native.sh
         basedOnDependencyAnalysis: false
     postBuildScripts:
@@ -33,15 +33,15 @@ targets:
         basedOnDependencyAnalysis: false
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.SafeMLXDemo
-        PRODUCT_NAME: SafeMLXDemo
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.EreduDemo
+        PRODUCT_NAME: EreduDemo
         SWIFT_VERSION: "6.0"
-        SWIFT_OBJC_BRIDGING_HEADER: App/Support/SafeMLXIOS-Bridging-Header.h
+        SWIFT_OBJC_BRIDGING_HEADER: App/Support/EreduIOS-Bridging-Header.h
         HEADER_SEARCH_PATHS: "$(SRCROOT)/App/Support"
         LIBRARY_SEARCH_PATHS: "$(SRCROOT)/Build/native"
         OTHER_LDFLAGS:
           - "$(inherited)"
-          - "-lsafemlx_ios"
+          - "-leredu_ios"
           - "-lc++"
           - "-framework"
           - Accelerate
@@ -53,7 +53,7 @@ targets:
           - QuartzCore
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: SafeMLX
+        INFOPLIST_KEY_CFBundleDisplayName: Eredu
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         TARGETED_DEVICE_FAMILY: "1,2"

@@ -29,11 +29,11 @@ From this directory:
 
 ```sh
 ./scripts/bootstrap.sh
-open SafeMLXDemo.xcodeproj
+open EreduDemo.xcodeproj
 ```
 
 Select your development team and an attached iPhone, then run the
-`SafeMLXDemo` scheme. The generated project and native build products remain
+`EreduDemo` scheme. The generated project and native build products remain
 ignored by Git.
 
 The default repository is
@@ -50,7 +50,7 @@ and decode throughput in tokens per second.
 ## Architecture
 
 - `ModelStore` owns the Hugging Face cache index and the screen state.
-- `SafeMLXEngine` wraps a small C ABI exposed by the Rust `staticlib` crate.
+- `EreduEngine` wraps a small C ABI exposed by the Rust `staticlib` crate.
 - Each loaded model lives on one dedicated Rust thread. Loading and generation
   therefore preserve MLX's thread-affine runtime state while Swift remains
   asynchronous.

@@ -52,7 +52,7 @@ final class ModelStore: ObservableObject {
 
     private let cache: HubCache
     private let hub: HubClient
-    private var engine: SafeMLXEngine?
+    private var engine: EreduEngine?
     private var loadedSnapshotPath: String?
     private var loadedModelLoadSeconds: TimeInterval?
     private static let recordsKey = "cachedModels.v1"
@@ -159,7 +159,7 @@ final class ModelStore: ObservableObject {
             if engine == nil || loadedSnapshotPath != snapshotURL.path {
                 status = "Loading \(selectedModel.repoID)…"
                 let loadStartedAt = ProcessInfo.processInfo.systemUptime
-                engine = try await SafeMLXEngine.load(modelAt: snapshotURL)
+                engine = try await EreduEngine.load(modelAt: snapshotURL)
                 loadedModelLoadSeconds = ProcessInfo.processInfo.systemUptime - loadStartedAt
                 loadedSnapshotPath = snapshotURL.path
             }
@@ -182,7 +182,7 @@ final class ModelStore: ObservableObject {
 
     private static func finishedStatus(
         loadSeconds: TimeInterval?,
-        stats: SafeMLXGenerationStats
+        stats: EreduGenerationStats
     ) -> String {
         let load = loadSeconds.map { String(format: "%.2fs", $0) } ?? "—"
         let ttft = stats.generatedTokens > 0

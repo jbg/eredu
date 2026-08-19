@@ -906,6 +906,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eredu-ios"
+version = "0.1.0"
+dependencies = [
+ "eredu",
+ "safemlx",
+ "serde_json",
+]
+
+[[package]]
 name = "eredu-text"
 version = "0.1.4"
 dependencies = [
@@ -2740,15 +2749,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
-]
-
-[[package]]
-name = "safemlx-ios"
-version = "0.1.0"
-dependencies = [
- "eredu",
- "safemlx",
- "serde_json",
 ]
 
 [[package]]

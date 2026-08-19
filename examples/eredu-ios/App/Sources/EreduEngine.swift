@@ -1,6 +1,6 @@
 import Foundation
 
-enum SafeMLXEngineError: LocalizedError {
+enum EreduEngineError: LocalizedError {
     case native(String)
     case missingMetalLibrary
 
@@ -31,12 +31,12 @@ private func receiveText(
 }
 
 private func consumeNativeError(_ pointer: UnsafeMutablePointer<CChar>?) -> String {
-    guard let pointer else { return "unknown SafeMLX error" }
-    defer { safemlx_string_free(pointer) }
+    guard let pointer else { return "unknown Eredu error" }
+    defer { eredu_string_free(pointer) }
     return String(cString: pointer)
 }
 
-struct SafeMLXGenerationStats: Sendable {
+struct EreduGenerationStats: Sendable {
     let generatedTokens: UInt64
     let timeToFirstToken: TimeInterval
     let tokensPerSecond: Double
@@ -44,7 +44,7 @@ struct SafeMLXGenerationStats: Sendable {
 
 /// Swift owner for the opaque Rust worker. The worker keeps all MLX objects on
 /// one native thread even when Swift tasks resume on different executors.
-final class SafeMLXEngine: @unchecked Sendable {
+final class EreduEngine: @unchecked Sendable {
     private let handle: OpaquePointer
 
     private init(handle: OpaquePointer) {
@@ -52,31 +52,31 @@ final class SafeMLXEngine: @unchecked Sendable {
     }
 
     deinit {
-        safemlx_model_free(handle)
+        eredu_model_free(handle)
     }
 
-    static func load(modelAt modelURL: URL) async throws -> SafeMLXEngine {
+    static func load(modelAt modelURL: URL) async throws -> EreduEngine {
         guard let metallibURL = Bundle.main.url(forResource: "mlx", withExtension: "metallib") else {
-            throw SafeMLXEngineError.missingMetalLibrary
+            throw EreduEngineError.missingMetalLibrary
         }
         return try await Task.detached(priority: .userInitiated) {
             var nativeError: UnsafeMutablePointer<CChar>?
             let handle = modelURL.path.withCString { modelPath in
                 metallibURL.path.withCString { metallibPath in
-                    safemlx_model_create(modelPath, metallibPath, &nativeError)
+                    eredu_model_create(modelPath, metallibPath, &nativeError)
                 }
             }
             guard let handle else {
-                throw SafeMLXEngineError.native(consumeNativeError(nativeError))
+                throw EreduEngineError.native(consumeNativeError(nativeError))
             }
-            return SafeMLXEngine(handle: handle)
+            return EreduEngine(handle: handle)
         }.value
     }
 
     func generate(
         prompt: String,
         onText: @escaping @Sendable (String) -> Void
-    ) async throws -> SafeMLXGenerationStats {
+    ) async throws -> EreduGenerationStats {
         try await Task.detached(priority: .userInitiated) { [self] in
             let streamContext = Unmanaged.passRetained(StreamContext(receive: onText))
             defer { streamContext.release() }
@@ -85,7 +85,7 @@ final class SafeMLXEngine: @unchecked Sendable {
             var timeToFirstToken = 0.0
             var tokensPerSecond = 0.0
             let status = prompt.withCString { promptPointer in
-                safemlx_model_generate(
+                eredu_model_generate(
                     handle,
                     promptPointer,
                     receiveText,
@@ -97,9 +97,9 @@ final class SafeMLXEngine: @unchecked Sendable {
                 )
             }
             guard status == 0 else {
-                throw SafeMLXEngineError.native(consumeNativeError(nativeError))
+                throw EreduEngineError.native(consumeNativeError(nativeError))
             }
-            return SafeMLXGenerationStats(
+            return EreduGenerationStats(
                 generatedTokens: generatedTokens,
                 timeToFirstToken: timeToFirstToken,
                 tokensPerSecond: tokensPerSecond

@@ -11,7 +11,7 @@ members = [
     "eredu-text",
     "safemlx-codec",
     "eredu-cli",
-    "examples/safemlx-ios/native",
+    "examples/eredu-ios/native",
 ]
 resolver = "2"
 

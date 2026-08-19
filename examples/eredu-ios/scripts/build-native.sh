@@ -30,6 +30,6 @@ env -i \
     CARGO_TARGET_DIR="$CARGO_OUTPUT_DIR" \
     SAFEMLX_METALLIB_OUTPUT_DIR="$NATIVE_OUTPUT_DIR" \
     IPHONEOS_DEPLOYMENT_TARGET=17.0 \
-    cargo build --release --target aarch64-apple-ios -p safemlx-ios
-cp "$CARGO_OUTPUT_DIR/aarch64-apple-ios/release/libsafemlx_ios.a" \
-   "$NATIVE_OUTPUT_DIR/libsafemlx_ios.a"
+    cargo build --release --target aarch64-apple-ios -p eredu-ios
+cp "$CARGO_OUTPUT_DIR/aarch64-apple-ios/release/liberedu_ios.a" \
+   "$NATIVE_OUTPUT_DIR/liberedu_ios.a"

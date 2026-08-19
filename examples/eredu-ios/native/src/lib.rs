@@ -77,7 +77,7 @@ fn publish_error(out: *mut *mut c_char, message: String) {
     let sanitized = message.replace('\0', "�");
     let message = CString::new(sanitized).expect("NUL bytes were replaced");
     // SAFETY: `out` is caller-provided writable storage. Ownership of the
-    // allocation passes to the caller, which releases it with `safemlx_string_free`.
+    // allocation passes to the caller, which releases it with `eredu_string_free`.
     unsafe { *out = message.into_raw() };
 }
 
@@ -201,7 +201,7 @@ fn worker_main(
 ///
 /// Returns null and sets `error_out` on failure.
 #[no_mangle]
-pub extern "C" fn safemlx_model_create(
+pub extern "C" fn eredu_model_create(
     model_path: *const c_char,
     metallib_path: *const c_char,
     error_out: *mut *mut c_char,
@@ -216,7 +216,7 @@ pub extern "C" fn safemlx_model_create(
         let (commands, receiver) = mpsc::channel();
         let (ready_sender, ready_receiver) = mpsc::channel();
         let worker = thread::Builder::new()
-            .name("safemlx-model".into())
+            .name("eredu-model".into())
             .spawn(move || worker_main(model_path, metallib_path, receiver, ready_sender))
             .map_err(|error| error.to_string())?;
         match ready_receiver.recv() {
@@ -248,7 +248,7 @@ pub extern "C" fn safemlx_model_create(
 ///
 /// Returns zero on success and sets `error_out` on failure.
 #[no_mangle]
-pub extern "C" fn safemlx_model_generate(
+pub extern "C" fn eredu_model_generate(
     handle: *mut ModelHandle,
     prompt: *const c_char,
     callback: Option<TextCallback>,
@@ -321,11 +321,11 @@ pub extern "C" fn safemlx_model_generate(
 
 /// Stops the worker and releases a model handle.
 #[no_mangle]
-pub extern "C" fn safemlx_model_free(handle: *mut ModelHandle) {
+pub extern "C" fn eredu_model_free(handle: *mut ModelHandle) {
     if handle.is_null() {
         return;
     }
-    // SAFETY: ownership was created by `safemlx_model_create` and is returned once.
+    // SAFETY: ownership was created by `eredu_model_create` and is returned once.
     let mut handle = unsafe { Box::from_raw(handle) };
     let _ = handle.commands.send(Command::Shutdown);
     if let Some(worker) = handle.worker.take() {
@@ -335,7 +335,7 @@ pub extern "C" fn safemlx_model_free(handle: *mut ModelHandle) {
 
 /// Releases an error string returned by this library.
 #[no_mangle]
-pub extern "C" fn safemlx_string_free(value: *mut c_char) {
+pub extern "C" fn eredu_string_free(value: *mut c_char) {
     if !value.is_null() {
         // SAFETY: ownership was created with `CString::into_raw` by this library.
         drop(unsafe { CString::from_raw(value) });

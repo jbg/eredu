@@ -73,7 +73,7 @@ struct ContentView: View {
                         .textSelection(.enabled)
                 }
             }
-            .navigationTitle("SafeMLX")
+            .navigationTitle("Eredu")
         }
     }
 }
