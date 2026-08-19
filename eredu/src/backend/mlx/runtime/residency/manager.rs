@@ -59,13 +59,13 @@ impl WeightBindingExt for WeightBinding {
     ) -> Result<Self, ResidencyError> {
         let binding_name = self.name().to_owned();
         let recipe = self.source_recipe();
-        let recipe =
-            recipe
-                .select_bounded(store, selection)
-                .map_err(|source| ResidencyError::Recipe {
-                    binding: binding_name.clone(),
-                    source,
-                })?;
+        let recipe = recipe
+            .select_bounded(store, selection)
+            .map_err(WeightRecipeError::from)
+            .map_err(|source| ResidencyError::Recipe {
+                binding: binding_name.clone(),
+                source,
+            })?;
         let metadata = recipe
             .infer(store)
             .map_err(WeightRecipeError::from)

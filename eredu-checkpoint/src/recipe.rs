@@ -173,6 +173,130 @@ impl DerivedWeightRecipe {
         }
     }
 
+    /// Rewrites an output selection toward physically bounded sources.
+    pub fn select_bounded<C: RecipeCatalog + ?Sized>(
+        &self,
+        catalog: &C,
+        selection: TensorSelection,
+    ) -> Result<Self, RecipeError> {
+        let metadata = self.infer(catalog)?;
+        let selection = normalize_selection(selection, &metadata.shape)?;
+        let expected_shape = selected_shape(metadata.shape.clone(), &selection)?;
+        let expanded = expand_indexed_sources(self.clone());
+        let rewritten = normalize_bounded_source_ranges(
+            expand_indexed_sources(push_selection(&expanded, catalog, selection)?),
+            catalog,
+        )?;
+        let actual = rewritten.infer(catalog)?;
+        if actual.shape != expected_shape || actual.dtype != metadata.dtype {
+            return Err(RecipeError::SelectionPushdownUnsupported {
+                operation: "recipe",
+                reason: format!(
+                    "rewrite produced shape {:?} and dtype {:?}, expected {:?} and {:?}",
+                    actual.shape, actual.dtype, expected_shape, metadata.dtype
+                ),
+            });
+        }
+        Ok(rewritten)
+    }
+
+    /// Selects rows from one matrix while retaining leading singleton axes.
+    pub fn select_bounded_matrix_rows<C: RecipeCatalog + ?Sized>(
+        &self,
+        catalog: &C,
+        leading_index: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Self, RecipeError> {
+        let metadata = self.infer(catalog)?;
+        if metadata.shape.len() < 2 {
+            return Err(RecipeError::SelectionPushdownUnsupported {
+                operation: "matrix row selection",
+                reason: format!("rank {} has no matrix row axis", metadata.shape.len()),
+            });
+        }
+        let row_axis = metadata.shape.len() - 2;
+        let leading = usize::try_from(element_count(
+            &metadata.shape[..row_axis],
+            "leading matrix dimensions",
+        )?)
+        .map_err(|_| RecipeError::ArithmeticOverflow("leading matrix dimensions"))?;
+        if leading_index >= leading {
+            return Err(RecipeError::InvalidIndices {
+                axis: 0,
+                dimension: leading,
+            });
+        }
+        let mut coordinates = vec![0usize; row_axis];
+        let mut remainder = leading_index;
+        for axis in (0..row_axis).rev() {
+            let dimension = metadata.shape[axis];
+            coordinates[axis] = remainder % dimension;
+            remainder /= dimension;
+        }
+        let mut selected = self.clone();
+        for (axis, coordinate) in coordinates.into_iter().enumerate() {
+            selected = selected.select_bounded(
+                catalog,
+                TensorSelection::Range {
+                    axis,
+                    start: coordinate,
+                    end: coordinate + 1,
+                },
+            )?;
+        }
+        selected.select_bounded(
+            catalog,
+            TensorSelection::Range {
+                axis: row_axis,
+                start,
+                end,
+            },
+        )
+    }
+
+    /// Returns a conservative bound for simultaneously live recipe values.
+    pub fn peak_materialization_bytes<C: RecipeCatalog + ?Sized>(
+        &self,
+        catalog: &C,
+    ) -> Result<u64, RecipeError> {
+        let output_bytes = self.infer(catalog)?.byte_len();
+        match self {
+            Self::Source { .. } => Ok(output_bytes),
+            Self::Select { input, .. }
+            | Self::Reshape { input, .. }
+            | Self::Transpose { input, .. }
+            | Self::Cast { input, .. }
+            | Self::View { input, .. }
+            | Self::NegLog { input }
+            | Self::SubtractOne { input } => {
+                let input_bytes = input.infer(catalog)?.byte_len();
+                let child_peak = input.peak_materialization_bytes(catalog)?;
+                Ok(child_peak.max(input_bytes.checked_add(output_bytes).ok_or(
+                    RecipeError::ArithmeticOverflow("unary recipe peak materialization bytes"),
+                )?))
+            }
+            Self::Concatenate { inputs, .. } | Self::Stack { inputs, .. } => {
+                let mut retained = 0u64;
+                let mut peak = 0u64;
+                for input in inputs {
+                    let child_peak = input.peak_materialization_bytes(catalog)?;
+                    peak = peak.max(retained.checked_add(child_peak).ok_or(
+                        RecipeError::ArithmeticOverflow("joined recipe child peak bytes"),
+                    )?);
+                    retained = retained
+                        .checked_add(input.infer(catalog)?.byte_len())
+                        .ok_or(RecipeError::ArithmeticOverflow(
+                            "joined recipe retained input bytes",
+                        ))?;
+                }
+                Ok(peak.max(retained.checked_add(output_bytes).ok_or(
+                    RecipeError::ArithmeticOverflow("joined recipe output peak bytes"),
+                )?))
+            }
+        }
+    }
+
     /// Returns every source checkpoint key in deterministic order.
     pub fn source_keys(&self) -> Vec<&str> {
         let mut keys = BTreeSet::new();
@@ -328,6 +452,766 @@ fn selected_shape(
     Ok(shape)
 }
 
+fn expand_indexed_sources(recipe: DerivedWeightRecipe) -> DerivedWeightRecipe {
+    match recipe {
+        DerivedWeightRecipe::Source {
+            key,
+            selection: TensorSelection::Indices { axis, indices },
+        } => {
+            let mut runs = Vec::<(usize, usize)>::new();
+            for index in indices {
+                if let Some((_, end)) = runs.last_mut() {
+                    if *end == index {
+                        *end += 1;
+                        continue;
+                    }
+                }
+                runs.push((index, index + 1));
+            }
+            let mut inputs = runs
+                .into_iter()
+                .map(|(start, end)| {
+                    DerivedWeightRecipe::source(
+                        key.clone(),
+                        TensorSelection::Range { axis, start, end },
+                    )
+                })
+                .collect::<Vec<_>>();
+            if inputs.len() == 1 {
+                inputs.pop().unwrap()
+            } else {
+                DerivedWeightRecipe::Concatenate { axis, inputs }
+            }
+        }
+        DerivedWeightRecipe::Source { .. } => recipe,
+        DerivedWeightRecipe::Select { input, selection } => DerivedWeightRecipe::Select {
+            input: Box::new(expand_indexed_sources(*input)),
+            selection,
+        },
+        DerivedWeightRecipe::Concatenate { axis, inputs } => DerivedWeightRecipe::Concatenate {
+            axis,
+            inputs: inputs.into_iter().map(expand_indexed_sources).collect(),
+        },
+        DerivedWeightRecipe::Stack { axis, inputs } => DerivedWeightRecipe::Stack {
+            axis,
+            inputs: inputs.into_iter().map(expand_indexed_sources).collect(),
+        },
+        DerivedWeightRecipe::Reshape { input, shape } => DerivedWeightRecipe::Reshape {
+            input: Box::new(expand_indexed_sources(*input)),
+            shape,
+        },
+        DerivedWeightRecipe::Transpose { input, axes } => DerivedWeightRecipe::Transpose {
+            input: Box::new(expand_indexed_sources(*input)),
+            axes,
+        },
+        DerivedWeightRecipe::Cast { input, dtype } => DerivedWeightRecipe::Cast {
+            input: Box::new(expand_indexed_sources(*input)),
+            dtype,
+        },
+        DerivedWeightRecipe::View {
+            input,
+            dtype,
+            shape,
+        } => DerivedWeightRecipe::View {
+            input: Box::new(expand_indexed_sources(*input)),
+            dtype,
+            shape,
+        },
+        DerivedWeightRecipe::NegLog { input } => DerivedWeightRecipe::NegLog {
+            input: Box::new(expand_indexed_sources(*input)),
+        },
+        DerivedWeightRecipe::SubtractOne { input } => DerivedWeightRecipe::SubtractOne {
+            input: Box::new(expand_indexed_sources(*input)),
+        },
+    }
+}
+
+fn normalize_bounded_source_ranges<C: RecipeCatalog + ?Sized>(
+    recipe: DerivedWeightRecipe,
+    store: &C,
+) -> Result<DerivedWeightRecipe, RecipeError> {
+    Ok(match recipe {
+        DerivedWeightRecipe::Source {
+            key,
+            selection: TensorSelection::Range { axis, start, end },
+        } if axis > 0 => {
+            let shape = store.tensor_metadata(&key)?.logical_shape;
+            if shape[..axis].iter().product::<usize>() == 1 {
+                let trailing = shape[axis + 1..]
+                    .iter()
+                    .try_fold(1usize, |count, dimension| {
+                        count
+                            .checked_mul(*dimension)
+                            .ok_or(RecipeError::ArithmeticOverflow(
+                                "bounded source range trailing span",
+                            ))
+                    })?;
+                let offset_elements =
+                    start
+                        .checked_mul(trailing)
+                        .ok_or(RecipeError::ArithmeticOverflow(
+                            "bounded source range offset",
+                        ))?;
+                let mut selected_shape = shape;
+                selected_shape[axis] = end - start;
+                DerivedWeightRecipe::source(
+                    key,
+                    TensorSelection::Contiguous {
+                        offset_elements,
+                        shape: selected_shape,
+                    },
+                )
+            } else {
+                DerivedWeightRecipe::source(key, TensorSelection::Range { axis, start, end })
+            }
+        }
+        DerivedWeightRecipe::Source { .. } => recipe,
+        DerivedWeightRecipe::Select { input, selection } => DerivedWeightRecipe::Select {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+            selection,
+        },
+        DerivedWeightRecipe::Concatenate { axis, inputs } => DerivedWeightRecipe::Concatenate {
+            axis,
+            inputs: inputs
+                .into_iter()
+                .map(|input| normalize_bounded_source_ranges(input, store))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        DerivedWeightRecipe::Stack { axis, inputs } => DerivedWeightRecipe::Stack {
+            axis,
+            inputs: inputs
+                .into_iter()
+                .map(|input| normalize_bounded_source_ranges(input, store))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        DerivedWeightRecipe::Reshape { input, shape } => DerivedWeightRecipe::Reshape {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+            shape,
+        },
+        DerivedWeightRecipe::Transpose { input, axes } => DerivedWeightRecipe::Transpose {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+            axes,
+        },
+        DerivedWeightRecipe::Cast { input, dtype } => DerivedWeightRecipe::Cast {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+            dtype,
+        },
+        DerivedWeightRecipe::View {
+            input,
+            dtype,
+            shape,
+        } => DerivedWeightRecipe::View {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+            dtype,
+            shape,
+        },
+        DerivedWeightRecipe::NegLog { input } => DerivedWeightRecipe::NegLog {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+        },
+        DerivedWeightRecipe::SubtractOne { input } => DerivedWeightRecipe::SubtractOne {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+        },
+    })
+}
+
+fn push_selection<C: RecipeCatalog + ?Sized>(
+    recipe: &DerivedWeightRecipe,
+    store: &C,
+    selection: TensorSelection,
+) -> Result<DerivedWeightRecipe, RecipeError> {
+    if matches!(selection, TensorSelection::Full) {
+        return Ok(recipe.clone());
+    }
+    match recipe {
+        DerivedWeightRecipe::Source {
+            key,
+            selection: source_selection,
+        } => {
+            let source_shape = store.tensor_metadata(key)?.logical_shape;
+            let source_selection = normalize_selection(source_selection.clone(), &source_shape)?;
+            let selected_source_shape = selected_shape(source_shape.clone(), &source_selection)?;
+            let selection = normalize_selection(selection, &selected_source_shape)?;
+            if matches!(selection, TensorSelection::Full) {
+                return Ok(DerivedWeightRecipe::source(key.clone(), source_selection));
+            }
+            if matches!(source_selection, TensorSelection::Full) {
+                return Ok(DerivedWeightRecipe::source(key.clone(), selection));
+            }
+            if let Some(selection) = select_from_contiguous_span(&source_selection, &selection)? {
+                return Ok(DerivedWeightRecipe::source(key.clone(), selection));
+            }
+            if selection_axis(&source_selection) == selection_axis(&selection) {
+                return Ok(DerivedWeightRecipe::source(
+                    key.clone(),
+                    compose_same_axis_selection(&source_selection, &selection)?,
+                ));
+            }
+            if let Some(contiguous) =
+                combine_independent_ranges(&source_shape, &source_selection, &selection)?
+            {
+                return Ok(DerivedWeightRecipe::source(key.clone(), contiguous));
+            }
+            Ok(DerivedWeightRecipe::Select {
+                input: Box::new(DerivedWeightRecipe::source(key.clone(), source_selection)),
+                selection,
+            })
+        }
+        DerivedWeightRecipe::Select {
+            input,
+            selection: existing,
+        } => {
+            if matches!(existing, TensorSelection::Full) {
+                return push_selection(input, store, selection);
+            }
+            if selection_axis(existing) == selection_axis(&selection) {
+                return push_selection(
+                    input,
+                    store,
+                    compose_same_axis_selection(existing, &selection)?,
+                );
+            }
+            // Independent axis selections commute. Push the newest selection
+            // toward the source first so a dynamic row tile can combine with
+            // an expert range into one contiguous checkpoint span before the
+            // pre-existing TP column selection is reapplied.
+            let selected_input = push_selection(input, store, selection)?;
+            push_selection(&selected_input, store, existing.clone())
+        }
+        DerivedWeightRecipe::Concatenate { axis, inputs } => {
+            push_concatenate_selection(*axis, inputs, store, selection)
+        }
+        DerivedWeightRecipe::Stack { axis, inputs } => {
+            push_stack_selection(*axis, inputs, store, selection)
+        }
+        DerivedWeightRecipe::Reshape { input, shape } => {
+            let input_metadata = input.infer(store)?;
+            let output_metadata = recipe.infer(store)?;
+            let input_selection = map_reinterpret_selection(
+                &input_metadata,
+                &output_metadata,
+                &selection,
+                "reshape",
+            )?;
+            Ok(DerivedWeightRecipe::Reshape {
+                input: Box::new(push_selection(input, store, input_selection)?),
+                shape: selected_shape(shape.clone(), &selection)?,
+            })
+        }
+        DerivedWeightRecipe::Transpose { input, axes } => {
+            let output_axis = selection_axis(&selection).expect("non-full selection");
+            let input_axis = *axes
+                .get(output_axis)
+                .ok_or(RecipeError::InvalidSelectionAxis {
+                    axis: output_axis,
+                    rank: axes.len(),
+                })?;
+            Ok(DerivedWeightRecipe::Transpose {
+                input: Box::new(push_selection(
+                    input,
+                    store,
+                    selection_with_axis(selection, input_axis),
+                )?),
+                axes: axes.clone(),
+            })
+        }
+        DerivedWeightRecipe::Cast { input, dtype } => Ok(DerivedWeightRecipe::Cast {
+            input: Box::new(push_selection(input, store, selection)?),
+            dtype: dtype.clone(),
+        }),
+        DerivedWeightRecipe::View {
+            input,
+            dtype,
+            shape,
+        } => {
+            let input_metadata = input.infer(store)?;
+            let output_metadata = recipe.infer(store)?;
+            let input_selection =
+                map_reinterpret_selection(&input_metadata, &output_metadata, &selection, "view")?;
+            Ok(DerivedWeightRecipe::View {
+                input: Box::new(push_selection(input, store, input_selection)?),
+                dtype: dtype.clone(),
+                shape: selected_shape(shape.clone(), &selection)?,
+            })
+        }
+        DerivedWeightRecipe::NegLog { input } => Ok(DerivedWeightRecipe::NegLog {
+            input: Box::new(push_selection(input, store, selection)?),
+        }),
+        DerivedWeightRecipe::SubtractOne { input } => Ok(DerivedWeightRecipe::SubtractOne {
+            input: Box::new(push_selection(input, store, selection)?),
+        }),
+    }
+}
+
+fn push_concatenate_selection<C: RecipeCatalog + ?Sized>(
+    axis: usize,
+    inputs: &[DerivedWeightRecipe],
+    store: &C,
+    selection: TensorSelection,
+) -> Result<DerivedWeightRecipe, RecipeError> {
+    let selected_axis = selection_axis(&selection).expect("non-full selection");
+    if selected_axis != axis {
+        let inputs = inputs
+            .iter()
+            .map(|input| push_selection(input, store, selection.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(DerivedWeightRecipe::Concatenate { axis, inputs });
+    }
+    let metadata = inputs
+        .iter()
+        .map(|input| input.infer(store))
+        .collect::<Result<Vec<_>, _>>()?;
+    let dimensions = metadata
+        .iter()
+        .map(|item| item.shape[axis])
+        .collect::<Vec<_>>();
+    let mut rewritten = Vec::new();
+    match selection {
+        TensorSelection::Range { start, end, .. } => {
+            let mut offset = 0usize;
+            for (input, dimension) in inputs.iter().zip(dimensions) {
+                let child_end =
+                    offset
+                        .checked_add(dimension)
+                        .ok_or(RecipeError::ArithmeticOverflow(
+                            "concatenate selection offset",
+                        ))?;
+                let overlap_start = start.max(offset);
+                let overlap_end = end.min(child_end);
+                if overlap_start < overlap_end {
+                    let child_selection = normalize_selection(
+                        TensorSelection::Range {
+                            axis,
+                            start: overlap_start - offset,
+                            end: overlap_end - offset,
+                        },
+                        &input.infer(store)?.shape,
+                    )?;
+                    rewritten.push(push_selection(input, store, child_selection)?);
+                }
+                offset = child_end;
+            }
+        }
+        TensorSelection::Indices { indices, .. } => {
+            let mut offsets = Vec::with_capacity(dimensions.len() + 1);
+            offsets.push(0usize);
+            for dimension in dimensions {
+                let next = offsets
+                    .last()
+                    .copied()
+                    .unwrap()
+                    .checked_add(dimension)
+                    .ok_or(RecipeError::ArithmeticOverflow(
+                        "concatenate selection offset",
+                    ))?;
+                offsets.push(next);
+            }
+            let mut runs = Vec::<(usize, Vec<usize>)>::new();
+            for index in indices {
+                let child = offsets
+                    .windows(2)
+                    .position(|bounds| index >= bounds[0] && index < bounds[1])
+                    .ok_or(RecipeError::InvalidIndices {
+                        axis,
+                        dimension: *offsets.last().unwrap(),
+                    })?;
+                let local = index - offsets[child];
+                if let Some((last_child, local_indices)) = runs.last_mut() {
+                    if *last_child == child {
+                        local_indices.push(local);
+                        continue;
+                    }
+                }
+                runs.push((child, vec![local]));
+            }
+            for (child, indices) in runs {
+                rewritten.push(push_selection(
+                    &inputs[child],
+                    store,
+                    TensorSelection::Indices { axis, indices },
+                )?);
+            }
+        }
+        TensorSelection::Full => unreachable!(),
+        TensorSelection::Contiguous { .. } => {
+            return Err(RecipeError::SelectionPushdownUnsupported {
+                operation: "concatenate",
+                reason: "a storage-contiguous span has no concatenate-axis semantics".into(),
+            })
+        }
+    }
+    match rewritten.len() {
+        0 => Err(RecipeError::SelectionPushdownUnsupported {
+            operation: "concatenate",
+            reason: "selection did not intersect any child".into(),
+        }),
+        1 => Ok(rewritten.pop().unwrap()),
+        _ => Ok(DerivedWeightRecipe::Concatenate {
+            axis,
+            inputs: rewritten,
+        }),
+    }
+}
+
+fn push_stack_selection<C: RecipeCatalog + ?Sized>(
+    axis: usize,
+    inputs: &[DerivedWeightRecipe],
+    store: &C,
+    selection: TensorSelection,
+) -> Result<DerivedWeightRecipe, RecipeError> {
+    let selected_axis = selection_axis(&selection).expect("non-full selection");
+    if selected_axis == axis {
+        let selected = match selection {
+            TensorSelection::Range { start, end, .. } => inputs[start..end].to_vec(),
+            TensorSelection::Indices { indices, .. } => indices
+                .into_iter()
+                .map(|index| inputs[index].clone())
+                .collect(),
+            TensorSelection::Full => unreachable!(),
+            TensorSelection::Contiguous { .. } => {
+                return Err(RecipeError::SelectionPushdownUnsupported {
+                    operation: "stack",
+                    reason: "a storage-contiguous span has no stack-axis semantics".into(),
+                })
+            }
+        };
+        return Ok(DerivedWeightRecipe::Stack {
+            axis,
+            inputs: selected,
+        });
+    }
+    let input_axis = if selected_axis < axis {
+        selected_axis
+    } else {
+        selected_axis - 1
+    };
+    let input_selection = selection_with_axis(selection, input_axis);
+    let inputs = inputs
+        .iter()
+        .map(|input| push_selection(input, store, input_selection.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DerivedWeightRecipe::Stack { axis, inputs })
+}
+
+fn map_reinterpret_selection(
+    input: &RecipeMetadata,
+    output: &RecipeMetadata,
+    selection: &TensorSelection,
+    operation: &'static str,
+) -> Result<TensorSelection, RecipeError> {
+    let output_axis = selection_axis(selection).expect("non-full selection");
+    let output_unit = axis_unit_bytes(&output.shape, output.dtype.bit_width()?, output_axis)?;
+    let output_cycle = output_unit
+        .checked_mul(output.shape[output_axis] as u64)
+        .ok_or(RecipeError::ArithmeticOverflow("selection output cycle"))?;
+    for input_axis in 0..input.shape.len() {
+        let input_unit = axis_unit_bytes(&input.shape, input.dtype.bit_width()?, input_axis)?;
+        let input_cycle = input_unit
+            .checked_mul(input.shape[input_axis] as u64)
+            .ok_or(RecipeError::ArithmeticOverflow("selection input cycle"))?;
+        if input_cycle != output_cycle {
+            continue;
+        }
+        if let Some(mapped) = map_selection_units(
+            selection,
+            input_axis,
+            input.shape[input_axis],
+            output_unit,
+            input_unit,
+        )? {
+            return normalize_selection(mapped, &input.shape);
+        }
+    }
+    Err(RecipeError::SelectionPushdownUnsupported {
+        operation,
+        reason: format!(
+            "axis {output_axis} selection cannot be expressed as a single-axis bounded selection from shape {:?} to {:?}",
+            input.shape, output.shape
+        ),
+    })
+}
+
+fn map_selection_units(
+    selection: &TensorSelection,
+    input_axis: usize,
+    input_dimension: usize,
+    output_unit: u64,
+    input_unit: u64,
+) -> Result<Option<TensorSelection>, RecipeError> {
+    let map_interval = |start: usize, end: usize| -> Result<Option<(usize, usize)>, RecipeError> {
+        let start_bytes = (start as u64)
+            .checked_mul(output_unit)
+            .ok_or(RecipeError::ArithmeticOverflow("selection interval start"))?;
+        let end_bytes = (end as u64)
+            .checked_mul(output_unit)
+            .ok_or(RecipeError::ArithmeticOverflow("selection interval end"))?;
+        if start_bytes % input_unit != 0 || end_bytes % input_unit != 0 {
+            return Ok(None);
+        }
+        let start = usize::try_from(start_bytes / input_unit)
+            .map_err(|_| RecipeError::ArithmeticOverflow("mapped selection start"))?;
+        let end = usize::try_from(end_bytes / input_unit)
+            .map_err(|_| RecipeError::ArithmeticOverflow("mapped selection end"))?;
+        Ok((end <= input_dimension).then_some((start, end)))
+    };
+    match selection {
+        TensorSelection::Range { start, end, .. } => Ok(map_interval(*start, *end)?.map(
+            |(start, end)| TensorSelection::Range {
+                axis: input_axis,
+                start,
+                end,
+            },
+        )),
+        TensorSelection::Indices { indices, .. } => {
+            let mut mapped = Vec::new();
+            let mut run_start = indices[0];
+            let mut run_end = run_start + 1;
+            for index in indices.iter().copied().skip(1) {
+                if index == run_end {
+                    run_end += 1;
+                    continue;
+                }
+                let Some((start, end)) = map_interval(run_start, run_end)? else {
+                    return Ok(None);
+                };
+                mapped.extend(start..end);
+                run_start = index;
+                run_end = index + 1;
+            }
+            let Some((start, end)) = map_interval(run_start, run_end)? else {
+                return Ok(None);
+            };
+            mapped.extend(start..end);
+            Ok(Some(TensorSelection::Indices {
+                axis: input_axis,
+                indices: mapped,
+            }))
+        }
+        TensorSelection::Full => Ok(Some(TensorSelection::Full)),
+        TensorSelection::Contiguous { .. } => Ok(None),
+    }
+}
+
+fn axis_unit_bytes(shape: &[usize], dtype_width: u64, axis: usize) -> Result<u64, RecipeError> {
+    shape[axis + 1..]
+        .iter()
+        .try_fold(dtype_width, |bytes, dimension| {
+            bytes
+                .checked_mul(*dimension as u64)
+                .ok_or(RecipeError::ArithmeticOverflow("selection axis unit"))
+        })
+}
+
+fn selection_axis(selection: &TensorSelection) -> Option<usize> {
+    match selection {
+        TensorSelection::Full => None,
+        TensorSelection::Range { axis, .. } | TensorSelection::Indices { axis, .. } => Some(*axis),
+        TensorSelection::Contiguous { .. } => None,
+    }
+}
+
+fn selection_with_axis(selection: TensorSelection, axis: usize) -> TensorSelection {
+    match selection {
+        TensorSelection::Full => TensorSelection::Full,
+        TensorSelection::Range { start, end, .. } => TensorSelection::Range { axis, start, end },
+        TensorSelection::Indices { indices, .. } => TensorSelection::Indices { axis, indices },
+        selection @ TensorSelection::Contiguous { .. } => selection,
+    }
+}
+
+fn normalize_selection(
+    selection: TensorSelection,
+    shape: &[usize],
+) -> Result<TensorSelection, RecipeError> {
+    selected_shape(shape.to_vec(), &selection)?;
+    match selection {
+        TensorSelection::Range {
+            axis,
+            start: 0,
+            end,
+        } if end == shape[axis] => Ok(TensorSelection::Full),
+        TensorSelection::Indices { axis, indices }
+            if indices.windows(2).all(|pair| pair[1] == pair[0] + 1) =>
+        {
+            let start = indices[0];
+            let end = indices[indices.len() - 1] + 1;
+            if start == 0 && end == shape[axis] {
+                Ok(TensorSelection::Full)
+            } else {
+                Ok(TensorSelection::Range { axis, start, end })
+            }
+        }
+        selection => Ok(selection),
+    }
+}
+
+fn compose_same_axis_selection(
+    existing: &TensorSelection,
+    requested: &TensorSelection,
+) -> Result<TensorSelection, RecipeError> {
+    debug_assert_eq!(selection_axis(existing), selection_axis(requested));
+    let axis = selection_axis(existing).expect("non-full selections");
+    match (existing, requested) {
+        (
+            TensorSelection::Range { start, .. },
+            TensorSelection::Range {
+                start: requested_start,
+                end: requested_end,
+                ..
+            },
+        ) => Ok(TensorSelection::Range {
+            axis,
+            start: start + requested_start,
+            end: start + requested_end,
+        }),
+        (TensorSelection::Range { start, .. }, TensorSelection::Indices { indices, .. }) => {
+            Ok(TensorSelection::Indices {
+                axis,
+                indices: indices.iter().map(|index| start + index).collect(),
+            })
+        }
+        (TensorSelection::Indices { indices, .. }, TensorSelection::Range { start, end, .. }) => {
+            Ok(TensorSelection::Indices {
+                axis,
+                indices: indices[*start..*end].to_vec(),
+            })
+        }
+        (
+            TensorSelection::Indices {
+                indices: existing, ..
+            },
+            TensorSelection::Indices { indices, .. },
+        ) => Ok(TensorSelection::Indices {
+            axis,
+            indices: indices.iter().map(|index| existing[*index]).collect(),
+        }),
+        _ => Err(RecipeError::SelectionPushdownUnsupported {
+            operation: "selection composition",
+            reason: "full selections must be normalized before composition".into(),
+        }),
+    }
+}
+
+fn combine_independent_ranges(
+    source_shape: &[usize],
+    existing: &TensorSelection,
+    requested: &TensorSelection,
+) -> Result<Option<TensorSelection>, RecipeError> {
+    let (
+        TensorSelection::Range {
+            axis: existing_axis,
+            start: existing_start,
+            end: existing_end,
+        },
+        TensorSelection::Range {
+            axis: requested_axis,
+            start: requested_start,
+            end: requested_end,
+        },
+    ) = (existing, requested)
+    else {
+        return Ok(None);
+    };
+    if existing_axis == requested_axis {
+        return Ok(None);
+    }
+    let mut starts = vec![0usize; source_shape.len()];
+    let mut ends = source_shape.to_vec();
+    starts[*existing_axis] = *existing_start;
+    ends[*existing_axis] = *existing_end;
+    starts[*requested_axis] = *requested_start;
+    ends[*requested_axis] = *requested_end;
+    let selected_shape = starts
+        .iter()
+        .zip(&ends)
+        .map(|(start, end)| end - start)
+        .collect::<Vec<_>>();
+    let Some(last_partial) = (0..source_shape.len())
+        .rev()
+        .find(|axis| starts[*axis] != 0 || ends[*axis] != source_shape[*axis])
+    else {
+        return Ok(Some(TensorSelection::Full));
+    };
+    if selected_shape[..last_partial]
+        .iter()
+        .any(|dimension| *dimension != 1)
+        || (last_partial + 1..source_shape.len())
+            .any(|axis| starts[axis] != 0 || ends[axis] != source_shape[axis])
+    {
+        return Ok(None);
+    }
+    let mut offset_elements = 0usize;
+    let mut stride = 1usize;
+    for axis in (0..source_shape.len()).rev() {
+        offset_elements = offset_elements
+            .checked_add(starts[axis].checked_mul(stride).ok_or(
+                RecipeError::ArithmeticOverflow("contiguous selection offset"),
+            )?)
+            .ok_or(RecipeError::ArithmeticOverflow(
+                "contiguous selection offset",
+            ))?;
+        stride = stride
+            .checked_mul(source_shape[axis])
+            .ok_or(RecipeError::ArithmeticOverflow(
+                "contiguous selection stride",
+            ))?;
+    }
+    Ok(Some(TensorSelection::Contiguous {
+        offset_elements,
+        shape: selected_shape,
+    }))
+}
+
+fn select_from_contiguous_span(
+    existing: &TensorSelection,
+    requested: &TensorSelection,
+) -> Result<Option<TensorSelection>, RecipeError> {
+    let TensorSelection::Contiguous {
+        offset_elements,
+        shape,
+    } = existing
+    else {
+        return Ok(None);
+    };
+    let (axis, start, end) = match requested {
+        TensorSelection::Range { axis, start, end } => (*axis, *start, *end),
+        TensorSelection::Indices { axis, indices }
+            if indices.windows(2).all(|pair| pair[1] == pair[0] + 1) =>
+        {
+            (*axis, indices[0], indices[indices.len() - 1] + 1)
+        }
+        _ => return Ok(None),
+    };
+    if shape[..axis].iter().product::<usize>() != 1 {
+        return Ok(None);
+    }
+    let trailing = shape[axis + 1..]
+        .iter()
+        .try_fold(1usize, |count, dimension| {
+            count
+                .checked_mul(*dimension)
+                .ok_or(RecipeError::ArithmeticOverflow(
+                    "contiguous selection trailing span",
+                ))
+        })?;
+    let offset_elements = offset_elements
+        .checked_add(
+            start
+                .checked_mul(trailing)
+                .ok_or(RecipeError::ArithmeticOverflow(
+                    "contiguous selection offset",
+                ))?,
+        )
+        .ok_or(RecipeError::ArithmeticOverflow(
+            "contiguous selection offset",
+        ))?;
+    let mut selected_shape = shape.clone();
+    selected_shape[axis] = end - start;
+    Ok(Some(TensorSelection::Contiguous {
+        offset_elements,
+        shape: selected_shape,
+    }))
+}
+
 fn infer_join<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     axis: usize,
@@ -448,6 +1332,11 @@ pub enum RecipeError {
     UnsupportedDtype { dtype: String },
     #[error("derived-weight arithmetic overflow: {0}")]
     ArithmeticOverflow(&'static str),
+    #[error("cannot push selection through {operation}: {reason}")]
+    SelectionPushdownUnsupported {
+        operation: &'static str,
+        reason: String,
+    },
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -533,5 +1422,51 @@ mod tests {
         assert_eq!(metadata.dtype(), &RecipeDtype::F16);
         assert_eq!(metadata.byte_len(), 18);
         assert_eq!(recipe.source_keys(), ["left", "right"]);
+    }
+
+    #[test]
+    fn bounded_selection_pushdown_is_backend_independent() {
+        let recipe = DerivedWeightRecipe::Concatenate {
+            axis: 0,
+            inputs: vec![
+                DerivedWeightRecipe::source("left", TensorSelection::Full),
+                DerivedWeightRecipe::source("right", TensorSelection::Full),
+            ],
+        };
+        let selected = recipe
+            .select_bounded(
+                &Catalog,
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 1,
+                    end: 3,
+                },
+            )
+            .unwrap();
+        assert_eq!(selected.infer(&Catalog).unwrap().shape(), &[2, 3]);
+        assert_eq!(
+            selected,
+            DerivedWeightRecipe::Concatenate {
+                axis: 0,
+                inputs: vec![
+                    DerivedWeightRecipe::source(
+                        "left",
+                        TensorSelection::Range {
+                            axis: 0,
+                            start: 1,
+                            end: 2,
+                        },
+                    ),
+                    DerivedWeightRecipe::source(
+                        "right",
+                        TensorSelection::Range {
+                            axis: 0,
+                            start: 0,
+                            end: 1,
+                        },
+                    ),
+                ],
+            }
+        );
     }
 }
