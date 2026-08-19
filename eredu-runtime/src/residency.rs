@@ -1,7 +1,12 @@
-//! Backend-neutral immutable-weight residency declarations.
+//! Backend-neutral immutable-weight residency declarations and control state.
 
-use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
-use eredu_core::residency::OffloadUnitId;
+use std::collections::BTreeMap;
+
+use eredu_checkpoint::{
+    recipe::{DerivedWeightRecipe, RecipeCatalog, RecipeError},
+    store::TensorSelection,
+};
+use eredu_core::residency::{OffloadPlan, OffloadUnitId, ResidencyLedger};
 
 /// One named checkpoint selection within an atomic resident unit.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -133,6 +138,175 @@ pub struct OffloadUnit {
     bindings: Vec<WeightBinding>,
 }
 
+/// Validated backend-neutral declarations paired with residency control state.
+///
+/// Concrete backends own their native values separately and mirror every
+/// publication or eviction through this controller's ledger. Keeping the
+/// declarations here ensures checkpoint shape policy and plan identity are
+/// validated before any backend allocation begins.
+#[derive(Debug)]
+pub struct ResidencyController {
+    ledger: ResidencyLedger,
+    units: BTreeMap<OffloadUnitId, OffloadUnit>,
+}
+
+impl ResidencyController {
+    /// Validates declarations against checkpoint metadata and an explicit plan.
+    pub fn new<C: RecipeCatalog + ?Sized>(
+        catalog: &C,
+        plan: OffloadPlan,
+        units: impl IntoIterator<Item = OffloadUnit>,
+    ) -> Result<Self, ResidencyControllerError> {
+        let mut definitions = BTreeMap::new();
+        for unit in units {
+            let id = unit.id().clone();
+            if definitions.insert(id.clone(), unit).is_some() {
+                return Err(ResidencyControllerError::DuplicateUnitDefinition { id });
+            }
+        }
+        for spec in plan.units() {
+            if !definitions.contains_key(spec.id()) {
+                return Err(ResidencyControllerError::MissingUnitDefinition {
+                    id: spec.id().clone(),
+                });
+            }
+        }
+        if let Some(id) = definitions
+            .keys()
+            .find(|id| plan.unit(id).is_none())
+            .cloned()
+        {
+            return Err(ResidencyControllerError::UnexpectedUnitDefinition { id });
+        }
+
+        for spec in plan.units() {
+            let unit = definitions
+                .get(spec.id())
+                .expect("definition identity validated above");
+            let mut total = 0u64;
+            for binding in unit.bindings() {
+                total = total.checked_add(binding.expected_bytes()).ok_or(
+                    ResidencyControllerError::ArithmeticOverflow {
+                        context: "unit binding byte total",
+                    },
+                )?;
+                let actual = binding
+                    .source_recipe()
+                    .infer(catalog)
+                    .map_err(|source| ResidencyControllerError::Recipe {
+                        binding: binding.name().to_owned(),
+                        source,
+                    })?
+                    .byte_len();
+                if actual != binding.expected_bytes() {
+                    return Err(ResidencyControllerError::BindingByteMismatch {
+                        id: unit.id().clone(),
+                        binding: binding.name().to_owned(),
+                        expected_bytes: binding.expected_bytes(),
+                        actual_bytes: actual,
+                    });
+                }
+            }
+            if total != spec.bytes() {
+                return Err(ResidencyControllerError::UnitByteMismatch {
+                    id: unit.id().clone(),
+                    planned_bytes: spec.bytes(),
+                    actual_bytes: total,
+                });
+            }
+        }
+
+        Ok(Self {
+            ledger: ResidencyLedger::new(plan),
+            units: definitions,
+        })
+    }
+
+    /// Returns the validated declaration for one planned unit.
+    pub fn unit(&self, id: &OffloadUnitId) -> Option<&OffloadUnit> {
+        self.units.get(id)
+    }
+
+    /// Returns declarations in stable unit-identifier order.
+    pub fn units(&self) -> impl ExactSizeIterator<Item = &OffloadUnit> {
+        self.units.values()
+    }
+
+    /// Returns immutable ownership, capacity, and telemetry state.
+    pub const fn ledger(&self) -> &ResidencyLedger {
+        &self.ledger
+    }
+
+    /// Returns mutable ownership, capacity, and telemetry state.
+    pub fn ledger_mut(&mut self) -> &mut ResidencyLedger {
+        &mut self.ledger
+    }
+}
+
+/// Failure while validating a residency control plane.
+#[derive(Debug, thiserror::Error)]
+pub enum ResidencyControllerError {
+    /// More than one definition used the same plan identifier.
+    #[error("duplicate residency unit definition: {id}")]
+    DuplicateUnitDefinition {
+        /// Duplicated identifier.
+        id: OffloadUnitId,
+    },
+    /// The plan had no matching unit definition.
+    #[error("offload plan unit {id} has no residency unit definition")]
+    MissingUnitDefinition {
+        /// Missing identifier.
+        id: OffloadUnitId,
+    },
+    /// A definition had no matching plan entry.
+    #[error("residency unit {id} is absent from the offload plan")]
+    UnexpectedUnitDefinition {
+        /// Unexpected identifier.
+        id: OffloadUnitId,
+    },
+    /// Binding sizes did not sum to the plan's unit size.
+    #[error(
+        "residency unit {id} defines {actual_bytes} bytes but its plan reserves {planned_bytes}"
+    )]
+    UnitByteMismatch {
+        /// Unit identifier.
+        id: OffloadUnitId,
+        /// Bytes reserved by the plan.
+        planned_bytes: u64,
+        /// Sum of binding sizes.
+        actual_bytes: u64,
+    },
+    /// A binding's selected checkpoint size contradicted its declaration.
+    #[error(
+        "binding {binding:?} in unit {id} selects {actual_bytes} bytes but declares {expected_bytes}"
+    )]
+    BindingByteMismatch {
+        /// Unit identifier.
+        id: OffloadUnitId,
+        /// Binding name.
+        binding: String,
+        /// Declared size.
+        expected_bytes: u64,
+        /// Catalog-validated size.
+        actual_bytes: u64,
+    },
+    /// A derived-weight recipe was invalid.
+    #[error("derived-weight recipe for binding {binding:?} failed: {source}")]
+    Recipe {
+        /// Local binding name.
+        binding: String,
+        /// Invalid recipe.
+        #[source]
+        source: RecipeError,
+    },
+    /// Checked byte arithmetic overflowed.
+    #[error("residency arithmetic overflow: {context}")]
+    ArithmeticOverflow {
+        /// Calculation that overflowed.
+        context: &'static str,
+    },
+}
+
 impl OffloadUnit {
     /// Creates a non-empty unit and sorts bindings by local name.
     pub fn new(
@@ -240,7 +414,36 @@ pub enum ResidencyDeclarationError {
 
 #[cfg(test)]
 mod tests {
+    use eredu_checkpoint::{store::TensorMetadata, StoredDtype};
+    use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitSpec, ResidencyPolicy};
+
     use super::*;
+
+    struct Catalog(BTreeMap<String, TensorMetadata>);
+
+    impl RecipeCatalog for Catalog {
+        fn tensor_metadata(
+            &self,
+            key: &str,
+        ) -> Result<TensorMetadata, eredu_checkpoint::store::StoreError> {
+            self.0.get(key).cloned().ok_or_else(|| {
+                eredu_checkpoint::store::StoreError::UnknownTensor {
+                    key: key.to_owned(),
+                }
+            })
+        }
+    }
+
+    fn metadata(name: &str, shape: Vec<usize>) -> TensorMetadata {
+        TensorMetadata {
+            name: name.to_owned(),
+            logical_shape: shape.clone(),
+            physical_shape: shape,
+            stored_dtype: StoredDtype::F32,
+            encoded_byte_len: 0,
+            backing_shard: None,
+        }
+    }
 
     #[test]
     fn declarations_are_validated_and_deterministic() {
@@ -250,5 +453,77 @@ mod tests {
         let unit = OffloadUnit::new(id, [b, a]).unwrap();
         assert_eq!(unit.bindings()[0].name(), "a");
         assert_eq!(unit.bindings()[1].name(), "b");
+    }
+
+    #[test]
+    fn controller_validates_catalog_bytes_before_allocating_backend_storage() {
+        let catalog = Catalog(BTreeMap::from([
+            ("a.weight".into(), metadata("a.weight", vec![2])),
+            ("b.weight".into(), metadata("b.weight", vec![1])),
+        ]));
+        let id = OffloadUnitId::new("layer.0").unwrap();
+        let unit = OffloadUnit::new(
+            id.clone(),
+            [
+                WeightBinding::new("a", "a.weight", TensorSelection::Full, 8).unwrap(),
+                WeightBinding::new("b", "b.weight", TensorSelection::Full, 4).unwrap(),
+            ],
+        )
+        .unwrap();
+        let plan = OffloadPlan::new(
+            OffloadConfig::default(),
+            [
+                OffloadUnitSpec::new(id.clone(), 12, ResidencyPolicy::Windowed, MemoryTier::Disk)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let controller = ResidencyController::new(&catalog, plan, [unit]).unwrap();
+        assert_eq!(controller.units().len(), 1);
+        assert_eq!(controller.unit(&id).unwrap().bindings().len(), 2);
+        assert!(!controller.ledger().initialized());
+    }
+
+    #[test]
+    fn controller_rejects_binding_and_plan_byte_mismatches() {
+        let catalog = Catalog(BTreeMap::from([(
+            "weight".into(),
+            metadata("weight", vec![2]),
+        )]));
+        let id = OffloadUnitId::new("layer.0").unwrap();
+        let plan = |bytes| {
+            OffloadPlan::new(
+                OffloadConfig::default(),
+                [OffloadUnitSpec::new(
+                    id.clone(),
+                    bytes,
+                    ResidencyPolicy::Windowed,
+                    MemoryTier::Disk,
+                )
+                .unwrap()],
+            )
+            .unwrap()
+        };
+
+        let wrong_binding = OffloadUnit::new(
+            id.clone(),
+            [WeightBinding::new("weight", "weight", TensorSelection::Full, 4).unwrap()],
+        )
+        .unwrap();
+        assert!(matches!(
+            ResidencyController::new(&catalog, plan(4), [wrong_binding]),
+            Err(ResidencyControllerError::BindingByteMismatch { .. })
+        ));
+
+        let wrong_plan = OffloadUnit::new(
+            id.clone(),
+            [WeightBinding::new("weight", "weight", TensorSelection::Full, 8).unwrap()],
+        )
+        .unwrap();
+        assert!(matches!(
+            ResidencyController::new(&catalog, plan(16), [wrong_plan]),
+            Err(ResidencyControllerError::UnitByteMismatch { .. })
+        ));
     }
 }

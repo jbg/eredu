@@ -22,7 +22,10 @@ pub use execution::{
 pub use parameter::{
     bind_materialized_unit, materialize_bindings, MaterializedUnit, ParameterOrchestrationError,
 };
-pub use residency::{OffloadUnit, ResidencyDeclarationError, WeightBinding};
+pub use residency::{
+    OffloadUnit, ResidencyController, ResidencyControllerError, ResidencyDeclarationError,
+    WeightBinding,
+};
 
 /// Inspectable architecture/runtime topology without backend-native values.
 #[derive(Debug, Clone, Eq, PartialEq)]
