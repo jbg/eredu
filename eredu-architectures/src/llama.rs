@@ -15,8 +15,9 @@ use eredu_checkpoint::WeightQuantization;
 use eredu_core::cache::LayerCachePolicy;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
-    AttentionCache, EmbeddingOperator, Error, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationOperator, RotaryOperator, RotarySpec, Tensor,
+    AttentionCache, EmbeddingOperator, EmbeddingSpec, Error, LinearOperator, LinearSpec,
+    NeuralBackend, NormalizationOperator, NormalizationSpec, ParameterSpec, RotaryOperator,
+    RotarySpec, Tensor,
 };
 
 /// Geometry consumed by the shared Llama implementation.
@@ -173,13 +174,17 @@ pub struct AttentionInput<'a, T, C> {
 }
 
 /// Llama grouped-query self attention.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
 pub struct Attention<B: NeuralBackend> {
     /// Number of query heads.
+    #[parameter(skip)]
     pub query_heads: i32,
     /// Number of key/value heads.
+    #[parameter(skip)]
     pub key_value_heads: i32,
     /// Inverse square-root head scaling.
+    #[parameter(skip)]
     pub scale: f32,
     /// Query projection.
     pub query: B::Linear,
@@ -192,6 +197,7 @@ pub struct Attention<B: NeuralBackend> {
     /// Rotary-position operator.
     pub rotary: B::Rotary,
     /// Layer-local sliding window.
+    #[parameter(skip)]
     pub sliding_window: Option<i32>,
 }
 
@@ -214,14 +220,18 @@ impl<B: NeuralBackend> Attention<B> {
         let head = config.head_dim();
         let query_heads = config.num_attention_heads();
         let key_value_heads = config.num_key_value_heads();
-        let linear = |field: &str, input, output, bias| {
+        let linear = |field: &str, input, output, bias: bool| {
             let weight_name = format!("{prefix}.{field}.weight");
+            let bias = bias
+                .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
+                .transpose()
+                .map_err(Error::backend)?;
             B::linear(
                 LinearSpec {
                     input,
                     output,
+                    weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
                     bias,
-                    weight_name: &weight_name,
                     quantization: config.weight_quantization(&weight_name),
                 },
                 context,
@@ -366,7 +376,8 @@ impl<B: NeuralBackend> Attention<B> {
 }
 
 /// Llama SwiGLU feed-forward network.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
 pub struct Mlp<B: NeuralBackend> {
     /// Gating projection.
     pub gate: B::Linear,
@@ -385,12 +396,17 @@ impl<B: NeuralBackend> Mlp<B> {
         let prefix = format!("model.layers.{layer}.mlp");
         let build = |field: &str, input, output| {
             let weight_name = format!("{prefix}.{field}.weight");
+            let bias = config
+                .mlp_bias()
+                .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
+                .transpose()
+                .map_err(Error::backend)?;
             B::linear(
                 LinearSpec {
                     input,
                     output,
-                    bias: config.mlp_bias(),
-                    weight_name: &weight_name,
+                    weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
+                    bias,
                     quantization: config.weight_quantization(&weight_name),
                 },
                 context,
@@ -442,7 +458,8 @@ impl<B: NeuralBackend> Mlp<B> {
 }
 
 /// One Llama decoder block.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
 pub struct TransformerBlock<B: NeuralBackend> {
     /// Self-attention operator.
     pub self_attention: Attention<B>,
@@ -464,10 +481,26 @@ impl<B: NeuralBackend> TransformerBlock<B> {
         Ok(Self {
             self_attention: Attention::new(config, layer, context)?,
             mlp: Mlp::new(config, layer, context)?,
-            input_norm: B::rms_norm(config.hidden_size(), config.rms_norm_epsilon(), context)?,
+            input_norm: B::rms_norm(
+                NormalizationSpec {
+                    dimensions: config.hidden_size(),
+                    epsilon: config.rms_norm_epsilon(),
+                    weight: ParameterSpec::trainable(format!(
+                        "model.layers.{layer}.input_layernorm.weight"
+                    ))
+                    .map_err(Error::backend)?,
+                },
+                context,
+            )?,
             post_attention_norm: B::rms_norm(
-                config.hidden_size(),
-                config.rms_norm_epsilon(),
+                NormalizationSpec {
+                    dimensions: config.hidden_size(),
+                    epsilon: config.rms_norm_epsilon(),
+                    weight: ParameterSpec::trainable(format!(
+                        "model.layers.{layer}.post_attention_layernorm.weight"
+                    ))
+                    .map_err(Error::backend)?,
+                },
                 context,
             )?,
         })
@@ -521,7 +554,8 @@ impl<B: NeuralBackend> TransformerBlock<B> {
 }
 
 /// Llama transformer body without its language-model head.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
 pub struct Decoder<B: NeuralBackend> {
     /// Token embedding table.
     pub embeddings: B::Embedding,
@@ -542,14 +576,25 @@ impl<B: NeuralBackend> Decoder<B> {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             embeddings: B::embedding(
-                config.vocabulary_size(),
-                config.hidden_size(),
-                "model.embed_tokens.weight",
-                config.weight_quantization("model.embed_tokens.weight"),
+                EmbeddingSpec {
+                    vocabulary: config.vocabulary_size(),
+                    dimensions: config.hidden_size(),
+                    weight: ParameterSpec::trainable("model.embed_tokens.weight")
+                        .map_err(Error::backend)?,
+                    quantization: config.weight_quantization("model.embed_tokens.weight"),
+                },
                 context,
             )?,
             layers,
-            norm: B::rms_norm(config.hidden_size(), config.rms_norm_epsilon(), context)?,
+            norm: B::rms_norm(
+                NormalizationSpec {
+                    dimensions: config.hidden_size(),
+                    epsilon: config.rms_norm_epsilon(),
+                    weight: ParameterSpec::trainable("model.norm.weight")
+                        .map_err(Error::backend)?,
+                },
+                context,
+            )?,
         })
     }
 
@@ -613,7 +658,8 @@ impl<B: NeuralBackend> Decoder<B> {
 }
 
 /// Complete Llama causal language model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
 pub struct Model<B: NeuralBackend> {
     /// Transformer body.
     pub decoder: Decoder<B>,
@@ -635,8 +681,8 @@ impl<B: NeuralBackend> Model<B> {
                 LinearSpec {
                     input: config.hidden_size(),
                     output: config.vocabulary_size(),
-                    bias: false,
-                    weight_name: "lm_head.weight",
+                    weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
+                    bias: None,
                     quantization: config.weight_quantization("lm_head.weight"),
                 },
                 context,

@@ -9,14 +9,15 @@ use std::{
 };
 
 use eredu_architectures::llama::ModelArgs;
+use eredu_nn::{
+    EmbeddingOperator, EmbeddingSpec, LinearOperator, LinearSpec, NeuralBackend,
+    NormalizationOperator, NormalizationSpec, ParameterSpec,
+};
 use safemlx::{
     error::Exception,
-    module::Module,
-    nn,
     ops::indexing::TryIndexOp,
     ops::{GgufCheckpoint, GgufMetadataValue},
-    quantization::MaybeQuantized,
-    Array, Dtype, Stream,
+    Array, Stream,
 };
 
 use crate::core::cache::{
@@ -28,10 +29,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{
         generation::CausalLm,
-        linear::{
-            build_unloaded_maybe_quantized_lm_head_with_quantization,
-            project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
-        },
+        shared::{MlxBackend, MlxEmbedding, MlxLinear, MlxRmsNorm},
     },
     backend::mlx::nn::{
         parallel::{
@@ -600,9 +598,9 @@ pub(crate) fn load_llama_gguf_model(
 /// Llama implementation of the generic layerwise model-family contract.
 pub struct LlamaLayerwiseAdapter {
     args: ModelArgs,
-    embedding: MaybeQuantized<nn::Embedding>,
-    norm: nn::RmsNorm,
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
+    embedding: MlxEmbedding,
+    norm: MlxRmsNorm,
+    lm_head: Option<MlxLinear>,
     parallel_embedding: Option<VocabParallelEmbedding>,
     parallel_lm_head: Option<VocabParallelLmHead>,
     parallel_kv_heads: Option<Vec<i32>>,
@@ -611,23 +609,44 @@ pub struct LlamaLayerwiseAdapter {
 impl LlamaLayerwiseAdapter {
     /// Creates metadata-only static modules for a normalized Llama configuration.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
-        let embedding = unloaded_maybe_quantized_embedding(
-            args.vocab_size,
-            args.hidden_size,
-            args.weight_quantization_for("model.embed_tokens.weight"),
+        let embedding = <MlxBackend as NeuralBackend>::embedding(
+            EmbeddingSpec {
+                vocabulary: args.vocab_size,
+                dimensions: args.hidden_size,
+                weight: ParameterSpec::trainable("model.embed_tokens.weight")
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                quantization: args.weight_quantization_for("model.embed_tokens.weight"),
+            },
             stream,
-        )?;
-        let norm =
-            nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let norm = <MlxBackend as NeuralBackend>::rms_norm(
+            NormalizationSpec {
+                dimensions: args.hidden_size,
+                epsilon: args.rms_norm_eps,
+                weight: ParameterSpec::trainable("model.norm.weight")
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            },
+            stream,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let lm_head = if args.tie_word_embeddings {
             None
         } else {
-            Some(build_unloaded_maybe_quantized_lm_head_with_quantization(
-                args.hidden_size,
-                args.vocab_size,
-                args.weight_quantization_for("lm_head.weight"),
-                stream,
-            )?)
+            Some(
+                <MlxBackend as NeuralBackend>::linear(
+                    LinearSpec {
+                        input: args.hidden_size,
+                        output: args.vocab_size,
+                        weight: ParameterSpec::trainable("lm_head.weight")
+                            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                        bias: None,
+                        quantization: args.weight_quantization_for("lm_head.weight"),
+                    },
+                    stream,
+                )
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            )
         };
         Ok(Self {
             args,
@@ -691,10 +710,10 @@ fn register_llama_layer_parallel_plan(
             value: "v_proj",
             output: "o_proj",
         },
-        &attention.query.0,
-        &attention.key.0,
-        &attention.value.0,
-        &attention.output.0,
+        &attention.query,
+        &attention.key,
+        &attention.value,
+        &attention.output,
         attention.query_heads,
         attention.key_value_heads,
         args.head_dim,
@@ -712,9 +731,9 @@ fn register_llama_layer_parallel_plan(
             up: "up_proj",
             down: "down_proj",
         },
-        &layer.inner.mlp.gate.0,
-        &layer.inner.mlp.up.0,
-        &layer.inner.mlp.down.0,
+        &layer.inner.mlp.gate,
+        &layer.inner.mlp.up,
+        &layer.inner.mlp.down,
         args.intermediate_size,
     )?;
     register_replicated_module(
@@ -858,7 +877,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
                 EMBEDDING_UNIT,
                 build_module_binding_plan_with_recipes(
                     &self.embedding,
-                    "model.embed_tokens",
+                    "",
                     store,
                     BTreeMap::new(),
                 )?
@@ -868,26 +887,16 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         if select(NORM_UNIT) {
             units.push(StaticUnitBindings::new(
                 NORM_UNIT,
-                build_module_binding_plan_with_recipes(
-                    &self.norm,
-                    "model.norm",
-                    store,
-                    BTreeMap::new(),
-                )?
-                .build_bindings(store)?,
+                build_module_binding_plan_with_recipes(&self.norm, "", store, BTreeMap::new())?
+                    .build_bindings(store)?,
             )?);
         }
         if select(HEAD_UNIT) {
             if let Some(head) = &self.lm_head {
                 units.push(StaticUnitBindings::new(
                     HEAD_UNIT,
-                    build_module_binding_plan_with_recipes(
-                        head,
-                        "lm_head",
-                        store,
-                        BTreeMap::new(),
-                    )?
-                    .build_bindings(store)?,
+                    build_module_binding_plan_with_recipes(head, "", store, BTreeMap::new())?
+                        .build_bindings(store)?,
                 )?);
             }
         }
@@ -1177,18 +1186,15 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
     fn layer_bindings(
         &self,
-        group: usize,
-        index: usize,
+        _group: usize,
+        _index: usize,
         layer: &Self::Layer,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        Ok(build_module_binding_plan_with_recipes(
-            layer,
-            &self.layer_checkpoint_prefix(group, index),
-            store,
-            BTreeMap::new(),
-        )?
-        .build_bindings(store)?)
+        Ok(
+            build_module_binding_plan_with_recipes(layer, "", store, BTreeMap::new())?
+                .build_bindings(store)?,
+        )
     }
 
     fn layer_unit_name(&self, _group: usize, index: usize) -> String {
@@ -1318,12 +1324,15 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Array, Error> {
         let hidden = self.norm.forward(hidden, stream)?;
-        Ok(project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.embedding,
-            &hidden,
-            stream,
-        )?)
+        match &mut self.lm_head {
+            Some(head) => head
+                .forward(&hidden, stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+            None => self
+                .embedding
+                .as_linear(&hidden, stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+        }
     }
 
     fn finish_with_execution(

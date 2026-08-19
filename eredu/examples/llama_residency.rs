@@ -10,7 +10,7 @@ use eredu::{
     backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     backend::mlx::{MlxBackend, ModelLoadOptions, WeightResidency},
     core::residency::{MemoryTier, OffloadConfig, TransferDirection},
-    core::{Backend as _, BackendSession as _},
+    core::{BackendProvider as _, BackendSession as _},
     load_model,
 };
 use safemlx::{Array, Device, DeviceType, ExecutionContext};

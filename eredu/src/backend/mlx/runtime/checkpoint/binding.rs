@@ -67,15 +67,15 @@ pub(crate) fn is_materialized_module_parameter(
     parameter: &Array,
     parameters: &FlattenedModuleParamRef<'_>,
 ) -> bool {
-    let weight_name = if name == "scales" {
-        Some("inner.weight".to_string())
+    let weight_names = if name == "scales" {
+        Some(["inner.weight".to_string(), "weight".to_string()])
     } else {
         name.strip_suffix(".scales")
-            .map(|prefix| format!("{prefix}.inner.weight"))
+            .map(|prefix| [format!("{prefix}.inner.weight"), format!("{prefix}.weight")])
     };
-    let weight_dtype = weight_name
-        .as_deref()
-        .and_then(|weight_name| parameters.get(weight_name))
+    let weight_dtype = weight_names
+        .as_ref()
+        .and_then(|names| names.iter().find_map(|name| parameters.get(name.as_str())))
         .map(|weight| weight.dtype());
     !is_native_scale_sentinel(name, parameter.shape(), weight_dtype)
 }

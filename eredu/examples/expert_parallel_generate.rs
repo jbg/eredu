@@ -6,7 +6,7 @@ use eredu::{
     backend::mlx::{
         DeviceAssignment, MlxBackend, MlxParallelContext, ModelLoadOptions, WeightResidency,
     },
-    core::{Backend as _, BackendSession as _},
+    core::{BackendProvider as _, BackendSession as _},
     load_model,
 };
 use safemlx::{

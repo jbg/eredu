@@ -51,6 +51,10 @@ pub enum Error {
     #[error(transparent)]
     ExecutionGraph(#[from] eredu_runtime::ExecutionGraphError),
 
+    /// Backend-neutral neural operator or parameter-topology failure.
+    #[error(transparent)]
+    Neural(#[from] eredu_nn::Error),
+
     /// Invalid module-to-checkpoint or resident-lease binding.
     #[error(transparent)]
     ModuleBinding(#[from] crate::backend::mlx::runtime::checkpoint::binding::ModuleBindingError),

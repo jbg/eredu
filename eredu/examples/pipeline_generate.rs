@@ -3,7 +3,7 @@
 use eredu::{
     backend::mlx::runtime::{generation::sampler::DefaultSampler, media::input},
     backend::mlx::{DeviceAssignment, MlxBackend, MlxParallelContext, ModelLoadOptions},
-    core::{Backend as _, BackendSession as _},
+    core::{BackendProvider as _, BackendSession as _},
     load_model,
 };
 use safemlx::{

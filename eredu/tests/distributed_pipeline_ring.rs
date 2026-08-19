@@ -33,7 +33,7 @@ use eredu::{
         LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, MlxParallelContext,
         ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions, WeightResidency,
     },
-    core::{residency::OffloadConfig, Backend as _, BackendSession as _},
+    core::{residency::OffloadConfig, BackendProvider as _, BackendSession as _},
     load_model, MtpCapability, MtpCheckpointKind, MtpConfig, PromptCacheDescriptor,
     PromptCacheOptions, PromptCacheTopology,
 };

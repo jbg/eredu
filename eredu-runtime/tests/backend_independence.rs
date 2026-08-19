@@ -2,8 +2,9 @@ use std::convert::Infallible;
 
 use eredu_core::Completion;
 use eredu_nn::{
-    AttentionMask, EmbeddingOperator, Error, Index, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationOperator, PadMode, RotaryOperator, RotarySpec, Tensor,
+    AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator, LinearSpec,
+    NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode, ParameterVisitor,
+    ParameterVisitorMut, Parameterized, RotaryOperator, RotarySpec, Tensor,
 };
 use eredu_runtime::{CollectiveBackend, ParameterBackend, SubmissionBackend, TransferBackend};
 
@@ -145,6 +146,20 @@ impl Tensor for FakeTensor {
 #[derive(Debug, Clone)]
 struct FakeOperator;
 
+impl Parameterized<FakeTensor> for FakeOperator {
+    fn visit_parameters<'a, V>(&'a self, _visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, FakeTensor>,
+    {
+    }
+    fn visit_parameters_mut<'a, V>(&'a mut self, _visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, FakeTensor>,
+    {
+    }
+    fn set_trainable(&mut self, _trainable: bool) {}
+}
+
 impl LinearOperator<FakeTensor> for FakeOperator {
     fn forward(&mut self, input: &FakeTensor, _: &()) -> Result<FakeTensor, Error> {
         Ok(input.clone())
@@ -179,19 +194,13 @@ impl NeuralBackend for FakeBackend {
     type Rotary = FakeOperator;
     type ParallelContext = ();
 
-    fn linear(_: LinearSpec<'_>, _: &()) -> Result<Self::Linear, Error> {
+    fn linear(_: LinearSpec, _: &()) -> Result<Self::Linear, Error> {
         Ok(FakeOperator)
     }
-    fn embedding(
-        _: i32,
-        _: i32,
-        _: &str,
-        _: Option<eredu_checkpoint::WeightQuantization>,
-        _: &(),
-    ) -> Result<Self::Embedding, Error> {
+    fn embedding(_: EmbeddingSpec, _: &()) -> Result<Self::Embedding, Error> {
         Ok(FakeOperator)
     }
-    fn rms_norm(_: i32, _: f32, _: &()) -> Result<Self::Normalization, Error> {
+    fn rms_norm(_: NormalizationSpec, _: &()) -> Result<Self::Normalization, Error> {
         Ok(FakeOperator)
     }
     fn rotary(_: RotarySpec<'_>, _: &()) -> Result<Self::Rotary, Error> {

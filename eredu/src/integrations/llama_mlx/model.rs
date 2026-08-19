@@ -6,7 +6,7 @@ use std::{collections::HashMap, path::Path};
 
 use safemlx::{
     error::Exception,
-    module::{Module, ModuleParameters},
+    module::Module,
     ops::indexing::TryIndexOp,
     ops::{GgufCheckpoint, GgufMetadataValue},
     Array, Stream,
@@ -92,231 +92,34 @@ impl TransformerBlock {
     }
 }
 
-fn insert_module_ref<'a>(
-    map: &mut safemlx::module::ModuleParamRef<'a>,
-    name: &str,
-    module: &'a impl safemlx::module::ModuleParameters,
-) {
-    map.insert(
-        name.into(),
-        safemlx::nested::NestedValue::Map(module.parameters().entries),
-    );
-}
-
-fn insert_module_mut<'a>(
-    map: &mut safemlx::module::ModuleParamMut<'a>,
-    name: &str,
-    module: &'a mut impl safemlx::module::ModuleParameters,
-) {
-    map.insert(
-        name.into(),
-        safemlx::nested::NestedValue::Map(module.parameters_mut().entries),
-    );
-}
-
-fn insert_trainable_ref<'a>(
-    map: &mut safemlx::module::ModuleParamRef<'a>,
-    name: &str,
-    module: &'a impl safemlx::module::ModuleParameters,
-) {
-    map.insert(
-        name.into(),
-        safemlx::nested::NestedValue::Map(module.trainable_parameters().entries),
-    );
-}
-
-fn attention_parameters(
-    attention: &eredu_architectures::llama::Attention<crate::backend::mlx::nn::shared::MlxBackend>,
-) -> safemlx::module::ModuleParamRef<'_> {
-    let mut map = safemlx::module::ModuleParamRef::new();
-    insert_module_ref(&mut map, "q_proj", &attention.query);
-    insert_module_ref(&mut map, "k_proj", &attention.key);
-    insert_module_ref(&mut map, "v_proj", &attention.value);
-    insert_module_ref(&mut map, "o_proj", &attention.output);
-    insert_module_ref(&mut map, "rope", &attention.rotary);
-    map
-}
-
-fn attention_parameters_mut(
-    attention: &mut eredu_architectures::llama::Attention<
-        crate::backend::mlx::nn::shared::MlxBackend,
-    >,
-) -> safemlx::module::ModuleParamMut<'_> {
-    let mut map = safemlx::module::ModuleParamMut::new();
-    insert_module_mut(&mut map, "q_proj", &mut attention.query);
-    insert_module_mut(&mut map, "k_proj", &mut attention.key);
-    insert_module_mut(&mut map, "v_proj", &mut attention.value);
-    insert_module_mut(&mut map, "o_proj", &mut attention.output);
-    insert_module_mut(&mut map, "rope", &mut attention.rotary);
-    map
-}
-
-fn mlp_parameters(
-    mlp: &eredu_architectures::llama::Mlp<crate::backend::mlx::nn::shared::MlxBackend>,
-) -> safemlx::module::ModuleParamRef<'_> {
-    let mut map = safemlx::module::ModuleParamRef::new();
-    insert_module_ref(&mut map, "gate_proj", &mlp.gate);
-    insert_module_ref(&mut map, "up_proj", &mlp.up);
-    insert_module_ref(&mut map, "down_proj", &mlp.down);
-    map
-}
-
-fn mlp_parameters_mut(
-    mlp: &mut eredu_architectures::llama::Mlp<crate::backend::mlx::nn::shared::MlxBackend>,
-) -> safemlx::module::ModuleParamMut<'_> {
-    let mut map = safemlx::module::ModuleParamMut::new();
-    insert_module_mut(&mut map, "gate_proj", &mut mlp.gate);
-    insert_module_mut(&mut map, "up_proj", &mut mlp.up);
-    insert_module_mut(&mut map, "down_proj", &mut mlp.down);
-    map
-}
-
-fn block_parameters(block: &SharedTransformerBlock) -> safemlx::module::ModuleParamRef<'_> {
-    let mut map = safemlx::module::ModuleParamRef::new();
-    map.insert(
-        "self_attn".into(),
-        safemlx::nested::NestedValue::Map(attention_parameters(&block.self_attention).entries),
-    );
-    map.insert(
-        "mlp".into(),
-        safemlx::nested::NestedValue::Map(mlp_parameters(&block.mlp).entries),
-    );
-    insert_module_ref(&mut map, "input_layernorm", &block.input_norm);
-    insert_module_ref(
-        &mut map,
-        "post_attention_layernorm",
-        &block.post_attention_norm,
-    );
-    map
-}
-
-fn block_parameters_mut(block: &mut SharedTransformerBlock) -> safemlx::module::ModuleParamMut<'_> {
-    let mut map = safemlx::module::ModuleParamMut::new();
-    map.insert(
-        "self_attn".into(),
-        safemlx::nested::NestedValue::Map(
-            attention_parameters_mut(&mut block.self_attention).entries,
-        ),
-    );
-    map.insert(
-        "mlp".into(),
-        safemlx::nested::NestedValue::Map(mlp_parameters_mut(&mut block.mlp).entries),
-    );
-    insert_module_mut(&mut map, "input_layernorm", &mut block.input_norm);
-    insert_module_mut(
-        &mut map,
-        "post_attention_layernorm",
-        &mut block.post_attention_norm,
-    );
-    map
-}
-
-fn block_trainable_parameters(
-    block: &SharedTransformerBlock,
-) -> safemlx::module::ModuleParamRef<'_> {
-    let attention = &block.self_attention;
-    let mut attention_map = safemlx::module::ModuleParamRef::new();
-    insert_trainable_ref(&mut attention_map, "q_proj", &attention.query);
-    insert_trainable_ref(&mut attention_map, "k_proj", &attention.key);
-    insert_trainable_ref(&mut attention_map, "v_proj", &attention.value);
-    insert_trainable_ref(&mut attention_map, "o_proj", &attention.output);
-    insert_trainable_ref(&mut attention_map, "rope", &attention.rotary);
-
-    let mut mlp_map = safemlx::module::ModuleParamRef::new();
-    insert_trainable_ref(&mut mlp_map, "gate_proj", &block.mlp.gate);
-    insert_trainable_ref(&mut mlp_map, "up_proj", &block.mlp.up);
-    insert_trainable_ref(&mut mlp_map, "down_proj", &block.mlp.down);
-
-    let mut map = safemlx::module::ModuleParamRef::new();
-    map.insert(
-        "self_attn".into(),
-        safemlx::nested::NestedValue::Map(attention_map.entries),
-    );
-    map.insert(
-        "mlp".into(),
-        safemlx::nested::NestedValue::Map(mlp_map.entries),
-    );
-    insert_trainable_ref(&mut map, "input_layernorm", &block.input_norm);
-    insert_trainable_ref(
-        &mut map,
-        "post_attention_layernorm",
-        &block.post_attention_norm,
-    );
-    map
-}
-
-fn block_frozen_states(block: &SharedTransformerBlock) -> impl Iterator<Item = Option<bool>> + '_ {
-    [
-        block.self_attention.query.all_frozen(),
-        block.self_attention.key.all_frozen(),
-        block.self_attention.value.all_frozen(),
-        block.self_attention.output.all_frozen(),
-        block.self_attention.rotary.all_frozen(),
-        block.mlp.gate.all_frozen(),
-        block.mlp.up.all_frozen(),
-        block.mlp.down.all_frozen(),
-        block.input_norm.all_frozen(),
-        block.post_attention_norm.all_frozen(),
-    ]
-    .into_iter()
-}
-
-fn freeze_block(block: &mut SharedTransformerBlock, mode: bool, recursive: bool) {
-    let attention = &mut block.self_attention;
-    let mlp = &mut block.mlp;
-    if mode {
-        attention.query.freeze_parameters(recursive);
-        attention.key.freeze_parameters(recursive);
-        attention.value.freeze_parameters(recursive);
-        attention.output.freeze_parameters(recursive);
-        attention.rotary.freeze_parameters(recursive);
-        mlp.gate.freeze_parameters(recursive);
-        mlp.up.freeze_parameters(recursive);
-        mlp.down.freeze_parameters(recursive);
-        block.input_norm.freeze_parameters(recursive);
-        block.post_attention_norm.freeze_parameters(recursive);
-    } else {
-        attention.query.unfreeze_parameters(recursive);
-        attention.key.unfreeze_parameters(recursive);
-        attention.value.unfreeze_parameters(recursive);
-        attention.output.unfreeze_parameters(recursive);
-        attention.rotary.unfreeze_parameters(recursive);
-        mlp.gate.unfreeze_parameters(recursive);
-        mlp.up.unfreeze_parameters(recursive);
-        mlp.down.unfreeze_parameters(recursive);
-        block.input_norm.unfreeze_parameters(recursive);
-        block.post_attention_norm.unfreeze_parameters(recursive);
-    }
-}
-
 impl safemlx::module::ModuleParameters for TransformerBlock {
     fn num_parameters(&self) -> usize {
-        self.parameters().flatten().len()
+        crate::backend::mlx::nn::shared::neutral_parameter_refs(&self.inner, false)
+            .entries
+            .len()
     }
     fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
-        block_parameters(&self.inner)
+        crate::backend::mlx::nn::shared::neutral_parameter_refs(&self.inner, false)
     }
     fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
-        block_parameters_mut(&mut self.inner)
+        crate::backend::mlx::nn::shared::neutral_parameter_refs_mut(&mut self.inner)
     }
     fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
-        block_trainable_parameters(&self.inner)
+        crate::backend::mlx::nn::shared::neutral_parameter_refs(&self.inner, true)
     }
-    fn freeze_parameters(&mut self, recursive: bool) {
-        freeze_block(&mut self.inner, true, recursive);
+    fn freeze_parameters(&mut self, _recursive: bool) {
+        eredu_nn::Parameterized::set_trainable(&mut self.inner, false);
     }
-    fn unfreeze_parameters(&mut self, recursive: bool) {
-        freeze_block(&mut self.inner, false, recursive);
+    fn unfreeze_parameters(&mut self, _recursive: bool) {
+        eredu_nn::Parameterized::set_trainable(&mut self.inner, true);
     }
     fn all_frozen(&self) -> Option<bool> {
-        let mut states = block_frozen_states(&self.inner).flatten().peekable();
-        states.peek()?;
-        Some(states.all(|frozen| frozen))
+        let states = crate::backend::mlx::nn::shared::neutral_parameter_states(&self.inner);
+        (!states.is_empty()).then(|| states.iter().all(|trainable| !trainable))
     }
     fn any_frozen(&self) -> Option<bool> {
-        let mut states = block_frozen_states(&self.inner).flatten().peekable();
-        states.peek()?;
-        Some(states.any(|frozen| frozen))
+        let states = crate::backend::mlx::nn::shared::neutral_parameter_states(&self.inner);
+        (!states.is_empty()).then(|| states.iter().any(|trainable| !trainable))
     }
 }
 
@@ -404,145 +207,32 @@ where
 
 impl safemlx::module::ModuleParameters for ResidentModel {
     fn num_parameters(&self) -> usize {
-        self.parameters().flatten().len()
+        crate::backend::mlx::nn::shared::neutral_parameter_refs(&self.inner, false)
+            .entries
+            .len()
     }
     fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
-        let mut model = safemlx::module::ModuleParamRef::new();
-        insert_module_ref(&mut model, "embed_tokens", &self.inner.decoder.embeddings);
-        let mut layers = safemlx::module::ModuleParamRef::new();
-        for (index, layer) in self.inner.decoder.layers.iter().enumerate() {
-            layers.insert(
-                index.to_string().into(),
-                safemlx::nested::NestedValue::Map(block_parameters(layer).entries),
-            );
-        }
-        model.insert(
-            "layers".into(),
-            safemlx::nested::NestedValue::Map(layers.entries),
-        );
-        insert_module_ref(&mut model, "norm", &self.inner.decoder.norm);
-        let mut root = safemlx::module::ModuleParamRef::new();
-        root.insert(
-            "model".into(),
-            safemlx::nested::NestedValue::Map(model.entries),
-        );
-        if let Some(head) = &self.inner.lm_head {
-            insert_module_ref(&mut root, "lm_head", head);
-        }
-        root
+        crate::backend::mlx::nn::shared::neutral_parameter_refs(&self.inner, false)
     }
     fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
-        let mut model = safemlx::module::ModuleParamMut::new();
-        insert_module_mut(
-            &mut model,
-            "embed_tokens",
-            &mut self.inner.decoder.embeddings,
-        );
-        let mut layers = safemlx::module::ModuleParamMut::new();
-        for (index, layer) in self.inner.decoder.layers.iter_mut().enumerate() {
-            layers.insert(
-                index.to_string().into(),
-                safemlx::nested::NestedValue::Map(block_parameters_mut(layer).entries),
-            );
-        }
-        model.insert(
-            "layers".into(),
-            safemlx::nested::NestedValue::Map(layers.entries),
-        );
-        insert_module_mut(&mut model, "norm", &mut self.inner.decoder.norm);
-        let mut root = safemlx::module::ModuleParamMut::new();
-        root.insert(
-            "model".into(),
-            safemlx::nested::NestedValue::Map(model.entries),
-        );
-        if let Some(head) = &mut self.inner.lm_head {
-            insert_module_mut(&mut root, "lm_head", head);
-        }
-        root
+        crate::backend::mlx::nn::shared::neutral_parameter_refs_mut(&mut self.inner)
     }
     fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
-        let mut model = safemlx::module::ModuleParamRef::new();
-        insert_trainable_ref(&mut model, "embed_tokens", &self.inner.decoder.embeddings);
-        let mut layers = safemlx::module::ModuleParamRef::new();
-        for (index, layer) in self.inner.decoder.layers.iter().enumerate() {
-            layers.insert(
-                index.to_string().into(),
-                safemlx::nested::NestedValue::Map(block_trainable_parameters(layer).entries),
-            );
-        }
-        model.insert(
-            "layers".into(),
-            safemlx::nested::NestedValue::Map(layers.entries),
-        );
-        insert_trainable_ref(&mut model, "norm", &self.inner.decoder.norm);
-        let mut root = safemlx::module::ModuleParamRef::new();
-        root.insert(
-            "model".into(),
-            safemlx::nested::NestedValue::Map(model.entries),
-        );
-        if let Some(head) = &self.inner.lm_head {
-            insert_trainable_ref(&mut root, "lm_head", head);
-        }
-        root
+        crate::backend::mlx::nn::shared::neutral_parameter_refs(&self.inner, true)
     }
-    fn freeze_parameters(&mut self, recursive: bool) {
-        self.inner.decoder.embeddings.freeze_parameters(recursive);
-        for layer in &mut self.inner.decoder.layers {
-            freeze_block(layer, true, recursive);
-        }
-        self.inner.decoder.norm.freeze_parameters(recursive);
-        if let Some(head) = &mut self.inner.lm_head {
-            head.freeze_parameters(recursive);
-        }
+    fn freeze_parameters(&mut self, _recursive: bool) {
+        eredu_nn::Parameterized::set_trainable(&mut self.inner, false);
     }
-    fn unfreeze_parameters(&mut self, recursive: bool) {
-        self.inner.decoder.embeddings.unfreeze_parameters(recursive);
-        for layer in &mut self.inner.decoder.layers {
-            freeze_block(layer, false, recursive);
-        }
-        self.inner.decoder.norm.unfreeze_parameters(recursive);
-        if let Some(head) = &mut self.inner.lm_head {
-            head.unfreeze_parameters(recursive);
-        }
+    fn unfreeze_parameters(&mut self, _recursive: bool) {
+        eredu_nn::Parameterized::set_trainable(&mut self.inner, true);
     }
     fn all_frozen(&self) -> Option<bool> {
-        let mut states = std::iter::once(self.inner.decoder.embeddings.all_frozen())
-            .chain(
-                self.inner
-                    .decoder
-                    .layers
-                    .iter()
-                    .flat_map(block_frozen_states),
-            )
-            .chain(std::iter::once(self.inner.decoder.norm.all_frozen()))
-            .chain(self.inner.lm_head.iter().map(ModuleParameters::all_frozen))
-            .flatten()
-            .peekable();
-        states.peek()?;
-        Some(states.all(|frozen| frozen))
+        let states = crate::backend::mlx::nn::shared::neutral_parameter_states(&self.inner);
+        (!states.is_empty()).then(|| states.iter().all(|trainable| !trainable))
     }
     fn any_frozen(&self) -> Option<bool> {
-        let mut states = std::iter::once(self.inner.decoder.embeddings.any_frozen())
-            .chain(self.inner.decoder.layers.iter().flat_map(|block| {
-                [
-                    block.self_attention.query.any_frozen(),
-                    block.self_attention.key.any_frozen(),
-                    block.self_attention.value.any_frozen(),
-                    block.self_attention.output.any_frozen(),
-                    block.self_attention.rotary.any_frozen(),
-                    block.mlp.gate.any_frozen(),
-                    block.mlp.up.any_frozen(),
-                    block.mlp.down.any_frozen(),
-                    block.input_norm.any_frozen(),
-                    block.post_attention_norm.any_frozen(),
-                ]
-            }))
-            .chain(std::iter::once(self.inner.decoder.norm.any_frozen()))
-            .chain(self.inner.lm_head.iter().map(ModuleParameters::any_frozen))
-            .flatten()
-            .peekable();
-        states.peek()?;
-        Some(states.any(|frozen| frozen))
+        let states = crate::backend::mlx::nn::shared::neutral_parameter_states(&self.inner);
+        (!states.is_empty()).then(|| states.iter().any(|trainable| !trainable))
     }
 }
 
@@ -671,5 +361,71 @@ where
             stream,
         )?;
         logits.try_index_device((.., -1, ..), stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use safemlx::{module::ModuleParameters, Device, DeviceType};
+
+    fn model_args() -> ModelArgs {
+        eredu_architectures::llama::model_args_from_config_value(&serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "intermediate_size": 32,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 64,
+            "max_position_embeddings": 128,
+            "tie_word_embeddings": false
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn resident_model_exposes_exact_authoritative_parameter_ids() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let mut model = match ResidentModel::new(model_args(), &stream) {
+            Ok(model) => model,
+            Err(error) if error.to_string().contains("No Metal device available") => return,
+            Err(error) => panic!("failed to construct resident Llama: {error}"),
+        };
+        let mut names = model
+            .parameters()
+            .flatten()
+            .into_keys()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "lm_head.weight",
+                "model.embed_tokens.weight",
+                "model.layers.0.input_layernorm.weight",
+                "model.layers.0.mlp.down_proj.weight",
+                "model.layers.0.mlp.gate_proj.weight",
+                "model.layers.0.mlp.up_proj.weight",
+                "model.layers.0.post_attention_layernorm.weight",
+                "model.layers.0.self_attn.k_proj.weight",
+                "model.layers.0.self_attn.o_proj.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.v_proj.weight",
+                "model.norm.weight",
+            ]
+        );
+        assert!(names.iter().all(|name| !name.contains(".inner.")));
+        assert_eq!(model.num_parameters(), names.len());
+        assert_eq!(model.trainable_parameters().flatten().len(), names.len());
+
+        model.freeze_parameters(true);
+        assert_eq!(model.trainable_parameters().flatten().len(), 0);
+        assert_eq!(model.all_frozen(), Some(true));
+        model.unfreeze_parameters(true);
+        assert_eq!(model.trainable_parameters().flatten().len(), names.len());
+        assert_eq!(model.any_frozen(), Some(false));
     }
 }
