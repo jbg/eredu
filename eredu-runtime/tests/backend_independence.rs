@@ -9,9 +9,9 @@ use eredu_nn::{
 };
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, CollectiveBackend, DeviceState, ExecutionGraph,
-    ExecutionGroupSpec, LayeredArchitecture, LayeredForwardState, LayerwiseRuntime,
-    ParameterBackend, ResidentUnitWindow, RuntimeLayerState, StateLayout, SubmissionBackend,
-    TransferBackend, WeightBinding,
+    ExecutionGroupSpec, ExecutionUnitAddress, LayeredArchitecture, LayeredForwardState,
+    LayerwisePolicy, LayerwiseRuntime, ParameterBackend, RuntimeLayerState, StateLayout,
+    SubmissionBackend, TransferBackend, WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -471,6 +471,90 @@ struct FakeUnit {
     marker: i32,
 }
 
+struct RecordingLease {
+    ordinal: usize,
+    unit: FakeUnit,
+}
+
+impl std::ops::Deref for RecordingLease {
+    type Target = FakeUnit;
+
+    fn deref(&self) -> &Self::Target {
+        &self.unit
+    }
+}
+
+impl std::ops::DerefMut for RecordingLease {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.unit
+    }
+}
+
+struct RecordingPolicy {
+    units: Vec<Option<FakeUnit>>,
+    addresses: Vec<(usize, usize, usize)>,
+}
+
+impl RecordingPolicy {
+    fn new(units: Vec<FakeUnit>) -> Self {
+        Self {
+            units: units.into_iter().map(Some).collect(),
+            addresses: Vec::new(),
+        }
+    }
+}
+
+impl LayerwisePolicy<FakeBackend, FakeUnit> for RecordingPolicy {
+    type Lease = RecordingLease;
+    type Error = &'static str;
+
+    fn begin(&mut self, _: &FakeTensor, _: &()) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn acquire(
+        &mut self,
+        ordinal: usize,
+        address: ExecutionUnitAddress,
+        _: &(),
+    ) -> Result<Self::Lease, Self::Error> {
+        self.addresses
+            .push((ordinal, address.group(), address.index()));
+        let unit = self
+            .units
+            .get_mut(ordinal)
+            .and_then(Option::take)
+            .ok_or("invalid fixture acquisition")?;
+        Ok(RecordingLease { ordinal, unit })
+    }
+
+    fn complete<'a, StateValues, ContextValues>(
+        &mut self,
+        ordinal: usize,
+        _: ExecutionUnitAddress,
+        lease: Self::Lease,
+        _: &'a FakeTensor,
+        _: StateValues,
+        _: ContextValues,
+        _: &(),
+    ) -> Result<(), Self::Error>
+    where
+        FakeTensor: 'a,
+        StateValues: Iterator<Item = &'a FakeTensor>,
+        ContextValues: Iterator<Item = &'a FakeTensor>,
+    {
+        if lease.ordinal != ordinal {
+            return Err("fixture completion ordinal drifted");
+        }
+        self.units[ordinal] = Some(lease.unit);
+        Ok(())
+    }
+
+    fn finish(&mut self, _: &FakeTensor, _: &()) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 impl Parameterized<FakeTensor> for FakeUnit {
     fn visit_parameters<'a, V>(&'a self, _visitor: &mut V)
     where
@@ -630,7 +714,7 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
         .map(|marker| FakeUnit { marker })
         .collect();
     let mut runtime =
-        LayerwiseRuntime::<_, FakeBackend, _, _>::new(architecture, ResidentUnitWindow::new(units));
+        LayerwiseRuntime::<_, FakeBackend, _, _>::new(architecture, RecordingPolicy::new(units));
 
     let (output, context_trace) = runtime
         .forward_with_context_hook((), &mut state, &(), |group, index, context| {
@@ -645,6 +729,10 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
         vec![(0, 0), (1, 0), (2, 0), (2, 1)]
     );
     assert_eq!(context_trace, runtime.architecture().trace);
+    assert_eq!(
+        runtime.policy().addresses,
+        vec![(0, 0, 0), (1, 1, 0), (2, 2, 0), (3, 2, 1)]
+    );
     assert_eq!(FORK_COUNT.load(Ordering::Relaxed), 1);
     assert_eq!(SUBMIT_COUNT.load(Ordering::Relaxed), 4);
     assert_eq!(ORDER_COUNT.load(Ordering::Relaxed), 5);

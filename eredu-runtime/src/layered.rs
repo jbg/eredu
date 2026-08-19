@@ -367,16 +367,21 @@ where
     ) -> Result<(), Self::Error>;
 
     /// Acquires one populated unit for exclusive execution.
+    ///
+    /// The flat ordinal addresses storage while `address` preserves the
+    /// architecture execution group and group-local unit index for scheduling.
     fn acquire(
         &mut self,
-        index: usize,
+        ordinal: usize,
+        address: crate::ExecutionUnitAddress,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Lease, Self::Error>;
 
     /// Retains the unit and dependent native values through exact completion.
     fn complete<'a, StateValues, ContextValues>(
         &mut self,
-        index: usize,
+        ordinal: usize,
+        address: crate::ExecutionUnitAddress,
         lease: Self::Lease,
         output: &'a B::Tensor,
         state_values: StateValues,
@@ -585,9 +590,12 @@ where
                     let ordinal = layout
                         .ordinal(group, index)
                         .expect("group-local unit belongs to the layout");
+                    let address = layout
+                        .address(ordinal)
+                        .expect("group-local unit has a stable policy address");
                     let mut lease = self
                         .policy
-                        .acquire(ordinal, executor)
+                        .acquire(ordinal, address, executor)
                         .map_err(LayerwiseRuntimeError::Policy)?;
                     hidden = self
                         .architecture
@@ -612,6 +620,7 @@ where
                     self.policy
                         .complete(
                             ordinal,
+                            address,
                             lease,
                             &hidden,
                             state_values,
@@ -779,9 +788,12 @@ where
                     let ordinal = layout
                         .ordinal(group, index)
                         .expect("group-local unit belongs to the layout");
+                    let address = layout
+                        .address(ordinal)
+                        .expect("group-local unit has a stable policy address");
                     let mut lease = self
                         .policy
-                        .acquire(ordinal, executor)
+                        .acquire(ordinal, address, executor)
                         .map_err(LayerwiseRuntimeError::Policy)?;
                     hidden = self
                         .architecture
@@ -807,6 +819,7 @@ where
                     self.policy
                         .complete(
                             ordinal,
+                            address,
                             lease,
                             &hidden,
                             state_values,
@@ -964,13 +977,16 @@ where
                     let ordinal = layout
                         .ordinal(group, index)
                         .expect("group-local unit belongs to the layout");
+                    let address = layout
+                        .address(ordinal)
+                        .expect("group-local unit has a stable policy address");
                     let path = self
                         .architecture
                         .unit_path(group, index)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let mut lease = self
                         .policy
-                        .acquire(ordinal, executor)
+                        .acquire(ordinal, address, executor)
                         .map_err(LayerwiseRuntimeError::Policy)?;
                     let unit_input = hidden.clone();
                     let output = self
@@ -997,6 +1013,7 @@ where
                     self.policy
                         .complete(
                             ordinal,
+                            address,
                             lease,
                             &hidden,
                             state_values,
@@ -1096,6 +1113,7 @@ where
     fn acquire(
         &mut self,
         index: usize,
+        _address: crate::ExecutionUnitAddress,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self::Lease, Self::Error> {
         let count = self.units.len();
@@ -1111,6 +1129,7 @@ where
     fn complete<'a, StateValues, ContextValues>(
         &mut self,
         index: usize,
+        _address: crate::ExecutionUnitAddress,
         lease: Self::Lease,
         _output: &'a B::Tensor,
         _state_values: StateValues,

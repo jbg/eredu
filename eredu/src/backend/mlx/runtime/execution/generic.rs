@@ -1,7 +1,10 @@
 //! SafeMLX realization of the backend-neutral layerwise unit policy.
 
 use eredu_checkpoint::store::SharedCheckpointSource;
-use eredu_runtime::{DenseDiskStreamReport, LayerWeightResidency, LayerwiseModelMetadata};
+use eredu_runtime::{
+    DenseDiskStreamReport, ExecutionUnitAddress, ExecutionUnitLayout, LayerWeightResidency,
+    LayerwiseModelMetadata,
+};
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -62,6 +65,7 @@ pub(crate) struct MlxLayerwisePolicy<U, F> {
     residency: ResidencyManager,
     store: SharedCheckpointSource,
     unit_ids: Vec<OffloadUnitId>,
+    layout: ExecutionUnitLayout,
     window_depth: usize,
     build: F,
     _static_leases: Vec<ResidentUnitLease>,
@@ -73,9 +77,10 @@ pub(crate) struct MlxLayerwisePolicy<U, F> {
 
 struct MlxDenseExecution {
     controller: Arc<DenseStreamController>,
-    window: Option<DenseTransferWindow>,
+    windows: Vec<Option<DenseTransferWindow>>,
     forward: Option<DenseStreamForwardGuard>,
-    group: Option<DenseStreamGroupGuard>,
+    groups: Vec<Option<DenseStreamGroupGuard>>,
+    prefill: bool,
 }
 
 /// Permanently populated MLX units used by fully resident execution.
@@ -126,6 +131,7 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
         residency: ResidencyManager,
         store: SharedCheckpointSource,
         unit_ids: Vec<OffloadUnitId>,
+        layout: ExecutionUnitLayout,
         window_depth: usize,
         build: F,
         static_leases: Vec<ResidentUnitLease>,
@@ -147,15 +153,17 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
             residency,
             store,
             unit_ids,
+            layout: layout.clone(),
             window_depth,
             build,
             _static_leases: static_leases,
             pending: VecDeque::new(),
             dense: dense.map(|controller| MlxDenseExecution {
                 controller,
-                window: None,
+                windows: (0..layout.group_count()).map(|_| None).collect(),
                 forward: None,
-                group: None,
+                groups: (0..layout.group_count()).map(|_| None).collect(),
+                prefill: false,
             }),
             sample_mlx_memory,
             sample_process_memory,
@@ -189,12 +197,17 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
         Ok(())
     }
 
-    fn trim_device_window(&self, current: usize) -> Result<(), Error> {
-        let end = current
-            .saturating_add(self.window_depth)
-            .min(self.unit_ids.len());
+    fn trim_device_window(
+        &self,
+        current: usize,
+        address: ExecutionUnitAddress,
+    ) -> Result<(), Error> {
+        let range = self.layout.group_range(address.group()).ok_or_else(|| {
+            Error::Parallel(format!("unknown execution group {}", address.group()))
+        })?;
+        let end = current.saturating_add(self.window_depth).min(range.end);
         for (index, id) in self.unit_ids.iter().enumerate() {
-            if index < current || index >= end {
+            if !range.contains(&index) || index < current || index >= end {
                 self.residency.evict(id, MemoryTier::Device)?;
             }
         }
@@ -286,7 +299,12 @@ impl<U> LayerwisePolicy<MlxBackend, U> for MlxResidentPolicy<U> {
         Ok(())
     }
 
-    fn acquire(&mut self, index: usize, _stream: &Stream) -> Result<Self::Lease, Self::Error> {
+    fn acquire(
+        &mut self,
+        index: usize,
+        _address: eredu_runtime::ExecutionUnitAddress,
+        _stream: &Stream,
+    ) -> Result<Self::Lease, Self::Error> {
         let count = self.units.len();
         let unit = self
             .units
@@ -302,6 +320,7 @@ impl<U> LayerwisePolicy<MlxBackend, U> for MlxResidentPolicy<U> {
     fn complete<'a, StateValues, ContextValues>(
         &mut self,
         index: usize,
+        _address: eredu_runtime::ExecutionUnitAddress,
         lease: Self::Lease,
         _output: &'a Array,
         _state_values: StateValues,
@@ -409,7 +428,7 @@ pub(crate) fn prepare_layerwise_policy<SM, U, F, I>(
     store: SharedCheckpointSource,
     static_modules: &mut SM,
     build: F,
-    layer_count: usize,
+    layout: ExecutionUnitLayout,
     options: LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
@@ -425,7 +444,7 @@ where
         store,
         static_modules,
         build,
-        layer_count,
+        layout,
         options,
         stream,
         weights_stream,
@@ -449,7 +468,7 @@ pub(crate) fn prepare_layerwise_policy_with_bindings<SM, U, F, I, SB, UB>(
     store: SharedCheckpointSource,
     static_modules: &mut SM,
     mut build: F,
-    layer_count: usize,
+    layout: ExecutionUnitLayout,
     options: LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
@@ -473,7 +492,8 @@ where
         &Stream,
     ) -> Result<Vec<WeightBinding>, Error>,
 {
-    if layer_count == 0 {
+    let unit_count = layout.len();
+    if unit_count == 0 {
         return Err(Error::Parallel(
             "generic MLX architecture declared no execution units".into(),
         ));
@@ -481,7 +501,7 @@ where
     let fully_resident = options.is_fully_resident();
     let dense = options.dense();
     let offload = options.offload()?;
-    let depth = options.device_depth(layer_count);
+    let depth = options.device_depth(unit_count);
     let mut definitions = Vec::new();
     let mut specs = Vec::new();
     let mut consumed = BTreeSet::new();
@@ -502,12 +522,12 @@ where
         MemoryTier::Device,
     )?);
 
-    let mut unit_ids = Vec::with_capacity(layer_count);
-    let mut unit_bytes = Vec::with_capacity(layer_count);
+    let mut unit_ids = Vec::with_capacity(unit_count);
+    let mut unit_bytes = Vec::with_capacity(unit_count);
     let mut layer_parameter_bytes = 0u64;
     let mut total_host_bytes = 0u64;
     let mut maximum_host_bytes = 0u64;
-    for index in 0..layer_count {
+    for index in 0..unit_count {
         let unit = build.build(index, stream)?;
         let bindings = unit_bindings(index, unit, store.as_ref(), stream)?;
         let bytes = binding_bytes(&bindings)?;
@@ -524,7 +544,17 @@ where
                 .iter()
                 .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
         );
-        let id = OffloadUnitId::new(format!("model.unit.{index:05}"))?;
+        let address = layout
+            .address(index)
+            .expect("validated layout covers every flat unit");
+        let group_id = layout
+            .group_id(address.group())
+            .expect("validated layout names every execution group");
+        let id = OffloadUnitId::new(format!(
+            "model.{}.{:05}",
+            group_id.as_str(),
+            address.index()
+        ))?;
         definitions.push(OffloadUnit::new(id.clone(), bindings)?);
         specs.push(OffloadUnitSpec::new(
             id.clone(),
@@ -549,7 +579,17 @@ where
     }
     consumed.extend(store.materialized_source_keys());
     validate_unused(store.as_ref(), &consumed, options.strict_loading(), ignored)?;
-    let device_window_bytes = largest_window_bytes(&unit_bytes, depth)?;
+    let device_window_bytes = (0..layout.group_count())
+        .map(|group| {
+            let range = layout
+                .group_range(group)
+                .expect("validated layout covers every execution group");
+            largest_window_bytes(&unit_bytes[range], depth)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
     let host_required = match dense {
         Some(dense) if dense.host_budget_bytes > 0 => maximum_host_bytes
             .checked_mul(dense.host_lookahead as u64)
@@ -580,7 +620,7 @@ where
     let metadata = LayerwiseModelMetadata::new(
         "generic",
         None,
-        layer_count,
+        unit_count,
         static_bytes,
         options.execution_residency(),
         layer_parameter_bytes,
@@ -593,11 +633,21 @@ where
             DenseStreamController::new(
                 &residency,
                 options,
-                layer_count,
+                unit_count,
                 layer_parameter_bytes,
                 maximum_host_bytes,
                 static_bytes,
-                [("model".to_string(), unit_ids.clone())],
+                (0..layout.group_count()).map(|group| {
+                    let range = layout
+                        .group_range(group)
+                        .expect("validated layout covers every execution group");
+                    let id = layout
+                        .group_id(group)
+                        .expect("validated layout names every execution group")
+                        .as_str()
+                        .to_owned();
+                    (id, unit_ids[range].to_vec())
+                }),
             )
             .map(Arc::new)
         })
@@ -606,6 +656,7 @@ where
         residency,
         Arc::clone(&store),
         unit_ids,
+        layout,
         depth,
         build,
         vec![static_lease],
@@ -628,35 +679,64 @@ where
         let Some(dense) = &mut self.dense else {
             return Ok(());
         };
-        if dense.window.is_some() || dense.forward.is_some() || dense.group.is_some() {
+        if dense.windows.iter().any(Option::is_some)
+            || dense.forward.is_some()
+            || dense.groups.iter().any(Option::is_some)
+        {
             return Err(Error::Parallel(
                 "dense MLX policy began a forward while another remained active".into(),
             ));
         }
         let prefill = initial.dim(1) > 1;
         let forward = dense.controller.forward_guard(prefill, &self.residency)?;
-        let group = dense.controller.group_guard(&self.residency, "model");
-        let window = dense.controller.transfer_window(
-            &self.residency,
-            "model",
-            &self.unit_ids,
-            0..self.unit_ids.len(),
-            prefill,
-        )?;
+        dense.prefill = prefill;
         dense.forward = Some(forward);
-        dense.group = Some(group);
-        dense.window = Some(window);
         Ok(())
     }
 
-    fn acquire(&mut self, index: usize, stream: &Stream) -> Result<Self::Lease, Self::Error> {
+    fn acquire(
+        &mut self,
+        index: usize,
+        address: ExecutionUnitAddress,
+        stream: &Stream,
+    ) -> Result<Self::Lease, Self::Error> {
+        if self.layout.address(index) != Some(address) {
+            return Err(Error::Parallel(format!(
+                "execution unit {index} does not match group {} unit {}",
+                address.group(),
+                address.index()
+            )));
+        }
         self.reap_completed()?;
         if self.dense.is_some() {
+            let group = address.group();
+            let group_id = self
+                .layout
+                .group_id(group)
+                .expect("validated unit address names its execution group")
+                .as_str();
+            let range = self
+                .layout
+                .group_range(group)
+                .expect("validated unit address has a group range");
+            let dense = self.dense.as_mut().expect("dense policy is active");
+            if dense.groups[group].is_none() {
+                dense.groups[group] = Some(dense.controller.group_guard(&self.residency, group_id));
+            }
+            if dense.windows[group].is_none() {
+                dense.windows[group] = Some(dense.controller.transfer_window(
+                    &self.residency,
+                    group_id,
+                    &self.unit_ids,
+                    range,
+                    dense.prefill,
+                )?);
+            }
             loop {
                 let refill = self
                     .dense
                     .as_mut()
-                    .and_then(|dense| dense.window.as_mut())
+                    .and_then(|dense| dense.windows[group].as_mut())
                     .expect("dense forward begins before acquisition")
                     .refill();
                 match refill {
@@ -668,7 +748,7 @@ where
             let transfer = self
                 .dense
                 .as_mut()
-                .and_then(|dense| dense.window.as_mut())
+                .and_then(|dense| dense.windows[group].as_mut())
                 .expect("dense forward begins before acquisition")
                 .next(stream)?;
             if transfer.index() != index {
@@ -692,10 +772,12 @@ where
         // overlapping in-flight unit would wait for the very transfer guard
         // retained by `pending` on this thread.
         self.drain_one()?;
-        self.trim_device_window(index)?;
-        let end = index
-            .saturating_add(self.window_depth)
-            .min(self.unit_ids.len());
+        self.trim_device_window(index, address)?;
+        let group_range = self
+            .layout
+            .group_range(address.group())
+            .expect("validated unit address has a group range");
+        let end = index.saturating_add(self.window_depth).min(group_range.end);
         let requests = self.unit_ids[index..end]
             .iter()
             .cloned()
@@ -725,6 +807,7 @@ where
     fn complete<'a, StateValues, ContextValues>(
         &mut self,
         _index: usize,
+        _address: ExecutionUnitAddress,
         lease: Self::Lease,
         output: &'a Array,
         state_values: StateValues,
@@ -753,9 +836,13 @@ where
                 .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
         }
         if let Some(dense) = &mut self.dense {
-            dense.window.take();
-            if let Some(group) = dense.group.take() {
-                group.complete()?;
+            for window in &mut dense.windows {
+                window.take();
+            }
+            for group in &mut dense.groups {
+                if let Some(group) = group.take() {
+                    group.complete()?;
+                }
             }
             if let Some(forward) = dense.forward.take() {
                 forward.complete()?;

@@ -99,6 +99,7 @@ impl ExecutionUnitAddress {
 /// Validated mapping between architecture groups and the flat residency-unit order.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExecutionUnitLayout {
+    group_ids: Vec<ExecutionGroupId>,
     group_ranges: Vec<Range<usize>>,
     addresses: Vec<ExecutionUnitAddress>,
 }
@@ -116,6 +117,14 @@ impl ExecutionUnitLayout {
                 declared_groups: counts.len(),
             });
         }
+        let group_ids = graph
+            .groups()
+            .iter()
+            .map(|group| {
+                ExecutionGroupId::new(group.id().to_owned())
+                    .expect("validated execution graph has non-empty group identifiers")
+            })
+            .collect();
         let mut group_ranges = Vec::with_capacity(counts.len());
         let mut addresses = Vec::new();
         for (group, count) in counts.into_iter().enumerate() {
@@ -128,6 +137,7 @@ impl ExecutionUnitLayout {
             group_ranges.push(start..end);
         }
         Ok(Self {
+            group_ids,
             group_ranges,
             addresses,
         })
@@ -141,6 +151,16 @@ impl ExecutionUnitLayout {
     /// Returns whether the architecture declares no executable units.
     pub fn is_empty(&self) -> bool {
         self.addresses.is_empty()
+    }
+
+    /// Returns the number of architecture execution groups.
+    pub fn group_count(&self) -> usize {
+        self.group_ranges.len()
+    }
+
+    /// Returns one architecture execution group's stable identifier.
+    pub fn group_id(&self, group: usize) -> Option<&ExecutionGroupId> {
+        self.group_ids.get(group)
     }
 
     /// Returns the group-major flat range for one architecture group.
@@ -685,6 +705,9 @@ mod tests {
         let layout = ExecutionUnitLayout::new(&graph, [2, 3]).unwrap();
 
         assert_eq!(layout.len(), 5);
+        assert_eq!(layout.group_count(), 2);
+        assert_eq!(layout.group_id(0).unwrap().as_str(), "vision");
+        assert_eq!(layout.group_id(1).unwrap().as_str(), "text");
         assert_eq!(layout.group_range(0), Some(0..2));
         assert_eq!(layout.group_range(1), Some(2..5));
         assert_eq!(layout.address(3).unwrap().group(), 1);

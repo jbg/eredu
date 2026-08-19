@@ -2,9 +2,9 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
-    CausalModel, ExecutionResidency, LayerWeightResidency, LayeredArchitecture,
-    LayeredForwardState, LayerwiseRuntime, ParallelLayeredArchitecture, RuntimeState,
-    WeightResidency,
+    CausalModel, ExecutionGraph, ExecutionResidency, ExecutionUnitLayout, LayerWeightResidency,
+    LayeredArchitecture, LayeredForwardState, LayerwiseRuntime, ParallelLayeredArchitecture,
+    RuntimeState, WeightResidency,
 };
 
 use std::{collections::HashMap, path::Path, sync::Arc};
@@ -120,6 +120,13 @@ enum LlamaExecution {
     TensorParallelLayerwise(Box<NeutralParallelLayerwiseRuntime>),
 }
 
+fn decoder_unit_layout(layer_count: usize) -> Result<ExecutionUnitLayout, Error> {
+    let graph = ExecutionGraph::chain(["decoder"])
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    ExecutionUnitLayout::new(&graph, [layer_count])
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
 fn load_model_args(model_dir: &Path) -> Result<ModelArgs, Error> {
     let file = std::fs::File::open(model_dir.join("config.json"))?;
     eredu_architectures::llama::model_args_from_config_reader(file)
@@ -163,11 +170,12 @@ fn load_neutral_llama(
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let factory = LlamaUnitFactory { args: args.clone() };
+    let unit_layout = decoder_unit_layout(layer_count)?;
     let (policy, mut metadata) = prepare_layerwise_policy(
         store,
         architecture.static_modules_mut(),
         factory,
-        layer_count,
+        unit_layout,
         options,
         stream,
         weights_stream,
@@ -754,11 +762,12 @@ fn load_neutral_llama_parallel(
     }
 
     let binding_args = args.clone();
+    let unit_layout = decoder_unit_layout(layer_count)?;
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
         &mut composition,
         factory,
-        layer_count,
+        unit_layout,
         options,
         stream,
         weights_stream,
