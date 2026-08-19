@@ -221,6 +221,10 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
         self.store.as_ref()
     }
 
+    pub(crate) fn checkpoint_store_arc(&self) -> SharedCheckpointSource {
+        Arc::clone(&self.store)
+    }
+
     pub(crate) fn residency_report(&self) -> Result<eredu_runtime::ResidencyReport, Error> {
         self.residency.report().map_err(Into::into)
     }
@@ -328,6 +332,10 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
 impl<U> MlxResidentPolicy<U> {
     pub(crate) fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
         self.store.as_ref()
+    }
+
+    pub(crate) fn checkpoint_store_arc(&self) -> SharedCheckpointSource {
+        Arc::clone(&self.store)
     }
 
     pub(crate) fn residency_report(&self) -> Result<eredu_runtime::ResidencyReport, Error> {

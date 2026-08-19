@@ -1513,13 +1513,54 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
     .into_inner()
     .into_complete()
     .unwrap();
-    let Model::GptOss(model) = model else {
+    let Model::GptOss(mut model) = model else {
         panic!("expected GPT-OSS model")
     };
     assert_eq!(
         model.residency_metadata().quantization(),
         Some(WeightQuantization::MxFp4)
     );
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let mut cache = model.new_cache();
+    let logits = model.forward(&tokens, &mut cache, stream).unwrap();
+    safemlx::transforms::eval([&logits]).unwrap();
+    assert_eq!(logits.shape(), &[1, 2, 32]);
+    let mut bounded =
+        crate::composition::mlx_architectures::gpt_oss::layerwise::load_gpt_oss_layerwise_model(
+            &dir,
+            eredu_runtime::LayerwiseLoadOptions::default(),
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+    assert_eq!(
+        bounded.residency_metadata().residency(),
+        eredu_runtime::ExecutionResidency::LayerwiseHost
+    );
+    let mut bounded_cache = bounded.new_cache();
+    let bounded_logits = bounded
+        .forward(&tokens, &mut bounded_cache, stream)
+        .unwrap();
+    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    assert_eq!(bounded_logits.shape(), logits.shape());
+    let mut cached_experts =
+        crate::composition::mlx_architectures::gpt_oss::layerwise::load_gpt_oss_expert_cache_model(
+            &dir,
+            eredu_runtime::NonExpertWeightResidency::FullyResident,
+            eredu_runtime::ExpertCacheLoadOptions::default(),
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+    let mut cached_expert_state = cached_experts.new_cache();
+    let cached_expert_logits = cached_experts
+        .forward(&tokens, &mut cached_expert_state, stream)
+        .unwrap();
+    safemlx::transforms::eval([&cached_expert_logits]).unwrap();
+    assert_eq!(cached_expert_logits.shape(), logits.shape());
+    assert!(cached_experts.expert_cache_report().unwrap().is_some());
     fs::remove_dir_all(dir).unwrap();
 }
 
