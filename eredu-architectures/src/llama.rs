@@ -19,7 +19,11 @@ use eredu_nn::{
     NeuralBackend, NormalizationOperator, NormalizationSpec, ParameterSpec, RotaryOperator,
     RotarySpec, Tensor,
 };
-use eredu_runtime::{ModelStateIdentity, StateLayout};
+use eredu_runtime::{
+    aligned_partition_units, module_parameter_group, partitioned_projection_group, MemberSharding,
+    ModelStateIdentity, ParallelPlanError, ParameterGroupSpec, ParameterRole, ProjectionSharding,
+    StateLayout,
+};
 
 /// Geometry consumed by the shared Llama implementation.
 pub trait Config {
@@ -587,6 +591,145 @@ impl<B: NeuralBackend> TransformerBlock<B> {
         let mlp = self.mlp.forward_parallel(&normalized, parallel, context)?;
         hidden.add(&mlp, context)
     }
+}
+
+/// Declares every rank-local placement group for one Llama decoder block.
+pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
+    block: &TransformerBlock<B>,
+    config: &impl Config,
+    layer: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    let prefix = format!("model.layers.{layer}");
+    let query_heads = usize::try_from(config.num_attention_heads()).map_err(|_| {
+        ParallelPlanError::InvalidGroup("Llama query-head count exceeds usize".into())
+    })?;
+    let key_value_heads = usize::try_from(config.num_key_value_heads()).map_err(|_| {
+        ParallelPlanError::InvalidGroup("Llama key/value-head count exceeds usize".into())
+    })?;
+    let head_dimension = usize::try_from(config.head_dim()).map_err(|_| {
+        ParallelPlanError::InvalidGroup("Llama head dimension exceeds usize".into())
+    })?;
+    if head_dimension == 0 || key_value_heads == 0 || !query_heads.is_multiple_of(key_value_heads) {
+        return Err(ParallelPlanError::InvalidGroup(format!(
+            "Llama attention geometry q={query_heads}, kv={key_value_heads}, dim={head_dimension} does not form positive integral GQA groups"
+        )));
+    }
+    let group_width = (query_heads / key_value_heads)
+        .checked_mul(head_dimension)
+        .ok_or_else(|| {
+            ParallelPlanError::InvalidGroup("Llama GQA group width overflowed".into())
+        })?;
+    let attention_alignment = config
+        .weight_quantization(&format!("{prefix}.self_attn.o_proj.weight"))
+        .map_or(Ok(1), |quantization| {
+            usize::try_from(quantization.group_size()).map_err(|_| {
+                ParallelPlanError::InvalidGroup(
+                    "Llama output-projection quantization group exceeds usize".into(),
+                )
+            })
+        })?;
+    let attention_units = aligned_partition_units(
+        &format!("{prefix}.self_attn"),
+        key_value_heads,
+        group_width,
+        attention_alignment,
+    )?;
+    let attention = partitioned_projection_group::<B::Tensor, B::Linear>(
+        format!("{prefix}.self_attn.projections"),
+        ParameterRole::AttentionHeads,
+        &[
+            (&block.self_attention.query, ProjectionSharding::Column),
+            (&block.self_attention.key, ProjectionSharding::Column),
+            (&block.self_attention.value, ProjectionSharding::Column),
+            (&block.self_attention.output, ProjectionSharding::Row),
+        ],
+        attention_units,
+    )?;
+
+    let intermediate = usize::try_from(config.intermediate_size()).map_err(|_| {
+        ParallelPlanError::InvalidGroup("Llama feed-forward width exceeds usize".into())
+    })?;
+    let mlp_alignment = config
+        .weight_quantization(&format!("{prefix}.mlp.down_proj.weight"))
+        .map_or(Ok(1), |quantization| {
+            usize::try_from(quantization.group_size()).map_err(|_| {
+                ParallelPlanError::InvalidGroup(
+                    "Llama down-projection quantization group exceeds usize".into(),
+                )
+            })
+        })?;
+    let mlp_units =
+        aligned_partition_units(&format!("{prefix}.mlp"), intermediate, 1, mlp_alignment)?;
+    let mlp = partitioned_projection_group::<B::Tensor, B::Linear>(
+        format!("{prefix}.mlp.projections"),
+        ParameterRole::FeedForwardIntermediate,
+        &[
+            (&block.mlp.gate, ProjectionSharding::Column),
+            (&block.mlp.up, ProjectionSharding::Column),
+            (&block.mlp.down, ProjectionSharding::Row),
+        ],
+        mlp_units,
+    )?;
+    let input_norm = module_parameter_group::<B::Tensor, _>(
+        format!("{prefix}.input_layernorm"),
+        ParameterRole::Replicated,
+        &block.input_norm,
+        |_, _| Ok(MemberSharding::Replicated),
+    )?;
+    let post_attention_norm = module_parameter_group::<B::Tensor, _>(
+        format!("{prefix}.post_attention_layernorm"),
+        ParameterRole::Replicated,
+        &block.post_attention_norm,
+        |_, _| Ok(MemberSharding::Replicated),
+    )?;
+    Ok(vec![attention, mlp, input_norm, post_attention_norm])
+}
+
+/// Declares embedding, final normalization, and output-head placement groups.
+pub fn static_parallel_parameter_groups<B: NeuralBackend>(
+    embeddings: &B::Embedding,
+    norm: &B::Normalization,
+    head: Option<&B::Linear>,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    let mut groups = vec![
+        module_parameter_group::<B::Tensor, _>(
+            "model.embed_tokens",
+            ParameterRole::Vocabulary,
+            embeddings,
+            |_, shape| {
+                if shape.is_empty() {
+                    Err(ParallelPlanError::InvalidTensor(
+                        "Llama embedding parameter is scalar".into(),
+                    ))
+                } else {
+                    Ok(MemberSharding::Balanced { axis: 0 })
+                }
+            },
+        )?,
+        module_parameter_group::<B::Tensor, _>(
+            "model.norm",
+            ParameterRole::Replicated,
+            norm,
+            |_, _| Ok(MemberSharding::Replicated),
+        )?,
+    ];
+    if let Some(head) = head {
+        groups.push(module_parameter_group::<B::Tensor, _>(
+            "lm_head",
+            ParameterRole::Vocabulary,
+            head,
+            |_, shape| {
+                if shape.is_empty() {
+                    Err(ParallelPlanError::InvalidTensor(
+                        "Llama language-model head parameter is scalar".into(),
+                    ))
+                } else {
+                    Ok(MemberSharding::Balanced { axis: 0 })
+                }
+            },
+        )?);
+    }
+    Ok(groups)
 }
 
 /// Llama transformer body without its language-model head.

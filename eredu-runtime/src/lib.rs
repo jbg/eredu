@@ -27,8 +27,10 @@ pub use execution::{
 };
 pub use generation::CausalModel;
 pub use parallel::{
-    LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec,
-    ParameterMemberSpec, ParameterRole, ShardingPolicy, TensorPlacement,
+    aligned_partition_units, module_parameter_group, partitioned_projection_group,
+    projection_parameter_group, LocalModelLayout, LocalTensorLayout, MemberSharding,
+    ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ProjectionSharding,
+    ShardingPolicy, TensorPlacement,
 };
 pub use parameter::{
     bind_materialized_unit, materialize_bindings, MaterializedUnit, ParameterOrchestrationError,

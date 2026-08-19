@@ -9,6 +9,8 @@ use std::{
     ops::Range,
 };
 
+use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized, Tensor};
+
 /// Semantic role of a logical parameter group.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ParameterRole {
@@ -30,6 +32,17 @@ pub enum ParameterRole {
     Channels,
     /// A fused tensor containing independently partitioned segments.
     Segmented,
+}
+
+/// Logical sharding behavior for a parameterized affine projection.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ProjectionSharding {
+    /// Keep every projection parameter complete on every rank.
+    Replicated,
+    /// Partition projection output features.
+    Column,
+    /// Partition projection input features and replicate output bias.
+    Row,
 }
 
 /// Rank-local selection rule for one physical checkpoint tensor.
@@ -208,6 +221,180 @@ impl ParameterGroupSpec {
     pub fn members(&self) -> &[ParameterMemberSpec] {
         &self.members
     }
+}
+
+/// Describes every parameter in a neutral module as one logical group.
+pub fn module_parameter_group<T, M>(
+    logical_name: impl Into<String>,
+    role: ParameterRole,
+    module: &M,
+    mut sharding: impl FnMut(&ParameterMetadata, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
+) -> Result<ParameterGroupSpec, ParallelPlanError>
+where
+    T: Tensor,
+    M: Parameterized<T>,
+{
+    struct Collector<'a, F> {
+        members: Vec<ParameterMemberSpec>,
+        sharding: &'a mut F,
+        error: Option<ParallelPlanError>,
+    }
+
+    impl<'a, 'tensor, T, F> ParameterVisitor<'tensor, T> for Collector<'a, F>
+    where
+        T: Tensor,
+        F: FnMut(&ParameterMetadata, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
+    {
+        fn visit(&mut self, metadata: ParameterMetadata, value: &'tensor T) {
+            if self.error.is_some() {
+                return;
+            }
+            let shape = value
+                .shape()
+                .iter()
+                .map(|dimension| {
+                    usize::try_from(*dimension).map_err(|_| {
+                        ParallelPlanError::InvalidTensor(format!(
+                            "parameter {} has negative dimension {dimension}",
+                            metadata.id.as_str()
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>();
+            let shape = match shape {
+                Ok(shape) => shape,
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            };
+            match (self.sharding)(&metadata, &shape) {
+                Ok(sharding) => self.members.push(ParameterMemberSpec::new(
+                    metadata.id.as_str(),
+                    shape,
+                    sharding,
+                )),
+                Err(error) => self.error = Some(error),
+            }
+        }
+    }
+
+    let mut collector = Collector {
+        members: Vec::new(),
+        sharding: &mut sharding,
+        error: None,
+    };
+    module.visit_parameters(&mut collector);
+    if let Some(error) = collector.error {
+        return Err(error);
+    }
+    ParameterGroupSpec::new(logical_name, role, collector.members)
+}
+
+/// Describes one affine projection and all encoding companions.
+pub fn projection_parameter_group<T, M>(
+    logical_name: impl Into<String>,
+    role: ParameterRole,
+    module: &M,
+    placement: ProjectionSharding,
+) -> Result<ParameterGroupSpec, ParallelPlanError>
+where
+    T: Tensor,
+    M: Parameterized<T>,
+{
+    module_parameter_group(
+        logical_name,
+        role,
+        module,
+        |metadata, shape| match placement {
+            ProjectionSharding::Replicated => Ok(MemberSharding::Replicated),
+            ProjectionSharding::Column if shape.is_empty() => {
+                Err(ParallelPlanError::InvalidTensor(format!(
+                    "column projection parameter {} is scalar",
+                    metadata.id.as_str()
+                )))
+            }
+            ProjectionSharding::Column => Ok(MemberSharding::Equal { axis: 0 }),
+            ProjectionSharding::Row if shape.len() >= 2 => Ok(MemberSharding::Equal { axis: 1 }),
+            ProjectionSharding::Row => Ok(MemberSharding::Replicated),
+        },
+    )
+}
+
+/// Describes projections that consume one shared logical partition.
+pub fn partitioned_projection_group<T, M>(
+    logical_name: impl Into<String>,
+    role: ParameterRole,
+    projections: &[(&M, ProjectionSharding)],
+    preferred_units: usize,
+) -> Result<ParameterGroupSpec, ParallelPlanError>
+where
+    T: Tensor,
+    M: Parameterized<T>,
+{
+    if preferred_units == 0 {
+        return Err(ParallelPlanError::InvalidGroup(
+            "partitioned projection group has zero preferred units".into(),
+        ));
+    }
+    let mut units = preferred_units;
+    let mut members = Vec::new();
+    for (module, placement) in projections {
+        let group = projection_parameter_group::<T, M>("projection", role, *module, *placement)?;
+        for member in group.members {
+            let sharding = match (placement, member.global_shape.len()) {
+                (ProjectionSharding::Replicated, _) | (ProjectionSharding::Row, 0 | 1) => {
+                    MemberSharding::Replicated
+                }
+                (ProjectionSharding::Column, 0) => unreachable!("validated above"),
+                (ProjectionSharding::Column, _) => {
+                    units = greatest_common_divisor(units, member.global_shape[0]);
+                    MemberSharding::Partitioned { axis: 0 }
+                }
+                (ProjectionSharding::Row, _) => {
+                    units = greatest_common_divisor(units, member.global_shape[1]);
+                    MemberSharding::Partitioned { axis: 1 }
+                }
+            };
+            members.push(ParameterMemberSpec::new(
+                member.target,
+                member.global_shape,
+                sharding,
+            ));
+        }
+    }
+    ParameterGroupSpec::partitioned(logical_name, role, units, members)
+}
+
+/// Returns the finest legal logical-unit count for an aligned partition.
+pub fn aligned_partition_units(
+    name: &str,
+    semantic_units: usize,
+    elements_per_unit: usize,
+    required_alignment: usize,
+) -> Result<usize, ParallelPlanError> {
+    if semantic_units == 0 || elements_per_unit == 0 || required_alignment == 0 {
+        return Err(ParallelPlanError::InvalidGroup(format!(
+            "{name} aligned partition dimensions must be positive, got units={semantic_units}, width={elements_per_unit}, alignment={required_alignment}"
+        )));
+    }
+    let units_per_partition =
+        required_alignment / greatest_common_divisor(elements_per_unit, required_alignment);
+    if !semantic_units.is_multiple_of(units_per_partition) {
+        return Err(ParallelPlanError::InvalidGroup(format!(
+            "{name} has {semantic_units} semantic units of width {elements_per_unit}, which cannot form complete alignment-{required_alignment} partitions"
+        )));
+    }
+    Ok(semantic_units / units_per_partition)
+}
+
+const fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 /// Behavior when a requested shard is not legal for the current TP size.
@@ -399,6 +586,9 @@ pub enum ParallelPlanError {
     /// A logical group is empty, ambiguous, or internally inconsistent.
     #[error("{0}")]
     InvalidGroup(String),
+    /// A backend-native parameter exposed invalid logical geometry.
+    #[error("{0}")]
+    InvalidTensor(String),
 }
 
 #[cfg(test)]

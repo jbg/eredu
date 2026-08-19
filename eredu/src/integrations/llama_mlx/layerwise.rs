@@ -31,11 +31,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::shared::{MlxBackend, MlxEmbedding, MlxLinear, MlxRmsNorm},
     backend::mlx::nn::{
-        parallel::{
-            planned_kv_head_layout, register_gqa_projection_group,
-            register_swiglu_projection_group, GqaProjectionNames, SwiGluProjectionNames,
-            VocabParallelEmbedding, VocabParallelLmHead,
-        },
+        parallel::{planned_kv_head_layout, VocabParallelEmbedding, VocabParallelLmHead},
         tensor::{create_attention_mask, AttentionMask},
     },
     backend::mlx::runtime::cache::residency::{
@@ -49,9 +45,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, store::open_gguf_checkpoint_source,
     },
-    backend::mlx::runtime::distributed::parallel::{
-        register_replicated_module, ParallelPlanBuilder,
-    },
+    backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
         open_safetensors_weight_store, ArchitectureAdapter, DenseDiskStreamReport,
@@ -702,60 +696,6 @@ pub struct LlamaAdapterInput<'a> {
     pub mask: Option<&'a Array>,
 }
 
-fn register_llama_layer_parallel_plan(
-    planner: &mut ParallelPlanBuilder,
-    layer: &TransformerBlock,
-    args: &ModelArgs,
-    prefix: &str,
-) -> Result<(), Error> {
-    let attention = &layer.inner.self_attention;
-    register_gqa_projection_group(
-        planner,
-        &format!("{prefix}.self_attn"),
-        GqaProjectionNames {
-            query: "q_proj",
-            key: "k_proj",
-            value: "v_proj",
-            output: "o_proj",
-        },
-        &attention.query,
-        &attention.key,
-        &attention.value,
-        &attention.output,
-        attention.query_heads,
-        attention.key_value_heads,
-        args.head_dim,
-    )?;
-    register_replicated_module(
-        planner,
-        &attention.rotary,
-        &format!("{prefix}.self_attn.rope"),
-    )?;
-    register_swiglu_projection_group(
-        planner,
-        &format!("{prefix}.mlp"),
-        SwiGluProjectionNames {
-            gate: "gate_proj",
-            up: "up_proj",
-            down: "down_proj",
-        },
-        &layer.inner.mlp.gate,
-        &layer.inner.mlp.up,
-        &layer.inner.mlp.down,
-        args.intermediate_size,
-    )?;
-    register_replicated_module(
-        planner,
-        &layer.inner.input_norm,
-        &format!("{prefix}.input_layernorm"),
-    )?;
-    register_replicated_module(
-        planner,
-        &layer.inner.post_attention_norm,
-        &format!("{prefix}.post_attention_layernorm"),
-    )
-}
-
 impl ArchitectureAdapter for LlamaLayerwiseAdapter {
     type Input<'a> = LlamaAdapterInput<'a>;
     type Cache = LlamaCache;
@@ -1075,39 +1015,22 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
-        planner.register(
-            crate::backend::mlx::nn::parallel::vocab_embedding_parameter_group(
-                &self.embedding,
-                "model.embed_tokens",
-                self.args.vocab_size as usize,
-                self.args.hidden_size,
-                false,
-            )?,
-        )?;
-        crate::backend::mlx::nn::parallel::register_replicated_parameter_group(
-            planner,
+        for group in eredu_architectures::llama::static_parallel_parameter_groups::<MlxBackend>(
+            &self.embedding,
             &self.norm,
-            "model.norm",
-        )?;
-        if let Some(head) = &self.lm_head {
-            planner.register(
-                crate::backend::mlx::nn::parallel::vocab_lm_head_parameter_group(
-                    head,
-                    "lm_head",
-                    self.args.hidden_size,
-                    self.args.vocab_size as usize,
-                    false,
-                )?,
-            )?;
+            self.lm_head.as_ref(),
+        )? {
+            planner.register(group)?;
         }
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = TransformerBlock::new_for_layer(&self.args, index as i32, stream)?;
-            register_llama_layer_parallel_plan(
-                planner,
-                &layer,
+            for group in eredu_architectures::llama::layer_parallel_parameter_groups::<MlxBackend>(
+                &layer.inner,
                 &self.args,
-                &format!("model.layers.{index}"),
-            )?;
+                index,
+            )? {
+                planner.register(group)?;
+            }
         }
         Ok(())
     }
