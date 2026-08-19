@@ -7,9 +7,9 @@ mod inspection;
 pub(crate) mod loading;
 mod model;
 mod prepared_speculative;
-pub(crate) mod realtime;
+pub mod realtime;
 mod session;
-pub(crate) mod speculative;
+pub mod speculative;
 pub(crate) mod structural;
 
 pub use capability::available_memory;

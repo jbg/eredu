@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Instant};
 
 use eredu::{
-    backend::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
+    composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
     load_realtime_model, RealtimeModel, RealtimeSampling, RealtimeScheduler, RequestId,
     SchedulerLimits,
 };

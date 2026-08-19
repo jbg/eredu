@@ -1,11 +1,11 @@
 use std::{path::PathBuf, time::Instant};
 
-use eredu::backend::mlx::architectures::qwen::hybrid::qwen3_5;
-use eredu::backend::mlx::runtime::checkpoint::quantization::AffineQuantization;
+use eredu::composition::mlx_architectures::qwen::hybrid::qwen3_5;
 use eredu::{
     api::LoadedModel, backend::mlx::ModelLoadOptions, GenerationConfigOverrides,
     TextGenerationConfig, TokenOutput,
 };
+use eredu_checkpoint::AffineQuantization;
 use safemlx::ExecutionContext;
 
 const DEFAULT_DECODE_TOKENS: usize = 128;

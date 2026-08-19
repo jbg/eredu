@@ -2046,9 +2046,7 @@ fn validate_codes<T: Tensor>(codes: &T, max_codebooks: i32) -> Result<(), Error>
 
 #[cfg(all(test, feature = "mlx"))]
 mod tests {
-    use super::{
-        transform_decoder_key, AudioTokenizer, Config, Mimi, MimiModuleParameters,
-    };
+    use super::{transform_decoder_key, AudioTokenizer, Config, Mimi, MimiModuleParameters};
     use eredu_nn::{AttentionMask, Error as ComputeError, Index, PadMode, Tensor};
     use safemlx::{
         ops::{concatenate_axis, indexing::TryIndexOp},

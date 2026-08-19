@@ -21,14 +21,13 @@ use eredu::{
         discover_hardware, expert_cache_telemetry, mtp_telemetry, residency_telemetry,
         MlxBackendFactory,
     },
-    backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     backend::mlx::runtime::generation::sampler::{MirostatV2Sampler, Sampler},
     backend::mlx::runtime::media::input::{InputPart, ModelInput},
     backend::mlx::runtime::residency::expert_cache::{ExpertPassStatistics, ExpertTierStatistics},
     backend::mlx::{
-        inspect_model, speculative::MtpComponentTimingGuard, MlxBackend, MlxInspectionOptions,
-        MlxModelInput, ModelLoadOptions,
+        inspect_model, MlxBackend, MlxInspectionOptions, MlxModelInput, ModelLoadOptions,
     },
+    composition::mlx::speculative::MtpComponentTimingGuard,
     core::residency::{CacheEvictionPolicy, MemoryTier, TransferDirection},
     core::speculative::MtpStats,
     runtime::chat::{
@@ -42,6 +41,7 @@ use eredu::{
     SemanticEvent, TextGenerationConfig, TimingTelemetry, TokenOutput, WeightTransformationPlan,
     EXECUTION_PLAN_SCHEMA_VERSION,
 };
+use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
 use safemlx::{
     ops::indexing::{NewAxis, TryIndexOp},
@@ -2245,8 +2245,8 @@ fn main() -> Result<()> {
     let mut output_ids = Vec::with_capacity(max_tokens);
     let profile_gemma4 = args.profile_components && model.model_type() == "gemma4";
     if profile_gemma4 {
-        eredu::backend::mlx::architectures::gemma4::model::set_perf_profiling(true);
-        eredu::backend::mlx::architectures::gemma4::model::reset_perf_stats();
+        eredu::composition::mlx_architectures::gemma4::model::set_perf_profiling(true);
+        eredu::composition::mlx_architectures::gemma4::model::reset_perf_stats();
     }
     let generation_started = Instant::now();
     let mut time_to_first_token = None;
@@ -2558,7 +2558,8 @@ fn main() -> Result<()> {
             );
         }
         if profile_gemma4 {
-            if let Some(stats) = eredu::backend::mlx::architectures::gemma4::model::perf_stats() {
+            if let Some(stats) = eredu::composition::mlx_architectures::gemma4::model::perf_stats()
+            {
                 eprintln!(
                     "gemma4_components_s: embed={:.6}, per_layer_inputs={:.6}, attention={:.6}, mlp={:.6}, per_layer_residual={:.6}, final_norm={:.6}, lm_head={:.6}, total={:.6}",
                     stats.embed_s,
@@ -2571,7 +2572,7 @@ fn main() -> Result<()> {
                     stats.component_total_s(),
                 );
             }
-            eredu::backend::mlx::architectures::gemma4::model::set_perf_profiling(false);
+            eredu::composition::mlx_architectures::gemma4::model::set_perf_profiling(false);
         }
         if let Some(report) = model.runtime().session().residency_report()? {
             let offload = report.offload();
@@ -3613,7 +3614,7 @@ mod tests {
 
     use clap::{CommandFactory, FromArgMatches, Parser};
     use eredu::{
-        backend::mlx::speculative::MtpExecutionStreams,
+        composition::mlx::speculative::MtpExecutionStreams,
         core::speculative::SpeculativeExecutionTopology,
     };
     use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};

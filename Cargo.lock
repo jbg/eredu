@@ -909,6 +909,7 @@ dependencies = [
  "anyhow",
  "clap",
  "eredu",
+ "eredu-checkpoint",
  "hf-hub",
  "safemlx",
  "serde",

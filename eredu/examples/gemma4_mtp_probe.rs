@@ -6,7 +6,7 @@ use eredu::{
         PreparedChatInput, PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest,
         SpeculativeDraft,
     },
-    backend::mlx::speculative::MlxDrafter,
+    composition::mlx::speculative::MlxDrafter,
     GenerationCancellationToken, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
 use safemlx::{ExecutionContext, Stream};

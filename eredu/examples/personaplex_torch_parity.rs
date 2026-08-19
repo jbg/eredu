@@ -1,8 +1,8 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use eredu::{
-    backend::mlx::architectures::moshi::{layerwise, model as moshi, personaplex},
-    backend::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput, MlxRealtimeModel},
+    composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput, MlxRealtimeModel},
+    composition::mlx_architectures::moshi::{layerwise, model as moshi, personaplex},
     LayerWeightResidency, RealtimeModel, RealtimeSampling, RealtimeScheduler, RequestId,
     SchedulerLimits,
 };

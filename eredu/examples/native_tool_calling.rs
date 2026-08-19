@@ -11,7 +11,7 @@ use eredu::{
         PreparedChatInput, PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest,
         SpeculativeDraft,
     },
-    backend::mlx::speculative::MlxDrafter,
+    composition::mlx::speculative::MlxDrafter,
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
     MtpCapability, MtpCheckpointKind, MtpSchedulerOptions, SemanticEvent,
 };

@@ -1,15 +1,13 @@
 use std::{path::PathBuf, time::Instant};
 
 use eredu::{
-    backend::mlx::architectures::moshi::personaplex,
-    backend::mlx::runtime::checkpoint::quantization::AffineQuantization,
-    backend::mlx::{
-        realtime::{MlxRealtimeBackend, MlxRealtimeInput},
-        ModelLoadOptions,
-    },
+    backend::mlx::ModelLoadOptions,
+    composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
+    composition::mlx_architectures::moshi::personaplex,
     load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
     RealtimeScheduler, RequestId, SchedulerLimits,
 };
+use eredu_checkpoint::AffineQuantization;
 use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

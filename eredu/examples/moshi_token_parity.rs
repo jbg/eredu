@@ -1,10 +1,10 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use eredu::{
-    backend::mlx::architectures::moshi::layerwise::{
+    composition::mlx::realtime::{generate_encoded_greedy, MlxRealtimeBackend},
+    composition::mlx_architectures::moshi::layerwise::{
         load_moshi_layerwise_model, MoshiLayerwiseModel,
     },
-    backend::mlx::realtime::{generate_encoded_greedy, MlxRealtimeBackend},
     load_realtime_model, LayerWeightResidency,
 };
 use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, ExecutionContext};

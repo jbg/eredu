@@ -7,8 +7,8 @@ use std::{
 };
 
 use eredu::{
-    backend::mlx::architectures::moshi::{layerwise as moshi, personaplex},
     backend::mlx::runtime::generation::sampler::{DefaultSampler, GenerationSampler},
+    composition::mlx_architectures::moshi::{layerwise as moshi, personaplex},
     LayerWeightResidency,
 };
 use eredu_codec::mimi::Mimi;
