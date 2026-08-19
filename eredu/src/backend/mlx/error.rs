@@ -153,6 +153,15 @@ pub enum Error {
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
+impl From<eredu_checkpoint::validation::StrictLoadFailure> for Error {
+    fn from(error: eredu_checkpoint::validation::StrictLoadFailure) -> Self {
+        Self::StrictLoadValidation {
+            missing: error.missing,
+            unused: error.unused,
+        }
+    }
+}
+
 impl From<eredu_checkpoint::Error> for Error {
     fn from(error: eredu_checkpoint::Error) -> Self {
         Self::Quantization(error.to_string())

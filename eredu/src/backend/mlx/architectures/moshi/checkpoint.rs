@@ -5,6 +5,7 @@
 //! quantization companion declarations here. Generic checkpoint code only
 //! evaluates the resulting declarative plan.
 
+use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
 use std::path::{Path, PathBuf};
@@ -13,7 +14,6 @@ use super::model::ModelArgs;
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::{
-        contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
         store::{SafetensorsWeightStore, WeightStore},
         validation,
     },
@@ -28,7 +28,9 @@ pub(crate) fn validate_safetensors_path(
 ) -> Result<(), Error> {
     let store =
         SafetensorsWeightStore::open(path).map_err(|error| Error::Other(Box::new(error)))?;
-    validate_safetensors(args, &store).into_loader_result()
+    validate_safetensors(args, &store)
+        .into_loader_result()
+        .map_err(Error::from)
 }
 
 pub(crate) fn source_path(model_dir: &Path, args: &ModelArgs) -> PathBuf {

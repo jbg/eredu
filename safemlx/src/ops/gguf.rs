@@ -20,6 +20,14 @@ pub struct GgufCheckpoint {
     inner: eredu_gguf::Checkpoint,
 }
 
+impl std::ops::Deref for GgufCheckpoint {
+    type Target = eredu_gguf::Checkpoint;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 /// One named MLX array produced from a GGUF tensor.
 #[derive(Debug)]
 pub struct GgufArray {

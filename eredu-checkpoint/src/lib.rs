@@ -9,6 +9,8 @@ use eredu_gguf::{Endian, GgmlType};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 pub mod schema;
+/// Header-only validation of declarative SafeTensors and GGUF plans.
+pub mod validation;
 
 /// Backend-neutral description of a checkpoint's stored scalar encoding.
 #[derive(Debug, Clone, Eq, PartialEq)]

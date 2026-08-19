@@ -1,22 +1,175 @@
 //! Deterministic header-only evaluation of declarative checkpoint plans.
 
-use eredu_checkpoint::StoredDtype;
+use crate::StoredDtype;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eredu_checkpoint::schema::{
+use crate::schema::{
     AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
     GgufTypeConstraint, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
     StoredDtypeConstraint, TensorRequirement, TensorRole,
 };
-use safemlx::ops::{GgufCheckpoint, GgufType};
+use eredu_gguf::{Checkpoint as GgufCheckpoint, GgmlType as GgufType};
 
-use super::{
-    contract::{
-        missing, shape_mismatch, CheckpointIssue, CheckpointIssueKind, CheckpointValidation,
-    },
-    store::{SafetensorsWeightStore, WeightMetadata, WeightStore, WeightStoreError},
-};
+/// Catalog metadata needed for header-only SafeTensors validation.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CatalogTensorMetadata {
+    /// Logical tensor shape.
+    pub shape: Vec<usize>,
+    /// Stored scalar encoding.
+    pub stored_dtype: StoredDtype,
+}
+
+/// Backend-neutral SafeTensors catalog consumed by declarative validation.
+pub trait SafetensorsCatalog {
+    /// Returns all catalog keys in deterministic order.
+    fn keys(&self) -> Vec<String>;
+    /// Returns metadata without materializing tensor payloads.
+    fn metadata(&self, key: &str) -> Result<CatalogTensorMetadata, String>;
+}
+
+/// Stable checkpoint validation categories used by inspection and strict load.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub enum CheckpointIssueKind {
+    /// A required tensor is absent.
+    MissingTensor,
+    /// A tensor is not admitted by the selected contract.
+    UnexpectedTensor,
+    /// Mutually exclusive layouts conflict.
+    ConflictingLayout,
+    /// Tensor geometry does not match the contract.
+    ShapeMismatch,
+    /// Stored encoding is unsupported.
+    UnsupportedEncoding,
+    /// Atomic encoding companions are inconsistent.
+    CompanionMismatch,
+    /// Architecture geometry is invalid.
+    InvalidGeometry,
+    /// Validation could not be completed.
+    ValidationUnavailable,
+}
+
+impl CheckpointIssueKind {
+    /// Compatibility spelling for quantization companion mismatches.
+    #[allow(non_upper_case_globals)]
+    pub const QuantizationCompanionMismatch: Self = Self::CompanionMismatch;
+}
+
+/// One structured checkpoint diagnostic.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CheckpointIssue {
+    /// Stable diagnostic category.
+    pub kind: CheckpointIssueKind,
+    /// Human-readable detail.
+    pub detail: String,
+    /// Related tensor name, when applicable.
+    pub tensor_name: Option<String>,
+    /// Related format type code, when applicable.
+    pub tensor_type_code: Option<u32>,
+    /// Related metadata key, when applicable.
+    pub metadata_key: Option<String>,
+}
+
+/// Result of exact, fail-closed checkpoint validation.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum CheckpointValidation {
+    /// The catalog exactly satisfies the contract.
+    Exact,
+    /// The catalog violates the contract.
+    Invalid(Vec<CheckpointIssue>),
+    /// Validation was unavailable and loading must fail closed.
+    Unverified(CheckpointIssue),
+}
+
+/// Neutral strict-load failure consumable by backend-specific error types.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[error("strict checkpoint validation failed")]
+pub struct StrictLoadFailure {
+    /// Missing required tensor names.
+    pub missing: Vec<String>,
+    /// Unexpected tensors and other validation details.
+    pub unused: Vec<String>,
+}
+
+impl CheckpointValidation {
+    /// Converts validation into a backend-neutral strict-load result.
+    pub fn into_loader_result(self) -> Result<(), StrictLoadFailure> {
+        match self {
+            Self::Exact => Ok(()),
+            Self::Unverified(issue) => Err(StrictLoadFailure {
+                missing: Vec::new(),
+                unused: vec![issue.detail],
+            }),
+            Self::Invalid(issues) => {
+                let mut missing = issues
+                    .iter()
+                    .filter(|issue| issue.kind == CheckpointIssueKind::MissingTensor)
+                    .filter_map(|issue| issue.tensor_name.clone())
+                    .collect::<Vec<_>>();
+                let mut unused = issues
+                    .into_iter()
+                    .filter(|issue| issue.kind != CheckpointIssueKind::MissingTensor)
+                    .map(|issue| {
+                        if issue.kind == CheckpointIssueKind::UnexpectedTensor {
+                            issue.tensor_name.unwrap_or(issue.detail)
+                        } else {
+                            issue.detail
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                missing.sort();
+                missing.dedup();
+                unused.sort();
+                Err(StrictLoadFailure { missing, unused })
+            }
+        }
+    }
+
+    /// Applies a caller-selected strict catalog policy.
+    pub fn with_strict_catalog(self, strict: bool) -> Self {
+        if strict {
+            return self;
+        }
+        match self {
+            Self::Invalid(mut issues) => {
+                issues.retain(|issue| issue.kind != CheckpointIssueKind::UnexpectedTensor);
+                Self::from_issues(issues)
+            }
+            validation => validation,
+        }
+    }
+
+    /// Builds exact or invalid validation from a diagnostic sequence.
+    pub fn from_issues(issues: Vec<CheckpointIssue>) -> Self {
+        if issues.is_empty() {
+            Self::Exact
+        } else {
+            Self::Invalid(issues)
+        }
+    }
+}
+
+/// Builds a missing-tensor diagnostic.
+pub fn missing(name: &str) -> CheckpointIssue {
+    CheckpointIssue {
+        kind: CheckpointIssueKind::MissingTensor,
+        detail: format!("checkpoint is missing required tensor {name:?}"),
+        tensor_name: Some(name.into()),
+        tensor_type_code: None,
+        metadata_key: None,
+    }
+}
+
+/// Builds a tensor shape diagnostic.
+pub fn shape_mismatch(name: &str, expected: &[usize], actual: &[usize]) -> CheckpointIssue {
+    CheckpointIssue {
+        kind: CheckpointIssueKind::ShapeMismatch,
+        detail: format!("tensor {name:?} expected shape {expected:?}, got {actual:?}"),
+        tensor_name: Some(name.into()),
+        tensor_type_code: None,
+        metadata_key: None,
+    }
+}
 
 /// The single physical layout selected from an architecture checkpoint plan.
 ///
@@ -24,27 +177,31 @@ use super::{
 /// aliases from an unselected layout or tensors that were not admitted by the
 /// architecture contract.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct ResolvedCheckpointPlan {
+pub struct ResolvedCheckpointPlan {
     identity: String,
     source_keys: BTreeSet<String>,
     unclaimed_keys: BTreeSet<String>,
 }
 
 impl ResolvedCheckpointPlan {
-    pub(crate) fn identity(&self) -> &str {
+    /// Returns the architecture checkpoint-plan identity.
+    pub fn identity(&self) -> &str {
         &self.identity
     }
 
-    pub(crate) fn source_keys(&self) -> &BTreeSet<String> {
+    /// Returns the exact selected physical source names.
+    pub fn source_keys(&self) -> &BTreeSet<String> {
         &self.source_keys
     }
 
-    pub(crate) fn unclaimed_keys(&self) -> &BTreeSet<String> {
+    /// Returns catalog names admitted but not claimed by a non-strict plan.
+    pub fn unclaimed_keys(&self) -> &BTreeSet<String> {
         &self.unclaimed_keys
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(
+    /// Creates a resolved plan for store contract tests.
+    pub fn for_test(
         identity: impl Into<String>,
         source_keys: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
@@ -162,15 +319,15 @@ impl Constraint<GgufType> for GgufTensorConstraint {
 }
 
 /// Validates a SafeTensors store without materializing payloads.
-pub(crate) fn validate_safetensors_plan(
-    store: &SafetensorsWeightStore,
+pub fn validate_safetensors_plan(
+    store: &impl SafetensorsCatalog,
     plan: &SafetensorsCheckpointPlan,
 ) -> CheckpointValidation {
     let mut catalog = BTreeMap::new();
     let mut metadata_issues = Vec::new();
     for key in store.keys() {
         match store.metadata(&key) {
-            Ok(WeightMetadata {
+            Ok(CatalogTensorMetadata {
                 shape,
                 stored_dtype,
                 ..
@@ -198,15 +355,15 @@ pub(crate) fn validate_safetensors_plan(
 }
 
 /// Resolves and validates the one SafeTensors layout that loading may consume.
-pub(crate) fn resolve_safetensors_plan(
-    store: &SafetensorsWeightStore,
+pub fn resolve_safetensors_plan(
+    store: &impl SafetensorsCatalog,
     plan: &SafetensorsCheckpointPlan,
 ) -> Result<ResolvedCheckpointPlan, CheckpointValidation> {
     let mut catalog = BTreeMap::new();
     let mut metadata_issues = Vec::new();
     for key in store.keys() {
         match store.metadata(&key) {
-            Ok(WeightMetadata {
+            Ok(CatalogTensorMetadata {
                 shape,
                 stored_dtype,
                 ..
@@ -233,7 +390,7 @@ pub(crate) fn resolve_safetensors_plan(
 }
 
 /// Validates a GGUF catalog without decoding tensor payloads.
-pub(crate) fn validate_gguf_plan(
+pub fn validate_gguf_plan(
     checkpoint: &GgufCheckpoint,
     plan: &GgufCheckpointPlan,
 ) -> CheckpointValidation {
@@ -248,7 +405,7 @@ pub(crate) fn validate_gguf_plan(
 }
 
 /// Resolves and validates the one GGUF layout that loading may consume.
-pub(crate) fn resolve_gguf_plan(
+pub fn resolve_gguf_plan(
     checkpoint: &GgufCheckpoint,
     plan: &GgufCheckpointPlan,
 ) -> Result<ResolvedCheckpointPlan, CheckpointValidation> {
@@ -264,7 +421,6 @@ pub(crate) fn resolve_gguf_plan(
 
 fn gguf_catalog(checkpoint: &GgufCheckpoint) -> BTreeMap<String, PhysicalMetadata<GgufType>> {
     checkpoint
-        .catalog()
         .tensors()
         .map(|tensor| {
             let descriptor = tensor.descriptor();
@@ -351,7 +507,7 @@ where
 }
 
 /// Validates that architecture-supplied tensor pairs use identical encodings.
-pub(crate) fn validate_matching_gguf_encodings(
+pub fn validate_matching_gguf_encodings(
     checkpoint: &GgufCheckpoint,
     pairs: impl IntoIterator<Item = (String, String)>,
     label: &str,
@@ -361,7 +517,7 @@ pub(crate) fn validate_matching_gguf_encodings(
 
 /// Validates paired encodings while permitting different dense floating
 /// storage types, which share the same dense runtime operation.
-pub(crate) fn validate_dense_or_matching_gguf_encodings(
+pub fn validate_dense_or_matching_gguf_encodings(
     checkpoint: &GgufCheckpoint,
     pairs: impl IntoIterator<Item = (String, String)>,
     label: &str,
@@ -376,7 +532,6 @@ fn validate_gguf_encoding_pairs(
     allow_mixed_dense: bool,
 ) -> Vec<CheckpointIssue> {
     let catalog = checkpoint
-        .catalog()
         .tensors()
         .map(|tensor| (tensor.descriptor().name.as_str(), tensor))
         .collect::<BTreeMap<_, _>>();
@@ -577,7 +732,7 @@ fn constraint_present<E, T: Constraint<E>>(
 
 fn discriminator_present<E, T: Constraint<E>>(
     catalog: &BTreeMap<String, PhysicalMetadata<E>>,
-    variant: &eredu_checkpoint::schema::LayoutVariant<T>,
+    variant: &crate::schema::LayoutVariant<T>,
     key: &str,
 ) -> bool {
     variant
@@ -727,7 +882,7 @@ fn companion_issue(name: &str, detail: String) -> CheckpointIssue {
     }
 }
 
-fn metadata_failure(name: &str, error: WeightStoreError) -> CheckpointIssue {
+fn metadata_failure(name: &str, error: String) -> CheckpointIssue {
     CheckpointIssue {
         kind: CheckpointIssueKind::ConflictingLayout,
         detail: format!("could not validate tensor {name:?}: {error}"),
@@ -740,7 +895,7 @@ fn metadata_failure(name: &str, error: WeightStoreError) -> CheckpointIssue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_checkpoint::schema::{LayoutVariant, TensorOperation};
+    use crate::schema::{LayoutVariant, TensorOperation};
 
     fn safe(
         key: &str,

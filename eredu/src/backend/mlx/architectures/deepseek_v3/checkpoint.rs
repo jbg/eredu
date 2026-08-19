@@ -8,16 +8,13 @@ use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
 use serde_json::Value;
 
 use super::model::{self, LayerPolicy, ModelArgs};
-use crate::backend::mlx::runtime::checkpoint::{
-    contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-    store::SafetensorsWeightStore,
-    validation,
-};
+use crate::backend::mlx::runtime::checkpoint::{store::SafetensorsWeightStore, validation};
 use eredu_checkpoint::schema::{
     AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
     GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
     StoredDtypeConstraint, TensorOperation,
 };
+use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 
 #[derive(Clone, Copy)]
 enum MatrixFormat {

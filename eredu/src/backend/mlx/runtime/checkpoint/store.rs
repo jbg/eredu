@@ -1738,6 +1738,26 @@ impl WeightStore for SafetensorsWeightStore {
     }
 }
 
+impl eredu_checkpoint::validation::SafetensorsCatalog for SafetensorsWeightStore {
+    fn keys(&self) -> Vec<String> {
+        WeightStore::keys(self)
+    }
+
+    fn metadata(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::validation::CatalogTensorMetadata, String> {
+        WeightStore::metadata(self, key)
+            .map(
+                |metadata| eredu_checkpoint::validation::CatalogTensorMetadata {
+                    shape: metadata.shape,
+                    stored_dtype: metadata.stored_dtype,
+                },
+            )
+            .map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
 enum WeightLeaseSource {
     Safetensors(Arc<MappedShard>),

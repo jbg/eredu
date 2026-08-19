@@ -14,7 +14,6 @@ use serde_json::Value;
 
 use super::model::{self, ModelArgs};
 use crate::backend::mlx::runtime::checkpoint::{
-    contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
     store::{SafetensorsWeightStore, WeightStore},
     validation,
 };
@@ -22,6 +21,7 @@ use eredu_checkpoint::schema::{
     CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
     SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
 };
+use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 
 pub(crate) fn validate_safetensors(
     config: &Value,

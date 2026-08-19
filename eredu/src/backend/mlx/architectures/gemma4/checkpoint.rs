@@ -12,16 +12,13 @@ use super::{
     model::{self, FeedForwardPolicy, Gemma4MmprojGguf, ModelArgs, ValuePolicy},
     vision::Gemma4VisionConfig,
 };
-use crate::backend::mlx::runtime::checkpoint::{
-    contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
-    store::SafetensorsWeightStore,
-    validation,
-};
+use crate::backend::mlx::runtime::checkpoint::{store::SafetensorsWeightStore, validation};
 use eredu_checkpoint::schema::{
     AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
     GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
     StoredDtypeConstraint, TensorOperation,
 };
+use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct MediaSpec {

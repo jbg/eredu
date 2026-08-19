@@ -24,8 +24,6 @@ pub mod binding;
 pub(crate) mod binding_plan;
 /// Out-of-core transformation of dense bindings into packed weight stores.
 pub mod bounded_quantization;
-/// Generic structured checkpoint diagnostics.
-pub(crate) mod contract;
 /// GGUF tokenizer metadata conversion.
 pub(crate) mod gguf;
 /// Strict checkpoint loading and validation.
@@ -37,4 +35,4 @@ pub mod recipe;
 /// Persistent lazy checkpoint tensor storage.
 pub mod store;
 /// Header-only SafeTensors and GGUF plan evaluation.
-pub(crate) mod validation;
+pub(crate) use eredu_checkpoint::validation;

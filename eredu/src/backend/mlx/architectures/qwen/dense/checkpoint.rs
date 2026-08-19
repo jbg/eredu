@@ -9,7 +9,6 @@ use serde_json::Value;
 
 use super::{config_from_gguf_catalog, config_from_hf_value, DecoderConfig};
 use crate::backend::mlx::runtime::checkpoint::{
-    contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
     store::{SafetensorsWeightStore, WeightStore},
     validation,
 };
@@ -18,6 +17,7 @@ use eredu_checkpoint::schema::{
     GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
     StoredDtypeConstraint, TensorOperation,
 };
+use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum GgufVariant {

@@ -32,7 +32,7 @@ use crate::backend::mlx::{
 };
 use crate::integrations::llama_mlx::checkpoint as llama_checkpoint;
 
-pub(crate) use crate::backend::mlx::runtime::checkpoint::contract::{
+pub(crate) use eredu_checkpoint::validation::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,
     CheckpointValidation as StructuralValidation,
 };
@@ -229,7 +229,9 @@ pub(crate) fn validate_safetensors_load_path(
     let config: Value = serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)?;
     let store =
         SafetensorsWeightStore::open(model_dir).map_err(|error| Error::Other(Box::new(error)))?;
-    validate_safetensors(kind, &config, &store, options).into_loader_result()
+    validate_safetensors(kind, &config, &store, options)
+        .into_loader_result()
+        .map_err(Error::from)
 }
 
 pub(crate) fn validate_gguf(
@@ -424,11 +426,7 @@ mod admission_policy_tests {
             tensor_type_code: None,
             metadata_key: None,
         };
-        let malformed = crate::backend::mlx::runtime::checkpoint::contract::shape_mismatch(
-            "model.weight",
-            &[2, 2],
-            &[1],
-        );
+        let malformed = eredu_checkpoint::validation::shape_mismatch("model.weight", &[2, 2], &[1]);
         assert_eq!(
             StructuralValidation::Invalid(vec![unexpected.clone(), malformed.clone()])
                 .with_strict_catalog(false),
@@ -437,6 +435,7 @@ mod admission_policy_tests {
 
         let error = StructuralValidation::Invalid(vec![unexpected])
             .into_loader_result()
+            .map_err(Error::from)
             .unwrap_err();
         assert!(matches!(
             error,

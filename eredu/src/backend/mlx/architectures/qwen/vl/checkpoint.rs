@@ -9,7 +9,6 @@ use super::{model, vision::VisionConfig};
 use crate::{
     backend::mlx::architectures::qwen::dense::{self, checkpoint as dense_checkpoint},
     backend::mlx::runtime::checkpoint::{
-        contract::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation},
         store::{SafetensorsWeightStore, WeightStore},
         validation,
     },
@@ -18,6 +17,7 @@ use eredu_checkpoint::schema::{
     CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
     SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
 };
+use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum GgufVariant {
