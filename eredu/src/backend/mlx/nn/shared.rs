@@ -344,6 +344,21 @@ pub(crate) struct MlxParameterTree<M> {
 impl<M: ModuleParameters> MlxParameterTree<M> {
     /// Captures one native module's complete stable parameter topology.
     pub(crate) fn new(inner: M, prefix: &str) -> Result<Self, ComputeError> {
+        Self::new_filtered(inner, prefix, |_| true)
+    }
+
+    /// Captures a stable subset of one native module's parameter topology.
+    ///
+    /// This is used when a reusable execution unit contains parameters whose
+    /// residency is owned by another policy, such as independently cached
+    /// experts. The predicate is evaluated once on checkpoint-facing names;
+    /// hot-path visitation remains statically dispatched over the retained
+    /// native slots.
+    pub(crate) fn new_filtered(
+        inner: M,
+        prefix: &str,
+        include: impl Fn(&str) -> bool,
+    ) -> Result<Self, ComputeError> {
         let mut topology = BTreeMap::new();
         for local in inner.parameters().flatten().into_keys() {
             let id = if prefix.is_empty() {
@@ -351,6 +366,9 @@ impl<M: ModuleParameters> MlxParameterTree<M> {
             } else {
                 format!("{prefix}.{local}")
             };
+            if !include(&id) {
+                continue;
+            }
             let group = ["scales", "biases"].into_iter().find_map(|component| {
                 id.strip_suffix(&format!(".{component}"))
                     .map(|base| format!("{base}.weight"))
@@ -393,14 +411,44 @@ impl<M: ModuleParameters> Parameterized<Array> for MlxParameterTree<M> {
     where
         V: ParameterVisitor<'a, Array>,
     {
-        visit_module_parameters(&self.inner, &self.topology, visitor);
+        let trainable = self
+            .inner
+            .trainable_parameters()
+            .flatten()
+            .into_keys()
+            .map(|name| name.to_string())
+            .collect::<BTreeSet<_>>();
+        for (local, value) in self.inner.parameters().flatten() {
+            let Some(spec) = self.topology.get(local.as_ref()) else {
+                continue;
+            };
+            visitor.visit(
+                ParameterMetadata::from_spec(spec, trainable.contains(local.as_ref())),
+                value,
+            );
+        }
     }
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, Array>,
     {
-        visit_module_parameters_mut(&mut self.inner, &self.topology, visitor);
+        let trainable = self
+            .inner
+            .trainable_parameters()
+            .flatten()
+            .into_keys()
+            .map(|name| name.to_string())
+            .collect::<BTreeSet<_>>();
+        for (local, value) in self.inner.parameters_mut().flatten() {
+            let Some(spec) = self.topology.get(local.as_ref()) else {
+                continue;
+            };
+            visitor.visit_mut(
+                ParameterMetadata::from_spec(spec, trainable.contains(local.as_ref())),
+                value,
+            );
+        }
     }
 
     fn set_trainable(&mut self, trainable: bool) {
