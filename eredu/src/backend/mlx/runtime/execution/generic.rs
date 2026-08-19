@@ -65,6 +65,8 @@ pub(crate) struct MlxLayerwisePolicy<U, F> {
     _static_leases: Vec<ResidentUnitLease>,
     pending: VecDeque<(Event, MlxUnitLease<U>)>,
     dense: Option<MlxDenseExecution>,
+    sample_mlx_memory: bool,
+    sample_process_memory: bool,
 }
 
 struct MlxDenseExecution {
@@ -126,6 +128,8 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
         build: F,
         static_leases: Vec<ResidentUnitLease>,
         dense: Option<Arc<DenseStreamController>>,
+        sample_mlx_memory: bool,
+        sample_process_memory: bool,
     ) -> Result<Self, Error> {
         if unit_ids.is_empty() {
             return Err(Error::Parallel(
@@ -151,6 +155,8 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
                 forward: None,
                 group: None,
             }),
+            sample_mlx_memory,
+            sample_process_memory,
         })
     }
 
@@ -177,6 +183,18 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
     fn drain(&mut self) -> Result<(), Error> {
         while !self.pending.is_empty() {
             self.drain_one()?;
+        }
+        Ok(())
+    }
+
+    fn trim_device_window(&self, current: usize) -> Result<(), Error> {
+        let end = current
+            .saturating_add(self.window_depth)
+            .min(self.unit_ids.len());
+        for (index, id) in self.unit_ids.iter().enumerate() {
+            if index < current || index >= end {
+                self.residency.evict(id, MemoryTier::Device)?;
+            }
         }
         Ok(())
     }
@@ -591,6 +609,8 @@ where
         build,
         vec![static_lease],
         dense_controller,
+        options.sample_mlx_memory(),
+        options.sample_process_memory(),
     )?;
     Ok((policy, metadata))
 }
@@ -665,6 +685,13 @@ where
                 },
             });
         }
+        // An ordinary lookahead transfer owns every lease in its window until
+        // the preceding unit's exact completion.  Release that completed
+        // window before requesting the overlapping next window; otherwise an
+        // overlapping in-flight unit would wait for the very transfer guard
+        // retained by `pending` on this thread.
+        self.drain_one()?;
+        self.trim_device_window(index)?;
         let end = index
             .saturating_add(self.window_depth)
             .min(self.unit_ids.len());
@@ -720,6 +747,10 @@ where
     fn finish(&mut self, output: &Array, _stream: &Stream) -> Result<(), Self::Error> {
         async_eval_with_event([output])?.synchronize()?;
         self.drain()?;
+        if self.dense.is_none() && (self.sample_mlx_memory || self.sample_process_memory) {
+            self.residency
+                .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
+        }
         if let Some(dense) = &mut self.dense {
             dense.window.take();
             if let Some(group) = dense.group.take() {

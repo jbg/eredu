@@ -1260,6 +1260,23 @@ mod tests {
         }
     }
 
+    fn acquire_with_context<T: CheckpointSource>(
+        store: &T,
+        key: &str,
+        selection: TensorSelection,
+        policy: WeightReadPolicy,
+        context: &MlxParameterMaterializationContext,
+    ) -> Result<WeightLease, WeightStoreError> {
+        let lease = store
+            .acquire_lease(TensorReadRequest {
+                key: key.into(),
+                selection,
+                policy,
+            })
+            .map_err(neutral_store_error)?;
+        context.weight_lease(lease)
+    }
+
     fn cpu_stream() -> Stream {
         Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
     }
@@ -1638,26 +1655,42 @@ mod tests {
             })
             .unwrap();
         let stream = cpu_stream();
+        let context = MlxParameterMaterializationContext::new(&stream, &stream);
         let selection = TensorSelection::Range {
             axis: 0,
             start: 1,
             end: 2,
         };
-        let weight = store
-            .acquire("bank.weight", selection.clone())
-            .unwrap()
-            .prepare_materialization(&stream, &stream)
-            .unwrap();
-        let scales = store
-            .acquire("bank.scales", selection.clone())
-            .unwrap()
-            .prepare_materialization(&stream, &stream)
-            .unwrap();
-        let biases = store
-            .acquire("bank.biases", selection)
-            .unwrap()
-            .prepare_materialization(&stream, &stream)
-            .unwrap();
+        let weight = acquire_with_context(
+            &store,
+            "bank.weight",
+            selection.clone(),
+            WeightReadPolicy::RequireBounded,
+            &context,
+        )
+        .unwrap()
+        .prepare_materialization(&stream, &stream)
+        .unwrap();
+        let scales = acquire_with_context(
+            &store,
+            "bank.scales",
+            selection.clone(),
+            WeightReadPolicy::RequireBounded,
+            &context,
+        )
+        .unwrap()
+        .prepare_materialization(&stream, &stream)
+        .unwrap();
+        let biases = acquire_with_context(
+            &store,
+            "bank.biases",
+            selection,
+            WeightReadPolicy::RequireBounded,
+            &context,
+        )
+        .unwrap()
+        .prepare_materialization(&stream, &stream)
+        .unwrap();
         weight.finish().unwrap();
         scales.finish().unwrap();
         biases.finish().unwrap();
@@ -1680,45 +1713,49 @@ mod tests {
             })
             .unwrap();
         let stream = cpu_stream();
-        let weight = store
-            .acquire_with_policy(
-                "bank.weight",
-                TensorSelection::Range {
-                    axis: 1,
-                    start: 4,
-                    end: 8,
-                },
-                WeightReadPolicy::RequireBounded,
-            )
-            .unwrap()
-            .prepare_materialization(&stream, &stream)
-            .unwrap();
-        let scales = store
-            .acquire_with_policy(
-                "bank.scales",
-                TensorSelection::Range {
-                    axis: 1,
-                    start: 1,
-                    end: 2,
-                },
-                WeightReadPolicy::RequireBounded,
-            )
-            .unwrap()
-            .prepare_materialization(&stream, &stream)
-            .unwrap();
-        let biases = store
-            .acquire_with_policy(
-                "bank.biases",
-                TensorSelection::Range {
-                    axis: 1,
-                    start: 1,
-                    end: 2,
-                },
-                WeightReadPolicy::RequireBounded,
-            )
-            .unwrap()
-            .prepare_materialization(&stream, &stream)
-            .unwrap();
+        let context = MlxParameterMaterializationContext::new(&stream, &stream);
+        let weight = acquire_with_context(
+            &store,
+            "bank.weight",
+            TensorSelection::Range {
+                axis: 1,
+                start: 4,
+                end: 8,
+            },
+            WeightReadPolicy::RequireBounded,
+            &context,
+        )
+        .unwrap()
+        .prepare_materialization(&stream, &stream)
+        .unwrap();
+        let scales = acquire_with_context(
+            &store,
+            "bank.scales",
+            TensorSelection::Range {
+                axis: 1,
+                start: 1,
+                end: 2,
+            },
+            WeightReadPolicy::RequireBounded,
+            &context,
+        )
+        .unwrap()
+        .prepare_materialization(&stream, &stream)
+        .unwrap();
+        let biases = acquire_with_context(
+            &store,
+            "bank.biases",
+            TensorSelection::Range {
+                axis: 1,
+                start: 1,
+                end: 2,
+            },
+            WeightReadPolicy::RequireBounded,
+            &context,
+        )
+        .unwrap()
+        .prepare_materialization(&stream, &stream)
+        .unwrap();
         assert_eq!(weight.output().shape(), [2, 4]);
         assert_eq!(scales.output().shape(), [2, 1]);
         assert_eq!(biases.output().shape(), [2, 1]);

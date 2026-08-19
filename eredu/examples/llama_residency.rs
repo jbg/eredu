@@ -4,7 +4,7 @@ use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
 use eredu::{
-    backend::mlx::architectures::llama::model as llama,
+    backend::mlx::nn::generation::sample,
     backend::mlx::runtime::execution::layerwise::LayerwiseLoadOptions,
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
@@ -26,6 +26,9 @@ struct Args {
     /// Number of greedy decode tokens.
     #[arg(long, default_value_t = 8)]
     decode_tokens: usize,
+    /// Keep every model parameter on the execution device.
+    #[arg(long, conflicts_with = "dense_disk_stream")]
+    fully_resident: bool,
     /// Maximum decoder layers resident on the execution device.
     #[arg(long, default_value_t = 1)]
     device_layer_window: usize,
@@ -68,11 +71,13 @@ fn main() -> anyhow::Result<()> {
     let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     anyhow::ensure!(
-        !args.dense_disk_stream
+        (!args.dense_disk_stream && !args.fully_resident)
             || (args.device_budget_bytes.is_none() && args.host_budget_bytes.is_none()),
-        "--device-budget-bytes and --host-budget-bytes apply only to layerwise host residency; use --stream-device-budget and --stream-host-budget with --dense-disk-stream"
+        "--device-budget-bytes and --host-budget-bytes apply only to layerwise host residency"
     );
-    let weight_residency = if args.dense_disk_stream {
+    let weight_residency = if args.fully_resident {
+        WeightResidency::fully_resident()
+    } else if args.dense_disk_stream {
         let mut dense = DenseDiskStreamLoadOptions::new(
             args.stream_device_budget,
             args.stream_host_budget,
@@ -153,7 +158,7 @@ fn main() -> anyhow::Result<()> {
 
     let decode_started = Instant::now();
     for _ in 0..args.decode_tokens {
-        let token = llama::sample(&logits, 0.0, None, stream)?;
+        let token = sample(&logits, 0.0, None, stream)?;
         stream.synchronize()?;
         let token = token.reshape(&[1, 1], stream)?;
         logits = session
@@ -171,10 +176,20 @@ fn main() -> anyhow::Result<()> {
     let observed_window = report
         .units()
         .iter()
-        .filter(|unit| unit.id().as_str().starts_with("llama.layer.") && unit.device_resident())
+        .filter(|unit| unit.id().as_str().starts_with("model.unit.") && unit.device_resident())
         .count();
 
     println!("model type: {}", session.model_type());
+    println!(
+        "residency policy: {}",
+        if args.fully_resident {
+            "fully-resident"
+        } else if args.dense_disk_stream {
+            "dense-disk-stream"
+        } else {
+            "layerwise-host"
+        }
+    );
     println!(
         "configured/observed device-layer window: {}/{}",
         args.device_layer_window, observed_window

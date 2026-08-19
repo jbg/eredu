@@ -385,7 +385,7 @@ impl From<DenseDiskStreamLoadOptions> for LayerWeightResidency {
 }
 
 impl LayerWeightResidency {
-    fn sample_mlx_memory(self) -> bool {
+    pub(crate) fn sample_mlx_memory(self) -> bool {
         match self {
             Self::FullyResident => false,
             Self::LayerwiseHost(options) => options.sample_mlx_memory,
@@ -393,7 +393,7 @@ impl LayerWeightResidency {
         }
     }
 
-    fn sample_process_memory(self) -> bool {
+    pub(crate) fn sample_process_memory(self) -> bool {
         match self {
             Self::FullyResident => false,
             Self::LayerwiseHost(options) => options.sample_process_memory,
