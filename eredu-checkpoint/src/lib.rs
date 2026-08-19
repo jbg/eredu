@@ -8,6 +8,7 @@
 use eredu_gguf::{Endian, GgmlType};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
+pub mod recipe;
 pub mod schema;
 /// Backend-neutral checkpoint stores, selections, and encoded leases.
 pub mod store;

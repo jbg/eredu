@@ -14,7 +14,7 @@ use safemlx::{
     module::{Module, ModuleParameters, Param},
     ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
-    Array, Dtype, Stream,
+    Array, Stream,
 };
 
 use crate::core::cache::{
@@ -60,7 +60,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::{
         binding_plan::{BindingPlan, PlannedBinding},
         quantization::should_quantize_on_load,
-        recipe::DerivedWeightRecipe,
+        recipe::{DerivedWeightRecipe, RecipeDtype},
     },
     backend::mlx::runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, partitioned_projection_members,
@@ -2456,7 +2456,7 @@ fn add_fused_projection_recipes(
                     } else {
                         DerivedWeightRecipe::Cast {
                             input: Box::new(selected),
-                            dtype: Dtype::Float32,
+                            dtype: RecipeDtype::F32,
                         }
                     },
                 );
@@ -2486,7 +2486,7 @@ fn add_fused_projection_recipes(
                     } else {
                         DerivedWeightRecipe::Cast {
                             input: Box::new(selected),
-                            dtype: Dtype::Float32,
+                            dtype: RecipeDtype::F32,
                         }
                     },
                 );

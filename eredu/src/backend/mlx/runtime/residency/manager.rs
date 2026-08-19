@@ -25,7 +25,9 @@ use safemlx::{
 
 use crate::{
     backend::mlx::residency::sample_allocator_memory,
-    backend::mlx::runtime::checkpoint::recipe::{DerivedWeightRecipe, WeightRecipeError},
+    backend::mlx::runtime::checkpoint::recipe::{
+        DerivedWeightRecipe, MlxWeightRecipeExt, WeightRecipeError,
+    },
     backend::mlx::runtime::checkpoint::store::{
         PendingWeightMaterialization, TensorSelection, WeightReadPolicy, WeightStore,
         WeightStoreDiagnostics, WeightStoreError,
@@ -190,6 +192,7 @@ impl WeightBinding {
                 })?;
         let metadata = recipe
             .infer(store)
+            .map_err(WeightRecipeError::from)
             .map_err(|source| ResidencyError::Recipe {
                 binding: self.name.clone(),
                 source,
@@ -1544,6 +1547,7 @@ fn validate_unit_bytes(
                     })?;
                 recipe
                     .infer(store)
+                    .map_err(WeightRecipeError::from)
                     .map_err(|source| ResidencyError::Recipe {
                         binding: binding.name.clone(),
                         source,

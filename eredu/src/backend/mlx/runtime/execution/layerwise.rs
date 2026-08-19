@@ -32,7 +32,7 @@ use crate::{
         BoundedQuantizationPlan, BoundedQuantizationReport, BoundedQuantizationTarget,
         BoundedQuantizedWeightStore,
     },
-    backend::mlx::runtime::checkpoint::recipe::RecipeDtype,
+    backend::mlx::runtime::checkpoint::recipe::{MlxWeightRecipeExt, RecipeDtype},
     backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
     backend::mlx::runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
     backend::mlx::runtime::residency::dense_stream::{
@@ -3764,7 +3764,11 @@ fn packed_weight_companion_dtypes(module: &impl ModuleParameters) -> BTreeMap<St
                 .unwrap_or_else(|| format!("{canonical}_scales"));
             let dtype = parameters
                 .get(scales.as_str())
-                .map(|parameter| RecipeDtype::from(parameter.dtype()))
+                .map(|parameter| {
+                    crate::backend::mlx::runtime::checkpoint::recipe::recipe_dtype_from_mlx(
+                        parameter.dtype(),
+                    )
+                })
                 .unwrap_or(RecipeDtype::F32);
             (canonical, dtype)
         })

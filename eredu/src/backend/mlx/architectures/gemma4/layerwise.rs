@@ -54,7 +54,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load,
-        recipe::DerivedWeightRecipe,
+        recipe::{recipe_dtype_from_mlx, DerivedWeightRecipe},
         store::{GgufWeightStore, TensorSelection, WeightStore},
     },
     backend::mlx::runtime::distributed::parallel::{
@@ -1947,10 +1947,12 @@ impl Gemma4LayerwiseAdapter {
                             raw.clone(),
                             TensorSelection::Full,
                         )),
-                        dtype: parameters
-                            .get(local_name)
-                            .expect("parameter came from the same flattened tree")
-                            .dtype(),
+                        dtype: recipe_dtype_from_mlx(
+                            parameters
+                                .get(local_name)
+                                .expect("parameter came from the same flattened tree")
+                                .dtype(),
+                        ),
                     },
                 );
             }

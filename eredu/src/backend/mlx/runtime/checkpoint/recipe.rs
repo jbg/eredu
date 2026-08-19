@@ -5,9 +5,9 @@
 //! to a single checkpoint key. They are validated from checkpoint metadata and
 //! materialized on the residency source stream before device promotion.
 
-use eredu_checkpoint::StoredDtype;
-
-use std::collections::BTreeSet;
+pub use eredu_checkpoint::recipe::{
+    DerivedWeightRecipe, RecipeDtype, RecipeMetadata as WeightRecipeMetadata,
+};
 
 use safemlx::{
     ops::{concatenate_axis, contiguous, stack_axis},
@@ -19,237 +19,114 @@ use crate::backend::mlx::runtime::checkpoint::store::{
     PendingWeightMaterialization, TensorSelection, WeightReadPolicy, WeightStore, WeightStoreError,
 };
 
-/// Scalar encoding produced by a derived-weight recipe.
-#[derive(Debug, Clone, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum RecipeDtype {
-    /// Boolean values.
-    Bool,
-    /// Unsigned 8-bit integers.
-    U8,
-    /// Signed 8-bit integers.
-    I8,
-    /// Signed 16-bit integers.
-    I16,
-    /// Unsigned 16-bit integers.
-    U16,
-    /// IEEE half-precision floating point.
-    F16,
-    /// Brain floating point.
-    BF16,
-    /// Signed 32-bit integers.
-    I32,
-    /// Unsigned 32-bit integers.
-    U32,
-    /// IEEE single-precision floating point.
-    F32,
-    /// IEEE double-precision floating point.
-    F64,
-    /// Signed 64-bit integers.
-    I64,
-    /// Unsigned 64-bit integers.
-    U64,
-    /// Complex values with two 32-bit floating-point components.
-    C64,
-    /// Encoded FP8 E4M3 bytes.
-    F8E4M3,
-    /// Encoded FP8 E5M2 bytes.
-    F8E5M2,
-    /// Packed FP4 E2M1 values.
-    F4,
-    /// Unsigned E8M0 scale values.
-    F8E8M0,
-    /// A checkpoint encoding unknown to this runtime.
-    Other(String),
-}
-
-impl RecipeDtype {
-    fn bit_width(&self) -> Result<u64, WeightRecipeError> {
-        match self {
-            Self::F4 => Ok(4),
-            Self::Bool | Self::U8 | Self::I8 | Self::F8E4M3 | Self::F8E5M2 | Self::F8E8M0 => Ok(8),
-            Self::I16 | Self::U16 | Self::F16 | Self::BF16 => Ok(16),
-            Self::I32 | Self::U32 | Self::F32 => Ok(32),
-            Self::F64 | Self::I64 | Self::U64 | Self::C64 => Ok(64),
-            Self::Other(dtype) => Err(WeightRecipeError::UnsupportedDtype {
-                dtype: dtype.clone(),
-            }),
-        }
+/// Converts an MLX scalar type into the backend-neutral recipe representation.
+pub fn recipe_dtype_from_mlx(value: Dtype) -> RecipeDtype {
+    match value {
+        Dtype::Bool => RecipeDtype::Bool,
+        Dtype::Uint8 => RecipeDtype::U8,
+        Dtype::Uint16 => RecipeDtype::U16,
+        Dtype::Uint32 => RecipeDtype::U32,
+        Dtype::Uint64 => RecipeDtype::U64,
+        Dtype::Int8 => RecipeDtype::I8,
+        Dtype::Int16 => RecipeDtype::I16,
+        Dtype::Int32 => RecipeDtype::I32,
+        Dtype::Int64 => RecipeDtype::I64,
+        Dtype::Float16 => RecipeDtype::F16,
+        Dtype::Float32 => RecipeDtype::F32,
+        Dtype::Float64 => RecipeDtype::F64,
+        Dtype::Bfloat16 => RecipeDtype::BF16,
+        Dtype::Complex64 => RecipeDtype::C64,
     }
 }
 
-impl From<StoredDtype> for RecipeDtype {
-    fn from(value: StoredDtype) -> Self {
-        match value {
-            StoredDtype::Bool => Self::Bool,
-            StoredDtype::U8 => Self::U8,
-            StoredDtype::I8 => Self::I8,
-            StoredDtype::I16 => Self::I16,
-            StoredDtype::U16 => Self::U16,
-            StoredDtype::F16 => Self::F16,
-            StoredDtype::BF16 => Self::BF16,
-            StoredDtype::I32 => Self::I32,
-            StoredDtype::U32 => Self::U32,
-            StoredDtype::F32 => Self::F32,
-            StoredDtype::F64 => Self::F64,
-            StoredDtype::I64 => Self::I64,
-            StoredDtype::U64 => Self::U64,
-            StoredDtype::C64 => Self::C64,
-            StoredDtype::F8E4M3 => Self::F8E4M3,
-            StoredDtype::F8E5M2 => Self::F8E5M2,
-            StoredDtype::F4 => Self::F4,
-            StoredDtype::F8E8M0 => Self::F8E8M0,
-            StoredDtype::Other(dtype) => Self::Other(dtype),
-        }
+fn mlx_dtype(value: &RecipeDtype) -> Result<Dtype, WeightRecipeError> {
+    match value {
+        RecipeDtype::Bool => Ok(Dtype::Bool),
+        RecipeDtype::U8
+        | RecipeDtype::F8E4M3
+        | RecipeDtype::F8E5M2
+        | RecipeDtype::F4
+        | RecipeDtype::F8E8M0 => Ok(Dtype::Uint8),
+        RecipeDtype::I8 => Ok(Dtype::Int8),
+        RecipeDtype::I16 => Ok(Dtype::Int16),
+        RecipeDtype::U16 => Ok(Dtype::Uint16),
+        RecipeDtype::F16 => Ok(Dtype::Float16),
+        RecipeDtype::BF16 => Ok(Dtype::Bfloat16),
+        RecipeDtype::I32 => Ok(Dtype::Int32),
+        RecipeDtype::U32 => Ok(Dtype::Uint32),
+        RecipeDtype::F32 => Ok(Dtype::Float32),
+        RecipeDtype::F64 => Ok(Dtype::Float64),
+        RecipeDtype::I64 => Ok(Dtype::Int64),
+        RecipeDtype::U64 => Ok(Dtype::Uint64),
+        RecipeDtype::C64 => Ok(Dtype::Complex64),
+        RecipeDtype::Other(dtype) => Err(WeightRecipeError::UnsupportedDtype {
+            dtype: dtype.clone(),
+        }),
+        _ => Err(WeightRecipeError::UnsupportedDtype {
+            dtype: format!("{value:?}"),
+        }),
     }
 }
 
-impl From<Dtype> for RecipeDtype {
-    fn from(value: Dtype) -> Self {
-        match value {
-            Dtype::Bool => Self::Bool,
-            Dtype::Uint8 => Self::U8,
-            Dtype::Uint16 => Self::U16,
-            Dtype::Uint32 => Self::U32,
-            Dtype::Uint64 => Self::U64,
-            Dtype::Int8 => Self::I8,
-            Dtype::Int16 => Self::I16,
-            Dtype::Int32 => Self::I32,
-            Dtype::Int64 => Self::I64,
-            Dtype::Float16 => Self::F16,
-            Dtype::Float32 => Self::F32,
-            Dtype::Float64 => Self::F64,
-            Dtype::Bfloat16 => Self::BF16,
-            Dtype::Complex64 => Self::C64,
-        }
-    }
-}
-
-/// Shape, encoding, and materialized size inferred for a recipe.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct WeightRecipeMetadata {
-    shape: Vec<usize>,
-    dtype: RecipeDtype,
-    byte_len: u64,
-}
-
-impl WeightRecipeMetadata {
-    /// Returns the inferred output shape.
-    pub fn shape(&self) -> &[usize] {
-        &self.shape
-    }
-
-    /// Returns the inferred output scalar encoding.
-    pub const fn dtype(&self) -> &RecipeDtype {
-        &self.dtype
-    }
-
-    /// Returns the checked materialized output size.
-    pub const fn byte_len(&self) -> u64 {
-        self.byte_len
-    }
-}
-
-/// A composable operation that derives one runtime weight from checkpoint tensors.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum DerivedWeightRecipe {
-    /// Selects a complete tensor, contiguous range, or ordered indices.
-    Source {
-        /// Checkpoint tensor key. This also represents checkpoint-key renaming.
-        key: String,
-        /// Selection applied before any derived operations.
+/// MLX lowering operations for a backend-neutral recipe.
+pub(crate) trait MlxWeightRecipeExt {
+    fn select_bounded(
+        &self,
+        store: &dyn WeightStore,
         selection: TensorSelection,
-    },
-    /// Applies another selection to a derived array.
-    Select {
-        /// Child recipe.
-        input: Box<Self>,
-        /// Selection applied to the child output.
-        selection: TensorSelection,
-    },
-    /// Concatenates child outputs along an existing axis.
-    Concatenate {
-        /// Concatenation axis.
-        axis: usize,
-        /// Ordered child recipes.
-        inputs: Vec<Self>,
-    },
-    /// Stacks child outputs along a new axis.
-    Stack {
-        /// Inserted axis.
-        axis: usize,
-        /// Ordered child recipes.
-        inputs: Vec<Self>,
-    },
-    /// Reshapes a child while preserving its element count.
-    Reshape {
-        /// Child recipe.
-        input: Box<Self>,
-        /// Exact output shape.
-        shape: Vec<usize>,
-    },
-    /// Reorders axes. Axis movement is represented by its resulting permutation.
-    Transpose {
-        /// Child recipe.
-        input: Box<Self>,
-        /// Output-axis to input-axis permutation.
-        axes: Vec<usize>,
-    },
-    /// Casts a child to an MLX execution dtype.
-    Cast {
-        /// Child recipe.
-        input: Box<Self>,
-        /// Output execution dtype.
-        dtype: Dtype,
-    },
-    /// Reinterprets the backing bytes as another scalar dtype and exact shape.
-    ///
-    /// Unlike [`Self::Cast`], this does not numerically convert values. It is
-    /// intended for checkpoint formats whose packed byte representation is
-    /// already the representation consumed by the runtime kernel.
-    View {
-        /// Child recipe.
-        input: Box<Self>,
-        /// Output execution dtype.
-        dtype: Dtype,
-        /// Exact output shape.
-        shape: Vec<usize>,
-    },
-    /// Applies `log(-x)` elementwise.
-    NegLog {
-        /// Child recipe.
-        input: Box<Self>,
-    },
-    /// Subtracts one elementwise for GGUF offset-normalization weights.
-    SubtractOne {
-        /// Child recipe.
-        input: Box<Self>,
-    },
+    ) -> Result<Self, WeightRecipeError>
+    where
+        Self: Sized;
+    fn select_bounded_matrix_rows(
+        &self,
+        store: &dyn WeightStore,
+        leading_index: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Self, WeightRecipeError>
+    where
+        Self: Sized;
+    fn preflight_bounded(&self, store: &dyn WeightStore) -> Result<(), WeightRecipeError>;
+    fn peak_materialization_bytes(&self, store: &dyn WeightStore)
+        -> Result<u64, WeightRecipeError>;
+    fn materialize(
+        &self,
+        store: &dyn WeightStore,
+        source_stream: &Stream,
+    ) -> Result<Array, WeightRecipeError>;
+    fn prepare_materialization(
+        &self,
+        store: &dyn WeightStore,
+        source_stream: &Stream,
+    ) -> Result<PendingWeightRecipe, WeightRecipeError>;
+    fn prepare_borrowed_materialization(
+        &self,
+        store: &dyn WeightStore,
+        source_stream: &Stream,
+    ) -> Result<PendingWeightRecipe, WeightRecipeError>;
+    fn prepare_materialization_mode(
+        &self,
+        store: &dyn WeightStore,
+        source_stream: &Stream,
+        borrow_sources: bool,
+    ) -> Result<PendingWeightRecipe, WeightRecipeError>;
+    fn materialize_inner(
+        &self,
+        store: &dyn WeightStore,
+        stream: &Stream,
+        sources: &mut Vec<PendingWeightMaterialization>,
+        borrow_sources: bool,
+    ) -> Result<Array, WeightRecipeError>;
 }
 
-impl DerivedWeightRecipe {
-    /// Creates a direct checkpoint source recipe.
-    pub fn source(key: impl Into<String>, selection: TensorSelection) -> Self {
-        Self::Source {
-            key: key.into(),
-            selection,
-        }
-    }
-
-    /// Returns every source checkpoint key in deterministic order.
-    pub fn source_keys(&self) -> Vec<&str> {
-        let mut keys = BTreeSet::new();
-        self.collect_source_keys(&mut keys);
-        keys.into_iter().collect()
-    }
-
+impl MlxWeightRecipeExt for DerivedWeightRecipe {
     /// Rewrites an output selection toward checkpoint sources.
     ///
     /// The returned recipe is metadata-equivalent to selecting this recipe's
     /// output, but joins and shape transforms are rewritten so source stores
     /// can perform bounded reads. Geometry that cannot be represented by the
     /// store's single-axis selection contract is rejected during planning.
-    pub fn select_bounded(
+    fn select_bounded(
         &self,
         store: &dyn WeightStore,
         selection: TensorSelection,
@@ -285,7 +162,7 @@ impl DerivedWeightRecipe {
     /// Leading dimensions are retained as singleton dimensions. This lets a
     /// bounded writer visit an expert-major bank one matrix at a time without
     /// flattening away the runtime bank geometry or reading adjacent experts.
-    pub(crate) fn select_bounded_matrix_rows(
+    fn select_bounded_matrix_rows(
         &self,
         store: &dyn WeightStore,
         leading_index: usize,
@@ -342,7 +219,7 @@ impl DerivedWeightRecipe {
 
     /// Validates that every checkpoint source can be acquired without a
     /// complete-tensor fallback.
-    pub fn preflight_bounded(&self, store: &dyn WeightStore) -> Result<(), WeightRecipeError> {
+    fn preflight_bounded(&self, store: &dyn WeightStore) -> Result<(), WeightRecipeError> {
         match self {
             Self::Source { key, selection } => {
                 drop(store.acquire_with_policy(
@@ -374,7 +251,7 @@ impl DerivedWeightRecipe {
     /// intentionally conservative for view-like operations so callers can use
     /// it as a hard admission input for out-of-core transformations without
     /// relying on MLX aliasing optimizations.
-    pub(crate) fn peak_materialization_bytes(
+    fn peak_materialization_bytes(
         &self,
         store: &dyn WeightStore,
     ) -> Result<u64, WeightRecipeError> {
@@ -415,101 +292,13 @@ impl DerivedWeightRecipe {
         }
     }
 
-    fn collect_source_keys<'a>(&'a self, keys: &mut BTreeSet<&'a str>) {
-        match self {
-            Self::Source { key, .. } => {
-                keys.insert(key);
-            }
-            Self::Concatenate { inputs, .. } | Self::Stack { inputs, .. } => {
-                for input in inputs {
-                    input.collect_source_keys(keys);
-                }
-            }
-            Self::Select { input, .. }
-            | Self::Reshape { input, .. }
-            | Self::Transpose { input, .. }
-            | Self::Cast { input, .. }
-            | Self::View { input, .. }
-            | Self::NegLog { input }
-            | Self::SubtractOne { input } => input.collect_source_keys(keys),
-        }
-    }
-
-    /// Validates the complete recipe and infers its output metadata.
-    pub fn infer(
-        &self,
-        store: &dyn WeightStore,
-    ) -> Result<WeightRecipeMetadata, WeightRecipeError> {
-        match self {
-            Self::Source { key, selection } => infer_source(store, key, selection),
-            Self::Select { input, selection } => {
-                let metadata = input.infer(store)?;
-                let shape = selected_shape(metadata.shape, selection)?;
-                metadata_for(shape, metadata.dtype)
-            }
-            Self::Concatenate { axis, inputs } => infer_join(store, *axis, inputs, false),
-            Self::Stack { axis, inputs } => infer_join(store, *axis, inputs, true),
-            Self::Reshape { input, shape } => {
-                let metadata = input.infer(store)?;
-                let old_count = element_count(&metadata.shape, "reshape input")?;
-                let new_count = element_count(shape, "reshape output")?;
-                if old_count != new_count {
-                    return Err(WeightRecipeError::ElementCountMismatch {
-                        input: old_count,
-                        output: new_count,
-                    });
-                }
-                metadata_for(shape.clone(), metadata.dtype)
-            }
-            Self::Transpose { input, axes } => {
-                let metadata = input.infer(store)?;
-                if axes.len() != metadata.shape.len() {
-                    return Err(WeightRecipeError::InvalidPermutation {
-                        axes: axes.clone(),
-                        rank: metadata.shape.len(),
-                    });
-                }
-                let unique = axes.iter().copied().collect::<BTreeSet<_>>();
-                if unique.len() != axes.len() || axes.iter().any(|axis| *axis >= axes.len()) {
-                    return Err(WeightRecipeError::InvalidPermutation {
-                        axes: axes.clone(),
-                        rank: metadata.shape.len(),
-                    });
-                }
-                let shape = axes.iter().map(|axis| metadata.shape[*axis]).collect();
-                metadata_for(shape, metadata.dtype)
-            }
-            Self::Cast { input, dtype } => {
-                let metadata = input.infer(store)?;
-                metadata_for(metadata.shape, (*dtype).into())
-            }
-            Self::View {
-                input,
-                dtype,
-                shape,
-            } => {
-                let input = input.infer(store)?;
-                let output = metadata_for(shape.clone(), (*dtype).into())?;
-                if input.byte_len != output.byte_len {
-                    return Err(WeightRecipeError::ByteCountMismatch {
-                        input: input.byte_len,
-                        output: output.byte_len,
-                    });
-                }
-                Ok(output)
-            }
-            Self::NegLog { input } => input.infer(store),
-            Self::SubtractOne { input } => input.infer(store),
-        }
-    }
-
     /// Materializes this recipe on the host source stream.
     ///
     /// Source leases remain live until their dependent output has been
     /// evaluated. If a multi-input join reaches the mapping bound, completed
     /// children are detached before retrying so cross-shard recipes can honor
     /// a one-mapping limit without serializing the normal batched path.
-    pub fn materialize(
+    fn materialize(
         &self,
         store: &dyn WeightStore,
         source_stream: &Stream,
@@ -518,7 +307,7 @@ impl DerivedWeightRecipe {
     }
 
     /// Schedules a recipe while retaining all mmap-backed source selections.
-    pub(crate) fn prepare_materialization(
+    fn prepare_materialization(
         &self,
         store: &dyn WeightStore,
         source_stream: &Stream,
@@ -528,7 +317,7 @@ impl DerivedWeightRecipe {
 
     /// Schedules a recipe whose bounded checkpoint sources may remain borrowed
     /// until the containing output is evaluated.
-    pub(crate) fn prepare_borrowed_materialization(
+    fn prepare_borrowed_materialization(
         &self,
         store: &dyn WeightStore,
         source_stream: &Stream,
@@ -665,7 +454,7 @@ impl DerivedWeightRecipe {
             }
             Self::Cast { input, dtype } => {
                 let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
-                Ok(array.as_dtype(*dtype, stream)?)
+                Ok(array.as_dtype(mlx_dtype(dtype)?, stream)?)
             }
             Self::View {
                 input,
@@ -677,7 +466,9 @@ impl DerivedWeightRecipe {
                     .iter()
                     .map(|dimension| usize_to_i32(*dimension, "view dimension"))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(array.view_dtype(*dtype, stream)?.reshape(&shape, stream)?)
+                Ok(array
+                    .view_dtype(mlx_dtype(dtype)?, stream)?
+                    .reshape(&shape, stream)?)
             }
             Self::NegLog { input } => {
                 let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
@@ -963,7 +754,7 @@ fn push_selection(
         }
         DerivedWeightRecipe::Cast { input, dtype } => Ok(DerivedWeightRecipe::Cast {
             input: Box::new(push_selection(input, store, selection)?),
-            dtype: *dtype,
+            dtype: dtype.clone(),
         }),
         DerivedWeightRecipe::View {
             input,
@@ -976,7 +767,7 @@ fn push_selection(
                 map_reinterpret_selection(&input_metadata, &output_metadata, &selection, "view")?;
             Ok(DerivedWeightRecipe::View {
                 input: Box::new(push_selection(input, store, input_selection)?),
-                dtype: *dtype,
+                dtype: dtype.clone(),
                 shape: selected_shape(shape.clone(), &selection)?,
             })
         }
@@ -1548,19 +1339,6 @@ fn materialize_inputs(
     Ok(arrays)
 }
 
-fn infer_source(
-    store: &dyn WeightStore,
-    key: &str,
-    selection: &TensorSelection,
-) -> Result<WeightRecipeMetadata, WeightRecipeError> {
-    if key.trim().is_empty() {
-        return Err(WeightRecipeError::EmptySourceKey);
-    }
-    let metadata = store.metadata(key)?;
-    let shape = selected_shape(metadata.shape, selection)?;
-    metadata_for(shape, metadata.stored_dtype.into())
-}
-
 fn selected_shape(
     mut shape: Vec<usize>,
     selection: &TensorSelection,
@@ -1636,77 +1414,6 @@ fn selected_shape(
     Ok(shape)
 }
 
-fn infer_join(
-    store: &dyn WeightStore,
-    axis: usize,
-    inputs: &[DerivedWeightRecipe],
-    stack: bool,
-) -> Result<WeightRecipeMetadata, WeightRecipeError> {
-    if inputs.is_empty() {
-        return Err(WeightRecipeError::EmptyInputs);
-    }
-    let metadata = inputs
-        .iter()
-        .map(|input| input.infer(store))
-        .collect::<Result<Vec<_>, _>>()?;
-    let first = &metadata[0];
-    if metadata.iter().any(|item| item.dtype != first.dtype) {
-        return Err(WeightRecipeError::DtypeMismatch);
-    }
-    let rank = first.shape.len();
-    if axis > rank || (!stack && axis == rank) {
-        return Err(WeightRecipeError::InvalidJoinAxis { axis, rank, stack });
-    }
-    if stack {
-        if metadata.iter().any(|item| item.shape != first.shape) {
-            return Err(WeightRecipeError::ShapeMismatch);
-        }
-        let mut shape = first.shape.clone();
-        shape.insert(axis, metadata.len());
-        metadata_for(shape, first.dtype.clone())
-    } else {
-        let mut shape = first.shape.clone();
-        shape[axis] = 0;
-        for item in &metadata {
-            if item.shape.len() != rank
-                || item
-                    .shape
-                    .iter()
-                    .enumerate()
-                    .any(|(index, dimension)| index != axis && *dimension != first.shape[index])
-            {
-                return Err(WeightRecipeError::ShapeMismatch);
-            }
-            shape[axis] = shape[axis].checked_add(item.shape[axis]).ok_or(
-                WeightRecipeError::ArithmeticOverflow("concatenate dimension"),
-            )?;
-        }
-        metadata_for(shape, first.dtype.clone())
-    }
-}
-
-fn metadata_for(
-    shape: Vec<usize>,
-    dtype: RecipeDtype,
-) -> Result<WeightRecipeMetadata, WeightRecipeError> {
-    let elements = element_count(&shape, "recipe output")?;
-    let bits = elements
-        .checked_mul(dtype.bit_width()?)
-        .ok_or(WeightRecipeError::ArithmeticOverflow("recipe output bits"))?;
-    let byte_len = bits
-        .checked_add(7)
-        .ok_or(WeightRecipeError::ArithmeticOverflow("recipe output bytes"))?
-        / 8;
-    if byte_len == 0 {
-        return Err(WeightRecipeError::ZeroSizedOutput);
-    }
-    Ok(WeightRecipeMetadata {
-        shape,
-        dtype,
-        byte_len,
-    })
-}
-
 fn element_count(shape: &[usize], context: &'static str) -> Result<u64, WeightRecipeError> {
     shape.iter().try_fold(1u64, |count, dimension| {
         let dimension = u64::try_from(*dimension)
@@ -1724,6 +1431,9 @@ fn usize_to_i32(value: usize, context: &'static str) -> Result<i32, WeightRecipe
 /// Structured validation and materialization failures for derived weights.
 #[derive(Debug, thiserror::Error)]
 pub enum WeightRecipeError {
+    /// Backend-neutral recipe validation or shape inference failed.
+    #[error(transparent)]
+    Neutral(#[from] eredu_checkpoint::recipe::RecipeError),
     /// A source key was empty.
     #[error("derived-weight source key must not be empty")]
     EmptySourceKey,
@@ -1883,7 +1593,7 @@ mod tests {
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let recipe = DerivedWeightRecipe::View {
             input: Box::new(DerivedWeightRecipe::source("left", TensorSelection::Full)),
-            dtype: Dtype::Uint8,
+            dtype: RecipeDtype::U8,
             shape: vec![2, 8],
         };
         let metadata = recipe.infer(store.as_ref()).unwrap();
@@ -1996,7 +1706,7 @@ mod tests {
                     },
                 ],
             }),
-            dtype: Dtype::Float32,
+            dtype: RecipeDtype::F32,
         };
         let metadata = recipe.infer(store.as_ref()).unwrap();
         assert_eq!(metadata.shape(), &[2, 4, 2]);
@@ -2305,7 +2015,7 @@ mod tests {
 
         let view = DerivedWeightRecipe::View {
             input: Box::new(source("left")),
-            dtype: Dtype::Uint8,
+            dtype: RecipeDtype::U8,
             shape: vec![2, 8],
         };
         let rewritten = view
@@ -2383,7 +2093,7 @@ mod tests {
         let (_dir, store) = fixture();
         let view = DerivedWeightRecipe::View {
             input: Box::new(source("left")),
-            dtype: Dtype::Uint8,
+            dtype: RecipeDtype::U8,
             shape: vec![2, 8],
         };
         assert!(matches!(
@@ -2411,7 +2121,7 @@ mod tests {
         };
         assert!(matches!(
             reshape.infer(store.as_ref()),
-            Err(WeightRecipeError::ElementCountMismatch { .. })
+            Err(eredu_checkpoint::recipe::RecipeError::ElementCountMismatch { .. })
         ));
         let transpose = DerivedWeightRecipe::Transpose {
             input: Box::new(source("left")),
@@ -2419,7 +2129,7 @@ mod tests {
         };
         assert!(matches!(
             transpose.infer(store.as_ref()),
-            Err(WeightRecipeError::InvalidPermutation { .. })
+            Err(eredu_checkpoint::recipe::RecipeError::InvalidPermutation { .. })
         ));
     }
 

@@ -54,7 +54,8 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     backend::mlx::runtime::checkpoint::{
-        quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
+        quantization::should_quantize_on_load,
+        recipe::{DerivedWeightRecipe, RecipeDtype},
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
@@ -1735,7 +1736,7 @@ impl InklingLayerwiseAdapter {
                 } else if raw.ends_with("_sconv.weight") {
                     DerivedWeightRecipe::Cast {
                         input: Box::new(source),
-                        dtype: Dtype::Float32,
+                        dtype: RecipeDtype::F32,
                     }
                 } else {
                     source

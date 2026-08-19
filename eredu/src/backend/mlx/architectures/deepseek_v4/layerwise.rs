@@ -15,7 +15,7 @@ use safemlx::{
     ops::{
         broadcast_to, indexing::NewAxis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue,
     },
-    Array, Dtype, Stream,
+    Array, Stream,
 };
 
 use crate::core::cache::{
@@ -36,7 +36,7 @@ use crate::{
                 populate_module_from_lease_excluding,
             },
             binding_plan::{BindingPlan, PlannedBinding},
-            recipe::DerivedWeightRecipe,
+            recipe::{DerivedWeightRecipe, RecipeDtype},
             store::{GgufWeightStore, TensorSelection, WeightStore},
         },
         execution::layerwise::{
@@ -2017,7 +2017,7 @@ fn expert_bank_recipe(
     if component == "weight" && args.expert_dtype.as_deref() == Some("fp4") {
         recipe = DerivedWeightRecipe::View {
             input: Box::new(recipe),
-            dtype: Dtype::Uint32,
+            dtype: RecipeDtype::U32,
             shape: target_shape.iter().map(|value| *value as usize).collect(),
         };
     }
@@ -2213,7 +2213,7 @@ pub(crate) fn expert_catalog(
                     };
                     recipe = DerivedWeightRecipe::View {
                         input: Box::new(recipe),
-                        dtype: Dtype::Uint32,
+                        dtype: RecipeDtype::U32,
                         shape: vec![1, output as usize, (input / 8) as usize],
                     };
                 }

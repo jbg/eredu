@@ -53,7 +53,8 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     backend::mlx::runtime::checkpoint::{
-        quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
+        quantization::should_quantize_on_load,
+        recipe::{recipe_dtype_from_mlx, DerivedWeightRecipe},
     },
     backend::mlx::runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, register_replicated_module,
@@ -118,7 +119,7 @@ fn lfm2_conv_weight_recipe(
     // kernel is F32.
     Some(DerivedWeightRecipe::Cast {
         input: Box::new(layout_recipe),
-        dtype: parameter_dtype,
+        dtype: recipe_dtype_from_mlx(parameter_dtype),
     })
 }
 

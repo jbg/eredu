@@ -287,6 +287,48 @@ pub trait WeightStore: Any {
     fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError>;
 }
 
+fn recipe_tensor_metadata(
+    store: &dyn WeightStore,
+    key: &str,
+) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
+    let metadata = store.metadata(key).map_err(|error| match error {
+        WeightStoreError::UnknownTensor { key } => {
+            eredu_checkpoint::store::StoreError::UnknownTensor { key }
+        }
+        other => eredu_checkpoint::store::StoreError::Internal(other.to_string()),
+    })?;
+    Ok(eredu_checkpoint::store::TensorMetadata {
+        name: metadata.name,
+        logical_shape: metadata.shape.clone(),
+        physical_shape: metadata.shape,
+        stored_dtype: metadata.stored_dtype,
+        encoded_byte_len: u64::try_from(metadata.logical_byte_len).map_err(|_| {
+            eredu_checkpoint::store::StoreError::Overflow {
+                context: format!("recipe metadata byte length for {key:?}"),
+            }
+        })?,
+        backing_shard: metadata.backing_shard,
+    })
+}
+
+impl eredu_checkpoint::recipe::RecipeCatalog for dyn WeightStore {
+    fn tensor_metadata(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
+        recipe_tensor_metadata(self, key)
+    }
+}
+
+impl eredu_checkpoint::recipe::RecipeCatalog for dyn WeightStore + Send + Sync {
+    fn tensor_metadata(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
+        recipe_tensor_metadata(self, key)
+    }
+}
+
 /// A checkpoint store restricted to the exact physical layout selected by an
 /// architecture contract.
 ///

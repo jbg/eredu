@@ -35,7 +35,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::{
         quantization::quantize_tensor,
-        recipe::{DerivedWeightRecipe, RecipeDtype},
+        recipe::{DerivedWeightRecipe, MlxWeightRecipeExt, RecipeDtype},
         store::{
             PendingWeightMaterialization, SafetensorsWeightStore, TensorSelection, WeightLease,
             WeightMetadata, WeightReadPolicy, WeightStore, WeightStoreBackend,

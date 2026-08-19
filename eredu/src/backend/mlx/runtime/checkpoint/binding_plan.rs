@@ -215,14 +215,14 @@ pub(crate) enum BindingPlanError {
     #[error(transparent)]
     Recipe(#[from] WeightRecipeError),
     #[error(transparent)]
+    NeutralRecipe(#[from] eredu_checkpoint::recipe::RecipeError),
+    #[error(transparent)]
     Residency(#[from] ResidencyError),
 }
 
 #[cfg(test)]
 mod tests {
     use std::{any::Any, path::PathBuf};
-
-    use safemlx::Dtype;
 
     use super::*;
     use crate::backend::mlx::runtime::checkpoint::store::{
@@ -451,7 +451,7 @@ mod tests {
             (
                 DerivedWeightRecipe::Cast {
                     input: Box::new(source),
-                    dtype: Dtype::Float16,
+                    dtype: RecipeDtype::F16,
                 },
                 vec![2, 2],
                 RecipeDtype::F16,
@@ -459,7 +459,7 @@ mod tests {
             (
                 DerivedWeightRecipe::View {
                     input: Box::new(DerivedWeightRecipe::source("bytes", TensorSelection::Full)),
-                    dtype: Dtype::Float32,
+                    dtype: RecipeDtype::F32,
                     shape: vec![1],
                 },
                 vec![1],
@@ -467,7 +467,7 @@ mod tests {
             ),
         ];
         for (recipe, shape, dtype) in recipes {
-            let metadata = recipe.infer(&store).unwrap();
+            let metadata = recipe.infer(&store as &dyn WeightStore).unwrap();
             assert_eq!(metadata.shape(), shape);
             assert_eq!(metadata.dtype(), &dtype);
         }
@@ -500,7 +500,7 @@ mod tests {
             input: Box::new(DerivedWeightRecipe::source("matrix", TensorSelection::Full)),
             shape: vec![3],
         };
-        assert!(invalid.infer(&store).is_err());
+        assert!(invalid.infer(&store as &dyn WeightStore).is_err());
         assert!(matches!(
             BindingPlan::new(vec![PlannedBinding::direct(
                 "overflow",

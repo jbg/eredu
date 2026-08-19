@@ -170,6 +170,14 @@ impl From<eredu_checkpoint::store::StoreError> for Error {
     }
 }
 
+impl From<eredu_checkpoint::recipe::RecipeError> for Error {
+    fn from(error: eredu_checkpoint::recipe::RecipeError) -> Self {
+        Self::WeightRecipe(
+            crate::backend::mlx::runtime::checkpoint::recipe::WeightRecipeError::Neutral(error),
+        )
+    }
+}
+
 impl From<eredu_checkpoint::Error> for Error {
     fn from(error: eredu_checkpoint::Error) -> Self {
         Self::Quantization(error.to_string())

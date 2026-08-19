@@ -44,7 +44,8 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     backend::mlx::runtime::checkpoint::{
-        quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
+        quantization::should_quantize_on_load,
+        recipe::{DerivedWeightRecipe, RecipeDtype},
     },
     backend::mlx::runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, register_projection_module,
@@ -793,7 +794,7 @@ impl GptOssLayerwiseAdapter {
                 "mlp.experts.gate_up_proj_blocks".into(),
                 DerivedWeightRecipe::View {
                     input: Box::new(gate_up_u32),
-                    dtype: Dtype::Uint8,
+                    dtype: RecipeDtype::U8,
                     shape: vec![experts, 2 * intermediate, hidden / 32, 16],
                 },
             ),
@@ -817,7 +818,7 @@ impl GptOssLayerwiseAdapter {
                 "mlp.experts.down_proj_blocks".into(),
                 DerivedWeightRecipe::View {
                     input: Box::new(source("down_proj.weight")),
-                    dtype: Dtype::Uint8,
+                    dtype: RecipeDtype::U8,
                     shape: vec![experts, hidden, intermediate / 32, 16],
                 },
             ),
@@ -1684,7 +1685,7 @@ pub(crate) fn gpt_oss_expert_catalog_cartesian(
                                 "up_proj.weight",
                                 vec![1, 2 * intermediate, hidden / 8],
                             )),
-                            dtype: Dtype::Uint8,
+                            dtype: RecipeDtype::U8,
                             shape: vec![1, 2 * intermediate, hidden / 32, 16],
                         },
                     ),
@@ -1704,7 +1705,7 @@ pub(crate) fn gpt_oss_expert_catalog_cartesian(
                         "down_proj_blocks",
                         DerivedWeightRecipe::View {
                             input: Box::new(selected("down_proj.weight")),
-                            dtype: Dtype::Uint8,
+                            dtype: RecipeDtype::U8,
                             shape: vec![1, hidden, intermediate / 32, 16],
                         },
                     ),

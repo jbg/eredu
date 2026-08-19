@@ -22,7 +22,8 @@ use crate::{
         load_array_quantized_strict, StrictLoadConfig, StrictLoadReport,
     },
     backend::mlx::runtime::checkpoint::recipe::{
-        DerivedWeightRecipe, RecipeDtype, WeightRecipeError,
+        recipe_dtype_from_mlx, DerivedWeightRecipe, MlxWeightRecipeExt, RecipeDtype,
+        WeightRecipeError,
     },
     backend::mlx::runtime::checkpoint::store::{
         TensorSelection, WeightMaterialization, WeightReadPolicy, WeightStore, WeightStoreError,
@@ -440,7 +441,7 @@ where
                         actual: metadata.shape().to_vec(),
                     });
                 }
-                let expected_dtype = RecipeDtype::from(parameter.dtype());
+                let expected_dtype = recipe_dtype_from_mlx(parameter.dtype());
                 if !recipe_dtype_matches(&expected_dtype, metadata.dtype()) {
                     return Err(ModuleBindingError::RecipeDtypeMismatch {
                         parameter: qualify(prefix, &local_name),
@@ -742,6 +743,9 @@ pub enum ModuleBindingError {
     /// Derived-weight metadata validation failed.
     #[error(transparent)]
     WeightRecipe(#[from] crate::backend::mlx::runtime::checkpoint::recipe::WeightRecipeError),
+    /// Backend-neutral recipe validation failed.
+    #[error(transparent)]
+    NeutralRecipe(#[from] eredu_checkpoint::recipe::RecipeError),
     /// Residency binding or lookup failed.
     #[error(transparent)]
     Residency(#[from] crate::backend::mlx::runtime::residency::manager::ResidencyError),
