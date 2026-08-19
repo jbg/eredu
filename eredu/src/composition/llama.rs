@@ -43,12 +43,12 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
-        DenseDiskStreamReport, LayerwiseModelMetadata, ParallelModelInfo, StaticUnitBindings,
+        DenseDiskStreamReport, ParallelModelInfo, StaticUnitBindings,
     },
     backend::mlx::runtime::media::input,
     composition::llama_mlx as resident,
 };
-use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_runtime::{CacheResidencyPolicy, LayerwiseModelMetadata, PagedCacheOptions};
 
 use eredu_runtime::{ResidencyReport, WeightBinding};
 
@@ -171,9 +171,9 @@ fn load_neutral_llama(
         weights_stream,
         |key| key.starts_with("rope_freqs.") || key.ends_with(".rotary_emb.inv_freq"),
     )?;
-    metadata.model_type = args.model_type.clone();
-    metadata.quantization = args.weight_quantization();
-    metadata.materialization = materialization;
+    metadata.set_model_type(args.model_type.clone());
+    metadata.set_quantization(args.weight_quantization());
+    metadata.set_materialization(materialization);
     let execution = if options.is_fully_resident() {
         LlamaExecution::Resident(LayerwiseRuntime::new(
             architecture,
@@ -773,8 +773,8 @@ fn load_neutral_llama_parallel(
             shard_layer_bindings(bindings, &format!("model.layers.{index}"), store, &layout)
         },
     )?;
-    metadata.model_type = args.model_type.clone();
-    metadata.quantization = args.weight_quantization();
+    metadata.set_model_type(args.model_type.clone());
+    metadata.set_quantization(args.weight_quantization());
     let local_parameter_bytes = metadata
         .static_device_bytes()
         .checked_add(metadata.layer_parameter_bytes())

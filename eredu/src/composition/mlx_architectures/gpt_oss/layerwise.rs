@@ -121,9 +121,7 @@ impl GptOssLayerwiseModel {
     }
 
     /// Returns generalized parameter-residency and encoding metadata.
-    pub fn residency_metadata(
-        &self,
-    ) -> &crate::backend::mlx::runtime::execution::layerwise::LayerwiseModelMetadata {
+    pub fn residency_metadata(&self) -> &eredu_runtime::LayerwiseModelMetadata {
         self.execution.metadata()
     }
 

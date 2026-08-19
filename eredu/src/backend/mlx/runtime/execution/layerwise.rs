@@ -11,7 +11,7 @@ use eredu_checkpoint::{
 };
 use eredu_runtime::{
     DenseDiskStreamLoadOptions, DenseTransferSchedule, ExecutionResidency, LayerWeightResidency,
-    OffloadUnit, WeightBinding, WeightResidency, DENSE_TRANSFER_WINDOW,
+    LayerwiseModelMetadata, OffloadUnit, WeightBinding, WeightResidency, DENSE_TRANSFER_WINDOW,
 };
 
 use std::{
@@ -1117,21 +1117,6 @@ impl Drop for DenseStreamGroupGuard {
     }
 }
 
-/// Inspectable parameter-residency metadata for a layerwise model.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct LayerwiseModelMetadata {
-    pub(crate) model_type: String,
-    pub(crate) quantization: Option<eredu_checkpoint::WeightQuantization>,
-    pub(crate) layer_count: usize,
-    pub(crate) static_device_bytes: u64,
-    pub(crate) residency: ExecutionResidency,
-    pub(crate) layer_parameter_bytes: u64,
-    pub(crate) maximum_device_layer_bytes: u64,
-    pub(crate) maximum_host_layer_bytes: u64,
-    pub(crate) device_layer_capacity: usize,
-    pub(crate) materialization: Option<WeightMaterializationReport>,
-}
-
 /// Architecture-neutral information for a rank-local parallel model.
 #[derive(Debug, Clone)]
 pub struct ParallelModelInfo {
@@ -1198,51 +1183,6 @@ impl ParallelModelInfo {
     /// Returns the maximum planned rank-local parameter footprint on device.
     pub const fn maximum_device_parameter_bytes(&self) -> u64 {
         self.maximum_device_parameter_bytes
-    }
-}
-
-impl LayerwiseModelMetadata {
-    /// Returns the checkpoint model type supplied by the adapter.
-    pub fn model_type(&self) -> &str {
-        &self.model_type
-    }
-    /// Returns checkpoint-native packed quantization metadata, if present.
-    pub const fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
-        self.quantization
-    }
-    /// Returns the decoder layer count.
-    pub const fn layer_count(&self) -> usize {
-        self.layer_count
-    }
-    /// Returns pinned static parameter bytes on the execution device.
-    pub const fn static_device_bytes(&self) -> u64 {
-        self.static_device_bytes
-    }
-    /// Returns the selected generalized parameter-residency policy.
-    pub const fn residency(&self) -> ExecutionResidency {
-        self.residency
-    }
-    /// Returns the complete rank-local decoder-layer parameter byte total.
-    pub const fn layer_parameter_bytes(&self) -> u64 {
-        self.layer_parameter_bytes
-    }
-    /// Returns the largest possible device-resident decoder-layer byte total.
-    pub const fn maximum_device_layer_bytes(&self) -> u64 {
-        self.maximum_device_layer_bytes
-    }
-    /// Returns the charged host-transfer capacity of the largest decoder layer.
-    pub const fn maximum_host_layer_bytes(&self) -> u64 {
-        self.maximum_host_layer_bytes
-    }
-    /// Returns the maximum number of decoder layers retained on device.
-    pub const fn device_layer_capacity(&self) -> usize {
-        self.device_layer_capacity
-    }
-
-    /// Returns bounded load-time materialization telemetry when dense semantic
-    /// weights were converted into a packed disk overlay.
-    pub const fn materialization(&self) -> Option<&WeightMaterializationReport> {
-        self.materialization.as_ref()
     }
 }
 
@@ -2074,18 +2014,17 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             }
         }
         let layer_count = groups.iter().map(|group| group.units().len()).sum();
-        let metadata = LayerwiseModelMetadata {
-            model_type: adapter.model_type().into(),
-            quantization: adapter.quantization(),
+        let metadata = LayerwiseModelMetadata::new(
+            adapter.model_type(),
+            adapter.quantization(),
             layer_count,
-            static_device_bytes: 0,
-            residency: ExecutionResidency::LayerwiseHost,
-            layer_parameter_bytes: 0,
-            maximum_device_layer_bytes: 0,
-            maximum_host_layer_bytes: 0,
-            device_layer_capacity: 0,
-            materialization: None,
-        };
+            0,
+            ExecutionResidency::LayerwiseHost,
+            0,
+            0,
+            0,
+            0,
+        );
         Ok(Self {
             adapter,
             graph,
@@ -2369,7 +2308,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         Ok(self
             .residency
             .report()?
-            .with_materialization(self.metadata.materialization.clone()))
+            .with_materialization(self.metadata.materialization().cloned()))
     }
 
     /// Returns dense-stream observations when that experimental policy is active.
@@ -3668,7 +3607,7 @@ where
             )?;
             let mut model =
                 load_layerwise_model(store, target_adapter, options, stream, weights_stream)?;
-            model.metadata.materialization = Some(report);
+            model.metadata.set_materialization(Some(report));
             Ok(model)
         }
         None => load_layerwise_model(store, source_adapter, options, stream, weights_stream),
@@ -3710,7 +3649,7 @@ where
                 stream,
                 weights_stream,
             )?;
-            model.metadata.materialization = Some(report);
+            model.metadata.set_materialization(Some(report));
             Ok(model)
         }
         None => load_tensor_parallel_layerwise_model(
@@ -4164,22 +4103,21 @@ where
     if fully_resident {
         model.materialize_resident_layers(stream)?;
     }
-    model.metadata = LayerwiseModelMetadata {
-        model_type: model.adapter.model_type().into(),
-        quantization: model.adapter.quantization(),
-        layer_count: planned_layer_count,
+    model.metadata = LayerwiseModelMetadata::new(
+        model.adapter.model_type(),
+        model.adapter.quantization(),
+        planned_layer_count,
         static_device_bytes,
-        residency: options.execution_residency(),
+        options.execution_residency(),
         layer_parameter_bytes,
-        maximum_device_layer_bytes: device_window_bytes,
+        device_window_bytes,
         maximum_host_layer_bytes,
-        device_layer_capacity: if fully_resident {
+        if fully_resident {
             planned_layer_count
         } else {
             maximum_group_depth
         },
-        materialization: None,
-    };
+    );
     if let Some(dense) = dense {
         let execution_groups = model
             .groups
@@ -4426,22 +4364,21 @@ where
     if fully_resident {
         model.materialize_resident_layers(stream)?;
     }
-    model.metadata = LayerwiseModelMetadata {
-        model_type: model.adapter.model_type().into(),
-        quantization: model.adapter.quantization(),
-        layer_count: planned_layer_count,
+    model.metadata = LayerwiseModelMetadata::new(
+        model.adapter.model_type(),
+        model.adapter.quantization(),
+        planned_layer_count,
         static_device_bytes,
-        residency: options.execution_residency(),
+        options.execution_residency(),
         layer_parameter_bytes,
-        maximum_device_layer_bytes: device_window_bytes,
+        device_window_bytes,
         maximum_host_layer_bytes,
-        device_layer_capacity: if fully_resident {
+        if fully_resident {
             planned_layer_count
         } else {
             maximum_group_depth
         },
-        materialization: None,
-    };
+    );
     let local_parameter_bytes = static_device_bytes
         .checked_add(layer_parameter_bytes)
         .ok_or(LayerwiseModelError::ArithmeticOverflow {

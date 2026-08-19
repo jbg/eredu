@@ -315,9 +315,7 @@ impl LayerwiseDecoder {
     }
 
     /// Returns generalized parameter-residency and memory metadata.
-    pub fn residency_metadata(
-        &self,
-    ) -> &crate::backend::mlx::runtime::execution::layerwise::LayerwiseModelMetadata {
+    pub fn residency_metadata(&self) -> &eredu_runtime::LayerwiseModelMetadata {
         self.execution.metadata()
     }
 

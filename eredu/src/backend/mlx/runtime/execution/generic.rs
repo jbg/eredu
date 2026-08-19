@@ -1,6 +1,6 @@
 //! SafeMLX realization of the backend-neutral layerwise unit policy.
 
-use eredu_runtime::LayerWeightResidency;
+use eredu_runtime::{LayerWeightResidency, LayerwiseModelMetadata};
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -19,7 +19,7 @@ use crate::backend::mlx::{
         execution::layerwise::{
             validate_device_budget, validate_host_budget, validate_unused, DenseDiskStreamReport,
             DensePreparedTransfer, DenseStreamController, DenseStreamForwardGuard,
-            DenseStreamGroupGuard, DenseTransferWindow, LayerwiseModelMetadata, SharedWeightStore,
+            DenseStreamGroupGuard, DenseTransferWindow, SharedWeightStore,
         },
         residency::manager::{
             host_capacity_upper_bound_for_bindings, ResidencyManager, ResidentTransfer,
@@ -576,18 +576,17 @@ where
     residency.initialize()?;
     let static_lease = residency.acquire(&static_id, MemoryTier::Device)?;
     populate_parameterized(static_modules, &static_lease)?;
-    let metadata = LayerwiseModelMetadata {
-        model_type: "generic".into(),
-        quantization: None,
+    let metadata = LayerwiseModelMetadata::new(
+        "generic",
+        None,
         layer_count,
-        static_device_bytes: static_bytes,
-        residency: options.execution_residency(),
+        static_bytes,
+        options.execution_residency(),
         layer_parameter_bytes,
-        maximum_device_layer_bytes: device_window_bytes,
-        maximum_host_layer_bytes: maximum_host_bytes,
-        device_layer_capacity: depth,
-        materialization: None,
-    };
+        device_window_bytes,
+        maximum_host_bytes,
+        depth,
+    );
     let dense_controller = dense
         .map(|options| {
             DenseStreamController::new(

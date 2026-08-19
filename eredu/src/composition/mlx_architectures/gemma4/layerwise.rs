@@ -547,9 +547,7 @@ impl Gemma4LayerwiseModel {
     }
 
     /// Returns canonical parameter and residency metadata.
-    pub fn metadata(
-        &self,
-    ) -> &crate::backend::mlx::runtime::execution::layerwise::LayerwiseModelMetadata {
+    pub fn metadata(&self) -> &eredu_runtime::LayerwiseModelMetadata {
         self.execution.metadata()
     }
 

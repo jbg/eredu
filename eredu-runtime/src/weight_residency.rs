@@ -614,6 +614,118 @@ pub enum ExecutionResidency {
     DenseDiskStream,
 }
 
+/// Inspectable backend-neutral parameter-residency metadata for a layered model.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LayerwiseModelMetadata {
+    model_type: String,
+    quantization: Option<eredu_checkpoint::WeightQuantization>,
+    layer_count: usize,
+    static_device_bytes: u64,
+    residency: ExecutionResidency,
+    layer_parameter_bytes: u64,
+    maximum_device_layer_bytes: u64,
+    maximum_host_layer_bytes: u64,
+    device_layer_capacity: usize,
+    materialization: Option<crate::WeightMaterializationReport>,
+}
+
+impl LayerwiseModelMetadata {
+    /// Creates one complete metadata snapshot before optional materialization telemetry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        model_type: impl Into<String>,
+        quantization: Option<eredu_checkpoint::WeightQuantization>,
+        layer_count: usize,
+        static_device_bytes: u64,
+        residency: ExecutionResidency,
+        layer_parameter_bytes: u64,
+        maximum_device_layer_bytes: u64,
+        maximum_host_layer_bytes: u64,
+        device_layer_capacity: usize,
+    ) -> Self {
+        Self {
+            model_type: model_type.into(),
+            quantization,
+            layer_count,
+            static_device_bytes,
+            residency,
+            layer_parameter_bytes,
+            maximum_device_layer_bytes,
+            maximum_host_layer_bytes,
+            device_layer_capacity,
+            materialization: None,
+        }
+    }
+
+    /// Replaces the normalized model identity after checkpoint resolution.
+    pub fn set_model_type(&mut self, model_type: impl Into<String>) {
+        self.model_type = model_type.into();
+    }
+
+    /// Replaces checkpoint-native packed quantization metadata.
+    pub fn set_quantization(&mut self, quantization: Option<eredu_checkpoint::WeightQuantization>) {
+        self.quantization = quantization;
+    }
+
+    /// Replaces bounded load-time materialization telemetry.
+    pub fn set_materialization(
+        &mut self,
+        materialization: Option<crate::WeightMaterializationReport>,
+    ) {
+        self.materialization = materialization;
+    }
+
+    /// Returns the checkpoint model type supplied by the architecture.
+    pub fn model_type(&self) -> &str {
+        &self.model_type
+    }
+
+    /// Returns checkpoint-native packed quantization metadata, if present.
+    pub const fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
+        self.quantization
+    }
+
+    /// Returns the ordered execution-unit count.
+    pub const fn layer_count(&self) -> usize {
+        self.layer_count
+    }
+
+    /// Returns pinned static parameter bytes on the execution device.
+    pub const fn static_device_bytes(&self) -> u64 {
+        self.static_device_bytes
+    }
+
+    /// Returns the selected generalized parameter-residency policy.
+    pub const fn residency(&self) -> ExecutionResidency {
+        self.residency
+    }
+
+    /// Returns complete rank-local execution-unit parameter bytes.
+    pub const fn layer_parameter_bytes(&self) -> u64 {
+        self.layer_parameter_bytes
+    }
+
+    /// Returns the largest possible device-resident execution-unit byte total.
+    pub const fn maximum_device_layer_bytes(&self) -> u64 {
+        self.maximum_device_layer_bytes
+    }
+
+    /// Returns the charged host-transfer capacity of the largest execution unit.
+    pub const fn maximum_host_layer_bytes(&self) -> u64 {
+        self.maximum_host_layer_bytes
+    }
+
+    /// Returns the maximum number of execution units retained on device.
+    pub const fn device_layer_capacity(&self) -> usize {
+        self.device_layer_capacity
+    }
+
+    /// Returns bounded load-time materialization telemetry.
+    pub const fn materialization(&self) -> Option<&crate::WeightMaterializationReport> {
+        self.materialization.as_ref()
+    }
+}
+
 /// Invalid backend-neutral immutable-weight residency policy.
 #[derive(Debug, thiserror::Error)]
 pub enum WeightResidencyPolicyError {
@@ -718,5 +830,32 @@ mod tests {
             ExpertIdentity::new(3, 7).unit_id().as_str(),
             "expert.layer.00003.global.00007"
         );
+    }
+
+    #[test]
+    fn layerwise_metadata_is_runtime_owned_and_updateable() {
+        let mut metadata = LayerwiseModelMetadata::new(
+            "generic",
+            None,
+            4,
+            10,
+            ExecutionResidency::LayerwiseHost,
+            20,
+            8,
+            6,
+            2,
+        );
+        metadata.set_model_type("llama");
+        metadata.set_quantization(Some(eredu_checkpoint::WeightQuantization::Affine(
+            eredu_checkpoint::AffineQuantization::default(),
+        )));
+
+        assert_eq!(metadata.model_type(), "llama");
+        assert_eq!(metadata.layer_count(), 4);
+        assert_eq!(metadata.static_device_bytes(), 10);
+        assert_eq!(metadata.layer_parameter_bytes(), 20);
+        assert_eq!(metadata.maximum_device_layer_bytes(), 8);
+        assert_eq!(metadata.maximum_host_layer_bytes(), 6);
+        assert_eq!(metadata.device_layer_capacity(), 2);
     }
 }

@@ -252,6 +252,7 @@ fn immutable_weight_residency_policy_is_runtime_owned() {
         "pub enum ExpertWeightResidency",
         "pub enum WeightResidency",
         "pub enum ExecutionResidency",
+        "pub struct LayerwiseModelMetadata",
     ] {
         assert!(
             runtime.contains(runtime_owned),
@@ -279,6 +280,7 @@ fn immutable_weight_residency_policy_is_runtime_owned() {
             "pub enum ExpertWeightResidency",
             "pub enum WeightResidency",
             "pub enum ExecutionResidency",
+            "pub struct LayerwiseModelMetadata",
         ] {
             assert!(
                 !source.contains(runtime_owned),

@@ -82,8 +82,8 @@ pub use state::{
 pub use weight_residency::{
     DenseDiskStreamLoadOptions, DenseTransferSchedule, DenseTransferScheduleError,
     ExecutionResidency, ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, ExpertWeightResidency,
-    LayerWeightResidency, LayerwiseLoadOptions, NonExpertWeightResidency, WeightResidency,
-    WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
+    LayerWeightResidency, LayerwiseLoadOptions, LayerwiseModelMetadata, NonExpertWeightResidency,
+    WeightResidency, WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
 };
 
 /// Inspectable architecture/runtime topology without backend-native values.
