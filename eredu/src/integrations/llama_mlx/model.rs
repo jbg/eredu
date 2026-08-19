@@ -5,9 +5,8 @@ use eredu_checkpoint::WeightQuantization;
 use std::collections::HashMap;
 
 use safemlx::{
-    error::Exception,
     ops::{GgufCheckpoint, GgufMetadataValue},
-    Array, Stream,
+    Stream,
 };
 
 use eredu_architectures::llama::ModelArgs;
@@ -16,75 +15,6 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
 };
-
-/// MLX specialization of the backend-neutral Llama block input.
-pub type AttentionInput<'a, C> = eredu_architectures::llama::AttentionInput<'a, Array, C>;
-
-/// MLX specialization of one backend-neutral Llama decoder block.
-pub type TransformerBlock = crate::backend::mlx::nn::shared::MlxModule<
-    eredu_architectures::llama::TransformerBlock<crate::backend::mlx::nn::shared::MlxBackend>,
->;
-
-impl
-    crate::backend::mlx::nn::shared::MlxModule<
-        eredu_architectures::llama::TransformerBlock<crate::backend::mlx::nn::shared::MlxBackend>,
-    >
-{
-    pub(crate) fn new_for_layer(
-        args: &ModelArgs,
-        layer_index: i32,
-        stream: &Stream,
-    ) -> Result<Self, Exception> {
-        let layer = usize::try_from(layer_index)
-            .map_err(|_| Exception::custom(format!("invalid Llama layer index {layer_index}")))?;
-        eredu_architectures::llama::TransformerBlock::<crate::backend::mlx::nn::shared::MlxBackend>::new(
-            args, layer, stream,
-        )
-        .map(Self::new)
-        .map_err(|error| Exception::custom(error.to_string()))
-    }
-
-    /// Executes one replicated decoder block.
-    pub fn forward<C>(
-        &mut self,
-        input: AttentionInput<'_, C>,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        C: eredu_nn::AttentionCache<Array>,
-    {
-        self.inner
-            .forward(input, stream)
-            .map_err(|error| Exception::custom(error.to_string()))
-    }
-
-    /// Executes a block with rank-local heads and MLP intermediates.
-    pub(crate) fn forward_tensor_parallel<C>(
-        &mut self,
-        hidden: &Array,
-        mask: Option<&Array>,
-        cache: Option<&mut C>,
-        allow_sliding_prefill: bool,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Exception>
-    where
-        C: eredu_nn::AttentionCache<Array>,
-    {
-        self.inner
-            .forward_tensor_parallel(
-                AttentionInput {
-                    hidden,
-                    mask,
-                    cache,
-                    allow_sliding_prefill,
-                },
-                group,
-                stream,
-            )
-            .map_err(|error| Exception::custom(error.to_string()))
-    }
-}
 
 pub(crate) struct PreparedLlamaGguf {
     pub(crate) args: ModelArgs,

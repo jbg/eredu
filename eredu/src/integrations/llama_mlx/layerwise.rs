@@ -28,7 +28,7 @@ use crate::core::cache::{
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::nn::shared::{MlxBackend, MlxEmbedding, MlxLinear, MlxRmsNorm},
+    backend::mlx::nn::shared::{MlxBackend, MlxEmbedding, MlxLinear, MlxModule, MlxRmsNorm},
     backend::mlx::nn::{
         parallel::{planned_kv_head_layout, VocabParallelEmbedding, VocabParallelLmHead},
         tensor::{create_attention_mask_from_cache, AttentionMask},
@@ -52,7 +52,7 @@ use crate::{
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
-    integrations::llama_mlx::model::{self as resident, AttentionInput, TransformerBlock},
+    integrations::llama_mlx::model as resident,
 };
 
 use eredu_runtime::ResidencyReport;
@@ -60,6 +60,19 @@ use eredu_runtime::ResidencyReport;
 const EMBEDDING_UNIT: &str = "llama.static.embedding";
 const NORM_UNIT: &str = "llama.static.norm";
 const HEAD_UNIT: &str = "llama.static.output";
+
+type AttentionInput<'a, C> = eredu_architectures::llama::AttentionInput<'a, Array, C>;
+type TransformerBlock = MlxModule<eredu_architectures::llama::TransformerBlock<MlxBackend>>;
+
+fn new_transformer_block(
+    args: &ModelArgs,
+    layer: usize,
+    stream: &Stream,
+) -> Result<TransformerBlock, Error> {
+    eredu_architectures::llama::TransformerBlock::<MlxBackend>::new(args, layer, stream)
+        .map(MlxModule::new)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
 
 fn load_model_args(model_dir: &Path) -> Result<ModelArgs, Error> {
     let file = std::fs::File::open(model_dir.join("config.json"))?;
@@ -842,9 +855,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
                 "Llama has no group {group}"
             )));
         }
-        let index =
-            i32::try_from(index).map_err(|_| LlamaModelError::LayerIndexOverflow { index })?;
-        Ok(TransformerBlock::new_for_layer(&self.args, index, stream)?)
+        new_transformer_block(&self.args, index, stream)
     }
 
     fn register_parallel_parameters(
@@ -861,7 +872,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
             planner.register(group)?;
         }
         for index in 0..self.args.num_hidden_layers as usize {
-            let layer = TransformerBlock::new_for_layer(&self.args, index as i32, stream)?;
+            let layer = new_transformer_block(&self.args, index, stream)?;
             for group in eredu_architectures::llama::layer_parallel_parameter_groups::<MlxBackend>(
                 &layer.inner,
                 &self.args,
@@ -945,11 +956,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         args.num_key_value_heads = key_width / args.head_dim;
         args.intermediate_size = i32::try_from(gate.local_shape()[0])
             .map_err(|_| Error::Parallel("local Llama MLP width exceeds i32".into()))?;
-        Ok(TransformerBlock::new_for_layer(
-            &args,
-            index as i32,
-            stream,
-        )?)
+        new_transformer_block(&args, index, stream)
     }
 
     fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
@@ -1004,15 +1011,18 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         let layer_state = cache
             .layer(index)
             .map_err(|error| Exception::custom(error.to_string()))?;
-        Ok(layer.forward(
-            AttentionInput {
-                hidden,
-                mask: context.mask.as_ref(),
-                cache: Some(layer_state),
-                allow_sliding_prefill: context.allow_sliding_prefill,
-            },
-            stream,
-        )?)
+        Ok(layer
+            .inner
+            .forward(
+                AttentionInput {
+                    hidden,
+                    mask: context.mask.as_ref(),
+                    cache: Some(layer_state),
+                    allow_sliding_prefill: context.allow_sliding_prefill,
+                },
+                stream,
+            )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?)
     }
 
     fn forward_layer_with_execution(
@@ -1041,14 +1051,19 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         let layer_state = cache
             .layer(index)
             .map_err(|error| Exception::custom(error.to_string()))?;
-        Ok(layer.forward_tensor_parallel(
-            hidden,
-            context.mask.as_ref(),
-            Some(layer_state),
-            context.allow_sliding_prefill,
-            tp_group,
-            execution.stream(),
-        )?)
+        Ok(layer
+            .inner
+            .forward_tensor_parallel(
+                AttentionInput {
+                    hidden,
+                    mask: context.mask.as_ref(),
+                    cache: Some(layer_state),
+                    allow_sliding_prefill: context.allow_sliding_prefill,
+                },
+                tp_group,
+                execution.stream(),
+            )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?)
     }
 
     fn retained_arrays<'a>(
@@ -1131,11 +1146,5 @@ pub enum LlamaModelError {
     InvalidLayerCount {
         /// Invalid configured count.
         count: i32,
-    },
-    /// A decoder index cannot be represented by the model implementation.
-    #[error("Llama decoder index {index} exceeds the supported range")]
-    LayerIndexOverflow {
-        /// Invalid decoder index.
-        index: usize,
     },
 }

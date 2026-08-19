@@ -76,6 +76,7 @@ use crate::{
         },
     },
     backend::mlx::error::Error,
+    backend::mlx::nn::shared::{MlxBackend, MlxModule},
     backend::mlx::nn::{attention::AttentionInput, linear, linear::project_logits_maybe_quantized},
     backend::mlx::nn::{
         parallel::{
@@ -145,6 +146,18 @@ use eredu_runtime::ResidentLayerGroup;
 use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;
 
 use safemlx::ops::indexing::TryIndexOp;
+
+type LlamaBlock = MlxModule<eredu_architectures::llama::TransformerBlock<MlxBackend>>;
+
+fn new_llama_block(
+    args: &LlamaModelArgs,
+    layer: usize,
+    stream: &Stream,
+) -> Result<LlamaBlock, Error> {
+    eredu_architectures::llama::TransformerBlock::<MlxBackend>::new(args, layer, stream)
+        .map(MlxModule::new)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
 
 fn build_pipeline_expert_cache(
     store: SharedWeightStore,
@@ -941,7 +954,7 @@ struct LlamaStage {
     range: Range<usize>,
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
-    layers: Vec<llama::TransformerBlock>,
+    layers: Vec<LlamaBlock>,
     dense_layers: Option<PipelineLayerStorage>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
@@ -9205,7 +9218,7 @@ impl LlamaStage {
             .transpose()?;
         let layers = range
             .clone()
-            .map(|layer| llama::TransformerBlock::new_for_layer(&args, layer as i32, stream))
+            .map(|layer| new_llama_block(&args, layer, stream))
             .collect::<Result<_, _>>()?;
         let norm = info
             .is_last
@@ -9332,20 +9345,14 @@ impl LlamaStage {
                 hidden,
                 stream,
             },
-            |global_layer, stream| {
-                Ok(llama::TransformerBlock::new_for_layer(
-                    args,
-                    global_layer as i32,
-                    stream,
-                )?)
-            },
+            |global_layer, stream| new_llama_block(args, global_layer, stream),
             |global_layer, layer, hidden, cache, stream| match cache {
                 PipelineLayerCache::KeyValue {
                     global_layer: cached_layer,
                     cache: PipelineKeyValueCache::Standard(cache),
                     ..
                 } if *cached_layer == global_layer => Ok(layer.forward(
-                    llama::AttentionInput {
+                    eredu_architectures::llama::AttentionInput {
                         hidden,
                         mask,
                         cache: Some(cache),
@@ -9358,7 +9365,7 @@ impl LlamaStage {
                     cache: PipelineKeyValueCache::Paged(cache),
                     ..
                 } if *cached_layer == global_layer => Ok(layer.forward(
-                    llama::AttentionInput {
+                    eredu_architectures::llama::AttentionInput {
                         hidden,
                         mask,
                         cache: Some(cache),
@@ -10173,26 +10180,36 @@ impl LlamaStage {
                         global_layer: cached_layer,
                         cache: PipelineKeyValueCache::Standard(cache),
                         ..
-                    } if *cached_layer == global_layer => layer.forward_tensor_parallel(
-                        hidden,
-                        mask,
-                        Some(cache),
-                        allow_sliding_prefill,
-                        group,
-                        stream,
-                    )?,
+                    } if *cached_layer == global_layer => layer
+                        .inner
+                        .forward_tensor_parallel(
+                            eredu_architectures::llama::AttentionInput {
+                                hidden,
+                                mask,
+                                cache: Some(cache),
+                                allow_sliding_prefill,
+                            },
+                            group,
+                            stream,
+                        )
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
                     PipelineLayerCache::KeyValue {
                         global_layer: cached_layer,
                         cache: PipelineKeyValueCache::Paged(cache),
                         ..
-                    } if *cached_layer == global_layer => layer.forward_tensor_parallel(
-                        hidden,
-                        mask,
-                        Some(cache),
-                        allow_sliding_prefill,
-                        group,
-                        stream,
-                    )?,
+                    } if *cached_layer == global_layer => layer
+                        .inner
+                        .forward_tensor_parallel(
+                            eredu_architectures::llama::AttentionInput {
+                                hidden,
+                                mask,
+                                cache: Some(cache),
+                                allow_sliding_prefill,
+                            },
+                            group,
+                            stream,
+                        )
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
                     _ => {
                         return Err(Error::Parallel(format!(
                             "Llama TP+PP cache does not match global layer {global_layer}"
