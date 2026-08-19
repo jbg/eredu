@@ -63,7 +63,7 @@ pub enum Model {
     /// Thinking Machines Lab Inkling multimodal model.
     Inkling(crate::backend::mlx::architectures::inkling::layerwise::InklingLayerwiseModel),
     /// Llama-compatible dense model.
-    Llama(crate::integrations::llama_mlx::layerwise::LlamaModel),
+    Llama(crate::composition::llama::LlamaModel),
     /// Meta Muse-Glimmer dense multimodal model.
     MuseGlimmer(crate::backend::mlx::architectures::muse_glimmer::layerwise::LayerwiseDecoder),
     /// Liquid AI LFM2/LFM2.5 model.

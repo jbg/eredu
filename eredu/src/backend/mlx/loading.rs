@@ -148,15 +148,14 @@ fn materialize_gguf_model(
             (Model::Gemma4(Box::new(loaded)), eos_token_ids)
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-            let (loaded, eos_token_ids) =
-                crate::integrations::llama_mlx::layerwise::load_llama_gguf_model(
-                    &checkpoint,
-                    &metadata,
-                    options.weight_residency,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
+            let (loaded, eos_token_ids) = crate::composition::llama::load_llama_gguf_model(
+                &checkpoint,
+                &metadata,
+                options.weight_residency,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
             (Model::Llama(loaded), eos_token_ids)
         }
         GgufArchitecture::MuseGlimmer => {
@@ -465,7 +464,7 @@ fn materialize_tensor_parallel(
             )?,
         )),
         ModelKind::Llama => Ok(Model::Llama(
-            crate::integrations::llama_mlx::layerwise::load_llama_tensor_parallel_model(
+            crate::composition::llama::load_llama_tensor_parallel_model(
                 path,
                 execution,
                 build,
@@ -717,15 +716,14 @@ fn materialize_gguf_tensor_parallel(
             Ok((Model::Gemma4(Box::new(model)), eos))
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-            let (model, eos) =
-                crate::integrations::llama_mlx::layerwise::load_llama_gguf_tensor_parallel_model(
-                    checkpoint,
-                    metadata,
-                    residency,
-                    build,
-                    stream,
-                    weights_stream,
-                )?;
+            let (model, eos) = crate::composition::llama::load_llama_gguf_tensor_parallel_model(
+                checkpoint,
+                metadata,
+                residency,
+                build,
+                stream,
+                weights_stream,
+            )?;
             Ok((Model::Llama(model), eos))
         }
         GgufArchitecture::MuseGlimmer => {
@@ -977,7 +975,7 @@ pub(super) fn materialize_safetensors(
             )?,
         )),
         ModelKind::Llama => Ok(Model::Llama(
-            crate::integrations::llama_mlx::layerwise::load_llama_safetensors_mlx(
+            crate::composition::llama::load_llama_safetensors_mlx(
                 model_dir,
                 execution.weight_residency(),
                 options.quantization,
