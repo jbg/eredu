@@ -1955,19 +1955,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
 }
 
 fn new_cache(args: &ModelArgs) -> MoshiCache {
-    MoshiCache {
-        temporal: vec![
-            crate::backend::mlx::runtime::cache::ConcatKeyValueCache::new_with_max_size_and_step(
-                args.context + 1,
-                256
-            );
-            args.num_layers as usize
-        ],
-        depth: vec![
-            crate::backend::mlx::runtime::cache::ConcatKeyValueCache::new();
-            args.depformer_num_layers as usize
-        ],
-    }
+    MoshiCache::new(args)
 }
 
 fn pytorch_static_bindings(

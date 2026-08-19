@@ -3,7 +3,7 @@
 use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_runtime::{
     DenseDiskStreamReport, ExecutionUnitAddress, ExecutionUnitLayout, LayerWeightResidency,
-    LayerwiseModelMetadata,
+    LayerwiseModelMetadata, ResidentLayerGroup, ResidentLayerGroupReport,
 };
 
 use std::{
@@ -233,13 +233,55 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
         self._static_leases.len()
     }
 
+    fn execution_group(&self, group: usize) -> Result<ResidentLayerGroup, Error> {
+        let range = self
+            .layout
+            .group_range(group)
+            .ok_or_else(|| Error::Parallel(format!("unknown execution group {group}")))?;
+        let id = self
+            .layout
+            .group_id(group)
+            .expect("validated layout names every execution group")
+            .as_str();
+        let depth = self.window_depth.min(range.len());
+        ResidentLayerGroup::new(id, self.unit_ids[range].iter().cloned(), depth)
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
+    pub(crate) fn execution_group_reports(&self) -> Result<Vec<ResidentLayerGroupReport>, Error> {
+        (0..self.layout.group_count())
+            .map(|group| {
+                self.execution_group(group)?
+                    .report(&self.residency)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub(crate) fn clear_device_group(&self, id: &str) -> Result<(), Error> {
+        let group = (0..self.layout.group_count())
+            .find(|&group| {
+                self.layout
+                    .group_id(group)
+                    .is_some_and(|group_id| group_id.as_str() == id)
+            })
+            .ok_or_else(|| Error::Parallel(format!("unknown execution group {id}")))?;
+        if let Some(dense) = &self.dense {
+            dense.controller.clear_group(&self.residency, id)?;
+        }
+        self.execution_group(group)?.clear(&self.residency)?;
+        Ok(())
+    }
+
     /// Evicts every temporary execution-device unit after exact completion.
     pub(crate) fn clear_device_window(&self) -> Result<(), Error> {
-        if let Some(dense) = &self.dense {
-            dense.controller.clear_group(&self.residency, "model")?;
-        }
-        for id in &self.unit_ids {
-            self.residency.evict(id, MemoryTier::Device)?;
+        for group in 0..self.layout.group_count() {
+            let id = self
+                .layout
+                .group_id(group)
+                .expect("validated layout names every execution group")
+                .as_str();
+            self.clear_device_group(id)?;
         }
         Ok(())
     }

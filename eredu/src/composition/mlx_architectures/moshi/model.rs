@@ -8,6 +8,8 @@
 //! codebooks autoregressively within the same frame.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_core::{AttentionPolicy, LayerSchedule};
+use eredu_runtime::{RuntimeState, StateError, StateLayout};
 
 use std::{collections::HashMap, ops::Range, path::Path};
 
@@ -1192,11 +1194,45 @@ struct DepFormer {
 /// Stateful caches for temporal and within-frame depth inference.
 #[derive(Debug, Clone)]
 pub struct MoshiCache {
+    layout: StateLayout,
     pub(crate) temporal: Vec<ConcatKeyValueCache>,
     pub(crate) depth: Vec<ConcatKeyValueCache>,
 }
 
 impl MoshiCache {
+    pub(crate) fn new(args: &ModelArgs) -> Self {
+        let temporal_policy = eredu_core::cache::LayerCachePolicy::key_value(
+            AttentionPolicy::sliding((args.context + 1) as u32)
+                .expect("validated Moshi temporal context is positive"),
+            args.num_heads,
+            args.dim / args.num_heads,
+        )
+        .expect("validated Moshi temporal cache geometry is positive");
+        let depth_context = args.depformer_context.unwrap_or(args.dep_q);
+        let depth_policy = eredu_core::cache::LayerCachePolicy::key_value(
+            AttentionPolicy::sliding(depth_context as u32)
+                .expect("validated Moshi depth context is positive"),
+            args.depformer_num_heads,
+            args.depformer_dim / args.depformer_num_heads,
+        )
+        .expect("validated Moshi depth cache geometry is positive");
+        let mut policies = vec![temporal_policy; args.num_layers as usize];
+        policies.extend(vec![depth_policy; args.depformer_num_layers as usize]);
+        let layout = StateLayout::new(
+            LayerSchedule::new(policies.len(), policies)
+                .expect("validated Moshi declares non-empty cache state"),
+        )
+        .expect("validated Moshi cache policies form a state layout");
+        Self {
+            layout,
+            temporal: vec![
+                ConcatKeyValueCache::new_with_max_size_and_step(args.context + 1, 256);
+                args.num_layers as usize
+            ],
+            depth: vec![ConcatKeyValueCache::new(); args.depformer_num_layers as usize],
+        }
+    }
+
     /// Clears both temporal history and the current depth frame.
     pub fn reset(&mut self) {
         self.temporal.iter_mut().for_each(|cache| cache.clear());
@@ -1205,6 +1241,73 @@ impl MoshiCache {
 
     pub(crate) fn reset_depth(&mut self) {
         self.depth.iter_mut().for_each(|cache| cache.clear());
+    }
+}
+
+impl RuntimeState<crate::backend::mlx::nn::shared::MlxBackend> for MoshiCache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    fn retained_values(
+        &self,
+        ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        let values = match address.group() {
+            0 => self
+                .temporal
+                .get(address.index())
+                .ok_or(StateError::UnknownLayer {
+                    layer: address.index(),
+                    count: self.temporal.len(),
+                })?
+                .retained_arrays(),
+            1 => self
+                .depth
+                .iter()
+                .flat_map(KeyValueCache::retained_arrays)
+                .collect(),
+            group => {
+                return Err(StateError::InvalidLayer {
+                    layer: ordinal,
+                    reason: format!("Moshi has no execution group {group}"),
+                });
+            }
+        };
+        Ok(values.into_iter())
+    }
+}
+
+#[cfg(test)]
+mod cache_state_tests {
+    use super::{ModelArgs, MoshiCache};
+    use eredu_core::AttentionPolicy;
+    use eredu_runtime::RuntimeState;
+
+    #[test]
+    fn cache_layout_preserves_temporal_and_shared_depth_geometry() {
+        let args = ModelArgs::v0_1();
+        let cache = MoshiCache::new(&args);
+        let layout = cache.layout();
+
+        assert_eq!(layout.len(), 38);
+        assert!(matches!(
+            layout.layer(0),
+            Some(eredu_core::cache::LayerCachePolicy::KeyValue {
+                attention: AttentionPolicy::Sliding { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            layout.layer(args.num_layers as usize),
+            Some(eredu_core::cache::LayerCachePolicy::KeyValue {
+                attention: AttentionPolicy::Sliding { .. },
+                ..
+            })
+        ));
     }
 }
 
@@ -1675,16 +1778,7 @@ impl Model {
 
     /// Allocates empty temporal and depth caches.
     pub fn new_cache(&self) -> MoshiCache {
-        MoshiCache {
-            temporal: vec![
-                ConcatKeyValueCache::new_with_max_size_and_step(
-                    self.args.context + 1,
-                    256
-                );
-                self.args.num_layers as usize
-            ],
-            depth: vec![ConcatKeyValueCache::new(); self.args.depformer_num_layers as usize],
-        }
+        MoshiCache::new(&self.args)
     }
 
     /// Returns the codec-token stream geometry consumed by realtime scheduling.
