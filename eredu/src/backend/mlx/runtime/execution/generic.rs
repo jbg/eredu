@@ -88,6 +88,9 @@ pub(crate) struct MlxResidentPolicy<U> {
     units: Vec<Option<MlxModule<U>>>,
     residency: ResidencyManager,
     store: SharedCheckpointSource,
+    unit_ids: Vec<OffloadUnitId>,
+    layout: ExecutionUnitLayout,
+    window_depth: usize,
     _transfer: ResidentTransfer,
 }
 
@@ -314,6 +317,9 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
             units,
             residency: self.residency.clone(),
             store: Arc::clone(&self.store),
+            unit_ids: self.unit_ids.clone(),
+            layout: self.layout.clone(),
+            window_depth: self.window_depth,
             _transfer: transfer,
         })
     }
@@ -330,6 +336,45 @@ impl<U> MlxResidentPolicy<U> {
 
     pub(crate) fn static_lease_count(&self) -> usize {
         1
+    }
+
+    fn execution_group(&self, group: usize) -> Result<ResidentLayerGroup, Error> {
+        let range = self
+            .layout
+            .group_range(group)
+            .ok_or_else(|| Error::Parallel(format!("unknown execution group {group}")))?;
+        let id = self
+            .layout
+            .group_id(group)
+            .expect("validated layout names every execution group")
+            .as_str();
+        ResidentLayerGroup::new(
+            id,
+            self.unit_ids[range.clone()].iter().cloned(),
+            self.window_depth.min(range.len()),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))
+    }
+
+    pub(crate) fn execution_group_reports(&self) -> Result<Vec<ResidentLayerGroupReport>, Error> {
+        (0..self.layout.group_count())
+            .map(|group| {
+                self.execution_group(group)?
+                    .report(&self.residency)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    pub(crate) fn clear_device_group(&self, id: &str) -> Result<(), Error> {
+        if (0..self.layout.group_count()).any(|group| {
+            self.layout
+                .group_id(group)
+                .is_some_and(|group_id| group_id.as_str() == id)
+        }) {
+            return Ok(());
+        }
+        Err(Error::Parallel(format!("unknown execution group {id}")))
     }
 }
 
