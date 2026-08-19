@@ -588,6 +588,12 @@ impl ParameterBackend for MlxBackend {
         materialization.output()
     }
 
+    fn finish_materialization(
+        materialization: Self::Materialization,
+    ) -> Result<Self::MaterializedWeight, Self::ParameterError> {
+        Ok(materialization.synchronize()?)
+    }
+
     fn bind(
         parameter: &mut Self::Parameter,
         weight: Self::MaterializedWeight,

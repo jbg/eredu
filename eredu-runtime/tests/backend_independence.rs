@@ -6,7 +6,10 @@ use eredu_nn::{
     NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode, ParameterVisitor,
     ParameterVisitorMut, Parameterized, RotaryOperator, RotarySpec, Tensor,
 };
-use eredu_runtime::{CollectiveBackend, ParameterBackend, SubmissionBackend, TransferBackend};
+use eredu_runtime::{
+    bind_materialized_unit, materialize_bindings, CollectiveBackend, ParameterBackend,
+    SubmissionBackend, TransferBackend, WeightBinding,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct FakeTensor(Vec<i32>);
@@ -145,6 +148,44 @@ impl Tensor for FakeTensor {
 
 #[derive(Debug, Clone)]
 struct FakeOperator;
+
+struct FakeModule {
+    weight: FakeTensor,
+}
+
+impl Parameterized<FakeTensor> for FakeModule {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, FakeTensor>,
+    {
+        visitor.visit(
+            eredu_nn::ParameterMetadata {
+                id: eredu_nn::ParameterId::new("weight").unwrap(),
+                trainable: true,
+                alias_of: None,
+                group: None,
+            },
+            &self.weight,
+        );
+    }
+
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, FakeTensor>,
+    {
+        visitor.visit_mut(
+            eredu_nn::ParameterMetadata {
+                id: eredu_nn::ParameterId::new("weight").unwrap(),
+                trainable: true,
+                alias_of: None,
+                group: None,
+            },
+            &mut self.weight,
+        );
+    }
+
+    fn set_trainable(&mut self, _trainable: bool) {}
+}
 
 impl Parameterized<FakeTensor> for FakeOperator {
     fn visit_parameters<'a, V>(&'a self, _visitor: &mut V)
@@ -302,6 +343,11 @@ impl ParameterBackend for FakeBackend {
     fn materialized_weight(materialization: &Self::Materialization) -> &Self::MaterializedWeight {
         materialization
     }
+    fn finish_materialization(
+        materialization: Self::Materialization,
+    ) -> Result<Self::MaterializedWeight, Infallible> {
+        Ok(materialization)
+    }
     fn bind(
         parameter: &mut Self::Parameter,
         weight: Self::MaterializedWeight,
@@ -350,4 +396,37 @@ fn runtime_capabilities_compile_and_run_without_mlx() {
     assert_eq!(parameter, host);
     FakeBackend::bind(&mut parameter, FakeTensor(vec![3, 2])).unwrap();
     FakeBackend::retain_until_complete(&(), &transfer, parameter).unwrap();
+}
+
+#[test]
+fn neutral_loader_materializes_and_binds_the_fake_backend() {
+    use eredu_checkpoint::store::{SafetensorsWeightStore, TensorSelection};
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("model.safetensors");
+    let bytes = [1.0f32, 2.0, 3.0, 4.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    serialize_to_file(
+        [(
+            "weight",
+            TensorView::new(Dtype::F32, vec![2, 2], &bytes).unwrap(),
+        )],
+        None,
+        &file,
+    )
+    .unwrap();
+    let source = SafetensorsWeightStore::open(&file).unwrap();
+    let binding = WeightBinding::new("weight", "weight", TensorSelection::Full, 16).unwrap();
+    let unit = materialize_bindings::<FakeBackend>(&source, &[binding], &()).unwrap();
+    let id = eredu_nn::ParameterId::new("weight").unwrap();
+    assert!(unit.contains(&id));
+
+    let mut module = FakeModule {
+        weight: FakeTensor(vec![0]),
+    };
+    bind_materialized_unit::<FakeBackend, _>(&mut module, unit).unwrap();
+    assert_eq!(module.weight, FakeTensor(vec![2, 2]));
 }

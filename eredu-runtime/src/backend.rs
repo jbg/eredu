@@ -25,7 +25,7 @@ pub trait SubmissionBackend: NeuralBackend {
 /// Materializes and binds checkpoint data to backend-native parameter slots.
 pub trait ParameterBackend: NeuralBackend {
     /// One backend-native parameter slot.
-    type Parameter;
+    type Parameter: 'static;
     /// Materialized backend-native checkpoint weight.
     type MaterializedWeight;
     /// Backend context used only while realizing checkpoint parameters.
@@ -50,6 +50,11 @@ pub trait ParameterBackend: NeuralBackend {
 
     /// Borrows the native weight retained by an in-flight materialization.
     fn materialized_weight(materialization: &Self::Materialization) -> &Self::MaterializedWeight;
+
+    /// Waits for this exact realization and releases its encoded source lease.
+    fn finish_materialization(
+        materialization: Self::Materialization,
+    ) -> Result<Self::MaterializedWeight, Self::ParameterError>;
 
     /// Binds one materialized weight to its destination parameter.
     fn bind(

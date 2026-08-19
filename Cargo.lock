@@ -988,6 +988,8 @@ dependencies = [
  "eredu-checkpoint",
  "eredu-core",
  "eredu-nn",
+ "safetensors",
+ "tempfile",
  "thiserror",
 ]
 
