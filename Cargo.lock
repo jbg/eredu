@@ -871,7 +871,6 @@ dependencies = [
  "thiserror",
  "tokenizers 0.23.1",
  "toktrie_hf_tokenizers",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -993,8 +992,10 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

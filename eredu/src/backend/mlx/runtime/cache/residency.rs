@@ -7,9 +7,8 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fs::{self, File},
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     panic::{catch_unwind, AssertUnwindSafe},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
@@ -39,18 +38,17 @@ use eredu_core::{
     residency::CacheEvictionPolicy,
 };
 use eredu_runtime::{
-    CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation, CacheIoAdmission,
-    CacheIoCompletionDisposition, CacheIoExecutionState, CacheIoExecutionStateError,
-    CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind, CacheIoPreparation,
-    CacheIoStartDisposition, CacheLifecycleError, CachePoolError, CachePoolMembership,
-    CachePoolReservation, CachePoolResource, CachePoolUsage, CacheResidencyConfigurationError,
-    CacheResidencyPool, CacheStorageError, CacheStoragePhase, LiveCacheDiskPolicy,
-    MutableCacheTail, PagedCacheOptions,
+    finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
+    resolve_prompt_cache_root, safe_prompt_cache_shard_path, CacheBlockLifecycle,
+    CacheBlockStorage, CacheHostDemotionOperation, CacheIoAdmission, CacheIoCompletionDisposition,
+    CacheIoExecutionState, CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey,
+    CacheIoOperationKind, CacheIoPreparation, CacheIoStartDisposition, CacheLifecycleError,
+    CachePoolError, CachePoolMembership, CachePoolReservation, CachePoolResource, CachePoolUsage,
+    CacheResidencyConfigurationError, CacheResidencyPool, CacheStorageError, CacheStoragePhase,
+    LiveCacheDiskPolicy, MutableCacheTail, PagedCacheOptions, PromptCachePersistenceError,
+    PromptCachePublication,
 };
 
-const MAX_PROMPT_CACHE_SHARD_HEADER_BYTES: u64 = 1024 * 1024;
-const PROMPT_CACHE_GENERATIONS_DIRECTORY: &str = ".generations";
-const PROMPT_CACHE_CURRENT_FILE: &str = "CURRENT";
 pub(crate) const PAGED_CACHE_PREFETCH_BLOCKS: usize = 2;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_LIVE_SHARD_ID: AtomicU64 = AtomicU64::new(1);
@@ -3080,52 +3078,8 @@ impl CacheResidencyManager {
     ) -> Result<PromptCacheManifest, CacheResidencyError> {
         let destination = destination.as_ref();
         descriptor.validate()?;
-        let parent = destination.parent().ok_or_else(|| {
-            CacheResidencyError::InvalidPromptCachePath(destination.to_path_buf())
-        })?;
-        fs::create_dir_all(parent).map_err(|source| CacheResidencyError::Io {
-            action: "create prompt cache parent",
-            path: parent.to_path_buf(),
-            source,
-        })?;
-        let replacing = destination.exists();
-        if replacing && !options.replace_existing {
-            return Err(CacheResidencyError::PromptCacheExists(
-                destination.to_path_buf(),
-            ));
-        }
-        if replacing && !destination.is_dir() {
-            return Err(CacheResidencyError::InvalidPromptCachePath(
-                destination.to_path_buf(),
-            ));
-        }
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let file_name = destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| CacheResidencyError::InvalidPromptCachePath(destination.into()))?;
-        let generation_name = format!("generation-{nonce}");
-        let generations = destination.join(PROMPT_CACHE_GENERATIONS_DIRECTORY);
-        if replacing {
-            fs::create_dir_all(&generations).map_err(|source| CacheResidencyError::Io {
-                action: "create prompt cache generation directory",
-                path: generations.clone(),
-                source,
-            })?;
-        }
-        let temporary = if replacing {
-            generations.join(format!(".tmp-{nonce}"))
-        } else {
-            parent.join(format!(".{file_name}.tmp-{nonce}"))
-        };
-        fs::create_dir(&temporary).map_err(|source| CacheResidencyError::Io {
-            action: "create temporary prompt cache",
-            path: temporary.clone(),
-            source,
-        })?;
+        let publication = PromptCachePublication::begin(destination, options.replace_existing)?;
+        let temporary = publication.staging_directory().to_path_buf();
 
         let result = (|| {
             let records = {
@@ -3156,8 +3110,7 @@ impl CacheResidencyManager {
                     )?;
                     save_host_cache_block(&shard_path, &block)?;
                 }
-                sync_file(&shard_path)?;
-                let payload_sha256 = hash_shard_payload(&shard_path)?;
+                let payload_sha256 = finalize_prompt_cache_shard(&shard_path)?;
                 logical_bytes += record.bytes;
                 let names = array_names(record.physical.id().representation);
                 manifest_blocks.push(PromptCacheBlock {
@@ -3189,8 +3142,7 @@ impl CacheResidencyManager {
                         ))
                     },
                 )?;
-                sync_file(&shard_path)?;
-                let payload_sha256 = hash_shard_payload(&shard_path)?;
+                let payload_sha256 = finalize_prompt_cache_shard(&shard_path)?;
                 let state_bytes = state.array.nbytes() as u64;
                 logical_bytes = logical_bytes.checked_add(state_bytes).ok_or_else(|| {
                     CacheResidencyError::PromptCache(PromptCacheError::Malformed(
@@ -3230,61 +3182,13 @@ impl CacheResidencyManager {
                 blocks: manifest_blocks,
                 state_tensors: manifest_state,
             };
-            let manifest_path = temporary.join("manifest.json");
-            let file = File::create(&manifest_path).map_err(|source| CacheResidencyError::Io {
-                action: "create prompt cache manifest",
-                path: manifest_path.clone(),
-                source,
-            })?;
-            let mut writer = BufWriter::new(file);
-            serde_json::to_writer_pretty(&mut writer, &manifest)
-                .map_err(CacheResidencyError::ManifestJson)?;
-            writer
-                .write_all(b"\n")
-                .map_err(|source| CacheResidencyError::Io {
-                    action: "write prompt cache manifest",
-                    path: manifest_path.clone(),
-                    source,
-                })?;
-            writer.flush().map_err(|source| CacheResidencyError::Io {
-                action: "flush prompt cache manifest",
-                path: manifest_path.clone(),
-                source,
-            })?;
-            sync_file(&manifest_path)?;
-            validate_manifest(&temporary, &manifest)?;
-            sync_directory(&temporary)?;
-
-            if replacing {
-                let generation = generations.join(&generation_name);
-                durable_rename(&temporary, &generation, false).map_err(|source| {
-                    CacheResidencyError::Io {
-                        action: "publish prompt cache generation",
-                        path: generation.clone(),
-                        source,
-                    }
-                })?;
-                sync_directory(&generations)?;
-                publish_prompt_cache_generation(destination, &generation_name, nonce)?;
-            } else {
-                durable_rename(&temporary, destination, false).map_err(|source| {
-                    CacheResidencyError::Io {
-                        action: "publish prompt cache",
-                        path: destination.to_path_buf(),
-                        source,
-                    }
-                })?;
-            }
-            sync_directory(parent)?;
+            publication.commit(&manifest)?;
             let mut state = self.lock()?;
             state.counters.report.prompt_cache_saves += 1;
             state.counters.report.prompt_cache_bytes += logical_bytes;
             Ok(manifest)
         })();
 
-        if result.is_err() && temporary.exists() {
-            let _ = fs::remove_dir_all(&temporary);
-        }
         result
     }
 }
@@ -3455,42 +3359,6 @@ pub struct PromptCacheStateArray<'a> {
     pub array: &'a Array,
 }
 
-/// Reads and validates a prompt-cache manifest without loading its arrays.
-pub fn inspect_prompt_cache(
-    directory: impl AsRef<Path>,
-) -> Result<PromptCacheManifest, CacheResidencyError> {
-    let directory = resolve_prompt_cache_root(directory.as_ref())?;
-    let manifest_path = directory.join("manifest.json");
-    let reader =
-        BufReader::new(
-            File::open(&manifest_path).map_err(|source| CacheResidencyError::Io {
-                action: "open prompt cache manifest",
-                path: manifest_path.clone(),
-                source,
-            })?,
-        );
-    let value: serde_json::Value =
-        serde_json::from_reader(reader).map_err(CacheResidencyError::ManifestJson)?;
-    let schema_version = value
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|version| u32::try_from(version).ok())
-        .ok_or_else(|| {
-            CacheResidencyError::PromptCache(PromptCacheError::Malformed(
-                "prompt-cache schema_version is missing or is not a u32".into(),
-            ))
-        })?;
-    if schema_version != PROMPT_CACHE_SCHEMA_VERSION {
-        return Err(CacheResidencyError::PromptCache(
-            PromptCacheError::UnsupportedSchema(schema_version),
-        ));
-    }
-    let manifest: PromptCacheManifest =
-        serde_json::from_value(value).map_err(CacheResidencyError::ManifestJson)?;
-    validate_manifest(&directory, &manifest)?;
-    Ok(manifest)
-}
-
 /// Catalogs a compatible prompt prefix lazily as read-only disk-backed blocks.
 pub(crate) fn open_prompt_cache(
     directory: impl AsRef<Path>,
@@ -3525,7 +3393,7 @@ pub(crate) fn open_prompt_cache(
                 end: block.end,
                 rank: block.rank,
             };
-            let shard = safe_shard_path(&cache_root, &block.shard)?;
+            let shard = safe_prompt_cache_shard_path(&cache_root, &block.shard)?;
             let mapped = map_prompt_cache_shard(&shard)?;
             let record = CacheBlockRecord {
                 physical: MlxCacheBlockStorage::disk(
@@ -3632,8 +3500,8 @@ pub(crate) fn open_prompt_cache_snapshot(
     let host_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let mut blocks = Vec::with_capacity(manifest.blocks.len());
     for block in &manifest.blocks {
-        let path = safe_shard_path(&root, &block.shard)?;
-        if hash_shard_payload(&path)? != block.payload_sha256 {
+        let path = safe_prompt_cache_shard_path(&root, &block.shard)?;
+        if hash_prompt_cache_shard_payload(&path)? != block.payload_sha256 {
             return Err(CacheResidencyError::MalformedShard {
                 path,
                 reason: "attention payload digest does not match the manifest".into(),
@@ -3718,8 +3586,8 @@ pub(crate) fn load_prompt_cache_state_tensors(
     let host_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let mut loaded = Vec::with_capacity(manifest.state_tensors.len());
     for state in &manifest.state_tensors {
-        let path = safe_shard_path(&root, &state.shard)?;
-        let actual_hash = hash_shard_payload(&path)?;
+        let path = safe_prompt_cache_shard_path(&root, &state.shard)?;
+        let actual_hash = hash_prompt_cache_shard_payload(&path)?;
         if actual_hash != state.payload_sha256 {
             return Err(CacheResidencyError::MalformedShard {
                 path,
@@ -3763,74 +3631,6 @@ pub(crate) fn load_prompt_cache_state_tensors(
     Ok(loaded)
 }
 
-fn resolve_prompt_cache_root(directory: &Path) -> Result<PathBuf, CacheResidencyError> {
-    let current_path = directory.join(PROMPT_CACHE_CURRENT_FILE);
-    if !current_path.exists() {
-        return Ok(directory.to_path_buf());
-    }
-    let length = current_path
-        .metadata()
-        .map_err(|source| CacheResidencyError::Io {
-            action: "stat prompt cache generation pointer",
-            path: current_path.clone(),
-            source,
-        })?
-        .len();
-    if length == 0 || length > 256 {
-        return Err(CacheResidencyError::MalformedStorage(
-            "prompt-cache generation pointer has an invalid length".into(),
-        ));
-    }
-    let generation =
-        fs::read_to_string(&current_path).map_err(|source| CacheResidencyError::Io {
-            action: "read prompt cache generation pointer",
-            path: current_path.clone(),
-            source,
-        })?;
-    let generation = generation.trim();
-    let generation_path = Path::new(generation);
-    if generation.is_empty()
-        || generation_path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-        || generation_path.components().count() != 1
-    {
-        return Err(CacheResidencyError::MalformedStorage(
-            "prompt-cache generation pointer is unsafe".into(),
-        ));
-    }
-    let root = directory
-        .join(PROMPT_CACHE_GENERATIONS_DIRECTORY)
-        .join(generation_path);
-    if !root.is_dir() {
-        return Err(CacheResidencyError::MalformedStorage(format!(
-            "prompt-cache generation {generation:?} is missing"
-        )));
-    }
-    Ok(root)
-}
-
-fn validate_manifest(
-    directory: &Path,
-    manifest: &PromptCacheManifest,
-) -> Result<(), CacheResidencyError> {
-    manifest.validate()?;
-    for block in &manifest.blocks {
-        let shard = safe_shard_path(directory, &block.shard)?;
-        if !shard.is_file() {
-            return Err(CacheResidencyError::MissingShard(shard));
-        }
-        validate_shard_file(&shard, block)?;
-    }
-    for state in &manifest.state_tensors {
-        let shard = safe_shard_path(directory, &state.shard)?;
-        if !shard.is_file() {
-            return Err(CacheResidencyError::MissingShard(shard));
-        }
-        validate_state_shard_file(&shard, state)?;
-    }
-    Ok(())
-}
 fn validate_block_arrays(
     arrays: &CacheBlockArrays,
     token_count: i64,
@@ -4454,37 +4254,6 @@ fn stored_dtype_to_host(dtype: StoredDtype) -> Result<Dtype, CacheResidencyError
     }
 }
 
-fn hash_shard_payload(path: &Path) -> Result<String, CacheResidencyError> {
-    let (_, _, data_start) = read_shard_metadata(path)?;
-    let mut file = File::open(path).map_err(|source| CacheResidencyError::Io {
-        action: "open prompt cache shard payload",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    file.seek(SeekFrom::Start(data_start))
-        .map_err(|source| CacheResidencyError::Io {
-            action: "seek prompt cache shard payload",
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|source| CacheResidencyError::Io {
-                action: "hash prompt cache shard payload",
-                path: path.to_path_buf(),
-                source,
-            })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(sha256_hex(hasher.finalize()))
-}
-
 fn verify_disk_payload(location: &DiskLocation) -> Result<(), CacheResidencyError> {
     let Some(expected) = &location.payload_sha256 else {
         return Ok(());
@@ -4504,7 +4273,7 @@ fn verify_disk_payload(location: &DiskLocation) -> Result<(), CacheResidencyErro
                 .ok_or_else(|| "safetensors header extends beyond the mapped shard".to_string())?;
             sha256_hex(Sha256::digest(&mapped[data_start..]))
         } else {
-            hash_shard_payload(&location.path).map_err(|error| error.to_string())?
+            hash_prompt_cache_shard_payload(&location.path).map_err(|error| error.to_string())?
         };
         if &actual == expected {
             Ok(())
@@ -4630,219 +4399,6 @@ fn sha256_hex(digest: impl AsRef<[u8]>) -> String {
     encoded
 }
 
-fn safe_shard_path(directory: &Path, relative: &str) -> Result<PathBuf, CacheResidencyError> {
-    let path = Path::new(relative);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(CacheResidencyError::UnsafeShardPath(relative.into()));
-    }
-    let joined = directory.join(path);
-    if joined.exists() {
-        let root = fs::canonicalize(directory).map_err(|source| CacheResidencyError::Io {
-            action: "canonicalize prompt cache directory",
-            path: directory.to_path_buf(),
-            source,
-        })?;
-        let canonical = fs::canonicalize(&joined).map_err(|source| CacheResidencyError::Io {
-            action: "canonicalize prompt cache shard",
-            path: joined.clone(),
-            source,
-        })?;
-        if !canonical.starts_with(&root) {
-            return Err(CacheResidencyError::UnsafeShardPath(relative.into()));
-        }
-    }
-    Ok(joined)
-}
-
-fn validate_shard_file(path: &Path, block: &PromptCacheBlock) -> Result<(), CacheResidencyError> {
-    let (metadata, file_len, data_start) = read_shard_metadata(path)?;
-    let entries = metadata.tensors();
-    if entries.len() != 2 {
-        return Err(CacheResidencyError::MalformedShard {
-            path: path.to_path_buf(),
-            reason: format!("expected two arrays, found {}", entries.len()),
-        });
-    }
-    let mut logical_bytes = 0u64;
-    for (name, expected_shape, expected_dtype) in [
-        (&block.first_array, &block.first_shape, &block.first_dtype),
-        (
-            &block.second_array,
-            &block.second_shape,
-            &block.second_dtype,
-        ),
-    ] {
-        let tensor = metadata
-            .info(name)
-            .ok_or_else(|| CacheResidencyError::MalformedShard {
-                path: path.to_path_buf(),
-                reason: format!("missing array {name}"),
-            })?;
-        let shape = tensor
-            .shape
-            .iter()
-            .map(|dimension| i32::try_from(*dimension))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| CacheResidencyError::MalformedShard {
-                path: path.to_path_buf(),
-                reason: "array dimension exceeds runtime range".into(),
-            })?;
-        if &shape != expected_shape || stored_dtype_name(tensor.dtype) != *expected_dtype {
-            return Err(CacheResidencyError::MalformedShard {
-                path: path.to_path_buf(),
-                reason: format!("array {name} shape or dtype does not match the manifest"),
-            });
-        }
-        logical_bytes = logical_bytes.saturating_add(
-            u64::try_from(tensor.data_offsets.1.saturating_sub(tensor.data_offsets.0))
-                .unwrap_or(u64::MAX),
-        );
-    }
-    if logical_bytes != block.logical_bytes {
-        return Err(CacheResidencyError::MalformedShard {
-            path: path.to_path_buf(),
-            reason: format!(
-                "logical byte count {logical_bytes} does not match manifest value {}",
-                block.logical_bytes
-            ),
-        });
-    }
-    let expected_file_len = data_start
-        .checked_add(metadata.data_len() as u64)
-        .ok_or_else(|| CacheResidencyError::MalformedShard {
-            path: path.to_path_buf(),
-            reason: "safetensors file length overflow".into(),
-        })?;
-    if expected_file_len != file_len {
-        return Err(CacheResidencyError::MalformedShard {
-            path: path.to_path_buf(),
-            reason: format!(
-                "safetensors payload boundary {expected_file_len} does not match file length {file_len}"
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn validate_state_shard_file(
-    path: &Path,
-    state: &PromptCacheStateTensor,
-) -> Result<(), CacheResidencyError> {
-    let (metadata, file_len, data_start) = read_shard_metadata(path)?;
-    let entries = metadata.tensors();
-    if entries.len() != 1 {
-        return Err(CacheResidencyError::MalformedShard {
-            path: path.to_path_buf(),
-            reason: format!("expected one state array, found {}", entries.len()),
-        });
-    }
-    let tensor =
-        metadata
-            .info(&state.array)
-            .ok_or_else(|| CacheResidencyError::MalformedShard {
-                path: path.to_path_buf(),
-                reason: format!("missing state array {}", state.array),
-            })?;
-    let shape = tensor
-        .shape
-        .iter()
-        .map(|dimension| i32::try_from(*dimension))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| CacheResidencyError::MalformedShard {
-            path: path.to_path_buf(),
-            reason: "state array dimension exceeds runtime range".into(),
-        })?;
-    let logical_bytes = u64::try_from(tensor.data_offsets.1.saturating_sub(tensor.data_offsets.0))
-        .unwrap_or(u64::MAX);
-    if shape != state.shape
-        || stored_dtype_name(tensor.dtype) != state.dtype
-        || logical_bytes != state.logical_bytes
-    {
-        return Err(CacheResidencyError::MalformedShard {
-            path: path.to_path_buf(),
-            reason: "state array shape, dtype, or byte count does not match the manifest".into(),
-        });
-    }
-    let expected_file_len = data_start
-        .checked_add(metadata.data_len() as u64)
-        .ok_or_else(|| CacheResidencyError::MalformedShard {
-            path: path.to_path_buf(),
-            reason: "safetensors file length overflow".into(),
-        })?;
-    if expected_file_len != file_len {
-        return Err(CacheResidencyError::MalformedShard {
-            path: path.to_path_buf(),
-            reason: "state safetensors payload boundary does not match file length".into(),
-        });
-    }
-    Ok(())
-}
-
-fn read_shard_metadata(
-    path: &Path,
-) -> Result<(safetensors::tensor::Metadata, u64, u64), CacheResidencyError> {
-    let mut file = File::open(path).map_err(|source| CacheResidencyError::Io {
-        action: "open prompt cache shard metadata",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let file_len = file
-        .metadata()
-        .map_err(|source| CacheResidencyError::Io {
-            action: "stat prompt cache shard",
-            path: path.to_path_buf(),
-            source,
-        })?
-        .len();
-    let mut length_bytes = [0u8; 8];
-    file.read_exact(&mut length_bytes)
-        .map_err(|source| CacheResidencyError::Io {
-            action: "read prompt cache shard header length",
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let header_len = u64::from_le_bytes(length_bytes);
-    if header_len == 0 || header_len > MAX_PROMPT_CACHE_SHARD_HEADER_BYTES {
-        return Err(CacheResidencyError::MalformedShard {
-            path: path.to_path_buf(),
-            reason: format!(
-                "safetensors header length {header_len} exceeds the prompt-cache bound"
-            ),
-        });
-    }
-    let data_start =
-        8u64.checked_add(header_len)
-            .ok_or_else(|| CacheResidencyError::MalformedShard {
-                path: path.to_path_buf(),
-                reason: "safetensors header length overflow".into(),
-            })?;
-    if data_start > file_len {
-        return Err(CacheResidencyError::MalformedShard {
-            path: path.to_path_buf(),
-            reason: "safetensors header extends beyond the file".into(),
-        });
-    }
-    let mut header = vec![0u8; header_len as usize];
-    file.read_exact(&mut header)
-        .map_err(|source| CacheResidencyError::Io {
-            action: "read prompt cache shard header",
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let metadata =
-        serde_json::from_slice::<safetensors::tensor::Metadata>(&header).map_err(|error| {
-            CacheResidencyError::MalformedShard {
-                path: path.to_path_buf(),
-                reason: error.to_string(),
-            }
-        })?;
-    Ok((metadata, file_len, data_start))
-}
-
 fn map_prompt_cache_shard(path: &Path) -> Result<Arc<Mmap>, CacheResidencyError> {
     let file = File::open(path).map_err(|source| CacheResidencyError::Io {
         action: "open prompt cache shard for mapping",
@@ -4866,57 +4422,6 @@ fn map_prompt_cache_shard(path: &Path) -> Result<Arc<Mmap>, CacheResidencyError>
     Ok(Arc::new(mapped))
 }
 
-fn publish_prompt_cache_generation(
-    destination: &Path,
-    generation_name: &str,
-    nonce: u128,
-) -> Result<(), CacheResidencyError> {
-    let temporary = destination.join(format!(".{PROMPT_CACHE_CURRENT_FILE}.tmp-{nonce}"));
-    let current = destination.join(PROMPT_CACHE_CURRENT_FILE);
-    let mut file = File::create(&temporary).map_err(|source| CacheResidencyError::Io {
-        action: "create prompt cache generation pointer",
-        path: temporary.clone(),
-        source,
-    })?;
-    writeln!(file, "{generation_name}").map_err(|source| CacheResidencyError::Io {
-        action: "write prompt cache generation pointer",
-        path: temporary.clone(),
-        source,
-    })?;
-    file.sync_all().map_err(|source| CacheResidencyError::Io {
-        action: "sync prompt cache generation pointer",
-        path: temporary.clone(),
-        source,
-    })?;
-    durable_rename(&temporary, &current, true).map_err(|source| CacheResidencyError::Io {
-        action: "switch prompt cache generation",
-        path: current,
-        source,
-    })?;
-    sync_directory(destination)
-}
-
-fn stored_dtype_name(dtype: safetensors::Dtype) -> String {
-    use safetensors::Dtype as Stored;
-    match dtype {
-        Stored::BOOL => "Bool",
-        Stored::U8 => "Uint8",
-        Stored::U16 => "Uint16",
-        Stored::U32 => "Uint32",
-        Stored::U64 => "Uint64",
-        Stored::I8 => "Int8",
-        Stored::I16 => "Int16",
-        Stored::I32 => "Int32",
-        Stored::I64 => "Int64",
-        Stored::F16 => "Float16",
-        Stored::BF16 => "Bfloat16",
-        Stored::F32 => "Float32",
-        Stored::F64 => "Float64",
-        dtype => return format!("{dtype:?}"),
-    }
-    .into()
-}
-
 #[cfg(test)]
 fn cpu_stream() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
@@ -4930,93 +4435,6 @@ fn sync_file(path: &Path) -> Result<(), CacheResidencyError> {
             path: path.to_path_buf(),
             source,
         })
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), CacheResidencyError> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|source| CacheResidencyError::Io {
-            action: "synchronize cache directory",
-            path: path.to_path_buf(),
-            source,
-        })
-}
-
-#[cfg(windows)]
-fn sync_directory(path: &Path) -> Result<(), CacheResidencyError> {
-    // Windows has no POSIX-style directory fsync. Prompt-cache metadata is
-    // published with MOVEFILE_WRITE_THROUGH in `durable_rename`; validate the
-    // expected directory here without trying to open it as an ordinary file.
-    if path.is_dir() {
-        Ok(())
-    } else {
-        Err(CacheResidencyError::Io {
-            action: "validate cache directory before durable publication",
-            path: path.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::NotADirectory,
-                "cache publication path is not a directory",
-            ),
-        })
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn sync_directory(path: &Path) -> Result<(), CacheResidencyError> {
-    if path.is_dir() {
-        Ok(())
-    } else {
-        Err(CacheResidencyError::Io {
-            action: "validate cache directory before publication",
-            path: path.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::NotADirectory,
-                "cache publication path is not a directory",
-            ),
-        })
-    }
-}
-
-#[cfg(not(windows))]
-fn durable_rename(source: &Path, destination: &Path, _replace: bool) -> std::io::Result<()> {
-    fs::rename(source, destination)
-}
-
-#[cfg(windows)]
-fn durable_rename(source: &Path, destination: &Path, replace: bool) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
-        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        if wide.contains(&0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Windows cache publication path contains an embedded NUL",
-            ));
-        }
-        wide.push(0);
-        Ok(wide)
-    }
-
-    let source = wide_path(source)?;
-    let destination = wide_path(destination)?;
-    let mut flags = MOVEFILE_WRITE_THROUGH;
-    if replace {
-        flags |= MOVEFILE_REPLACE_EXISTING;
-    }
-    // SAFETY: both UTF-16 buffers are NUL-terminated and remain alive for the
-    // duration of the call. The source and destination are sibling paths, so
-    // publication cannot become a copy across volumes.
-    let moved = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) };
-    if moved == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
 }
 
 #[cfg(unix)]
@@ -5066,6 +4484,9 @@ pub enum CacheResidencyError {
     /// Backend-neutral prompt-cache identity or catalog validation failed.
     #[error(transparent)]
     PromptCache(#[from] PromptCacheError),
+    /// Backend-neutral prompt-cache filesystem or publication operation failed.
+    #[error(transparent)]
+    Persistence(#[from] PromptCachePersistenceError),
     /// Paged options were contradictory or unbounded.
     #[error("invalid paged cache options: {0}")]
     InvalidOptions(String),
@@ -5129,18 +4550,6 @@ pub enum CacheResidencyError {
         #[source]
         source: std::io::Error,
     },
-    /// A manifest could not be encoded or decoded.
-    #[error("invalid prompt cache manifest JSON: {0}")]
-    ManifestJson(#[source] serde_json::Error),
-    /// Filesystem publication metadata is malformed.
-    #[error("malformed prompt cache storage: {0}")]
-    MalformedStorage(String),
-    /// A shard path could escape the prompt-cache directory.
-    #[error("unsafe prompt cache shard path {0:?}")]
-    UnsafeShardPath(String),
-    /// A manifest referenced a missing shard.
-    #[error("missing prompt cache shard {0}")]
-    MissingShard(PathBuf),
     /// A safetensors block had missing, extra, or corrupt arrays.
     #[error("malformed prompt cache shard {path}: {reason}")]
     MalformedShard {
@@ -5149,29 +4558,21 @@ pub enum CacheResidencyError {
         /// Structural or data validation failure.
         reason: String,
     },
-    /// The target path cannot be published atomically.
-    #[error("invalid prompt cache path {0}")]
-    InvalidPromptCachePath(PathBuf),
-    /// The destination exists and explicit replacement was not requested.
-    #[error("prompt cache destination already exists: {0}")]
-    PromptCacheExists(PathBuf),
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        cpu_stream, durable_rename, hash_shard_payload, host_cache_capacity_upper_bound,
+        cpu_stream, hash_prompt_cache_shard_payload, host_cache_capacity_upper_bound,
         inspect_prompt_cache, live_block_paths, map_prompt_cache_shard, open_prompt_cache,
-        publish_live_block_file, publish_prompt_cache_generation, safe_shard_path,
-        verify_disk_payload, CacheBlockArrays, CacheBlockId, CacheBlockRecord, CacheIoOperationKey,
-        CacheIoOperationKind, CacheLayerResidencyStats, CacheManagerState, CachePoolError,
-        CachePoolResource, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
-        CacheResidencyManager, CacheResidencyPool, CacheStoragePhase, CacheTier, DiskLocation,
-        DiskResult, DiskTask, DiskWorker, DiskWriteCommit, HostCacheBlock, HostDemotionCompletion,
-        HostDemotionTicket, HostWriteReservation, MlxCacheBlockStorage, MlxCacheIoOperation,
-        PagedCacheOptions, StateTensorOwner, StateTensorRole, TemporaryFileGuard,
-        CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
-        PROMPT_CACHE_GENERATIONS_DIRECTORY,
+        publish_live_block_file, verify_disk_payload, CacheBlockArrays, CacheBlockId,
+        CacheBlockRecord, CacheIoOperationKey, CacheIoOperationKind, CacheLayerResidencyStats,
+        CacheManagerState, CachePoolError, CachePoolResource, CacheRankIdentity,
+        CacheRepresentation, CacheResidencyError, CacheResidencyManager, CacheResidencyPool,
+        CacheStoragePhase, CacheTier, DiskLocation, DiskResult, DiskTask, DiskWorker,
+        DiskWriteCommit, HostCacheBlock, HostDemotionCompletion, HostDemotionTicket,
+        HostWriteReservation, MlxCacheBlockStorage, MlxCacheIoOperation, PagedCacheOptions,
+        StateTensorOwner, StateTensorRole, TemporaryFileGuard, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
     };
     use crate::core::cache::{
         prompt_cache_token_fingerprint, validate_prompt_cache_model_identity, LayerCachePolicy,
@@ -5183,6 +4584,7 @@ mod tests {
     use crate::core::{AttentionPolicy, LayerSchedule};
     use eredu_runtime::{
         CachePoolLimits, CacheResidencyConfigurationError, MutableCacheTail,
+        PromptCachePersistenceError,
     };
     use safemlx::{
         host_transfer_capacity_upper_bound, transforms::async_eval_with_event, Array, Device,
@@ -5191,9 +4593,7 @@ mod tests {
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
     use std::{
         fs,
-        fs::OpenOptions,
         hash::{DefaultHasher, Hash, Hasher},
-        io::Write as _,
         path::Path,
         sync::{mpsc, Arc, OnceLock},
         thread,
@@ -5442,7 +4842,8 @@ mod tests {
                 first_dtype: "Float32".into(),
                 second_dtype: "Float32".into(),
                 logical_bytes: 8,
-                payload_sha256: hash_shard_payload(&root.join("block.safetensors")).unwrap(),
+                payload_sha256: hash_prompt_cache_shard_payload(&root.join("block.safetensors"))
+                    .unwrap(),
             }],
             state_tensors: Vec::new(),
         };
@@ -5572,7 +4973,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             inspect_prompt_cache(directory.path()),
-            Err(CacheResidencyError::PromptCache(
+            Err(PromptCachePersistenceError::PromptCache(
                 PromptCacheError::UnsupportedSchema(3)
             ))
         ));
@@ -5753,7 +5154,7 @@ mod tests {
                 shape: vec![1, 3, 4],
                 dtype: "Float32".into(),
                 logical_bytes: 48,
-                payload_sha256: hash_shard_payload(&shard).unwrap(),
+                payload_sha256: hash_prompt_cache_shard_payload(&shard).unwrap(),
             }],
         };
         fs::write(
@@ -5933,30 +5334,6 @@ mod tests {
     }
 
     #[test]
-    fn shard_paths_cannot_escape_cache_directory() {
-        let root = Path::new("/tmp/cache");
-        assert_eq!(
-            safe_shard_path(root, "block-0001.safetensors").unwrap(),
-            root.join("block-0001.safetensors")
-        );
-        assert!(matches!(
-            safe_shard_path(root, "../outside.safetensors"),
-            Err(CacheResidencyError::UnsafeShardPath(_))
-        ));
-        assert!(safe_shard_path(root, "/outside.safetensors").is_err());
-    }
-
-    #[test]
-    fn malformed_manifest_is_rejected_without_loading_arrays() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("manifest.json"), b"{not-json").unwrap();
-        assert!(matches!(
-            inspect_prompt_cache(directory.path()),
-            Err(CacheResidencyError::ManifestJson(_))
-        ));
-    }
-
-    #[test]
     fn same_length_prompt_payload_corruption_is_rejected_before_array_conversion() {
         let directory = tempfile::tempdir().unwrap();
         let manifest = write_prompt_fixture(directory.path(), "payload-checksum");
@@ -5983,39 +5360,6 @@ mod tests {
     }
 
     #[test]
-    fn shard_inspection_enforces_a_bounded_header_read() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("oversized.safetensors");
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        file.write_all(&(MAX_PROMPT_CACHE_SHARD_HEADER_BYTES + 1).to_le_bytes())
-            .unwrap();
-        let block = PromptCacheBlock {
-            global_layer: 0,
-            representation: CacheRepresentation::KeyValue,
-            start: 0,
-            end: 1,
-            rank: None,
-            shard: "oversized.safetensors".into(),
-            first_array: "keys".into(),
-            second_array: "values".into(),
-            first_shape: vec![1, 1, 1, 1],
-            second_shape: vec![1, 1, 1, 1],
-            first_dtype: "Float32".into(),
-            second_dtype: "Float32".into(),
-            logical_bytes: 8,
-            payload_sha256: "0".repeat(64),
-        };
-        assert!(matches!(
-            super::validate_shard_file(&path, &block),
-            Err(CacheResidencyError::MalformedShard { .. })
-        ));
-    }
-
-    #[test]
     fn imported_prompt_shards_are_actually_mapped_and_retained() {
         let directory = tempfile::tempdir().unwrap();
         write_prompt_fixture(directory.path(), "mapped");
@@ -6037,54 +5381,6 @@ mod tests {
         for record in state.blocks.values() {
             verify_disk_payload(record.disk().unwrap()).unwrap();
         }
-    }
-
-    #[test]
-    fn generation_switch_keeps_the_previous_cache_canonical_until_commit() {
-        let directory = tempfile::tempdir().unwrap();
-        let destination = directory.path().join("prompt-cache");
-        write_prompt_fixture(&destination, "old");
-        let generation_name = "generation-test";
-        let generation = destination
-            .join(PROMPT_CACHE_GENERATIONS_DIRECTORY)
-            .join(generation_name);
-        write_prompt_fixture(&generation, "new");
-
-        assert_eq!(
-            inspect_prompt_cache(&destination)
-                .unwrap()
-                .application_namespace
-                .as_deref(),
-            Some("old")
-        );
-        publish_prompt_cache_generation(&destination, generation_name, 1).unwrap();
-        assert_eq!(
-            inspect_prompt_cache(&destination)
-                .unwrap()
-                .application_namespace
-                .as_deref(),
-            Some("new")
-        );
-    }
-
-    #[test]
-    fn durable_rename_publishes_directories_and_replaces_pointer_files() {
-        let root = tempfile::tempdir().unwrap();
-        let pointer = root.path().join("CURRENT");
-        let temporary_pointer = root.path().join(".CURRENT.tmp");
-        fs::write(&pointer, b"old\n").unwrap();
-        fs::write(&temporary_pointer, b"new\n").unwrap();
-        durable_rename(&temporary_pointer, &pointer, true).unwrap();
-        assert_eq!(fs::read(&pointer).unwrap(), b"new\n");
-        assert!(!temporary_pointer.exists());
-
-        let temporary_generation = root.path().join(".generation.tmp");
-        let generation = root.path().join("generation-1");
-        fs::create_dir(&temporary_generation).unwrap();
-        fs::write(temporary_generation.join("manifest.json"), b"{}").unwrap();
-        durable_rename(&temporary_generation, &generation, false).unwrap();
-        assert_eq!(fs::read(generation.join("manifest.json")).unwrap(), b"{}");
-        assert!(!temporary_generation.exists());
     }
 
     #[test]

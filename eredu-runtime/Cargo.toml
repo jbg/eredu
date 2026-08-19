@@ -13,9 +13,13 @@ eredu-checkpoint.workspace = true
 eredu-core.workspace = true
 eredu-nn.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+safetensors = "0.8"
 thiserror.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
-safetensors = "0.8"
-serde_json.workspace = true
 tempfile.workspace = true

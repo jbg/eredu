@@ -2948,14 +2948,14 @@ mod tests {
     };
     use crate::{
         backend::mlx::runtime::cache::residency::{
-            inspect_prompt_cache, open_prompt_cache, CacheBlockArrays, CacheResidencyManager,
+            open_prompt_cache, CacheBlockArrays, CacheResidencyManager,
         },
         core::cache::{
             CacheRankIdentity, CacheRepresentation, PromptCacheDescriptor,
             PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
         },
     };
-    use eredu_runtime::PagedCacheOptions;
+    use eredu_runtime::{inspect_prompt_cache, PagedCacheOptions};
     use safemlx::{
         fast::ScaledDotProductAttentionMask,
         ops::{indexing::TryIndexOp, zeros_dtype},

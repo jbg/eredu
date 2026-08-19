@@ -156,7 +156,23 @@ fn cache_execution_algorithms_are_runtime_owned() {
     assert!(runtime.contains("pub struct CacheResidencyPool"));
     assert!(runtime.contains("mod executor;"));
     assert!(runtime.contains("mod lifecycle;"));
+    assert!(runtime.contains("mod persistence;"));
     assert!(runtime.contains("mod storage;"));
+
+    let persistence =
+        std::fs::read_to_string(workspace.join("eredu-runtime/src/cache/persistence.rs"))
+            .expect("runtime prompt-cache persistence must be readable");
+    for runtime_owned in [
+        "pub struct PromptCachePublication",
+        "pub fn inspect_prompt_cache",
+        "pub fn validate_prompt_cache_manifest",
+        "pub fn hash_prompt_cache_shard_payload",
+    ] {
+        assert!(
+            persistence.contains(runtime_owned),
+            "runtime does not own prompt-cache algorithm {runtime_owned}"
+        );
+    }
 
     let mlx =
         std::fs::read_to_string(workspace.join("eredu/src/backend/mlx/runtime/cache/residency.rs"))
@@ -165,6 +181,10 @@ fn cache_execution_algorithms_are_runtime_owned() {
         "pub enum CacheResidencyPolicy",
         "pub enum LiveCacheDiskPolicy",
         "pub struct PagedCacheOptions",
+        "fn inspect_prompt_cache",
+        "fn validate_prompt_cache_manifest",
+        "fn hash_prompt_cache_shard_payload",
+        "fn publish_prompt_cache_generation",
     ] {
         assert!(
             !mlx.contains(runtime_owned),
@@ -243,14 +263,7 @@ fn backend_and_example_dependencies_have_the_correct_manifest_ownership() {
     let dependencies = package["dependencies"].as_array().unwrap();
     let mlx_features = package["features"]["mlx"].as_array().unwrap();
 
-    for name in [
-        "safetensors",
-        "memmap2",
-        "tempfile",
-        "half",
-        "libc",
-        "windows-sys",
-    ] {
+    for name in ["safetensors", "memmap2", "tempfile", "half", "libc"] {
         let dependency = dependencies
             .iter()
             .find(|dependency| dependency["name"] == name && dependency["kind"].is_null())
@@ -266,6 +279,21 @@ fn backend_and_example_dependencies_have_the_correct_manifest_ownership() {
             "MLX feature must enable backend dependency {name}"
         );
     }
+
+    let runtime = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "eredu-runtime")
+        .expect("neutral runtime package must be present");
+    let windows = runtime["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|dependency| dependency["name"] == "windows-sys")
+        .expect("runtime persistence must own its Windows publication primitive");
+    assert_eq!(windows["optional"], false);
+    assert_eq!(windows["target"], "cfg(windows)");
 
     let features = package["features"].as_object().unwrap();
     for removed in ["media-processing", "image-processing", "audio-processing"] {

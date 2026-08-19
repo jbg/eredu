@@ -130,7 +130,6 @@ mlx = [
     "dep:tempfile",
     "dep:half",
     "dep:libc",
-    "dep:windows-sys",
 ]
 cuda = ["mlx", "safemlx/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "eredu-text/esaxx_fast"]
@@ -169,9 +168,6 @@ toktrie_hf_tokenizers = "=1.7.6"
 libc = { version = "0.2", optional = true }
 image = { version = "0.25", default-features = false, optional = true }
 rustfft = { version = "6", optional = true }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"], optional = true }
 
 [dev-dependencies]
 anyhow = "1"
