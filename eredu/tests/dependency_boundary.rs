@@ -159,6 +159,20 @@ fn cache_execution_algorithms_are_runtime_owned() {
     assert!(runtime.contains("mod persistence;"));
     assert!(runtime.contains("mod storage;"));
     assert!(runtime.contains("mod telemetry;"));
+    assert!(runtime.contains("mod worker;"));
+
+    let worker = std::fs::read_to_string(workspace.join("eredu-runtime/src/cache/worker.rs"))
+        .expect("runtime cache worker must be readable");
+    for runtime_owned in [
+        "pub struct CacheIoWorker",
+        "pub struct CacheIoSubmission",
+        "pub struct CacheIoTicket",
+    ] {
+        assert!(
+            worker.contains(runtime_owned),
+            "runtime does not own cache worker primitive {runtime_owned}"
+        );
+    }
 
     let telemetry = std::fs::read_to_string(workspace.join("eredu-runtime/src/cache/telemetry.rs"))
         .expect("runtime cache telemetry must be readable");
@@ -208,6 +222,9 @@ fn cache_execution_algorithms_are_runtime_owned() {
         "fn live_block_paths",
         "fn publish_live_block_file",
         "struct TemporaryFileGuard",
+        "enum DiskRequest",
+        "struct DiskCompletion",
+        "struct DiskWorkerShared",
     ] {
         assert!(
             !mlx.contains(runtime_owned),

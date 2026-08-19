@@ -40,9 +40,10 @@ use eredu_core::{
 use eredu_runtime::{
     finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
     resolve_prompt_cache_root, safe_prompt_cache_shard_path, CacheBlockLifecycle,
-    CacheBlockStorage, CacheHostDemotionOperation, CacheIoAdmission, CacheIoCompletionDisposition,
-    CacheIoExecutionState, CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey,
-    CacheIoOperationKind, CacheIoPreparation, CacheIoStartDisposition, CacheLayerResidencyStats,
+    CacheBlockStorage, CacheHostDemotionOperation, CacheIoExecutionStateError, CacheIoOperation,
+    CacheIoOperationKey, CacheIoOperationKind, CacheIoSubmission as RuntimeCacheIoSubmission,
+    CacheIoSubmissionOutcome, CacheIoTicket as RuntimeCacheIoTicket,
+    CacheIoWorker as RuntimeCacheIoWorker, CacheIoWorkerError, CacheLayerResidencyStats,
     CacheLifecycleError, CachePoolError, CachePoolMembership, CachePoolReservation,
     CachePoolResource, CachePoolUsage, CacheResidencyConfigurationError, CacheResidencyPool,
     CacheResidencyReport, CacheResidencyTelemetry, CacheStorageError, CacheStoragePhase,
@@ -571,15 +572,6 @@ enum DiskTask {
     Panic,
 }
 
-enum DiskRequest {
-    Operation {
-        key: CacheIoOperationKey,
-        task: Box<DiskTask>,
-        completion: Arc<DiskCompletion>,
-    },
-    Stop,
-}
-
 struct DiskWriteCommit {
     state: Weak<Mutex<CacheManagerState>>,
     key: CacheIoOperationKey,
@@ -712,375 +704,71 @@ impl Drop for DiskWriteCommit {
     }
 }
 
-#[derive(Debug, Clone)]
-enum DiskCompletionState {
-    Finished(Result<DiskResult, String>),
-    Cancelled,
-}
-
-#[derive(Debug, Default)]
-struct DiskCompletion {
-    state: Mutex<Option<DiskCompletionState>>,
-    ready: Condvar,
-    released: Mutex<bool>,
-    released_ready: Condvar,
-}
-
-impl DiskCompletion {
-    fn finish(&self, result: Result<DiskResult, CacheResidencyError>) {
-        if let Ok(mut state) = self.state.lock() {
-            if state.is_none() {
-                *state = Some(DiskCompletionState::Finished(
-                    result.map_err(|error| error.to_string()),
-                ));
-                self.ready.notify_all();
-            }
-        }
-    }
-
-    fn cancel(&self) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        if state.is_some() {
-            return false;
-        }
-        *state = Some(DiskCompletionState::Cancelled);
-        self.ready.notify_all();
-        true
-    }
-
-    fn is_ready(&self) -> bool {
-        self.state.lock().map_or(true, |state| state.is_some())
-    }
-
-    fn wait(&self, generation: u64) -> Result<DiskResult, CacheResidencyError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| CacheResidencyError::ManagerPoisoned)?;
-        while state.is_none() {
-            state = self
-                .ready
-                .wait(state)
-                .map_err(|_| CacheResidencyError::ManagerPoisoned)?;
-        }
-        match state.as_ref().expect("completion state was awaited") {
-            DiskCompletionState::Finished(Ok(result)) => Ok(result.clone()),
-            DiskCompletionState::Finished(Err(error)) => {
-                Err(CacheResidencyError::Runtime(error.clone()))
-            }
-            DiskCompletionState::Cancelled => {
-                Err(CacheResidencyError::DiskOperationCancelled { generation })
-            }
-        }
-    }
-
-    fn release_task_resources(&self) {
-        if let Ok(mut released) = self.released.lock() {
-            *released = true;
-            self.released_ready.notify_all();
-        }
-    }
-
-    fn wait_for_task_resources(&self) -> Result<(), CacheResidencyError> {
-        let mut released = self
-            .released
-            .lock()
-            .map_err(|_| CacheResidencyError::ManagerPoisoned)?;
-        while !*released {
-            released = self
-                .released_ready
-                .wait(released)
-                .map_err(|_| CacheResidencyError::ManagerPoisoned)?;
-        }
-        Ok(())
-    }
-}
+type RuntimeDiskWorker = RuntimeCacheIoWorker<DiskTask, DiskResult>;
+type RuntimeDiskSubmission = RuntimeCacheIoSubmission<DiskTask, DiskResult>;
 
 #[derive(Debug, Clone)]
 struct DiskTicket {
-    key: CacheIoOperationKey,
-    completion: Arc<DiskCompletion>,
-    shared: Arc<DiskWorkerShared>,
+    inner: RuntimeCacheIoTicket<DiskResult>,
+}
+
+impl std::ops::Deref for DiskTicket {
+    type Target = RuntimeCacheIoTicket<DiskResult>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl DiskTicket {
     fn wait(&self) -> Result<DiskResult, CacheResidencyError> {
-        self.completion.wait(self.key.generation)
+        self.inner.wait().map_err(disk_worker_error)
     }
 
     fn cancel(&self) -> bool {
-        let Ok(mut execution) = self.shared.execution.lock() else {
-            return false;
-        };
-        let cancelled = execution.cancel(&self.key) && self.completion.cancel();
-        self.shared.space_available.notify_all();
-        cancelled
+        self.inner.cancel()
     }
 
     fn wait_for_task_resources(&self) -> Result<(), CacheResidencyError> {
-        self.completion.wait_for_task_resources()
+        self.inner
+            .wait_for_task_resources()
+            .map_err(disk_worker_error)
+    }
+
+    #[cfg(test)]
+    fn shares_completion_with(&self, other: &Self) -> bool {
+        self.inner.shares_completion_with(&other.inner)
     }
 }
 
 struct DiskSubmission {
+    inner: RuntimeDiskSubmission,
     ticket: DiskTicket,
-    sender: mpsc::Sender<DiskRequest>,
-    shared: Arc<DiskWorkerShared>,
-    unsent: Option<DiskRequest>,
     joined: bool,
     write_reservation_id: Option<u64>,
 }
 
-#[derive(Debug)]
-struct DiskSubmissionOutcome {
-    joined: bool,
-    backpressure: bool,
-    peak_occupancy: usize,
-}
-
 impl DiskSubmission {
-    fn enqueue(mut self) -> Result<DiskSubmissionOutcome, CacheResidencyError> {
-        let mut backpressure = false;
-        if let Some(request) = self.unsent.take() {
-            let mut execution = match self.shared.execution.lock() {
-                Ok(execution) => execution,
-                Err(_) => {
-                    drop(request);
-                    self.ticket.completion.release_task_resources();
-                    return Err(CacheResidencyError::ManagerPoisoned);
-                }
-            };
-            loop {
-                match execution.admit(&self.ticket.key)? {
-                    CacheIoAdmission::Admitted => {
-                        if self.sender.send(request).is_err() {
-                            execution.rollback_admission(&self.ticket.key)?;
-                            self.ticket
-                                .completion
-                                .finish(Err(CacheResidencyError::Runtime(
-                                    "live cache disk worker stopped".into(),
-                                )));
-                            self.ticket.completion.release_task_resources();
-                        }
-                        break;
-                    }
-                    CacheIoAdmission::AtCapacity => {
-                        backpressure = true;
-                        execution = match self.shared.space_available.wait(execution) {
-                            Ok(execution) => execution,
-                            Err(_) => {
-                                drop(request);
-                                self.ticket.completion.release_task_resources();
-                                return Err(CacheResidencyError::ManagerPoisoned);
-                            }
-                        };
-                    }
-                    CacheIoAdmission::Cancelled => {
-                        drop(request);
-                        self.ticket.completion.release_task_resources();
-                        break;
-                    }
-                }
-            }
-            drop(execution);
-        }
-        Ok(DiskSubmissionOutcome {
-            joined: self.joined,
-            backpressure,
-            peak_occupancy: self
-                .shared
-                .execution
-                .lock()
-                .map_err(|_| CacheResidencyError::ManagerPoisoned)?
-                .peak_queued(),
-        })
-    }
-}
-
-impl Drop for DiskSubmission {
-    fn drop(&mut self) {
-        let Some(request) = self.unsent.take() else {
-            return;
-        };
-        self.ticket.cancel();
-        drop(request);
-        self.ticket.completion.release_task_resources();
-        retire_disk_completion(&self.shared, &self.ticket.key, &self.ticket.completion);
-    }
-}
-
-#[derive(Debug)]
-struct DiskWorkerShared {
-    in_flight: Mutex<HashMap<CacheIoOperationKey, Arc<DiskCompletion>>>,
-    execution: Mutex<CacheIoExecutionState>,
-    space_available: Condvar,
-}
-
-impl DiskWorkerShared {
-    fn new(capacity: usize) -> Result<Self, CacheIoExecutionStateError> {
-        Ok(Self {
-            in_flight: Mutex::new(HashMap::new()),
-            execution: Mutex::new(CacheIoExecutionState::new(capacity)?),
-            space_available: Condvar::new(),
-        })
-    }
-}
-
-fn retire_disk_completion(
-    shared: &DiskWorkerShared,
-    key: &CacheIoOperationKey,
-    completion: &Arc<DiskCompletion>,
-) {
-    let retired = if let Ok(mut execution) = shared.execution.lock() {
-        execution.retire(key).unwrap_or(false)
-    } else {
-        false
-    };
-    if retired {
-        shared.space_available.notify_all();
-        if let Ok(mut in_flight) = shared.in_flight.lock() {
-            if in_flight
-                .get(key)
-                .is_some_and(|current| Arc::ptr_eq(current, completion))
-            {
-                in_flight.remove(key);
-            }
-        }
+    fn enqueue(self) -> Result<CacheIoSubmissionOutcome, CacheResidencyError> {
+        self.inner.enqueue().map_err(disk_worker_error)
     }
 }
 
 #[derive(Debug)]
 struct DiskWorker {
-    sender: mpsc::Sender<DiskRequest>,
-    handle: Mutex<Option<JoinHandle<()>>>,
-    shared: Arc<DiskWorkerShared>,
+    inner: RuntimeDiskWorker,
 }
 
 impl DiskWorker {
     fn new(capacity: usize) -> Result<Self, CacheResidencyError> {
-        let (sender, receiver) = mpsc::channel::<DiskRequest>();
-        let shared = Arc::new(DiskWorkerShared::new(capacity)?);
-        let worker_shared = Arc::clone(&shared);
-        let handle = thread::Builder::new()
-            .name("safemlx-cache-disk".into())
-            .spawn(move || {
-                while let Ok(request) = receiver.recv() {
-                    match request {
-                        DiskRequest::Operation {
-                            key,
-                            task,
-                            completion,
-                        } => {
-                            let start = worker_shared
-                                .execution
-                                .lock()
-                                .map_err(|_| CacheResidencyError::ManagerPoisoned)
-                                .and_then(|mut execution| {
-                                    execution.begin(&key).map_err(Into::into)
-                                });
-                            worker_shared.space_available.notify_all();
-                            match start {
-                                Ok(CacheIoStartDisposition::Execute) => {}
-                                Ok(CacheIoStartDisposition::Discard) => {
-                                    drop(task);
-                                    completion.release_task_resources();
-                                    retire_disk_completion(&worker_shared, &key, &completion);
-                                    continue;
-                                }
-                                Err(error) => {
-                                    drop(task);
-                                    completion.finish(Err(error));
-                                    completion.release_task_resources();
-                                    retire_disk_completion(&worker_shared, &key, &completion);
-                                    continue;
-                                }
-                            }
-                            let mut write_commit = None;
-                            let result = catch_unwind(AssertUnwindSafe(|| match *task {
-                                DiskTask::Write {
-                                    directory,
-                                    id,
-                                    block,
-                                    commit,
-                                } => {
-                                    write_commit = commit;
-                                    write_live_block(&directory, &id, &block).map(DiskResult::Write)
-                                }
-                                DiskTask::Read {
-                                    location,
-                                    representation,
-                                } => load_host_cache_block_direct(&location, representation)
-                                    .map(DiskResult::Read),
-                                #[cfg(test)]
-                                DiskTask::Pause { started, release } => {
-                                    let _ = started.send(());
-                                    let _ = release.recv();
-                                    Ok(DiskResult::Test)
-                                }
-                                #[cfg(test)]
-                                DiskTask::PauseWrite {
-                                    started,
-                                    release,
-                                    commit,
-                                } => {
-                                    write_commit = commit;
-                                    let _ = started.send(());
-                                    let _ = release.recv();
-                                    Err(CacheResidencyError::Runtime(
-                                        "injected canceled cache write".into(),
-                                    ))
-                                }
-                                #[cfg(test)]
-                                DiskTask::Panic => panic!("injected cache disk worker panic"),
-                            }))
-                            .unwrap_or_else(|_| {
-                                Err(CacheResidencyError::Runtime(
-                                    "live cache disk worker operation panicked".into(),
-                                ))
-                            });
-                            if let Some(commit) = &write_commit {
-                                commit.reconcile(&result);
-                            }
-                            // The task-local arrays have been dropped by this
-                            // point. Release their reservation before waking
-                            // logical completion waiters.
-                            drop(write_commit);
-                            let disposition = worker_shared
-                                .execution
-                                .lock()
-                                .map_err(|_| CacheResidencyError::ManagerPoisoned)
-                                .and_then(|mut execution| {
-                                    execution.complete(&key).map_err(Into::into)
-                                });
-                            if !matches!(disposition, Ok(CacheIoCompletionDisposition::Publish))
-                                || completion.is_ready()
-                            {
-                                if let Ok(DiskResult::Write(location)) = result {
-                                    if !location.persistent {
-                                        let _ = fs::remove_file(location.path);
-                                    }
-                                }
-                            } else {
-                                completion.finish(result);
-                            }
-                            completion.release_task_resources();
-                            retire_disk_completion(&worker_shared, &key, &completion);
-                        }
-                        DiskRequest::Stop => break,
-                    }
-                }
-            })
-            .map_err(|source| CacheResidencyError::Io {
-                action: "start live cache disk worker",
-                path: PathBuf::from("safemlx-cache-disk"),
-                source,
-            })?;
         Ok(Self {
-            sender,
-            handle: Mutex::new(Some(handle)),
-            shared,
+            inner: RuntimeDiskWorker::new(
+                capacity,
+                "safemlx-cache-disk",
+                execute_disk_task,
+                discard_disk_result,
+            )
+            .map_err(disk_worker_error)?,
         })
     }
 
@@ -1095,64 +783,28 @@ impl DiskWorker {
     fn prepare_with_write_reservation(
         &self,
         key: CacheIoOperationKey,
-        mut task: DiskTask,
+        task: DiskTask,
         write_reservation_id: Option<u64>,
     ) -> Result<DiskSubmission, CacheResidencyError> {
-        let mut in_flight = self
-            .shared
-            .execution
-            .lock()
-            .map_err(|_| CacheResidencyError::ManagerPoisoned)?;
-        let preparation = in_flight.prepare(key.clone());
-        let mut completions = self
-            .shared
-            .in_flight
-            .lock()
-            .map_err(|_| CacheResidencyError::ManagerPoisoned)?;
-        if preparation == CacheIoPreparation::Joined {
-            let completion = completions
-                .get(&key)
-                .expect("core joined key has an adapter completion");
-            if let DiskTask::Write {
+        let mut inner = self.inner.prepare(key, task).map_err(disk_worker_error)?;
+        let joined = inner.joined;
+        if joined {
+            if let Some(DiskTask::Write {
                 commit: Some(commit),
                 ..
-            } = &mut task
+            }) = inner.joined_task_mut()
             {
                 commit.armed = false;
             }
-            return Ok(DiskSubmission {
-                ticket: DiskTicket {
-                    key,
-                    completion: Arc::clone(completion),
-                    shared: Arc::clone(&self.shared),
-                },
-                sender: self.sender.clone(),
-                shared: Arc::clone(&self.shared),
-                unsent: None,
-                joined: true,
-                write_reservation_id: None,
-            });
         }
-        let completion = Arc::new(DiskCompletion::default());
-        completions.insert(key.clone(), Arc::clone(&completion));
-        drop(completions);
-        drop(in_flight);
-        let request = DiskRequest::Operation {
-            key: key.clone(),
-            task: Box::new(task),
-            completion: Arc::clone(&completion),
+        let ticket = DiskTicket {
+            inner: inner.ticket.clone(),
         };
         Ok(DiskSubmission {
-            ticket: DiskTicket {
-                key,
-                completion,
-                shared: Arc::clone(&self.shared),
-            },
-            sender: self.sender.clone(),
-            shared: Arc::clone(&self.shared),
-            unsent: Some(request),
-            joined: false,
-            write_reservation_id,
+            inner,
+            ticket,
+            joined,
+            write_reservation_id: if joined { None } else { write_reservation_id },
         })
     }
 
@@ -1211,18 +863,84 @@ impl DiskWorker {
     }
 
     fn retire(&self, ticket: &DiskTicket) {
-        retire_disk_completion(&self.shared, &ticket.key, &ticket.completion);
+        self.inner.retire(&ticket.inner);
     }
 }
 
-impl Drop for DiskWorker {
-    fn drop(&mut self) {
-        let _ = self.sender.send(DiskRequest::Stop);
-        if let Ok(handle) = self.handle.get_mut() {
-            if let Some(handle) = handle.take() {
-                let _ = handle.join();
-            }
+fn execute_disk_task(task: DiskTask) -> Result<DiskResult, String> {
+    let mut write_commit = None;
+    let result = catch_unwind(AssertUnwindSafe(|| match task {
+        DiskTask::Write {
+            directory,
+            id,
+            block,
+            commit,
+        } => {
+            write_commit = commit;
+            write_live_block(&directory, &id, &block).map(DiskResult::Write)
         }
+        DiskTask::Read {
+            location,
+            representation,
+        } => load_host_cache_block_direct(&location, representation).map(DiskResult::Read),
+        #[cfg(test)]
+        DiskTask::Pause { started, release } => {
+            let _ = started.send(());
+            let _ = release.recv();
+            Ok(DiskResult::Test)
+        }
+        #[cfg(test)]
+        DiskTask::PauseWrite {
+            started,
+            release,
+            commit,
+        } => {
+            write_commit = commit;
+            let _ = started.send(());
+            let _ = release.recv();
+            Err(CacheResidencyError::Runtime(
+                "injected canceled cache write".into(),
+            ))
+        }
+        #[cfg(test)]
+        DiskTask::Panic => panic!("injected cache disk worker panic"),
+    }))
+    .unwrap_or_else(|_| {
+        Err(CacheResidencyError::Runtime(
+            "live cache disk worker operation panicked".into(),
+        ))
+    });
+    if let Some(commit) = &write_commit {
+        commit.reconcile(&result);
+    }
+    drop(write_commit);
+    result.map_err(|error| error.to_string())
+}
+
+fn discard_disk_result(result: DiskResult) {
+    if let DiskResult::Write(location) = result {
+        if !location.persistent {
+            let _ = fs::remove_file(location.path);
+        }
+    }
+}
+
+fn disk_worker_error(error: CacheIoWorkerError) -> CacheResidencyError {
+    match error {
+        CacheIoWorkerError::Poisoned => CacheResidencyError::ManagerPoisoned,
+        CacheIoWorkerError::OperationFailed(message) => CacheResidencyError::Runtime(message),
+        CacheIoWorkerError::Cancelled { generation } => {
+            CacheResidencyError::DiskOperationCancelled { generation }
+        }
+        CacheIoWorkerError::Spawn {
+            thread_name,
+            source,
+        } => CacheResidencyError::Io {
+            action: "start live cache disk worker",
+            path: PathBuf::from(thread_name),
+            source,
+        },
+        CacheIoWorkerError::Execution(error) => error.into(),
     }
 }
 
@@ -5111,10 +4829,7 @@ mod tests {
         second.enqueue().unwrap();
         assert!(ticket.wait().is_err());
         assert!(second_ticket.wait().is_err());
-        assert!(std::sync::Arc::ptr_eq(
-            &ticket.completion,
-            &second_ticket.completion
-        ));
+        assert!(ticket.shares_completion_with(&second_ticket));
         worker.retire(&ticket);
     }
 
