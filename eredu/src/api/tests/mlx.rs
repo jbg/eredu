@@ -17,6 +17,7 @@ use crate::{
         ResolvedModelConfig,
     },
     composition::mlx_architectures::{
+        deepseek_v3::model as deepseek_v3,
         deepseek_v4::model as deepseek_v4,
         gpt_oss::model as gpt_oss,
         lfm2::model as lfm2,
@@ -1659,6 +1660,121 @@ fn tiny_lfm2_moe_neutral_runtime_executes_independent_expert_cache() {
     safemlx::transforms::eval([&logits]).unwrap();
     assert_eq!(logits.shape(), &[1, 2, 16]);
     assert!(model.expert_cache_report().unwrap().is_some());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn tiny_deepseek_v3_neutral_runtime_executes_compressed_state_mtp_and_expert_cache() {
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let weights_stream = weights_context.stream();
+    let dir = temp_model_dir(
+        r#"{
+              "model_type":"deepseek_v3","hidden_size":16,"intermediate_size":24,
+              "moe_intermediate_size":8,"num_hidden_layers":2,"num_attention_heads":2,
+              "vocab_size":16,"rms_norm_eps":0.000001,"max_position_embeddings":64,
+              "q_lora_rank":8,"kv_lora_rank":8,"qk_nope_head_dim":4,
+              "qk_rope_head_dim":4,"v_head_dim":8,"first_k_dense_replace":1,
+              "moe_layer_freq":1,"n_routed_experts":2,"n_shared_experts":1,
+              "num_experts_per_tok":1,"n_group":1,"topk_group":1,
+              "topk_method":"noaux_tc","scoring_func":"sigmoid",
+              "norm_topk_prob":true,"routed_scaling_factor":1.0,
+              "num_nextn_predict_layers":1,"tie_word_embeddings":false
+            }"#,
+    );
+    let args = deepseek_v3::get_model_args(&dir).unwrap();
+    let plan = crate::composition::mlx_architectures::deepseek_v3::checkpoint::safetensors_plan(
+        &args, true,
+    )
+    .unwrap();
+    let mut tensors = plan.common_tensors;
+    for group in plan.layout_groups {
+        let packed = group
+            .variants
+            .into_iter()
+            .find(|variant| variant.id == "packed")
+            .unwrap();
+        tensors.extend(packed.tensors);
+    }
+    let arrays = tensors
+        .iter()
+        .map(|tensor| {
+            let shape = tensor
+                .shape
+                .iter()
+                .map(|dimension| i32::try_from(*dimension).unwrap())
+                .collect::<Vec<_>>();
+            let dtype = if matches!(
+                tensor.dtype,
+                eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                    eredu_checkpoint::StoredDtype::I32
+                )
+            ) {
+                Dtype::Int32
+            } else {
+                Dtype::Float32
+            };
+            (
+                tensor.key.clone(),
+                zeros_dtype(&shape, dtype, stream).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Array::save_safetensors(
+        arrays.iter().map(|(name, array)| (name.as_str(), array)),
+        None,
+        dir.join("model.safetensors"),
+    )
+    .unwrap();
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+
+    let mut resident = crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
+        &dir,
+        eredu_runtime::LayerWeightResidency::FullyResident,
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    let mut resident_cache = resident.new_cache();
+    let resident_logits = resident
+        .forward(&tokens, &mut resident_cache, stream)
+        .unwrap();
+    safemlx::transforms::eval([&resident_logits]).unwrap();
+    assert_eq!(resident_logits.shape(), &[1, 2, 16]);
+    assert_eq!(resident.mtp_len(), 1);
+
+    let mut bounded = crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
+        &dir,
+        eredu_runtime::LayerwiseLoadOptions::default(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    let mut bounded_cache = bounded.new_cache();
+    let bounded_logits = bounded
+        .forward(&tokens, &mut bounded_cache, stream)
+        .unwrap();
+    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    assert_eq!(bounded_logits.shape(), resident_logits.shape());
+    assert!(bounded.residency_report().unwrap().initialized());
+
+    let mut sparse = crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_expert_cache_model(
+        &dir,
+        eredu_runtime::NonExpertWeightResidency::FullyResident,
+        eredu_runtime::ExpertCacheLoadOptions::default(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    let mut sparse_cache = sparse.new_cache();
+    let sparse_logits = sparse.forward(&tokens, &mut sparse_cache, stream).unwrap();
+    safemlx::transforms::eval([&sparse_logits]).unwrap();
+    assert_eq!(sparse_logits.shape(), resident_logits.shape());
+    assert!(sparse.expert_cache_report().unwrap().is_some());
     fs::remove_dir_all(dir).unwrap();
 }
 
