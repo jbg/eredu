@@ -2,7 +2,7 @@
 
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_nn::RopeValue;
-use eredu_runtime::CausalModel;
+use eredu_runtime::{CausalModel, RuntimeState, StateError, StateLayout};
 
 use std::{
     cell::RefCell,
@@ -5564,8 +5564,10 @@ where
 }
 
 /// Gemma 4 generation cache.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Cache {
+    layout: StateLayout,
+    decoder_group: usize,
     pub(crate) kv: Vec<Option<ConcatKeyValueCache>>,
     pub(crate) token_ids: Vec<u32>,
     prefix_embeddings: Option<Array>,
@@ -5577,9 +5579,38 @@ impl Cache {
     const KV_GROWTH_STEP: i32 = 256;
 
     pub(crate) fn new(args: &ModelArgs) -> Self {
-        let mut cache = Self::default();
+        let layout = StateLayout::new(
+            prompt_cache_layer_layout(args).expect("validated Gemma 4 cache geometry"),
+        )
+        .expect("validated Gemma 4 state layout");
+        Self::new_with_layout(args, layout)
+    }
+
+    pub(crate) fn new_with_geometry(
+        args: &ModelArgs,
+        geometry: &[ParallelLayerGeometry],
+    ) -> Result<Self, Error> {
+        let layout = StateLayout::new(prompt_cache_layer_layout_with_geometry(args, geometry)?)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        Ok(Self::new_with_layout(args, layout))
+    }
+
+    fn new_with_layout(args: &ModelArgs, layout: StateLayout) -> Self {
+        let mut cache = Self {
+            layout,
+            decoder_group: 0,
+            kv: Vec::new(),
+            token_ids: Vec::new(),
+            prefix_embeddings: None,
+            prefix_len: 0,
+            rank: None,
+        };
         cache.reset_kv(args);
         cache
+    }
+
+    pub(crate) fn set_decoder_group(&mut self, decoder_group: usize) {
+        self.decoder_group = decoder_group;
     }
 
     pub(crate) fn reset_kv(&mut self, args: &ModelArgs) {
@@ -5628,6 +5659,43 @@ impl Cache {
         self.token_ids.truncate(len);
         self.kv = kv;
         Ok(())
+    }
+}
+
+impl RuntimeState<crate::backend::mlx::nn::shared::MlxBackend> for Cache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        if address.group() < self.decoder_group {
+            return Ok(Vec::new().into_iter());
+        }
+        if address.group() != self.decoder_group {
+            return Err(StateError::UnknownLayer {
+                layer: address.group(),
+                count: self.decoder_group + 1,
+            });
+        }
+        self.kv
+            .get(address.index())
+            .ok_or(StateError::UnknownLayer {
+                layer: address.index(),
+                count: self.kv.len(),
+            })
+            .map(|cache| {
+                cache
+                    .as_ref()
+                    .map(KeyValueCache::retained_arrays)
+                    .unwrap_or_default()
+                    .into_iter()
+            })
     }
 }
 
@@ -5743,7 +5811,9 @@ impl Model {
             .collect::<BTreeMap<_, _>>();
         let prefix_embeddings =
             state.remove(&(StateTensorOwner::Layer(0), StateTensorRole::PrefixEmbedding));
-        let mut cache = Cache::new(args);
+        let layout = StateLayout::new(identity.layer_layout.clone())
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut cache = Cache::new_with_layout(args, layout);
         cache.rank = identity.topology.cache_rank_identity();
         cache.token_ids = prefix_token_ids.to_vec();
         cache.prefix_len = prefix_embeddings

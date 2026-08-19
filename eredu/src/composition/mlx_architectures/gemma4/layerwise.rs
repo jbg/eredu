@@ -1,7 +1,9 @@
 //! Text-decoder bounded layer execution for Gemma 4 checkpoints.
 
 use eredu_runtime::{
-    StaticUnitBindings, {ExpertIdentity, ExpertPass, LayerWeightResidency, WeightResidency},
+    ExecutionGraph, ExecutionUnitLayout, LayeredArchitecture, LayeredForwardState,
+    LayerwiseRuntime, ParallelLayeredArchitecture, StaticUnitBindings,
+    {ExpertIdentity, ExpertPass, LayerWeightResidency, WeightResidency},
 };
 
 use eredu_checkpoint::WeightQuantization;
@@ -21,6 +23,7 @@ use std::{
 
 use safemlx::{
     error::Exception,
+    macros::ModuleParameters,
     module::{Module, ModuleParameters, ModuleParametersExt, Param},
     nn,
     ops::{
@@ -32,12 +35,13 @@ use safemlx::{
 };
 
 use crate::core::cache::{
-    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    PromptCacheTopology,
+    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
 };
 
 use crate::{
     backend::mlx::error::Error,
+    backend::mlx::nn::shared::{MlxBackend, MlxParameterTree},
     backend::mlx::nn::{
         parallel::{LinearParallelism, ParallelLinear, VocabParallelLmHead},
         tensor::create_causal_mask,
@@ -48,6 +52,7 @@ use crate::{
         populate_module_from_lease, populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
+    backend::mlx::runtime::checkpoint::store::WeightStoreBackend,
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load,
         recipe::{recipe_dtype_from_mlx, DerivedWeightRecipe},
@@ -58,10 +63,15 @@ use crate::{
         register_partitioned_projection_group, register_projection_module,
         register_replicated_module, ParallelPlanBuilder, ProjectionSharding,
     },
-    backend::mlx::runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerwiseModel, LoadTimeQuantizableAdapter,
+    backend::mlx::runtime::execution::{
+        generic::{
+            prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
+            MlxUnitFactory,
+        },
+        layerwise::{
+            open_safetensors_weight_store, quantize_module_store_with_bindings,
+            shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
+        },
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -537,9 +547,696 @@ fn register_gemma_audio_layer_parallel_plan(
     Ok(())
 }
 
+type Gemma4Unit = MlxParameterTree<Gemma4Layer>;
+type Gemma4Static = MlxParameterTree<Gemma4StaticModules>;
+type Gemma4ResidentRuntime =
+    LayerwiseRuntime<Gemma4Architecture, MlxBackend, Cache, MlxResidentPolicy<Gemma4Unit>>;
+type Gemma4BoundedRuntime = LayerwiseRuntime<
+    Gemma4Architecture,
+    MlxBackend,
+    Cache,
+    MlxLayerwisePolicy<Gemma4Unit, Gemma4UnitFactory>,
+>;
+
+enum Gemma4Runtime {
+    Resident(Gemma4ResidentRuntime),
+    Layerwise(Gemma4BoundedRuntime),
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct Gemma4ReplicatedStatic {
+    #[param]
+    embedding: Gemma4Embedding,
+    #[param]
+    per_layer_embedding: Option<Gemma4Embedding>,
+    #[param]
+    per_layer_projection: Option<MaybeQuantized<nn::Linear>>,
+    #[param]
+    per_layer_norm: Option<nn::RmsNorm>,
+    #[param]
+    norm: nn::RmsNorm,
+    #[param]
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
+    #[param]
+    vision: Option<Gemma4VisionLayerwiseStatic>,
+    #[param]
+    embed_vision: Option<Gemma4ModalityEmbedder>,
+    #[param]
+    audio: Option<Gemma4AudioLayerwiseStatic>,
+    #[param]
+    embed_audio: Option<Gemma4ModalityEmbedder>,
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct Gemma4ParallelStatic {
+    #[param]
+    embedding: Gemma4Embedding,
+    #[param]
+    per_layer_embedding: Option<Gemma4Embedding>,
+    #[param]
+    per_layer_projection: Option<ParallelLinear>,
+    #[param]
+    per_layer_norm: Option<nn::RmsNorm>,
+    #[param]
+    norm: nn::RmsNorm,
+    #[param]
+    lm_head: Option<VocabParallelLmHead>,
+    #[param]
+    vision: Option<Gemma4VisionLayerwiseStatic>,
+    #[param]
+    embed_vision: Option<Gemma4ModalityEmbedder>,
+    #[param]
+    audio: Option<Gemma4AudioLayerwiseStatic>,
+    #[param]
+    embed_audio: Option<Gemma4ModalityEmbedder>,
+}
+
+#[derive(Debug, Clone)]
+enum Gemma4StaticModules {
+    Replicated(Gemma4ReplicatedStatic),
+    Parallel(Gemma4ParallelStatic),
+}
+
+macro_rules! gemma4_static_parameters {
+    ($self:ident, $method:ident $(, $arg:expr)?) => {
+        match $self {
+            Gemma4StaticModules::Replicated(module) => module.$method($($arg)?),
+            Gemma4StaticModules::Parallel(module) => module.$method($($arg)?),
+        }
+    };
+}
+
+impl ModuleParameters for Gemma4StaticModules {
+    fn num_parameters(&self) -> usize {
+        gemma4_static_parameters!(self, num_parameters)
+    }
+    fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        gemma4_static_parameters!(self, parameters)
+    }
+    fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
+        gemma4_static_parameters!(self, parameters_mut)
+    }
+    fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        gemma4_static_parameters!(self, trainable_parameters)
+    }
+    fn freeze_parameters(&mut self, recursive: bool) {
+        gemma4_static_parameters!(self, freeze_parameters, recursive)
+    }
+    fn unfreeze_parameters(&mut self, recursive: bool) {
+        gemma4_static_parameters!(self, unfreeze_parameters, recursive)
+    }
+    fn all_frozen(&self) -> Option<bool> {
+        gemma4_static_parameters!(self, all_frozen)
+    }
+    fn any_frozen(&self) -> Option<bool> {
+        gemma4_static_parameters!(self, any_frozen)
+    }
+}
+
+struct Gemma4UnitFactory {
+    adapter: Gemma4LayerwiseAdapter,
+    parallel_layout: Option<Arc<eredu_runtime::LocalModelLayout>>,
+}
+
+impl MlxUnitFactory<Gemma4Unit> for Gemma4UnitFactory {
+    fn build(&mut self, ordinal: usize, stream: &Stream) -> Result<Gemma4Unit, Error> {
+        let (group, index) = gemma4_ordinal(&self.adapter, ordinal)?;
+        let layer = match self.parallel_layout.as_deref() {
+            Some(layout) => self
+                .adapter
+                .new_parallel_layer(group, index, layout, stream)?,
+            None => self.adapter.new_layer(group, index, stream)?,
+        };
+        let sparse = self.adapter.external_experts
+            && self.adapter.execution_group_name(group)? == "text_decoder";
+        MlxParameterTree::new_filtered(layer, "", |name| !sparse || !name.starts_with("experts."))
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+}
+
+struct Gemma4Architecture {
+    adapter: Gemma4LayerwiseAdapter,
+    static_modules: Gemma4Static,
+    parallel_topology: Option<crate::backend::mlx::MlxParallelContext>,
+}
+
+impl Gemma4Architecture {
+    fn from_adapter(adapter: Gemma4LayerwiseAdapter) -> Result<Self, Error> {
+        let modules = if adapter.parallel_vocabulary.is_some() {
+            Gemma4StaticModules::Parallel(Gemma4ParallelStatic {
+                embedding: adapter.embedding.clone(),
+                per_layer_embedding: adapter.per_layer_embedding.clone(),
+                per_layer_projection: adapter.parallel_per_layer_projection.clone(),
+                per_layer_norm: adapter.per_layer_norm.clone(),
+                norm: adapter.norm.clone(),
+                lm_head: adapter.parallel_lm_head.clone(),
+                vision: adapter.vision.clone(),
+                embed_vision: adapter.embed_vision.clone(),
+                audio: adapter.audio.clone(),
+                embed_audio: adapter.embed_audio.clone(),
+            })
+        } else {
+            Gemma4StaticModules::Replicated(Gemma4ReplicatedStatic {
+                embedding: adapter.embedding.clone(),
+                per_layer_embedding: adapter.per_layer_embedding.clone(),
+                per_layer_projection: adapter.per_layer_projection.clone(),
+                per_layer_norm: adapter.per_layer_norm.clone(),
+                norm: adapter.norm.clone(),
+                lm_head: adapter.lm_head.clone(),
+                vision: adapter.vision.clone(),
+                embed_vision: adapter.embed_vision.clone(),
+                audio: adapter.audio.clone(),
+                embed_audio: adapter.embed_audio.clone(),
+            })
+        };
+        Ok(Self {
+            static_modules: MlxParameterTree::new(modules, "")
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+            adapter,
+            parallel_topology: None,
+        })
+    }
+
+    fn sync_adapter_static(&mut self) {
+        match &*self.static_modules {
+            Gemma4StaticModules::Replicated(modules) => {
+                self.adapter.embedding = modules.embedding.clone();
+                self.adapter.per_layer_embedding = modules.per_layer_embedding.clone();
+                self.adapter.per_layer_projection = modules.per_layer_projection.clone();
+                self.adapter.per_layer_norm = modules.per_layer_norm.clone();
+                self.adapter.norm = modules.norm.clone();
+                self.adapter.lm_head = modules.lm_head.clone();
+                self.adapter.vision = modules.vision.clone();
+                self.adapter.embed_vision = modules.embed_vision.clone();
+                self.adapter.audio = modules.audio.clone();
+                self.adapter.embed_audio = modules.embed_audio.clone();
+            }
+            Gemma4StaticModules::Parallel(modules) => {
+                self.adapter.embedding = modules.embedding.clone();
+                self.adapter.per_layer_embedding = modules.per_layer_embedding.clone();
+                self.adapter.parallel_per_layer_projection = modules.per_layer_projection.clone();
+                self.adapter.per_layer_norm = modules.per_layer_norm.clone();
+                self.adapter.norm = modules.norm.clone();
+                self.adapter.parallel_lm_head = modules.lm_head.clone();
+                self.adapter.vision = modules.vision.clone();
+                self.adapter.embed_vision = modules.embed_vision.clone();
+                self.adapter.audio = modules.audio.clone();
+                self.adapter.embed_audio = modules.embed_audio.clone();
+            }
+        }
+    }
+}
+
+impl LayeredArchitecture<MlxBackend, Cache> for Gemma4Architecture {
+    type Input<'a> = Gemma4Input<'a>;
+    type StaticModules = Gemma4Static;
+    type Unit = Gemma4Unit;
+    type ForwardContext = Gemma4ForwardContext;
+    type RetainedContextValues<'a> = std::vec::IntoIter<&'a Array>;
+    type Error = Error;
+
+    fn model_identity(&self) -> &str {
+        &self.adapter.args.model_type
+    }
+    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
+        self.adapter.execution_graph()
+    }
+    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
+        self.adapter.layer_count(group)
+    }
+    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
+        if index >= self.group_unit_count(group)? {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Gemma 4 group {group} has no unit {index}"
+            )));
+        }
+        Ok(self.adapter.layer_checkpoint_prefix(group, index))
+    }
+    fn static_modules(&self) -> &Self::StaticModules {
+        &self.static_modules
+    }
+    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
+        &mut self.static_modules
+    }
+    fn build_unit(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Unit, Error> {
+        let layer = self.adapter.new_layer(group, index, stream)?;
+        let sparse = self.adapter.external_experts
+            && self.adapter.execution_group_name(group)? == "text_decoder";
+        MlxParameterTree::new_filtered(layer, "", |name| !sparse || !name.starts_with("experts."))
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
+    fn begin_forward<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
+        self.sync_adapter_static();
+        cache.set_decoder_group(self.adapter.pipeline_text_group());
+        self.adapter.validate_cache(cache)?;
+        self.adapter.begin_forward(input, cache, stream)
+    }
+    fn begin_execution_group(
+        &mut self,
+        group: usize,
+        initial: &Array,
+        dependencies: &[&Array],
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let dependencies = dependencies
+            .iter()
+            .map(|value| (*value).clone())
+            .collect::<Vec<_>>();
+        self.adapter
+            .begin_execution_group(group, initial, &dependencies, cache, forward, stream)
+    }
+    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        self.adapter.should_execute_group(group, forward)
+    }
+    fn forward_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.adapter
+            .forward_layer(group, index, &mut **unit, hidden, cache, forward, stream)
+    }
+    fn complete_execution_group(
+        &mut self,
+        group: usize,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.adapter
+            .complete_execution_group(group, hidden, cache, forward, stream)
+    }
+    fn finish_forward(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.adapter.finish(hidden, cache, forward, stream)
+    }
+    fn retained_context_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        group: usize,
+        index: usize,
+    ) -> Self::RetainedContextValues<'a> {
+        self.adapter
+            .retained_context_arrays(forward, group, index)
+            .into_iter()
+    }
+}
+
+impl ParallelLayeredArchitecture<MlxBackend, Cache> for Gemma4Architecture {
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
+        self.sync_adapter_static();
+        cache.set_decoder_group(self.adapter.pipeline_text_group());
+        self.adapter.validate_cache(cache)?;
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Gemma 4 parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        self.adapter
+            .begin_forward_with_execution(input, cache, &execution)
+    }
+    fn forward_unit_parallel(
+        &mut self,
+        group_index: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Gemma 4 parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        self.adapter.forward_layer_with_execution(
+            group_index,
+            index,
+            &mut **unit,
+            hidden,
+            cache,
+            forward,
+            &execution,
+        )
+    }
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &Self::ForwardContext,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Gemma 4 parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        self.adapter
+            .finish_with_execution(hidden, cache, forward, &execution)
+    }
+}
+
+struct Gemma4Execution {
+    runtime: Gemma4Runtime,
+    metadata: eredu_runtime::LayerwiseModelMetadata,
+    parallel_info:
+        Option<eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
+    topology: Option<crate::backend::mlx::MlxParallelContext>,
+}
+
+impl Gemma4Execution {
+    fn architecture(&self) -> &Gemma4Architecture {
+        match &self.runtime {
+            Gemma4Runtime::Resident(runtime) => runtime.architecture(),
+            Gemma4Runtime::Layerwise(runtime) => runtime.architecture(),
+        }
+    }
+    fn architecture_mut(&mut self) -> &mut Gemma4Architecture {
+        match &mut self.runtime {
+            Gemma4Runtime::Resident(runtime) => runtime.architecture_mut(),
+            Gemma4Runtime::Layerwise(runtime) => runtime.architecture_mut(),
+        }
+    }
+    fn adapter(&self) -> &Gemma4LayerwiseAdapter {
+        &self.architecture().adapter
+    }
+    fn adapter_mut(&mut self) -> &mut Gemma4LayerwiseAdapter {
+        &mut self.architecture_mut().adapter
+    }
+    fn metadata(&self) -> &eredu_runtime::LayerwiseModelMetadata {
+        &self.metadata
+    }
+    fn bind_parallel_topology(&mut self, topology: crate::backend::mlx::MlxParallelContext) {
+        self.topology = Some(topology);
+        self.architecture_mut().parallel_topology = Some(topology);
+    }
+    fn parallel_info(
+        &self,
+    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+        self.parallel_info.as_ref()
+    }
+    fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
+        match &self.runtime {
+            Gemma4Runtime::Resident(runtime) => runtime.policy().checkpoint_store(),
+            Gemma4Runtime::Layerwise(runtime) => runtime.policy().checkpoint_store(),
+        }
+    }
+    fn checkpoint_store_arc(&self) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
+        match &self.runtime {
+            Gemma4Runtime::Resident(runtime) => runtime.policy().checkpoint_store_arc(),
+            Gemma4Runtime::Layerwise(runtime) => runtime.policy().checkpoint_store_arc(),
+        }
+    }
+    fn residency_report(&self) -> Result<ResidencyReport, Error> {
+        match &self.runtime {
+            Gemma4Runtime::Resident(runtime) => runtime.policy().residency_report(),
+            Gemma4Runtime::Layerwise(runtime) => runtime.policy().residency_report(),
+        }
+    }
+    fn dense_stream_report(&self) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
+        match &self.runtime {
+            Gemma4Runtime::Resident(_) => Ok(None),
+            Gemma4Runtime::Layerwise(runtime) => runtime.policy().dense_stream_report(),
+        }
+    }
+    fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.adapter().prompt_cache_model_identity(self.topology)
+    }
+    fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        Ok(self.prompt_cache_model_identity()?.layer_layout)
+    }
+    fn prompt_cache_rank_identity(&self) -> Option<crate::core::cache::CacheRankIdentity> {
+        self.topology
+            .map(crate::backend::mlx::cache::prompt_cache_topology)
+            .and_then(|topology| topology.cache_rank_identity())
+    }
+    fn prompt_cache_directory(&self, root: &Path) -> std::path::PathBuf {
+        match self.topology {
+            Some(topology) => root.join(format!("rank-{:05}", topology.global_rank)),
+            None => root.to_path_buf(),
+        }
+    }
+    fn save_prompt_cache(
+        &self,
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(&descriptor, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        self.adapter().save_prompt_cache(
+            cache,
+            &self.prompt_cache_directory(destination.as_ref()),
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+    fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(expected, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        self.adapter().load_prompt_cache(
+            &self.prompt_cache_directory(directory.as_ref()),
+            expected,
+            &identity,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+    fn forward(
+        &mut self,
+        input: Gemma4Input<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match &mut self.runtime {
+            Gemma4Runtime::Resident(runtime) => runtime.forward(input, cache, stream),
+            Gemma4Runtime::Layerwise(runtime) => runtime.forward(input, cache, stream),
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))
+    }
+    fn forward_tensor_parallel(
+        &mut self,
+        input: Gemma4Input<'_>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match &mut self.runtime {
+            Gemma4Runtime::Resident(runtime) => {
+                runtime.forward_parallel(input, cache, group, stream)
+            }
+            Gemma4Runtime::Layerwise(runtime) => {
+                runtime.forward_parallel(input, cache, group, stream)
+            }
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))
+    }
+    fn forward_with_context_hook(
+        &mut self,
+        input: Gemma4Input<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+        hook: impl FnMut(usize, usize, &mut Gemma4ForwardContext) -> Result<(), Error>,
+    ) -> Result<(Array, Gemma4ForwardContext), Error> {
+        match &mut self.runtime {
+            Gemma4Runtime::Resident(runtime) => {
+                runtime.forward_with_context_hook(input, cache, stream, hook)
+            }
+            Gemma4Runtime::Layerwise(runtime) => {
+                runtime.forward_with_context_hook(input, cache, stream, hook)
+            }
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))
+    }
+    fn forward_with_layer_executor<E>(
+        &mut self,
+        input: Gemma4Input<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+        mut execute: E,
+    ) -> Result<Array, Error>
+    where
+        E: FnMut(
+            &mut Gemma4LayerwiseAdapter,
+            usize,
+            usize,
+            &mut Gemma4Layer,
+            &Array,
+            &mut Cache,
+            &mut Gemma4ForwardContext,
+            &Stream,
+        ) -> Result<Array, Error>,
+    {
+        let execute = |architecture: &mut Gemma4Architecture,
+                       group,
+                       index,
+                       unit: &mut Gemma4Unit,
+                       hidden: &Array,
+                       cache: &mut Cache,
+                       forward: &mut Gemma4ForwardContext,
+                       stream: &Stream| {
+            execute(
+                &mut architecture.adapter,
+                group,
+                index,
+                &mut **unit,
+                hidden,
+                cache,
+                forward,
+                stream,
+            )
+        };
+        match &mut self.runtime {
+            Gemma4Runtime::Resident(runtime) => {
+                runtime.forward_with_unit_executor(input, cache, stream, execute)
+            }
+            Gemma4Runtime::Layerwise(runtime) => {
+                runtime.forward_with_unit_executor(input, cache, stream, execute)
+            }
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))
+    }
+    fn forward_with_observer(
+        &mut self,
+        input: Gemma4Input<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+    ) -> Result<Array, Error> {
+        let mut observer =
+            crate::backend::mlx::runtime::execution::inspection::ActivationObserverProxy(observer);
+        self.forward_with_layer_executor(
+            input,
+            cache,
+            stream,
+            |adapter, group, index, layer, hidden, cache, context, stream| {
+                adapter.forward_layer_with_observer(
+                    group,
+                    index,
+                    layer,
+                    hidden,
+                    cache,
+                    context,
+                    stream,
+                    &mut observer,
+                )
+            },
+        )
+    }
+    fn forward_tensor_parallel_with_layer_executor<E>(
+        &mut self,
+        input: Gemma4Input<'_>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        mut execute: E,
+    ) -> Result<Array, Error>
+    where
+        E: FnMut(
+            &mut Gemma4LayerwiseAdapter,
+            usize,
+            usize,
+            &mut Gemma4Layer,
+            &Array,
+            &mut Cache,
+            &mut Gemma4ForwardContext,
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        ) -> Result<Array, Error>,
+    {
+        let topology = self.topology.ok_or_else(|| {
+            Error::Parallel("Gemma 4 parallel topology was not configured".into())
+        })?;
+        let execute = |architecture: &mut Gemma4Architecture,
+                       group_index,
+                       index,
+                       unit: &mut Gemma4Unit,
+                       hidden: &Array,
+                       cache: &mut Cache,
+                       forward: &mut Gemma4ForwardContext,
+                       group: &safemlx::distributed::Group,
+                       stream: &Stream| {
+            let context = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+            execute(
+                &mut architecture.adapter,
+                group_index,
+                index,
+                &mut **unit,
+                hidden,
+                cache,
+                forward,
+                &context,
+            )
+        };
+        match &mut self.runtime {
+            Gemma4Runtime::Resident(runtime) => {
+                runtime.forward_parallel_with_unit_executor(input, cache, group, stream, execute)
+            }
+            Gemma4Runtime::Layerwise(runtime) => {
+                runtime.forward_parallel_with_unit_executor(input, cache, group, stream, execute)
+            }
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))
+    }
+    fn clear_all_device_groups(&self) -> Result<(), Error> {
+        let graph = self.architecture().execution_graph()?;
+        for group in graph.groups() {
+            match &self.runtime {
+                Gemma4Runtime::Resident(runtime) => {
+                    runtime.policy().clear_device_group(group.id())?
+                }
+                Gemma4Runtime::Layerwise(runtime) => {
+                    runtime.policy().clear_device_group(group.id())?
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Gemma 4 multimodal model using bounded residency for media and text blocks.
 pub struct Gemma4LayerwiseModel {
-    execution: LayerwiseModel<Gemma4LayerwiseAdapter>,
+    execution: Gemma4Execution,
 }
 
 impl Gemma4LayerwiseModel {
@@ -581,7 +1278,12 @@ impl Gemma4LayerwiseModel {
 
     /// Creates an empty Gemma 4 generation cache.
     pub fn new_cache(&self) -> Cache {
-        let mut cache = Cache::new(self.args());
+        let mut cache = match self.execution.adapter().parallel_text_geometry.as_deref() {
+            Some(geometry) => Cache::new_with_geometry(self.args(), geometry)
+                .expect("validated Gemma 4 parallel cache geometry"),
+            None => Cache::new(self.args()),
+        };
+        cache.set_decoder_group(self.execution.adapter().pipeline_text_group());
         cache.rank = self.execution.prompt_cache_rank_identity();
         cache
     }
@@ -944,6 +1646,413 @@ impl CausalModel<Cache> for Gemma4LayerwiseModel {
     }
 }
 
+fn gemma4_execution_layout(adapter: &Gemma4LayerwiseAdapter) -> Result<ExecutionUnitLayout, Error> {
+    let graph = adapter.execution_graph()?;
+    let counts = (0..graph.groups().len())
+        .map(|group| adapter.layer_count(group))
+        .collect::<Result<Vec<_>, _>>()?;
+    ExecutionUnitLayout::new(&graph, counts).map_err(|error| Error::Parallel(error.to_string()))
+}
+
+fn gemma4_ordinal(
+    adapter: &Gemma4LayerwiseAdapter,
+    mut ordinal: usize,
+) -> Result<(usize, usize), Error> {
+    let graph = adapter.execution_graph()?;
+    for group in 0..graph.groups().len() {
+        let count = adapter.layer_count(group)?;
+        if ordinal < count {
+            return Ok((group, ordinal));
+        }
+        ordinal -= count;
+    }
+    Err(Error::Parallel(
+        "Gemma 4 unit ordinal is out of range".into(),
+    ))
+}
+
+fn gemma4_raw_unit(
+    adapter: &Gemma4LayerwiseAdapter,
+    ordinal: usize,
+    stream: &Stream,
+) -> Result<Gemma4Layer, Error> {
+    let (group, index) = gemma4_ordinal(adapter, ordinal)?;
+    adapter.new_layer(group, index, stream)
+}
+
+fn gemma4_raw_unit_bindings(
+    adapter: &Gemma4LayerwiseAdapter,
+    ordinal: usize,
+    unit: &Gemma4Layer,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    let (group, index) = gemma4_ordinal(adapter, ordinal)?;
+    adapter.layer_bindings(group, index, unit, store)
+}
+
+fn gemma4_unit_bindings(
+    adapter: &Gemma4LayerwiseAdapter,
+    ordinal: usize,
+    unit: &Gemma4Unit,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    gemma4_raw_unit_bindings(adapter, ordinal, unit, store)
+}
+
+fn replicated_gemma4_static(adapter: &Gemma4LayerwiseAdapter) -> Gemma4StaticModules {
+    Gemma4StaticModules::Replicated(Gemma4ReplicatedStatic {
+        embedding: adapter.embedding.clone(),
+        per_layer_embedding: adapter.per_layer_embedding.clone(),
+        per_layer_projection: adapter.per_layer_projection.clone(),
+        per_layer_norm: adapter.per_layer_norm.clone(),
+        norm: adapter.norm.clone(),
+        lm_head: adapter.lm_head.clone(),
+        vision: adapter.vision.clone(),
+        embed_vision: adapter.embed_vision.clone(),
+        audio: adapter.audio.clone(),
+        embed_audio: adapter.embed_audio.clone(),
+    })
+}
+
+fn gemma4_static_bindings(
+    adapter: &Gemma4LayerwiseAdapter,
+    modules: &Gemma4StaticModules,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    let Gemma4StaticModules::Replicated(modules) = modules else {
+        return Err(Error::Parallel(
+            "global Gemma 4 bindings require replicated static modules".into(),
+        ));
+    };
+    let qualify =
+        |prefix: &str, bindings: Vec<WeightBinding>| -> Result<Vec<WeightBinding>, Error> {
+            bindings
+                .into_iter()
+                .map(|binding| {
+                    let name = format!("{prefix}.{}", binding.name());
+                    binding.with_name(name).map_err(Into::into)
+                })
+                .collect()
+        };
+    let mut bindings = qualify(
+        "embedding",
+        adapter.bindings(
+            &modules.embedding,
+            "model.language_model.embed_tokens",
+            store,
+        )?,
+    )?;
+    if let Some(module) = &modules.per_layer_embedding {
+        bindings.extend(qualify(
+            "per_layer_embedding",
+            adapter.bindings(module, "model.language_model.embed_tokens_per_layer", store)?,
+        )?);
+    }
+    if let Some(module) = &modules.per_layer_projection {
+        bindings.extend(qualify(
+            "per_layer_projection",
+            adapter.bindings(
+                module,
+                "model.language_model.per_layer_model_projection",
+                store,
+            )?,
+        )?);
+    }
+    if let Some(module) = &modules.per_layer_norm {
+        bindings.extend(qualify(
+            "per_layer_norm",
+            adapter.bindings(
+                module,
+                "model.language_model.per_layer_projection_norm",
+                store,
+            )?,
+        )?);
+    }
+    bindings.extend(qualify(
+        "norm",
+        adapter.bindings(&modules.norm, "model.language_model.norm", store)?,
+    )?);
+    if let Some(module) = &modules.lm_head {
+        bindings.extend(qualify(
+            "lm_head",
+            adapter.bindings(module, "lm_head", store)?,
+        )?);
+    }
+    if let Some(module) = &modules.vision {
+        bindings.extend(qualify(
+            "vision",
+            adapter.bindings(module, "model.vision_tower", store)?,
+        )?);
+    }
+    if let Some(module) = &modules.embed_vision {
+        bindings.extend(qualify(
+            "embed_vision",
+            adapter.bindings(module, "model.embed_vision", store)?,
+        )?);
+    }
+    if let Some(module) = &modules.audio {
+        bindings.extend(qualify(
+            "audio",
+            adapter.bindings(module, "model.audio_tower", store)?,
+        )?);
+    }
+    if let Some(module) = &modules.embed_audio {
+        bindings.extend(qualify(
+            "embed_audio",
+            adapter.bindings(module, "model.embed_audio", store)?,
+        )?);
+    }
+    Ok(bindings)
+}
+
+fn fresh_gemma4_adapter(
+    source: &Gemma4LayerwiseAdapter,
+    stream: &Stream,
+) -> Result<Gemma4LayerwiseAdapter, Error> {
+    let mut adapter = Gemma4LayerwiseAdapter::new(
+        source.args.clone(),
+        source.vision_config.clone(),
+        source.image_token_id,
+        source.video_token_id,
+        source.audio_config.clone(),
+        source.audio_token_id,
+        stream,
+    )?;
+    adapter.external_experts = source.external_experts;
+    adapter.parallel_text_geometry = source.parallel_text_geometry.clone();
+    Ok(adapter)
+}
+
+fn resolve_gemma4_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    adapter: &Gemma4LayerwiseAdapter,
+) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
+    if store.is_checkpoint_contract_resolved()
+        || store.source_diagnostics()?.backend != WeightStoreBackend::Safetensors
+    {
+        return Ok(store);
+    }
+    let plan = adapter.safetensors_checkpoint_plan()?;
+    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
+        .map_err(|validation| {
+            Error::UnsupportedArchitecture(format!(
+                "Gemma 4 checkpoint contract did not resolve: {validation:?}"
+            ))
+        })?;
+    Ok(Arc::new(
+        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
+    ))
+}
+
+fn quantize_gemma4_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    source: &Gemma4LayerwiseAdapter,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<
+    (
+        Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        Gemma4LayerwiseAdapter,
+        eredu_runtime::WeightMaterializationReport,
+    ),
+    Error,
+> {
+    let target = source.load_time_quantized(quantization, stream)?;
+    let source_static = replicated_gemma4_static(source);
+    let target_static = replicated_gemma4_static(&target);
+    let source_units = fresh_gemma4_adapter(source, stream)?;
+    let target_units = fresh_gemma4_adapter(&target, stream)?;
+    let static_binding_adapter = fresh_gemma4_adapter(source, stream)?;
+    let unit_binding_adapter = fresh_gemma4_adapter(source, stream)?;
+    let unit_count = gemma4_execution_layout(source)?.len();
+    let (store, report) = quantize_module_store_with_bindings(
+        store,
+        &source_static,
+        &target_static,
+        move |ordinal, stream| gemma4_raw_unit(&source_units, ordinal, stream),
+        move |ordinal, stream| gemma4_raw_unit(&target_units, ordinal, stream),
+        unit_count,
+        quantization,
+        stream,
+        move |modules, store| gemma4_static_bindings(&static_binding_adapter, modules, store),
+        move |ordinal, unit, store| {
+            gemma4_raw_unit_bindings(&unit_binding_adapter, ordinal, unit, store)
+        },
+    )?;
+    Ok((store, target, report))
+}
+
+fn load_gemma4_with_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    adapter: Gemma4LayerwiseAdapter,
+    options: LayerWeightResidency,
+    quantization: Option<WeightQuantization>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Gemma4Execution, Error> {
+    let store = resolve_gemma4_store(store, &adapter)?;
+    let (store, adapter, materialization) = match quantization {
+        Some(quantization) => {
+            let (store, adapter, report) =
+                quantize_gemma4_store(store, &adapter, quantization, stream)?;
+            (store, adapter, Some(report))
+        }
+        None => (store, adapter, None),
+    };
+    let layout = gemma4_execution_layout(&adapter)?;
+    let factory = Gemma4UnitFactory {
+        adapter: fresh_gemma4_adapter(&adapter, stream)?,
+        parallel_layout: None,
+    };
+    let static_binding_adapter = fresh_gemma4_adapter(&adapter, stream)?;
+    let unit_binding_adapter = fresh_gemma4_adapter(&adapter, stream)?;
+    let sparse = adapter.external_experts;
+    let model_type = adapter.args.model_type.clone();
+    let checkpoint_quantization = adapter.args.weight_quantization();
+    let mut architecture = Gemma4Architecture::from_adapter(adapter)?;
+    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+        Arc::clone(&store),
+        architecture.static_modules_mut(),
+        factory,
+        layout,
+        options,
+        stream,
+        weights_stream,
+        move |key| sparse && key.contains(".experts."),
+        move |modules, store| gemma4_static_bindings(&static_binding_adapter, &**modules, store),
+        move |ordinal, unit, store, _| {
+            gemma4_unit_bindings(&unit_binding_adapter, ordinal, &unit, store)
+        },
+    )?;
+    metadata.set_model_type(model_type);
+    metadata.set_quantization(checkpoint_quantization);
+    metadata.set_materialization(materialization);
+    let runtime = if options.is_fully_resident() {
+        Gemma4Runtime::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        Gemma4Runtime::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok(Gemma4Execution {
+        runtime,
+        metadata,
+        parallel_info: None,
+        topology: None,
+    })
+}
+
+fn load_gemma4_parallel_with_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    mut adapter: Gemma4LayerwiseAdapter,
+    options: LayerWeightResidency,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Gemma4Execution, Error> {
+    let store = resolve_gemma4_store(store, &adapter)?;
+    let mut planner = build.planner();
+    adapter.register_parallel_parameters(build, &mut planner, stream)?;
+    let (_, local_layout) = planner.finish()?;
+    adapter.configure_parallel_static(build, &local_layout, stream)?;
+
+    let global_adapter = fresh_gemma4_adapter(&adapter, stream)?;
+    let global_static = replicated_gemma4_static(&global_adapter);
+    let static_bindings = gemma4_static_bindings(&global_adapter, &global_static, store.as_ref())?;
+    let mut global_parameter_bytes =
+        crate::backend::mlx::runtime::checkpoint::binding::binding_bytes(&static_bindings)?;
+    let unit_count = gemma4_execution_layout(&global_adapter)?.len();
+    for ordinal in 0..unit_count {
+        let unit = gemma4_raw_unit(&global_adapter, ordinal, stream)?;
+        global_parameter_bytes = global_parameter_bytes
+            .checked_add(
+                crate::backend::mlx::runtime::checkpoint::binding::binding_bytes(
+                    &gemma4_raw_unit_bindings(&global_adapter, ordinal, &unit, store.as_ref())?,
+                )?,
+            )
+            .ok_or_else(|| Error::Parallel("Gemma 4 global parameter bytes overflowed".into()))?;
+    }
+
+    let shared_layout = Arc::new(local_layout);
+    let mut factory_adapter = fresh_gemma4_adapter(&adapter, stream)?;
+    factory_adapter.configure_parallel_static(build, &shared_layout, stream)?;
+    let factory = Gemma4UnitFactory {
+        adapter: factory_adapter,
+        parallel_layout: Some(Arc::clone(&shared_layout)),
+    };
+    let static_layout = Arc::clone(&shared_layout);
+    let unit_layout = Arc::clone(&shared_layout);
+    let unit_binding_adapter = global_adapter;
+    let sparse = adapter.external_experts;
+    let model_type = adapter.args.model_type.clone();
+    let checkpoint_quantization = adapter.args.weight_quantization();
+    let layout = gemma4_execution_layout(&adapter)?;
+    let mut architecture = Gemma4Architecture::from_adapter(adapter)?;
+    architecture.parallel_topology = Some(build.topology());
+    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+        Arc::clone(&store),
+        architecture.static_modules_mut(),
+        factory,
+        layout,
+        options,
+        stream,
+        weights_stream,
+        move |key| sparse && key.contains(".experts."),
+        move |_, store| shard_layer_bindings(static_bindings, "", store, &static_layout),
+        move |ordinal, _local, store, stream| {
+            let global = gemma4_raw_unit(&unit_binding_adapter, ordinal, stream)?;
+            let (group, index) = gemma4_ordinal(&unit_binding_adapter, ordinal)?;
+            shard_layer_bindings(
+                unit_binding_adapter.layer_bindings(group, index, &global, store)?,
+                &unit_binding_adapter.layer_checkpoint_prefix(group, index),
+                store,
+                &unit_layout,
+            )
+        },
+    )?;
+    metadata.set_model_type(model_type.clone());
+    metadata.set_quantization(checkpoint_quantization);
+    let local_parameter_bytes = metadata
+        .static_device_bytes()
+        .checked_add(metadata.layer_parameter_bytes())
+        .ok_or_else(|| Error::Parallel("Gemma 4 local parameter bytes overflowed".into()))?;
+    let maximum_device_parameter_bytes = metadata
+        .static_device_bytes()
+        .checked_add(metadata.maximum_device_layer_bytes())
+        .ok_or_else(|| Error::Parallel("Gemma 4 device parameter bytes overflowed".into()))?;
+    let info = eredu_runtime::ParallelModelInfo::new(
+        build.topology(),
+        model_type,
+        shared_layout
+            .tensors()
+            .map(|(target, _)| target.to_string())
+            .collect(),
+        local_parameter_bytes,
+        global_parameter_bytes,
+        if options.is_fully_resident() {
+            local_parameter_bytes
+        } else {
+            metadata.static_device_bytes()
+        },
+        maximum_device_parameter_bytes,
+    );
+    let runtime = if options.is_fully_resident() {
+        Gemma4Runtime::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        Gemma4Runtime::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok(Gemma4Execution {
+        runtime,
+        metadata,
+        parallel_info: Some(info),
+        topology: Some(build.topology()),
+    })
+}
+
 /// Loads Gemma 4 text and configured media towers through generalized residency.
 pub fn load_gemma4_layerwise_model(
     model_dir: impl AsRef<Path>,
@@ -974,7 +2083,7 @@ pub fn load_gemma4_layerwise_model(
     )?;
     let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(Gemma4LayerwiseModel {
-        execution: load_layerwise_model_with_quantization(
+        execution: load_gemma4_with_store(
             store,
             adapter,
             options,
@@ -1025,7 +2134,7 @@ pub(crate) fn load_gemma4_tensor_parallel_layerwise_model(
         stream,
     )?;
     Ok(Gemma4LayerwiseModel {
-        execution: load_tensor_parallel_layerwise_model(
+        execution: load_gemma4_parallel_with_store(
             open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
@@ -1062,7 +2171,7 @@ pub(crate) fn load_gemma4_gguf_tensor_parallel_model(
         prepared.audio_config.as_ref(),
         options.max_mapped_shards(),
     )?;
-    let execution = load_tensor_parallel_layerwise_model(
+    let execution = load_gemma4_parallel_with_store(
         store,
         Gemma4LayerwiseAdapter::new(
             prepared.args,
@@ -1124,7 +2233,7 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
         }
         let mut adapter = adapter;
         adapter.external_experts = true;
-        let mut execution = load_layerwise_model_with_quantization(
+        let mut execution = load_gemma4_with_store(
             store,
             adapter,
             residency.layers(),
@@ -1153,7 +2262,7 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
         });
         return Ok((Gemma4LayerwiseModel { execution }, prepared.eos_token_ids));
     }
-    let execution = load_layerwise_model_with_quantization(
+    let execution = load_gemma4_with_store(
         store,
         adapter,
         residency.layers(),
@@ -1202,7 +2311,14 @@ pub(crate) fn load_gemma4_sparse_ep_base_with_store(
 ) -> Result<Gemma4LayerwiseModel, Error> {
     let adapter = Gemma4LayerwiseAdapter::new_external_experts(args, stream)?;
     Ok(Gemma4LayerwiseModel {
-        execution: load_layerwise_model(store, adapter, non_expert.into(), stream, weights_stream)?,
+        execution: load_gemma4_with_store(
+            store,
+            adapter,
+            non_expert.into(),
+            None,
+            stream,
+            weights_stream,
+        )?,
     })
 }
 
@@ -1217,7 +2333,7 @@ pub(crate) fn load_gemma4_sparse_tp_ep_base_with_store(
 ) -> Result<Gemma4LayerwiseModel, Error> {
     let adapter = Gemma4LayerwiseAdapter::new_external_experts(args, stream)?;
     Ok(Gemma4LayerwiseModel {
-        execution: load_tensor_parallel_layerwise_model(
+        execution: load_gemma4_parallel_with_store(
             store,
             adapter,
             non_expert.into(),
@@ -4684,3 +5800,32 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
 /// Gemma 4 token generation using bounded text-layer execution.
 pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     crate::backend::mlx::nn::generation::Generate<'a, Gemma4LayerwiseModel, Cache, S>;
+
+#[cfg(test)]
+mod neutral_runtime_tests {
+    #[test]
+    fn production_model_and_loaders_use_the_neutral_layerwise_runtime() {
+        let source = include_str!("layerwise.rs");
+        let wrapper_start = source
+            .find("pub struct Gemma4LayerwiseModel")
+            .expect("Gemma 4 production wrapper");
+        let adapter_start = source
+            .find("/// Adapter for Gemma 4 per-layer inputs")
+            .expect("pipeline-only legacy adapter marker");
+        let production = &source[wrapper_start..adapter_start];
+        assert!(production.contains("execution: Gemma4Execution"));
+        assert!(production.contains("load_gemma4_with_store("));
+        assert!(production.contains("load_gemma4_parallel_with_store("));
+        for legacy in [
+            "LayerwiseModel<",
+            "load_layerwise_model(",
+            "load_layerwise_model_with_quantization(",
+            "load_tensor_parallel_layerwise_model(",
+        ] {
+            assert!(
+                !production.contains(legacy),
+                "production Gemma 4 path still references {legacy}"
+            );
+        }
+    }
+}
