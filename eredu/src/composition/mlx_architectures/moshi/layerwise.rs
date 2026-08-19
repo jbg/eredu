@@ -1,11 +1,13 @@
 //! Bounded layer execution for Moshi and PersonaPlex realtime token models.
 
-use eredu_runtime::{LayerWeightResidency, StaticUnitBindings};
+use eredu_runtime::{
+    ExecutionGraph, ExecutionUnitLayout, LayerWeightResidency, LayeredArchitecture,
+    LayeredForwardState, LayerwiseRuntime, ParallelLayeredArchitecture, ResidencyReport,
+    ResidentLayerGroupReport, WeightBinding,
+};
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_runtime::WeightBinding;
-
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use safemlx::{
     error::Exception,
@@ -17,22 +19,26 @@ use safemlx::{
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::runtime::cache::KeyValueCache,
+    backend::mlx::nn::shared::{MlxBackend, MlxParameterTree},
     backend::mlx::runtime::checkpoint::artifact::LoadedArtifactIdentity,
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_binding_plan_with_recipes, build_module_bindings, populate_module_from_lease,
+        build_module_binding_plan_with_recipes, build_module_bindings,
     },
     backend::mlx::runtime::checkpoint::store::TensorSelection,
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
     },
-    backend::mlx::runtime::execution::layerwise::{
-        load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, ArchitectureAdapter, LayerwiseModel,
-        LoadTimeQuantizableAdapter,
+    backend::mlx::runtime::execution::{
+        generic::{
+            prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
+            MlxUnitFactory,
+        },
+        layerwise::{
+            open_safetensors_weight_store, quantize_module_store_with_bindings,
+            shard_layer_bindings,
+        },
     },
     backend::mlx::runtime::generation::sampler::Sampler,
-    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx::realtime::MlxRealtimeOutput,
     composition::mlx_architectures::moshi::model::{
         self as resident, DepFormerSlice, MoshiLayerwiseStatic, MoshiTransformerLayer,
@@ -40,16 +46,10 @@ use crate::{
     core::realtime::RealtimeSpeechConfig,
 };
 
-use eredu_runtime::ResidencyReport;
-
-use eredu_runtime::ResidentLayerGroupReport;
-
 pub use crate::composition::mlx_architectures::moshi::model::{
     GenerationState, GenerationStepWithLogits, ModelArgs, MoshiCache, SampleStepOutput,
     TokenStepOutput,
 };
-
-const STATIC_UNIT: &str = "moshi.static";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CheckpointLayout {
@@ -59,8 +59,87 @@ enum CheckpointLayout {
 
 /// Moshi-family model with independent temporal and depth-codebook residency windows.
 pub struct MoshiLayerwiseModel {
-    execution: LayerwiseModel<MoshiLayerwiseAdapter>,
+    execution: MoshiExecution,
     artifact_identity: LoadedArtifactIdentity,
+}
+
+type MoshiUnit = MlxParameterTree<MoshiExecutionUnit>;
+type MoshiStatic = MlxParameterTree<MoshiLayerwiseStatic>;
+type MoshiResidentRuntime =
+    LayerwiseRuntime<MoshiArchitecture, MlxBackend, MoshiCache, MlxResidentPolicy<MoshiUnit>>;
+type MoshiLayerwiseRuntime = LayerwiseRuntime<
+    MoshiArchitecture,
+    MlxBackend,
+    MoshiCache,
+    MlxLayerwisePolicy<MoshiUnit, MoshiUnitFactory>,
+>;
+
+enum MoshiExecution {
+    Resident(MoshiResidentRuntime),
+    Layerwise(MoshiLayerwiseRuntime),
+}
+
+impl MoshiExecution {
+    fn forward_with_context_hook<'a, H>(
+        &mut self,
+        input: MoshiLayerwiseInput<'a>,
+        cache: &mut MoshiCache,
+        stream: &Stream,
+        hook: H,
+    ) -> Result<(Array, MoshiForwardContext), eredu_runtime::LayerwiseRuntimeError<Error, Error>>
+    where
+        H: FnMut(usize, usize, &mut MoshiForwardContext) -> Result<(), Error>,
+    {
+        match self {
+            Self::Resident(execution) => {
+                execution.forward_with_context_hook(input, cache, stream, hook)
+            }
+            Self::Layerwise(execution) => {
+                execution.forward_with_context_hook(input, cache, stream, hook)
+            }
+        }
+    }
+
+    fn forward_parallel_with_context_hook<'a, H>(
+        &mut self,
+        input: MoshiLayerwiseInput<'a>,
+        cache: &mut MoshiCache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        hook: H,
+    ) -> Result<(Array, MoshiForwardContext), eredu_runtime::LayerwiseRuntimeError<Error, Error>>
+    where
+        H: FnMut(usize, usize, &mut MoshiForwardContext) -> Result<(), Error>,
+    {
+        match self {
+            Self::Resident(execution) => {
+                execution.forward_parallel_with_context_hook(input, cache, group, stream, hook)
+            }
+            Self::Layerwise(execution) => {
+                execution.forward_parallel_with_context_hook(input, cache, group, stream, hook)
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MoshiUnitFactory {
+    args: ModelArgs,
+    parallel_layout: Option<Arc<eredu_runtime::LocalModelLayout>>,
+}
+
+impl MlxUnitFactory<MoshiUnit> for MoshiUnitFactory {
+    fn build(&mut self, ordinal: usize, stream: &Stream) -> Result<MoshiUnit, Error> {
+        let (group, index) = moshi_unit_address(&self.args, ordinal)?;
+        let unit = build_moshi_unit(
+            &self.args,
+            group,
+            index,
+            self.parallel_layout.as_deref(),
+            stream,
+        )?;
+        MlxParameterTree::new(unit, "").map_err(|error| Error::Parallel(error.to_string()))
+    }
 }
 
 impl MoshiLayerwiseModel {
@@ -75,7 +154,10 @@ impl MoshiLayerwiseModel {
 
     /// Returns the parsed Moshi-family configuration.
     pub fn args(&self) -> &ModelArgs {
-        self.execution.adapter().args()
+        match &self.execution {
+            MoshiExecution::Resident(execution) => execution.architecture().args(),
+            MoshiExecution::Layerwise(execution) => execution.architecture().args(),
+        }
     }
 
     /// Allocates empty temporal and within-frame depth caches.
@@ -103,37 +185,44 @@ impl MoshiLayerwiseModel {
 
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
-        self.execution.residency_report()
+        match &self.execution {
+            MoshiExecution::Resident(execution) => execution.policy().residency_report(),
+            MoshiExecution::Layerwise(execution) => execution.policy().residency_report(),
+        }
     }
 
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
     ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
-        self.execution.dense_stream_report()
+        match &self.execution {
+            MoshiExecution::Resident(_) => Ok(None),
+            MoshiExecution::Layerwise(execution) => execution.policy().dense_stream_report(),
+        }
     }
 
     /// Returns residency attributed to the temporal and depth execution groups.
     pub fn execution_group_reports(&self) -> Result<Vec<ResidentLayerGroupReport>, Error> {
-        self.execution
-            .execution_groups()
-            .iter()
-            .map(|group| {
-                group
-                    .report(self.execution.residency_manager())
-                    .map_err(Error::from)
-            })
-            .collect()
+        match &self.execution {
+            MoshiExecution::Resident(execution) => execution.policy().execution_group_reports(),
+            MoshiExecution::Layerwise(execution) => execution.policy().execution_group_reports(),
+        }
     }
 
     /// Clears one temporary execution group without affecting the other group.
     pub fn clear_device_group(&self, group: &str) -> Result<(), Error> {
-        self.execution.clear_device_group(group)
+        match &self.execution {
+            MoshiExecution::Resident(execution) => execution.policy().clear_device_group(group),
+            MoshiExecution::Layerwise(execution) => execution.policy().clear_device_group(group),
+        }
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
-        self.execution.checkpoint_store()
+    pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
+        match &self.execution {
+            MoshiExecution::Resident(execution) => execution.policy().checkpoint_store(),
+            MoshiExecution::Layerwise(execution) => execution.policy().checkpoint_store(),
+        }
     }
 
     /// Runs one frame with teacher-forced depth inputs.
@@ -173,7 +262,7 @@ impl MoshiLayerwiseModel {
     ) -> Result<TokenStepOutput, Exception> {
         let (_, context) = self
             .execution
-            .forward_tensor_parallel_with_context_hook(
+            .forward_parallel_with_context_hook(
                 MoshiLayerwiseInput::TeacherForced {
                     text_token,
                     audio_tokens,
@@ -243,7 +332,7 @@ impl MoshiLayerwiseModel {
         }
         let (_, context) = self
             .execution
-            .forward_tensor_parallel_with_context_hook(
+            .forward_parallel_with_context_hook(
                 MoshiLayerwiseInput::Autoregressive {
                     text_token,
                     audio_tokens,
@@ -965,18 +1054,15 @@ pub(crate) fn load_moshi_tensor_parallel_layerwise_model(
     let args = resident::get_model_args(model_dir)?;
     let source = super::checkpoint::source_path(model_dir, &args);
     super::checkpoint::validate_safetensors_path(&source, &args)?;
-    let adapter = MoshiLayerwiseAdapter::new(args, CheckpointLayout::Native, stream)?;
-    Ok(MoshiLayerwiseModel {
-        execution: load_tensor_parallel_layerwise_model(
-            open_safetensors_weight_store(&source, options.max_mapped_shards())?,
-            adapter,
-            options,
-            build,
-            stream,
-            weights_stream,
-        )?,
-        artifact_identity: LoadedArtifactIdentity::in_memory(),
-    })
+    load_parallel_with_layout(
+        open_safetensors_weight_store(&source, options.max_mapped_shards())?,
+        args,
+        CheckpointLayout::Native,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )
 }
 
 /// Loads the released PersonaPlex PyTorch checkpoint through bounded layer residency.
@@ -1039,18 +1125,15 @@ pub fn load_personaplex_tensor_parallel_layerwise_model(
         crate::composition::mlx_architectures::moshi::personaplex::get_model_metadata(model_dir)?;
     let mut args = crate::composition::mlx_architectures::moshi::personaplex::model_args_7b_v1();
     args.quantization = metadata.quantization;
-    let adapter = MoshiLayerwiseAdapter::new(args, CheckpointLayout::Pytorch, stream)?;
-    Ok(MoshiLayerwiseModel {
-        execution: load_tensor_parallel_layerwise_model(
-            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
-            adapter,
-            options,
-            build,
-            stream,
-            weights_stream,
-        )?,
-        artifact_identity: LoadedArtifactIdentity::in_memory(),
-    })
+    load_parallel_with_layout(
+        open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
+        args,
+        CheckpointLayout::Pytorch,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )
 }
 
 fn load_with_layout(
@@ -1071,31 +1154,218 @@ fn load_with_layout(
         })
         .transpose()?
         .flatten();
-    let adapter = MoshiLayerwiseAdapter::new(args, layout, stream)?;
     let store = open_safetensors_weight_store(source, options.max_mapped_shards())?;
+    let store = resolve_moshi_store(store, &args, layout)?;
+    let (store, args) = match quantize_on_load {
+        Some(quantization) => quantize_moshi_store(store, &args, layout, quantization, stream)?,
+        None => (store, args),
+    };
+    let mut architecture = MoshiArchitecture::new(args.clone(), stream)?;
+    let unit_layout = moshi_execution_layout(&args)?;
+    let factory = MoshiUnitFactory {
+        args,
+        parallel_layout: None,
+    };
+    let binding_layout = layout;
+    let binding_args = architecture.args.clone();
+    let (policy, _) = prepare_layerwise_policy_with_bindings(
+        Arc::clone(&store),
+        architecture.static_modules_mut(),
+        factory,
+        unit_layout,
+        options,
+        stream,
+        weights_stream,
+        |_| false,
+        move |modules, store| moshi_static_bindings(binding_layout, modules, store),
+        move |ordinal, unit, store, _| {
+            let (group, index) = moshi_unit_address(&binding_args, ordinal)?;
+            moshi_unit_bindings(binding_layout, &binding_args, group, index, &unit, store)
+        },
+    )?;
+    let execution = if options.is_fully_resident() {
+        MoshiExecution::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        MoshiExecution::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
     Ok(MoshiLayerwiseModel {
-        execution: load_layerwise_model_with_quantization(
-            store,
-            adapter,
-            options,
-            quantize_on_load,
-            stream,
-            weights_stream,
-        )?,
+        execution,
         artifact_identity: LoadedArtifactIdentity::in_memory(),
     })
 }
 
-impl LoadTimeQuantizableAdapter for MoshiLayerwiseAdapter {
-    fn load_time_quantized(
-        &self,
-        quantization: WeightQuantization,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let mut args = self.args.clone();
-        args.quantization = Some(quantization);
-        Self::new(args, self.layout, stream)
+fn load_parallel_with_layout(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    args: ModelArgs,
+    checkpoint_layout: CheckpointLayout,
+    options: LayerWeightResidency,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MoshiLayerwiseModel, Error> {
+    let store = resolve_moshi_store(store, &args, checkpoint_layout)?;
+    let mut architecture = MoshiArchitecture::new(args.clone(), stream)?;
+    let mut planner = build.planner();
+    for group in architecture.parallel_parameter_groups(build)? {
+        planner.register(group)?;
     }
+    let (_, local_layout) = planner.finish()?;
+    if local_layout.is_empty() {
+        return Err(Error::Parallel(
+            "Moshi declared no tensor-parallel parameters".into(),
+        ));
+    }
+    architecture.configure_parallel_static(build, &local_layout, stream)?;
+
+    let global_static = MoshiLayerwiseStatic::new(&args, stream)?;
+    let global_static = MlxParameterTree::new(global_static, "")
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let static_bindings = moshi_static_bindings(checkpoint_layout, &global_static, store.as_ref())?;
+    let unit_layout = moshi_execution_layout(&args)?;
+    let shared_layout = Arc::new(local_layout);
+    let factory = MoshiUnitFactory {
+        args: args.clone(),
+        parallel_layout: Some(Arc::clone(&shared_layout)),
+    };
+    let binding_args = args.clone();
+    let binding_local_layout = Arc::clone(&shared_layout);
+    let (policy, _) = prepare_layerwise_policy_with_bindings(
+        Arc::clone(&store),
+        architecture.static_modules_mut(),
+        factory,
+        unit_layout,
+        options,
+        stream,
+        weights_stream,
+        |_| false,
+        move |_, store| shard_layer_bindings(static_bindings, "", store, &shared_layout),
+        move |ordinal, _local, store, stream| {
+            let (group, index) = moshi_unit_address(&binding_args, ordinal)?;
+            let global = build_moshi_unit(&binding_args, group, index, None, stream)?;
+            let global = MlxParameterTree::new(global, "")
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            let bindings = moshi_unit_bindings(
+                checkpoint_layout,
+                &binding_args,
+                group,
+                index,
+                &global,
+                store,
+            )?;
+            shard_layer_bindings(
+                bindings,
+                &moshi_unit_prefix(group, index),
+                store,
+                &binding_local_layout,
+            )
+        },
+    )?;
+    let execution = if options.is_fully_resident() {
+        MoshiExecution::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        MoshiExecution::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok(MoshiLayerwiseModel {
+        execution,
+        artifact_identity: LoadedArtifactIdentity::in_memory(),
+    })
+}
+
+fn resolve_moshi_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    args: &ModelArgs,
+    layout: CheckpointLayout,
+) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
+    if store.is_checkpoint_contract_resolved()
+        || store.source_diagnostics()?.backend
+            != eredu_checkpoint::store::WeightStoreBackend::Safetensors
+    {
+        return Ok(store);
+    }
+    let plan = match layout {
+        CheckpointLayout::Native => super::checkpoint::safetensors_plan(args)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+        CheckpointLayout::Pytorch => super::personaplex_checkpoint::safetensors_plan(args)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+    };
+    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
+        .map_err(|validation| {
+            Error::UnsupportedArchitecture(format!(
+                "Moshi checkpoint contract did not resolve: {validation:?}"
+            ))
+        })?;
+    Ok(Arc::new(
+        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
+    ))
+}
+
+fn quantize_moshi_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    source_args: &ModelArgs,
+    layout: CheckpointLayout,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<
+    (
+        Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        ModelArgs,
+    ),
+    Error,
+> {
+    let mut target_args = source_args.clone();
+    target_args.quantization = Some(quantization);
+    let source_static = MoshiLayerwiseStatic::new(source_args, stream)?;
+    let target_static = MoshiLayerwiseStatic::new(&target_args, stream)?;
+    let source_units = source_args.clone();
+    let target_units = target_args.clone();
+    let binding_args = source_args.clone();
+    let count = usize::try_from(source_args.num_layers + source_args.dep_q)
+        .map_err(|_| Error::UnsupportedArchitecture("invalid Moshi unit count".into()))?;
+    let (store, _) = quantize_module_store_with_bindings(
+        store,
+        &source_static,
+        &target_static,
+        move |ordinal, stream| {
+            let (group, index) = moshi_unit_address(&source_units, ordinal)?;
+            build_moshi_unit(&source_units, group, index, None, stream)
+        },
+        move |ordinal, stream| {
+            let (group, index) = moshi_unit_address(&target_units, ordinal)?;
+            build_moshi_unit(&target_units, group, index, None, stream)
+        },
+        count,
+        quantization,
+        stream,
+        move |module, store| match layout {
+            CheckpointLayout::Native => Ok(build_module_bindings(module, "", store)?),
+            CheckpointLayout::Pytorch => pytorch_static_bindings(module, store),
+        },
+        move |ordinal, module, store| {
+            let (group, index) = moshi_unit_address(&binding_args, ordinal)?;
+            match layout {
+                CheckpointLayout::Native => Ok(build_module_bindings(
+                    module,
+                    &moshi_unit_prefix(group, index),
+                    store,
+                )?),
+                CheckpointLayout::Pytorch => pytorch_layer_bindings(
+                    module,
+                    &moshi_unit_prefix(group, index),
+                    group,
+                    index,
+                    binding_args.dep_q as usize,
+                    store,
+                ),
+            }
+        },
+    )?;
+    Ok((store, target_args))
 }
 
 /// Family-specific input for teacher-forced or autoregressive depth execution.
@@ -1206,19 +1476,19 @@ impl ModuleParameters for MoshiExecutionUnit {
     }
 }
 
-/// Shared adapter for native Moshi and released PersonaPlex layouts.
-pub(crate) struct MoshiLayerwiseAdapter {
+/// Neutral layered composition for native Moshi and released PersonaPlex layouts.
+pub(crate) struct MoshiArchitecture {
     args: ModelArgs,
-    layout: CheckpointLayout,
-    static_modules: MoshiLayerwiseStatic,
+    static_modules: MoshiStatic,
 }
 
-impl MoshiLayerwiseAdapter {
-    fn new(args: ModelArgs, layout: CheckpointLayout, stream: &Stream) -> Result<Self, Error> {
+impl MoshiArchitecture {
+    fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        let static_modules = MoshiLayerwiseStatic::new(&args, stream)?;
         Ok(Self {
-            static_modules: MoshiLayerwiseStatic::new(&args, stream)?,
+            static_modules: MlxParameterTree::new(static_modules, "")
+                .map_err(|error| Error::Parallel(error.to_string()))?,
             args,
-            layout,
         })
     }
 
@@ -1228,235 +1498,253 @@ impl MoshiLayerwiseAdapter {
     }
 }
 
-impl ArchitectureAdapter for MoshiLayerwiseAdapter {
-    type Input<'a> = MoshiLayerwiseInput<'a>;
-    type Cache = MoshiCache;
-    type Layer = MoshiExecutionUnit;
-    type ForwardContext = MoshiForwardContext;
+fn moshi_execution_layout(args: &ModelArgs) -> Result<ExecutionUnitLayout, Error> {
+    let graph = ExecutionGraph::chain(["temporal_transformer", "depth_codebook_slices"])
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    ExecutionUnitLayout::new(&graph, [args.num_layers as usize, args.dep_q as usize])
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
 
-    fn safetensors_checkpoint_plan(
-        &self,
-    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
-        match self.layout {
-            CheckpointLayout::Native => super::checkpoint::safetensors_plan(&self.args)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
-            CheckpointLayout::Pytorch => {
-                super::personaplex_checkpoint::safetensors_plan(&self.args)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+fn moshi_unit_address(args: &ModelArgs, ordinal: usize) -> Result<(usize, usize), Error> {
+    let temporal = args.num_layers as usize;
+    if ordinal < temporal {
+        return Ok((0, ordinal));
+    }
+    let depth = ordinal - temporal;
+    if depth < args.dep_q as usize {
+        return Ok((1, depth));
+    }
+    Err(Error::UnsupportedArchitecture(format!(
+        "Moshi execution unit {ordinal} is outside {} units",
+        temporal + args.dep_q as usize
+    )))
+}
+
+fn moshi_unit_prefix(group: usize, index: usize) -> String {
+    if group == 0 {
+        format!("transformer.layers.{index}")
+    } else {
+        format!("depformer.slices.{index}")
+    }
+}
+
+fn build_moshi_unit(
+    args: &ModelArgs,
+    group: usize,
+    index: usize,
+    parallel_layout: Option<&eredu_runtime::LocalModelLayout>,
+    stream: &Stream,
+) -> Result<MoshiExecutionUnit, Error> {
+    let Some(layout) = parallel_layout else {
+        return match group {
+            0 => Ok(MoshiExecutionUnit::Temporal(Box::new(
+                MoshiTransformerLayer::new_temporal(args, stream)?,
+            ))),
+            1 => Ok(MoshiExecutionUnit::Depth(Box::new(
+                DepFormerSlice::new_for_index(args, index, stream)?,
+            ))),
+            _ => Err(Error::UnsupportedArchitecture(format!(
+                "Moshi has no execution group {group}"
+            ))),
+        };
+    };
+    let (prefix, dim, heads, feed_forward) = match group {
+        0 => (
+            format!("transformer.layers.{index}"),
+            args.dim,
+            args.num_heads,
+            args.dim_feedforward.unwrap_or(4 * args.dim),
+        ),
+        1 => (
+            format!("depformer.slices.{index}.transformer.layers.0"),
+            args.depformer_dim,
+            args.depformer_num_heads,
+            args.depformer_dim_feedforward
+                .unwrap_or(4 * args.depformer_dim),
+        ),
+        _ => {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Moshi has no execution group {group}"
+            )))
+        }
+    };
+    let local_qkv = layout
+        .tensor(&format!("{prefix}.self_attn.in_proj.weight"))
+        .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} attention")))?
+        .local_shape()[0];
+    let local_in = layout
+        .tensor(&format!("{prefix}.gating.linear_in.weight"))
+        .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} MLP")))?
+        .local_shape()[0];
+    let head_dim = dim / heads;
+    let local_heads = i32::try_from(local_qkv / 3)
+        .map_err(|_| Error::Parallel("Moshi local attention width exceeds i32".into()))?
+        / head_dim;
+    let global_hidden = if feed_forward == 4 * dim {
+        11 * dim / 4
+    } else {
+        2 * feed_forward / 3
+    };
+    let local_hidden = i32::try_from(local_in / 2)
+        .map_err(|_| Error::Parallel("Moshi local MLP width exceeds i32".into()))?;
+    if local_hidden > global_hidden {
+        return Err(Error::Parallel(format!(
+            "Moshi local MLP width {local_hidden} exceeds global width {global_hidden}"
+        )));
+    }
+    match group {
+        0 => Ok(MoshiExecutionUnit::Temporal(Box::new(
+            MoshiTransformerLayer::new_temporal_tensor_parallel(
+                args,
+                local_heads,
+                local_hidden,
+                stream,
+            )?,
+        ))),
+        1 => Ok(MoshiExecutionUnit::Depth(Box::new(
+            DepFormerSlice::new_for_index_tensor_parallel(
+                args,
+                index,
+                local_heads,
+                local_hidden,
+                stream,
+            )?,
+        ))),
+        _ => unreachable!("validated Moshi execution group"),
+    }
+}
+
+fn moshi_static_bindings(
+    layout: CheckpointLayout,
+    module: &MoshiStatic,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    match layout {
+        CheckpointLayout::Native => Ok(build_module_bindings(&**module, "", store)?),
+        CheckpointLayout::Pytorch => pytorch_static_bindings(&**module, store),
+    }
+}
+
+fn moshi_unit_bindings(
+    layout: CheckpointLayout,
+    args: &ModelArgs,
+    group: usize,
+    index: usize,
+    unit: &MoshiUnit,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    match layout {
+        CheckpointLayout::Native => Ok(build_module_bindings(
+            &**unit,
+            &moshi_unit_prefix(group, index),
+            store,
+        )?),
+        CheckpointLayout::Pytorch => pytorch_layer_bindings(
+            &**unit,
+            &moshi_unit_prefix(group, index),
+            group,
+            index,
+            args.dep_q as usize,
+            store,
+        ),
+    }
+}
+
+fn begin_moshi_forward<'a>(
+    architecture: &mut MoshiArchitecture,
+    input: MoshiLayerwiseInput<'a>,
+    cache: &mut MoshiCache,
+    parallel: Option<&safemlx::distributed::Group>,
+    stream: &Stream,
+) -> Result<LayeredForwardState<Array, MoshiForwardContext>, Error> {
+    if cache.temporal.len() != architecture.args.num_layers as usize
+        || cache.depth.len() != architecture.args.depformer_num_layers as usize
+    {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Moshi cache has {} temporal and {} depth layers; expected {} and {}",
+            cache.temporal.len(),
+            cache.depth.len(),
+            architecture.args.num_layers,
+            architecture.args.depformer_num_layers
+        )));
+    }
+    let (text, audio, depth, forced_text, forced_audio, forced_mask, autoregressive) = match input {
+        MoshiLayerwiseInput::TeacherForced {
+            text_token,
+            audio_tokens,
+            depth_tokens,
+        } => {
+            if depth_tokens.shape().len() != 2
+                || depth_tokens.dim(0) != text_token.dim(0)
+                || depth_tokens.dim(1) != architecture.args.dep_q
+            {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Moshi depth input must have shape [batch, {}]",
+                    architecture.args.dep_q
+                )));
             }
+            (
+                text_token,
+                audio_tokens,
+                Some(depth_tokens.clone()),
+                None,
+                None,
+                None,
+                false,
+            )
         }
-    }
-
-    fn static_units(
-        &self,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let bindings = match self.layout {
-            CheckpointLayout::Native => build_module_bindings(&self.static_modules, "", store)?,
-            CheckpointLayout::Pytorch => pytorch_static_bindings(&self.static_modules, store)?,
-        };
-        Ok(vec![StaticUnitBindings::new(STATIC_UNIT, bindings)?])
-    }
-
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        if leases.len() != 1 {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Moshi adapter received {} static leases, expected 1",
-                leases.len()
-            )));
-        }
-        Ok(populate_module_from_lease(
-            &mut self.static_modules,
-            &leases[0],
-        )?)
-    }
-
-    fn validate_cache(&self, cache: &mut MoshiCache) -> Result<(), Error> {
-        if cache.temporal.len() != self.args.num_layers as usize
-            || cache.depth.len() != self.args.depformer_num_layers as usize
-        {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Moshi cache has {} temporal and {} depth layers; expected {} and {}",
-                cache.temporal.len(),
-                cache.depth.len(),
-                self.args.num_layers,
-                self.args.depformer_num_layers
-            )));
-        }
-        Ok(())
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        let (text, audio, depth, forced_text, forced_audio, forced_mask, autoregressive) =
-            match input {
-                MoshiLayerwiseInput::TeacherForced {
-                    text_token,
-                    audio_tokens,
-                    depth_tokens,
-                } => {
-                    if depth_tokens.shape().len() != 2
-                        || depth_tokens.dim(0) != text_token.dim(0)
-                        || depth_tokens.dim(1) != self.args.dep_q
-                    {
-                        return Err(Error::UnsupportedArchitecture(format!(
-                            "Moshi depth input must have shape [batch, {}]",
-                            self.args.dep_q
-                        )));
-                    }
-                    (
-                        text_token,
-                        audio_tokens,
-                        Some(depth_tokens.clone()),
-                        None,
-                        None,
-                        None,
-                        false,
-                    )
-                }
-                MoshiLayerwiseInput::Autoregressive {
-                    text_token,
-                    audio_tokens,
-                    forced_text_token,
-                    forced_audio_tokens,
-                    forced_audio_codebooks,
-                } => (
-                    text_token,
-                    audio_tokens,
-                    None,
-                    forced_text_token.cloned(),
-                    forced_audio_tokens.cloned(),
-                    forced_audio_codebooks.map(ToOwned::to_owned),
-                    true,
-                ),
-            };
-        cache.reset_depth();
-        let hidden = self
-            .static_modules
-            .temporal_input(&self.args, text, audio, stream)?;
-        Ok(eredu_runtime::LayeredForwardState {
-            context: MoshiForwardContext {
-                temporal_input: hidden.clone(),
-                temporal_output: None,
-                text_logits: None,
-                audio_logits: Vec::with_capacity(self.args.dep_q as usize),
-                depth_tokens: depth,
-                previous: None,
-                sampled_text: None,
-                predicted_audio: Vec::with_capacity(self.args.dep_q as usize),
-                current_audio_logits: None,
-                forced_text_token: forced_text,
-                forced_audio_tokens: forced_audio,
-                forced_audio_codebooks: forced_mask,
-                autoregressive,
-            },
-            hidden,
-        })
-    }
-
-    fn begin_forward_with_execution<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        let Some(group) = execution.group() else {
-            return self.begin_forward(input, cache, execution.stream());
-        };
-        let (text, audio, depth, forced_text, forced_audio, forced_mask, autoregressive) =
-            match input {
-                MoshiLayerwiseInput::TeacherForced {
-                    text_token,
-                    audio_tokens,
-                    depth_tokens,
-                } => (
-                    text_token,
-                    audio_tokens,
-                    Some(depth_tokens.clone()),
-                    None,
-                    None,
-                    None,
-                    false,
-                ),
-                MoshiLayerwiseInput::Autoregressive {
-                    text_token,
-                    audio_tokens,
-                    forced_text_token,
-                    forced_audio_tokens,
-                    forced_audio_codebooks,
-                } => (
-                    text_token,
-                    audio_tokens,
-                    None,
-                    forced_text_token.cloned(),
-                    forced_audio_tokens.cloned(),
-                    forced_audio_codebooks.map(ToOwned::to_owned),
-                    true,
-                ),
-            };
-        cache.reset_depth();
-        let hidden = self.static_modules.temporal_input_tensor_parallel(
-            &self.args,
+        MoshiLayerwiseInput::Autoregressive {
+            text_token,
+            audio_tokens,
+            forced_text_token,
+            forced_audio_tokens,
+            forced_audio_codebooks,
+        } => (
+            text_token,
+            audio_tokens,
+            None,
+            forced_text_token.cloned(),
+            forced_audio_tokens.cloned(),
+            forced_audio_codebooks.map(ToOwned::to_owned),
+            true,
+        ),
+    };
+    cache.reset_depth();
+    let hidden = match parallel {
+        Some(group) => architecture.static_modules.temporal_input_tensor_parallel(
+            &architecture.args,
             text,
             audio,
             group,
-            execution.stream(),
-        )?;
-        Ok(eredu_runtime::LayeredForwardState {
-            context: MoshiForwardContext {
-                temporal_input: hidden.clone(),
-                temporal_output: None,
-                text_logits: None,
-                audio_logits: Vec::with_capacity(self.args.dep_q as usize),
-                depth_tokens: depth,
-                previous: None,
-                sampled_text: None,
-                predicted_audio: Vec::with_capacity(self.args.dep_q as usize),
-                current_audio_logits: None,
-                forced_text_token: forced_text,
-                forced_audio_tokens: forced_audio,
-                forced_audio_codebooks: forced_mask,
-                autoregressive,
-            },
-            hidden,
-        })
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        eredu_runtime::ExecutionGraph::chain(["temporal_transformer", "depth_codebook_slices"])
-            .map_err(Into::into)
-    }
-
-    fn layer_count(&self, group: usize) -> Result<usize, Error> {
-        match group {
-            0 => Ok(self.args.num_layers as usize),
-            1 => Ok(self.args.dep_q as usize),
-            _ => Err(Error::UnsupportedArchitecture(format!(
-                "Moshi has no execution group {group}"
-            ))),
+            stream,
+        )?,
+        None => {
+            architecture
+                .static_modules
+                .temporal_input(&architecture.args, text, audio, stream)?
         }
-    }
+    };
+    Ok(LayeredForwardState {
+        context: MoshiForwardContext {
+            temporal_input: hidden.clone(),
+            temporal_output: None,
+            text_logits: None,
+            audio_logits: Vec::with_capacity(architecture.args.dep_q as usize),
+            depth_tokens: depth,
+            previous: None,
+            sampled_text: None,
+            predicted_audio: Vec::with_capacity(architecture.args.dep_q as usize),
+            current_audio_logits: None,
+            forced_text_token: forced_text,
+            forced_audio_tokens: forced_audio,
+            forced_audio_codebooks: forced_mask,
+            autoregressive,
+        },
+        hidden,
+    })
+}
 
-    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
-        match group {
-            0 => Ok(MoshiExecutionUnit::Temporal(Box::new(
-                MoshiTransformerLayer::new_temporal(&self.args, stream)?,
-            ))),
-            1 => Ok(MoshiExecutionUnit::Depth(Box::new(
-                DepFormerSlice::new_for_index(&self.args, index, stream)?,
-            ))),
-            _ => Err(Error::UnsupportedArchitecture(format!(
-                "Moshi has no execution group {group}"
-            ))),
-        }
-    }
-
+impl MoshiArchitecture {
     fn parallel_parameter_groups(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
@@ -1640,143 +1928,101 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         _layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
-        self.static_modules =
+        let modules =
             MoshiLayerwiseStatic::new_tensor_parallel(&self.args, context.topology(), stream)?;
+        self.static_modules = MlxParameterTree::new(modules, "")
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok(())
     }
+}
 
-    fn new_parallel_layer(
-        &self,
-        group: usize,
-        index: usize,
-        layout: &eredu_runtime::LocalModelLayout,
-        stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
-        let (prefix, dim, heads, feed_forward) = if group == 0 {
-            (
-                format!("transformer.layers.{index}"),
-                self.args.dim,
-                self.args.num_heads,
-                self.args.dim_feedforward.unwrap_or(4 * self.args.dim),
-            )
-        } else {
-            (
-                format!("depformer.slices.{index}.transformer.layers.0"),
-                self.args.depformer_dim,
-                self.args.depformer_num_heads,
-                self.args
-                    .depformer_dim_feedforward
-                    .unwrap_or(4 * self.args.depformer_dim),
-            )
-        };
-        let local_qkv = layout
-            .tensor(&format!("{prefix}.self_attn.in_proj.weight"))
-            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} attention")))?
-            .local_shape()[0];
-        let local_in = layout
-            .tensor(&format!("{prefix}.gating.linear_in.weight"))
-            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} MLP")))?
-            .local_shape()[0];
-        let head_dim = dim / heads;
-        let local_heads = i32::try_from(local_qkv / 3)
-            .map_err(|_| Error::Parallel("Moshi local attention width exceeds i32".into()))?
-            / head_dim;
-        let global_hidden = if feed_forward == 4 * dim {
-            11 * dim / 4
-        } else {
-            2 * feed_forward / 3
-        };
-        let _ = global_hidden;
-        let local_hidden = i32::try_from(local_in / 2)
-            .map_err(|_| Error::Parallel("Moshi local MLP width exceeds i32".into()))?;
+impl LayeredArchitecture<MlxBackend, MoshiCache> for MoshiArchitecture {
+    type Input<'a> = MoshiLayerwiseInput<'a>;
+    type StaticModules = MoshiStatic;
+    type Unit = MoshiUnit;
+    type ForwardContext = MoshiForwardContext;
+    type RetainedContextValues<'a> = std::vec::IntoIter<&'a Array>;
+    type Error = Error;
+
+    fn model_identity(&self) -> &str {
+        "moshi"
+    }
+
+    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
+        ExecutionGraph::chain(["temporal_transformer", "depth_codebook_slices"]).map_err(Into::into)
+    }
+
+    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
         match group {
-            0 => Ok(MoshiExecutionUnit::Temporal(Box::new(
-                MoshiTransformerLayer::new_temporal_tensor_parallel(
-                    &self.args,
-                    local_heads,
-                    local_hidden,
-                    stream,
-                )?,
-            ))),
-            1 => Ok(MoshiExecutionUnit::Depth(Box::new(
-                DepFormerSlice::new_for_index_tensor_parallel(
-                    &self.args,
-                    index,
-                    local_heads,
-                    local_hidden,
-                    stream,
-                )?,
-            ))),
+            0 => Ok(self.args.num_layers as usize),
+            1 => Ok(self.args.dep_q as usize),
             _ => Err(Error::UnsupportedArchitecture(format!(
                 "Moshi has no execution group {group}"
             ))),
         }
     }
 
-    fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
-        if group == 0 {
-            format!("transformer.layers.{index}")
-        } else {
-            format!("depformer.slices.{index}")
+    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
+        if index >= self.group_unit_count(group)? {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Moshi execution group {group} has no unit {index}"
+            )));
         }
+        Ok(moshi_unit_prefix(group, index))
     }
 
-    fn layer_unit_name(&self, group: usize, index: usize) -> String {
-        if group == 0 {
-            format!("moshi.temporal.{index:05}")
-        } else {
-            format!("moshi.depth_slice.{index:05}")
-        }
+    fn static_modules(&self) -> &Self::StaticModules {
+        &self.static_modules
     }
 
-    fn layer_bindings(
-        &self,
-        group: usize,
-        index: usize,
-        layer: &Self::Layer,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        match self.layout {
-            CheckpointLayout::Native => Ok(build_module_bindings(
-                layer,
-                &self.layer_checkpoint_prefix(group, index),
-                store,
-            )?),
-            CheckpointLayout::Pytorch => {
-                pytorch_layer_bindings(layer, group, index, self.args.dep_q as usize, store)
-            }
-        }
+    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
+        &mut self.static_modules
     }
 
-    fn parallel_layer_bindings(
-        &self,
-        group: usize,
-        index: usize,
-        _layer: &Self::Layer,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &eredu_runtime::LocalModelLayout,
+    fn build_unit(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Unit, Error> {
+        let unit = build_moshi_unit(&self.args, group, index, None, stream)?;
+        MlxParameterTree::new(unit, "").map_err(|error| Error::Parallel(error.to_string()))
+    }
+
+    fn begin_forward<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut MoshiCache,
         stream: &Stream,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        let global = self.new_layer(group, index, stream)?;
-        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
-            self.layer_bindings(group, index, &global, store)?,
-            &self.layer_checkpoint_prefix(group, index),
-            store,
-            layout,
-        )
+    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
+        begin_moshi_forward(self, input, cache, None, stream)
     }
 
-    fn forward_layer(
+    fn begin_execution_group(
+        &mut self,
+        group: usize,
+        initial: &Array,
+        dependencies: &[&Array],
+        _cache: &mut MoshiCache,
+        _forward: &mut Self::ForwardContext,
+        _stream: &Stream,
+    ) -> Result<Array, Error> {
+        match (group, dependencies) {
+            (0, []) => Ok(initial.clone()),
+            (1, [temporal]) => Ok((*temporal).clone()),
+            _ => Err(Error::UnsupportedArchitecture(format!(
+                "Moshi execution group {group} received {} dependencies",
+                dependencies.len()
+            ))),
+        }
+    }
+
+    fn forward_unit(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut Self::Unit,
         hidden: &Array,
-        cache: &mut Self::Cache,
+        cache: &mut MoshiCache,
         context: &mut Self::ForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        match (group, layer) {
+        match (group, &mut **layer) {
             (0, MoshiExecutionUnit::Temporal(layer)) => {
                 let output =
                     layer.forward_layerwise(hidden.clone(), &mut cache.temporal[index], stream)?;
@@ -1826,43 +2072,71 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         }
     }
 
-    fn forward_layer_with_execution(
+    fn retained_context_values<'a>(
+        &self,
+        context: &'a Self::ForwardContext,
+        _group: usize,
+        _index: usize,
+    ) -> Self::RetainedContextValues<'a> {
+        std::iter::once(&context.temporal_input)
+            .chain(context.temporal_output.iter())
+            .chain(context.text_logits.iter())
+            .chain(context.audio_logits.iter())
+            .chain(context.previous.iter())
+            .chain(context.sampled_text.iter())
+            .chain(context.predicted_audio.iter())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    fn finish_forward(
         &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
+        _hidden: &Array,
+        _cache: &mut MoshiCache,
+        context: &Self::ForwardContext,
+        _stream: &Stream,
     ) -> Result<Array, Error> {
-        let Some(tp_group) = execution.group() else {
-            return self.forward_layer(
-                group,
-                index,
-                layer,
-                hidden,
-                cache,
-                context,
-                execution.stream(),
-            );
-        };
-        match layer {
-            MoshiExecutionUnit::Temporal(layer) if group == 0 => {
+        context
+            .text_logits
+            .clone()
+            .ok_or_else(|| Error::UnsupportedArchitecture("Moshi produced no text logits".into()))
+    }
+}
+
+impl ParallelLayeredArchitecture<MlxBackend, MoshiCache> for MoshiArchitecture {
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut MoshiCache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
+        begin_moshi_forward(self, input, cache, Some(group), stream)
+    }
+
+    fn forward_unit_parallel(
+        &mut self,
+        execution_group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &Array,
+        cache: &mut MoshiCache,
+        context: &mut Self::ForwardContext,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match &mut **unit {
+            MoshiExecutionUnit::Temporal(layer) if execution_group == 0 => {
                 let output = layer.forward_tensor_parallel(
                     hidden.clone(),
                     &mut cache.temporal[index],
-                    tp_group,
-                    execution.stream(),
+                    group,
+                    stream,
                 )?;
                 if index + 1 == self.args.num_layers as usize {
-                    let (temporal, logits) = self.static_modules.finish_temporal_tensor_parallel(
-                        &output,
-                        tp_group,
-                        execution.stream(),
-                    )?;
+                    let (temporal, logits) = self
+                        .static_modules
+                        .finish_temporal_tensor_parallel(&output, group, stream)?;
                     context.temporal_output = Some(temporal.clone());
                     context.text_logits = Some(logits);
                     Ok(temporal)
@@ -1870,7 +2144,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
                     Ok(output)
                 }
             }
-            MoshiExecutionUnit::Depth(slice) if group == 1 => {
+            MoshiExecutionUnit::Depth(slice) if execution_group == 1 => {
                 let previous = if context.autoregressive {
                     context
                         .previous
@@ -1886,65 +2160,33 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
                         .depth_tokens
                         .as_ref()
                         .expect("teacher-forced depth tokens")
-                        .try_index_device((.., index as i32), execution.stream())?
-                        .expand_dims(1, execution.stream())?
+                        .try_index_device((.., index as i32), stream)?
+                        .expand_dims(1, stream)?
                 };
                 let logits = slice.forward_tensor_parallel(
                     context.temporal_output.as_ref().expect("temporal output"),
                     &previous,
                     context.autoregressive,
                     &mut cache.depth,
-                    tp_group,
-                    execution.stream(),
+                    group,
+                    stream,
                 )?;
                 context.current_audio_logits = Some(logits.clone());
                 context.audio_logits.push(logits);
                 Ok(hidden.clone())
             }
             _ => Err(Error::UnsupportedArchitecture(format!(
-                "Moshi TP execution unit does not match group {group}"
+                "Moshi TP execution unit does not match group {execution_group}"
             ))),
         }
     }
 
-    fn retained_arrays<'a>(
-        &self,
-        cache: &'a Self::Cache,
-        group: usize,
-        index: usize,
-    ) -> Vec<&'a Array> {
-        if group == 0 {
-            cache.temporal[index].retained_arrays()
-        } else {
-            cache
-                .depth
-                .iter()
-                .flat_map(KeyValueCache::retained_arrays)
-                .collect()
-        }
-    }
-
-    fn retained_context_arrays<'a>(
-        &self,
-        context: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Vec<&'a Array> {
-        std::iter::once(&context.temporal_input)
-            .chain(context.temporal_output.iter())
-            .chain(context.text_logits.iter())
-            .chain(context.audio_logits.iter())
-            .chain(context.previous.iter())
-            .chain(context.sampled_text.iter())
-            .chain(context.predicted_audio.iter())
-            .collect()
-    }
-
-    fn finish(
+    fn finish_forward_parallel(
         &mut self,
         _hidden: &Array,
-        _cache: &mut Self::Cache,
+        _cache: &mut MoshiCache,
         context: &Self::ForwardContext,
+        _group: &safemlx::distributed::Group,
         _stream: &Stream,
     ) -> Result<Array, Error> {
         context
@@ -1990,6 +2232,7 @@ fn pytorch_static_bindings(
 
 fn pytorch_layer_bindings(
     module: &MoshiExecutionUnit,
+    prefix: &str,
     group: usize,
     index: usize,
     depth_count: usize,
@@ -2006,7 +2249,7 @@ fn pytorch_layer_bindings(
         recipes.insert(name.to_string(), recipe);
     }
     Ok(
-        build_module_binding_plan_with_recipes(module, "", store, recipes)?
+        build_module_binding_plan_with_recipes(module, prefix, store, recipes)?
             .build_bindings(store)?,
     )
 }
@@ -2136,6 +2379,34 @@ fn validate_forced_depth(
     Ok(())
 }
 
-fn layerwise_exception(error: Error) -> Exception {
+fn layerwise_exception(error: impl std::fmt::Display) -> Exception {
     Exception::custom(error.to_string())
+}
+
+#[cfg(test)]
+mod neutral_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn execution_layout_preserves_temporal_and_depth_groups() {
+        let args = ModelArgs::v0_1();
+        let layout = moshi_execution_layout(&args).unwrap();
+        assert_eq!(layout.group_count(), 2);
+        assert_eq!(layout.group_id(0).unwrap().as_str(), "temporal_transformer");
+        assert_eq!(
+            layout.group_id(1).unwrap().as_str(),
+            "depth_codebook_slices"
+        );
+        assert_eq!(
+            layout.group_range(0).unwrap().len(),
+            args.num_layers as usize
+        );
+        assert_eq!(layout.group_range(1).unwrap().len(), args.dep_q as usize);
+        assert_eq!(moshi_unit_address(&args, 0).unwrap(), (0, 0));
+        assert_eq!(
+            moshi_unit_address(&args, args.num_layers as usize).unwrap(),
+            (1, 0)
+        );
+        assert!(moshi_unit_address(&args, args.num_layers as usize + args.dep_q as usize).is_err());
+    }
 }

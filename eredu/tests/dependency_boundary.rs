@@ -101,6 +101,35 @@ fn mlx_backend_contains_no_llama_knowledge() {
 }
 
 #[test]
+fn moshi_composition_uses_the_neutral_layered_runtime() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source =
+        std::fs::read_to_string(root.join("src/composition/mlx_architectures/moshi/layerwise.rs"))
+            .expect("Moshi layered composition must be readable");
+    for required in [
+        "impl LayeredArchitecture<MlxBackend, MoshiCache> for MoshiArchitecture",
+        "impl ParallelLayeredArchitecture<MlxBackend, MoshiCache> for MoshiArchitecture",
+        "prepare_layerwise_policy_with_bindings",
+    ] {
+        assert!(
+            source.contains(required),
+            "Moshi composition is missing neutral runtime contract {required:?}"
+        );
+    }
+    for legacy in [
+        "impl ArchitectureAdapter",
+        "LayerwiseModel<Moshi",
+        "load_layerwise_model_with_quantization",
+        "load_tensor_parallel_layerwise_model(",
+    ] {
+        assert!(
+            !source.contains(legacy),
+            "Moshi composition still depends on legacy execution contract {legacy:?}"
+        );
+    }
+}
+
+#[test]
 fn mlx_sampling_contains_only_backend_primitives() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let sampler =
