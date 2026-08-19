@@ -1032,7 +1032,7 @@ impl ExpertCache {
         let transfer = self
             .manager
             .acquire_many_with_transfer(&requests, MemoryTier::Device)?;
-        transfer.wait_on(stream)?;
+        transfer.order_after(stream)?;
         let wait = started.elapsed();
         let after = self.resident_snapshot()?;
         let (host_evictions, host_eviction_bytes) = before.evicted(&after, MemoryTier::Host);

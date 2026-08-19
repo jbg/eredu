@@ -316,6 +316,173 @@ pub trait ResidencyLeaseOwner: Sized {
     fn release_residency_pin(&self, id: &OffloadUnitId, tier: MemoryTier);
 }
 
+/// Backend hook used by the neutral exact-transfer ownership lifecycle.
+pub trait ResidencyTransferOwner<C, R>: Sized {
+    /// Backend executor on which a dependent submission can be ordered.
+    type Executor: ?Sized;
+    /// Concrete completion or publication failure.
+    type Error;
+
+    /// Orders an executor after one exact transfer without blocking the host.
+    fn order_after(
+        completion: &C,
+        executor: &Self::Executor,
+        id: &OffloadUnitId,
+    ) -> Result<(), Self::Error>;
+
+    /// Observes exact completion without blocking.
+    fn is_complete(completion: &C, id: &OffloadUnitId) -> Result<bool, Self::Error>;
+
+    /// Waits for this exact transfer only.
+    fn wait(completion: &C, id: &OffloadUnitId) -> Result<(), Self::Error>;
+
+    /// Releases retained backend resources according to transfer success.
+    fn finish_resources(resources: R, succeeded: bool);
+
+    /// Publishes or rolls back the exact transfer generation.
+    fn resolve_transfer(
+        &self,
+        ids: &[OffloadUnitId],
+        tier: MemoryTier,
+        generation: u64,
+        succeeded: bool,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Caller-owned exact transfer and source-lifetime guard.
+pub struct ResidencyTransfer<L, C, R, O>
+where
+    O: ResidencyTransferOwner<C, R>,
+{
+    leases: Vec<L>,
+    completion: Option<C>,
+    resources: Option<R>,
+    owner: Weak<O>,
+    ids: Vec<OffloadUnitId>,
+    tier: MemoryTier,
+    generation: u64,
+}
+
+impl<L, C, R, O> ResidencyTransfer<L, C, R, O>
+where
+    O: ResidencyTransferOwner<C, R>,
+{
+    /// Creates an already-complete transfer containing only resident leases.
+    pub fn immediate(leases: Vec<L>, tier: MemoryTier) -> Self {
+        Self {
+            leases,
+            completion: None,
+            resources: None,
+            owner: Weak::new(),
+            ids: Vec::new(),
+            tier,
+            generation: 0,
+        }
+    }
+
+    /// Creates an in-flight transfer owning its exact completion and retained resources.
+    pub fn submitted(
+        leases: Vec<L>,
+        completion: C,
+        resources: R,
+        owner: Weak<O>,
+        ids: Vec<OffloadUnitId>,
+        tier: MemoryTier,
+        generation: u64,
+    ) -> Self {
+        assert!(
+            !ids.is_empty(),
+            "an in-flight residency transfer must contain at least one unit"
+        );
+        Self {
+            leases,
+            completion: Some(completion),
+            resources: Some(resources),
+            owner,
+            ids,
+            tier,
+            generation,
+        }
+    }
+
+    /// Returns resident unit leases protected by this transfer.
+    pub fn leases(&self) -> &[L] {
+        &self.leases
+    }
+
+    /// Returns whether the transfer contains no resident units.
+    pub fn is_empty(&self) -> bool {
+        self.leases.is_empty()
+    }
+
+    /// Orders dependent backend work after this exact transfer.
+    pub fn order_after(&self, executor: &O::Executor) -> Result<(), O::Error> {
+        match &self.completion {
+            Some(completion) => O::order_after(completion, executor, self.primary_id()),
+            None => Ok(()),
+        }
+    }
+
+    /// Returns whether this exact transfer completed without blocking.
+    pub fn is_complete(&self) -> Result<bool, O::Error> {
+        match &self.completion {
+            Some(completion) => O::is_complete(completion, self.primary_id()),
+            None => Ok(true),
+        }
+    }
+
+    /// Waits for exact completion and publishes or rolls back the transfer.
+    pub fn synchronize(&mut self) -> Result<(), O::Error> {
+        self.finish(true)
+    }
+
+    fn primary_id(&self) -> &OffloadUnitId {
+        self.ids
+            .first()
+            .expect("an in-flight residency transfer has at least one unit")
+    }
+
+    fn finish(&mut self, report_error: bool) -> Result<(), O::Error> {
+        let result = match &self.completion {
+            Some(completion) => O::wait(completion, self.primary_id()),
+            None => Ok(()),
+        };
+        let succeeded = result.is_ok();
+        if let Some(resources) = self.resources.take() {
+            O::finish_resources(resources, succeeded);
+        }
+        if succeeded {
+            self.completion = None;
+        }
+        self.publish(succeeded)?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if report_error => Err(error),
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn publish(&mut self, succeeded: bool) -> Result<(), O::Error> {
+        if self.generation == 0 {
+            return Ok(());
+        }
+        let generation = std::mem::take(&mut self.generation);
+        if let Some(owner) = self.owner.upgrade() {
+            owner.resolve_transfer(&self.ids, self.tier, generation, succeeded)?;
+        }
+        Ok(())
+    }
+}
+
+impl<L, C, R, O> Drop for ResidencyTransfer<L, C, R, O>
+where
+    O: ResidencyTransferOwner<C, R>,
+{
+    fn drop(&mut self) {
+        let _ = self.finish(false);
+    }
+}
+
 /// Statically dispatched lease retaining one backend-native resident unit.
 pub struct ResidencyLease<S, O>
 where
@@ -606,6 +773,18 @@ impl ResidencyController {
         };
         self.ledger.record_prefetch(tier, outcome);
         Ok(outcome)
+    }
+
+    /// Resolves one exact transfer and returns backend copies invalidated by failure.
+    pub fn resolve_transfer(
+        &mut self,
+        ids: &[OffloadUnitId],
+        tier: MemoryTier,
+        generation: u64,
+        succeeded: bool,
+    ) -> Result<Vec<EvictedResidencyCopy>, ResidencyLedgerError> {
+        self.ledger
+            .resolve_transfer(ids, tier, generation, succeeded)
     }
 
     /// Replaces one protected window and selects unique bounded lookahead in caller order.
@@ -1178,6 +1357,60 @@ mod tests {
         }
     }
 
+    struct TestTransferCompletion {
+        succeeds: bool,
+        waits: Arc<Mutex<usize>>,
+    }
+
+    struct TestTransferResources(Arc<Mutex<Vec<bool>>>);
+
+    #[derive(Default)]
+    struct TestTransferOwner(Mutex<Vec<(Vec<OffloadUnitId>, MemoryTier, u64, bool)>>);
+
+    impl ResidencyTransferOwner<TestTransferCompletion, TestTransferResources> for TestTransferOwner {
+        type Executor = Mutex<usize>;
+        type Error = &'static str;
+
+        fn order_after(
+            _: &TestTransferCompletion,
+            executor: &Self::Executor,
+            _: &OffloadUnitId,
+        ) -> Result<(), Self::Error> {
+            *executor.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        fn is_complete(
+            completion: &TestTransferCompletion,
+            _: &OffloadUnitId,
+        ) -> Result<bool, Self::Error> {
+            Ok(completion.succeeds)
+        }
+
+        fn wait(completion: &TestTransferCompletion, _: &OffloadUnitId) -> Result<(), Self::Error> {
+            *completion.waits.lock().unwrap() += 1;
+            completion.succeeds.then_some(()).ok_or("transfer failed")
+        }
+
+        fn finish_resources(resources: TestTransferResources, succeeded: bool) {
+            resources.0.lock().unwrap().push(succeeded);
+        }
+
+        fn resolve_transfer(
+            &self,
+            ids: &[OffloadUnitId],
+            tier: MemoryTier,
+            generation: u64,
+            succeeded: bool,
+        ) -> Result<(), Self::Error> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((ids.to_vec(), tier, generation, succeeded));
+            Ok(())
+        }
+    }
+
     #[derive(Default)]
     struct WindowManager {
         prepared: RefCell<Vec<(String, Vec<OffloadUnitId>)>>,
@@ -1278,6 +1511,69 @@ mod tests {
         assert_eq!(lease.binding_names().collect::<Vec<_>>(), vec!["weight"]);
         drop(lease);
         assert_eq!(*owner.0.lock().unwrap(), vec![(id, MemoryTier::Device)]);
+    }
+
+    #[test]
+    fn neutral_transfer_orders_publishes_and_releases_resources() {
+        let owner = Arc::new(TestTransferOwner::default());
+        let waits = Arc::new(Mutex::new(0));
+        let resources = Arc::new(Mutex::new(Vec::new()));
+        let executor = Mutex::new(0);
+        let id = OffloadUnitId::new("layer.0").unwrap();
+        let mut transfer = ResidencyTransfer::submitted(
+            vec![7],
+            TestTransferCompletion {
+                succeeds: true,
+                waits: Arc::clone(&waits),
+            },
+            TestTransferResources(Arc::clone(&resources)),
+            Arc::downgrade(&owner),
+            vec![id.clone()],
+            MemoryTier::Device,
+            11,
+        );
+
+        assert_eq!(transfer.leases(), &[7]);
+        transfer.order_after(&executor).unwrap();
+        assert_eq!(*executor.lock().unwrap(), 1);
+        transfer.synchronize().unwrap();
+        assert!(transfer.is_complete().unwrap());
+        assert_eq!(*waits.lock().unwrap(), 1);
+        assert_eq!(*resources.lock().unwrap(), vec![true]);
+        assert_eq!(
+            *owner.0.lock().unwrap(),
+            vec![(vec![id], MemoryTier::Device, 11, true)]
+        );
+    }
+
+    #[test]
+    fn neutral_transfer_failure_remains_observable_and_resolves_once() {
+        let owner = Arc::new(TestTransferOwner::default());
+        let waits = Arc::new(Mutex::new(0));
+        let resources = Arc::new(Mutex::new(Vec::new()));
+        let id = OffloadUnitId::new("layer.0").unwrap();
+        let mut transfer = ResidencyTransfer::submitted(
+            Vec::<u8>::new(),
+            TestTransferCompletion {
+                succeeds: false,
+                waits: Arc::clone(&waits),
+            },
+            TestTransferResources(Arc::clone(&resources)),
+            Arc::downgrade(&owner),
+            vec![id.clone()],
+            MemoryTier::Host,
+            4,
+        );
+
+        assert_eq!(transfer.synchronize(), Err("transfer failed"));
+        assert_eq!(transfer.synchronize(), Err("transfer failed"));
+        assert_eq!(*resources.lock().unwrap(), vec![false]);
+        assert_eq!(
+            *owner.0.lock().unwrap(),
+            vec![(vec![id], MemoryTier::Host, 4, false)]
+        );
+        drop(transfer);
+        assert_eq!(*waits.lock().unwrap(), 3);
     }
 
     #[test]

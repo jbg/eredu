@@ -247,7 +247,7 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
         let transfer = self
             .residency
             .acquire_many_with_transfer(&requests, MemoryTier::Device)?;
-        transfer.wait_on(stream)?;
+        transfer.order_after(stream)?;
         let mut units = Vec::with_capacity(self.unit_ids.len());
         for (index, lease) in transfer.leases().iter().enumerate() {
             let mut unit = MlxModule::new(self.build.build(index, stream)?);
@@ -711,7 +711,7 @@ where
                 Err(error) => return Err(error.into()),
             }
         };
-        transfer.wait_on(stream)?;
+        transfer.order_after(stream)?;
         let mut unit = MlxModule::new(self.build.build(index, stream)?);
         populate_module_from_lease(&mut unit, &transfer.leases()[0])?;
         Ok(MlxUnitLease {

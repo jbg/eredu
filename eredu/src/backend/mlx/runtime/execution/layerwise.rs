@@ -1138,7 +1138,7 @@ impl DenseTransferWindow {
             }
         })?;
         debug_assert_eq!(transfer.index(), index);
-        transfer.transfer.wait_on(consumer)?;
+        transfer.transfer.order_after(consumer)?;
         Ok(transfer)
     }
 
@@ -3167,7 +3167,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                         }
                         Err(error) => return Err(error.into()),
                     };
-                    transfer.wait_on(&group_stream)?;
+                    transfer.order_after(&group_stream)?;
                     let mut layer = match self.parallel_layout.as_ref() {
                         Some(layout) if tensor_parallel_group.is_some() => self
                             .adapter

@@ -441,6 +441,31 @@ fn weight_lease_ownership_is_runtime_owned() {
 }
 
 #[test]
+fn weight_transfer_ownership_is_runtime_owned() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let runtime = std::fs::read_to_string(workspace.join("eredu-runtime/src/residency.rs"))
+        .expect("runtime residency transfer must be readable");
+    for runtime_owned in [
+        "pub trait ResidencyTransferOwner",
+        "pub struct ResidencyTransfer",
+        "impl<L, C, R, O> Drop for ResidencyTransfer",
+    ] {
+        assert!(runtime.contains(runtime_owned));
+    }
+
+    let mlx = std::fs::read_to_string(
+        workspace.join("eredu/src/backend/mlx/runtime/residency/manager.rs"),
+    )
+    .expect("MLX residency realization must be readable");
+    assert!(!mlx.contains("pub struct ResidentTransfer"));
+    assert!(!mlx.contains("impl Drop for ResidentTransfer"));
+    assert!(!mlx.contains("fn finish(&mut self, report_error"));
+    assert!(!mlx.contains(".ledger_mut()\n            .resolve_transfer"));
+}
+
+#[test]
 fn llama_hot_path_remains_statically_dispatched_and_device_native() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
