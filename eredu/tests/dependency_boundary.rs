@@ -359,6 +359,21 @@ fn execution_group_orchestration_is_runtime_owned() {
 }
 
 #[test]
+fn parallel_model_metadata_is_runtime_owned() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let runtime = std::fs::read_to_string(workspace.join("eredu-runtime/src/parallel.rs"))
+        .expect("runtime parallel policy must be readable");
+    let mlx = std::fs::read_to_string(
+        workspace.join("eredu/src/backend/mlx/runtime/execution/layerwise.rs"),
+    )
+    .expect("MLX layerwise realization must be readable");
+    assert!(runtime.contains("pub struct ParallelModelInfo"));
+    assert!(!mlx.contains("pub struct ParallelModelInfo"));
+}
+
+#[test]
 fn weight_prefetch_execution_is_runtime_owned() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

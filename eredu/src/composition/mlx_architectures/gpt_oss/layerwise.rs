@@ -116,7 +116,7 @@ impl GptOssLayerwiseModel {
     /// Returns rank-local generalized parallel information when applicable.
     pub fn parallel_info(
         &self,
-    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
+    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
         self.execution.parallel_info()
     }
 

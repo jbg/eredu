@@ -94,7 +94,7 @@ impl Model {
     /// model was loaded through generalized parallel execution groups.
     pub fn parallel_info(
         &self,
-    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
+    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
         match self {
             Self::Llama(model) => model.parallel_info(),
             Self::MuseGlimmer(model) => model.parallel_info(),

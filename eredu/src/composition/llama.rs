@@ -43,13 +43,14 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
-        ParallelModelInfo, StaticUnitBindings,
+        StaticUnitBindings,
     },
     backend::mlx::runtime::media::input,
     composition::llama_mlx as resident,
 };
 use eredu_runtime::{
     CacheResidencyPolicy, DenseDiskStreamReport, LayerwiseModelMetadata, PagedCacheOptions,
+    ParallelModelInfo,
 };
 
 use eredu_runtime::{ResidencyReport, WeightBinding};
@@ -245,7 +246,7 @@ pub struct LlamaModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
     metadata: LayerwiseModelMetadata,
-    parallel_info: Option<ParallelModelInfo>,
+    parallel_info: Option<ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
     parallel_rank: Option<crate::CacheRankIdentity>,
     execution: LlamaExecution,
 }
@@ -281,7 +282,7 @@ impl LlamaModel {
     /// Returns rank-local generalized parallel information when applicable.
     pub fn parallel_info(
         &self,
-    ) -> Option<&crate::backend::mlx::runtime::execution::layerwise::ParallelModelInfo> {
+    ) -> Option<&ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
         self.parallel_info.as_ref()
     }
 

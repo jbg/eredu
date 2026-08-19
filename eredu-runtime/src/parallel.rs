@@ -11,6 +11,80 @@ use std::{
 
 use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized, Tensor};
 
+/// Architecture-neutral information for one rank-local parallel model.
+#[derive(Debug, Clone)]
+pub struct ParallelModelInfo<T> {
+    topology: T,
+    model_type: String,
+    owned_tensors: Vec<String>,
+    local_parameter_bytes: u64,
+    global_parameter_bytes: u64,
+    pinned_device_parameter_bytes: u64,
+    maximum_device_parameter_bytes: u64,
+}
+
+impl<T> ParallelModelInfo<T> {
+    /// Creates a complete rank-local parallel model summary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        topology: T,
+        model_type: impl Into<String>,
+        owned_tensors: Vec<String>,
+        local_parameter_bytes: u64,
+        global_parameter_bytes: u64,
+        pinned_device_parameter_bytes: u64,
+        maximum_device_parameter_bytes: u64,
+    ) -> Self {
+        Self {
+            topology,
+            model_type: model_type.into(),
+            owned_tensors,
+            local_parameter_bytes,
+            global_parameter_bytes,
+            pinned_device_parameter_bytes,
+            maximum_device_parameter_bytes,
+        }
+    }
+
+    /// Returns the backend's concrete topology value unchanged.
+    pub fn topology(&self) -> T
+    where
+        T: Clone,
+    {
+        self.topology.clone()
+    }
+
+    /// Returns the architecture's normalized model type.
+    pub fn model_type(&self) -> &str {
+        &self.model_type
+    }
+
+    /// Returns exact checkpoint targets owned or replicated by this rank.
+    pub fn owned_tensors(&self) -> &[String] {
+        &self.owned_tensors
+    }
+
+    /// Returns planned rank-local parameter bytes across static and execution units.
+    pub const fn local_parameter_bytes(&self) -> u64 {
+        self.local_parameter_bytes
+    }
+
+    /// Returns the unsharded model parameter bytes represented by this checkpoint.
+    pub const fn global_parameter_bytes(&self) -> u64 {
+        self.global_parameter_bytes
+    }
+
+    /// Returns rank-local parameter bytes permanently pinned on the execution device.
+    pub const fn pinned_device_parameter_bytes(&self) -> u64 {
+        self.pinned_device_parameter_bytes
+    }
+
+    /// Returns the maximum planned rank-local parameter footprint on device.
+    pub const fn maximum_device_parameter_bytes(&self) -> u64 {
+        self.maximum_device_parameter_bytes
+    }
+}
+
 /// Semantic role of a logical parameter group.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ParameterRole {
@@ -632,5 +706,25 @@ mod tests {
             )],
         )
         .is_ok());
+    }
+
+    #[test]
+    fn parallel_model_info_preserves_opaque_topology_and_accounting() {
+        let info = ParallelModelInfo::new(
+            (2usize, 1usize),
+            "generic",
+            vec!["layer.weight".into()],
+            10,
+            20,
+            4,
+            8,
+        );
+        assert_eq!(info.topology(), (2, 1));
+        assert_eq!(info.model_type(), "generic");
+        assert_eq!(info.owned_tensors(), ["layer.weight"]);
+        assert_eq!(info.local_parameter_bytes(), 10);
+        assert_eq!(info.global_parameter_bytes(), 20);
+        assert_eq!(info.pinned_device_parameter_bytes(), 4);
+        assert_eq!(info.maximum_device_parameter_bytes(), 8);
     }
 }

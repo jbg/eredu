@@ -67,8 +67,8 @@ pub use layered::{
 pub use parallel::{
     aligned_partition_units, module_parameter_group, partitioned_projection_group,
     projection_parameter_group, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ProjectionSharding,
-    ShardingPolicy, TensorPlacement,
+    ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+    ProjectionSharding, ShardingPolicy, TensorPlacement,
 };
 pub use parameter::{
     bind_materialized_unit, materialize_bindings, MaterializedUnit, ParameterOrchestrationError,

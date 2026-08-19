@@ -118,8 +118,8 @@ pub use eredu_runtime::{
     ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, ExpertWeightResidency,
     LayerWeightResidency, LayerwiseLoadOptions, LayerwiseModelMetadata, LiveCacheBlockPublication,
     LiveCacheDiskPolicy, LiveCachePublicationError, MutableCacheTail, NonExpertWeightResidency,
-    PagedCacheOptions, PromptCachePersistenceError, PromptCachePublication, WeightResidency,
-    WeightResidencyPolicyError, CACHE_RESIDENCY_LAYER_REPORT_LIMIT, DENSE_TRANSFER_WINDOW,
-    MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_CURRENT_FILE,
+    PagedCacheOptions, ParallelModelInfo, PromptCachePersistenceError, PromptCachePublication,
+    WeightResidency, WeightResidencyPolicyError, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+    DENSE_TRANSFER_WINDOW, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_CURRENT_FILE,
     PROMPT_CACHE_GENERATIONS_DIRECTORY,
 };

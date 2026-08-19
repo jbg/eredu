@@ -11,8 +11,8 @@ use eredu_checkpoint::{
 };
 use eredu_runtime::{
     DenseDiskStreamLoadOptions, DenseDiskStreamReport, DenseStreamTelemetry, DenseTransferSchedule,
-    ExecutionResidency, LayerWeightResidency, LayerwiseModelMetadata, OffloadUnit, WeightBinding,
-    WeightResidency, DENSE_TRANSFER_WINDOW,
+    ExecutionResidency, LayerWeightResidency, LayerwiseModelMetadata, OffloadUnit,
+    ParallelModelInfo, WeightBinding, WeightResidency, DENSE_TRANSFER_WINDOW,
 };
 
 use std::{
@@ -449,75 +449,6 @@ impl Drop for DenseStreamGroupGuard {
         if self.armed {
             let _ = self.controller.clear_group(&self.manager, &self.group);
         }
-    }
-}
-
-/// Architecture-neutral information for a rank-local parallel model.
-#[derive(Debug, Clone)]
-pub struct ParallelModelInfo {
-    topology: crate::backend::mlx::MlxParallelContext,
-    model_type: String,
-    owned_tensors: Vec<String>,
-    local_parameter_bytes: u64,
-    global_parameter_bytes: u64,
-    pinned_device_parameter_bytes: u64,
-    maximum_device_parameter_bytes: u64,
-}
-
-impl ParallelModelInfo {
-    pub(crate) fn new(
-        topology: crate::backend::mlx::MlxParallelContext,
-        model_type: impl Into<String>,
-        owned_tensors: Vec<String>,
-        local_parameter_bytes: u64,
-        global_parameter_bytes: u64,
-        pinned_device_parameter_bytes: u64,
-        maximum_device_parameter_bytes: u64,
-    ) -> Self {
-        Self {
-            topology,
-            model_type: model_type.into(),
-            owned_tensors,
-            local_parameter_bytes,
-            global_parameter_bytes,
-            pinned_device_parameter_bytes,
-            maximum_device_parameter_bytes,
-        }
-    }
-
-    /// Returns the complete distributed topology and this process's coordinates.
-    pub const fn topology(&self) -> crate::backend::mlx::MlxParallelContext {
-        self.topology
-    }
-
-    /// Returns the adapter's normalized model type.
-    pub fn model_type(&self) -> &str {
-        &self.model_type
-    }
-
-    /// Returns exact checkpoint targets owned or replicated by this rank.
-    pub fn owned_tensors(&self) -> &[String] {
-        &self.owned_tensors
-    }
-
-    /// Returns planned rank-local parameter bytes across static and execution units.
-    pub const fn local_parameter_bytes(&self) -> u64 {
-        self.local_parameter_bytes
-    }
-
-    /// Returns the unsharded model parameter bytes represented by this checkpoint.
-    pub const fn global_parameter_bytes(&self) -> u64 {
-        self.global_parameter_bytes
-    }
-
-    /// Returns rank-local parameter bytes permanently pinned on the execution device.
-    pub const fn pinned_device_parameter_bytes(&self) -> u64 {
-        self.pinned_device_parameter_bytes
-    }
-
-    /// Returns the maximum planned rank-local parameter footprint on device.
-    pub const fn maximum_device_parameter_bytes(&self) -> u64 {
-        self.maximum_device_parameter_bytes
     }
 }
 
@@ -1215,7 +1146,7 @@ pub struct LayerwiseModel<A: ArchitectureAdapter> {
     metadata: LayerwiseModelMetadata,
     parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     parallel_topology: Option<crate::backend::mlx::MlxParallelContext>,
-    parallel_info: Option<ParallelModelInfo>,
+    parallel_info: Option<ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
     execution_streams: Vec<Stream>,
     #[cfg(test)]
     force_serial_execution: bool,
@@ -1459,7 +1390,9 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
 
     /// Returns rank-local parallel placement information when loaded with a
     /// generalized distributed execution group.
-    pub const fn parallel_info(&self) -> Option<&ParallelModelInfo> {
+    pub const fn parallel_info(
+        &self,
+    ) -> Option<&ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
         self.parallel_info.as_ref()
     }
 
@@ -3719,10 +3652,10 @@ where
         .ok_or(LayerwiseModelError::ArithmeticOverflow {
             context: "rank-local parallel parameter byte total",
         })?;
-    model.parallel_info = Some(ParallelModelInfo {
-        topology: build.topology(),
-        model_type: model.adapter.model_type().into(),
-        owned_tensors: model
+    model.parallel_info = Some(ParallelModelInfo::new(
+        build.topology(),
+        model.adapter.model_type(),
+        model
             .parallel_layout
             .as_ref()
             .expect("parallel layout was assigned")
@@ -3731,17 +3664,17 @@ where
             .collect(),
         local_parameter_bytes,
         global_parameter_bytes,
-        pinned_device_parameter_bytes: if fully_resident {
+        if fully_resident {
             local_parameter_bytes
         } else {
             static_device_bytes
         },
-        maximum_device_parameter_bytes: static_device_bytes
-            .checked_add(device_window_bytes)
-            .ok_or(LayerwiseModelError::ArithmeticOverflow {
+        static_device_bytes.checked_add(device_window_bytes).ok_or(
+            LayerwiseModelError::ArithmeticOverflow {
                 context: "maximum rank-local device parameter byte total",
-            })?,
-    });
+            },
+        )?,
+    ));
     if let Some(dense) = dense {
         let execution_groups = model
             .groups
