@@ -1,8 +1,9 @@
 //! Text-decoder bounded layer execution for Thinking Machines Lab Inkling.
 
 use eredu_runtime::{
-    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, LayerWeightResidency,
-    NonExpertWeightResidency, StaticUnitBindings, WeightResidency,
+    ExecutionGraph, ExecutionUnitLayout, ExpertCacheLoadOptions, ExpertIdentity, ExpertPass,
+    LayerWeightResidency, LayeredArchitecture, LayeredForwardState, LayerwiseRuntime,
+    NonExpertWeightResidency, ParallelLayeredArchitecture, StaticUnitBindings, WeightResidency,
 };
 
 use eredu_checkpoint::WeightQuantization;
@@ -31,12 +32,13 @@ use safemlx::{
 };
 
 use crate::core::cache::{
-    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    PromptCacheTopology,
+    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
 };
 
 use crate::{
     backend::mlx::error::Error,
+    backend::mlx::nn::shared::{MlxBackend, MlxParameterTree},
     backend::mlx::nn::{
         self as common,
         moe::PackedSwiGluExperts,
@@ -47,20 +49,25 @@ use crate::{
     },
     backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
-        packed_companion_checkpoint_name, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        binding_bytes, build_module_binding_plan_with_recipes,
+        build_module_binding_plan_with_recipes_excluding, packed_companion_checkpoint_name,
+        populate_module_from_lease, populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
-    backend::mlx::runtime::checkpoint::store::TensorSelection,
+    backend::mlx::runtime::checkpoint::store::{TensorSelection, WeightStoreBackend},
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load,
         recipe::{DerivedWeightRecipe, RecipeDtype},
     },
-    backend::mlx::runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerwiseModel, LoadTimeQuantizableAdapter,
+    backend::mlx::runtime::execution::{
+        generic::{
+            prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
+            MlxUnitFactory,
+        },
+        layerwise::{
+            open_safetensors_weight_store, quantize_module_store_with_bindings,
+            shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
+        },
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -277,9 +284,796 @@ impl InklingMtpModule {
     }
 }
 
+type InklingUnit = MlxParameterTree<InklingLayer>;
+type InklingStatic = MlxParameterTree<InklingStaticModules>;
+type InklingResidentRuntime =
+    LayerwiseRuntime<InklingArchitecture, MlxBackend, Cache, MlxResidentPolicy<InklingUnit>>;
+type InklingBoundedRuntime = LayerwiseRuntime<
+    InklingArchitecture,
+    MlxBackend,
+    Cache,
+    MlxLayerwisePolicy<InklingUnit, InklingUnitFactory>,
+>;
+
+enum InklingRuntime {
+    Resident(InklingResidentRuntime),
+    Layerwise(InklingBoundedRuntime),
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct InklingReplicatedStatic {
+    #[param]
+    embedding: MaybeQuantized<nn::Embedding>,
+    #[param]
+    embed_norm: nn::RmsNorm,
+    #[param]
+    norm: nn::RmsNorm,
+    #[param]
+    lm_head: MaybeQuantized<nn::Linear>,
+    #[param]
+    mtp: Option<InklingMtpModule>,
+    #[param]
+    audio: Option<AudioModel>,
+    #[param]
+    vision_norm: Option<nn::RmsNorm>,
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct InklingParallelStatic {
+    #[param]
+    embedding: VocabParallelEmbedding,
+    #[param]
+    embed_norm: nn::RmsNorm,
+    #[param]
+    norm: nn::RmsNorm,
+    #[param]
+    lm_head: VocabParallelLmHead,
+    #[param]
+    mtp: Option<InklingMtpModule>,
+    #[param]
+    audio: Option<AudioModel>,
+    #[param]
+    vision_norm: Option<nn::RmsNorm>,
+}
+
+#[derive(Debug, Clone)]
+enum InklingStaticModules {
+    Replicated(InklingReplicatedStatic),
+    Parallel(InklingParallelStatic),
+}
+
+macro_rules! inkling_static_parameters {
+    ($self:ident, $method:ident $(, $arg:expr)?) => {
+        match $self {
+            InklingStaticModules::Replicated(module) => module.$method($($arg)?),
+            InklingStaticModules::Parallel(module) => module.$method($($arg)?),
+        }
+    };
+}
+
+impl ModuleParameters for InklingStaticModules {
+    fn num_parameters(&self) -> usize {
+        inkling_static_parameters!(self, num_parameters)
+    }
+    fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        inkling_static_parameters!(self, parameters)
+    }
+    fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
+        inkling_static_parameters!(self, parameters_mut)
+    }
+    fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        inkling_static_parameters!(self, trainable_parameters)
+    }
+    fn freeze_parameters(&mut self, recursive: bool) {
+        inkling_static_parameters!(self, freeze_parameters, recursive)
+    }
+    fn unfreeze_parameters(&mut self, recursive: bool) {
+        inkling_static_parameters!(self, unfreeze_parameters, recursive)
+    }
+    fn all_frozen(&self) -> Option<bool> {
+        inkling_static_parameters!(self, all_frozen)
+    }
+    fn any_frozen(&self) -> Option<bool> {
+        inkling_static_parameters!(self, any_frozen)
+    }
+}
+
+struct InklingUnitFactory {
+    adapter: InklingLayerwiseAdapter,
+    vision_units: usize,
+    parallel_layout: Option<Arc<eredu_runtime::LocalModelLayout>>,
+}
+
+impl MlxUnitFactory<InklingUnit> for InklingUnitFactory {
+    fn build(&mut self, ordinal: usize, stream: &Stream) -> Result<InklingUnit, Error> {
+        let (group, index) = if ordinal < self.vision_units {
+            (0, ordinal)
+        } else {
+            (
+                usize::from(self.vision_units > 0),
+                ordinal - self.vision_units,
+            )
+        };
+        let layer = match self.parallel_layout.as_deref() {
+            Some(layout) => self
+                .adapter
+                .new_parallel_layer(group, index, layout, stream)?,
+            None => self.adapter.new_layer(group, index, stream)?,
+        };
+        let sparse =
+            self.adapter.sparse_expert_cache && group == usize::from(self.adapter.vision_depth > 0);
+        MlxParameterTree::new_filtered(layer, "", |name| {
+            !sparse || !name.starts_with("moe.experts.")
+        })
+        .map_err(|error| Error::Parallel(error.to_string()))
+    }
+}
+
+struct InklingArchitecture {
+    adapter: InklingLayerwiseAdapter,
+    static_modules: InklingStatic,
+    parallel_topology: Option<crate::backend::mlx::MlxParallelContext>,
+}
+
+impl InklingArchitecture {
+    fn from_adapter(adapter: InklingLayerwiseAdapter) -> Result<Self, Error> {
+        let modules = match (&adapter.parallel_embedding, &adapter.parallel_lm_head) {
+            (Some(embedding), Some(head)) => {
+                InklingStaticModules::Parallel(InklingParallelStatic {
+                    embedding: embedding.clone(),
+                    embed_norm: adapter.embed_norm.clone(),
+                    norm: adapter.norm.clone(),
+                    lm_head: head.clone(),
+                    mtp: adapter.mtp.clone(),
+                    audio: adapter.audio.clone(),
+                    vision_norm: adapter.vision_norm.clone(),
+                })
+            }
+            _ => InklingStaticModules::Replicated(InklingReplicatedStatic {
+                embedding: adapter.embedding.clone(),
+                embed_norm: adapter.embed_norm.clone(),
+                norm: adapter.norm.clone(),
+                lm_head: adapter.lm_head.clone(),
+                mtp: adapter.mtp.clone(),
+                audio: adapter.audio.clone(),
+                vision_norm: adapter.vision_norm.clone(),
+            }),
+        };
+        Ok(Self {
+            static_modules: MlxParameterTree::new(modules, "")
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+            adapter,
+            parallel_topology: None,
+        })
+    }
+
+    fn sync_adapter_static(&mut self) {
+        match &*self.static_modules {
+            InklingStaticModules::Replicated(modules) => {
+                self.adapter.embedding = modules.embedding.clone();
+                self.adapter.embed_norm = modules.embed_norm.clone();
+                self.adapter.norm = modules.norm.clone();
+                self.adapter.lm_head = modules.lm_head.clone();
+                self.adapter.mtp = modules.mtp.clone();
+                self.adapter.audio = modules.audio.clone();
+                self.adapter.vision_norm = modules.vision_norm.clone();
+            }
+            InklingStaticModules::Parallel(modules) => {
+                self.adapter.parallel_embedding = Some(modules.embedding.clone());
+                self.adapter.embed_norm = modules.embed_norm.clone();
+                self.adapter.norm = modules.norm.clone();
+                self.adapter.parallel_lm_head = Some(modules.lm_head.clone());
+                self.adapter.mtp = modules.mtp.clone();
+                self.adapter.audio = modules.audio.clone();
+                self.adapter.vision_norm = modules.vision_norm.clone();
+            }
+        }
+    }
+}
+
+impl LayeredArchitecture<MlxBackend, Cache> for InklingArchitecture {
+    type Input<'a> = InklingExecutionInput<'a>;
+    type StaticModules = InklingStatic;
+    type Unit = InklingUnit;
+    type ForwardContext = InklingForwardContext;
+    type RetainedContextValues<'a> = std::vec::IntoIter<&'a Array>;
+    type Error = Error;
+
+    fn model_identity(&self) -> &str {
+        &self.adapter.args.model_type
+    }
+    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
+        self.adapter.execution_graph()
+    }
+    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
+        self.adapter.layer_count(group)
+    }
+    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
+        if index >= self.group_unit_count(group)? {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Inkling group {group} has no unit {index}"
+            )));
+        }
+        Ok(self.adapter.layer_checkpoint_prefix(group, index))
+    }
+    fn static_modules(&self) -> &Self::StaticModules {
+        &self.static_modules
+    }
+    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
+        &mut self.static_modules
+    }
+    fn build_unit(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Unit, Error> {
+        let layer = self.adapter.new_layer(group, index, stream)?;
+        let sparse =
+            self.adapter.sparse_expert_cache && group == usize::from(self.adapter.vision_depth > 0);
+        MlxParameterTree::new_filtered(layer, "", |name| {
+            !sparse || !name.starts_with("moe.experts.")
+        })
+        .map_err(|error| Error::Parallel(error.to_string()))
+    }
+    fn begin_forward<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
+        self.sync_adapter_static();
+        cache.set_decoder_group(usize::from(self.adapter.vision_depth > 0));
+        self.adapter.validate_cache(cache)?;
+        self.adapter.begin_forward(input, cache, stream)
+    }
+    fn begin_execution_group(
+        &mut self,
+        group: usize,
+        initial: &Array,
+        dependencies: &[&Array],
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let dependencies = dependencies
+            .iter()
+            .map(|value| (*value).clone())
+            .collect::<Vec<_>>();
+        self.adapter
+            .begin_execution_group(group, initial, &dependencies, cache, forward, stream)
+    }
+    fn should_execute_group(&self, group: usize, forward: &Self::ForwardContext) -> bool {
+        self.adapter.should_execute_group(group, forward)
+    }
+    fn forward_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.adapter
+            .forward_layer(group, index, &mut **unit, hidden, cache, forward, stream)
+    }
+    fn complete_execution_group(
+        &mut self,
+        group: usize,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.adapter
+            .complete_execution_group(group, hidden, cache, forward, stream)
+    }
+    fn finish_forward(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.adapter.finish(hidden, cache, forward, stream)
+    }
+    fn retained_context_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        group: usize,
+        index: usize,
+    ) -> Self::RetainedContextValues<'a> {
+        self.adapter
+            .retained_context_arrays(forward, group, index)
+            .into_iter()
+    }
+}
+
+impl ParallelLayeredArchitecture<MlxBackend, Cache> for InklingArchitecture {
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
+        self.sync_adapter_static();
+        cache.set_decoder_group(usize::from(self.adapter.vision_depth > 0));
+        self.adapter.validate_cache(cache)?;
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Inkling parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        self.adapter
+            .begin_forward_with_execution(input, cache, &execution)
+    }
+    fn forward_unit_parallel(
+        &mut self,
+        group_index: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Inkling parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        self.adapter.forward_layer_with_execution(
+            group_index,
+            index,
+            &mut **unit,
+            hidden,
+            cache,
+            forward,
+            &execution,
+        )
+    }
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &Self::ForwardContext,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Inkling parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        self.adapter
+            .finish_with_execution(hidden, cache, forward, &execution)
+    }
+}
+
+struct InklingExecution {
+    runtime: InklingRuntime,
+    metadata: eredu_runtime::LayerwiseModelMetadata,
+    parallel_info:
+        Option<eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
+    topology: Option<crate::backend::mlx::MlxParallelContext>,
+}
+
+impl InklingExecution {
+    fn architecture(&self) -> &InklingArchitecture {
+        match &self.runtime {
+            InklingRuntime::Resident(runtime) => runtime.architecture(),
+            InklingRuntime::Layerwise(runtime) => runtime.architecture(),
+        }
+    }
+    fn architecture_mut(&mut self) -> &mut InklingArchitecture {
+        match &mut self.runtime {
+            InklingRuntime::Resident(runtime) => runtime.architecture_mut(),
+            InklingRuntime::Layerwise(runtime) => runtime.architecture_mut(),
+        }
+    }
+    fn adapter(&self) -> &InklingLayerwiseAdapter {
+        &self.architecture().adapter
+    }
+    fn adapter_mut(&mut self) -> &mut InklingLayerwiseAdapter {
+        &mut self.architecture_mut().adapter
+    }
+    fn bind_parallel_topology(&mut self, topology: crate::backend::mlx::MlxParallelContext) {
+        self.topology = Some(topology);
+        self.architecture_mut().parallel_topology = Some(topology);
+    }
+    fn parallel_info(
+        &self,
+    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+        self.parallel_info.as_ref()
+    }
+    fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
+        match &self.runtime {
+            InklingRuntime::Resident(runtime) => runtime.policy().checkpoint_store(),
+            InklingRuntime::Layerwise(runtime) => runtime.policy().checkpoint_store(),
+        }
+    }
+    fn checkpoint_store_arc(&self) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
+        match &self.runtime {
+            InklingRuntime::Resident(runtime) => runtime.policy().checkpoint_store_arc(),
+            InklingRuntime::Layerwise(runtime) => runtime.policy().checkpoint_store_arc(),
+        }
+    }
+    fn residency_report(&self) -> Result<ResidencyReport, Error> {
+        match &self.runtime {
+            InklingRuntime::Resident(runtime) => runtime.policy().residency_report(),
+            InklingRuntime::Layerwise(runtime) => runtime.policy().residency_report(),
+        }
+    }
+    fn dense_stream_report(&self) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
+        match &self.runtime {
+            InklingRuntime::Resident(_) => Ok(None),
+            InklingRuntime::Layerwise(runtime) => runtime.policy().dense_stream_report(),
+        }
+    }
+    fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.adapter().prompt_cache_model_identity(self.topology)
+    }
+    fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        Ok(self.prompt_cache_model_identity()?.layer_layout)
+    }
+    fn prompt_cache_rank_identity(&self) -> Option<crate::core::cache::CacheRankIdentity> {
+        self.topology
+            .map(crate::backend::mlx::cache::prompt_cache_topology)
+            .and_then(|topology| topology.cache_rank_identity())
+    }
+    fn prompt_cache_directory(&self, root: &Path) -> std::path::PathBuf {
+        match self.topology {
+            Some(topology) => root.join(format!("rank-{:05}", topology.global_rank)),
+            None => root.to_path_buf(),
+        }
+    }
+    fn save_prompt_cache(
+        &self,
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(&descriptor, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        self.adapter().save_prompt_cache(
+            cache,
+            &self.prompt_cache_directory(destination.as_ref()),
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+    fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(expected, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        self.adapter().load_prompt_cache(
+            &self.prompt_cache_directory(directory.as_ref()),
+            expected,
+            &identity,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+    fn forward(
+        &mut self,
+        input: InklingExecutionInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match &mut self.runtime {
+            InklingRuntime::Resident(runtime) => runtime
+                .forward(input, cache, stream)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            InklingRuntime::Layerwise(runtime) => runtime
+                .forward(input, cache, stream)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_tensor_parallel(
+        &mut self,
+        input: InklingExecutionInput<'_>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match &mut self.runtime {
+            InklingRuntime::Resident(runtime) => runtime
+                .forward_parallel(input, cache, group, stream)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            InklingRuntime::Layerwise(runtime) => runtime
+                .forward_parallel(input, cache, group, stream)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_with_context_hook(
+        &mut self,
+        input: InklingExecutionInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+        hook: impl FnMut(usize, usize, &mut InklingForwardContext) -> Result<(), Error>,
+    ) -> Result<(Array, InklingForwardContext), Error> {
+        match &mut self.runtime {
+            InklingRuntime::Resident(runtime) => runtime
+                .forward_with_context_hook(input, cache, stream, hook)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            InklingRuntime::Layerwise(runtime) => runtime
+                .forward_with_context_hook(input, cache, stream, hook)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_tensor_parallel_with_context(
+        &mut self,
+        input: InklingExecutionInput<'_>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<(Array, InklingForwardContext), Error> {
+        match &mut self.runtime {
+            InklingRuntime::Resident(runtime) => runtime
+                .forward_parallel_with_context_hook(input, cache, group, stream, |_, _, _| Ok(()))
+                .map_err(|error| Error::Parallel(error.to_string())),
+            InklingRuntime::Layerwise(runtime) => runtime
+                .forward_parallel_with_context_hook(input, cache, group, stream, |_, _, _| Ok(()))
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_with_layer_executor<E>(
+        &mut self,
+        input: InklingExecutionInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+        mut execute: E,
+    ) -> Result<Array, Error>
+    where
+        E: FnMut(
+            &mut InklingLayerwiseAdapter,
+            usize,
+            usize,
+            &mut InklingLayer,
+            &Array,
+            &mut Cache,
+            &mut InklingForwardContext,
+            &Stream,
+        ) -> Result<Array, Error>,
+    {
+        let execute = |architecture: &mut InklingArchitecture,
+                       group,
+                       index,
+                       unit: &mut InklingUnit,
+                       hidden: &Array,
+                       cache: &mut Cache,
+                       forward: &mut InklingForwardContext,
+                       stream: &Stream| {
+            execute(
+                &mut architecture.adapter,
+                group,
+                index,
+                &mut **unit,
+                hidden,
+                cache,
+                forward,
+                stream,
+            )
+        };
+        match &mut self.runtime {
+            InklingRuntime::Resident(runtime) => runtime
+                .forward_with_unit_executor(input, cache, stream, execute)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            InklingRuntime::Layerwise(runtime) => runtime
+                .forward_with_unit_executor(input, cache, stream, execute)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_with_layer_executor_and_context<E>(
+        &mut self,
+        input: InklingExecutionInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+        mut execute: E,
+    ) -> Result<(Array, InklingForwardContext), Error>
+    where
+        E: FnMut(
+            &mut InklingLayerwiseAdapter,
+            usize,
+            usize,
+            &mut InklingLayer,
+            &Array,
+            &mut Cache,
+            &mut InklingForwardContext,
+            &Stream,
+        ) -> Result<Array, Error>,
+    {
+        let execute = |architecture: &mut InklingArchitecture,
+                       group,
+                       index,
+                       unit: &mut InklingUnit,
+                       hidden: &Array,
+                       cache: &mut Cache,
+                       forward: &mut InklingForwardContext,
+                       stream: &Stream| {
+            execute(
+                &mut architecture.adapter,
+                group,
+                index,
+                &mut **unit,
+                hidden,
+                cache,
+                forward,
+                stream,
+            )
+        };
+        match &mut self.runtime {
+            InklingRuntime::Resident(runtime) => runtime
+                .forward_with_unit_executor_and_context_hook(
+                    input,
+                    cache,
+                    stream,
+                    execute,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(|error| Error::Parallel(error.to_string())),
+            InklingRuntime::Layerwise(runtime) => runtime
+                .forward_with_unit_executor_and_context_hook(
+                    input,
+                    cache,
+                    stream,
+                    execute,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_tensor_parallel_with_layer_executor<E>(
+        &mut self,
+        input: InklingExecutionInput<'_>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        mut execute: E,
+    ) -> Result<Array, Error>
+    where
+        E: FnMut(
+            &mut InklingLayerwiseAdapter,
+            usize,
+            usize,
+            &mut InklingLayer,
+            &Array,
+            &mut Cache,
+            &mut InklingForwardContext,
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        ) -> Result<Array, Error>,
+    {
+        let topology = self.topology.ok_or_else(|| {
+            Error::Parallel("Inkling parallel topology was not configured".into())
+        })?;
+        let execute = |architecture: &mut InklingArchitecture,
+                       group_index,
+                       index,
+                       unit: &mut InklingUnit,
+                       hidden: &Array,
+                       cache: &mut Cache,
+                       forward: &mut InklingForwardContext,
+                       group: &safemlx::distributed::Group,
+                       stream: &Stream| {
+            let context = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+            execute(
+                &mut architecture.adapter,
+                group_index,
+                index,
+                &mut **unit,
+                hidden,
+                cache,
+                forward,
+                &context,
+            )
+        };
+        match &mut self.runtime {
+            InklingRuntime::Resident(runtime) => runtime
+                .forward_parallel_with_unit_executor(input, cache, group, stream, execute)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            InklingRuntime::Layerwise(runtime) => runtime
+                .forward_parallel_with_unit_executor(input, cache, group, stream, execute)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_tensor_parallel_with_layer_executor_and_context<E>(
+        &mut self,
+        input: InklingExecutionInput<'_>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        mut execute: E,
+    ) -> Result<(Array, InklingForwardContext), Error>
+    where
+        E: FnMut(
+            &mut InklingLayerwiseAdapter,
+            usize,
+            usize,
+            &mut InklingLayer,
+            &Array,
+            &mut Cache,
+            &mut InklingForwardContext,
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        ) -> Result<Array, Error>,
+    {
+        let topology = self.topology.ok_or_else(|| {
+            Error::Parallel("Inkling parallel topology was not configured".into())
+        })?;
+        let execute = |architecture: &mut InklingArchitecture,
+                       group_index,
+                       index,
+                       unit: &mut InklingUnit,
+                       hidden: &Array,
+                       cache: &mut Cache,
+                       forward: &mut InklingForwardContext,
+                       group: &safemlx::distributed::Group,
+                       stream: &Stream| {
+            let context = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+            execute(
+                &mut architecture.adapter,
+                group_index,
+                index,
+                &mut **unit,
+                hidden,
+                cache,
+                forward,
+                &context,
+            )
+        };
+        match &mut self.runtime {
+            InklingRuntime::Resident(runtime) => runtime
+                .forward_parallel_with_unit_executor_and_context_hook(
+                    input,
+                    cache,
+                    group,
+                    stream,
+                    execute,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(|error| Error::Parallel(error.to_string())),
+            InklingRuntime::Layerwise(runtime) => runtime
+                .forward_parallel_with_unit_executor_and_context_hook(
+                    input,
+                    cache,
+                    group,
+                    stream,
+                    execute,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn clear_all_device_groups(&self) -> Result<(), Error> {
+        let graph = self.architecture().execution_graph()?;
+        for group in graph.groups() {
+            match &self.runtime {
+                InklingRuntime::Resident(runtime) => {
+                    runtime.policy().clear_device_group(group.id())?
+                }
+                InklingRuntime::Layerwise(runtime) => {
+                    runtime.policy().clear_device_group(group.id())?
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Inkling multimodal model using bounded residency for hMLP and decoder blocks.
 pub struct InklingLayerwiseModel {
-    execution: LayerwiseModel<InklingLayerwiseAdapter>,
+    execution: InklingExecution,
 }
 
 pub(crate) struct InklingTensorMtpTarget<'a> {
@@ -521,7 +1315,12 @@ impl InklingLayerwiseModel {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
             CacheResidencyPolicy::Paged(options) => {
                 let rank = self.execution.prompt_cache_rank_identity();
-                let cache = Cache::new_paged(&self.args().text_config, options, rank)?;
+                let cache = match self.execution.adapter().parallel_text_geometry.as_deref() {
+                    Some(geometry) => {
+                        Cache::new_paged_with_geometry(self.args(), geometry, options, rank)?
+                    }
+                    None => Cache::new_paged(self.args(), options, rank)?,
+                };
                 match &self.execution.adapter().mtp {
                     Some(mtp) => cache
                         .with_paged_mtp_policies(&mtp.policies, rank)
@@ -1095,6 +1894,409 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
     }
 }
 
+fn inkling_execution_layout(
+    adapter: &InklingLayerwiseAdapter,
+) -> Result<ExecutionUnitLayout, Error> {
+    let graph = adapter.execution_graph()?;
+    let counts = (0..graph.groups().len())
+        .map(|group| adapter.layer_count(group))
+        .collect::<Result<Vec<_>, _>>()?;
+    ExecutionUnitLayout::new(&graph, counts).map_err(|error| Error::Parallel(error.to_string()))
+}
+
+fn inkling_static_bindings(
+    adapter: &InklingLayerwiseAdapter,
+    modules: &InklingStaticModules,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    let qualify =
+        |prefix: &str, bindings: Vec<WeightBinding>| -> Result<Vec<WeightBinding>, Error> {
+            bindings
+                .into_iter()
+                .map(|binding| {
+                    let name = format!("{prefix}.{}", binding.name());
+                    binding.with_name(name).map_err(Into::into)
+                })
+                .collect()
+        };
+    let InklingStaticModules::Replicated(modules) = modules else {
+        return Err(Error::Parallel(
+            "global Inkling bindings require replicated static modules".into(),
+        ));
+    };
+    let mut bindings = qualify(
+        "embedding",
+        build_module_binding_plan_with_recipes(
+            &modules.embedding,
+            "model.embed_tokens",
+            store,
+            adapter.recipes_for_module(&modules.embedding, "model.embed_tokens", store)?,
+        )?
+        .build_bindings(store)?,
+    )?;
+    bindings.extend(qualify(
+        "embed_norm",
+        build_module_binding_plan_with_recipes(
+            &modules.embed_norm,
+            "model.embed_norm",
+            store,
+            adapter.recipes_for_module(&modules.embed_norm, "model.embed_norm", store)?,
+        )?
+        .build_bindings(store)?,
+    )?);
+    bindings.extend(qualify(
+        "norm",
+        build_module_binding_plan_with_recipes(
+            &modules.norm,
+            "model.norm",
+            store,
+            adapter.recipes_for_module(&modules.norm, "model.norm", store)?,
+        )?
+        .build_bindings(store)?,
+    )?);
+    bindings.extend(qualify(
+        "lm_head",
+        build_module_binding_plan_with_recipes(
+            &modules.lm_head,
+            "lm_head",
+            store,
+            adapter.recipes_for_module(&modules.lm_head, "lm_head", store)?,
+        )?
+        .build_bindings(store)?,
+    )?);
+    if let Some(mtp) = &modules.mtp {
+        bindings.extend(qualify(
+            "mtp",
+            build_module_binding_plan_with_recipes(
+                mtp,
+                "mtp",
+                store,
+                adapter.recipes_for_module(mtp, "mtp", store)?,
+            )?
+            .build_bindings(store)?,
+        )?);
+    }
+    if let Some(audio) = &modules.audio {
+        bindings.extend(qualify(
+            "audio",
+            build_module_binding_plan_with_recipes(
+                audio,
+                "audio",
+                store,
+                adapter.recipes_for_module(audio, "audio", store)?,
+            )?
+            .build_bindings(store)?,
+        )?);
+    }
+    if let Some(norm) = &modules.vision_norm {
+        bindings.extend(qualify(
+            "vision_norm",
+            build_module_binding_plan_with_recipes(
+                norm,
+                "visual.final_norm",
+                store,
+                adapter.recipes_for_module(norm, "visual.final_norm", store)?,
+            )?
+            .build_bindings(store)?,
+        )?);
+    }
+    Ok(bindings)
+}
+
+fn inkling_ordinal(adapter: &InklingLayerwiseAdapter, ordinal: usize) -> (usize, usize) {
+    if ordinal < adapter.vision_depth {
+        (0, ordinal)
+    } else {
+        (
+            usize::from(adapter.vision_depth > 0),
+            ordinal - adapter.vision_depth,
+        )
+    }
+}
+
+fn inkling_raw_unit(
+    adapter: &InklingLayerwiseAdapter,
+    ordinal: usize,
+    stream: &Stream,
+) -> Result<InklingLayer, Error> {
+    let (group, index) = inkling_ordinal(adapter, ordinal);
+    adapter.new_layer(group, index, stream)
+}
+
+fn inkling_raw_unit_bindings(
+    adapter: &InklingLayerwiseAdapter,
+    ordinal: usize,
+    unit: &InklingLayer,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    let (group, index) = inkling_ordinal(adapter, ordinal);
+    adapter.layer_bindings(group, index, unit, store)
+}
+
+fn inkling_unit_bindings(
+    adapter: &InklingLayerwiseAdapter,
+    ordinal: usize,
+    unit: &InklingUnit,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    inkling_raw_unit_bindings(adapter, ordinal, unit, store)
+}
+
+fn replicated_inkling_static(adapter: &InklingLayerwiseAdapter) -> InklingStaticModules {
+    InklingStaticModules::Replicated(InklingReplicatedStatic {
+        embedding: adapter.embedding.clone(),
+        embed_norm: adapter.embed_norm.clone(),
+        norm: adapter.norm.clone(),
+        lm_head: adapter.lm_head.clone(),
+        mtp: adapter.mtp.clone(),
+        audio: adapter.audio.clone(),
+        vision_norm: adapter.vision_norm.clone(),
+    })
+}
+
+fn fresh_inkling_adapter(
+    source: &InklingLayerwiseAdapter,
+    stream: &Stream,
+) -> Result<InklingLayerwiseAdapter, Error> {
+    let mut adapter = InklingLayerwiseAdapter::new(source.args.clone(), stream)?;
+    adapter.sparse_expert_cache = source.sparse_expert_cache;
+    adapter.parallel_text_geometry = source.parallel_text_geometry.clone();
+    adapter.parallel_vision_input_ranges = source.parallel_vision_input_ranges.clone();
+    Ok(adapter)
+}
+
+fn resolve_inkling_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    adapter: &InklingLayerwiseAdapter,
+) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
+    if store.is_checkpoint_contract_resolved()
+        || store.source_diagnostics()?.backend != WeightStoreBackend::Safetensors
+    {
+        return Ok(store);
+    }
+    let plan = adapter.safetensors_checkpoint_plan()?;
+    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
+        .map_err(|validation| {
+            Error::UnsupportedArchitecture(format!(
+                "Inkling checkpoint contract did not resolve: {validation:?}"
+            ))
+        })?;
+    Ok(Arc::new(
+        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
+    ))
+}
+
+fn quantize_inkling_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    source: &InklingLayerwiseAdapter,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<
+    (
+        Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        InklingLayerwiseAdapter,
+        eredu_runtime::WeightMaterializationReport,
+    ),
+    Error,
+> {
+    let target = source.load_time_quantized(quantization, stream)?;
+    let source_static = replicated_inkling_static(source);
+    let target_static = replicated_inkling_static(&target);
+    let source_units = fresh_inkling_adapter(source, stream)?;
+    let target_units = fresh_inkling_adapter(&target, stream)?;
+    let static_binding_adapter = fresh_inkling_adapter(source, stream)?;
+    let unit_binding_adapter = fresh_inkling_adapter(source, stream)?;
+    let unit_count = inkling_execution_layout(source)?.len();
+    let (store, report) = quantize_module_store_with_bindings(
+        store,
+        &source_static,
+        &target_static,
+        move |ordinal, stream| inkling_raw_unit(&source_units, ordinal, stream),
+        move |ordinal, stream| inkling_raw_unit(&target_units, ordinal, stream),
+        unit_count,
+        quantization,
+        stream,
+        move |modules, store| inkling_static_bindings(&static_binding_adapter, modules, store),
+        move |ordinal, unit, store| {
+            inkling_raw_unit_bindings(&unit_binding_adapter, ordinal, unit, store)
+        },
+    )?;
+    Ok((store, target, report))
+}
+
+fn load_inkling_with_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    adapter: InklingLayerwiseAdapter,
+    options: LayerWeightResidency,
+    quantization: Option<WeightQuantization>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<InklingExecution, Error> {
+    let store = resolve_inkling_store(store, &adapter)?;
+    let (store, adapter, materialization) = match quantization {
+        Some(quantization) => {
+            let (store, adapter, report) =
+                quantize_inkling_store(store, &adapter, quantization, stream)?;
+            (store, adapter, Some(report))
+        }
+        None => (store, adapter, None),
+    };
+    let layout = inkling_execution_layout(&adapter)?;
+    let factory = InklingUnitFactory {
+        adapter: fresh_inkling_adapter(&adapter, stream)?,
+        vision_units: adapter.vision_depth,
+        parallel_layout: None,
+    };
+    let static_binding_adapter = fresh_inkling_adapter(&adapter, stream)?;
+    let unit_binding_adapter = fresh_inkling_adapter(&adapter, stream)?;
+    let sparse = adapter.sparse_expert_cache;
+    let model_type = adapter.args.model_type.clone();
+    let quantization = adapter.args.text_config.weight_quantization;
+    let mut architecture = InklingArchitecture::from_adapter(adapter)?;
+    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+        Arc::clone(&store),
+        architecture.static_modules_mut(),
+        factory,
+        layout,
+        options,
+        stream,
+        weights_stream,
+        move |key| sparse && key.contains(".moe.experts."),
+        move |modules, store| inkling_static_bindings(&static_binding_adapter, &**modules, store),
+        move |ordinal, unit, store, _| {
+            inkling_unit_bindings(&unit_binding_adapter, ordinal, &unit, store)
+        },
+    )?;
+    metadata.set_model_type(model_type);
+    metadata.set_quantization(quantization);
+    metadata.set_materialization(materialization);
+    let runtime = if options.is_fully_resident() {
+        InklingRuntime::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        InklingRuntime::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok(InklingExecution {
+        runtime,
+        metadata,
+        parallel_info: None,
+        topology: None,
+    })
+}
+
+fn load_inkling_parallel_with_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    mut adapter: InklingLayerwiseAdapter,
+    options: LayerWeightResidency,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<InklingExecution, Error> {
+    let store = resolve_inkling_store(store, &adapter)?;
+    let mut planner = build.planner();
+    adapter.register_parallel_parameters(build, &mut planner, stream)?;
+    let (_, local_layout) = planner.finish()?;
+    adapter.configure_parallel_static(build, &local_layout, stream)?;
+
+    let global_adapter = fresh_inkling_adapter(&adapter, stream)?;
+    let global_static = replicated_inkling_static(&global_adapter);
+    let static_bindings = inkling_static_bindings(&global_adapter, &global_static, store.as_ref())?;
+    let mut global_parameter_bytes = binding_bytes(&static_bindings)?;
+    let unit_count = inkling_execution_layout(&global_adapter)?.len();
+    for ordinal in 0..unit_count {
+        let unit = inkling_raw_unit(&global_adapter, ordinal, stream)?;
+        global_parameter_bytes = global_parameter_bytes
+            .checked_add(binding_bytes(&inkling_raw_unit_bindings(
+                &global_adapter,
+                ordinal,
+                &unit,
+                store.as_ref(),
+            )?)?)
+            .ok_or_else(|| Error::Parallel("Inkling global parameter bytes overflowed".into()))?;
+    }
+
+    let shared_layout = Arc::new(local_layout);
+    let mut factory_adapter = fresh_inkling_adapter(&adapter, stream)?;
+    factory_adapter.configure_parallel_static(build, &shared_layout, stream)?;
+    let factory = InklingUnitFactory {
+        adapter: factory_adapter,
+        vision_units: adapter.vision_depth,
+        parallel_layout: Some(Arc::clone(&shared_layout)),
+    };
+    let static_layout = Arc::clone(&shared_layout);
+    let unit_layout = Arc::clone(&shared_layout);
+    let unit_binding_adapter = global_adapter;
+    let sparse = adapter.sparse_expert_cache;
+    let model_type = adapter.args.model_type.clone();
+    let quantization = adapter.args.text_config.weight_quantization;
+    let layout = inkling_execution_layout(&adapter)?;
+    let mut architecture = InklingArchitecture::from_adapter(adapter)?;
+    architecture.parallel_topology = Some(build.topology());
+    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+        Arc::clone(&store),
+        architecture.static_modules_mut(),
+        factory,
+        layout,
+        options,
+        stream,
+        weights_stream,
+        move |key| sparse && key.contains(".moe.experts."),
+        move |_, store| shard_layer_bindings(static_bindings, "", store, &static_layout),
+        move |ordinal, _local, store, stream| {
+            let global = inkling_raw_unit(&unit_binding_adapter, ordinal, stream)?;
+            let (group, index) = inkling_ordinal(&unit_binding_adapter, ordinal);
+            shard_layer_bindings(
+                unit_binding_adapter.layer_bindings(group, index, &global, store)?,
+                &unit_binding_adapter.layer_checkpoint_prefix(group, index),
+                store,
+                &unit_layout,
+            )
+        },
+    )?;
+    metadata.set_model_type(model_type.clone());
+    metadata.set_quantization(quantization);
+    let local_parameter_bytes = metadata
+        .static_device_bytes()
+        .checked_add(metadata.layer_parameter_bytes())
+        .ok_or_else(|| Error::Parallel("Inkling local parameter bytes overflowed".into()))?;
+    let maximum_device_parameter_bytes = metadata
+        .static_device_bytes()
+        .checked_add(metadata.maximum_device_layer_bytes())
+        .ok_or_else(|| Error::Parallel("Inkling device parameter bytes overflowed".into()))?;
+    let info = eredu_runtime::ParallelModelInfo::new(
+        build.topology(),
+        model_type,
+        shared_layout
+            .tensors()
+            .map(|(target, _)| target.to_string())
+            .collect(),
+        local_parameter_bytes,
+        global_parameter_bytes,
+        if options.is_fully_resident() {
+            local_parameter_bytes
+        } else {
+            metadata.static_device_bytes()
+        },
+        maximum_device_parameter_bytes,
+    );
+    let runtime = if options.is_fully_resident() {
+        InklingRuntime::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        InklingRuntime::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok(InklingExecution {
+        runtime,
+        metadata,
+        parallel_info: Some(info),
+        topology: Some(build.topology()),
+    })
+}
+
 /// Loads Inkling's multimodal model through the generalized execution engine.
 pub fn load_inkling_layerwise_model(
     model_dir: impl AsRef<Path>,
@@ -1120,7 +2322,7 @@ pub fn load_inkling_layerwise_model(
     let adapter = InklingLayerwiseAdapter::new(args, stream)?;
     let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(InklingLayerwiseModel {
-        execution: load_layerwise_model_with_quantization(
+        execution: load_inkling_with_store(
             store,
             adapter,
             options,
@@ -1162,7 +2364,7 @@ pub(crate) fn load_inkling_tensor_parallel_layerwise_model(
     let args = resident::get_model_args(model_dir)?;
     let adapter = InklingLayerwiseAdapter::new(args, stream)?;
     Ok(InklingLayerwiseModel {
-        execution: load_tensor_parallel_layerwise_model(
+        execution: load_inkling_parallel_with_store(
             open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
@@ -1197,7 +2399,7 @@ pub(crate) fn load_inkling_gguf_tensor_parallel_model(
         &prepared.args,
         options.max_mapped_shards(),
     )?;
-    let execution = load_tensor_parallel_layerwise_model(
+    let execution = load_inkling_parallel_with_store(
         store,
         InklingLayerwiseAdapter::new(prepared.args, stream)?,
         options,
@@ -1250,7 +2452,7 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
             prepared.eos_token_ids,
         ));
     }
-    let execution = load_layerwise_model_with_quantization(
+    let execution = load_inkling_with_store(
         store,
         InklingLayerwiseAdapter::new(args, stream)?,
         residency.layers(),
@@ -1298,10 +2500,10 @@ fn load_inkling_gguf_sparse_with_store(
 ) -> Result<InklingLayerwiseModel, Error> {
     let mut adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution = load_layerwise_model_with_quantization(
+    let mut execution = load_inkling_with_store(
         store,
         adapter,
-        non_expert,
+        non_expert.into(),
         quantization,
         stream,
         weights_stream,
@@ -1364,10 +2566,10 @@ pub fn load_inkling_expert_cache_model(
     let mut adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
     let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
-    let mut execution = load_layerwise_model_with_quantization(
+    let mut execution = load_inkling_with_store(
         store,
         adapter,
-        non_expert,
+        non_expert.into(),
         quantize_on_load,
         stream,
         weights_stream,
@@ -1404,7 +2606,14 @@ pub(crate) fn load_inkling_sparse_ep_base_with_store(
 ) -> Result<InklingLayerwiseModel, Error> {
     let mut adapter = InklingLayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
-    let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    let execution = load_inkling_with_store(
+        store,
+        adapter,
+        non_expert.into(),
+        None,
+        stream,
+        weights_stream,
+    )?;
     Ok(InklingLayerwiseModel { execution })
 }
 
@@ -1419,10 +2628,10 @@ pub(crate) fn load_inkling_sparse_tp_ep_base_with_store(
 ) -> Result<InklingLayerwiseModel, Error> {
     let mut adapter = InklingLayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
-    let execution = load_tensor_parallel_layerwise_model(
+    let execution = load_inkling_parallel_with_store(
         store,
         adapter,
-        non_expert,
+        non_expert.into(),
         build,
         stream,
         weights_stream,
@@ -1571,7 +2780,11 @@ impl InklingLayerwiseAdapter {
     }
 
     fn new_cache(&self) -> Cache {
-        let cache = Cache::new(&self.args.text_config);
+        let cache = match self.parallel_text_geometry.as_deref() {
+            Some(geometry) => Cache::new_with_geometry(&self.args, geometry)
+                .expect("validated Inkling parallel cache geometry"),
+            None => Cache::new(&self.args),
+        };
         match &self.mtp {
             Some(mtp) => cache.with_mtp_policies(&mtp.policies),
             None => cache,
@@ -2046,7 +3259,7 @@ impl InklingLayerwiseAdapter {
         >,
         stream: &Stream,
     ) -> Result<InklingPipelineIngressState, Error> {
-        let mut cache = Cache::new(&self.args.text_config);
+        let mut cache = Cache::new(&self.args);
         let forward = match execution {
             Some(execution) if execution.is_tensor_parallel() => self
                 .begin_forward_with_execution(
@@ -2099,7 +3312,7 @@ impl InklingLayerwiseAdapter {
             })
             .ok_or_else(|| Error::Parallel("Inkling continuation has no payload".into()))?;
         Ok(InklingPipelineIngressState {
-            cache: Cache::new(&self.args.text_config),
+            cache: Cache::new(&self.args),
             forward: eredu_runtime::LayeredForwardState {
                 hidden,
                 context: InklingForwardContext {
@@ -4121,3 +5334,32 @@ pub(crate) fn inkling_expert_catalog(
 /// Inkling text token generation using bounded layer execution.
 pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, InklingLayerwiseModel, Cache, S>;
+
+#[cfg(test)]
+mod neutral_runtime_tests {
+    #[test]
+    fn production_model_and_loaders_use_the_neutral_layerwise_runtime() {
+        let source = include_str!("layerwise.rs");
+        let wrapper_start = source
+            .find("pub struct InklingLayerwiseModel")
+            .expect("Inkling production wrapper");
+        let adapter_start = source
+            .find("/// Adapter for Inkling local/global attention")
+            .expect("pipeline-only legacy adapter marker");
+        let production = &source[wrapper_start..adapter_start];
+        assert!(production.contains("execution: InklingExecution"));
+        assert!(production.contains("load_inkling_with_store("));
+        assert!(production.contains("load_inkling_parallel_with_store("));
+        for legacy in [
+            "LayerwiseModel<",
+            "load_layerwise_model(",
+            "load_layerwise_model_with_quantization(",
+            "load_tensor_parallel_layerwise_model(",
+        ] {
+            assert!(
+                !production.contains(legacy),
+                "production Inkling path still references {legacy}"
+            );
+        }
+    }
+}

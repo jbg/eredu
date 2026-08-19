@@ -7,7 +7,7 @@
 #![allow(missing_docs)]
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_runtime::CausalModel;
+use eredu_runtime::{CausalModel, RuntimeState, StateError, StateLayout};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -707,13 +707,34 @@ impl LayerCache {
 #[derive(Debug, Clone)]
 /// Heterogeneous Inkling generation cache.
 pub struct Cache {
+    layout: StateLayout,
+    decoder_group: usize,
     pub layers: Vec<LayerCache>,
     pub(crate) mtp_layers: Vec<LayerCache>,
 }
 
 impl Cache {
-    pub(crate) fn new(args: &TextArgs) -> Self {
+    pub(crate) fn new(args: &ModelArgs) -> Self {
+        let layout = StateLayout::new(
+            prompt_cache_layer_layout(args).expect("validated Inkling cache geometry"),
+        )
+        .expect("validated Inkling state layout");
+        Self::new_with_layout(&args.text_config, layout)
+    }
+
+    pub(crate) fn new_with_geometry(
+        args: &ModelArgs,
+        geometry: &[ParallelLayerGeometry],
+    ) -> Result<Self, Error> {
+        let layout = StateLayout::new(prompt_cache_layer_layout_with_geometry(args, geometry)?)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        Ok(Self::new_with_layout(&args.text_config, layout))
+    }
+
+    pub(crate) fn new_with_layout(args: &TextArgs, layout: StateLayout) -> Self {
         Self {
+            layout,
+            decoder_group: 0,
             layers: args
                 .layer_schedule
                 .iter()
@@ -771,7 +792,7 @@ impl Cache {
     }
 
     pub(crate) fn new_paged(
-        args: &TextArgs,
+        args: &ModelArgs,
         options: PagedCacheOptions,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
@@ -780,16 +801,47 @@ impl Cache {
         Self::new_paged_with_manager(args, manager, rank)
     }
 
+    pub(crate) fn new_paged_with_geometry(
+        args: &ModelArgs,
+        geometry: &[ParallelLayerGeometry],
+        options: PagedCacheOptions,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let manager = CacheResidencyManager::new(options)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let layer_layout = prompt_cache_layer_layout_with_geometry(args, geometry)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let layout =
+            StateLayout::new(layer_layout).map_err(|error| Exception::custom(error.to_string()))?;
+        Self::new_paged_with_manager_and_layout(args, manager, rank, layout)
+    }
+
     pub(crate) fn new_paged_with_manager(
-        args: &TextArgs,
+        args: &ModelArgs,
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
-        let layer_count = usize::try_from(args.num_hidden_layers)
+        let layer_layout = prompt_cache_layer_layout(args)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let layout =
+            StateLayout::new(layer_layout).map_err(|error| Exception::custom(error.to_string()))?;
+        Self::new_paged_with_manager_and_layout(args, manager, rank, layout)
+    }
+
+    fn new_paged_with_manager_and_layout(
+        args: &ModelArgs,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+        layout: StateLayout,
+    ) -> Result<Self, Exception> {
+        let text = &args.text_config;
+        let layer_count = usize::try_from(text.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid Inkling cache layer count"))?;
         Ok(Self {
+            layout,
+            decoder_group: 0,
             layers: (0..layer_count)
-                .map(|layer| LayerCache::new_paged(args, layer, manager.clone(), rank))
+                .map(|layer| LayerCache::new_paged(text, layer, manager.clone(), rank))
                 .collect::<Result<Vec<_>, _>>()?,
             mtp_layers: Vec::new(),
         })
@@ -803,6 +855,10 @@ impl Cache {
                 _ => None,
             })
             .transpose()
+    }
+
+    pub(crate) fn set_decoder_group(&mut self, group: usize) {
+        self.decoder_group = group;
     }
 
     pub fn offset(&self) -> i32 {
@@ -877,6 +933,50 @@ impl Cache {
             }
         }
         Ok(())
+    }
+}
+
+impl RuntimeState<crate::backend::mlx::nn::shared::MlxBackend> for Cache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        if address.group() < self.decoder_group {
+            return Ok(Vec::new().into_iter());
+        }
+        if address.group() != self.decoder_group {
+            return Err(StateError::UnknownLayer {
+                layer: address.group(),
+                count: self.decoder_group + 1,
+            });
+        }
+        self.layers
+            .get(address.index())
+            .ok_or(StateError::UnknownLayer {
+                layer: address.index(),
+                count: self.layers.len(),
+            })
+            .map(|layer| {
+                layer
+                    .kv
+                    .retained_arrays()
+                    .into_iter()
+                    .chain(
+                        layer
+                            .convolutions
+                            .iter()
+                            .filter_map(|cache| cache.state.as_ref()),
+                    )
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            })
     }
 }
 
@@ -3290,11 +3390,11 @@ impl Model {
     }
 
     pub fn new_cache(&self) -> Cache {
-        Cache::new(&self.args.text_config)
+        Cache::new(&self.args)
     }
 
     pub fn new_paged_cache(&self, options: PagedCacheOptions) -> Result<Cache, Exception> {
-        Cache::new_paged(&self.args.text_config, options, None)
+        Cache::new_paged(&self.args, options, None)
     }
 
     pub(crate) fn save_prompt_cache(
@@ -3450,7 +3550,7 @@ impl Model {
             .into_iter()
             .map(|state| ((state.owner, state.role), state.array))
             .collect::<BTreeMap<_, _>>();
-        let mut cache = Cache::new(&args.text_config);
+        let mut cache = Cache::new(args);
         let end = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Exception::custom("Inkling prompt length exceeds i32"))?;
         for (layer, layer_cache) in cache.layers.iter_mut().enumerate() {
