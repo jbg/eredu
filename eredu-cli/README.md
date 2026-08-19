@@ -1,7 +1,8 @@
-# Eredu CLI example
+# Eredu CLI
 
-This workspace crate is a script-friendly example application for
-`eredu`. It is not distributed as a standalone command-line product.
+`eredu-cli` is the command-line interface for running local models with Eredu.
+The package installs an `eredu` executable and supports both interactive use
+and script-friendly input, output, planning, and telemetry.
 
 It accepts a local Hugging Face-style model directory, a local GGUF file or
 canonical shard, or a model identifier already present in the local Hugging
@@ -10,22 +11,25 @@ Face cache. It does not download models.
 ## Basic use
 
 ```sh
-cargo run --release -p eredu-cli -- \
-  --model /path/to/model \
+cargo install eredu-cli
+
+eredu --model /path/to/model \
   "Write a Rust function that adds two integers."
 ```
+
+From a workspace checkout, use `cargo run --release -p eredu-cli --` in place
+of `eredu`.
 
 The default device is `gpu:0`. Select another device and sampling policy with
 command-line options:
 
 ```sh
-cargo run --release -p eredu-cli -- \
-  --model /path/to/model --device cpu \
+eredu --model /path/to/model --device cpu \
   --temperature 0.7 --top-p 0.9 --max-tokens 512 \
   "Tell me a short story."
 ```
 
-On supported CUDA hosts, add `--features cuda` before `--`.
+On supported CUDA hosts, install with `cargo install eredu-cli --features cuda`.
 
 Run the command with `--help` for the complete option list.
 
@@ -38,8 +42,7 @@ the response can be piped safely:
 
 ```sh
 printf 'Summarize the purpose of MLX.' | \
-  cargo run --release -q -p eredu-cli -- \
-  --model /path/to/model > response.txt
+  eredu --model /path/to/model > response.txt
 ```
 
 Chat templates are applied automatically. Use `--raw` for an untemplated text
@@ -58,8 +61,7 @@ expert caching, and supported embedded drafting.
 Inspect the selected plan without loading the model:
 
 ```sh
-cargo run --release -q -p eredu-cli -- \
-  --model /path/to/model --device gpu:0 --auto plan > plan.json
+eredu --model /path/to/model --device gpu:0 --auto plan > plan.json
 ```
 
 Use `--auto benchmark` to evaluate admitted candidates in isolated child
@@ -77,8 +79,7 @@ flags and defaults.
 Eligible dense checkpoints can be quantized while loading:
 
 ```sh
-cargo run --release -p eredu-cli -- \
-  --model /path/to/model --quantize 4 \
+eredu --model /path/to/model --quantize 4 \
   "Explain quantization."
 ```
 
@@ -87,7 +88,7 @@ Supported mixture-of-experts models can use an independent expert cache. These
 policies accept explicit host and device budgets and trade transfer or I/O work
 for a smaller resident parameter set.
 
-See [Model loading, quantization, and memory](../../doc/model-loading.md) for
+See [Model loading, quantization, and memory](../doc/model-loading.md) for
 the policy contracts and accounting model.
 
 ## Speculative generation
@@ -96,8 +97,7 @@ Supported embedded prediction heads are selected by the execution plan. Supply
 an external compatible assistant with `--draft-model`:
 
 ```sh
-cargo run --release -p eredu-cli -- \
-  --model /path/to/target \
+eredu --model /path/to/target \
   --draft-model /path/to/assistant \
   --mtp-draft-device cpu --mtp-draft-tokens 3 \
   "Explain speculative decoding."
@@ -105,7 +105,7 @@ cargo run --release -p eredu-cli -- \
 
 Speculative generation requires a recognized executable chat protocol and is
 not available with `--raw`. See [Speculative decoding and
-MTP](../../doc/speculative-decoding.md) for compatibility and placement rules.
+MTP](../doc/speculative-decoding.md) for compatibility and placement rules.
 
 ## Native tool calls
 
@@ -114,12 +114,11 @@ enabled only when the checkpoint has a recognized rendering, constraint, and
 parsing profile.
 
 ```sh
-cargo run --release -p eredu-cli -- \
-  --model /path/to/model \
+eredu --model /path/to/model \
   --tools tools.json --tool-choice required \
   "Look up the weather in Bogota."
 ```
 
 Visible text and canonical tool events are written to standard output. See
-[Native tool calling](../../doc/tool-calling.md) for schemas and event
+[Native tool calling](../doc/tool-calling.md) for schemas and event
 semantics.

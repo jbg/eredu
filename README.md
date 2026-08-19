@@ -56,9 +56,11 @@ cargo run --release -p eredu-cli -- \
   "Write a Rust function that adds two integers."
 ```
 
-The example CLI accepts local model directories, GGUF files, and model
-identifiers already present in the local Hugging Face cache. It does not
-download models. See the [CLI guide](examples/eredu-cli/README.md) for automatic
+The CLI is also installable with `cargo install eredu-cli`.
+
+The CLI accepts local model directories, GGUF files, and model identifiers
+already present in the local Hugging Face cache. It does not download models.
+See the [CLI guide](eredu-cli/README.md) for automatic
 planning, quantization, residency, speculative generation, and tool calling.
 
 ## Workspace crates
@@ -69,6 +71,7 @@ portable components or implementation layers for specialized use.
 | Crate | Role |
 | --- | --- |
 | [`eredu`](eredu/) | Main model loading, generation, chat, multimodal, realtime, and planning API |
+| [`eredu-cli`](eredu-cli/) | Command-line model runner built on Eredu |
 | [`eredu-core`](eredu-core/) | Backend-neutral runtime contracts, scheduling, validation, residency, and portable schemas |
 | [`eredu-text`](eredu-text/) | Backend-neutral tokenization and chat-template utilities |
 | [`eredu-gguf`](eredu-gguf/) | Bounded, framework-independent GGUF reading, writing, and tensor conversion |
@@ -76,8 +79,8 @@ portable components or implementation layers for specialized use.
 | [`safemlx-sys`](safemlx-sys/) | MLX C bindings and native build integration |
 | [`safemlx-codec`](safemlx-codec/) | MLX neural audio codec implementation used by realtime speech models |
 
-The workspace also contains procedural macros, integration tests, an iOS
-example, and the `eredu-cli` example application.
+The workspace also contains procedural macros, integration tests, and an iOS
+example application.
 
 ## Documentation
 
@@ -89,7 +92,7 @@ example, and the `eredu-cli` example application.
 - [Native tool calling](doc/tool-calling.md)
 - [Speculative decoding and MTP](doc/speculative-decoding.md)
 - [Platform setup](doc/platforms.md)
-- [CLI guide](examples/eredu-cli/README.md)
+- [CLI guide](eredu-cli/README.md)
 
 All published crates are pre-1.0, so applications should expect API changes
 between minor releases.

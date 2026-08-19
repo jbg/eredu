@@ -6,8 +6,10 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 rust-version.workspace = true
-publish = false
-description = "Example command-line text generator for eredu"
+keywords.workspace = true
+categories.workspace = true
+description = "Command-line interface for running local models with Eredu"
+readme = "README.md"
 
 [features]
 cuda = ["safemlx/cuda", "eredu/cuda"]

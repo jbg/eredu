@@ -106,7 +106,7 @@ values.
 - [Native tool calling](../doc/tool-calling.md)
 - [Parallel execution](../doc/parallel-execution.md)
 - [Platform setup](../doc/platforms.md)
-- [CLI example](../examples/eredu-cli/README.md)
+- [Eredu CLI](../eredu-cli/README.md)
 
 The minimum supported Rust version is 1.89.
 

@@ -155,5 +155,5 @@ eredu = "0.4"
 eredu = { version = "0.4", default-features = false, features = ["cuda"] }
 ```
 
-The `eredu-cli` example has its own `cuda` feature, which enables CUDA in Eredu
+The `eredu-cli` crate has its own `cuda` feature, which enables CUDA in Eredu
 and its MLX implementation layer.
