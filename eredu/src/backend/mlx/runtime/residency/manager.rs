@@ -36,84 +36,72 @@ use crate::{
 };
 
 use eredu_runtime::residency::{
-    OffloadUnit, ResidencyController, ResidencyControllerError, ResidencyWindowError,
-    ResidencyWindowManager, WeightBinding,
+    OffloadUnit, ResidencyController, ResidencyControllerError, ResidencyLease,
+    ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyWindowError, ResidencyWindowManager,
+    WeightBinding,
 };
 use eredu_runtime::ResidencyReport;
 
 /// A resident unit that prevents eviction of one tier until it is dropped.
-pub struct ResidentUnitLease {
-    id: OffloadUnitId,
-    tier: MemoryTier,
-    storage: ResidentLeaseStorage,
-    manager: Weak<ManagerInner>,
-}
+pub(crate) type ResidentUnitLease = ResidencyLease<ResidentLeaseStorage, ManagerInner>;
 
-enum ResidentLeaseStorage {
+pub(crate) enum ResidentLeaseStorage {
     Host(Arc<ResidentHostBuffers>),
     Device(Arc<ResidentArrays>),
 }
 
-impl ResidentUnitLease {
-    /// Returns the acquired unit identifier.
-    pub fn id(&self) -> &OffloadUnitId {
-        &self.id
-    }
+impl ResidencyLeaseStorage for ResidentLeaseStorage {
+    type DeviceValue = Array;
+    type HostValue = ImmutableHostTransferBuffer;
+    type Error = ResidencyError;
+    type BindingNames<'a> = Box<dyn Iterator<Item = &'a str> + 'a>;
 
-    /// Returns the protected resident tier.
-    pub const fn tier(&self) -> MemoryTier {
-        self.tier
-    }
-
-    /// Looks up an immutable resident array by stable binding name.
-    ///
-    /// Consumers should not retain cloned `Array` handles beyond this lease if
-    /// residency accounting is expected to remain authoritative. Arbitrary
-    /// external array clones cannot be tracked by the manager.
-    pub fn array(&self, name: &str) -> Result<&Array, ResidencyError> {
-        match &self.storage {
+    fn device_value<'a>(
+        &'a self,
+        id: &OffloadUnitId,
+        name: &str,
+    ) -> Result<&'a Self::DeviceValue, Self::Error> {
+        match self {
             ResidentLeaseStorage::Device(arrays) => {
                 arrays
                     .arrays
                     .get(name)
                     .ok_or_else(|| ResidencyError::UnknownBinding {
-                        id: self.id.clone(),
+                        id: id.clone(),
                         name: name.to_string(),
                     })
             }
             ResidentLeaseStorage::Host(_) => Err(ResidencyError::HostBindingIsNotArray {
-                id: self.id.clone(),
+                id: id.clone(),
                 name: name.to_string(),
             }),
         }
     }
 
-    /// Looks up an immutable typed host-transfer buffer by stable binding name.
-    ///
-    /// Host-resident weights are deliberately not MLX arrays. Device leases
-    /// reject this accessor so physical storage and execution residency cannot
-    /// be confused by callers.
-    pub fn host_buffer(&self, name: &str) -> Result<&ImmutableHostTransferBuffer, ResidencyError> {
-        match &self.storage {
+    fn host_value<'a>(
+        &'a self,
+        id: &OffloadUnitId,
+        name: &str,
+    ) -> Result<&'a Self::HostValue, Self::Error> {
+        match self {
             ResidentLeaseStorage::Host(buffers) => {
                 buffers
                     .buffers
                     .get(name)
                     .ok_or_else(|| ResidencyError::UnknownBinding {
-                        id: self.id.clone(),
+                        id: id.clone(),
                         name: name.to_string(),
                     })
             }
             ResidentLeaseStorage::Device(_) => Err(ResidencyError::DeviceBindingIsNotHostBuffer {
-                id: self.id.clone(),
+                id: id.clone(),
                 name: name.to_string(),
             }),
         }
     }
 
-    /// Returns binding names in stable order.
-    pub fn binding_names(&self) -> Box<dyn Iterator<Item = &str> + '_> {
-        match &self.storage {
+    fn binding_names(&self) -> Self::BindingNames<'_> {
+        match self {
             ResidentLeaseStorage::Host(buffers) => {
                 Box::new(buffers.buffers.keys().map(String::as_str))
             }
@@ -121,18 +109,6 @@ impl ResidentUnitLease {
                 Box::new(arrays.arrays.keys().map(String::as_str))
             }
         }
-    }
-}
-
-impl Drop for ResidentUnitLease {
-    fn drop(&mut self) {
-        let Some(manager) = self.manager.upgrade() else {
-            return;
-        };
-        let Ok(mut state) = manager.state.lock() else {
-            return;
-        };
-        state.control.ledger_mut().unpin(&self.id, self.tier);
     }
 }
 
@@ -693,12 +669,12 @@ impl ResidencyManager {
                     )),
                     MemoryTier::Disk => unreachable!("validated above"),
                 };
-                Ok(ResidentUnitLease {
-                    id: id.clone(),
+                Ok(ResidentUnitLease::new(
+                    id.clone(),
                     tier,
                     storage,
-                    manager: Arc::downgrade(&self.inner),
-                })
+                    Arc::downgrade(&self.inner),
+                ))
             })
             .collect::<Result<Vec<_>, ResidencyError>>()?;
         Ok((leases, submitted))
@@ -911,10 +887,18 @@ impl ResidencyWindowManager for ResidencyManager {
     }
 }
 
-struct ManagerInner {
+pub(crate) struct ManagerInner {
     store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     state: Mutex<ManagerState>,
     changed: Condvar,
+}
+
+impl ResidencyLeaseOwner for ManagerInner {
+    fn release_residency_pin(&self, id: &OffloadUnitId, tier: MemoryTier) {
+        if let Ok(mut state) = self.state.lock() {
+            state.control.ledger_mut().unpin(id, tier);
+        }
+    }
 }
 
 struct ManagerState {
@@ -1776,7 +1760,7 @@ mod tests {
 
     fn host_i32(lease: &ResidentUnitLease, name: &str) -> Vec<i32> {
         lease
-            .host_buffer(name)
+            .host_value(name)
             .unwrap()
             .as_bytes()
             .unwrap()
@@ -1856,7 +1840,7 @@ mod tests {
         assert!(!state(&report, "b").device_resident());
 
         let lease = manager.acquire(&id("a"), MemoryTier::Device).unwrap();
-        assert_eq!(lease.array("weight").unwrap().shape(), &[2]);
+        assert_eq!(lease.device_value("weight").unwrap().shape(), &[2]);
     }
 
     #[test]
@@ -1914,7 +1898,7 @@ mod tests {
         let consumer = cpu_stream();
         transfer.wait_on(&consumer).unwrap();
         let dependent = lease
-            .array("weight")
+            .device_value("weight")
             .unwrap()
             .add(Array::from_int(1), &consumer)
             .unwrap();
@@ -1977,7 +1961,7 @@ mod tests {
         let consumer = cpu_stream();
         transfer.wait_on(&consumer).unwrap();
         let dependent = transfer.leases()[0]
-            .array("weight")
+            .device_value("weight")
             .unwrap()
             .add(Array::from_int(1), &consumer)
             .unwrap();
@@ -2016,7 +2000,7 @@ mod tests {
                 .acquire(&id("a"), MemoryTier::Device)
                 .map(|lease| {
                     lease
-                        .array("weight")
+                        .device_value("weight")
                         .unwrap()
                         .evaluated()
                         .unwrap()
@@ -2316,15 +2300,15 @@ mod tests {
         );
         assert_eq!(host_i32(&host, "weight"), [1, 2]);
         assert!(matches!(
-            host.array("weight"),
+            host.device_value("weight"),
             Err(ResidencyError::HostBindingIsNotArray { .. })
         ));
         assert!(matches!(
-            host.host_buffer("unknown"),
+            host.host_value("unknown"),
             Err(ResidencyError::UnknownBinding { .. })
         ));
         assert!(matches!(
-            host.host_buffer("weight").unwrap().storage_kind().unwrap(),
+            host.host_value("weight").unwrap().storage_kind().unwrap(),
             HostTransferStorageKind::Cpu
                 | HostTransferStorageKind::MetalShared
                 | HostTransferStorageKind::CudaPinned
@@ -2339,9 +2323,9 @@ mod tests {
         let device = manager
             .acquire(&id("quantized"), MemoryTier::Device)
             .unwrap();
-        assert_eq!(device.array("scales").unwrap().shape(), &[2]);
+        assert_eq!(device.device_value("scales").unwrap().shape(), &[2]);
         assert!(matches!(
-            device.host_buffer("scales"),
+            device.host_value("scales"),
             Err(ResidencyError::DeviceBindingIsNotHostBuffer { .. })
         ));
         let report = manager.report().unwrap();
@@ -2757,7 +2741,7 @@ mod tests {
         let lease = manager.acquire(&id("a"), MemoryTier::Device).unwrap();
         assert_eq!(
             lease
-                .array("weight")
+                .device_value("weight")
                 .unwrap()
                 .evaluated()
                 .unwrap()

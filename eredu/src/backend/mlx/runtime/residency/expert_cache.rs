@@ -1237,7 +1237,7 @@ impl AcquiredExperts {
             .transfer
             .leases()
             .iter()
-            .map(|lease| lease.array(name).cloned())
+            .map(|lease| lease.device_value(name).cloned())
             .collect::<Result<Vec<_>, _>>()?;
         if values.is_empty() {
             return Err(ExpertCacheError::EmptyCompactBinding {
@@ -1699,13 +1699,13 @@ mod tests {
             .acquire(&ExpertIdentity::new(2, 0).unit_id(), MemoryTier::Host)
             .unwrap();
         assert!(matches!(
-            host.host_buffer("weight").unwrap().storage_kind().unwrap(),
+            host.host_value("weight").unwrap().storage_kind().unwrap(),
             HostTransferStorageKind::Cpu
                 | HostTransferStorageKind::MetalShared
                 | HostTransferStorageKind::CudaPinned
         ));
         assert!(matches!(
-            host.array("weight"),
+            host.device_value("weight"),
             Err(ResidencyError::HostBindingIsNotArray { .. })
         ));
         drop(host);

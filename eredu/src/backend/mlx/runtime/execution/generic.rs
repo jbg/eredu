@@ -347,7 +347,7 @@ fn populate_parameterized<M: Parameterized<Array>>(
                 return;
             }
             let name = metadata.id.to_string();
-            let value = match self.lease.array(&name) {
+            let value = match self.lease.device_value(&name) {
                 Ok(value) => value,
                 Err(error) => {
                     self.error = Some(error.to_string());

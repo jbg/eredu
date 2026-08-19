@@ -600,7 +600,7 @@ where
         if !expected_names.contains(name.as_ref()) {
             continue;
         }
-        let value = lease.array(name)?;
+        let value = lease.device_value(name)?;
         if parameter.shape() != value.shape() {
             return Err(ModuleBindingError::ResidentShapeMismatch {
                 unit: lease.id().to_string(),
