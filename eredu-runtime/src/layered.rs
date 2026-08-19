@@ -478,6 +478,21 @@ where
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>> {
+        self.forward_with_context_hook(input, state, context, |_, _, _| Ok(()))
+            .map(|(output, _)| output)
+    }
+
+    /// Runs one pass and exposes mutable architecture context after each unit.
+    pub fn forward_with_context_hook<'a, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut hook: H,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), A::Error>,
+    {
         let graph = self
             .architecture
             .execution_graph()
@@ -586,6 +601,8 @@ where
                             executor,
                         )
                         .map_err(LayerwiseRuntimeError::Architecture)?;
+                    hook(group, index, &mut forward_context)
+                        .map_err(LayerwiseRuntimeError::Architecture)?;
                     let state_values = state
                         .retained_values(ordinal)
                         .map_err(LayerwiseRuntimeError::State)?;
@@ -638,7 +655,7 @@ where
         self.policy
             .finish(&output, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
-        Ok(output)
+        Ok((output, forward_context))
     }
 
     /// Runs one complete rank-local pass through the neutral parallel lifecycle.
@@ -651,6 +668,23 @@ where
     ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
     where
         A: ParallelLayeredArchitecture<B, S>,
+    {
+        self.forward_parallel_with_context_hook(input, state, parallel, context, |_, _, _| Ok(()))
+            .map(|(output, _)| output)
+    }
+
+    /// Runs one rank-local pass and exposes mutable context after each unit.
+    pub fn forward_parallel_with_context_hook<'a, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut hook: H,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), A::Error>,
     {
         let graph = self
             .architecture
@@ -762,6 +796,8 @@ where
                             executor,
                         )
                         .map_err(LayerwiseRuntimeError::Architecture)?;
+                    hook(group, index, &mut forward_context)
+                        .map_err(LayerwiseRuntimeError::Architecture)?;
                     let state_values = state
                         .retained_values(ordinal)
                         .map_err(LayerwiseRuntimeError::State)?;
@@ -821,7 +857,7 @@ where
         self.policy
             .finish(&output, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
-        Ok(output)
+        Ok((output, forward_context))
     }
 
     /// Runs one pass with statically dispatched unit-boundary observation and

@@ -496,7 +496,7 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
     type Input<'a> = ();
     type StaticModules = FakeOperator;
     type Unit = FakeUnit;
-    type ForwardContext = ();
+    type ForwardContext = Vec<(usize, usize)>;
     type RetainedContextValues<'a> = std::iter::Empty<&'a FakeTensor>;
     type Error = Error;
 
@@ -549,7 +549,7 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
     ) -> Result<LayeredForwardState<FakeTensor, Self::ForwardContext>, Self::Error> {
         Ok(LayeredForwardState {
             hidden: FakeTensor(vec![0]),
-            context: (),
+            context: Vec::new(),
         })
     }
 
@@ -632,13 +632,19 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
     let mut runtime =
         LayerwiseRuntime::<_, FakeBackend, _, _>::new(architecture, ResidentUnitWindow::new(units));
 
-    let output = runtime.forward((), &mut state, &()).unwrap();
+    let (output, context_trace) = runtime
+        .forward_with_context_hook((), &mut state, &(), |group, index, context| {
+            context.push((group, index));
+            Ok(())
+        })
+        .unwrap();
 
     assert_eq!(output, FakeTensor(vec![30, 20, 21]));
     assert_eq!(
         runtime.architecture().trace,
         vec![(0, 0), (1, 0), (2, 0), (2, 1)]
     );
+    assert_eq!(context_trace, runtime.architecture().trace);
     assert_eq!(FORK_COUNT.load(Ordering::Relaxed), 1);
     assert_eq!(SUBMIT_COUNT.load(Ordering::Relaxed), 4);
     assert_eq!(ORDER_COUNT.load(Ordering::Relaxed), 5);
