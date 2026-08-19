@@ -53,7 +53,6 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes,
         build_module_binding_plan_with_recipes_excluding, build_module_bindings,
-        populate_module_from_lease, populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{open_gguf_checkpoint_source, TensorSelection},
@@ -71,13 +70,11 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_module_store_with_bindings, shard_layer_bindings,
-        LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx_architectures::lfm2::model::{
         self as resident, Cache, DecoderLayer, FeedForwardPolicy, LayerCache, ModelArgs,
         OperatorPolicy,
@@ -2100,10 +2097,6 @@ impl Lfm2LayerwiseAdapter {
     pub const fn args(&self) -> &ModelArgs {
         &self.args
     }
-
-    fn new_cache(&self) -> Cache {
-        Cache::new(&self.args).expect("validated LFM2 layer schedule")
-    }
 }
 
 fn lfm2_split_expert_recipes(
@@ -2240,142 +2233,21 @@ impl KeyValueCache for OffsetOnlyCache {
     }
 }
 
-impl LoadTimeQuantizableAdapter for Lfm2LayerwiseAdapter {
-    fn load_time_quantized(
-        &self,
-        quantization: WeightQuantization,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let mut args = self.args.clone();
-        args.weight_quantization = Some(quantization);
-        args.quantized_weights = None;
-        args.quantized_weight_configs = None;
-        let mut adapter = Self::new(args, stream)?;
-        adapter.sparse_expert_cache = self.sparse_expert_cache;
-        Ok(adapter)
-    }
-}
+impl Lfm2LayerwiseAdapter {}
 
-impl MlxArchitectureSemantics for Lfm2LayerwiseAdapter {
-    type Input<'a> = &'a Array;
-    type Cache = Cache;
-    type Layer = DecoderLayer;
-    type ForwardContext = Lfm2ForwardContext;
-
-    fn model_type(&self) -> &str {
+impl Lfm2LayerwiseAdapter {
+    pub(crate) fn model_type(&self) -> &str {
         &self.args.model_type
     }
 
-    fn safetensors_checkpoint_plan(
-        &self,
-    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
-        super::checkpoint::safetensors_plan(&self.args, true)
-            .map_err(Error::UnsupportedArchitecture)
-    }
-
-    fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
-        self.args.weight_quantization
-    }
-
-    fn prompt_cache_model_identity(
-        &self,
-        topology: Option<crate::backend::mlx::MlxParallelContext>,
-    ) -> Result<PromptCacheModelIdentity, Error> {
-        let layer_count = usize::try_from(self.args.num_hidden_layers)
-            .map_err(|_| Exception::custom("invalid LFM2 cache layer count"))?;
-        let geometry = match topology {
-            Some(topology) if topology.is_axis_active(crate::ParallelAxis::Tensor) => {
-                self.parallel_cache_geometry.clone().ok_or_else(|| {
-                    Error::Parallel(
-                        "LFM2 parallel cache identity requested before local layout configuration"
-                            .into(),
-                    )
-                })?
-            }
-            _ => self
-                .args
-                .layer_schedule
-                .iter()
-                .map(|policy| match policy.operator {
-                    OperatorPolicy::CausalConvolution => resident::Lfm2LayerCacheGeometry {
-                        kv_heads: None,
-                        convolution_channels: Some(self.args.hidden_size),
-                    },
-                    OperatorPolicy::SelfAttention(_) => resident::Lfm2LayerCacheGeometry {
-                        kv_heads: Some(self.args.num_key_value_heads),
-                        convolution_channels: None,
-                    },
-                })
-                .collect(),
-        };
-        Ok(PromptCacheModelIdentity {
-            model_family: "lfm2".into(),
-            effective_model_type: self.args.model_type.clone(),
-            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(&self.args),
-            layer_count,
-            global_layer_start: 0,
-            global_layer_end: layer_count,
-            sink_tokens: 0,
-            layer_prefix_offsets: vec![0; layer_count],
-            topology: topology.map_or_else(
-                PromptCacheTopology::default,
-                crate::backend::mlx::cache::prompt_cache_topology,
-            ),
-            layer_layout: resident::prompt_cache_layer_layout_with_geometry(&self.args, &geometry)
-                .map_err(|error| Exception::custom(error.to_string()))?,
-        })
-    }
-
-    fn save_prompt_cache(
-        &self,
-        cache: &mut Self::Cache,
-        destination: &Path,
-        descriptor: PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        options: &PromptCacheOptions,
-        stream: &Stream,
-    ) -> Result<PromptCacheManifest, Error> {
-        let rank = descriptor.topology.cache_rank_identity();
-        resident::Model::save_prompt_cache_with_rank(
-            cache,
-            destination,
-            descriptor,
-            prefix_token_ids,
-            options,
-            rank,
-            stream,
-        )
-        .map_err(Into::into)
-    }
-
-    fn load_prompt_cache(
-        &self,
-        directory: &Path,
-        expected: &PromptCacheDescriptor,
-        identity: &PromptCacheModelIdentity,
-        prefix_token_ids: &[u32],
-        _options: PagedCacheOptions,
-        stream: &Stream,
-    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
-        resident::Model::load_prompt_cache_with_identity(
-            &self.args,
-            directory,
-            expected,
-            prefix_token_ids,
-            identity.clone(),
-            stream,
-        )
-        .map_err(Into::into)
-    }
-
-    fn static_units(
+    pub(crate) fn static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
-    fn selected_static_units(
+    pub(crate) fn selected_static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
@@ -2422,123 +2294,7 @@ impl MlxArchitectureSemantics for Lfm2LayerwiseAdapter {
         Ok(units)
     }
 
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected = if self.lm_head.is_some() { 3 } else { 2 };
-        if leases.len() != expected {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "LFM2 adapter received {} static leases, expected {expected}",
-                leases.len()
-            )));
-        }
-        if let Some(v) = &mut self.parallel_embedding {
-            populate_module_from_lease(v.inner_mut(), &leases[0])?;
-        } else {
-            populate_module_from_lease(&mut self.embedding, &leases[0])?;
-        }
-        populate_module_from_lease(&mut self.norm, &leases[1])?;
-        if let Some(v) = &mut self.parallel_lm_head {
-            populate_module_from_lease(v.inner_mut(), &leases[2])?;
-        } else if let Some(head) = &mut self.lm_head {
-            populate_module_from_lease(head, &leases[2])?;
-        }
-        Ok(())
-    }
-
-    fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
-        if cache.layers.is_empty() {
-            *cache = self.new_cache();
-            return Ok(());
-        }
-        if cache.layers.len() != self.args.num_hidden_layers as usize {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "LFM2 cache has {} layers, expected {}",
-                cache.layers.len(),
-                self.args.num_hidden_layers
-            )));
-        }
-        for (index, layer_cache) in cache.layers.iter().enumerate() {
-            let policy = self.args.layer_schedule.get(index).ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "LFM2 layer schedule has no policy for layer {index}"
-                ))
-            })?;
-            let matches = matches!(
-                (policy.operator, layer_cache),
-                (OperatorPolicy::CausalConvolution, LayerCache::Conv(_))
-                    | (OperatorPolicy::SelfAttention(_), LayerCache::Attention(_))
-            );
-            if !matches {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "LFM2 cache kind does not match the layer schedule at layer {index}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        let hidden = self.embedding.forward(input, stream)?;
-        let mask = if hidden.dim(1) > 1 {
-            let offset_cache = vec![Some(OffsetOnlyCache(cache.offset()))];
-            match create_attention_mask(&hidden, &offset_cache, Some(true), stream)? {
-                Some(AttentionMask::Array(mask)) => Some(mask),
-                Some(AttentionMask::Causal) => {
-                    return Err(Error::UnsupportedArchitecture(
-                        "LFM2 requires an array causal mask".into(),
-                    ));
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        Ok(eredu_runtime::LayeredForwardState {
-            hidden,
-            context: Lfm2ForwardContext { mask },
-        })
-    }
-    fn begin_forward_with_execution<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        let Some(v) = &mut self.parallel_embedding else {
-            return self.begin_forward(input, cache, execution.stream());
-        };
-        let hidden = v.forward(input, execution)?;
-        let mask = if hidden.dim(1) > 1 {
-            let offset_cache = vec![Some(OffsetOnlyCache(cache.offset()))];
-            match create_attention_mask(&hidden, &offset_cache, Some(true), execution.stream())? {
-                Some(AttentionMask::Array(v)) => Some(v),
-                Some(AttentionMask::Causal) => {
-                    return Err(Error::UnsupportedArchitecture(
-                        "LFM2 requires an array causal mask".into(),
-                    ))
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        Ok(eredu_runtime::LayeredForwardState {
-            hidden,
-            context: Lfm2ForwardContext { mask },
-        })
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
-    }
-
-    fn layer_count(&self, group: usize) -> Result<usize, Error> {
+    pub(crate) fn layer_count(&self, group: usize) -> Result<usize, Error> {
         if group == 0 {
             Ok(self.args.num_hidden_layers as usize)
         } else {
@@ -2548,20 +2304,25 @@ impl MlxArchitectureSemantics for Lfm2LayerwiseAdapter {
         }
     }
 
-    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
+    pub(crate) fn new_layer(
+        &self,
+        group: usize,
+        index: usize,
+        stream: &Stream,
+    ) -> Result<DecoderLayer, Error> {
         self.layer_count(group)?;
         let index = i32::try_from(index)
             .map_err(|_| Error::UnsupportedArchitecture("LFM2 layer index exceeds i32".into()))?;
         DecoderLayer::new(&self.args, index, stream)
     }
 
-    fn new_expert_parallel_layer(
+    pub(crate) fn new_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<DecoderLayer, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
         if layer.feed_forward.is_moe {
             let prefix = format!("model.layers.{index}.feed_forward.experts");
@@ -2585,14 +2346,14 @@ impl MlxArchitectureSemantics for Lfm2LayerwiseAdapter {
         Ok(layer)
     }
 
-    fn new_tensor_expert_parallel_layer(
+    pub(crate) fn new_tensor_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<DecoderLayer, Error> {
         let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
         if layer.feed_forward.is_moe {
             let prefix = format!("model.layers.{index}.feed_forward.experts");
@@ -2622,7 +2383,7 @@ impl MlxArchitectureSemantics for Lfm2LayerwiseAdapter {
         Ok(layer)
     }
 
-    fn expert_parallel_assignment(
+    pub(crate) fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
@@ -2643,7 +2404,7 @@ impl MlxArchitectureSemantics for Lfm2LayerwiseAdapter {
             )?,
         ))
     }
-    fn register_parallel_parameters(
+    pub(crate) fn register_parallel_parameters(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
@@ -2680,70 +2441,13 @@ impl MlxArchitectureSemantics for Lfm2LayerwiseAdapter {
         }
         Ok(())
     }
-    fn configure_parallel_static(
-        &mut self,
-        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &eredu_runtime::LocalModelLayout,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let head_dim = self.args.hidden_size / self.args.num_attention_heads;
-        let kv_heads = planned_optional_kv_head_layout(
-            layout,
-            self.args
-                .layer_schedule
-                .iter()
-                .map(|policy| matches!(policy.operator, OperatorPolicy::SelfAttention(_))),
-            head_dim,
-            "model.layers",
-        )?;
-        let convolution_channels = planned_optional_partition_widths(
-            layout,
-            self.args
-                .layer_schedule
-                .iter()
-                .map(|policy| policy.operator == OperatorPolicy::CausalConvolution),
-            1,
-            "model.layers",
-            "conv.conv",
-        )?;
-        self.parallel_cache_geometry = Some(
-            kv_heads
-                .into_iter()
-                .zip(convolution_channels)
-                .map(
-                    |(kv_heads, convolution_channels)| resident::Lfm2LayerCacheGeometry {
-                        kv_heads,
-                        convolution_channels,
-                    },
-                )
-                .collect(),
-        );
-        self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
-            self.args.vocab_size as usize,
-            self.args.hidden_size,
-            self.args
-                .weight_quantization_for("model.embed_tokens.weight"),
-            context,
-            stream,
-        )?);
-        if self.lm_head.is_some() {
-            self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
-                self.args.hidden_size,
-                self.args.vocab_size as usize,
-                self.args.weight_quantization_for("lm_head.weight"),
-                context,
-                stream,
-            )?);
-        }
-        Ok(())
-    }
-    fn new_parallel_layer(
+    pub(crate) fn new_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<DecoderLayer, Error> {
         self.layer_count(group)?;
         let prefix = format!("model.layers.{index}");
         let find = |n: &str| {
@@ -2812,46 +2516,24 @@ impl MlxArchitectureSemantics for Lfm2LayerwiseAdapter {
         )
     }
 
-    fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
+    pub(crate) fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
         format!("model.layers.{index}")
     }
 
-    fn layer_unit_name(&self, _group: usize, index: usize) -> String {
-        format!("lfm2.layer.{index:05}")
-    }
-
-    fn populate_layer(
-        &self,
-        _group: usize,
-        _index: usize,
-        layer: &mut Self::Layer,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        if self.sparse_expert_cache {
-            Ok(populate_module_from_lease_excluding(
-                layer,
-                lease,
-                |name| name.starts_with("feed_forward.experts."),
-            )?)
-        } else {
-            Ok(populate_module_from_lease(layer, lease)?)
-        }
-    }
-
-    fn layer_bindings(
+    pub(crate) fn layer_bindings(
         &self,
         _group: usize,
         index: usize,
-        layer: &Self::Layer,
+        layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         lfm2_unit_bindings(&self.args, index, layer, store, self.sparse_expert_cache)
     }
-    fn parallel_layer_bindings(
+    pub(crate) fn parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
@@ -2865,11 +2547,11 @@ impl MlxArchitectureSemantics for Lfm2LayerwiseAdapter {
         )
     }
 
-    fn expert_parallel_layer_bindings(
+    pub(crate) fn expert_parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
@@ -2897,206 +2579,79 @@ impl MlxArchitectureSemantics for Lfm2LayerwiseAdapter {
             .collect()
     }
 
-    fn additional_consumed_checkpoint_keys(
+    pub(crate) fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
+        true
+    }
+
+    pub(crate) fn new_cartesian_layer(
         &self,
+        group: usize,
+        index: usize,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<DecoderLayer, Error> {
+        match (layout, assignment) {
+            (None, None) => self.new_layer(group, index, stream),
+            (Some(layout), None) => self.new_parallel_layer(group, index, layout, stream),
+            (None, Some(assignment)) => {
+                self.new_expert_parallel_layer(group, index, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => {
+                self.new_tensor_expert_parallel_layer(group, index, layout, assignment, stream)
+            }
+        }
+    }
+
+    pub(crate) fn tensor_expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Vec<String> {
-        if self.sparse_expert_cache {
-            store
-                .source_keys()
-                .into_iter()
-                .filter(|key| key.contains(".feed_forward.experts."))
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn forward_layer(
-        &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        layout: &eredu_runtime::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.layer_count(group)?;
-        let policy = self.args.layer_policy(index).ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
-                "LFM2 layer schedule has no policy for layer {index}"
-            ))
-        })?;
-        if self.sparse_expert_cache && policy.feed_forward == FeedForwardPolicy::SparseMoe {
-            let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "LFM2 sparse expert cache was not initialized".into(),
-                )
-            })?;
-            let pass = if hidden.dim(1) > 1 {
-                ExpertPass::Prefill
-            } else {
-                ExpertPass::Decode
-            };
-            return Ok(layer.forward_with_expert_executor(
-                hidden,
-                context.mask.as_ref(),
-                Some(&mut cache.layers[index]),
-                stream,
-                |flat, indices, weights, stream| {
-                    expert_cache
-                        .execute_routes_bounded(
-                            ExpertRouteBatch::new(index, flat, indices, weights, pass),
-                            stream,
-                            |flat, acquired, weights, stream| {
-                                let started = Instant::now();
-                                let prefix = format!("model.layers.{index}.feed_forward.experts");
-                                let load_time = expert_cache.weight_quantization();
-                                let mut bank = PackedSwiGluExperts::new(
-                                    acquired.identities().len() as i32,
-                                    self.args.hidden_size,
-                                    self.args.moe_intermediate_size,
-                                    load_time.or_else(|| {
-                                        self.args.weight_quantization_for(&format!(
-                                            "{prefix}.gate_up_proj"
-                                        ))
-                                    }),
-                                    load_time.or_else(|| {
-                                        self.args
-                                            .weight_quantization_for(&format!("{prefix}.down_proj"))
-                                    }),
-                                    stream,
-                                )?;
-                                bank.gate_up_proj = Param::new(
-                                    acquired
-                                        .compact_binding("gate_up_proj", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj = Param::new(
-                                    acquired
-                                        .compact_binding("down_proj", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.gate_up_proj_scales = Param::new(
-                                    acquired
-                                        .optional_compact_binding("gate_up_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.gate_up_proj_biases = Param::new(
-                                    acquired
-                                        .optional_compact_binding("gate_up_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj_scales = Param::new(
-                                    acquired
-                                        .optional_compact_binding("down_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj_biases = Param::new(
-                                    acquired
-                                        .optional_compact_binding("down_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                expert_cache.record_compact_bank(
-                                    pass,
-                                    acquired.scratch_bytes(),
-                                    started.elapsed(),
-                                )?;
-                                Ok(bank.forward(
-                                    flat,
-                                    acquired.compact_routes(),
-                                    weights,
-                                    stream,
-                                )?)
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))
-                },
-            )?);
-        }
-        Ok(layer.forward(
-            hidden,
-            context.mask.as_ref(),
-            Some(&mut cache.layers[index]),
-            stream,
-        )?)
-    }
-    fn forward_layer_with_execution(
-        &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        let Some(tp_group) = execution.group() else {
-            return self.forward_layer(
-                group,
-                index,
-                layer,
-                hidden,
-                cache,
-                context,
-                execution.stream(),
-            );
-        };
-        self.layer_count(group)?;
-        Ok(layer.forward_tensor_parallel(
-            hidden,
-            context.mask.as_ref(),
-            Some(&mut cache.layers[index]),
-            tp_group,
-            execution.stream(),
-        )?)
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let bindings =
+            self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
+        shard_layer_bindings(
+            bindings,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            layout,
+        )
     }
 
-    fn retained_arrays<'a>(
+    pub(crate) fn cartesian_layer_bindings(
         &self,
-        cache: &'a Self::Cache,
-        _group: usize,
+        group: usize,
         index: usize,
-    ) -> Vec<&'a Array> {
-        cache.layers[index].retained_arrays()
-    }
-
-    fn finish(
-        &mut self,
-        hidden: &Array,
-        _cache: &mut Self::Cache,
-        _context: &Self::ForwardContext,
+        layer: &DecoderLayer,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
-    ) -> Result<Array, Error> {
-        let hidden = self.norm.forward(hidden, stream)?;
-        Ok(project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.embedding,
-            &hidden,
-            stream,
-        )?)
-    }
-    fn finish_with_execution(
-        &mut self,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        let Some(embedding) = &mut self.parallel_embedding else {
-            return self.finish(hidden, cache, context, execution.stream());
-        };
-        let hidden = self.norm.forward(hidden, execution.stream())?;
-        let logits = match &mut self.parallel_lm_head {
-            Some(head) => head.forward(&hidden, execution)?,
-            None => embedding.project_logits(&hidden, execution)?,
-        };
-        logits.all_gather(execution)
+    ) -> Result<Vec<WeightBinding>, Error> {
+        match (layout, assignment) {
+            (None, None) => {
+                // The execution layer can have transformed target geometry
+                // (for example load-time affine quantization). Bindings must
+                // continue to describe the adapter's source checkpoint
+                // geometry and are transformed only during population.
+                let source = self.new_layer(group, index, stream)?;
+                self.layer_bindings(group, index, &source, store)
+            }
+            (Some(layout), None) => {
+                self.parallel_layer_bindings(group, index, layer, store, layout, stream)
+            }
+            (None, Some(assignment)) => {
+                self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => self.tensor_expert_parallel_layer_bindings(
+                group, index, layer, store, layout, assignment, stream,
+            ),
+        }
     }
 }
 

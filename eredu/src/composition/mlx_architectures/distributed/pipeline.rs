@@ -83,9 +83,8 @@ use crate::{
         ParallelBuildContext, ParallelExecutionContext,
     },
     backend::mlx::runtime::execution::layerwise::{
-        open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
-        DenseStreamController, DenseTransferWindow, LoadTimeQuantizableAdapter,
-        MlxArchitectureSemantics, PipelineStageQuantizationSelection,
+        open_safetensors_weight_store, quantize_pipeline_stage_store_with, shard_layer_bindings,
+        DenseStreamController, DenseTransferWindow, PipelineStageQuantizationSelection,
     },
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
@@ -160,6 +159,128 @@ fn new_llama_block(
     eredu_architectures::llama::TransformerBlock::<MlxBackend>::new(args, layer, stream)
         .map(MlxModule::new)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
+/// Cold-path checkpoint capabilities needed while assembling a pipeline stage.
+///
+/// This deliberately excludes forward execution, cache semantics, and residency
+/// policy: those remain architecture-owned or backend-neutral runtime concerns.
+trait PipelineQuantizationAdapter {
+    type Layer: ModuleParameters;
+
+    fn model_type(&self) -> &str;
+    fn static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error>;
+    fn selected_static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        select: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<StaticUnitBindings>, Error>;
+    fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool;
+    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error>;
+    fn layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &Self::Layer,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<WeightBinding>, Error>;
+}
+
+macro_rules! impl_pipeline_quantization_adapter {
+    ($adapter:ty, $layer:ty) => {
+        impl PipelineQuantizationAdapter for $adapter {
+            type Layer = $layer;
+
+            fn model_type(&self) -> &str {
+                <$adapter>::model_type(self)
+            }
+
+            fn static_units(
+                &self,
+                store: &dyn eredu_checkpoint::store::CheckpointSource,
+            ) -> Result<Vec<StaticUnitBindings>, Error> {
+                <$adapter>::static_units(self, store)
+            }
+
+            fn selected_static_units(
+                &self,
+                store: &dyn eredu_checkpoint::store::CheckpointSource,
+                select: &dyn Fn(&str) -> bool,
+            ) -> Result<Vec<StaticUnitBindings>, Error> {
+                <$adapter>::selected_static_units(self, store, select)
+            }
+
+            fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
+                <$adapter>::quantizes_static_binding(self, binding)
+            }
+
+            fn new_layer(
+                &self,
+                group: usize,
+                index: usize,
+                stream: &Stream,
+            ) -> Result<Self::Layer, Error> {
+                <$adapter>::new_layer(self, group, index, stream)
+            }
+
+            fn layer_bindings(
+                &self,
+                group: usize,
+                index: usize,
+                layer: &Self::Layer,
+                store: &dyn eredu_checkpoint::store::CheckpointSource,
+            ) -> Result<Vec<WeightBinding>, Error> {
+                <$adapter>::layer_bindings(self, group, index, layer, store)
+            }
+        }
+    };
+}
+
+impl_pipeline_quantization_adapter!(MuseGlimmerLayerwiseAdapter, MuseGlimmerLayer);
+impl_pipeline_quantization_adapter!(
+    crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter,
+    deepseek_v3::DecoderLayer
+);
+impl_pipeline_quantization_adapter!(KimiLinearLayerwiseAdapter, kimi_linear::DecoderLayer);
+impl_pipeline_quantization_adapter!(DeepSeekV4LayerwiseAdapter, deepseek_v4::DecoderLayer);
+impl_pipeline_quantization_adapter!(QwenHybridLayerwiseAdapter, QwenHybridLayer);
+impl_pipeline_quantization_adapter!(Qwen3VlLayerwiseAdapter, Qwen3VlLayer);
+impl_pipeline_quantization_adapter!(
+    dense_qwen::layerwise::DenseQwenLayerwiseAdapter,
+    dense_qwen::TransformerBlock
+);
+impl_pipeline_quantization_adapter!(Lfm2LayerwiseAdapter, lfm2::DecoderLayer);
+impl_pipeline_quantization_adapter!(Gemma4LayerwiseAdapter, Gemma4Layer);
+impl_pipeline_quantization_adapter!(NemotronHLayerwiseAdapter, nemotron_h::TransformerBlock);
+impl_pipeline_quantization_adapter!(InklingLayerwiseAdapter, InklingLayer);
+impl_pipeline_quantization_adapter!(
+    crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter,
+    gpt_oss::TransformerBlock
+);
+
+fn quantize_pipeline_stage_store<A: PipelineQuantizationAdapter>(
+    store: SharedCheckpointSource,
+    source: &A,
+    target: &A,
+    selection: PipelineStageQuantizationSelection<'_>,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error> {
+    quantize_pipeline_stage_store_with(
+        store,
+        selection,
+        quantization,
+        stream,
+        source.model_type(),
+        |store| source.static_units(store),
+        |binding| target.quantizes_static_binding(binding),
+        |group, index, stream| source.new_layer(group, index, stream),
+        |group, index, stream| target.new_layer(group, index, stream),
+        |group, index, layer, store| source.layer_bindings(group, index, layer, store),
+    )
 }
 
 fn build_pipeline_expert_cache(
@@ -7767,7 +7888,7 @@ fn selected_pipeline_static_roles(
 /// Exact whole-artifact admission is performed once by the shared structural
 /// plan before dispatch. This function deliberately selects only stage-owned
 /// static modules and never reconstructs a second namespace validator.
-fn pipeline_binding_units<A: MlxArchitectureSemantics>(
+fn pipeline_binding_units<A: PipelineQuantizationAdapter>(
     adapter: &A,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     roles: &[&str],

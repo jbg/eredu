@@ -51,8 +51,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes,
         build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
-        packed_companion_checkpoint_name, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        packed_companion_checkpoint_name,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{
@@ -73,14 +72,13 @@ use crate::{
         },
         layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
+            shard_layer_bindings,
         },
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx_architectures::nemotron_h::model::{
         self as resident, BlockInput, Cache, Experts, LayerCache, LayerPolicy, ModelArgs,
         TransformerBlock,
@@ -1643,7 +1641,7 @@ impl NemotronHLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
+    pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
         self.execution.checkpoint_store()
     }
 
@@ -3388,8 +3386,8 @@ impl KeyValueCache for OffsetOnlyCache {
     }
 }
 
-impl LoadTimeQuantizableAdapter for NemotronHLayerwiseAdapter {
-    fn load_time_quantized(
+impl NemotronHLayerwiseAdapter {
+    pub(crate) fn load_time_quantized(
         &self,
         quantization: WeightQuantization,
         stream: &Stream,
@@ -3404,27 +3402,18 @@ impl LoadTimeQuantizableAdapter for NemotronHLayerwiseAdapter {
     }
 }
 
-impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
-    type Input<'a> = &'a Array;
-    type Cache = Cache;
-    type Layer = TransformerBlock;
-    type ForwardContext = NemotronHForwardContext;
-
-    fn model_type(&self) -> &str {
+impl NemotronHLayerwiseAdapter {
+    pub(crate) fn model_type(&self) -> &str {
         &self.args.model_type
     }
 
-    fn safetensors_checkpoint_plan(
+    pub(crate) fn safetensors_checkpoint_plan(
         &self,
     ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
         super::checkpoint::safetensors_plan(&self.args).map_err(Error::UnsupportedArchitecture)
     }
 
-    fn quantization(&self) -> Option<WeightQuantization> {
-        self.args.quantization
-    }
-
-    fn prompt_cache_model_identity(
+    pub(crate) fn prompt_cache_model_identity(
         &self,
         topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
@@ -3459,9 +3448,9 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         })
     }
 
-    fn save_prompt_cache(
+    pub(crate) fn save_prompt_cache(
         &self,
-        cache: &mut Self::Cache,
+        cache: &mut Cache,
         destination: &Path,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
@@ -3481,7 +3470,7 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn load_prompt_cache(
+    pub(crate) fn load_prompt_cache(
         &self,
         directory: &Path,
         expected: &PromptCacheDescriptor,
@@ -3489,7 +3478,7 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
         stream: &Stream,
-    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
         resident::Model::load_paged_prompt_cache_with_identity(
             &self.args,
             directory,
@@ -3502,14 +3491,14 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn static_units(
+    pub(crate) fn static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
-    fn selected_static_units(
+    pub(crate) fn selected_static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
@@ -3571,41 +3560,7 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         Ok(units)
     }
 
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected = 2 + usize::from(self.lm_head.is_some()) + usize::from(self.mtp.is_some());
-        if leases.len() != expected {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Nemotron-H adapter received {} static leases, expected {expected}",
-                leases.len()
-            )));
-        }
-        if let Some(v) = &mut self.parallel_embedding {
-            populate_module_from_lease(v.inner_mut(), &leases[0])?;
-        } else {
-            populate_module_from_lease(&mut self.embeddings, &leases[0])?;
-        }
-        populate_module_from_lease(&mut self.norm, &leases[1])?;
-        let mut index = 2;
-        if let Some(v) = &mut self.parallel_lm_head {
-            populate_module_from_lease(v.inner_mut(), &leases[index])?;
-            index += 1;
-        } else if let Some(head) = &mut self.lm_head {
-            populate_module_from_lease(head, &leases[index])?;
-            index += 1;
-        }
-        if let Some(mtp) = &mut self.mtp {
-            if self.sparse_expert_cache {
-                populate_module_from_lease_excluding(mtp, &leases[index], |name| {
-                    name.contains(".moe.experts.")
-                })?;
-            } else {
-                populate_module_from_lease(mtp, &leases[index])?;
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
+    pub(crate) fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
         if cache.layers.is_empty() {
             *cache = self.new_cache();
             return Ok(());
@@ -3642,12 +3597,12 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         Ok(())
     }
 
-    fn begin_forward<'a>(
+    pub(crate) fn begin_forward<'a>(
         &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
+        input: &'a Array,
+        cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, NemotronHForwardContext>, Error> {
         let hidden = self.embeddings.forward(input, stream)?;
         let mask = if hidden.dim(1) > 1 {
             let offset_cache = vec![Some(OffsetOnlyCache(cache.offset()))];
@@ -3671,14 +3626,14 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
             },
         })
     }
-    fn begin_forward_with_execution<'a>(
+    pub(crate) fn begin_forward_with_execution<'a>(
         &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
+        input: &'a Array,
+        cache: &mut Cache,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, NemotronHForwardContext>, Error> {
         let Some(v) = &mut self.parallel_embedding else {
             return self.begin_forward(input, cache, execution.stream());
         };
@@ -3706,11 +3661,11 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         })
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
+    pub(crate) fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
         eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
     }
 
-    fn layer_count(&self, group: usize) -> Result<usize, Error> {
+    pub(crate) fn layer_count(&self, group: usize) -> Result<usize, Error> {
         if group == 0 {
             Ok(self.args.num_hidden_layers as usize)
         } else {
@@ -3720,18 +3675,23 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         }
     }
 
-    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
+    pub(crate) fn new_layer(
+        &self,
+        group: usize,
+        index: usize,
+        stream: &Stream,
+    ) -> Result<TransformerBlock, Error> {
         self.layer_count(group)?;
         TransformerBlock::new(&self.args, index, stream)
     }
 
-    fn new_expert_parallel_layer(
+    pub(crate) fn new_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<TransformerBlock, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
         if let Some(moe) = &mut layer.moe {
             let prefix = format!("model.layers.{index}.moe.experts");
@@ -3758,14 +3718,14 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         Ok(layer)
     }
 
-    fn new_tensor_expert_parallel_layer(
+    pub(crate) fn new_tensor_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<TransformerBlock, Error> {
         let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
         if let Some(moe) = &mut layer.moe {
             let prefix = format!("model.layers.{index}.moe.experts");
@@ -3793,7 +3753,7 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         Ok(layer)
     }
 
-    fn expert_parallel_assignment(
+    pub(crate) fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
@@ -3819,7 +3779,7 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
             )?,
         ))
     }
-    fn register_parallel_parameters(
+    pub(crate) fn register_parallel_parameters(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
@@ -3887,7 +3847,7 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         }
         Ok(())
     }
-    fn configure_parallel_static(
+    pub(crate) fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         layout: &eredu_runtime::LocalModelLayout,
@@ -4004,13 +3964,13 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         }
         Ok(())
     }
-    fn new_parallel_layer(
+    pub(crate) fn new_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<TransformerBlock, Error> {
         self.layer_count(group)?;
         let _ = layout;
         let geometry = self
@@ -4026,37 +3986,15 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         TransformerBlock::new_parallel_layerwise(&self.args, index, geometry, stream)
     }
 
-    fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
+    pub(crate) fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
         format!("model.layers.{index}")
     }
 
-    fn layer_unit_name(&self, _group: usize, index: usize) -> String {
-        format!("nemotron_h.layer.{index:05}")
-    }
-
-    fn populate_layer(
-        &self,
-        _group: usize,
-        _index: usize,
-        layer: &mut Self::Layer,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        if self.sparse_expert_cache {
-            Ok(populate_module_from_lease_excluding(
-                layer,
-                lease,
-                |name| name.starts_with("moe.experts."),
-            )?)
-        } else {
-            Ok(populate_module_from_lease(layer, lease)?)
-        }
-    }
-
-    fn layer_bindings(
+    pub(crate) fn layer_bindings(
         &self,
         _group: usize,
         index: usize,
-        layer: &Self::Layer,
+        layer: &TransformerBlock,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = format!("model.layers.{index}");
@@ -4089,11 +4027,11 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
             })
             .collect()
     }
-    fn parallel_layer_bindings(
+    pub(crate) fn parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &TransformerBlock,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
@@ -4107,11 +4045,11 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         )
     }
 
-    fn expert_parallel_layer_bindings(
+    pub(crate) fn expert_parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &TransformerBlock,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
@@ -4139,29 +4077,14 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
             .collect()
     }
 
-    fn additional_consumed_checkpoint_keys(
-        &self,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Vec<String> {
-        if self.sparse_expert_cache {
-            store
-                .source_keys()
-                .into_iter()
-                .filter(|key| key.contains(".experts."))
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn forward_layer(
+    pub(crate) fn forward_layer(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut TransformerBlock,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut NemotronHForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.layer_count(group)?;
@@ -4206,14 +4129,14 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
             stream,
         )?)
     }
-    fn forward_layer_with_execution(
+    pub(crate) fn forward_layer_with_execution(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut TransformerBlock,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut NemotronHForwardContext,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
@@ -4241,21 +4164,12 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         )?)
     }
 
-    fn retained_arrays<'a>(
-        &self,
-        cache: &'a Self::Cache,
-        _group: usize,
-        index: usize,
-    ) -> Vec<&'a Array> {
-        cache.layers[index].retained_arrays()
-    }
-
-    fn complete_execution_group(
+    pub(crate) fn complete_execution_group(
         &mut self,
         group: usize,
         hidden: &Array,
-        _cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        _cache: &mut Cache,
+        context: &mut NemotronHForwardContext,
         _stream: &Stream,
     ) -> Result<Array, Error> {
         self.layer_count(group)?;
@@ -4263,11 +4177,11 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
         Ok(hidden.clone())
     }
 
-    fn finish(
+    pub(crate) fn finish(
         &mut self,
         hidden: &Array,
-        _cache: &mut Self::Cache,
-        _context: &Self::ForwardContext,
+        _cache: &mut Cache,
+        _context: &NemotronHForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let hidden = self.norm.forward(hidden, stream)?;
@@ -4278,11 +4192,11 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
             stream,
         )?)
     }
-    fn finish_with_execution(
+    pub(crate) fn finish_with_execution(
         &mut self,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &Self::ForwardContext,
+        cache: &mut Cache,
+        context: &NemotronHForwardContext,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
@@ -4296,6 +4210,81 @@ impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
             None => embedding.project_logits(&hidden, execution)?,
         };
         logits.all_gather(execution)
+    }
+
+    pub(crate) fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
+        true
+    }
+
+    pub(crate) fn new_cartesian_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<TransformerBlock, Error> {
+        match (layout, assignment) {
+            (None, None) => self.new_layer(group, index, stream),
+            (Some(layout), None) => self.new_parallel_layer(group, index, layout, stream),
+            (None, Some(assignment)) => {
+                self.new_expert_parallel_layer(group, index, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => {
+                self.new_tensor_expert_parallel_layer(group, index, layout, assignment, stream)
+            }
+        }
+    }
+
+    pub(crate) fn tensor_expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &TransformerBlock,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: &eredu_runtime::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let bindings =
+            self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
+        shard_layer_bindings(
+            bindings,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            layout,
+        )
+    }
+
+    pub(crate) fn cartesian_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &TransformerBlock,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        match (layout, assignment) {
+            (None, None) => {
+                // The execution layer can have transformed target geometry
+                // (for example load-time affine quantization). Bindings must
+                // continue to describe the adapter's source checkpoint
+                // geometry and are transformed only during population.
+                let source = self.new_layer(group, index, stream)?;
+                self.layer_bindings(group, index, &source, store)
+            }
+            (Some(layout), None) => {
+                self.parallel_layer_bindings(group, index, layer, store, layout, stream)
+            }
+            (None, Some(assignment)) => {
+                self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => self.tensor_expert_parallel_layer_bindings(
+                group, index, layer, store, layout, assignment, stream,
+            ),
+        }
     }
 }
 

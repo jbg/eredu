@@ -19,22 +19,17 @@ use std::{
 
 use safemlx::{module::ModuleParameters, Array, Stream};
 
-use crate::core::cache::{
-    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-};
 
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::binding::{
-        binding_bytes, build_module_bindings, is_materialized_module_parameter,
-        populate_module_from_lease, ModuleBindingError,
+        binding_bytes, build_module_bindings, is_materialized_module_parameter, ModuleBindingError,
     },
     backend::mlx::runtime::checkpoint::bounded_quantization::{
         BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
     },
     backend::mlx::runtime::checkpoint::recipe::RecipeDtype,
     backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
-    backend::mlx::runtime::execution::inspection::ActivationObserver,
     backend::mlx::runtime::residency::dense_stream::BackgroundLayerPrefetch,
     backend::mlx::runtime::residency::manager::{
         ResidencyError, ResidencyManager, ResidentTransfer, ResidentUnitLease,
@@ -44,7 +39,6 @@ use crate::{
         ResidencyPolicy,
     },
 };
-use eredu_runtime::PagedCacheOptions;
 
 use eredu_runtime::WeightMaterializationReport;
 
@@ -420,647 +414,6 @@ impl Drop for DenseStreamGroupGuard {
     }
 }
 
-use eredu_runtime::ExecutionGraph;
-
-/// Architecture contract for resident, bounded-residency, and distributed
-/// execution.
-///
-/// Heterogeneous caches, architecture-specific inputs, multiple execution
-/// groups, and retained recurrent state are represented directly rather than
-/// being forced into a decoder-only KV-cache interface.
-pub(crate) trait MlxArchitectureSemantics: Sized {
-    /// Borrowed family-specific forward input.
-    type Input<'a>;
-    /// Complete architecture-owned cache and recurrent state.
-    type Cache;
-    /// Runtime execution unit. Families with heterogeneous blocks may use an enum.
-    type Layer: ModuleParameters;
-    /// Masks, positions, prepared media, or other per-forward state.
-    type ForwardContext;
-
-    /// Stable architecture identity used by residency metadata.
-    fn model_type(&self) -> &str {
-        std::any::type_name::<Self>()
-    }
-
-    /// Returns the architecture-owned physical contract used to resolve the
-    /// SafeTensors store before any binding recipe is inferred or materialized.
-    fn safetensors_checkpoint_plan(
-        &self,
-    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error>;
-
-    /// Model-wide checkpoint quantization, when one uniform encoding exists.
-    fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
-        None
-    }
-
-    /// Returns whether a floating static matrix is represented by a packed
-    /// parameter group in this adapter. Multimodal adapters override this for
-    /// checkpoint components whose target modules intentionally stay dense.
-    fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
-        true
-    }
-
-    /// Returns the exact cache compatibility identity for replicated or
-    /// rank-local parallel execution.
-    fn prompt_cache_model_identity(
-        &self,
-        _topology: Option<crate::backend::mlx::MlxParallelContext>,
-    ) -> Result<PromptCacheModelIdentity, Error> {
-        Err(Error::Parallel(format!(
-            "architecture adapter {} has not declared a prompt-cache identity",
-            std::any::type_name::<Self>()
-        )))
-    }
-
-    /// Persists a validated architecture-owned cache.
-    #[allow(clippy::too_many_arguments)]
-    fn save_prompt_cache(
-        &self,
-        _cache: &mut Self::Cache,
-        _destination: &Path,
-        _descriptor: PromptCacheDescriptor,
-        _prefix_token_ids: &[u32],
-        _options: &PromptCacheOptions,
-        _stream: &Stream,
-    ) -> Result<PromptCacheManifest, Error> {
-        Err(Error::Parallel(format!(
-            "architecture adapter {} has not implemented prompt-cache persistence",
-            std::any::type_name::<Self>()
-        )))
-    }
-
-    /// Restores a validated architecture-owned cache.
-    #[allow(clippy::too_many_arguments)]
-    fn load_prompt_cache(
-        &self,
-        _directory: &Path,
-        _expected: &PromptCacheDescriptor,
-        _identity: &PromptCacheModelIdentity,
-        _prefix_token_ids: &[u32],
-        _options: PagedCacheOptions,
-        _stream: &Stream,
-    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
-        Err(Error::Parallel(format!(
-            "architecture adapter {} has not implemented prompt-cache restoration",
-            std::any::type_name::<Self>()
-        )))
-    }
-
-    /// Builds bindings for modules that remain pinned on the execution device.
-    fn static_units(
-        &self,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<Vec<StaticUnitBindings>, Error>;
-
-    /// Builds only static units selected by their stable architecture id.
-    ///
-    /// Adapters should override this when binding construction consults a
-    /// sharded store, so distributed stages do not open unowned static shards.
-    fn selected_static_units(
-        &self,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-        select: &dyn Fn(&str) -> bool,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        Ok(self
-            .static_units(store)?
-            .into_iter()
-            .filter(|unit| select(unit.id().as_str()))
-            .collect())
-    }
-
-    /// Assigns pinned leases to the adapter's static modules.
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error>;
-
-    /// Validates or initializes the complete cache before any weight lease is acquired.
-    fn validate_cache(&self, cache: &mut Self::Cache) -> Result<(), Error>;
-
-    /// Embeds or prepares the input and creates family-owned forward context.
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error>;
-
-    /// Embeds or prepares input under an explicit execution context.
-    fn begin_forward_with_execution<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        self.begin_forward(input, cache, execution.stream())
-    }
-
-    /// Declares the complete named execution-group dependency graph.
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error>;
-
-    /// Returns whether a group is needed for this particular forward pass.
-    ///
-    /// This lets multimodal adapters skip vision groups during text-only decode.
-    fn should_execute_group(&self, _group: usize, _context: &Self::ForwardContext) -> bool {
-        true
-    }
-
-    /// Returns the number of ordered units in one group.
-    fn layer_count(&self, group: usize) -> Result<usize, Error>;
-
-    /// Creates a metadata-only runtime unit for one group position.
-    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error>;
-
-    /// Describes this architecture's physical checkpoint tensors using typed
-    /// logical roles for tensor-parallel planning.
-    ///
-    /// Adapters without an exact tensor-parallel parameter plan fail closed.
-    fn parallel_parameter_groups(
-        &self,
-        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-    ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, Error> {
-        Err(Error::Parallel(format!(
-            "architecture adapter {} has not declared tensor-parallel parameter roles",
-            std::any::type_name::<Self>()
-        )))
-    }
-
-    /// Registers placement for streamed and pinned parameters. Composite
-    /// adapters can override this to reuse the planners of their nested model
-    /// families instead of duplicating parameter-name logic.
-    fn register_parallel_parameters(
-        &self,
-        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
-        _stream: &Stream,
-    ) -> Result<(), Error> {
-        for group in self.parallel_parameter_groups(context)? {
-            planner.register(group)?;
-        }
-        Ok(())
-    }
-
-    /// Rebuilds pinned modules whose parameter geometry is rank-local.
-    ///
-    /// The loader captures the global static bindings before invoking this
-    /// hook, then applies the typed layout to those bindings before residency
-    /// initialization.
-    fn configure_parallel_static(
-        &mut self,
-        _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &eredu_runtime::LocalModelLayout,
-        _stream: &Stream,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-
-    /// Creates a rank-local runtime unit from planned model geometry.
-    fn new_parallel_layer(
-        &self,
-        _group: usize,
-        _index: usize,
-        _layout: &eredu_runtime::LocalModelLayout,
-        _stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
-        Err(Error::Parallel(format!(
-            "architecture adapter {} has not implemented rank-local layer construction",
-            std::any::type_name::<Self>()
-        )))
-    }
-
-    /// Creates a rank-local runtime unit whose routed experts follow an
-    /// authoritative expert assignment.
-    ///
-    /// Architectures supporting PP+EP implement this hook instead of exposing
-    /// expert-bank representation details to the pipeline runtime.
-    fn new_expert_parallel_layer(
-        &self,
-        _group: usize,
-        _index: usize,
-        _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
-        _stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
-        Err(Error::Parallel(format!(
-            "architecture adapter {} has not implemented expert-local layer construction",
-            std::any::type_name::<Self>()
-        )))
-    }
-
-    /// Creates a layer whose ordinary projections follow the TP layout while
-    /// routed experts are restricted to the authoritative EP assignment.
-    ///
-    /// Architectures opt into triple-axis execution by implementing this one
-    /// semantic composition point; pipeline placement remains external.
-    fn new_tensor_expert_parallel_layer(
-        &self,
-        _group: usize,
-        _index: usize,
-        _layout: &eredu_runtime::LocalModelLayout,
-        _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
-        _stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
-        Err(Error::Parallel(format!(
-            "architecture adapter {} has not implemented combined tensor/expert-local layer construction",
-            std::any::type_name::<Self>()
-        )))
-    }
-
-    /// Derives this rank's expert ownership from architecture metadata and the
-    /// authoritative Cartesian topology.
-    ///
-    /// The default accepts an inactive EP axis and fails closed otherwise.
-    fn expert_parallel_assignment(
-        &self,
-        topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
-    {
-        if topology.expert_parallel_size > 1 {
-            Err(Error::Parallel(format!(
-                "architecture adapter {} has not declared expert ownership for EP size {}",
-                std::any::type_name::<Self>(),
-                topology.expert_parallel_size
-            )))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Creates one runtime unit for replicated, TP-local, or EP-local
-    /// execution from shared semantic inputs.
-    ///
-    /// Architecture adapters own the semantic composition of simultaneous TP
-    /// and EP; PP remains the outer selection of execution units.
-    fn new_cartesian_layer(
-        &self,
-        group: usize,
-        index: usize,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
-        stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
-        match (layout, assignment) {
-            (None, None) => self.new_layer(group, index, stream),
-            (Some(layout), None) => self.new_parallel_layer(group, index, layout, stream),
-            (None, Some(assignment)) => {
-                self.new_expert_parallel_layer(group, index, assignment, stream)
-            }
-            (Some(layout), Some(assignment)) => {
-                self.new_tensor_expert_parallel_layer(group, index, layout, assignment, stream)
-            }
-        }
-    }
-
-    /// Returns the checkpoint prefix for one runtime unit.
-    fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String;
-
-    /// Returns the stable residency unit name for one runtime unit.
-    fn layer_unit_name(&self, group: usize, index: usize) -> String;
-    /// Populates one temporary execution unit from its protected lease.
-    fn populate_layer(
-        &self,
-        _group: usize,
-        _index: usize,
-        layer: &mut Self::Layer,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        Ok(populate_module_from_lease(layer, lease)?)
-    }
-
-    /// Builds direct or derived bindings for one runtime unit.
-    fn layer_bindings(
-        &self,
-        group: usize,
-        index: usize,
-        layer: &Self::Layer,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        Ok(build_module_bindings(
-            layer,
-            &self.layer_checkpoint_prefix(group, index),
-            store,
-        )?)
-    }
-
-    /// Builds rank-local bindings for a tensor-parallel execution unit.
-    fn parallel_layer_bindings(
-        &self,
-        group: usize,
-        index: usize,
-        layer: &Self::Layer,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &eredu_runtime::LocalModelLayout,
-        _stream: &Stream,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        build_parallel_module_bindings(
-            layer,
-            &self.layer_checkpoint_prefix(group, index),
-            store,
-            layout,
-        )
-    }
-
-    /// Builds rank-local bindings for an expert-parallel execution unit.
-    ///
-    /// The adapter owns checkpoint expert layout, packed companions, and the
-    /// mapping from global expert ids to its layer representation.
-    fn expert_parallel_layer_bindings(
-        &self,
-        _group: usize,
-        _index: usize,
-        _layer: &Self::Layer,
-        _store: &dyn eredu_checkpoint::store::CheckpointSource,
-        _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
-        _stream: &Stream,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        Err(Error::Parallel(format!(
-            "architecture adapter {} has not implemented expert-local checkpoint bindings",
-            std::any::type_name::<Self>()
-        )))
-    }
-
-    /// Builds bindings for a layer that is simultaneously TP-sharded and
-    /// restricted to EP-owned routed experts.
-    ///
-    /// The default composes the architecture's EP selection recipe with the
-    /// shared semantic TP shard plan. Architectures only need to override this
-    /// when their checkpoint representation requires a different ordering.
-    #[allow(clippy::too_many_arguments)]
-    fn tensor_expert_parallel_layer_bindings(
-        &self,
-        group: usize,
-        index: usize,
-        layer: &Self::Layer,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: &eredu_runtime::LocalModelLayout,
-        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
-        stream: &Stream,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        let bindings =
-            self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
-        shard_layer_bindings(
-            bindings,
-            &self.layer_checkpoint_prefix(group, index),
-            store,
-            layout,
-        )
-    }
-
-    /// Builds bindings for the same replicated, TP-local, or EP-local unit
-    /// geometry selected by [`Self::new_cartesian_layer`].
-    #[allow(clippy::too_many_arguments)]
-    fn cartesian_layer_bindings(
-        &self,
-        group: usize,
-        index: usize,
-        layer: &Self::Layer,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
-        stream: &Stream,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        match (layout, assignment) {
-            (None, None) => {
-                // The execution layer can have transformed target geometry
-                // (for example load-time affine quantization). Bindings must
-                // continue to describe the adapter's source checkpoint
-                // geometry and are transformed only during population.
-                let source = self.new_layer(group, index, stream)?;
-                self.layer_bindings(group, index, &source, store)
-            }
-            (Some(layout), None) => {
-                self.parallel_layer_bindings(group, index, layer, store, layout, stream)
-            }
-            (None, Some(assignment)) => {
-                self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)
-            }
-            (Some(layout), Some(assignment)) => self.tensor_expert_parallel_layer_bindings(
-                group, index, layer, store, layout, assignment, stream,
-            ),
-        }
-    }
-
-    /// Returns checkpoint keys consumed by dependent units outside execution groups.
-    fn additional_consumed_checkpoint_keys(
-        &self,
-        _store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Vec<String> {
-        Vec::new()
-    }
-
-    /// Executes one populated unit while inspecting and mutating the complete cache.
-    #[allow(clippy::too_many_arguments)]
-    fn forward_layer(
-        &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        stream: &Stream,
-    ) -> Result<Array, Error>;
-
-    /// Executes one populated unit with architecture-specific observation.
-    ///
-    /// The default provides stable unit boundary names. Adapters whose block
-    /// math exposes richer observations override this hook without replacing
-    /// residency, cache, or graph execution.
-    #[allow(clippy::too_many_arguments)]
-    fn forward_layer_with_observer<O: ActivationObserver>(
-        &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        stream: &Stream,
-        observer: &mut O,
-    ) -> Result<Array, Error> {
-        let prefix = self.layer_checkpoint_prefix(group, index);
-        observer.observe(&format!("{prefix}.input"), hidden)?;
-        let output = self.forward_layer(group, index, layer, hidden, cache, context, stream)?;
-        observer.observe(&format!("{prefix}.output"), &output)?;
-        Ok(observer
-            .intervene(&format!("{prefix}.output"), &output)?
-            .unwrap_or(output))
-    }
-
-    /// Executes one unit under an explicit replicated or TP context.
-    ///
-    /// The default preserves ordinary execution and rejects TP, ensuring a
-    /// family cannot become distributed merely because it implements the
-    /// resident adapter contract.
-    #[allow(clippy::too_many_arguments)]
-    fn forward_layer_with_execution(
-        &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        if execution.is_tensor_parallel() {
-            return Err(Error::Parallel(format!(
-                "architecture adapter {} has not implemented tensor-parallel execution",
-                std::any::type_name::<Self>()
-            )));
-        }
-        self.forward_layer(
-            group,
-            index,
-            layer,
-            hidden,
-            cache,
-            context,
-            execution.stream(),
-        )
-    }
-
-    /// Returns every cache/state array that must be evaluated before lease release.
-    fn retained_arrays<'a>(
-        &self,
-        cache: &'a Self::Cache,
-        group: usize,
-        index: usize,
-    ) -> Vec<&'a Array>;
-
-    /// Returns transient forward-context arrays that must be evaluated before lease release.
-    fn retained_context_arrays<'a>(
-        &self,
-        _context: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Vec<&'a Array> {
-        Vec::new()
-    }
-
-    /// Selects or assembles the activation consumed by one ready group.
-    ///
-    /// Root groups receive `initial_hidden`. A group with one dependency uses
-    /// that output by default. Multi-input groups must define an exact merge.
-    #[allow(clippy::too_many_arguments)]
-    fn begin_execution_group(
-        &mut self,
-        group: usize,
-        initial_hidden: &Array,
-        dependency_outputs: &[Array],
-        _cache: &mut Self::Cache,
-        _context: &mut Self::ForwardContext,
-        _stream: &Stream,
-    ) -> Result<Array, Error> {
-        match dependency_outputs {
-            [] => Ok(initial_hidden.clone()),
-            [dependency] => Ok(dependency.clone()),
-            _ => Err(LayerwiseModelError::UnmergedExecutionGroupInputs {
-                group,
-                inputs: dependency_outputs.len(),
-            }
-            .into()),
-        }
-    }
-
-    /// Selects or assembles a ready group under an explicit execution context.
-    #[allow(clippy::too_many_arguments)]
-    fn begin_execution_group_with_execution(
-        &mut self,
-        group: usize,
-        initial_hidden: &Array,
-        dependency_outputs: &[Array],
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        self.begin_execution_group(
-            group,
-            initial_hidden,
-            dependency_outputs,
-            cache,
-            context,
-            execution.stream(),
-        )
-    }
-
-    /// Converts one group's output into the activation consumed by the next group.
-    ///
-    /// Multimodal adapters use this hook to merge encoded media before entering
-    /// a text decoder. Homogeneous adapters keep the activation unchanged.
-    fn complete_execution_group(
-        &mut self,
-        _group: usize,
-        hidden: &Array,
-        _cache: &mut Self::Cache,
-        _context: &mut Self::ForwardContext,
-        _stream: &Stream,
-    ) -> Result<Array, Error> {
-        Ok(hidden.clone())
-    }
-
-    /// Converts group output under an explicit execution context.
-    fn complete_execution_group_with_execution(
-        &mut self,
-        group: usize,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        self.complete_execution_group(group, hidden, cache, context, execution.stream())
-    }
-
-    /// Applies final normalization, projections, or family-specific output assembly.
-    fn finish(
-        &mut self,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &Self::ForwardContext,
-        stream: &Stream,
-    ) -> Result<Array, Error>;
-
-    /// Produces final output under an explicit execution context.
-    fn finish_with_execution(
-        &mut self,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        self.finish(hidden, cache, context, execution.stream())
-    }
-
-    /// Returns whether a checkpoint key is intentionally ignored by strict loading.
-    fn ignores_checkpoint_key(&self, _key: &str) -> bool {
-        false
-    }
-}
-
-/// Semantic adapter capability required by bounded load-time quantization.
-///
-/// Implementations rebuild the same architecture with packed matrix modules
-/// while preserving architecture-owned execution choices such as multimodal
-/// towers and externally resident experts. Checkpoint format is deliberately
-/// absent from this contract: SafeTensors and dense GGUF use the same packed
-/// overlay once their stores expose the adapter's semantic recipes.
-pub(crate) trait LoadTimeQuantizableAdapter: MlxArchitectureSemantics {
-    /// Rebuilds this adapter with `quantization` as its uniform packed matrix
-    /// representation.
-    fn load_time_quantized(
-        &self,
-        quantization: WeightQuantization,
-        stream: &Stream,
-    ) -> Result<Self, Error>;
-}
-
 /// Residency-owned execution engine for generalized adapters.
 ///
 /// Group windows, lease lifetime, retained-state evaluation, stream
@@ -1344,16 +697,33 @@ impl<'a> PipelineStageQuantizationSelection<'a> {
     }
 }
 
-pub(crate) fn quantize_pipeline_stage_store<A>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantize_pipeline_stage_store_with<L, SU, Q, SL, TL, LB>(
     store: SharedCheckpointSource,
-    source_adapter: &A,
-    target_adapter: &A,
     selection: PipelineStageQuantizationSelection<'_>,
     quantization: WeightQuantization,
     stream: &Stream,
+    model_type: &str,
+    source_static_units: SU,
+    quantizes_static_binding: Q,
+    mut source_layer: SL,
+    mut target_layer: TL,
+    mut layer_bindings: LB,
 ) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
 where
-    A: MlxArchitectureSemantics,
+    L: ModuleParameters,
+    SU: FnOnce(
+        &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<StaticUnitBindings>, Error>,
+    Q: Fn(&WeightBinding) -> bool,
+    SL: FnMut(usize, usize, &Stream) -> Result<L, Error>,
+    TL: FnMut(usize, usize, &Stream) -> Result<L, Error>,
+    LB: FnMut(
+        usize,
+        usize,
+        &L,
+        &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<WeightBinding>, Error>,
 {
     let mut recipes = BTreeMap::new();
     let mut collect =
@@ -1400,7 +770,7 @@ where
             Ok::<(), Error>(())
         };
 
-    for unit in source_adapter.static_units(store.as_ref())? {
+    for unit in source_static_units(store.as_ref())? {
         if !selection
             .static_roles
             .iter()
@@ -1411,7 +781,7 @@ where
         let selected = unit
             .bindings()
             .iter()
-            .filter(|binding| target_adapter.quantizes_static_binding(binding))
+            .filter(|binding| quantizes_static_binding(binding))
             .map(|binding| {
                 (
                     crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
@@ -1426,11 +796,11 @@ where
 
     for (group, range) in selection.layer_groups {
         for index in range {
-            let source_layer = source_adapter.new_layer(group, index, stream)?;
-            let target_layer = target_adapter.new_layer(group, index, stream)?;
+            let source_layer = source_layer(group, index, stream)?;
+            let target_layer = target_layer(group, index, stream)?;
             let selected = packed_weight_companion_dtypes(&target_layer);
             collect(
-                &source_adapter.layer_bindings(group, index, &source_layer, store.as_ref())?,
+                &layer_bindings(group, index, &source_layer, store.as_ref())?,
                 Some(&selected),
             )?;
         }
@@ -1439,7 +809,7 @@ where
     if recipes.is_empty() {
         return Err(Error::Quantization(format!(
             "pipeline architecture adapter {} declared no floating matrix bindings for stage-local load-time quantization",
-            source_adapter.model_type()
+            model_type
         )));
     }
     let targets = recipes

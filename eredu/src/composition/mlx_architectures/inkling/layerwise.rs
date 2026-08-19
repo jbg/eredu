@@ -51,7 +51,6 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes,
         build_module_binding_plan_with_recipes_excluding, packed_companion_checkpoint_name,
-        populate_module_from_lease, populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{TensorSelection, WeightStoreBackend},
@@ -66,7 +65,7 @@ use crate::{
         },
         layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
+            shard_layer_bindings,
         },
     },
     backend::mlx::runtime::media::input,
@@ -74,7 +73,6 @@ use crate::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
         ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx_architectures::inkling::model::{
         self as resident, AudioModel, Cache, DecoderLayer, ModelArgs, VisionLayer, VisionModel,
     },
@@ -1362,7 +1360,7 @@ impl InklingLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
+    pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
         self.execution.checkpoint_store()
     }
 
@@ -3564,8 +3562,8 @@ fn inkling_w13_recipe(
     }))
 }
 
-impl LoadTimeQuantizableAdapter for InklingLayerwiseAdapter {
-    fn load_time_quantized(
+impl InklingLayerwiseAdapter {
+    pub(crate) fn load_time_quantized(
         &self,
         quantization: WeightQuantization,
         stream: &Stream,
@@ -3603,27 +3601,18 @@ impl LoadTimeQuantizableAdapter for InklingLayerwiseAdapter {
     }
 }
 
-impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
-    type Input<'a> = InklingExecutionInput<'a>;
-    type Cache = Cache;
-    type Layer = InklingLayer;
-    type ForwardContext = InklingForwardContext;
-
-    fn model_type(&self) -> &str {
+impl InklingLayerwiseAdapter {
+    pub(crate) fn model_type(&self) -> &str {
         &self.args.model_type
     }
 
-    fn safetensors_checkpoint_plan(
+    pub(crate) fn safetensors_checkpoint_plan(
         &self,
     ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
         super::checkpoint::safetensors_plan(&self.args).map_err(Error::UnsupportedArchitecture)
     }
 
-    fn quantization(&self) -> Option<WeightQuantization> {
-        self.args.text_config.weight_quantization
-    }
-
-    fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
+    pub(crate) fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
         let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
         if target.starts_with("visual.") || target.contains(".visual.") {
             return false;
@@ -3647,7 +3636,7 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         }
     }
 
-    fn prompt_cache_model_identity(
+    pub(crate) fn prompt_cache_model_identity(
         &self,
         topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
@@ -3683,9 +3672,9 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         })
     }
 
-    fn save_prompt_cache(
+    pub(crate) fn save_prompt_cache(
         &self,
-        cache: &mut Self::Cache,
+        cache: &mut Cache,
         destination: &Path,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
@@ -3703,7 +3692,7 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn load_prompt_cache(
+    pub(crate) fn load_prompt_cache(
         &self,
         directory: &Path,
         expected: &PromptCacheDescriptor,
@@ -3711,7 +3700,7 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         prefix_token_ids: &[u32],
         _options: PagedCacheOptions,
         stream: &Stream,
-    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
         resident::Model::load_prompt_cache_with_identity(
             &self.args,
             directory,
@@ -3723,14 +3712,14 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn static_units(
+    pub(crate) fn static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
-    fn selected_static_units(
+    pub(crate) fn selected_static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
@@ -3829,57 +3818,19 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         Ok(units)
     }
 
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected = 4
-            + usize::from(self.mtp.is_some())
-            + usize::from(self.audio.is_some())
-            + usize::from(self.vision_norm.is_some());
-        if leases.len() != expected {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Inkling adapter received {} static leases, expected {expected}",
-                leases.len()
-            )));
-        }
-        if let Some(embedding) = &mut self.parallel_embedding {
-            populate_module_from_lease(embedding.inner_mut(), &leases[0])?;
-        } else {
-            populate_module_from_lease(&mut self.embedding, &leases[0])?;
-        }
-        populate_module_from_lease(&mut self.embed_norm, &leases[1])?;
-        populate_module_from_lease(&mut self.norm, &leases[2])?;
-        if let Some(head) = &mut self.parallel_lm_head {
-            populate_module_from_lease(head.inner_mut(), &leases[3])?;
-        } else {
-            populate_module_from_lease(&mut self.lm_head, &leases[3])?;
-        }
-        let mut index = 4;
-        if let Some(mtp) = &mut self.mtp {
-            populate_module_from_lease(mtp, &leases[index])?;
-            index += 1;
-        }
-        if let Some(audio) = &mut self.audio {
-            populate_module_from_lease(audio, &leases[index])?;
-            index += 1;
-        }
-        if let Some(norm) = &mut self.vision_norm {
-            populate_module_from_lease(norm, &leases[index])?;
-        }
-        Ok(())
-    }
-
-    fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
+    pub(crate) fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
         if cache.layers.is_empty() {
             *cache = self.new_cache();
         }
         cache.validate(&self.args.text_config.layer_schedule)
     }
 
-    fn begin_forward<'a>(
+    pub(crate) fn begin_forward<'a>(
         &mut self,
-        input: Self::Input<'a>,
-        _cache: &mut Self::Cache,
+        input: InklingExecutionInput<'a>,
+        _cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, InklingForwardContext>, Error> {
         let InklingExecutionInput {
             input,
             last_token_only,
@@ -4039,14 +3990,14 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         })
     }
 
-    fn begin_forward_with_execution<'a>(
+    pub(crate) fn begin_forward_with_execution<'a>(
         &mut self,
-        input: Self::Input<'a>,
-        _cache: &mut Self::Cache,
+        input: InklingExecutionInput<'a>,
+        _cache: &mut Cache,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, InklingForwardContext>, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.begin_forward(input, _cache, execution.stream());
         };
@@ -4214,7 +4165,7 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         })
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
+    pub(crate) fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
         if self.vision_depth > 0 {
             eredu_runtime::ExecutionGraph::chain(["vision_encoder", "text_decoder"])
                 .map_err(Into::into)
@@ -4223,12 +4174,16 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         }
     }
 
-    fn should_execute_group(&self, group: usize, context: &Self::ForwardContext) -> bool {
+    pub(crate) fn should_execute_group(
+        &self,
+        group: usize,
+        context: &InklingForwardContext,
+    ) -> bool {
         self.execution_group_name(group)
             .is_ok_and(|name| name != "vision_encoder" || !context.vision_jobs.is_empty())
     }
 
-    fn layer_count(&self, group: usize) -> Result<usize, Error> {
+    pub(crate) fn layer_count(&self, group: usize) -> Result<usize, Error> {
         match self.execution_group_name(group)? {
             "vision_encoder" => Ok(self.vision_depth),
             "text_decoder" => Ok(self.args.text_config.num_hidden_layers as usize),
@@ -4236,7 +4191,12 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         }
     }
 
-    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
+    pub(crate) fn new_layer(
+        &self,
+        group: usize,
+        index: usize,
+        stream: &Stream,
+    ) -> Result<InklingLayer, Error> {
         self.layer_count(group)?;
         if self.execution_group_name(group)? == "vision_encoder" {
             let args = self
@@ -4263,13 +4223,13 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         }
     }
 
-    fn new_expert_parallel_layer(
+    pub(crate) fn new_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<InklingLayer, Error> {
         if self.execution_group_name(group)? == "vision_encoder" {
             return self.new_layer(group, index, stream);
         }
@@ -4289,14 +4249,14 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         )))
     }
 
-    fn new_tensor_expert_parallel_layer(
+    pub(crate) fn new_tensor_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<InklingLayer, Error> {
         if self.execution_group_name(group)? == "vision_encoder" {
             return self.new_parallel_layer(group, index, layout, stream);
         }
@@ -4327,7 +4287,7 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         )))
     }
 
-    fn expert_parallel_assignment(
+    pub(crate) fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
@@ -4356,7 +4316,7 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         ))
     }
 
-    fn parallel_parameter_groups(
+    pub(crate) fn parallel_parameter_groups(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, Error> {
@@ -4430,7 +4390,7 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         Ok(groups)
     }
 
-    fn configure_parallel_static(
+    pub(crate) fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         layout: &eredu_runtime::LocalModelLayout,
@@ -4604,7 +4564,7 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         Ok(())
     }
 
-    fn register_parallel_parameters(
+    pub(crate) fn register_parallel_parameters(
         &self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
@@ -4657,13 +4617,13 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         Ok(())
     }
 
-    fn new_parallel_layer(
+    pub(crate) fn new_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<InklingLayer, Error> {
         if self.execution_group_name(group)? != "vision_encoder" {
             let _ = layout;
             let geometry = self
@@ -4717,7 +4677,7 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         )?))
     }
 
-    fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
+    pub(crate) fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
         if self.execution_group_name(group).ok() == Some("vision_encoder") {
             format!("visual.layers.{index}")
         } else {
@@ -4725,19 +4685,11 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         }
     }
 
-    fn layer_unit_name(&self, group: usize, index: usize) -> String {
-        if self.execution_group_name(group).ok() == Some("vision_encoder") {
-            format!("inkling.vision.{index:05}")
-        } else {
-            format!("inkling.layer.{index:05}")
-        }
-    }
-
-    fn layer_bindings(
+    pub(crate) fn layer_bindings(
         &self,
         group: usize,
         index: usize,
-        layer: &Self::Layer,
+        layer: &InklingLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
@@ -4771,11 +4723,11 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
             .collect()
     }
 
-    fn parallel_layer_bindings(
+    pub(crate) fn parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &InklingLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
@@ -4789,11 +4741,11 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         )
     }
 
-    fn expert_parallel_layer_bindings(
+    pub(crate) fn expert_parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &InklingLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
@@ -4821,47 +4773,14 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
             .collect()
     }
 
-    fn populate_layer(
-        &self,
-        _group: usize,
-        _index: usize,
-        layer: &mut Self::Layer,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        if self.sparse_expert_cache {
-            Ok(populate_module_from_lease_excluding(
-                layer,
-                lease,
-                |name| name.starts_with("moe.experts."),
-            )?)
-        } else {
-            Ok(populate_module_from_lease(layer, lease)?)
-        }
-    }
-
-    fn additional_consumed_checkpoint_keys(
-        &self,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Vec<String> {
-        if self.sparse_expert_cache {
-            store
-                .source_keys()
-                .into_iter()
-                .filter(|key| key.contains(".mlp.experts.") || key.contains(".moe.experts."))
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn forward_layer(
+    pub(crate) fn forward_layer(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut InklingLayer,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut InklingForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         match (self.execution_group_name(group)?, layer) {
@@ -4917,14 +4836,14 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         }
     }
 
-    fn forward_layer_with_execution(
+    pub(crate) fn forward_layer_with_execution(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut InklingLayer,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut InklingForwardContext,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
@@ -5004,43 +4923,22 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         )
     }
 
-    fn retained_arrays<'a>(
+    pub(crate) fn retained_context_arrays<'a>(
         &self,
-        cache: &'a Self::Cache,
-        group: usize,
-        index: usize,
-    ) -> Vec<&'a Array> {
-        if self.execution_group_name(group).ok() == Some("text_decoder") {
-            let layer = &cache.layers[index];
-            let mut arrays = layer.kv.retained_arrays();
-            arrays.extend(
-                layer
-                    .convolutions
-                    .iter()
-                    .filter_map(|cache| cache.state.as_ref()),
-            );
-            arrays
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn retained_context_arrays<'a>(
-        &self,
-        context: &'a Self::ForwardContext,
+        context: &'a InklingForwardContext,
         _group: usize,
         _index: usize,
     ) -> Vec<&'a Array> {
         context.vision_jobs.iter().map(|job| &job.hidden).collect()
     }
 
-    fn begin_execution_group(
+    pub(crate) fn begin_execution_group(
         &mut self,
         group: usize,
         initial_hidden: &Array,
         dependency_outputs: &[Array],
-        _cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        _cache: &mut Cache,
+        context: &mut InklingForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let group_name = self.execution_group_name(group)?;
@@ -5089,12 +4987,12 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         Ok(concatenate_axis(&embeddings, 1, stream)?)
     }
 
-    fn complete_execution_group(
+    pub(crate) fn complete_execution_group(
         &mut self,
         group: usize,
         hidden: &Array,
-        _cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        _cache: &mut Cache,
+        context: &mut InklingForwardContext,
         _stream: &Stream,
     ) -> Result<Array, Error> {
         if self.execution_group_name(group)? == "text_decoder" {
@@ -5103,11 +5001,11 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         Ok(hidden.clone())
     }
 
-    fn finish(
+    pub(crate) fn finish(
         &mut self,
         hidden: &Array,
-        _cache: &mut Self::Cache,
-        context: &Self::ForwardContext,
+        _cache: &mut Cache,
+        context: &InklingForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let hidden = self.norm.forward(hidden, stream)?;
@@ -5120,11 +5018,11 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
         )?)
     }
 
-    fn finish_with_execution(
+    pub(crate) fn finish_with_execution(
         &mut self,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &Self::ForwardContext,
+        cache: &mut Cache,
+        context: &InklingForwardContext,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
@@ -5139,6 +5037,98 @@ impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
             context.last_token_only,
             execution.stream(),
             |hidden, _| head.forward(hidden, execution)?.all_gather(execution),
+        )
+    }
+
+    pub(crate) fn new_cartesian_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<InklingLayer, Error> {
+        match (layout, assignment) {
+            (None, None) => self.new_layer(group, index, stream),
+            (Some(layout), None) => self.new_parallel_layer(group, index, layout, stream),
+            (None, Some(assignment)) => {
+                self.new_expert_parallel_layer(group, index, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => {
+                self.new_tensor_expert_parallel_layer(group, index, layout, assignment, stream)
+            }
+        }
+    }
+
+    pub(crate) fn tensor_expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &InklingLayer,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: &eredu_runtime::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let bindings =
+            self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
+        shard_layer_bindings(
+            bindings,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            layout,
+        )
+    }
+
+    pub(crate) fn cartesian_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &InklingLayer,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        match (layout, assignment) {
+            (None, None) => {
+                // The execution layer can have transformed target geometry
+                // (for example load-time affine quantization). Bindings must
+                // continue to describe the adapter's source checkpoint
+                // geometry and are transformed only during population.
+                let source = self.new_layer(group, index, stream)?;
+                self.layer_bindings(group, index, &source, store)
+            }
+            (Some(layout), None) => {
+                self.parallel_layer_bindings(group, index, layer, store, layout, stream)
+            }
+            (None, Some(assignment)) => {
+                self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => self.tensor_expert_parallel_layer_bindings(
+                group, index, layer, store, layout, assignment, stream,
+            ),
+        }
+    }
+
+    pub(crate) fn begin_execution_group_with_execution(
+        &mut self,
+        group: usize,
+        initial_hidden: &Array,
+        dependency_outputs: &[Array],
+        cache: &mut Cache,
+        context: &mut InklingForwardContext,
+        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
+            '_,
+        >,
+    ) -> Result<Array, Error> {
+        self.begin_execution_group(
+            group,
+            initial_hidden,
+            dependency_outputs,
+            cache,
+            context,
+            execution.stream(),
         )
     }
 }

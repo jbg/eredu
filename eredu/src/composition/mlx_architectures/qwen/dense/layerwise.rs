@@ -56,8 +56,7 @@ use crate::{
     },
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes,
-        build_module_binding_plan_with_recipes_excluding, populate_module_from_lease,
-        populate_module_from_lease_excluding, ModuleBindingPlan,
+        build_module_binding_plan_with_recipes_excluding, ModuleBindingPlan,
     },
     backend::mlx::runtime::checkpoint::store::{
         open_gguf_checkpoint_source, TensorSelection, WeightStoreBackend,
@@ -78,16 +77,15 @@ use crate::{
         },
         layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
+            shard_layer_bindings,
         },
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     core::cache::{
-        LayerCachePolicy, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
         PromptCacheOptions, PromptCacheTopology,
     },
 };
@@ -634,7 +632,7 @@ impl LayerwiseDecoder {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
+    pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
         self.execution.checkpoint_store()
     }
 
@@ -2722,278 +2720,21 @@ pub(crate) fn register_qwen_layer_parallel_plan(
     )
 }
 
-impl LoadTimeQuantizableAdapter for DenseQwenLayerwiseAdapter {
-    fn load_time_quantized(
-        &self,
-        quantization: WeightQuantization,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let mut args = self.args.clone();
-        args.quantization = Some(quantization);
-        args.quantization_config = None;
-        args.quantized_weight_configs = None;
-        if self.sparse_expert_cache {
-            Self::new_external_experts(args, stream)
-        } else {
-            Self::new(args, stream)
-        }
-    }
-}
+impl DenseQwenLayerwiseAdapter {}
 
-impl MlxArchitectureSemantics for DenseQwenLayerwiseAdapter {
-    type Input<'a> = DenseQwenAdapterInput<'a>;
-    type Cache = DenseQwenLayerwiseCache;
-    type Layer = TransformerBlock;
-    type ForwardContext = DenseQwenForwardContext;
-
-    fn model_type(&self) -> &str {
+impl DenseQwenLayerwiseAdapter {
+    pub(crate) fn model_type(&self) -> &str {
         &self.args.model_type
     }
 
-    fn safetensors_checkpoint_plan(
-        &self,
-    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
-        super::checkpoint::safetensors_plan(&self.args).map_err(Error::UnsupportedArchitecture)
-    }
-
-    fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
-        self.args.quantization.or(self.args.quantization_config)
-    }
-
-    fn prompt_cache_model_identity(
-        &self,
-        topology: Option<crate::backend::mlx::MlxParallelContext>,
-    ) -> Result<PromptCacheModelIdentity, Error> {
-        let layer_count = usize::try_from(self.args.num_hidden_layers)
-            .map_err(|_| Exception::custom("invalid dense-Qwen cache layer count"))?;
-        let local_kv_heads = match topology {
-            Some(topology) if topology.is_axis_active(crate::ParallelAxis::Tensor) => {
-                self.parallel_kv_heads.clone().ok_or_else(|| {
-                    Error::Parallel(
-                    "dense-Qwen parallel cache identity requested before local layout configuration"
-                        .into(),
-                )
-                })?
-            }
-            _ => vec![self.args.num_key_value_heads; layer_count],
-        };
-        if local_kv_heads.len() != layer_count {
-            return Err(Error::Parallel(format!(
-                "dense-Qwen parallel cache geometry has {} layers, expected {layer_count}",
-                local_kv_heads.len()
-            )));
-        }
-        let layer_layout = crate::LayerSchedule::new(
-            layer_count,
-            self.args
-                .attention_schedule
-                .iter()
-                .zip(local_kv_heads)
-                .map(|(attention, kv_heads)| {
-                    LayerCachePolicy::key_value(*attention, kv_heads, self.args.head_dim)
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(PromptCacheModelIdentity {
-            model_family: "dense_qwen".into(),
-            effective_model_type: self.args.model_type.clone(),
-            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(&self.args),
-            layer_count,
-            global_layer_start: 0,
-            global_layer_end: layer_count,
-            sink_tokens: 0,
-            layer_prefix_offsets: vec![0; layer_count],
-            topology: topology.map_or_else(
-                PromptCacheTopology::default,
-                crate::backend::mlx::cache::prompt_cache_topology,
-            ),
-            layer_layout,
-        })
-    }
-
-    fn save_prompt_cache(
-        &self,
-        cache: &mut Self::Cache,
-        destination: &Path,
-        descriptor: PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        options: &PromptCacheOptions,
-        stream: &Stream,
-    ) -> Result<PromptCacheManifest, Error> {
-        match cache {
-            DenseQwenLayerwiseCache::Concat { caches: cache, .. } => resident::save_prompt_cache(
-                &self.args,
-                cache,
-                destination,
-                descriptor,
-                prefix_token_ids,
-                options,
-                stream,
-            )
-            .map_err(Into::into),
-            DenseQwenLayerwiseCache::Paged { caches, .. } => {
-                for cache in caches.iter_mut().flatten() {
-                    cache.finalize()?;
-                }
-                caches
-                    .iter()
-                    .flatten()
-                    .next()
-                    .ok_or_else(|| Error::Parallel("cannot persist an empty dense-Qwen cache".into()))?
-                    .manager()
-                    .save_prompt_cache(destination, descriptor, prefix_token_ids, &[], options)
-                    .map_err(|error| Error::Parallel(error.to_string()))
-            }
-            DenseQwenLayerwiseCache::Sliding { .. } => Err(Error::Parallel(
-                "dense-Qwen sliding-cache persistence is unsupported; use concat or paged cache state".into(),
-            )),
-        }
-    }
-
-    fn load_prompt_cache(
-        &self,
-        directory: &Path,
-        expected: &PromptCacheDescriptor,
-        identity: &PromptCacheModelIdentity,
-        prefix_token_ids: &[u32],
-        _options: PagedCacheOptions,
-        stream: &Stream,
-    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
-        let (cache, manifest) = resident::load_prompt_cache_with_identity(
-            &self.args,
-            directory,
-            expected,
-            prefix_token_ids,
-            identity,
-            stream,
-        )?;
-        Ok((
-            DenseQwenLayerwiseCache::concat(
-                StateLayout::new(identity.layer_layout.clone())
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                cache,
-            ),
-            manifest,
-        ))
-    }
-
-    fn validate_cache(&self, cache: &mut Self::Cache) -> Result<(), Error> {
-        let expected = usize::try_from(self.args.num_hidden_layers).map_err(|_| {
-            Error::UnsupportedArchitecture(format!(
-                "dense-Qwen layer count {} is invalid",
-                self.args.num_hidden_layers
-            ))
-        })?;
-        match cache {
-            DenseQwenLayerwiseCache::Concat { caches, .. } => {
-                if caches.is_empty() {
-                    *caches = self
-                        .args
-                        .attention_schedule
-                        .iter()
-                        .map(|policy| {
-                            Some(match policy.window() {
-                                Some(window) => ConcatKeyValueCache::new_for_sliding_attention(
-                                    i32::try_from(window.get())
-                                        .expect("validated dense-Qwen attention window fits i32"),
-                                ),
-                                None => ConcatKeyValueCache::new(),
-                            })
-                        })
-                        .collect();
-                }
-                validate_dense_qwen_cache(caches, expected)
-            }
-            DenseQwenLayerwiseCache::Sliding { caches, .. } => {
-                validate_dense_qwen_cache(caches, expected)
-            }
-            DenseQwenLayerwiseCache::Paged { caches, .. } => {
-                validate_dense_qwen_cache(caches, expected)
-            }
-        }
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        let hidden = self.embedding.forward(input.inputs, stream)?;
-        let mask = match cache {
-            DenseQwenLayerwiseCache::Concat { caches, .. } => {
-                dense_qwen_attention_mask(&hidden, input.mask, caches, stream)?
-            }
-            DenseQwenLayerwiseCache::Sliding { caches, .. } => {
-                dense_qwen_attention_mask(&hidden, input.mask, caches, stream)?
-            }
-            DenseQwenLayerwiseCache::Paged { caches, .. } => {
-                dense_qwen_attention_mask(&hidden, input.mask, caches, stream)?
-            }
-        };
-        Ok(eredu_runtime::LayeredForwardState {
-            hidden,
-            context: DenseQwenForwardContext { mask },
-        })
-    }
-
-    fn begin_forward_with_execution<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        let Some(embedding) = &mut self.parallel_embedding else {
-            return self.begin_forward(input, cache, execution.stream());
-        };
-        let hidden = embedding.forward(input.inputs, execution)?;
-        let mask = match cache {
-            DenseQwenLayerwiseCache::Concat { caches, .. } => {
-                dense_qwen_attention_mask(&hidden, input.mask, caches, execution.stream())?
-            }
-            DenseQwenLayerwiseCache::Sliding { caches, .. } => {
-                dense_qwen_attention_mask(&hidden, input.mask, caches, execution.stream())?
-            }
-            DenseQwenLayerwiseCache::Paged { caches, .. } => {
-                dense_qwen_attention_mask(&hidden, input.mask, caches, execution.stream())?
-            }
-        };
-        Ok(eredu_runtime::LayeredForwardState {
-            hidden,
-            context: DenseQwenForwardContext { mask },
-        })
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
-    }
-
-    fn layer_count(&self, group: usize) -> Result<usize, Error> {
-        if group != 0 {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "dense Qwen has no group {group}"
-            )));
-        }
-        usize::try_from(self.args.num_hidden_layers).map_err(|_| {
-            Error::UnsupportedArchitecture(format!(
-                "dense-Qwen layer count {} is invalid",
-                self.args.num_hidden_layers
-            ))
-        })
-    }
-
-    fn static_units(
+    pub(crate) fn static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
-    fn selected_static_units(
+    pub(crate) fn selected_static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
@@ -3040,29 +2781,12 @@ impl MlxArchitectureSemantics for DenseQwenLayerwiseAdapter {
         Ok(units)
     }
 
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected = if self.lm_head.is_some() { 3 } else { 2 };
-        if leases.len() != expected {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "dense-Qwen adapter received {} static leases, expected {expected}",
-                leases.len()
-            )));
-        }
-        if let Some(embedding) = &mut self.parallel_embedding {
-            populate_module_from_lease(embedding.inner_mut(), &leases[0])?;
-        } else {
-            populate_module_from_lease(&mut self.embedding, &leases[0])?;
-        }
-        populate_module_from_lease(&mut self.norm, &leases[1])?;
-        if let Some(head) = &mut self.parallel_lm_head {
-            populate_module_from_lease(head.inner_mut(), &leases[2])?;
-        } else if let Some(head) = &mut self.lm_head {
-            populate_module_from_lease(head, &leases[2])?;
-        }
-        Ok(())
-    }
-
-    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
+    pub(crate) fn new_layer(
+        &self,
+        group: usize,
+        index: usize,
+        stream: &Stream,
+    ) -> Result<TransformerBlock, Error> {
         if group != 0 {
             return Err(Error::UnsupportedArchitecture(format!(
                 "dense Qwen has no group {group}"
@@ -3078,7 +2802,7 @@ impl MlxArchitectureSemantics for DenseQwenLayerwiseAdapter {
         Ok(layer)
     }
 
-    fn register_parallel_parameters(
+    pub(crate) fn register_parallel_parameters(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
@@ -3121,45 +2845,13 @@ impl MlxArchitectureSemantics for DenseQwenLayerwiseAdapter {
         Ok(())
     }
 
-    fn configure_parallel_static(
-        &mut self,
-        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &eredu_runtime::LocalModelLayout,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        self.parallel_kv_heads = Some(planned_kv_head_layout(
-            layout,
-            self.args.num_hidden_layers as usize,
-            self.args.head_dim,
-            "model.layers",
-        )?);
-        self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
-            self.args.vocab_size as usize,
-            self.args.hidden_size,
-            self.args
-                .weight_quantization_for("model.embed_tokens.weight"),
-            context,
-            stream,
-        )?);
-        if self.lm_head.is_some() {
-            self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
-                self.args.hidden_size,
-                self.args.vocab_size as usize,
-                self.args.weight_quantization_for("lm_head.weight"),
-                context,
-                stream,
-            )?);
-        }
-        Ok(())
-    }
-
-    fn new_parallel_layer(
+    pub(crate) fn new_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<TransformerBlock, Error> {
         if group != 0 {
             return Err(Error::UnsupportedArchitecture(format!(
                 "dense Qwen has no group {group}"
@@ -3204,13 +2896,13 @@ impl MlxArchitectureSemantics for DenseQwenLayerwiseAdapter {
         Ok(layer)
     }
 
-    fn new_expert_parallel_layer(
+    pub(crate) fn new_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<TransformerBlock, Error> {
         if !self.args.is_moe() {
             return Err(Error::Parallel(
                 "dense Qwen has no routed experts for expert-local layer construction".into(),
@@ -3241,14 +2933,14 @@ impl MlxArchitectureSemantics for DenseQwenLayerwiseAdapter {
         Ok(layer)
     }
 
-    fn new_tensor_expert_parallel_layer(
+    pub(crate) fn new_tensor_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<TransformerBlock, Error> {
         if !self.args.is_moe() {
             return Err(Error::Parallel(
                 "dense Qwen has no routed experts for combined tensor/expert layer construction"
@@ -3281,7 +2973,7 @@ impl MlxArchitectureSemantics for DenseQwenLayerwiseAdapter {
         Ok(layer)
     }
 
-    fn expert_parallel_assignment(
+    pub(crate) fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
@@ -3303,37 +2995,15 @@ impl MlxArchitectureSemantics for DenseQwenLayerwiseAdapter {
         ))
     }
 
-    fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
+    pub(crate) fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
         format!("model.layers.{index}")
     }
 
-    fn layer_unit_name(&self, _group: usize, index: usize) -> String {
-        format!("dense_qwen.layer.{index:05}")
-    }
-
-    fn populate_layer(
-        &self,
-        _group: usize,
-        _index: usize,
-        layer: &mut Self::Layer,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        if self.sparse_expert_cache {
-            Ok(populate_module_from_lease_excluding(
-                layer,
-                lease,
-                |name| name.starts_with("mlp.experts."),
-            )?)
-        } else {
-            Ok(populate_module_from_lease(layer, lease)?)
-        }
-    }
-
-    fn layer_bindings(
+    pub(crate) fn layer_bindings(
         &self,
         _group: usize,
         index: usize,
-        layer: &Self::Layer,
+        layer: &TransformerBlock,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         qwen_text_layer_bindings(
@@ -3345,11 +3015,11 @@ impl MlxArchitectureSemantics for DenseQwenLayerwiseAdapter {
         )
     }
 
-    fn parallel_layer_bindings(
+    pub(crate) fn parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &TransformerBlock,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
@@ -3363,11 +3033,11 @@ impl MlxArchitectureSemantics for DenseQwenLayerwiseAdapter {
         )
     }
 
-    fn expert_parallel_layer_bindings(
+    pub(crate) fn expert_parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &TransformerBlock,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
@@ -3395,332 +3065,83 @@ impl MlxArchitectureSemantics for DenseQwenLayerwiseAdapter {
             .collect()
     }
 
-    fn additional_consumed_checkpoint_keys(
+    pub(crate) fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
+        true
+    }
+
+    pub(crate) fn new_cartesian_layer(
         &self,
+        group: usize,
+        index: usize,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<TransformerBlock, Error> {
+        match (layout, assignment) {
+            (None, None) => self.new_layer(group, index, stream),
+            (Some(layout), None) => self.new_parallel_layer(group, index, layout, stream),
+            (None, Some(assignment)) => {
+                self.new_expert_parallel_layer(group, index, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => {
+                self.new_tensor_expert_parallel_layer(group, index, layout, assignment, stream)
+            }
+        }
+    }
+
+    pub(crate) fn tensor_expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &TransformerBlock,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Vec<String> {
-        if self.sparse_expert_cache {
-            store
-                .source_keys()
-                .into_iter()
-                .filter(|key| key.contains(".mlp.experts."))
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn ignores_checkpoint_key(&self, key: &str) -> bool {
-        super::checkpoint::is_redundant_tied_output_head_key(&self.args, key)
-    }
-
-    fn forward_layer(
-        &mut self,
-        _group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        layout: &eredu_runtime::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Array, Error> {
-        match cache {
-            DenseQwenLayerwiseCache::Concat { caches, .. } => self.forward_cached_layer(
-                index,
-                layer,
-                hidden,
-                caches[index].as_mut().expect("validated dense-Qwen cache"),
-                context,
-                stream,
-            ),
-            DenseQwenLayerwiseCache::Sliding { caches, .. } => self.forward_cached_layer(
-                index,
-                layer,
-                hidden,
-                caches[index].as_mut().expect("validated dense-Qwen cache"),
-                context,
-                stream,
-            ),
-            DenseQwenLayerwiseCache::Paged { caches, .. } => self.forward_cached_layer(
-                index,
-                layer,
-                hidden,
-                caches[index].as_mut().expect("validated dense-Qwen cache"),
-                context,
-                stream,
-            ),
-        }
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let bindings =
+            self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
+        shard_layer_bindings(
+            bindings,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            layout,
+        )
     }
 
-    fn forward_layer_with_observer<
-        O: crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
-    >(
-        &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        stream: &Stream,
-        observer: &mut O,
-    ) -> Result<Array, Error> {
-        if self.sparse_expert_cache {
-            let prefix = self.layer_checkpoint_prefix(group, index);
-            observer.observe(&format!("{prefix}.input"), hidden)?;
-            let output = self.forward_layer(group, index, layer, hidden, cache, context, stream)?;
-            observer.observe(&format!("{prefix}.output"), &output)?;
-            return Ok(observer
-                .intervene(&format!("{prefix}.output"), &output)?
-                .unwrap_or(output));
-        }
-        let prefix = self.layer_checkpoint_prefix(group, index);
-        Ok(match cache {
-            DenseQwenLayerwiseCache::Concat { caches, .. } => layer.forward_with_observer(
-                AttentionInput {
-                    x: hidden,
-                    mask: context.mask.as_ref(),
-                    cache: Some(caches[index].as_mut().expect("validated dense-Qwen cache")),
-                },
-                stream,
-                &prefix,
-                observer,
-            )?,
-            DenseQwenLayerwiseCache::Sliding { caches, .. } => layer.forward_with_observer(
-                AttentionInput {
-                    x: hidden,
-                    mask: context.mask.as_ref(),
-                    cache: Some(caches[index].as_mut().expect("validated dense-Qwen cache")),
-                },
-                stream,
-                &prefix,
-                observer,
-            )?,
-            DenseQwenLayerwiseCache::Paged { caches, .. } => layer.forward_with_observer(
-                AttentionInput {
-                    x: hidden,
-                    mask: context.mask.as_ref(),
-                    cache: Some(caches[index].as_mut().expect("validated dense-Qwen cache")),
-                },
-                stream,
-                &prefix,
-                observer,
-            )?,
-        })
-    }
-
-    fn forward_layer_with_execution(
-        &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        let Some(tp_group) = execution.group() else {
-            return self.forward_layer(
-                group,
-                index,
-                layer,
-                hidden,
-                cache,
-                context,
-                execution.stream(),
-            );
-        };
-        match cache {
-            DenseQwenLayerwiseCache::Concat { caches, .. } => Ok(layer.forward_tensor_parallel(
-                hidden,
-                context.mask.as_ref(),
-                caches[index].as_mut(),
-                tp_group,
-                execution.stream(),
-            )?),
-            DenseQwenLayerwiseCache::Sliding { caches, .. } => Ok(layer.forward_tensor_parallel(
-                hidden,
-                context.mask.as_ref(),
-                caches[index].as_mut(),
-                tp_group,
-                execution.stream(),
-            )?),
-            DenseQwenLayerwiseCache::Paged { caches, .. } => Ok(layer.forward_tensor_parallel(
-                hidden,
-                context.mask.as_ref(),
-                caches[index].as_mut(),
-                tp_group,
-                execution.stream(),
-            )?),
-        }
-    }
-
-    fn retained_arrays<'a>(
+    pub(crate) fn cartesian_layer_bindings(
         &self,
-        cache: &'a Self::Cache,
-        _group: usize,
+        group: usize,
         index: usize,
-    ) -> Vec<&'a Array> {
-        match cache {
-            DenseQwenLayerwiseCache::Concat { caches, .. } => retained_cache_arrays(caches, index),
-            DenseQwenLayerwiseCache::Sliding { caches, .. } => retained_cache_arrays(caches, index),
-            DenseQwenLayerwiseCache::Paged { caches, .. } => retained_cache_arrays(caches, index),
-        }
-    }
-
-    fn finish(
-        &mut self,
-        hidden: &Array,
-        _cache: &mut Self::Cache,
-        _context: &Self::ForwardContext,
+        layer: &TransformerBlock,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
-    ) -> Result<Array, Error> {
-        let hidden = self.norm.forward(hidden, stream)?;
-        Ok(project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.embedding,
-            &hidden,
-            stream,
-        )?)
-    }
-
-    fn finish_with_execution(
-        &mut self,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        let Some(embedding) = &mut self.parallel_embedding else {
-            return self.finish(hidden, cache, context, execution.stream());
-        };
-        let hidden = self.norm.forward(hidden, execution.stream())?;
-        let logits = match &mut self.parallel_lm_head {
-            Some(head) => head.forward(&hidden, execution)?,
-            None => embedding.project_logits(&hidden, execution)?,
-        };
-        logits.all_gather(execution)
+    ) -> Result<Vec<WeightBinding>, Error> {
+        match (layout, assignment) {
+            (None, None) => {
+                // The execution layer can have transformed target geometry
+                // (for example load-time affine quantization). Bindings must
+                // continue to describe the adapter's source checkpoint
+                // geometry and are transformed only during population.
+                let source = self.new_layer(group, index, stream)?;
+                self.layer_bindings(group, index, &source, store)
+            }
+            (Some(layout), None) => {
+                self.parallel_layer_bindings(group, index, layer, store, layout, stream)
+            }
+            (None, Some(assignment)) => {
+                self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => self.tensor_expert_parallel_layer_bindings(
+                group, index, layer, store, layout, assignment, stream,
+            ),
+        }
     }
 }
 
-impl DenseQwenLayerwiseAdapter {
-    fn forward_cached_layer<C: KeyValueCache>(
-        &self,
-        index: usize,
-        layer: &mut TransformerBlock,
-        hidden: &Array,
-        cache: &mut C,
-        context: &DenseQwenForwardContext,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        if self.sparse_expert_cache {
-            let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "Qwen3 sparse expert cache was not initialized".into(),
-                )
-            })?;
-            let pass = if hidden.dim(1) > 1 {
-                ExpertPass::Prefill
-            } else {
-                ExpertPass::Decode
-            };
-            return Ok(layer.forward_sparse_experts(
-                AttentionInput {
-                    x: hidden,
-                    mask: context.mask.as_ref(),
-                    cache: Some(cache),
-                },
-                stream,
-                |flat, indices, weights, stream| {
-                    expert_cache
-                        .execute_routes_bounded(
-                            ExpertRouteBatch::new(index, flat, indices, weights, pass),
-                            stream,
-                            |flat, acquired, weights, stream| {
-                                if acquired.is_empty() {
-                                    return Err(ExpertCacheError::EmptyRoutedBank {
-                                        architecture: "Qwen3",
-                                    });
-                                }
-                                let started = Instant::now();
-                                let prefix = format!("model.layers.{index}.mlp.experts");
-                                let load_time = expert_cache.weight_quantization();
-                                let mut bank = resident::Experts::new(
-                                    acquired.identities().len() as i32,
-                                    self.args.hidden_size,
-                                    self.args.moe_intermediate_size,
-                                    load_time.or_else(|| {
-                                        self.args.weight_quantization_for(&format!(
-                                            "{prefix}.gate_up_proj"
-                                        ))
-                                    }),
-                                    load_time.or_else(|| {
-                                        self.args
-                                            .weight_quantization_for(&format!("{prefix}.down_proj"))
-                                    }),
-                                    stream,
-                                )?;
-                                bank.gate_up_proj = Param::new(
-                                    acquired
-                                        .compact_binding("gate_up_proj", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.gate_up_proj_scales = Param::new(
-                                    acquired
-                                        .optional_compact_binding("gate_up_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.gate_up_proj_biases = Param::new(
-                                    acquired
-                                        .optional_compact_binding("gate_up_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj = Param::new(
-                                    acquired
-                                        .compact_binding("down_proj", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj_scales = Param::new(
-                                    acquired
-                                        .optional_compact_binding("down_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj_biases = Param::new(
-                                    acquired
-                                        .optional_compact_binding("down_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                expert_cache.record_compact_bank(
-                                    pass,
-                                    acquired.scratch_bytes(),
-                                    started.elapsed(),
-                                )?;
-                                Ok(bank.forward(
-                                    flat,
-                                    acquired.compact_routes(),
-                                    weights,
-                                    stream,
-                                )?)
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))
-                },
-            )?);
-        }
-        Ok(layer.forward(
-            AttentionInput {
-                x: hidden,
-                mask: context.mask.as_ref(),
-                cache: Some(cache),
-            },
-            stream,
-        )?)
-    }
-}
+impl DenseQwenLayerwiseAdapter {}
 
 fn validate_dense_qwen_cache<C: KeyValueCache>(
     caches: &[Option<C>],

@@ -44,8 +44,7 @@ use crate::{
     },
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes,
-        build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
-        populate_module_from_lease, populate_module_from_lease_excluding, ModuleBindingPlan,
+        build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name, ModuleBindingPlan,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::{open_gguf_checkpoint_source, TensorSelection},
@@ -63,13 +62,11 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_module_store_with_bindings, shard_layer_bindings,
-        LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx_architectures::deepseek_v3::model::{
         self as resident, Cache, DecoderLayer, LayerPolicy, ModelArgs,
     },
@@ -2957,10 +2954,6 @@ impl DeepSeekV3LayerwiseAdapter {
             )
     }
 
-    fn new_cache(&self) -> Cache {
-        Cache::new(&self.args).with_mtp_layers(self.mtp.as_ref().map_or(0, DeepSeekMtpModule::len))
-    }
-
     fn recipes_for_layer(
         &self,
         layer: &DecoderLayer,
@@ -3407,110 +3400,21 @@ fn register_deepseek_layer_parallel_plan_at(
     Ok(())
 }
 
-impl LoadTimeQuantizableAdapter for DeepSeekV3LayerwiseAdapter {
-    fn load_time_quantized(
-        &self,
-        quantization: WeightQuantization,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let mut args = self.args.clone();
-        args.quantization_config = None;
-        args.quantization = Some(quantization);
-        args.quantized_weight_configs = None;
-        if self.sparse_expert_cache {
-            Self::new_sparse(args, stream)
-        } else {
-            Self::new(args, stream)
-        }
-    }
-}
+impl DeepSeekV3LayerwiseAdapter {}
 
-impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
-    type Input<'a> = &'a Array;
-    type Cache = Cache;
-    type Layer = DecoderLayer;
-    type ForwardContext = DeepSeekV3ForwardContext;
-
-    fn model_type(&self) -> &str {
+impl DeepSeekV3LayerwiseAdapter {
+    pub(crate) fn model_type(&self) -> &str {
         &self.args.model_type
     }
 
-    fn safetensors_checkpoint_plan(
-        &self,
-    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
-        super::checkpoint::safetensors_plan(&self.args, true)
-            .map_err(Error::UnsupportedArchitecture)
-    }
-
-    fn prompt_cache_model_identity(
-        &self,
-        topology: Option<crate::backend::mlx::MlxParallelContext>,
-    ) -> Result<PromptCacheModelIdentity, Error> {
-        let layer_count = self.args.layer_schedule.len();
-        Ok(PromptCacheModelIdentity {
-            model_family: "deepseek_v3".into(),
-            effective_model_type: self.args.model_type.clone(),
-            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(&self.args),
-            layer_count,
-            global_layer_start: 0,
-            global_layer_end: layer_count,
-            sink_tokens: 0,
-            layer_prefix_offsets: vec![0; layer_count],
-            topology: topology.map_or_else(
-                PromptCacheTopology::default,
-                crate::backend::mlx::cache::prompt_cache_topology,
-            ),
-            layer_layout: PromptCacheModelIdentity::compressed_layouts(
-                layer_count,
-                self.args.kv_lora_rank,
-                self.args.qk_rope_head_dim,
-            )
-            .map_err(|error| Exception::custom(error.to_string()))?,
-        })
-    }
-
-    fn save_prompt_cache(
-        &self,
-        cache: &mut Self::Cache,
-        destination: &Path,
-        descriptor: PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        options: &PromptCacheOptions,
-        _stream: &Stream,
-    ) -> Result<PromptCacheManifest, Error> {
-        cache
-            .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
-            .map_err(Into::into)
-    }
-
-    fn load_prompt_cache(
-        &self,
-        directory: &Path,
-        expected: &PromptCacheDescriptor,
-        identity: &PromptCacheModelIdentity,
-        prefix_token_ids: &[u32],
-        options: PagedCacheOptions,
-        _stream: &Stream,
-    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
-        Cache::load_prompt_cache(
-            &self.args,
-            directory,
-            expected,
-            identity,
-            prefix_token_ids,
-            options,
-        )
-        .map_err(Into::into)
-    }
-
-    fn static_units(
+    pub(crate) fn static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
-    fn selected_static_units(
+    pub(crate) fn selected_static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
@@ -3570,117 +3474,7 @@ impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
         Ok(units)
     }
 
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected = 3 + usize::from(self.mtp.is_some());
-        if leases.len() != expected {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "DeepSeek-V3 adapter received {} static leases, expected {expected}",
-                leases.len(),
-            )));
-        }
-        if let Some(embedding) = &mut self.parallel_embedding {
-            populate_module_from_lease(embedding.inner_mut(), &leases[0])?;
-        } else {
-            populate_module_from_lease(&mut self.embedding, &leases[0])?;
-        }
-        populate_module_from_lease(&mut self.norm, &leases[1])?;
-        if let Some(head) = &mut self.parallel_lm_head {
-            populate_module_from_lease(head.inner_mut(), &leases[2])?;
-        } else {
-            populate_module_from_lease(&mut self.lm_head, &leases[2])?;
-        }
-        if let Some(mtp) = &mut self.mtp {
-            if self.sparse_expert_cache {
-                populate_module_from_lease_excluding(mtp, &leases[3], |name| {
-                    name.contains(".decoder.mlp.experts.")
-                })?;
-            } else {
-                populate_module_from_lease(mtp, &leases[3])?;
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
-        if cache.layers.is_empty() {
-            *cache = self.new_cache();
-        }
-        if cache.layers.len() != self.args.layer_schedule.len() {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "DeepSeek-V3 cache has {} layers, expected {}",
-                cache.layers.len(),
-                self.args.layer_schedule.len()
-            )));
-        }
-        Ok(())
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        let hidden = self.embedding.forward(input, stream)?;
-        let offset = cache.offset();
-        let mask = if hidden.dim(1) > 1 && offset > 0 {
-            Some(create_causal_mask(
-                hidden.dim(1),
-                Some(offset),
-                None,
-                None,
-                stream,
-            )?)
-        } else {
-            None
-        };
-        Ok(eredu_runtime::LayeredForwardState {
-            hidden,
-            context: DeepSeekV3ForwardContext {
-                mask,
-                draft_hidden: None,
-            },
-        })
-    }
-
-    fn begin_forward_with_execution<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        let Some(embedding) = &mut self.parallel_embedding else {
-            return self.begin_forward(input, cache, execution.stream());
-        };
-        let hidden = embedding.forward(input, execution)?;
-        let offset = cache.offset();
-        let mask = if hidden.dim(1) > 1 && offset > 0 {
-            Some(create_causal_mask(
-                hidden.dim(1),
-                Some(offset),
-                None,
-                None,
-                execution.stream(),
-            )?)
-        } else {
-            None
-        };
-        Ok(eredu_runtime::LayeredForwardState {
-            hidden,
-            context: DeepSeekV3ForwardContext {
-                mask,
-                draft_hidden: None,
-            },
-        })
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
-    }
-
-    fn layer_count(&self, group: usize) -> Result<usize, Error> {
+    pub(crate) fn layer_count(&self, group: usize) -> Result<usize, Error> {
         if group == 0 {
             Ok(self.args.layer_schedule.len())
         } else {
@@ -3690,7 +3484,12 @@ impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
         }
     }
 
-    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
+    pub(crate) fn new_layer(
+        &self,
+        group: usize,
+        index: usize,
+        stream: &Stream,
+    ) -> Result<DecoderLayer, Error> {
         self.layer_count(group)?;
         Ok(DecoderLayer::new_layerwise(
             &self.args,
@@ -3699,13 +3498,13 @@ impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
         )?)
     }
 
-    fn new_expert_parallel_layer(
+    pub(crate) fn new_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<DecoderLayer, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
         if let Some(moe) = layer.mlp.moe_mut() {
             moe.experts = resident::RoutedExperts::new_compact(
@@ -3724,14 +3523,14 @@ impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
         Ok(layer)
     }
 
-    fn new_tensor_expert_parallel_layer(
+    pub(crate) fn new_tensor_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<DecoderLayer, Error> {
         let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
         if let Some(moe) = layer.mlp.moe_mut() {
             let intermediate = moe.experts.intermediate_size;
@@ -3752,7 +3551,7 @@ impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
         Ok(layer)
     }
 
-    fn expert_parallel_assignment(
+    pub(crate) fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
@@ -3780,7 +3579,7 @@ impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
         ))
     }
 
-    fn register_parallel_parameters(
+    pub(crate) fn register_parallel_parameters(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
@@ -3843,7 +3642,7 @@ impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
         Ok(())
     }
 
-    fn configure_parallel_static(
+    pub(crate) fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         layout: &eredu_runtime::LocalModelLayout,
@@ -3944,13 +3743,13 @@ impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
         Ok(())
     }
 
-    fn new_parallel_layer(
+    pub(crate) fn new_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<DecoderLayer, Error> {
         self.layer_count(group)?;
         let prefix = format!("model.layers.{index}");
         let tensor = |suffix: &str| {
@@ -4013,37 +3812,15 @@ impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
         )?)
     }
 
-    fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
+    pub(crate) fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
         format!("model.layers.{index}")
     }
 
-    fn layer_unit_name(&self, _group: usize, index: usize) -> String {
-        format!("deepseek_v3.layer.{index:05}")
-    }
-
-    fn populate_layer(
-        &self,
-        _group: usize,
-        _index: usize,
-        layer: &mut Self::Layer,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        if self.sparse_expert_cache {
-            Ok(populate_module_from_lease_excluding(
-                layer,
-                lease,
-                |name| name.starts_with("mlp.experts."),
-            )?)
-        } else {
-            Ok(populate_module_from_lease(layer, lease)?)
-        }
-    }
-
-    fn layer_bindings(
+    pub(crate) fn layer_bindings(
         &self,
         _group: usize,
         index: usize,
-        layer: &Self::Layer,
+        layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         Ok(self
@@ -4051,11 +3828,11 @@ impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
             .build_bindings(store)?)
     }
 
-    fn parallel_layer_bindings(
+    pub(crate) fn parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
@@ -4069,11 +3846,11 @@ impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
         )
     }
 
-    fn expert_parallel_layer_bindings(
+    pub(crate) fn expert_parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
@@ -4101,187 +3878,79 @@ impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
             .collect()
     }
 
-    fn additional_consumed_checkpoint_keys(
+    pub(crate) fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
+        true
+    }
+
+    pub(crate) fn new_cartesian_layer(
         &self,
+        group: usize,
+        index: usize,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<DecoderLayer, Error> {
+        match (layout, assignment) {
+            (None, None) => self.new_layer(group, index, stream),
+            (Some(layout), None) => self.new_parallel_layer(group, index, layout, stream),
+            (None, Some(assignment)) => {
+                self.new_expert_parallel_layer(group, index, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => {
+                self.new_tensor_expert_parallel_layer(group, index, layout, assignment, stream)
+            }
+        }
+    }
+
+    pub(crate) fn tensor_expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Vec<String> {
-        store
-            .source_keys()
-            .into_iter()
-            .filter(|key| self.sparse_expert_cache && key.contains(".mlp.experts."))
-            .collect()
-    }
-
-    fn forward_layer(
-        &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        layout: &eredu_runtime::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.layer_count(group)?;
-        if self.sparse_expert_cache
-            && self.args.layer_policy(index) == Some(&LayerPolicy::SparseMoe)
-        {
-            let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "DeepSeek-V3 sparse expert cache was not initialized".into(),
-                )
-            })?;
-            let pass = if hidden.dim(1) > 1 {
-                ExpertPass::Prefill
-            } else {
-                ExpertPass::Decode
-            };
-            let output = layer.forward_sparse_experts(
-                hidden,
-                context.mask.as_ref(),
-                Some(&mut cache.layers[index]),
-                stream,
-                |flat, indices, weights, stream| {
-                    execute_cached_deepseek_experts(
-                        &self.args,
-                        expert_cache,
-                        index,
-                        flat,
-                        indices,
-                        weights,
-                        pass,
-                        stream,
-                    )
-                },
-            )?;
-            return Ok(output);
-        }
-        Ok(layer.forward_stage(
-            hidden,
-            context.mask.as_ref(),
-            Some(&mut cache.layers[index]),
-            stream,
-        )?)
-    }
-
-    fn forward_layer_with_observer<
-        O: crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
-    >(
-        &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        stream: &Stream,
-        observer: &mut O,
-    ) -> Result<Array, Error> {
-        self.layer_count(group)?;
-        if self.sparse_expert_cache {
-            let prefix = self.layer_checkpoint_prefix(group, index);
-            observer.observe(&format!("{prefix}.input"), hidden)?;
-            let output = <Self as MlxArchitectureSemantics>::forward_layer(
-                self, group, index, layer, hidden, cache, context, stream,
-            )?;
-            observer.observe(&format!("{prefix}.output"), &output)?;
-            return Ok(observer
-                .intervene(&format!("{prefix}.output"), &output)?
-                .unwrap_or(output));
-        }
-        Ok(layer.forward_stage_with_observer(
-            hidden,
-            context.mask.as_ref(),
-            Some(&mut cache.layers[index]),
-            stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let bindings =
+            self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
+        shard_layer_bindings(
+            bindings,
             &self.layer_checkpoint_prefix(group, index),
-            observer,
-        )?)
+            store,
+            layout,
+        )
     }
 
-    fn forward_layer_with_execution(
-        &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        let Some(tp_group) = execution.group() else {
-            return self.forward_layer(
-                group,
-                index,
-                layer,
-                hidden,
-                cache,
-                context,
-                execution.stream(),
-            );
-        };
-        self.layer_count(group)?;
-        Ok(layer.forward_tensor_parallel(
-            hidden,
-            context.mask.as_ref(),
-            Some(&mut cache.layers[index]),
-            tp_group,
-            execution.stream(),
-        )?)
-    }
-
-    fn retained_arrays<'a>(
+    pub(crate) fn cartesian_layer_bindings(
         &self,
-        cache: &'a Self::Cache,
-        _group: usize,
-        index: usize,
-    ) -> Vec<&'a Array> {
-        cache.layers[index]
-            .arrays()
-            .map(|(latent, rotary)| vec![latent, rotary])
-            .unwrap_or_default()
-    }
-
-    fn complete_execution_group(
-        &mut self,
         group: usize,
-        hidden: &Array,
-        _cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        _stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.layer_count(group)?;
-        context.draft_hidden = Some(hidden.clone());
-        Ok(hidden.clone())
-    }
-
-    fn finish(
-        &mut self,
-        hidden: &Array,
-        _cache: &mut Self::Cache,
-        _context: &Self::ForwardContext,
+        index: usize,
+        layer: &DecoderLayer,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
-    ) -> Result<Array, Error> {
-        let hidden = self.norm.forward(hidden, stream)?;
-        Ok(self.lm_head.forward(&hidden, stream)?)
-    }
-
-    fn finish_with_execution(
-        &mut self,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        let Some(head) = &mut self.parallel_lm_head else {
-            return self.finish(hidden, cache, context, execution.stream());
-        };
-        let hidden = self.norm.forward(hidden, execution.stream())?;
-        head.forward(&hidden, execution)?.all_gather(execution)
+    ) -> Result<Vec<WeightBinding>, Error> {
+        match (layout, assignment) {
+            (None, None) => {
+                // The execution layer can have transformed target geometry
+                // (for example load-time affine quantization). Bindings must
+                // continue to describe the adapter's source checkpoint
+                // geometry and are transformed only during population.
+                let source = self.new_layer(group, index, stream)?;
+                self.layer_bindings(group, index, &source, store)
+            }
+            (Some(layout), None) => {
+                self.parallel_layer_bindings(group, index, layer, store, layout, stream)
+            }
+            (None, Some(assignment)) => {
+                self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => self.tensor_expert_parallel_layer_bindings(
+                group, index, layer, store, layout, assignment, stream,
+            ),
+        }
     }
 }
 

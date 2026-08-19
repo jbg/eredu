@@ -49,7 +49,6 @@ use crate::{
     backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::{
         build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
-        populate_module_from_lease, populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
     backend::mlx::runtime::checkpoint::store::WeightStoreBackend,
@@ -70,7 +69,7 @@ use crate::{
         },
         layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
+            shard_layer_bindings,
         },
     },
     backend::mlx::runtime::media::input,
@@ -78,7 +77,6 @@ use crate::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
         ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx_architectures::gemma4::{
         audio::{AudioLayer, Gemma4AudioConfig, Gemma4AudioLayerwiseStatic, Gemma4AudioTower},
         model::{
@@ -1362,7 +1360,7 @@ impl Gemma4LayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
+    pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
         self.execution.checkpoint_store()
     }
 
@@ -3603,8 +3601,8 @@ impl Gemma4LayerwiseAdapter {
     }
 }
 
-impl LoadTimeQuantizableAdapter for Gemma4LayerwiseAdapter {
-    fn load_time_quantized(
+impl Gemma4LayerwiseAdapter {
+    pub(crate) fn load_time_quantized(
         &self,
         quantization: WeightQuantization,
         stream: &Stream,
@@ -3649,17 +3647,12 @@ fn ignores_gemma4_checkpoint_key(key: &str) -> bool {
         .any(|prefix| key.starts_with(prefix))
 }
 
-impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
-    type Input<'a> = Gemma4Input<'a>;
-    type Cache = Cache;
-    type Layer = Gemma4Layer;
-    type ForwardContext = Gemma4ForwardContext;
-
-    fn model_type(&self) -> &str {
+impl Gemma4LayerwiseAdapter {
+    pub(crate) fn model_type(&self) -> &str {
         &self.args.model_type
     }
 
-    fn safetensors_checkpoint_plan(
+    pub(crate) fn safetensors_checkpoint_plan(
         &self,
     ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
         super::checkpoint::safetensors_plan(
@@ -3671,11 +3664,7 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         .map_err(Error::UnsupportedArchitecture)
     }
 
-    fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
-        self.args.weight_quantization()
-    }
-
-    fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
+    pub(crate) fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
         let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
         if target.contains("vision_tower.") {
             return target.ends_with("patch_embedder.input_proj.weight")
@@ -3713,7 +3702,7 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         true
     }
 
-    fn prompt_cache_model_identity(
+    pub(crate) fn prompt_cache_model_identity(
         &self,
         topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
@@ -3747,9 +3736,9 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         })
     }
 
-    fn save_prompt_cache(
+    pub(crate) fn save_prompt_cache(
         &self,
-        cache: &mut Self::Cache,
+        cache: &mut Cache,
         destination: &Path,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
@@ -3767,7 +3756,7 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn load_prompt_cache(
+    pub(crate) fn load_prompt_cache(
         &self,
         directory: &Path,
         expected: &PromptCacheDescriptor,
@@ -3775,7 +3764,7 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         prefix_token_ids: &[u32],
         _options: PagedCacheOptions,
         stream: &Stream,
-    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
         resident::Model::load_prompt_cache_with_identity(
             &self.args,
             directory,
@@ -3787,14 +3776,14 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn static_units(
+    pub(crate) fn static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
-    fn selected_static_units(
+    pub(crate) fn selected_static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
@@ -3887,62 +3876,7 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         Ok(units)
     }
 
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let mut index = 0;
-        populate_module_from_lease(&mut self.embedding, &leases[index])?;
-        index += 1;
-        if let Some(module) = &mut self.per_layer_embedding {
-            populate_module_from_lease(module, &leases[index])?;
-            index += 1;
-        }
-        if self.per_layer_projection.is_some() {
-            if let Some(module) = &mut self.parallel_per_layer_projection {
-                populate_module_from_lease(module.inner_mut(), &leases[index])?;
-            } else if let Some(module) = &mut self.per_layer_projection {
-                populate_module_from_lease(module, &leases[index])?;
-            }
-            index += 1;
-        }
-        if let Some(module) = &mut self.per_layer_norm {
-            populate_module_from_lease(module, &leases[index])?;
-            index += 1;
-        }
-        populate_module_from_lease(&mut self.norm, &leases[index])?;
-        index += 1;
-        if self.lm_head.is_some() {
-            if let Some(module) = &mut self.parallel_lm_head {
-                populate_module_from_lease(module.inner_mut(), &leases[index])?;
-            } else if let Some(module) = &mut self.lm_head {
-                populate_module_from_lease(module, &leases[index])?;
-            }
-            index += 1;
-        }
-        if let Some(module) = &mut self.vision {
-            populate_module_from_lease(module, &leases[index])?;
-            index += 1;
-        }
-        if let Some(module) = &mut self.embed_vision {
-            populate_module_from_lease(module, &leases[index])?;
-            index += 1;
-        }
-        if let Some(module) = &mut self.audio {
-            populate_module_from_lease(module, &leases[index])?;
-            index += 1;
-        }
-        if let Some(module) = &mut self.embed_audio {
-            populate_module_from_lease(module, &leases[index])?;
-            index += 1;
-        }
-        if index != leases.len() {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Gemma 4 adapter received {} static leases, consumed {index}",
-                leases.len()
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
+    pub(crate) fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
         if cache.kv.is_empty() {
             cache.reset_kv(&self.args);
         }
@@ -3956,12 +3890,12 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         Ok(())
     }
 
-    fn begin_forward<'a>(
+    pub(crate) fn begin_forward<'a>(
         &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
+        input: Gemma4Input<'a>,
+        cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Gemma4ForwardContext>, Error> {
         if let Gemma4Input::Prefill(typed) = input {
             input::validate(typed)?;
             cache.token_ids.clear();
@@ -4185,14 +4119,14 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         })
     }
 
-    fn begin_forward_with_execution<'a>(
+    pub(crate) fn begin_forward_with_execution<'a>(
         &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
+        input: Gemma4Input<'a>,
+        cache: &mut Cache,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, Gemma4ForwardContext>, Error> {
         let Some(group) = execution.group() else {
             return self.begin_forward(input, cache, execution.stream());
         };
@@ -4433,7 +4367,7 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         })
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
+    pub(crate) fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
         use eredu_runtime::{ExecutionGraph, ExecutionGroupSpec};
         let mut groups = Vec::new();
         let mut ingress = Vec::new();
@@ -4456,7 +4390,11 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         ExecutionGraph::new(groups, "text_decoder").map_err(Into::into)
     }
 
-    fn should_execute_group(&self, group: usize, context: &Self::ForwardContext) -> bool {
+    pub(crate) fn should_execute_group(
+        &self,
+        group: usize,
+        context: &Gemma4ForwardContext,
+    ) -> bool {
         self.execution_group_name(group).is_ok_and(|id| match id {
             "vision_encoder" => !context.vision_jobs.is_empty(),
             "audio_encoder" => !context.audio_jobs.is_empty(),
@@ -4464,7 +4402,7 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         })
     }
 
-    fn layer_count(&self, group: usize) -> Result<usize, Error> {
+    pub(crate) fn layer_count(&self, group: usize) -> Result<usize, Error> {
         match self.execution_group_name(group)? {
             "vision_encoder" => Ok(self.vision_depth),
             "audio_encoder" => Ok(self.audio_depth),
@@ -4473,7 +4411,12 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         }
     }
 
-    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
+    pub(crate) fn new_layer(
+        &self,
+        group: usize,
+        index: usize,
+        stream: &Stream,
+    ) -> Result<Gemma4Layer, Error> {
         self.layer_count(group)?;
         match self.execution_group_name(group)? {
             "vision_encoder" => Ok(Gemma4Layer::Vision(Box::new(VisionLayer::new(
@@ -4504,7 +4447,7 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         }
     }
 
-    fn register_parallel_parameters(
+    pub(crate) fn register_parallel_parameters(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
@@ -4701,7 +4644,7 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         Ok(())
     }
 
-    fn configure_parallel_static(
+    pub(crate) fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         layout: &eredu_runtime::LocalModelLayout,
@@ -4956,13 +4899,13 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         Ok(())
     }
 
-    fn new_parallel_layer(
+    pub(crate) fn new_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<Gemma4Layer, Error> {
         let local_semantic = |target: &str, global: i32| -> Result<i32, Error> {
             let tensor = layout.tensor(target).ok_or_else(|| {
                 Error::Parallel(format!("missing Gemma 4 TP layout for {target}"))
@@ -5040,13 +4983,13 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         }
     }
 
-    fn new_expert_parallel_layer(
+    pub(crate) fn new_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<Gemma4Layer, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
         if self.execution_group_name(group)? != "text_decoder" {
             return Ok(layer);
@@ -5075,14 +5018,14 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         Ok(layer)
     }
 
-    fn new_tensor_expert_parallel_layer(
+    pub(crate) fn new_tensor_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<Gemma4Layer, Error> {
         let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
         if self.execution_group_name(group)? != "text_decoder" {
             return Ok(layer);
@@ -5109,7 +5052,7 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         Ok(layer)
     }
 
-    fn expert_parallel_assignment(
+    pub(crate) fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
@@ -5140,20 +5083,7 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         ))
     }
 
-    fn expert_parallel_layer_bindings(
-        &self,
-        group: usize,
-        index: usize,
-        _layer: &Self::Layer,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-        _assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
-        stream: &Stream,
-    ) -> Result<Vec<WeightBinding>, Error> {
-        let source = self.new_layer(group, index, stream)?;
-        self.layer_bindings(group, index, &source, store)
-    }
-
-    fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
+    pub(crate) fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
         match self.execution_group_name(group).ok() {
             Some("vision_encoder") => format!("model.vision_tower.encoder.layers.{index}"),
             Some("audio_encoder") => format!("model.audio_tower.layers.{index}"),
@@ -5161,77 +5091,21 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         }
     }
 
-    fn layer_unit_name(&self, group: usize, index: usize) -> String {
-        match self.execution_group_name(group).ok() {
-            Some("vision_encoder") => format!("gemma4.vision.{index:05}"),
-            Some("audio_encoder") => format!("gemma4.audio.{index:05}"),
-            _ => format!("gemma4.layer.{index:05}"),
-        }
-    }
-
-    fn layer_bindings(
+    pub(crate) fn layer_bindings(
         &self,
         group: usize,
         index: usize,
-        layer: &Self::Layer,
+        layer: &Gemma4Layer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         self.bindings(layer, &self.layer_checkpoint_prefix(group, index), store)
     }
 
-    fn populate_layer(
-        &self,
-        group: usize,
-        _index: usize,
-        layer: &mut Self::Layer,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        if self.external_experts && self.execution_group_name(group)? == "text_decoder" {
-            populate_module_from_lease_excluding(layer, lease, |name| {
-                name.starts_with("experts.")
-            })?;
-        } else {
-            populate_module_from_lease(layer, lease)?;
-        }
-        if !self.external_experts {
-            if let Gemma4Layer::Text(block) = layer {
-                if let Some(experts) = &mut block.experts {
-                    for projection in [
-                        &mut experts.switch_glu.gate_proj,
-                        &mut experts.switch_glu.up_proj,
-                        &mut experts.switch_glu.down_proj,
-                    ] {
-                        projection.cache_native_view()?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn additional_consumed_checkpoint_keys(
-        &self,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Vec<String> {
-        if self.external_experts {
-            store
-                .source_keys()
-                .into_iter()
-                .filter(|key| {
-                    key.starts_with("model.language_model.layers.")
-                        && key.contains(".experts.switch_glu.")
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn parallel_layer_bindings(
+    pub(crate) fn parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &Gemma4Layer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
@@ -5245,14 +5119,14 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         )
     }
 
-    fn forward_layer(
+    pub(crate) fn forward_layer(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut Gemma4Layer,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut Gemma4ForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         match (self.execution_group_name(group)?, layer) {
@@ -5339,16 +5213,16 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         }
     }
 
-    fn forward_layer_with_observer<
+    pub(crate) fn forward_layer_with_observer<
         O: crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     >(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut Gemma4Layer,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut Gemma4ForwardContext,
         stream: &Stream,
         observer: &mut O,
     ) -> Result<Array, Error> {
@@ -5401,14 +5275,14 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
             .unwrap_or(output))
     }
 
-    fn forward_layer_with_execution(
+    pub(crate) fn forward_layer_with_execution(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut Gemma4Layer,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut Gemma4ForwardContext,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
@@ -5488,25 +5362,9 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         )
     }
 
-    fn retained_arrays<'a>(
+    pub(crate) fn retained_context_arrays<'a>(
         &self,
-        cache: &'a Self::Cache,
-        group: usize,
-        index: usize,
-    ) -> Vec<&'a Array> {
-        if self.execution_group_name(group).ok() == Some("text_decoder") {
-            cache.kv[index]
-                .as_ref()
-                .map(KeyValueCache::retained_arrays)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn retained_context_arrays<'a>(
-        &self,
-        context: &'a Self::ForwardContext,
+        context: &'a Gemma4ForwardContext,
         _group: usize,
         _index: usize,
     ) -> Vec<&'a Array> {
@@ -5523,13 +5381,13 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         arrays
     }
 
-    fn begin_execution_group(
+    pub(crate) fn begin_execution_group(
         &mut self,
         group: usize,
         initial_hidden: &Array,
         dependency_outputs: &[Array],
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut Gemma4ForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         if self.execution_group_name(group)? != "text_decoder" {
@@ -5601,13 +5459,13 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         Ok(hidden)
     }
 
-    fn begin_execution_group_with_execution(
+    pub(crate) fn begin_execution_group_with_execution(
         &mut self,
         group: usize,
         initial_hidden: &Array,
         dependency_outputs: &[Array],
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut Gemma4ForwardContext,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
@@ -5700,12 +5558,12 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         Ok(hidden)
     }
 
-    fn complete_execution_group(
+    pub(crate) fn complete_execution_group(
         &mut self,
         group: usize,
         hidden: &Array,
-        _cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        _cache: &mut Cache,
+        context: &mut Gemma4ForwardContext,
         _stream: &Stream,
     ) -> Result<Array, Error> {
         if self.execution_group_name(group)? == "text_decoder" {
@@ -5714,11 +5572,11 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         Ok(hidden.clone())
     }
 
-    fn finish(
+    pub(crate) fn finish(
         &mut self,
         hidden: &Array,
-        _cache: &mut Self::Cache,
-        _context: &Self::ForwardContext,
+        _cache: &mut Cache,
+        _context: &Gemma4ForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let hidden = self.norm.forward(hidden, stream)?;
@@ -5733,11 +5591,11 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         Ok(logits)
     }
 
-    fn finish_with_execution(
+    pub(crate) fn finish_with_execution(
         &mut self,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &Self::ForwardContext,
+        cache: &mut Cache,
+        context: &Gemma4ForwardContext,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
@@ -5792,8 +5650,24 @@ impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
         Ok(logits)
     }
 
-    fn ignores_checkpoint_key(&self, key: &str) -> bool {
-        ignores_gemma4_checkpoint_key(key)
+    pub(crate) fn new_cartesian_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<Gemma4Layer, Error> {
+        match (layout, assignment) {
+            (None, None) => self.new_layer(group, index, stream),
+            (Some(layout), None) => self.new_parallel_layer(group, index, layout, stream),
+            (None, Some(assignment)) => {
+                self.new_expert_parallel_layer(group, index, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => {
+                self.new_tensor_expert_parallel_layer(group, index, layout, assignment, stream)
+            }
+        }
     }
 }
 

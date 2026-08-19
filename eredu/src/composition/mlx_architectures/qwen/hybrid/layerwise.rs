@@ -47,8 +47,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes,
         build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
-        is_materialized_module_parameter, populate_module_from_lease,
-        populate_module_from_lease_excluding, ModuleBindingPlan,
+        is_materialized_module_parameter, ModuleBindingPlan,
     },
     backend::mlx::runtime::checkpoint::store::{TensorSelection, WeightStoreBackend},
     backend::mlx::runtime::checkpoint::{
@@ -68,14 +67,13 @@ use crate::{
         },
         layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
+            shard_layer_bindings,
         },
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx_architectures::qwen::{
         hybrid::{
             qwen3_5::{
@@ -143,10 +141,6 @@ impl QwenHybridExecution {
 
     fn adapter(&self) -> &QwenHybridLayerwiseAdapter {
         &self.architecture().adapter
-    }
-
-    fn adapter_mut(&mut self) -> &mut QwenHybridLayerwiseAdapter {
-        &mut self.architecture_mut().adapter
     }
 
     fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
@@ -1890,7 +1884,7 @@ impl QwenHybridLayerwiseModel {
     }
 
     /// Returns the persistent checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn eredu_checkpoint::store::CheckpointSource) {
+    pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
         self.execution.checkpoint_store()
     }
 
@@ -4644,8 +4638,8 @@ impl KeyValueCache for OffsetOnlyCache {
     }
 }
 
-impl LoadTimeQuantizableAdapter for QwenHybridLayerwiseAdapter {
-    fn load_time_quantized(
+impl QwenHybridLayerwiseAdapter {
+    pub(crate) fn load_time_quantized(
         &self,
         quantization: WeightQuantization,
         stream: &Stream,
@@ -4667,17 +4661,12 @@ impl LoadTimeQuantizableAdapter for QwenHybridLayerwiseAdapter {
     }
 }
 
-impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
-    type Input<'a> = QwenHybridInput<'a>;
-    type Cache = Cache;
-    type Layer = QwenHybridLayer;
-    type ForwardContext = QwenHybridForwardContext;
-
-    fn model_type(&self) -> &str {
+impl QwenHybridLayerwiseAdapter {
+    pub(crate) fn model_type(&self) -> &str {
         &self.args.model_type
     }
 
-    fn safetensors_checkpoint_plan(
+    pub(crate) fn safetensors_checkpoint_plan(
         &self,
     ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
         let variant = match self.family {
@@ -4688,16 +4677,12 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
             .map_err(Error::UnsupportedArchitecture)
     }
 
-    fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
-        self.args.quantization
-    }
-
-    fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
+    pub(crate) fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
         let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
         !target.starts_with("visual.") && !target.contains(".visual.")
     }
 
-    fn prompt_cache_model_identity(
+    pub(crate) fn prompt_cache_model_identity(
         &self,
         topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
@@ -4731,9 +4716,9 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         })
     }
 
-    fn save_prompt_cache(
+    pub(crate) fn save_prompt_cache(
         &self,
-        cache: &mut Self::Cache,
+        cache: &mut Cache,
         destination: &Path,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
@@ -4751,7 +4736,7 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn load_prompt_cache(
+    pub(crate) fn load_prompt_cache(
         &self,
         directory: &Path,
         expected: &PromptCacheDescriptor,
@@ -4759,7 +4744,7 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         prefix_token_ids: &[u32],
         _options: PagedCacheOptions,
         stream: &Stream,
-    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
         resident::Model::load_prompt_cache_with_identity(
             &self.args,
             directory,
@@ -4771,14 +4756,14 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         .map_err(Into::into)
     }
 
-    fn static_units(
+    pub(crate) fn static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
-    fn selected_static_units(
+    pub(crate) fn selected_static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
@@ -4827,48 +4812,7 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         Ok(units)
     }
 
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected = 2
-            + usize::from(self.lm_head.is_some())
-            + usize::from(self.mtp.is_some())
-            + usize::from(self.vision.is_some());
-        if leases.len() != expected {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Qwen hybrid adapter received {} static leases, expected {expected}",
-                leases.len()
-            )));
-        }
-        if let Some(v) = &mut self.parallel_embedding {
-            populate_module_from_lease(v.inner_mut(), &leases[0])?;
-        } else {
-            populate_module_from_lease(&mut self.embedding, &leases[0])?;
-        }
-        populate_module_from_lease(&mut self.norm, &leases[1])?;
-        let mut index = 2;
-        if let Some(v) = &mut self.parallel_lm_head {
-            populate_module_from_lease(v.inner_mut(), &leases[index])?;
-            index += 1;
-        } else if let Some(head) = &mut self.lm_head {
-            populate_module_from_lease(head, &leases[index])?;
-            index += 1;
-        }
-        if let Some(mtp) = &mut self.mtp {
-            if self.sparse_expert_cache {
-                populate_module_from_lease_excluding(mtp, &leases[index], |name| {
-                    name.contains(".mlp.experts.")
-                })?;
-            } else {
-                populate_module_from_lease(mtp, &leases[index])?;
-            }
-            index += 1;
-        }
-        if let Some(vision) = &mut self.vision {
-            populate_module_from_lease(vision, &leases[index])?;
-        }
-        Ok(())
-    }
-
-    fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
+    pub(crate) fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
         if cache.layers.is_empty() {
             *cache = self.new_cache();
             return Ok(());
@@ -4902,12 +4846,12 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         Ok(())
     }
 
-    fn begin_forward<'a>(
+    pub(crate) fn begin_forward<'a>(
         &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
+        input: QwenHybridInput<'a>,
+        cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, QwenHybridForwardContext>, Error> {
         let (hidden, parts, vision_jobs, needs_assembly) = match input {
             QwenHybridInput::Decode(tokens) => (
                 self.embedding.forward(tokens, stream)?,
@@ -5025,14 +4969,14 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
             },
         })
     }
-    fn begin_forward_with_execution<'a>(
+    pub(crate) fn begin_forward_with_execution<'a>(
         &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
+        input: QwenHybridInput<'a>,
+        cache: &mut Cache,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
+    ) -> Result<eredu_runtime::LayeredForwardState<Array, QwenHybridForwardContext>, Error> {
         let Some(embedding) = &mut self.parallel_embedding else {
             return self.begin_forward(input, cache, execution.stream());
         };
@@ -5092,7 +5036,7 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         })
     }
 
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
+    pub(crate) fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
         if self.vision.is_some() {
             eredu_runtime::ExecutionGraph::chain(["vision_encoder", "text_decoder"])
                 .map_err(Into::into)
@@ -5101,12 +5045,16 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         }
     }
 
-    fn should_execute_group(&self, group: usize, context: &Self::ForwardContext) -> bool {
+    pub(crate) fn should_execute_group(
+        &self,
+        group: usize,
+        context: &QwenHybridForwardContext,
+    ) -> bool {
         self.execution_group_name(group)
             .is_ok_and(|name| name != "vision_encoder" || !context.vision_jobs.is_empty())
     }
 
-    fn layer_count(&self, group: usize) -> Result<usize, Error> {
+    pub(crate) fn layer_count(&self, group: usize) -> Result<usize, Error> {
         match self.execution_group_name(group)? {
             "vision_encoder" => Ok(self
                 .vision
@@ -5119,7 +5067,12 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         }
     }
 
-    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
+    pub(crate) fn new_layer(
+        &self,
+        group: usize,
+        index: usize,
+        stream: &Stream,
+    ) -> Result<QwenHybridLayer, Error> {
         self.layer_count(group)?;
         if self.execution_group_name(group)? == "vision_encoder" {
             Ok(QwenHybridLayer::Vision(Box::new(QwenVisionBlock::new(
@@ -5134,13 +5087,13 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         }
     }
 
-    fn new_expert_parallel_layer(
+    pub(crate) fn new_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<QwenHybridLayer, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
         if matches!(layer, QwenHybridLayer::Vision(_)) {
             return Ok(layer);
@@ -5164,14 +5117,14 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         Ok(layer)
     }
 
-    fn new_tensor_expert_parallel_layer(
+    pub(crate) fn new_tensor_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<QwenHybridLayer, Error> {
         let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
         if matches!(layer, QwenHybridLayer::Vision(_)) {
             return Ok(layer);
@@ -5196,7 +5149,7 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         Ok(layer)
     }
 
-    fn expert_parallel_assignment(
+    pub(crate) fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
@@ -5219,7 +5172,7 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         ))
     }
 
-    fn register_parallel_parameters(
+    pub(crate) fn register_parallel_parameters(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
@@ -5279,7 +5232,7 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         }
         Ok(())
     }
-    fn configure_parallel_static(
+    pub(crate) fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         layout: &eredu_runtime::LocalModelLayout,
@@ -5419,13 +5372,13 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         }
         Ok(())
     }
-    fn new_parallel_layer(
+    pub(crate) fn new_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<QwenHybridLayer, Error> {
         if self.execution_group_name(group)? == "vision_encoder" {
             let vision = &self.vision.as_ref().expect("vision group").config;
             return Ok(QwenHybridLayer::Vision(Box::new(
@@ -5448,7 +5401,7 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         )))
     }
 
-    fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
+    pub(crate) fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
         if self.execution_group_name(group).ok() == Some("vision_encoder") {
             format!("visual.blocks.{index}")
         } else {
@@ -5456,19 +5409,11 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         }
     }
 
-    fn layer_unit_name(&self, group: usize, index: usize) -> String {
-        if self.execution_group_name(group).ok() == Some("vision_encoder") {
-            format!("qwen_hybrid.vision.{index:05}")
-        } else {
-            format!("qwen_hybrid.layer.{index:05}")
-        }
-    }
-
-    fn layer_bindings(
+    pub(crate) fn layer_bindings(
         &self,
         group: usize,
         index: usize,
-        layer: &Self::Layer,
+        layer: &QwenHybridLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
@@ -5491,11 +5436,11 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
             },
         )
     }
-    fn parallel_layer_bindings(
+    pub(crate) fn parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &QwenHybridLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
@@ -5509,11 +5454,11 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         )
     }
 
-    fn expert_parallel_layer_bindings(
+    pub(crate) fn expert_parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &QwenHybridLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
@@ -5544,47 +5489,14 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
             .collect()
     }
 
-    fn populate_layer(
-        &self,
-        _group: usize,
-        _index: usize,
-        layer: &mut Self::Layer,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        if self.sparse_expert_cache {
-            Ok(populate_module_from_lease_excluding(
-                layer,
-                lease,
-                |name| name.starts_with("mlp.experts."),
-            )?)
-        } else {
-            Ok(populate_module_from_lease(layer, lease)?)
-        }
-    }
-
-    fn additional_consumed_checkpoint_keys(
-        &self,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Vec<String> {
-        if self.sparse_expert_cache {
-            store
-                .source_keys()
-                .into_iter()
-                .filter(|key| key.contains(".mlp.experts."))
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn forward_layer(
+    pub(crate) fn forward_layer(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut QwenHybridLayer,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut QwenHybridForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         match (self.execution_group_name(group)?, layer) {
@@ -5721,16 +5633,16 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         }
     }
 
-    fn forward_layer_with_observer<
+    pub(crate) fn forward_layer_with_observer<
         O: crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
     >(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut QwenHybridLayer,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut QwenHybridForwardContext,
         stream: &Stream,
         observer: &mut O,
     ) -> Result<Array, Error> {
@@ -5761,14 +5673,14 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
             .unwrap_or(output))
     }
 
-    fn forward_layer_with_execution(
+    pub(crate) fn forward_layer_with_execution(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut QwenHybridLayer,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut QwenHybridForwardContext,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
@@ -5800,22 +5712,9 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         }
     }
 
-    fn retained_arrays<'a>(
+    pub(crate) fn retained_context_arrays<'a>(
         &self,
-        cache: &'a Self::Cache,
-        group: usize,
-        index: usize,
-    ) -> Vec<&'a Array> {
-        if self.execution_group_name(group).ok() == Some("text_decoder") {
-            cache.layers[index].retained_arrays()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn retained_context_arrays<'a>(
-        &self,
-        context: &'a Self::ForwardContext,
+        context: &'a QwenHybridForwardContext,
         _group: usize,
         _index: usize,
     ) -> Vec<&'a Array> {
@@ -5826,13 +5725,13 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
             .collect()
     }
 
-    fn begin_execution_group(
+    pub(crate) fn begin_execution_group(
         &mut self,
         group: usize,
         initial_hidden: &Array,
         dependency_outputs: &[Array],
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut QwenHybridForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let group_name = self.execution_group_name(group)?;
@@ -5883,12 +5782,12 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         Ok(hidden)
     }
 
-    fn complete_execution_group(
+    pub(crate) fn complete_execution_group(
         &mut self,
         group: usize,
         hidden: &Array,
-        _cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        _cache: &mut Cache,
+        context: &mut QwenHybridForwardContext,
         _stream: &Stream,
     ) -> Result<Array, Error> {
         if self.execution_group_name(group)? == "text_decoder" {
@@ -5897,11 +5796,11 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         Ok(hidden.clone())
     }
 
-    fn finish(
+    pub(crate) fn finish(
         &mut self,
         hidden: &Array,
-        _cache: &mut Self::Cache,
-        _context: &Self::ForwardContext,
+        _cache: &mut Cache,
+        _context: &QwenHybridForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         let hidden = self.norm.forward(hidden, stream)?;
@@ -5912,11 +5811,11 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
             stream,
         )?)
     }
-    fn finish_with_execution(
+    pub(crate) fn finish_with_execution(
         &mut self,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &Self::ForwardContext,
+        cache: &mut Cache,
+        context: &QwenHybridForwardContext,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
@@ -5932,12 +5831,75 @@ impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
         logits.all_gather(execution)
     }
 
-    fn ignores_checkpoint_key(&self, key: &str) -> bool {
-        self.vision.is_none()
-            && (key.starts_with("visual.")
-                || key.starts_with("vision_tower.")
-                || key.starts_with("model.visual.")
-                || key.starts_with("model.vision_tower."))
+    pub(crate) fn new_cartesian_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<QwenHybridLayer, Error> {
+        match (layout, assignment) {
+            (None, None) => self.new_layer(group, index, stream),
+            (Some(layout), None) => self.new_parallel_layer(group, index, layout, stream),
+            (None, Some(assignment)) => {
+                self.new_expert_parallel_layer(group, index, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => {
+                self.new_tensor_expert_parallel_layer(group, index, layout, assignment, stream)
+            }
+        }
+    }
+
+    pub(crate) fn tensor_expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &QwenHybridLayer,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: &eredu_runtime::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let bindings =
+            self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
+        shard_layer_bindings(
+            bindings,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            layout,
+        )
+    }
+
+    pub(crate) fn cartesian_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &QwenHybridLayer,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        match (layout, assignment) {
+            (None, None) => {
+                // The execution layer can have transformed target geometry
+                // (for example load-time affine quantization). Bindings must
+                // continue to describe the adapter's source checkpoint
+                // geometry and are transformed only during population.
+                let source = self.new_layer(group, index, stream)?;
+                self.layer_bindings(group, index, &source, store)
+            }
+            (Some(layout), None) => {
+                self.parallel_layer_bindings(group, index, layer, store, layout, stream)
+            }
+            (None, Some(assignment)) => {
+                self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => self.tensor_expert_parallel_layer_bindings(
+                group, index, layer, store, layout, assignment, stream,
+            ),
+        }
     }
 }
 

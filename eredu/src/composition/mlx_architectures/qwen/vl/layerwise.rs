@@ -50,8 +50,7 @@ use crate::{
     },
     backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::{
-        binding_bytes, build_module_binding_plan_with_recipes, populate_module_from_lease,
-        populate_module_from_lease_excluding,
+        binding_bytes, build_module_binding_plan_with_recipes,
     },
     backend::mlx::runtime::checkpoint::store::{TensorSelection, WeightStoreBackend},
     backend::mlx::runtime::checkpoint::{
@@ -63,13 +62,11 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_module_store_with_bindings, shard_layer_bindings,
-        LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheReport, ExpertRouteBatch,
     },
-    backend::mlx::runtime::residency::manager::ResidentUnitLease,
     composition::mlx_architectures::qwen::dense::{
         layerwise::{qwen_text_layer_bindings, register_qwen_layer_parallel_plan},
         Decoder, Experts as QwenExperts, FeedForward, TransformerBlock,
@@ -537,7 +534,7 @@ fn prepare_qwen3_vl_decode<F>(
     args: &ModelArgs,
     tokens: &Array,
     cache: &Cache,
-    stream: &Stream,
+    _stream: &Stream,
     mut embed: F,
 ) -> Result<LayeredForwardState<Array, Qwen3VlForwardContext>, Error>
 where
@@ -3077,79 +3074,12 @@ impl Qwen3VlLayerwiseAdapter {
             },
         })
     }
-
-    fn prepare_decode(
-        &mut self,
-        tokens: &Array,
-        cache: &mut Cache,
-        execution: Option<
-            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
-        >,
-        stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Qwen3VlForwardContext>, Error> {
-        let hidden = match (&mut self.parallel_embedding, execution) {
-            (Some(embedding), Some(execution)) => embedding.forward(tokens, execution)?,
-            _ => self.embedding.forward(tokens, stream)?,
-        };
-        let start = cache
-            .kv
-            .first()
-            .and_then(Option::as_ref)
-            .map(KeyValueCache::offset)
-            .unwrap_or(0)
-            + cache.rope_delta;
-        let positions = [
-            (start..start + tokens.dim(1)).collect(),
-            (start..start + tokens.dim(1)).collect(),
-            (start..start + tokens.dim(1)).collect(),
-        ];
-        let (cos, sin) = resident::mrope_embeddings(
-            &positions,
-            self.args.text_config.head_dim,
-            self.args.text_config.rope_theta,
-            &self.args.mrope_section,
-        );
-        Ok(eredu_runtime::LayeredForwardState {
-            hidden,
-            context: Qwen3VlForwardContext {
-                tokens: tokens.clone(),
-                parts: Vec::new(),
-                vision: None,
-                mask: None,
-                cos,
-                sin,
-                visual_mask: None,
-                deepstack_features: Vec::new(),
-            },
-        })
-    }
 }
 
-impl LoadTimeQuantizableAdapter for Qwen3VlLayerwiseAdapter {
-    fn load_time_quantized(
-        &self,
-        quantization: WeightQuantization,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let mut args = self.args.clone();
-        args.text_config.quantization = Some(quantization);
-        args.text_config.quantization_config = None;
-        args.text_config.quantized_weight_configs = None;
-        args.vision_config
-            .apply_load_time_quantization(quantization);
-        let mut adapter = Self::new(args, stream)?;
-        adapter.sparse_expert_cache = self.sparse_expert_cache;
-        Ok(adapter)
-    }
-}
+impl Qwen3VlLayerwiseAdapter {}
 
-impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
-    type Input<'a> = Qwen3VlInput<'a>;
-    type Cache = Cache;
-    type Layer = Qwen3VlLayer;
-    type ForwardContext = Qwen3VlForwardContext;
-
-    fn model_type(&self) -> &str {
+impl Qwen3VlLayerwiseAdapter {
+    pub(crate) fn model_type(&self) -> &str {
         if self.args.text_config.model_type == "qwen3_vl_moe_text" {
             "qwen3_vl_moe"
         } else {
@@ -3157,21 +3087,7 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         }
     }
 
-    fn safetensors_checkpoint_plan(
-        &self,
-    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
-        super::checkpoint::safetensors_plan(&self.args, true)
-            .map_err(Error::UnsupportedArchitecture)
-    }
-
-    fn quantization(&self) -> Option<eredu_checkpoint::WeightQuantization> {
-        self.args
-            .text_config
-            .quantization
-            .or(self.args.text_config.quantization_config)
-    }
-
-    fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
+    pub(crate) fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
         let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
         let vision = target
             .strip_prefix("model.visual.")
@@ -3186,7 +3102,7 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         }
     }
 
-    fn prompt_cache_model_identity(
+    pub(crate) fn prompt_cache_model_identity(
         &self,
         topology: Option<crate::backend::mlx::MlxParallelContext>,
     ) -> Result<PromptCacheModelIdentity, Error> {
@@ -3222,47 +3138,7 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         })
     }
 
-    fn save_prompt_cache(
-        &self,
-        cache: &mut Self::Cache,
-        destination: &Path,
-        descriptor: PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        options: &PromptCacheOptions,
-        stream: &Stream,
-    ) -> Result<PromptCacheManifest, Error> {
-        resident::Model::save_prompt_cache(
-            cache,
-            destination,
-            descriptor,
-            prefix_token_ids,
-            options,
-            stream,
-        )
-        .map_err(Into::into)
-    }
-
-    fn load_prompt_cache(
-        &self,
-        directory: &Path,
-        expected: &PromptCacheDescriptor,
-        identity: &PromptCacheModelIdentity,
-        prefix_token_ids: &[u32],
-        _options: PagedCacheOptions,
-        stream: &Stream,
-    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
-        resident::Model::load_prompt_cache_with_identity(
-            &self.args,
-            directory,
-            expected,
-            prefix_token_ids,
-            identity,
-            stream,
-        )
-        .map_err(Into::into)
-    }
-
-    fn static_units(
+    pub(crate) fn static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
@@ -3323,82 +3199,12 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         Ok(units)
     }
 
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected = if self.lm_head.is_some() { 4 } else { 3 };
-        if leases.len() != expected {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Qwen3-VL adapter received {} static leases, expected {expected}",
-                leases.len()
-            )));
-        }
-        populate_module_from_lease(&mut self.vision, &leases[0])?;
-        if let Some(embedding) = &mut self.parallel_embedding {
-            populate_module_from_lease(embedding.inner_mut(), &leases[1])?;
-        } else {
-            populate_module_from_lease(&mut self.embedding, &leases[1])?;
-        }
-        populate_module_from_lease(&mut self.norm, &leases[2])?;
-        if let Some(head) = &mut self.parallel_lm_head {
-            populate_module_from_lease(head.inner_mut(), &leases[3])?;
-        } else if let Some(head) = &mut self.lm_head {
-            populate_module_from_lease(head, &leases[3])?;
-        }
-        Ok(())
-    }
-
-    fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
-        cache.validate(&self.args)
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
+    pub(crate) fn new_layer(
+        &self,
+        group: usize,
+        index: usize,
         stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        match input {
-            Qwen3VlInput::Prefill(input) => self.prepare_prefill(input, cache, None, stream),
-            Qwen3VlInput::Decode(tokens) => self.prepare_decode(tokens, cache, None, stream),
-        }
-    }
-
-    fn begin_forward_with_execution<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        match input {
-            Qwen3VlInput::Prefill(input) => {
-                self.prepare_prefill(input, cache, Some(execution), execution.stream())
-            }
-            Qwen3VlInput::Decode(tokens) => {
-                self.prepare_decode(tokens, cache, Some(execution), execution.stream())
-            }
-        }
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        eredu_runtime::ExecutionGraph::chain(["vision_encoder", "text_decoder"]).map_err(Into::into)
-    }
-
-    fn should_execute_group(&self, group: usize, context: &Self::ForwardContext) -> bool {
-        group != 0 || context.vision.is_some()
-    }
-
-    fn layer_count(&self, group: usize) -> Result<usize, Error> {
-        match group {
-            0 => Ok(self.args.vision_config.layer_count()),
-            1 => Ok(self.args.text_config.num_hidden_layers as usize),
-            _ => Err(Error::UnsupportedArchitecture(format!(
-                "Qwen3-VL has no execution group {group}"
-            ))),
-        }
-    }
-
-    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
+    ) -> Result<Qwen3VlLayer, Error> {
         match group {
             0 => Ok(Qwen3VlLayer::Vision(Box::new(QwenVisionBlock::new(
                 &self.args.vision_config,
@@ -3414,7 +3220,7 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         }
     }
 
-    fn parallel_parameter_groups(
+    pub(crate) fn parallel_parameter_groups(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, Error> {
@@ -3437,7 +3243,7 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         Ok(groups)
     }
 
-    fn configure_parallel_static(
+    pub(crate) fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         layout: &eredu_runtime::LocalModelLayout,
@@ -3470,7 +3276,7 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         Ok(())
     }
 
-    fn register_parallel_parameters(
+    pub(crate) fn register_parallel_parameters(
         &self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
@@ -3497,13 +3303,13 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         Ok(())
     }
 
-    fn new_parallel_layer(
+    pub(crate) fn new_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<Qwen3VlLayer, Error> {
         if group != 0 {
             let prefix = format!("model.language_model.layers.{index}");
             let planned = |name: &str| {
@@ -3548,13 +3354,13 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         )?)))
     }
 
-    fn new_expert_parallel_layer(
+    pub(crate) fn new_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<Qwen3VlLayer, Error> {
         if group != 1 || !self.args.text_config.is_moe() {
             return Err(Error::Parallel(format!(
                 "Qwen3-VL expert-local construction requires an MoE text layer, got group {group}"
@@ -3591,14 +3397,14 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         Ok(layer)
     }
 
-    fn new_tensor_expert_parallel_layer(
+    pub(crate) fn new_tensor_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<Qwen3VlLayer, Error> {
         if group != 1 || !self.args.text_config.is_moe() {
             return Err(Error::Parallel(format!(
                 "Qwen3-VL combined tensor/expert construction requires an MoE text layer, got group {group}"
@@ -3636,7 +3442,7 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         Ok(layer)
     }
 
-    fn expert_parallel_assignment(
+    pub(crate) fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
@@ -3658,7 +3464,7 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         ))
     }
 
-    fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
+    pub(crate) fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
         if group == 0 {
             format!("model.visual.blocks.{index}")
         } else {
@@ -3666,19 +3472,11 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         }
     }
 
-    fn layer_unit_name(&self, group: usize, index: usize) -> String {
-        if group == 0 {
-            format!("qwen3_vl.vision.{index:05}")
-        } else {
-            format!("qwen3_vl.text.{index:05}")
-        }
-    }
-
-    fn layer_bindings(
+    pub(crate) fn layer_bindings(
         &self,
         group: usize,
         index: usize,
-        layer: &Self::Layer,
+        layer: &Qwen3VlLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
@@ -3703,11 +3501,11 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         }
     }
 
-    fn parallel_layer_bindings(
+    pub(crate) fn parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &Qwen3VlLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
@@ -3721,11 +3519,11 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         )
     }
 
-    fn expert_parallel_layer_bindings(
+    pub(crate) fn expert_parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &Qwen3VlLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
@@ -3758,54 +3556,14 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
             .collect()
     }
 
-    fn populate_layer(
-        &self,
-        _group: usize,
-        _index: usize,
-        layer: &mut Self::Layer,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        if self.sparse_expert_cache {
-            Ok(populate_module_from_lease_excluding(
-                layer,
-                lease,
-                |name| name.starts_with("mlp.experts."),
-            )?)
-        } else {
-            Ok(populate_module_from_lease(layer, lease)?)
-        }
-    }
-
-    fn additional_consumed_checkpoint_keys(
-        &self,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Vec<String> {
-        if self.sparse_expert_cache {
-            store
-                .source_keys()
-                .into_iter()
-                .filter(|key| key.contains(".mlp.experts."))
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn ignores_checkpoint_key(&self, key: &str) -> bool {
-        crate::composition::mlx_architectures::qwen::dense::checkpoint::is_redundant_tied_output_head_key(
-            &self.args.text_config,
-            key,
-        )
-    }
-
-    fn forward_layer(
+    pub(crate) fn forward_layer(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut Qwen3VlLayer,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut Qwen3VlForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         match (group, layer) {
@@ -3968,14 +3726,14 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         }
     }
 
-    fn forward_layer_with_execution(
+    pub(crate) fn forward_layer_with_execution(
         &mut self,
         group: usize,
         index: usize,
-        layer: &mut Self::Layer,
+        layer: &mut Qwen3VlLayer,
         hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut Qwen3VlForwardContext,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
@@ -4037,45 +3795,13 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         )
     }
 
-    fn retained_arrays<'a>(
-        &self,
-        cache: &'a Self::Cache,
-        group: usize,
-        index: usize,
-    ) -> Vec<&'a Array> {
-        if group == 1 {
-            cache.kv[index]
-                .as_ref()
-                .map(KeyValueCache::retained_arrays)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn retained_context_arrays<'a>(
-        &self,
-        context: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Vec<&'a Array> {
-        context
-            .vision
-            .as_ref()
-            .map(QwenVisionLayerwiseState::retained_arrays)
-            .unwrap_or_default()
-            .into_iter()
-            .chain(context.deepstack_features.iter())
-            .collect()
-    }
-
-    fn begin_execution_group(
+    pub(crate) fn begin_execution_group(
         &mut self,
         group: usize,
         initial_hidden: &Array,
         dependency_outputs: &[Array],
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut Qwen3VlForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         if group == 0 {
@@ -4136,13 +3862,13 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         Ok(hidden)
     }
 
-    fn begin_execution_group_with_execution(
+    pub(crate) fn begin_execution_group_with_execution(
         &mut self,
         group: usize,
         initial_hidden: &Array,
         dependency_outputs: &[Array],
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        cache: &mut Cache,
+        context: &mut Qwen3VlForwardContext,
         execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
             '_,
         >,
@@ -4217,44 +3943,87 @@ impl MlxArchitectureSemantics for Qwen3VlLayerwiseAdapter {
         Ok(hidden)
     }
 
-    fn finish(
-        &mut self,
-        hidden: &Array,
-        _cache: &mut Self::Cache,
-        _context: &Self::ForwardContext,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        let hidden = self.norm.forward(hidden, stream)?;
-        Ok(common::linear::project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.embedding,
-            &hidden,
-            stream,
-        )?)
+    pub(crate) fn selected_static_units(
+        &self,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        select: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
+        Ok(self
+            .static_units(store)?
+            .into_iter()
+            .filter(|unit| select(unit.id().as_str()))
+            .collect())
     }
 
-    fn finish_with_execution(
-        &mut self,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        if self.parallel_embedding.is_none() {
-            return self.finish(hidden, cache, context, execution.stream());
+    pub(crate) fn new_cartesian_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<Qwen3VlLayer, Error> {
+        match (layout, assignment) {
+            (None, None) => self.new_layer(group, index, stream),
+            (Some(layout), None) => self.new_parallel_layer(group, index, layout, stream),
+            (None, Some(assignment)) => {
+                self.new_expert_parallel_layer(group, index, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => {
+                self.new_tensor_expert_parallel_layer(group, index, layout, assignment, stream)
+            }
         }
-        let hidden = self.norm.forward(hidden, execution.stream())?;
-        let logits = if let Some(head) = &mut self.parallel_lm_head {
-            head.forward(&hidden, execution)?
-        } else {
-            self.parallel_embedding
-                .as_mut()
-                .expect("parallel embedding")
-                .project_logits(&hidden, execution)?
-        };
-        logits.all_gather(execution)
+    }
+
+    pub(crate) fn tensor_expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &Qwen3VlLayer,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: &eredu_runtime::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let bindings =
+            self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
+        shard_layer_bindings(
+            bindings,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            layout,
+        )
+    }
+
+    pub(crate) fn cartesian_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &Qwen3VlLayer,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        match (layout, assignment) {
+            (None, None) => {
+                // The execution layer can have transformed target geometry
+                // (for example load-time affine quantization). Bindings must
+                // continue to describe the adapter's source checkpoint
+                // geometry and are transformed only during population.
+                let source = self.new_layer(group, index, stream)?;
+                self.layer_bindings(group, index, &source, store)
+            }
+            (Some(layout), None) => {
+                self.parallel_layer_bindings(group, index, layer, store, layout, stream)
+            }
+            (None, Some(assignment)) => {
+                self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => self.tensor_expert_parallel_layer_bindings(
+                group, index, layer, store, layout, assignment, stream,
+            ),
+        }
     }
 }
 

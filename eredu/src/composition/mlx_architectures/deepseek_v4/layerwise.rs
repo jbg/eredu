@@ -39,8 +39,7 @@ use crate::{
         checkpoint::{
             binding::{
                 binding_bytes, build_module_binding_plan_with_recipes,
-                build_module_binding_plan_with_recipes_excluding, populate_module_from_lease,
-                populate_module_from_lease_excluding,
+                build_module_binding_plan_with_recipes_excluding,
             },
             binding_plan::{BindingPlan, PlannedBinding},
             recipe::{DerivedWeightRecipe, RecipeDtype},
@@ -53,28 +52,22 @@ use crate::{
             },
             layerwise::{
                 open_safetensors_weight_store, quantize_module_store_with_bindings,
-                shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
+                shard_layer_bindings,
             },
         },
-        residency::{
-            expert_cache::{
+        residency::expert_cache::{
                 ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
                 ExpertRouteBatch,
             },
-            manager::ResidentUnitLease,
-        },
     },
 };
 
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions, ResidencyReport};
 
-use super::{
-    attention::AttentionCache,
-    model::{
+use super::model::{
         load_prompt_cache_with_identity, prompt_cache_model_identity, save_prompt_cache_with_rank,
         Cache, DecoderLayer, Model as ResidentModel, ModelArgs,
-    },
-};
+    };
 
 const EMBEDDING_UNIT: &str = "deepseek_v4.static.embedding";
 const NORM_UNIT: &str = "deepseek_v4.static.norm";
@@ -1076,16 +1069,6 @@ impl DeepSeekV4LayerwiseAdapter {
         Ok(adapter)
     }
 
-    fn new_cache(&self) -> Result<Cache, Exception> {
-        let layers = self.args.compress_ratios[..self.args.num_hidden_layers as usize]
-            .iter()
-            .map(|ratio| AttentionCache::new_for_ratio(*ratio, self.args.sliding_window))
-            .collect::<Result<_, _>>()?;
-        let mut cache = self.static_model.new_cache()?;
-        cache.layers = layers;
-        Ok(cache)
-    }
-
     fn layer_recipes(
         &self,
         layer: &DecoderLayer,
@@ -1372,8 +1355,8 @@ impl DeepSeekV4LayerwiseAdapter {
     }
 }
 
-impl LoadTimeQuantizableAdapter for DeepSeekV4LayerwiseAdapter {
-    fn load_time_quantized(
+impl DeepSeekV4LayerwiseAdapter {
+    pub(crate) fn load_time_quantized(
         &self,
         quantization: WeightQuantization,
         stream: &Stream,
@@ -1387,27 +1370,12 @@ impl LoadTimeQuantizableAdapter for DeepSeekV4LayerwiseAdapter {
     }
 }
 
-impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
-    type Input<'a> = &'a Array;
-    type Cache = Cache;
-    type Layer = DecoderLayer;
-    type ForwardContext = DeepSeekV4ForwardContext;
-
-    fn model_type(&self) -> &str {
+impl DeepSeekV4LayerwiseAdapter {
+    pub(crate) fn model_type(&self) -> &str {
         &self.args.model_type
     }
 
-    fn safetensors_checkpoint_plan(
-        &self,
-    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
-        super::checkpoint::safetensors_plan(&self.args).map_err(Error::UnsupportedArchitecture)
-    }
-
-    fn quantization(&self) -> Option<WeightQuantization> {
-        self.args.quantization
-    }
-
-    fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
+    pub(crate) fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
         let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
         if target == "head.weight" {
             return true;
@@ -1423,60 +1391,7 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
             && !target.contains(".markov_w1.")
     }
 
-    fn prompt_cache_model_identity(
-        &self,
-        topology: Option<crate::backend::mlx::MlxParallelContext>,
-    ) -> Result<PromptCacheModelIdentity, Error> {
-        prompt_cache_model_identity(
-            &self.args,
-            topology.map_or_else(
-                PromptCacheTopology::default,
-                crate::backend::mlx::cache::prompt_cache_topology,
-            ),
-        )
-    }
-
-    fn save_prompt_cache(
-        &self,
-        cache: &mut Self::Cache,
-        destination: &Path,
-        descriptor: PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        options: &PromptCacheOptions,
-        stream: &Stream,
-    ) -> Result<PromptCacheManifest, Error> {
-        save_prompt_cache_with_rank(
-            cache,
-            destination,
-            descriptor.clone(),
-            prefix_token_ids,
-            options,
-            descriptor.topology.cache_rank_identity(),
-            stream,
-        )
-    }
-
-    fn load_prompt_cache(
-        &self,
-        directory: &Path,
-        expected: &PromptCacheDescriptor,
-        identity: &PromptCacheModelIdentity,
-        prefix_token_ids: &[u32],
-        options: PagedCacheOptions,
-        stream: &Stream,
-    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
-        load_prompt_cache_with_identity(
-            &self.args,
-            directory,
-            expected,
-            prefix_token_ids,
-            identity.clone(),
-            options,
-            stream,
-        )
-    }
-
-    fn static_units(
+    pub(crate) fn static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
@@ -1532,78 +1447,7 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
         .collect())
     }
 
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected =
-            4 + usize::from(self.static_model.mtp.is_some() || self.static_model.dspark.is_some());
-        if leases.len() != expected {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "DeepSeek V4 adapter received {} static leases, expected {expected}",
-                leases.len(),
-            )));
-        }
-        populate_module_from_lease(&mut self.static_model.model.embed_tokens, &leases[0])?;
-        populate_module_from_lease(&mut self.static_model.model.norm, &leases[1])?;
-        populate_module_from_lease(&mut self.static_model.model.hc_head, &leases[2])?;
-        populate_module_from_lease(&mut self.static_model.lm_head, &leases[3])?;
-        if let Some(lease) = leases.get(4) {
-            if let Some(mtp) = &mut self.static_model.mtp {
-                populate_module_from_lease(mtp, lease)?;
-            } else if let Some(dspark) = &mut self.static_model.dspark {
-                populate_module_from_lease(dspark, lease)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
-        if cache.layers.is_empty() {
-            *cache = self.new_cache()?;
-        }
-        if cache.layers.len() != self.args.num_hidden_layers as usize {
-            return Err(Error::UnsupportedArchitecture(
-                "DeepSeek V4 cache does not match decoder depth".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        _cache: &mut Cache,
-        stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        let embedded = self
-            .static_model
-            .model
-            .embed_tokens
-            .forward(input, stream)?;
-        let hidden = embedded.try_index_device((.., .., NewAxis, ..), stream)?;
-        let hidden = broadcast_to(
-            &hidden,
-            &[
-                embedded.dim(0),
-                embedded.dim(1),
-                self.args.hc_mult,
-                self.args.hidden_size,
-            ],
-            stream,
-        )?;
-        Ok(eredu_runtime::LayeredForwardState {
-            hidden,
-            context: DeepSeekV4ForwardContext {
-                input_ids: input.clone(),
-                captures: Vec::new(),
-                draft_hidden: None,
-            },
-        })
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
-    }
-
-    fn layer_count(&self, group: usize) -> Result<usize, Error> {
+    pub(crate) fn layer_count(&self, group: usize) -> Result<usize, Error> {
         if group == 0 {
             Ok(self.args.num_hidden_layers as usize)
         } else {
@@ -1613,7 +1457,7 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
         }
     }
 
-    fn new_layer(
+    pub(crate) fn new_layer(
         &self,
         group: usize,
         index: usize,
@@ -1623,7 +1467,7 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
         Ok(DecoderLayer::new(&self.args, index, stream)?)
     }
 
-    fn register_parallel_parameters(
+    pub(crate) fn register_parallel_parameters(
         &self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
@@ -1649,7 +1493,7 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
         Ok(())
     }
 
-    fn configure_parallel_static(
+    pub(crate) fn configure_parallel_static(
         &mut self,
         context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         _layout: &eredu_runtime::LocalModelLayout,
@@ -1659,7 +1503,7 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
         Ok(())
     }
 
-    fn new_parallel_layer(
+    pub(crate) fn new_parallel_layer(
         &self,
         group: usize,
         index: usize,
@@ -1711,7 +1555,7 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
         )?)
     }
 
-    fn new_expert_parallel_layer(
+    pub(crate) fn new_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
@@ -1721,7 +1565,7 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
         self.new_layer(group, index, stream)
     }
 
-    fn new_tensor_expert_parallel_layer(
+    pub(crate) fn new_tensor_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
@@ -1732,7 +1576,7 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
         self.new_parallel_layer(group, index, layout, stream)
     }
 
-    fn expert_parallel_assignment(
+    pub(crate) fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
@@ -1754,15 +1598,11 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
         ))
     }
 
-    fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
+    pub(crate) fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
         format!("layers.{index}")
     }
 
-    fn layer_unit_name(&self, _group: usize, index: usize) -> String {
-        format!("deepseek_v4.layer.{index:05}")
-    }
-
-    fn layer_bindings(
+    pub(crate) fn layer_bindings(
         &self,
         _group: usize,
         index: usize,
@@ -1779,7 +1619,7 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
         Ok(bindings.build_bindings(store)?)
     }
 
-    fn parallel_layer_bindings(
+    pub(crate) fn parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
@@ -1797,11 +1637,11 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
         )
     }
 
-    fn expert_parallel_layer_bindings(
+    pub(crate) fn expert_parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
@@ -1829,169 +1669,87 @@ impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
             .collect()
     }
 
-    fn populate_layer(
-        &self,
-        _group: usize,
-        _index: usize,
-        layer: &mut DecoderLayer,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        if self.sparse_expert_cache {
-            populate_module_from_lease_excluding(layer, lease, |name| {
-                name.starts_with("ffn.switch_mlp.")
-            })?;
-        } else {
-            populate_module_from_lease(layer, lease)?;
-        }
-        Ok(())
-    }
-
-    fn additional_consumed_checkpoint_keys(
+    pub(crate) fn selected_static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Vec<String> {
-        if self.sparse_expert_cache {
-            store
-                .source_keys()
-                .into_iter()
-                .filter(|key| is_routed_expert_source(key))
-                .collect()
-        } else {
-            Vec::new()
+        select: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
+        Ok(self
+            .static_units(store)?
+            .into_iter()
+            .filter(|unit| select(unit.id().as_str()))
+            .collect())
+    }
+
+    pub(crate) fn new_cartesian_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<DecoderLayer, Error> {
+        match (layout, assignment) {
+            (None, None) => self.new_layer(group, index, stream),
+            (Some(layout), None) => self.new_parallel_layer(group, index, layout, stream),
+            (None, Some(assignment)) => {
+                self.new_expert_parallel_layer(group, index, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => {
+                self.new_tensor_expert_parallel_layer(group, index, layout, assignment, stream)
+            }
         }
     }
 
-    fn forward_layer(
-        &mut self,
+    pub(crate) fn tensor_expert_parallel_layer_bindings(
+        &self,
         group: usize,
         index: usize,
-        layer: &mut DecoderLayer,
-        hidden: &Array,
-        cache: &mut Cache,
-        context: &mut DeepSeekV4ForwardContext,
+        layer: &DecoderLayer,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: &eredu_runtime::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.layer_count(group)?;
-        let output = if let Some(expert_cache) = &self.expert_cache {
-            let pass = if hidden.dim(1) > 1 {
-                ExpertPass::Prefill
-            } else {
-                ExpertPass::Decode
-            };
-            layer.forward_with_expert_executor(
-                hidden,
-                None,
-                Some(&mut cache.layers[index]),
-                &context.input_ids,
-                stream,
-                |flat, indices, weights, stream| {
-                    execute_cached_experts(
-                        &self.args,
-                        expert_cache,
-                        index,
-                        flat,
-                        indices,
-                        weights,
-                        pass,
-                        stream,
-                    )
-                },
-            )?
-        } else {
-            layer.forward(
-                hidden,
-                None,
-                Some(&mut cache.layers[index]),
-                &context.input_ids,
-                stream,
-            )?
-        };
-        capture_draft_hidden(&self.args, index, &output, context, stream)?;
-        Ok(output)
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let bindings =
+            self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
+        shard_layer_bindings(
+            bindings,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            layout,
+        )
     }
 
-    fn forward_layer_with_execution(
-        &mut self,
+    pub(crate) fn cartesian_layer_bindings(
+        &self,
         group: usize,
         index: usize,
-        layer: &mut DecoderLayer,
-        hidden: &Array,
-        cache: &mut Cache,
-        context: &mut DeepSeekV4ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        let Some(tp_group) = execution.group() else {
-            return self.forward_layer(
-                group,
-                index,
-                layer,
-                hidden,
-                cache,
-                context,
-                execution.stream(),
-            );
-        };
-        self.layer_count(group)?;
-        let output = if let Some(expert_cache) = &self.expert_cache {
-            let pass = if hidden.dim(1) > 1 {
-                ExpertPass::Prefill
-            } else {
-                ExpertPass::Decode
-            };
-            layer.forward_tensor_with_expert_executor(
-                hidden,
-                None,
-                Some(&mut cache.layers[index]),
-                &context.input_ids,
-                tp_group,
-                execution.stream(),
-                |flat, indices, weights, stream| {
-                    execute_cached_experts(
-                        &self.args,
-                        expert_cache,
-                        index,
-                        flat,
-                        indices,
-                        weights,
-                        pass,
-                        stream,
-                    )
-                },
-            )?
-        } else {
-            layer.forward_tensor_parallel(
-                hidden,
-                None,
-                Some(&mut cache.layers[index]),
-                &context.input_ids,
-                tp_group,
-                execution.stream(),
-            )?
-        };
-        capture_draft_hidden(&self.args, index, &output, context, execution.stream())?;
-        Ok(output)
-    }
-
-    fn retained_arrays<'a>(&self, cache: &'a Cache, _group: usize, index: usize) -> Vec<&'a Array> {
-        cache.layers[index].retained_arrays()
-    }
-
-    fn finish(
-        &mut self,
-        hidden: &Array,
-        _cache: &mut Cache,
-        _context: &DeepSeekV4ForwardContext,
+        layer: &DecoderLayer,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
-    ) -> Result<Array, Error> {
-        let hidden = self.static_model.model.hc_head.forward(hidden, stream)?;
-        let hidden = self.static_model.model.norm.forward(&hidden, stream)?;
-        Ok(self.static_model.lm_head.forward(&hidden, stream)?)
-    }
-
-    fn ignores_checkpoint_key(&self, _key: &str) -> bool {
-        false
+    ) -> Result<Vec<WeightBinding>, Error> {
+        match (layout, assignment) {
+            (None, None) => {
+                // The execution layer can have transformed target geometry
+                // (for example load-time affine quantization). Bindings must
+                // continue to describe the adapter's source checkpoint
+                // geometry and are transformed only during population.
+                let source = self.new_layer(group, index, stream)?;
+                self.layer_bindings(group, index, &source, store)
+            }
+            (Some(layout), None) => {
+                self.parallel_layer_bindings(group, index, layer, store, layout, stream)
+            }
+            (None, Some(assignment)) => {
+                self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => self.tensor_expert_parallel_layer_bindings(
+                group, index, layer, store, layout, assignment, stream,
+            ),
+        }
     }
 }
 

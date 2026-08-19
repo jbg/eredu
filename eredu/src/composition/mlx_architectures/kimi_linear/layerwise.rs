@@ -49,7 +49,6 @@ use crate::{
             binding::{
                 binding_bytes, build_module_binding_plan_with_recipes,
                 build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
-                populate_module_from_lease, populate_module_from_lease_excluding,
             },
             binding_plan::{BindingPlan, PlannedBinding},
             quantization::should_quantize_on_load,
@@ -67,12 +66,9 @@ use crate::{
         },
         execution::layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
+            shard_layer_bindings,
         },
-        residency::{
-            expert_cache::{ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch},
-            manager::ResidentUnitLease,
-        },
+        residency::expert_cache::{ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch},
     },
 };
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
@@ -2466,22 +2462,7 @@ impl KimiLinearLayerwiseAdapter {
     }
 }
 
-impl LoadTimeQuantizableAdapter for KimiLinearLayerwiseAdapter {
-    fn load_time_quantized(
-        &self,
-        quantization: WeightQuantization,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let mut args = self.args.clone();
-        args.quantization = Some(quantization);
-        args.quantized_weight_configs = None;
-        if self.sparse_expert_cache {
-            Self::new_sparse(args, stream)
-        } else {
-            Self::new(args, stream)
-        }
-    }
-}
+impl KimiLinearLayerwiseAdapter {}
 
 fn normalized_checkpoint_keys(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
@@ -2496,114 +2477,19 @@ fn normalized_checkpoint_keys(
         .collect()
 }
 
-impl MlxArchitectureSemantics for KimiLinearLayerwiseAdapter {
-    type Input<'a> = &'a Array;
-    type Cache = Cache;
-    type Layer = DecoderLayer;
-    type ForwardContext = KimiLinearForwardContext;
-
-    fn model_type(&self) -> &str {
+impl KimiLinearLayerwiseAdapter {
+    pub(crate) fn model_type(&self) -> &str {
         &self.args.model_type
     }
 
-    fn safetensors_checkpoint_plan(
-        &self,
-    ) -> Result<eredu_checkpoint::schema::SafetensorsCheckpointPlan, Error> {
-        super::checkpoint::safetensors_plan(&self.args).map_err(Error::UnsupportedArchitecture)
-    }
-
-    fn prompt_cache_model_identity(
-        &self,
-        topology: Option<crate::backend::mlx::MlxParallelContext>,
-    ) -> Result<PromptCacheModelIdentity, Error> {
-        let geometry = match topology {
-            Some(topology) if topology.is_axis_active(crate::ParallelAxis::Tensor) => {
-                self.parallel_cache_geometry.clone().ok_or_else(|| {
-                    Error::Parallel(
-                        "Kimi parallel cache identity requested before local layout configuration"
-                            .into(),
-                    )
-                })?
-            }
-            _ => self
-                .args
-                .layer_schedule
-                .iter()
-                .map(|policy| resident::KimiLayerCacheGeometry {
-                    kda_heads: (policy.attention == resident::AttentionKind::Kda)
-                        .then_some(self.args.kda_config.num_heads),
-                })
-                .collect(),
-        };
-        let layer_count = self.args.num_hidden_layers as usize;
-        Ok(PromptCacheModelIdentity {
-            model_family: "kimi_linear".into(),
-            effective_model_type: self.args.model_type.clone(),
-            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(&self.args),
-            layer_count,
-            global_layer_start: 0,
-            global_layer_end: layer_count,
-            sink_tokens: 0,
-            layer_prefix_offsets: vec![0; layer_count],
-            topology: topology.map_or_else(
-                PromptCacheTopology::default,
-                crate::backend::mlx::cache::prompt_cache_topology,
-            ),
-            layer_layout: resident::prompt_cache_layer_layout_with_geometry(&self.args, &geometry)
-                .map_err(|error| Exception::custom(error.to_string()))?,
-        })
-    }
-
-    fn save_prompt_cache(
-        &self,
-        cache: &mut Self::Cache,
-        destination: &Path,
-        descriptor: PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        options: &PromptCacheOptions,
-        _stream: &Stream,
-    ) -> Result<PromptCacheManifest, Error> {
-        let rank = descriptor.topology.cache_rank_identity();
-        resident::Model::save_prompt_cache_with_rank(
-            cache,
-            destination,
-            descriptor,
-            prefix_token_ids,
-            options,
-            rank,
-        )
-        .map_err(Into::into)
-    }
-
-    fn load_prompt_cache(
-        &self,
-        directory: &Path,
-        expected: &PromptCacheDescriptor,
-        identity: &PromptCacheModelIdentity,
-        prefix_token_ids: &[u32],
-        options: PagedCacheOptions,
-        stream: &Stream,
-    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
-        resident::Model::load_paged_prompt_cache_with_identity(
-            &self.args,
-            directory,
-            expected,
-            prefix_token_ids,
-            identity,
-            options,
-            stream,
-        )
-        .map_err(Into::into)
-    }
-
-    fn static_units(
+    pub(crate) fn static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         self.selected_static_units(store, &|_| true)
     }
 
-    fn selected_static_units(
+    pub(crate) fn selected_static_units(
         &self,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
@@ -2650,94 +2536,7 @@ impl MlxArchitectureSemantics for KimiLinearLayerwiseAdapter {
         Ok(units)
     }
 
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected = if self.lm_head.is_some() { 3 } else { 2 };
-        if leases.len() != expected {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Kimi Linear adapter received {} static leases, expected {expected}",
-                leases.len()
-            )));
-        }
-        if let Some(v) = &mut self.parallel_embedding {
-            populate_module_from_lease(v.inner_mut(), &leases[0])?;
-        } else {
-            populate_module_from_lease(&mut self.embedding, &leases[0])?;
-        }
-        populate_module_from_lease(&mut self.norm, &leases[1])?;
-        if let Some(v) = &mut self.parallel_lm_head {
-            populate_module_from_lease(v.inner_mut(), &leases[2])?;
-        } else if let Some(lm_head) = &mut self.lm_head {
-            populate_module_from_lease(lm_head, &leases[2])?;
-        }
-        Ok(())
-    }
-
-    fn validate_cache(&self, cache: &mut Cache) -> Result<(), Error> {
-        if cache.layers.is_empty() {
-            *cache = Cache::new(&self.args);
-        }
-        cache.validate(&self.args.layer_schedule)
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        stream: &Stream,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        let hidden = self.embedding.forward(input, stream)?;
-        let offset = cache.offset();
-        let mask = if hidden.dim(1) > 1 && offset > 0 {
-            Some(create_causal_mask(
-                hidden.dim(1),
-                Some(offset),
-                None,
-                None,
-                stream,
-            )?)
-        } else {
-            None
-        };
-        Ok(eredu_runtime::LayeredForwardState {
-            hidden,
-            context: KimiLinearForwardContext { mask },
-        })
-    }
-    fn begin_forward_with_execution<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        cache: &mut Self::Cache,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<eredu_runtime::LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        let Some(v) = &mut self.parallel_embedding else {
-            return self.begin_forward(input, cache, execution.stream());
-        };
-        let hidden = v.forward(input, execution)?;
-        let offset = cache.offset();
-        let mask = if hidden.dim(1) > 1 && offset > 0 {
-            Some(create_causal_mask(
-                hidden.dim(1),
-                Some(offset),
-                None,
-                None,
-                execution.stream(),
-            )?)
-        } else {
-            None
-        };
-        Ok(eredu_runtime::LayeredForwardState {
-            hidden,
-            context: KimiLinearForwardContext { mask },
-        })
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
-    }
-
-    fn layer_count(&self, group: usize) -> Result<usize, Error> {
+    pub(crate) fn layer_count(&self, group: usize) -> Result<usize, Error> {
         if group == 0 {
             Ok(self.args.layer_schedule.len())
         } else {
@@ -2747,18 +2546,23 @@ impl MlxArchitectureSemantics for KimiLinearLayerwiseAdapter {
         }
     }
 
-    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
+    pub(crate) fn new_layer(
+        &self,
+        group: usize,
+        index: usize,
+        stream: &Stream,
+    ) -> Result<DecoderLayer, Error> {
         self.layer_count(group)?;
         Ok(DecoderLayer::new(&self.args, index, stream)?)
     }
 
-    fn new_expert_parallel_layer(
+    pub(crate) fn new_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<DecoderLayer, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
         if let FeedForward::Moe(moe) = &mut layer.mlp {
             let prefix = format!("model.layers.{index}.mlp.experts");
@@ -2782,14 +2586,14 @@ impl MlxArchitectureSemantics for KimiLinearLayerwiseAdapter {
         Ok(layer)
     }
 
-    fn new_tensor_expert_parallel_layer(
+    pub(crate) fn new_tensor_expert_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<DecoderLayer, Error> {
         let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
         if let FeedForward::Moe(moe) = &mut layer.mlp {
             let prefix = format!("model.layers.{index}.mlp.experts");
@@ -2814,7 +2618,7 @@ impl MlxArchitectureSemantics for KimiLinearLayerwiseAdapter {
         Ok(layer)
     }
 
-    fn expert_parallel_assignment(
+    pub(crate) fn expert_parallel_assignment(
         &self,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
@@ -2841,7 +2645,7 @@ impl MlxArchitectureSemantics for KimiLinearLayerwiseAdapter {
             )?,
         ))
     }
-    fn register_parallel_parameters(
+    pub(crate) fn register_parallel_parameters(
         &self,
         _context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
         planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
@@ -2878,54 +2682,13 @@ impl MlxArchitectureSemantics for KimiLinearLayerwiseAdapter {
         }
         Ok(())
     }
-    fn configure_parallel_static(
-        &mut self,
-        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &eredu_runtime::LocalModelLayout,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let kda_heads = planned_optional_partition_widths(
-            layout,
-            self.args
-                .layer_schedule
-                .iter()
-                .map(|policy| policy.attention == resident::AttentionKind::Kda),
-            self.args.kda_config.head_dim,
-            "model.layers",
-            "self_attn.q_proj",
-        )?;
-        self.parallel_cache_geometry = Some(
-            kda_heads
-                .into_iter()
-                .map(|kda_heads| resident::KimiLayerCacheGeometry { kda_heads })
-                .collect(),
-        );
-        self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
-            self.args.vocab_size as usize,
-            self.args.hidden_size,
-            self.args
-                .weight_quantization_for("model.embed_tokens.weight"),
-            context,
-            stream,
-        )?);
-        if self.lm_head.is_some() {
-            self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
-                self.args.hidden_size,
-                self.args.vocab_size as usize,
-                self.args.weight_quantization_for("lm_head.weight"),
-                context,
-                stream,
-            )?);
-        }
-        Ok(())
-    }
-    fn new_parallel_layer(
+    pub(crate) fn new_parallel_layer(
         &self,
         group: usize,
         index: usize,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    ) -> Result<DecoderLayer, Error> {
         self.layer_count(group)?;
         let prefix = format!("model.layers.{index}");
         let find = |n: &str| {
@@ -3013,19 +2776,15 @@ impl MlxArchitectureSemantics for KimiLinearLayerwiseAdapter {
         )?)
     }
 
-    fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
+    pub(crate) fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
         format!("model.layers.{index}")
     }
 
-    fn layer_unit_name(&self, _group: usize, index: usize) -> String {
-        format!("kimi_linear.layer.{index:05}")
-    }
-
-    fn layer_bindings(
+    pub(crate) fn layer_bindings(
         &self,
         _group: usize,
         index: usize,
-        layer: &Self::Layer,
+        layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let plan = build_module_binding_plan_with_recipes_excluding(
@@ -3037,11 +2796,11 @@ impl MlxArchitectureSemantics for KimiLinearLayerwiseAdapter {
         )?;
         Ok(plan.build_bindings(store)?)
     }
-    fn parallel_layer_bindings(
+    pub(crate) fn parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: &eredu_runtime::LocalModelLayout,
         stream: &Stream,
@@ -3055,11 +2814,11 @@ impl MlxArchitectureSemantics for KimiLinearLayerwiseAdapter {
         )
     }
 
-    fn expert_parallel_layer_bindings(
+    pub(crate) fn expert_parallel_layer_bindings(
         &self,
         group: usize,
         index: usize,
-        _layer: &Self::Layer,
+        _layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
@@ -3087,236 +2846,79 @@ impl MlxArchitectureSemantics for KimiLinearLayerwiseAdapter {
             .collect()
     }
 
-    fn populate_layer(
+    pub(crate) fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
+        true
+    }
+
+    pub(crate) fn new_cartesian_layer(
         &self,
-        _group: usize,
-        _index: usize,
-        layer: &mut Self::Layer,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        if self.sparse_expert_cache {
-            Ok(populate_module_from_lease_excluding(
-                layer,
-                lease,
-                |name| name.starts_with("mlp.experts."),
-            )?)
-        } else {
-            Ok(populate_module_from_lease(layer, lease)?)
+        group: usize,
+        index: usize,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<DecoderLayer, Error> {
+        match (layout, assignment) {
+            (None, None) => self.new_layer(group, index, stream),
+            (Some(layout), None) => self.new_parallel_layer(group, index, layout, stream),
+            (None, Some(assignment)) => {
+                self.new_expert_parallel_layer(group, index, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => {
+                self.new_tensor_expert_parallel_layer(group, index, layout, assignment, stream)
+            }
         }
     }
 
-    fn additional_consumed_checkpoint_keys(
+    pub(crate) fn tensor_expert_parallel_layer_bindings(
         &self,
+        group: usize,
+        index: usize,
+        layer: &DecoderLayer,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-    ) -> Vec<String> {
-        if self.sparse_expert_cache {
-            store
-                .source_keys()
-                .into_iter()
-                .filter(|key| {
-                    key.contains(".mlp.experts.") || key.contains(".block_sparse_moe.experts.")
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn forward_layer(
-        &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
+        layout: &eredu_runtime::LocalModelLayout,
+        assignment: &crate::backend::mlx::runtime::distributed::expert::ExpertAssignment,
         stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.layer_count(group)?;
-        let policy = self.args.layer_policy(index).ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
-                "Kimi Linear layer schedule has no policy for layer {index}"
-            ))
-        })?;
-        if self.sparse_expert_cache && policy.feed_forward == FeedForwardPolicy::SparseMoe {
-            let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "Kimi Linear sparse expert cache was not initialized".into(),
-                )
-            })?;
-            let pass = if hidden.dim(1) > 1 {
-                ExpertPass::Prefill
-            } else {
-                ExpertPass::Decode
-            };
-            return Ok(layer.forward_sparse_experts(
-                hidden,
-                context.mask.as_ref(),
-                Some(&mut cache.layers[index]),
-                stream,
-                |flat, indices, weights, stream| {
-                    expert_cache
-                        .execute_routes_bounded(
-                            ExpertRouteBatch::new(index, flat, indices, weights, pass),
-                            stream,
-                            |flat, acquired, weights, stream| {
-                                let started = Instant::now();
-                                let load_time = expert_cache.weight_quantization();
-                                let gate_up_quantization = load_time.or_else(|| {
-                                    self.args.weight_quantization_for(&format!(
-                                        "model.layers.{index}.mlp.experts.gate_up_proj"
-                                    ))
-                                });
-                                let down_quantization = load_time.or_else(|| {
-                                    self.args.weight_quantization_for(&format!(
-                                        "model.layers.{index}.mlp.experts.down_proj"
-                                    ))
-                                });
-                                let mut bank =
-                                    crate::backend::mlx::nn::moe::PackedSwiGluExperts::new(
-                                        acquired.identities().len() as i32,
-                                        self.args.hidden_size,
-                                        self.args.moe_intermediate_size,
-                                        gate_up_quantization,
-                                        down_quantization,
-                                        stream,
-                                    )?;
-                                bank.gate_up_proj = Param::new(
-                                    acquired
-                                        .compact_binding("gate_up_proj", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.gate_up_proj_scales = Param::new(
-                                    acquired
-                                        .optional_compact_binding("gate_up_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.gate_up_proj_biases = Param::new(
-                                    acquired
-                                        .optional_compact_binding("gate_up_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj = Param::new(
-                                    acquired
-                                        .compact_binding("down_proj", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj_scales = Param::new(
-                                    acquired
-                                        .optional_compact_binding("down_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj_biases = Param::new(
-                                    acquired
-                                        .optional_compact_binding("down_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                expert_cache.record_compact_bank(
-                                    pass,
-                                    acquired.scratch_bytes(),
-                                    started.elapsed(),
-                                )?;
-                                Ok(bank.forward(
-                                    flat,
-                                    acquired.compact_routes(),
-                                    weights,
-                                    stream,
-                                )?)
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))
-                },
-            )?);
-        }
-        let mut observer = None;
-        Ok(layer.forward_impl(
-            hidden,
-            context.mask.as_ref(),
-            Some(&mut cache.layers[index]),
-            stream,
-            &format!("model.layers.{index}"),
-            &mut observer,
-        )?)
-    }
-    fn forward_layer_with_execution(
-        &mut self,
-        group: usize,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &mut Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        let Some(tp_group) = execution.group() else {
-            return self.forward_layer(
-                group,
-                index,
-                layer,
-                hidden,
-                cache,
-                context,
-                execution.stream(),
-            );
-        };
-        self.layer_count(group)?;
-        Ok(layer.forward_tensor_parallel(
-            hidden,
-            context.mask.as_ref(),
-            Some(&mut cache.layers[index]),
-            tp_group,
-            execution.stream(),
-        )?)
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let bindings =
+            self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
+        shard_layer_bindings(
+            bindings,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            layout,
+        )
     }
 
-    fn retained_arrays<'a>(
+    pub(crate) fn cartesian_layer_bindings(
         &self,
-        cache: &'a Self::Cache,
-        _group: usize,
+        group: usize,
         index: usize,
-    ) -> Vec<&'a Array> {
-        cache.layers[index].retained_arrays()
-    }
-
-    fn finish(
-        &mut self,
-        hidden: &Array,
-        _cache: &mut Self::Cache,
-        _context: &Self::ForwardContext,
+        layer: &DecoderLayer,
+        store: &dyn eredu_checkpoint::store::CheckpointSource,
+        layout: Option<&eredu_runtime::LocalModelLayout>,
+        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
-    ) -> Result<Array, Error> {
-        let hidden = self.norm.forward(hidden, stream)?;
-        Ok(project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.embedding,
-            &hidden,
-            stream,
-        )?)
-    }
-    fn finish_with_execution(
-        &mut self,
-        hidden: &Array,
-        cache: &mut Self::Cache,
-        context: &Self::ForwardContext,
-        execution: &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<
-            '_,
-        >,
-    ) -> Result<Array, Error> {
-        let Some(embedding) = &mut self.parallel_embedding else {
-            return self.finish(hidden, cache, context, execution.stream());
-        };
-        let hidden = self.norm.forward(hidden, execution.stream())?;
-        let logits = match &mut self.parallel_lm_head {
-            Some(head) => head.forward(&hidden, execution)?,
-            None => embedding.project_logits(&hidden, execution)?,
-        };
-        logits.all_gather(execution)
-    }
-
-    fn ignores_checkpoint_key(&self, key: &str) -> bool {
-        key.starts_with("model.mtp.")
+    ) -> Result<Vec<WeightBinding>, Error> {
+        match (layout, assignment) {
+            (None, None) => {
+                // The execution layer can have transformed target geometry
+                // (for example load-time affine quantization). Bindings must
+                // continue to describe the adapter's source checkpoint
+                // geometry and are transformed only during population.
+                let source = self.new_layer(group, index, stream)?;
+                self.layer_bindings(group, index, &source, store)
+            }
+            (Some(layout), None) => {
+                self.parallel_layer_bindings(group, index, layer, store, layout, stream)
+            }
+            (None, Some(assignment)) => {
+                self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => self.tensor_expert_parallel_layer_bindings(
+                group, index, layer, store, layout, assignment, stream,
+            ),
+        }
     }
 }
 
