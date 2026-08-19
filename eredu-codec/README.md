@@ -1,9 +1,10 @@
-# safemlx-codec
+# eredu-codec
 
-`safemlx-codec` is the MLX neural-audio implementation used by Eredu's realtime
-speech models. Applications should normally access it through
-[`eredu`](../eredu/); direct use remains available for codec-only pipelines
-that do not need the model runtime.
+`eredu-codec` contains backend-neutral neural-audio architectures used with
+Eredu's realtime speech models. The optional `mlx` feature provides checkpoint
+loading and execution through SafeMLX without changing the architecture code.
+Other backends can construct `Mimi<T>` and use `Mimi::load_parameters` with
+their own native tensors and checkpoint-layout conversion.
 
 ## Mimi
 
@@ -17,7 +18,7 @@ decoder used by Moshi-family speech models. It supports:
 - stateful one-frame decoding for realtime playback.
 
 ```rust,ignore
-use safemlx_codec::{mimi::Mimi, AudioTokenizer};
+use eredu_codec::{mimi::Mimi, AudioTokenizer};
 
 let mut mimi = Mimi::load("/path/to/tokenizer.safetensors", Some(8), stream)?;
 let tokens = mimi.encode(&pcm, stream)?;

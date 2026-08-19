@@ -77,7 +77,8 @@ portable components or implementation layers for specialized use.
 | [`eredu-gguf`](eredu-gguf/) | Bounded, framework-independent GGUF reading, writing, and tensor conversion |
 | [`safemlx`](safemlx/) | Low-level MLX implementation used by Eredu's default backend |
 | [`safemlx-sys`](safemlx-sys/) | MLX C bindings and native build integration |
-| [`safemlx-codec`](safemlx-codec/) | MLX neural audio codec implementation used by realtime speech models |
+| [`eredu-nn`](eredu-nn/) | Backend-neutral tensor and neural-operation contracts for shared architectures |
+| [`eredu-codec`](eredu-codec/) | Backend-neutral neural audio codec architectures used by realtime speech models |
 
 The workspace also contains procedural macros, integration tests, and an iOS
 example application.

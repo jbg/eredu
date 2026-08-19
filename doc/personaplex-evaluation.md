@@ -25,7 +25,7 @@ produce codec noise rather than meaningful speech.
 ## Run one comparison
 
 ```sh
-cargo run --release -p safemlx-codec \
+cargo run --release -p eredu-codec --features mlx \
   --example personaplex_quantization_eval -- \
   /path/to/personaplex-dense \
   /path/to/personaplex-quantized \
@@ -81,10 +81,10 @@ suite file has this shape:
 Run and summarize it with:
 
 ```sh
-python safemlx-codec/scripts/personaplex_quantization_suite.py run \
+python eredu-codec/scripts/personaplex_quantization_suite.py run \
   suite.json /tmp/personaplex-quantization-suite
 
-python safemlx-codec/scripts/personaplex_quantization_suite.py summarize \
+python eredu-codec/scripts/personaplex_quantization_suite.py summarize \
   /tmp/personaplex-quantization-suite \
   /tmp/personaplex-quantization-suite/human_ratings.json
 ```
@@ -102,7 +102,7 @@ comparison. The included reference runner consumes that file:
 ```sh
 PYTORCH_ENABLE_MPS_FALLBACK=1 \
 PYTHONPATH=/path/to/upstream/moshi:/path/to/python/dependencies \
-python safemlx-codec/scripts/personaplex_pytorch_backend_reference.py \
+python eredu-codec/scripts/personaplex_pytorch_backend_reference.py \
   --moshi-source /path/to/upstream/moshi \
   --model /path/to/personaplex/model.safetensors \
   --mimi /path/to/tokenizer.safetensors \

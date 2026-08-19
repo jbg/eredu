@@ -11,7 +11,8 @@ on:
       - "safemlx-sys/**"
       - "eredu/**"
       - "eredu-text/**"
-      - "safemlx-codec/**"
+      - "eredu-codec/**"
+      - "eredu-nn/**"
       - "safemlx-tests/**"
       - "eredu-cli/**"
   push:
@@ -91,6 +92,8 @@ jobs:
         run: |
           cargo test -j 1 -p eredu --features cuda --lib --no-run
           cargo check -j 1 -p eredu --features cuda --example llama_residency
+      - name: Compile the CUDA codec backend
+        run: cargo test -j 1 -p eredu-codec --features cuda --no-run
       - name: Check the CUDA language-model CLI
         run: cargo check -j 1 -p eredu-cli --features cuda
 

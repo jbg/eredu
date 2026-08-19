@@ -1,0 +1,42 @@
+[package]
+name = "eredu-codec"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Backend-neutral neural audio codec architectures for Eredu"
+
+[features]
+default = []
+mlx = ["dep:memmap2", "dep:safemlx", "dep:safetensors", "eredu-nn/mlx"]
+cuda = ["mlx", "safemlx/cuda"]
+nccl = ["cuda", "safemlx/nccl"]
+
+[dependencies]
+eredu-nn.workspace = true
+safemlx = { workspace = true, features = ["safetensors"], optional = true }
+thiserror.workspace = true
+memmap2 = { version = "0.9", optional = true }
+safetensors = { version = "0.8", optional = true }
+
+[dev-dependencies]
+eredu.workspace = true
+sentencepiece-rs = "0.2.2"
+serde.workspace = true
+serde_json.workspace = true
+
+[[example]]
+name = "mimi_realtime_bench"
+required-features = ["mlx"]
+
+[[example]]
+name = "personaplex_full_path_bench"
+required-features = ["mlx"]
+
+[[example]]
+name = "personaplex_quantization_eval"
+required-features = ["mlx"]

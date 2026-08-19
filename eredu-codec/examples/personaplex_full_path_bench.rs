@@ -5,8 +5,8 @@ use eredu::{
     load_realtime_model, RealtimeModel, RealtimeSampling, RealtimeScheduler, RequestId,
     SchedulerLimits,
 };
+use eredu_codec::mimi::Mimi;
 use safemlx::{transforms::eval, Array, Device, DeviceType, ExecutionContext, Stream};
-use safemlx_codec::mimi::Mimi;
 
 const SAMPLE_RATE: f64 = 24_000.0;
 const FRAME_RATE: f64 = 12.5;
@@ -16,12 +16,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_dir = args
         .first()
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("SAFEMLX_PERSONAPLEX_DIR").map(PathBuf::from))
+        .or_else(|| std::env::var_os("EREDU_PERSONAPLEX_DIR").map(PathBuf::from))
         .expect("usage: personaplex_full_path_bench <model-dir> <mimi.safetensors> [frames]");
     let mimi_path = args
         .get(1)
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("SAFEMLX_MIMI_PATH").map(PathBuf::from))
+        .or_else(|| std::env::var_os("EREDU_MIMI_PATH").map(PathBuf::from))
         .expect("usage: personaplex_full_path_bench <model-dir> <mimi.safetensors> [frames]");
     let frames = args
         .get(2)
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn warmup(
     model: &mut RealtimeModel<MlxRealtimeBackend>,
-    mimi: &mut Mimi,
+    mimi: &mut Mimi<Array>,
     pcm_frame: &Array,
     stream: &Stream,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -83,7 +83,7 @@ fn warmup(
 
 fn run_full_path(
     model: &mut RealtimeModel<MlxRealtimeBackend>,
-    mimi: &mut Mimi,
+    mimi: &mut Mimi<Array>,
     pcm_frame: &Array,
     frames: i32,
     stream: &Stream,

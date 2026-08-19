@@ -9,7 +9,8 @@ members = [
     "eredu",
     "eredu-core",
     "eredu-text",
-    "safemlx-codec",
+    "eredu-nn",
+    "eredu-codec",
     "eredu-cli",
     "examples/eredu-ios/native",
 ]
@@ -34,7 +35,8 @@ safemlx-internal-macros = { version = "0.1.1", path = "safemlx-internal-macros" 
 eredu = { version = "0.4.1", path = "eredu" }
 eredu-core = { version = "0.1.0", path = "eredu-core" }
 eredu-text = { version = "0.1.4", path = "eredu-text", default-features = false }
-safemlx-codec = { version = "0.1.0", path = "safemlx-codec" }
+eredu-nn = { version = "0.1.0", path = "eredu-nn", default-features = false }
+eredu-codec = { version = "0.1.0", path = "eredu-codec", default-features = false }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

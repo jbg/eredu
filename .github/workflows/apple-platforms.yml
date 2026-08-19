@@ -15,7 +15,8 @@ on:
       - "safemlx-tests/**"
       - "eredu/**"
       - "eredu-text/**"
-      - "safemlx-codec/**"
+      - "eredu-codec/**"
+      - "eredu-nn/**"
       - "eredu-cli/**"
   push:
     branches: [main]
@@ -40,6 +41,8 @@ jobs:
           cargo test --workspace -- \
             --skip cpu_stream_creation_is_concurrent_safe \
             --skip async_eval_cpu_streams_are_concurrent_safe
+      - name: Test the MLX codec backend
+        run: cargo test -p eredu-codec --features mlx
       - name: Test concurrent MLX use
         run: cargo test --workspace concurrent_safe -- --test-threads=1
 

@@ -13,8 +13,8 @@ use eredu::{
         generation::sampler::{DefaultSampler, GenerationSampler},
     },
 };
+use eredu_codec::mimi::Mimi;
 use safemlx::{random::RandomState, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
-use safemlx_codec::mimi::Mimi;
 use sentencepiece_rs::SentencePieceProcessor;
 use serde::Serialize;
 use serde_json::json;
@@ -435,7 +435,7 @@ fn seeded_random_state(seed: u64, stream: &Stream) -> EvalResult<RandomState> {
     Ok(RandomState::from_key(key))
 }
 
-fn encode_pcm(mimi: &mut Mimi, pcm: &[f32], stream: &Stream) -> EvalResult<Vec<Vec<i32>>> {
+fn encode_pcm(mimi: &mut Mimi<Array>, pcm: &[f32], stream: &Stream) -> EvalResult<Vec<Vec<i32>>> {
     mimi.reset_encode_state();
     let mut output = Vec::with_capacity(pcm.len() / FRAME_SAMPLES);
     for frame in pcm.chunks_exact(FRAME_SAMPLES) {
@@ -1012,7 +1012,7 @@ fn array_f32(array: &Array, stream: &Stream) -> EvalResult<Vec<f32>> {
 }
 
 fn decode_tokens(
-    mimi: &mut Mimi,
+    mimi: &mut Mimi<Array>,
     token_frames: &[Vec<i32>],
     stream: &Stream,
 ) -> EvalResult<Vec<f32>> {

@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_dir = positional
         .first()
         .map(|value| PathBuf::from(value.as_str()))
-        .or_else(|| std::env::var_os("SAFEMLX_PERSONAPLEX_DIR").map(PathBuf::from))
+        .or_else(|| std::env::var_os("EREDU_PERSONAPLEX_DIR").map(PathBuf::from))
         .expect("usage: personaplex_step_bench <model-dir> [frames] [--quantize-on-load]");
     let frames = positional
         .get(1)

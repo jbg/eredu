@@ -885,6 +885,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "eredu-codec"
+version = "0.1.0"
+dependencies = [
+ "eredu",
+ "eredu-nn",
+ "memmap2",
+ "safemlx",
+ "safetensors",
+ "sentencepiece-rs",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eredu-core"
 version = "0.1.0"
 dependencies = [
@@ -912,6 +927,15 @@ dependencies = [
  "eredu",
  "safemlx",
  "serde_json",
+]
+
+[[package]]
+name = "eredu-nn"
+version = "0.1.0"
+dependencies = [
+ "safemlx",
+ "smallvec",
+ "thiserror",
 ]
 
 [[package]]
@@ -2724,20 +2748,6 @@ dependencies = [
  "smallvec",
  "strum",
  "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "safemlx-codec"
-version = "0.1.0"
-dependencies = [
- "eredu",
- "memmap2",
- "safemlx",
- "safetensors",
- "sentencepiece-rs",
- "serde",
- "serde_json",
  "thiserror",
 ]
 

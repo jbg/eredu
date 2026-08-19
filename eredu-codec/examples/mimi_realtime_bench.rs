@@ -1,11 +1,11 @@
 use std::{path::PathBuf, time::Instant};
 
+use eredu_codec::mimi::Mimi;
 use safemlx::{
     ops::{concatenate_axis, indexing::TryIndexOp},
     transforms::eval,
     Array, Device, DeviceType, ExecutionContext,
 };
-use safemlx_codec::mimi::Mimi;
 
 const SAMPLE_RATE: f64 = 24_000.0;
 const FRAME_RATE: f64 = 12.5;
@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint = args
         .first()
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("SAFEMLX_MIMI_PATH").map(PathBuf::from))
+        .or_else(|| std::env::var_os("EREDU_MIMI_PATH").map(PathBuf::from))
         .expect("usage: mimi_realtime_bench <tokenizer.safetensors> [frames] [codebooks]");
     let frames = args
         .get(1)

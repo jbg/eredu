@@ -19,7 +19,7 @@ relevant model, execution, or platform guide here.
 - [Cancellation and bounded execution](cancellation.md): scheduler lifecycle and
   the boundary between cooperative cancellation and submitted backend work.
 - [PersonaPlex quantization evaluation](personaplex-evaluation.md): the audio
-  comparison and blinded-listening tools in `safemlx-codec`.
+  comparison and blinded-listening tools in `eredu-codec`.
 
 ## Runtime and backends
 

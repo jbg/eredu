@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate an upstream PyTorch PersonaPlex reference from safemlx token fixtures.
 
-The input JSON is produced by the safemlx-codec
+The input JSON is produced by the eredu-codec
 `personaplex_quantization_eval` example. Voice, text, and user-audio codec
 tokens are consumed directly so the backend comparison does not depend on
 separate tokenizer or Mimi encoder numerics.
@@ -397,7 +397,7 @@ def main() -> None:
         },
         "greedy_token_parity": greedy_parity,
         "greedy_text_parity": greedy_text_parity,
-        "codec_note": "The safemlx sample uses safemlx Mimi and the PyTorch sample uses upstream Mimi. Independent codec parity was previously measured at 0.999994 waveform correlation on the same token stream.",
+        "codec_note": "The Eredu MLX sample and the PyTorch sample use the shared Mimi architecture contract. Independent codec parity was previously measured at 0.999994 waveform correlation on the same token stream.",
     }
     (args.output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     (args.output_dir / "answer_key.json").write_text(json.dumps(assignment, indent=2))
