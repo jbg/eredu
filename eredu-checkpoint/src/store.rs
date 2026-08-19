@@ -174,6 +174,26 @@ pub trait CheckpointSource: Send + Sync {
     fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError>;
     /// Returns deterministic storage diagnostics.
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError>;
+
+    /// Returns physical source keys consumed to synthesize overlay bindings.
+    fn materialized_source_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Returns catalog keys admitted but not claimed by a resolved contract.
+    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Returns whether an overlay key supersedes a source-side semantic recipe.
+    fn is_authoritative_materialized_key(&self, _key: &str) -> bool {
+        false
+    }
+
+    /// Returns whether this source is restricted by a resolved contract.
+    fn is_checkpoint_contract_resolved(&self) -> bool {
+        false
+    }
 }
 
 /// A checkpoint source restricted to one resolved architecture contract.
@@ -221,22 +241,49 @@ impl CheckpointSource for ResolvedCheckpointSource {
         self.source
             .source_keys()
             .into_iter()
-            .filter(|key| self.contract.source_keys().contains(key))
+            .filter(|key| {
+                self.contract.source_keys().contains(key)
+                    || self.source.is_authoritative_materialized_key(key)
+            })
             .collect()
     }
 
     fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
-        self.authorize(key)?;
+        if !self.source.is_authoritative_materialized_key(key) {
+            self.authorize(key)?;
+        }
         self.source.source_metadata(key)
     }
 
     fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
-        self.authorize(&request.key)?;
+        if !self.source.is_authoritative_materialized_key(&request.key) {
+            self.authorize(&request.key)?;
+        }
         self.source.acquire_lease(request)
     }
 
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
         self.source.source_diagnostics()
+    }
+
+    fn materialized_source_keys(&self) -> Vec<String> {
+        self.source
+            .materialized_source_keys()
+            .into_iter()
+            .filter(|key| self.contract.source_keys().contains(key))
+            .collect()
+    }
+
+    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+        self.contract.unclaimed_keys().iter().cloned().collect()
+    }
+
+    fn is_authoritative_materialized_key(&self, key: &str) -> bool {
+        self.source.is_authoritative_materialized_key(key)
+    }
+
+    fn is_checkpoint_contract_resolved(&self) -> bool {
+        true
     }
 }
 
