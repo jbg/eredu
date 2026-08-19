@@ -43,14 +43,13 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
-        StaticUnitBindings,
     },
     backend::mlx::runtime::media::input,
     composition::llama_mlx as resident,
 };
 use eredu_runtime::{
     CacheResidencyPolicy, DenseDiskStreamReport, LayerwiseModelMetadata, PagedCacheOptions,
-    ParallelModelInfo,
+    ParallelModelInfo, StaticUnitBindings,
 };
 
 use eredu_runtime::{ResidencyReport, WeightBinding};

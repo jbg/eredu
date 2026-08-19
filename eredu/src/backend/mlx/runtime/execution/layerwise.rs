@@ -12,7 +12,7 @@ use eredu_checkpoint::{
 use eredu_runtime::{
     DenseDiskStreamLoadOptions, DenseDiskStreamReport, DenseStreamTelemetry, DenseTransferSchedule,
     ExecutionResidency, LayerWeightResidency, LayerwiseModelMetadata, OffloadUnit,
-    ParallelModelInfo, WeightBinding, WeightResidency, DENSE_TRANSFER_WINDOW,
+    ParallelModelInfo, StaticUnitBindings, WeightBinding, WeightResidency, DENSE_TRANSFER_WINDOW,
 };
 
 use std::{
@@ -449,32 +449,6 @@ impl Drop for DenseStreamGroupGuard {
         if self.armed {
             let _ = self.controller.clear_group(&self.manager, &self.group);
         }
-    }
-}
-
-/// One pinned static module and its checkpoint bindings.
-pub struct StaticUnitBindings {
-    id: OffloadUnitId,
-    bindings: Vec<WeightBinding>,
-}
-
-impl StaticUnitBindings {
-    /// Creates a pinned static unit definition.
-    pub(crate) fn new(id: impl Into<String>, bindings: Vec<WeightBinding>) -> Result<Self, Error> {
-        Ok(Self {
-            id: OffloadUnitId::new(id.into())?,
-            bindings,
-        })
-    }
-
-    /// Returns the stable residency identifier for this static module.
-    pub(crate) const fn id(&self) -> &OffloadUnitId {
-        &self.id
-    }
-
-    /// Returns the authoritative checkpoint bindings for this static module.
-    pub(crate) fn bindings(&self) -> &[WeightBinding] {
-        &self.bindings
     }
 }
 
@@ -3200,13 +3174,14 @@ where
     let mut static_device_bytes = 0u64;
     let mut static_ids = Vec::new();
     for unit in adapter.static_units(store.as_ref())? {
-        static_ids.push(unit.id.clone());
+        let (id, bindings) = unit.into_parts();
+        static_ids.push(id.clone());
         add_unit(
             &mut definitions,
             &mut specs,
             &mut consumed,
-            unit.id,
-            unit.bindings,
+            id,
+            bindings,
             ResidencyPolicy::Pinned,
             MemoryTier::Device,
             &mut static_device_bytes,
@@ -3442,18 +3417,19 @@ where
     let mut global_parameter_bytes = 0u64;
     let mut static_ids = Vec::new();
     for unit in static_units {
+        let (id, bindings) = unit.into_parts();
         global_parameter_bytes = global_parameter_bytes
-            .checked_add(binding_bytes(&unit.bindings)?)
+            .checked_add(binding_bytes(&bindings)?)
             .ok_or(LayerwiseModelError::ArithmeticOverflow {
                 context: "global static parameter byte total",
             })?;
-        let bindings = shard_layer_bindings(unit.bindings, "", store.as_ref(), &layout)?;
-        static_ids.push(unit.id.clone());
+        let bindings = shard_layer_bindings(bindings, "", store.as_ref(), &layout)?;
+        static_ids.push(id.clone());
         add_unit(
             &mut definitions,
             &mut specs,
             &mut consumed,
-            unit.id,
+            id,
             bindings,
             ResidencyPolicy::Pinned,
             MemoryTier::Device,

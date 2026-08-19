@@ -1,6 +1,6 @@
 //! Bounded layer execution for Moshi and PersonaPlex realtime token models.
 
-use eredu_runtime::LayerWeightResidency;
+use eredu_runtime::{LayerWeightResidency, StaticUnitBindings};
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::WeightBinding;
@@ -29,7 +29,7 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
         open_safetensors_weight_store, ArchitectureAdapter, LayerwiseForwardState, LayerwiseModel,
-        LoadTimeQuantizableAdapter, StaticUnitBindings,
+        LoadTimeQuantizableAdapter,
     },
     backend::mlx::runtime::generation::sampler::Sampler,
     backend::mlx::runtime::residency::manager::ResidentUnitLease,

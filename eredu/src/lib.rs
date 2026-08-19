@@ -119,7 +119,7 @@ pub use eredu_runtime::{
     LayerWeightResidency, LayerwiseLoadOptions, LayerwiseModelMetadata, LiveCacheBlockPublication,
     LiveCacheDiskPolicy, LiveCachePublicationError, MutableCacheTail, NonExpertWeightResidency,
     PagedCacheOptions, ParallelModelInfo, PromptCachePersistenceError, PromptCachePublication,
-    WeightResidency, WeightResidencyPolicyError, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
-    DENSE_TRANSFER_WINDOW, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_CURRENT_FILE,
-    PROMPT_CACHE_GENERATIONS_DIRECTORY,
+    StaticUnitBindings, WeightResidency, WeightResidencyPolicyError,
+    CACHE_RESIDENCY_LAYER_REPORT_LIMIT, DENSE_TRANSFER_WINDOW, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
+    PROMPT_CACHE_CURRENT_FILE, PROMPT_CACHE_GENERATIONS_DIRECTORY,
 };

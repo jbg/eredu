@@ -14,8 +14,8 @@ use eredu_architectures::llama::ModelArgs as LlamaModelArgs;
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
     DenseDiskStreamLoadOptions, LayerWeightResidency, LayerwiseLoadOptions, OffloadUnit,
-    ResidencyReport, ShardingPolicy, WeightBinding, WeightMaterializationReport,
-    DENSE_TRANSFER_WINDOW,
+    ResidencyReport, ShardingPolicy, StaticUnitBindings, WeightBinding,
+    WeightMaterializationReport, DENSE_TRANSFER_WINDOW,
 };
 
 mod placement;
@@ -86,7 +86,6 @@ use crate::{
         open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
         ArchitectureAdapter, DenseStreamController, DenseTransferWindow,
         LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection, SharedWeightStore,
-        StaticUnitBindings,
     },
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::{PreparedModelInput, PreparedModelInputIdentity},

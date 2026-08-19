@@ -7,8 +7,42 @@ use eredu_core::{
     DEFAULT_MAX_MAPPED_SHARDS,
 };
 
+use crate::WeightBinding;
+
 /// Current plus next unit retained by dense streamed execution.
 pub const DENSE_TRANSFER_WINDOW: usize = 2;
+
+/// One pinned static module and its checkpoint bindings.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StaticUnitBindings {
+    id: OffloadUnitId,
+    bindings: Vec<WeightBinding>,
+}
+
+impl StaticUnitBindings {
+    /// Creates a pinned static unit definition.
+    pub fn new(id: impl Into<String>, bindings: Vec<WeightBinding>) -> Result<Self, OffloadError> {
+        Ok(Self {
+            id: OffloadUnitId::new(id.into())?,
+            bindings,
+        })
+    }
+
+    /// Returns the stable residency identifier for this static module.
+    pub const fn id(&self) -> &OffloadUnitId {
+        &self.id
+    }
+
+    /// Returns the authoritative checkpoint bindings for this static module.
+    pub fn bindings(&self) -> &[WeightBinding] {
+        &self.bindings
+    }
+
+    /// Consumes the definition into its stable identifier and checkpoint bindings.
+    pub fn into_parts(self) -> (OffloadUnitId, Vec<WeightBinding>) {
+        (self.id, self.bindings)
+    }
+}
 
 /// Ordered bounded transfer cursor used by dense streamed execution.
 #[derive(Debug)]
@@ -760,6 +794,24 @@ pub enum WeightResidencyPolicyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_unit_bindings_are_runtime_owned_and_decomposable() {
+        let binding = WeightBinding::new(
+            "embedding",
+            "model.embedding.weight",
+            eredu_checkpoint::store::TensorSelection::Full,
+            16,
+        )
+        .unwrap();
+        let unit = StaticUnitBindings::new("static.embedding", vec![binding.clone()]).unwrap();
+
+        assert_eq!(unit.id().as_str(), "static.embedding");
+        assert_eq!(unit.bindings(), &[binding.clone()]);
+        let (id, bindings) = unit.into_parts();
+        assert_eq!(id.as_str(), "static.embedding");
+        assert_eq!(bindings, vec![binding]);
+    }
 
     #[test]
     fn dense_stream_controls_fail_closed_without_a_backend() {
