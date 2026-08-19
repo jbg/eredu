@@ -53,7 +53,7 @@ use crate::{
             },
             layerwise::{
                 open_safetensors_weight_store, quantize_module_store_with_bindings,
-                shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
+                shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
             },
         },
         residency::{
@@ -1387,7 +1387,7 @@ impl LoadTimeQuantizableAdapter for DeepSeekV4LayerwiseAdapter {
     }
 }
 
-impl ArchitectureAdapter for DeepSeekV4LayerwiseAdapter {
+impl MlxArchitectureSemantics for DeepSeekV4LayerwiseAdapter {
     type Input<'a> = &'a Array;
     type Cache = Cache;
     type Layer = DecoderLayer;

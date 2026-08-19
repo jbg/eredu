@@ -63,7 +63,7 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_module_store_with_bindings, shard_layer_bindings,
-        ArchitectureAdapter, LoadTimeQuantizableAdapter,
+        LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -3425,7 +3425,7 @@ impl LoadTimeQuantizableAdapter for DeepSeekV3LayerwiseAdapter {
     }
 }
 
-impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
+impl MlxArchitectureSemantics for DeepSeekV3LayerwiseAdapter {
     type Input<'a> = &'a Array;
     type Cache = Cache;
     type Layer = DecoderLayer;
@@ -4181,7 +4181,7 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         if self.sparse_expert_cache {
             let prefix = self.layer_checkpoint_prefix(group, index);
             observer.observe(&format!("{prefix}.input"), hidden)?;
-            let output = <Self as ArchitectureAdapter>::forward_layer(
+            let output = <Self as MlxArchitectureSemantics>::forward_layer(
                 self, group, index, layer, hidden, cache, context, stream,
             )?;
             observer.observe(&format!("{prefix}.output"), &output)?;

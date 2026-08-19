@@ -73,7 +73,7 @@ use crate::{
         },
         layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
+            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
         },
     },
     backend::mlx::runtime::media::input,
@@ -3404,7 +3404,7 @@ impl LoadTimeQuantizableAdapter for NemotronHLayerwiseAdapter {
     }
 }
 
-impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
+impl MlxArchitectureSemantics for NemotronHLayerwiseAdapter {
     type Input<'a> = &'a Array;
     type Cache = Cache;
     type Layer = TransformerBlock;

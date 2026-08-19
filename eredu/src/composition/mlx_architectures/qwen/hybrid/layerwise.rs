@@ -68,7 +68,7 @@ use crate::{
         },
         layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
+            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
         },
     },
     backend::mlx::runtime::media::input,
@@ -4667,7 +4667,7 @@ impl LoadTimeQuantizableAdapter for QwenHybridLayerwiseAdapter {
     }
 }
 
-impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
+impl MlxArchitectureSemantics for QwenHybridLayerwiseAdapter {
     type Input<'a> = QwenHybridInput<'a>;
     type Cache = Cache;
     type Layer = QwenHybridLayer;

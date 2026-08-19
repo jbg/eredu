@@ -78,7 +78,7 @@ use crate::{
         },
         layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
+            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
         },
     },
     backend::mlx::runtime::media::input,
@@ -2755,7 +2755,7 @@ impl LoadTimeQuantizableAdapter for MuseGlimmerLayerwiseAdapter {
     }
 }
 
-impl ArchitectureAdapter for MuseGlimmerLayerwiseAdapter {
+impl MlxArchitectureSemantics for MuseGlimmerLayerwiseAdapter {
     type Input<'a> = MuseGlimmerAdapterInput<'a>;
     type Cache = MuseGlimmerLayerwiseCache;
     type Layer = MuseGlimmerLayer;

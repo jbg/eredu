@@ -84,8 +84,8 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
-        ArchitectureAdapter, DenseStreamController, DenseTransferWindow,
-        LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection,
+        DenseStreamController, DenseTransferWindow, LoadTimeQuantizableAdapter,
+        MlxArchitectureSemantics, PipelineStageQuantizationSelection,
     },
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
@@ -7767,7 +7767,7 @@ fn selected_pipeline_static_roles(
 /// Exact whole-artifact admission is performed once by the shared structural
 /// plan before dispatch. This function deliberately selects only stage-owned
 /// static modules and never reconstructs a second namespace validator.
-fn pipeline_binding_units<A: ArchitectureAdapter>(
+fn pipeline_binding_units<A: MlxArchitectureSemantics>(
     adapter: &A,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     roles: &[&str],

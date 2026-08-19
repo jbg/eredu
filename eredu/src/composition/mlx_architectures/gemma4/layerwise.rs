@@ -70,7 +70,7 @@ use crate::{
         },
         layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
+            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
         },
     },
     backend::mlx::runtime::media::input,
@@ -3649,7 +3649,7 @@ fn ignores_gemma4_checkpoint_key(key: &str) -> bool {
         .any(|prefix| key.starts_with(prefix))
 }
 
-impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
+impl MlxArchitectureSemantics for Gemma4LayerwiseAdapter {
     type Input<'a> = Gemma4Input<'a>;
     type Cache = Cache;
     type Layer = Gemma4Layer;

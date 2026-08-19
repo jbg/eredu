@@ -66,7 +66,7 @@ use crate::{
         },
         layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
+            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
         },
     },
     backend::mlx::runtime::media::input,
@@ -3603,7 +3603,7 @@ impl LoadTimeQuantizableAdapter for InklingLayerwiseAdapter {
     }
 }
 
-impl ArchitectureAdapter for InklingLayerwiseAdapter {
+impl MlxArchitectureSemantics for InklingLayerwiseAdapter {
     type Input<'a> = InklingExecutionInput<'a>;
     type Cache = Cache;
     type Layer = InklingLayer;

@@ -64,7 +64,7 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_module_store_with_bindings, shard_layer_bindings,
-        ArchitectureAdapter, LoadTimeQuantizableAdapter,
+        LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -2017,7 +2017,7 @@ impl LoadTimeQuantizableAdapter for GptOssLayerwiseAdapter {
     }
 }
 
-impl ArchitectureAdapter for GptOssLayerwiseAdapter {
+impl MlxArchitectureSemantics for GptOssLayerwiseAdapter {
     type Input<'a> = &'a Array;
     type Cache = Cache;
     type Layer = TransformerBlock;

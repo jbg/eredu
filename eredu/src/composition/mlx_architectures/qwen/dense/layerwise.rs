@@ -78,7 +78,7 @@ use crate::{
         },
         layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
+            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
         },
     },
     backend::mlx::runtime::media::input,
@@ -2740,7 +2740,7 @@ impl LoadTimeQuantizableAdapter for DenseQwenLayerwiseAdapter {
     }
 }
 
-impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
+impl MlxArchitectureSemantics for DenseQwenLayerwiseAdapter {
     type Input<'a> = DenseQwenAdapterInput<'a>;
     type Cache = DenseQwenLayerwiseCache;
     type Layer = TransformerBlock;

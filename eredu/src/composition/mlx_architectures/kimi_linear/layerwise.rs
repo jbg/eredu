@@ -67,7 +67,7 @@ use crate::{
         },
         execution::layerwise::{
             open_safetensors_weight_store, quantize_module_store_with_bindings,
-            shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
+            shard_layer_bindings, LoadTimeQuantizableAdapter, MlxArchitectureSemantics,
         },
         residency::{
             expert_cache::{ExpertCache, ExpertCacheReport, ExpertCatalogEntry, ExpertRouteBatch},
@@ -2496,7 +2496,7 @@ fn normalized_checkpoint_keys(
         .collect()
 }
 
-impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
+impl MlxArchitectureSemantics for KimiLinearLayerwiseAdapter {
     type Input<'a> = &'a Array;
     type Cache = Cache;
     type Layer = DecoderLayer;
