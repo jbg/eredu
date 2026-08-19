@@ -978,7 +978,9 @@ pub(super) fn materialize_safetensors(
         ModelKind::Llama => Ok(Model::Llama(
             crate::composition::llama::load_llama_safetensors_mlx(
                 model_dir,
-                execution.weight_residency(),
+                crate::backend::mlx::runtime::execution::layerwise::WeightResidency::with_layers(
+                    execution,
+                ),
                 options.quantization,
                 stream,
                 weights_stream,

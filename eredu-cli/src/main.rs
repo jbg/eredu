@@ -24,7 +24,6 @@ use eredu::{
     backend::mlx::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     backend::mlx::runtime::generation::sampler::{MirostatV2Sampler, Sampler},
     backend::mlx::runtime::media::input::{InputPart, ModelInput},
-    backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     backend::mlx::runtime::residency::expert_cache::{ExpertPassStatistics, ExpertTierStatistics},
     backend::mlx::{
         inspect_model, speculative::MtpComponentTimingGuard, MlxBackend, MlxInspectionOptions,
@@ -35,12 +34,13 @@ use eredu::{
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
-    AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner, DevicePlan, DraftPlacementPlan,
-    DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry, ExpertCachePlan,
-    FinishReason, GenerationCancellationToken, GenerationConfigOverrides, HardwareMemorySemantics,
-    HardwareProfile, ModelResourceProfile, MtpSchedulerOptions, Observed, PlanExplanation,
-    PlanExplanationEntry, PlanExplanationLevel, SemanticEvent, TextGenerationConfig,
-    TimingTelemetry, TokenOutput, WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
+    AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner, DenseDiskStreamLoadOptions,
+    DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanReport,
+    ExecutionTelemetry, ExpertCachePlan, FinishReason, GenerationCancellationToken,
+    GenerationConfigOverrides, HardwareMemorySemantics, HardwareProfile, ModelResourceProfile,
+    MtpSchedulerOptions, Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
+    SemanticEvent, TextGenerationConfig, TimingTelemetry, TokenOutput, WeightTransformationPlan,
+    EXECUTION_PLAN_SCHEMA_VERSION,
 };
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
 use safemlx::{

@@ -34,10 +34,8 @@ pub(crate) use distributed::MlxDistributedConfig;
 pub use distributed::MlxDistributedSession;
 pub use runtime::distributed::topology::{PlacementPlan, RankPartition};
 pub use runtime::execution::layerwise::{
-    LayerWeightResidency, LayerwiseLoadOptions, NonExpertWeightResidency, ParallelModelInfo,
-    WeightResidency,
+    NonExpertWeightResidency, ParallelModelInfo, WeightResidency,
 };
-pub use runtime::residency::dense_stream::DenseDiskStreamLoadOptions;
 pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
 pub use topology::{DeviceAssignment, MlxParallelContext};
 

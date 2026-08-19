@@ -9,7 +9,10 @@ use eredu_checkpoint::{
     store::{CheckpointSource, ResolvedCheckpointSource, WeightStoreBackend},
     WeightQuantization,
 };
-use eredu_runtime::{OffloadUnit, WeightBinding};
+use eredu_runtime::{
+    DenseDiskStreamLoadOptions, ExecutionResidency, LayerWeightResidency, LayerwiseLoadOptions,
+    OffloadUnit, WeightBinding, DENSE_TRANSFER_WINDOW,
+};
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -37,9 +40,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::recipe::RecipeDtype,
     backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
     backend::mlx::runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
-    backend::mlx::runtime::residency::dense_stream::{
-        BackgroundLayerPrefetch, DenseDiskStreamLoadOptions, DENSE_TRANSFER_WINDOW,
-    },
+    backend::mlx::runtime::residency::dense_stream::BackgroundLayerPrefetch,
     backend::mlx::runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, ResidencyError, ResidencyManager, ResidentTransfer,
         ResidentUnitLease,
@@ -118,7 +119,7 @@ pub(crate) fn validate_gguf_layerwise_source(
         }
     };
     let architecture = crate::core::GgufArchitecture::resolve(architecture_name)?;
-    let residency = options.weight_residency();
+    let residency = WeightResidency::with_layers(options);
     crate::composition::mlx::structural::validate_gguf(
         architecture,
         checkpoint,
@@ -127,75 +128,6 @@ pub(crate) fn validate_gguf_layerwise_source(
     )
     .into_loader_result()?;
     Ok(architecture)
-}
-
-/// Loader controls for a host-backed layerwise execution engine.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct LayerwiseLoadOptions {
-    /// Residency budgets and maximum device-layer window.
-    pub offload: OffloadConfig,
-    /// Maximum number of checkpoint payload shards retained as mappings.
-    pub max_mapped_shards: usize,
-    /// Reject checkpoint tensors unrelated to the adapter's parameter tree.
-    pub strict_loading: bool,
-    /// Sample MLX allocator memory when a forward pass completes.
-    pub sample_mlx_memory: bool,
-    /// Sample process memory metrics when a forward pass completes.
-    pub sample_process_memory: bool,
-}
-
-impl LayerwiseLoadOptions {
-    /// Creates strict options with the default mapped-shard bound.
-    pub fn new(offload: OffloadConfig) -> Self {
-        Self {
-            offload,
-            ..Self::default()
-        }
-    }
-}
-
-impl Default for LayerwiseLoadOptions {
-    fn default() -> Self {
-        Self {
-            offload: OffloadConfig::default(),
-            max_mapped_shards: crate::core::DEFAULT_MAX_MAPPED_SHARDS,
-            strict_loading: true,
-            sample_mlx_memory: false,
-            sample_process_memory: false,
-        }
-    }
-}
-
-/// Placement policy for ordinary architecture execution units.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-pub enum LayerWeightResidency {
-    /// Construct every rank-local module once and retain it on the execution device.
-    #[default]
-    FullyResident,
-    /// Eagerly materialize units on a host stream and use a bounded device window.
-    LayerwiseHost(LayerwiseLoadOptions),
-    /// Leave units cold on disk and use finite host and device caches.
-    DenseDiskStream(DenseDiskStreamLoadOptions),
-}
-
-impl LayerWeightResidency {
-    /// Returns the backend shard/reader cache bound carried by this policy.
-    pub(crate) const fn max_mapped_shards(self) -> usize {
-        match self {
-            Self::FullyResident => crate::core::DEFAULT_MAX_MAPPED_SHARDS,
-            Self::LayerwiseHost(options) => options.max_mapped_shards,
-            Self::DenseDiskStream(options) => options.max_mapped_shards,
-        }
-    }
-
-    /// Returns whether whole-artifact admission rejects unrelated tensors.
-    pub(crate) const fn strict_loading(self) -> bool {
-        match self {
-            Self::FullyResident => true,
-            Self::LayerwiseHost(options) => options.strict_loading,
-            Self::DenseDiskStream(options) => options.strict_loading,
-        }
-    }
 }
 
 /// Routed-expert placement relative to ordinary layer units.
@@ -358,95 +290,6 @@ impl From<NonExpertWeightResidency> for LayerWeightResidency {
 impl Default for WeightResidency {
     fn default() -> Self {
         Self::fully_resident()
-    }
-}
-
-/// Static-parameter placement used by the generalized execution engine.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ExecutionResidency {
-    /// Every module is constructed once and all rank-local parameters remain on device.
-    FullyResident,
-    /// Decoder parameters remain on host behind bounded device windows.
-    LayerwiseHost,
-    /// Decoder parameters are materialized through bounded disk, host, and device caches.
-    DenseDiskStream,
-}
-
-impl From<LayerwiseLoadOptions> for LayerWeightResidency {
-    fn from(value: LayerwiseLoadOptions) -> Self {
-        Self::LayerwiseHost(value)
-    }
-}
-
-impl From<DenseDiskStreamLoadOptions> for LayerWeightResidency {
-    fn from(value: DenseDiskStreamLoadOptions) -> Self {
-        Self::DenseDiskStream(value)
-    }
-}
-
-impl LayerWeightResidency {
-    pub(crate) fn sample_mlx_memory(self) -> bool {
-        match self {
-            Self::FullyResident => false,
-            Self::LayerwiseHost(options) => options.sample_mlx_memory,
-            Self::DenseDiskStream(options) => options.sample_mlx_memory,
-        }
-    }
-
-    pub(crate) fn sample_process_memory(self) -> bool {
-        match self {
-            Self::FullyResident => false,
-            Self::LayerwiseHost(options) => options.sample_process_memory,
-            Self::DenseDiskStream(options) => options.sample_process_memory,
-        }
-    }
-
-    pub(crate) fn device_depth(self, layer_count: usize) -> usize {
-        match self {
-            Self::FullyResident => layer_count,
-            Self::LayerwiseHost(options) => options.offload.prefetch_depth(),
-            Self::DenseDiskStream(_) => layer_count.min(DENSE_TRANSFER_WINDOW),
-        }
-    }
-
-    pub(crate) fn offload(self) -> Result<OffloadConfig, Error> {
-        match self {
-            Self::FullyResident => Ok(OffloadConfig::default()),
-            Self::LayerwiseHost(options) => Ok(options.offload),
-            Self::DenseDiskStream(options) => {
-                options.validate()?;
-                Ok(OffloadConfig::new(
-                    Some(options.device_budget_bytes),
-                    Some(options.host_budget_bytes),
-                    options.host_lookahead.max(DENSE_TRANSFER_WINDOW),
-                )?
-                .with_eviction_policy(options.eviction_policy))
-            }
-        }
-    }
-
-    pub(crate) fn dense(self) -> Option<DenseDiskStreamLoadOptions> {
-        match self {
-            Self::DenseDiskStream(options) => Some(options),
-            Self::FullyResident | Self::LayerwiseHost(_) => None,
-        }
-    }
-
-    pub(crate) const fn weight_residency(self) -> WeightResidency {
-        WeightResidency::with_layers(self)
-    }
-
-    /// Returns whether every ordinary execution unit remains device-resident.
-    pub const fn is_fully_resident(self) -> bool {
-        matches!(self, Self::FullyResident)
-    }
-
-    pub(crate) const fn residency(self) -> ExecutionResidency {
-        match self {
-            Self::FullyResident => ExecutionResidency::FullyResident,
-            Self::LayerwiseHost(_) => ExecutionResidency::LayerwiseHost,
-            Self::DenseDiskStream(_) => ExecutionResidency::DenseDiskStream,
-        }
     }
 }
 
@@ -1086,9 +929,9 @@ impl DenseStreamController {
     }
 
     fn commit_forward(&self, manager: &ResidencyManager) -> Result<(), Error> {
-        if self.options.sample_mlx_memory || self.options.sample_process_memory {
+        if self.options.sample_backend_memory || self.options.sample_process_memory {
             manager.sample_memory(
-                self.options.sample_mlx_memory,
+                self.options.sample_backend_memory,
                 self.options.sample_process_memory,
             )?;
         }
@@ -4487,7 +4330,10 @@ where
         groups,
         static_leases,
     )?
-    .with_memory_sampling(options.sample_mlx_memory(), options.sample_process_memory());
+    .with_memory_sampling(
+        options.sample_backend_memory(),
+        options.sample_process_memory(),
+    );
     if fully_resident {
         model.materialize_resident_layers(stream)?;
     }
@@ -4496,7 +4342,7 @@ where
         quantization: model.adapter.quantization(),
         layer_count: planned_layer_count,
         static_device_bytes,
-        residency: options.residency(),
+        residency: options.execution_residency(),
         layer_parameter_bytes,
         maximum_device_layer_bytes: device_window_bytes,
         maximum_host_layer_bytes,
@@ -4744,7 +4590,10 @@ where
         groups,
         static_leases,
     )?
-    .with_memory_sampling(options.sample_mlx_memory(), options.sample_process_memory());
+    .with_memory_sampling(
+        options.sample_backend_memory(),
+        options.sample_process_memory(),
+    );
     model.parallel_layout = Some(layout);
     model.parallel_topology = Some(build.topology());
     if fully_resident {
@@ -4755,7 +4604,7 @@ where
         quantization: model.adapter.quantization(),
         layer_count: planned_layer_count,
         static_device_bytes,
-        residency: options.residency(),
+        residency: options.execution_residency(),
         layer_parameter_bytes,
         maximum_device_layer_bytes: device_window_bytes,
         maximum_host_layer_bytes,

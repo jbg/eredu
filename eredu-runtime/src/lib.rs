@@ -23,6 +23,7 @@ pub mod parameter;
 pub mod residency;
 /// Architecture-declared mutable state and concrete runtime realizations.
 pub mod state;
+mod weight_residency;
 
 pub use backend::{CollectiveBackend, ParameterBackend, SubmissionBackend, TransferBackend};
 pub use cache::{
@@ -73,6 +74,10 @@ pub use residency::{
 pub use state::{
     DeviceState, ModelStateIdentity, PagedStatePlan, RuntimeLayerState, RuntimeState, StateError,
     StateLayout, StateResidencyPlan,
+};
+pub use weight_residency::{
+    DenseDiskStreamLoadOptions, ExecutionResidency, LayerWeightResidency, LayerwiseLoadOptions,
+    WeightResidencyPolicyError, DENSE_TRANSFER_WINDOW,
 };
 
 /// Inspectable architecture/runtime topology without backend-native values.

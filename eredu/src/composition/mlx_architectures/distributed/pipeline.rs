@@ -13,7 +13,9 @@
 use eredu_architectures::llama::ModelArgs as LlamaModelArgs;
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
-    OffloadUnit, ResidencyReport, ShardingPolicy, WeightBinding, WeightMaterializationReport,
+    DenseDiskStreamLoadOptions, LayerWeightResidency, LayerwiseLoadOptions, OffloadUnit,
+    ResidencyReport, ShardingPolicy, WeightBinding, WeightMaterializationReport,
+    DENSE_TRANSFER_WINDOW,
 };
 
 mod placement;
@@ -83,12 +85,11 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
         ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, DenseTransferWindow,
-        LayerWeightResidency, LayerwiseLoadOptions, LoadTimeQuantizableAdapter,
-        PipelineStageQuantizationSelection, SharedWeightStore, StaticUnitBindings,
+        LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection, SharedWeightStore,
+        StaticUnitBindings,
     },
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
-    backend::mlx::runtime::residency::dense_stream::DENSE_TRANSFER_WINDOW,
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertPass,
     },
@@ -1790,9 +1791,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
 #[derive(Debug, Clone, Copy)]
 enum PipelineLayerLoadOptions {
     LayerwiseHost(LayerwiseLoadOptions),
-    DenseDiskStream(
-        crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-    ),
+    DenseDiskStream(DenseDiskStreamLoadOptions),
 }
 
 enum PipelineLayerController {
@@ -7944,10 +7943,10 @@ where
     residency.initialize()?;
     let (sample_mlx_memory, sample_process_memory) = match options {
         PipelineLayerLoadOptions::LayerwiseHost(options) => {
-            (options.sample_mlx_memory, options.sample_process_memory)
+            (options.sample_backend_memory, options.sample_process_memory)
         }
         PipelineLayerLoadOptions::DenseDiskStream(options) => {
-            (options.sample_mlx_memory, options.sample_process_memory)
+            (options.sample_backend_memory, options.sample_process_memory)
         }
     };
     let controller = match options {

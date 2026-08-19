@@ -1,5 +1,7 @@
 //! Text-decoder bounded layer execution for Thinking Machines Lab Inkling.
 
+use eredu_runtime::LayerWeightResidency;
+
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
 use eredu_runtime::{OffloadUnit, WeightBinding};
@@ -55,8 +57,8 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
-        StaticUnitBindings, WeightResidency,
+        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
+        WeightResidency,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -1181,7 +1183,7 @@ pub(crate) fn load_inkling_gguf_tensor_parallel_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(InklingLayerwiseModel, Vec<u32>), Error> {
-    let residency = options.weight_residency();
+    let residency = WeightResidency::with_layers(options);
     crate::composition::mlx::structural::validate_gguf(
         crate::core::GgufArchitecture::Inkling,
         checkpoint,

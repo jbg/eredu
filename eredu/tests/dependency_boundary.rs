@@ -234,6 +234,45 @@ fn cache_execution_algorithms_are_runtime_owned() {
 }
 
 #[test]
+fn immutable_weight_residency_policy_is_runtime_owned() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let runtime = std::fs::read_to_string(workspace.join("eredu-runtime/src/weight_residency.rs"))
+        .expect("runtime weight-residency policy must be readable");
+    for runtime_owned in [
+        "pub struct LayerwiseLoadOptions",
+        "pub struct DenseDiskStreamLoadOptions",
+        "pub enum LayerWeightResidency",
+        "pub enum ExecutionResidency",
+    ] {
+        assert!(
+            runtime.contains(runtime_owned),
+            "runtime does not own immutable-weight policy {runtime_owned}"
+        );
+    }
+
+    for relative in [
+        "eredu/src/backend/mlx/runtime/execution/layerwise.rs",
+        "eredu/src/backend/mlx/runtime/residency/dense_stream.rs",
+    ] {
+        let source = std::fs::read_to_string(workspace.join(relative))
+            .expect("MLX weight-residency realization must be readable");
+        for runtime_owned in [
+            "pub struct LayerwiseLoadOptions",
+            "pub struct DenseDiskStreamLoadOptions",
+            "pub enum LayerWeightResidency",
+            "pub enum ExecutionResidency",
+        ] {
+            assert!(
+                !source.contains(runtime_owned),
+                "MLX redefined immutable-weight policy {runtime_owned} in {relative}"
+            );
+        }
+    }
+}
+
+#[test]
 fn llama_hot_path_remains_statically_dispatched_and_device_native() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

@@ -2,8 +2,8 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
-    CausalModel, LayeredArchitecture, LayeredForwardState, LayerwiseRuntime,
-    ParallelLayeredArchitecture, RuntimeState,
+    CausalModel, ExecutionResidency, LayerWeightResidency, LayeredArchitecture,
+    LayeredForwardState, LayerwiseRuntime, ParallelLayeredArchitecture, RuntimeState,
 };
 
 use std::{collections::HashMap, path::Path, sync::Arc};
@@ -42,8 +42,8 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
-        DenseDiskStreamReport, ExecutionResidency, LayerWeightResidency, LayerwiseModelMetadata,
-        ParallelModelInfo, StaticUnitBindings, WeightResidency,
+        DenseDiskStreamReport, LayerwiseModelMetadata, ParallelModelInfo, StaticUnitBindings,
+        WeightResidency,
     },
     backend::mlx::runtime::media::input,
     composition::llama_mlx as resident,

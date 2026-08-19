@@ -26,17 +26,12 @@ use super::{
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::{
-        execution::layerwise::{
-            LayerwiseLoadOptions, LayerwiseModelError, NonExpertWeightResidency, WeightResidency,
-        },
-        residency::{
-            dense_stream::DenseDiskStreamLoadOptions,
-            expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport},
-        },
+        execution::layerwise::{LayerwiseModelError, NonExpertWeightResidency, WeightResidency},
+        residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport},
     },
 };
 use eredu_core::residency::{MemoryTier, OffloadConfig, TransferDirection};
-use eredu_runtime::ResidencyReport;
+use eredu_runtime::{DenseDiskStreamLoadOptions, LayerwiseLoadOptions, ResidencyReport};
 
 /// MLX automatic-planning adapter and whole-session backend factory.
 #[derive(Debug, Clone, Copy, Default)]
@@ -186,7 +181,7 @@ fn mlx_load_options(
                 *device_layer_window,
             )?,
             max_mapped_shards: plan.max_mapped_shards,
-            sample_mlx_memory: factory.sample_mlx_memory,
+            sample_backend_memory: factory.sample_mlx_memory,
             sample_process_memory: factory.sample_process_memory,
             ..LayerwiseLoadOptions::default()
         }),
@@ -203,7 +198,7 @@ fn mlx_load_options(
                 *background_queue,
             )?;
             options.max_mapped_shards = plan.max_mapped_shards;
-            options.sample_mlx_memory = factory.sample_mlx_memory;
+            options.sample_backend_memory = factory.sample_mlx_memory;
             options.sample_process_memory = factory.sample_process_memory;
             NonExpertWeightResidency::DenseDiskStream(options)
         }

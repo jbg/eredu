@@ -1,5 +1,7 @@
 //! Bounded layer execution for Moshi and PersonaPlex realtime token models.
 
+use eredu_runtime::LayerWeightResidency;
+
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::WeightBinding;
 
@@ -26,8 +28,8 @@ use crate::{
     },
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model_with_quantization, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, ArchitectureAdapter, LayerWeightResidency,
-        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
+        open_safetensors_weight_store, ArchitectureAdapter, LayerwiseForwardState, LayerwiseModel,
+        LoadTimeQuantizableAdapter, StaticUnitBindings,
     },
     backend::mlx::runtime::generation::sampler::Sampler,
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
@@ -932,7 +934,7 @@ fn token_position(
 /// Loads a native MLX-layout Moshi checkpoint through bounded layer residency.
 pub fn load_moshi_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
+    options: impl Into<LayerWeightResidency>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -956,7 +958,7 @@ pub fn load_moshi_layerwise_model(
 #[cfg(test)]
 pub(crate) fn load_moshi_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
+    options: impl Into<LayerWeightResidency>,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -983,7 +985,7 @@ pub(crate) fn load_moshi_tensor_parallel_layerwise_model(
 /// Loads the released PersonaPlex PyTorch checkpoint through bounded layer residency.
 pub fn load_personaplex_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
+    options: impl Into<LayerWeightResidency>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1029,7 +1031,7 @@ pub fn load_pytorch_layerwise_model(
 /// Loads PersonaPlex with rank-local temporal and depth transformers.
 pub fn load_personaplex_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
+    options: impl Into<LayerWeightResidency>,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1058,7 +1060,7 @@ fn load_with_layout(
     source: impl AsRef<Path>,
     args: ModelArgs,
     layout: CheckpointLayout,
-    options: impl Into<crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency>,
+    options: impl Into<LayerWeightResidency>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,

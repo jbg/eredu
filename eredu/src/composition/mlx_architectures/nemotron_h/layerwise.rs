@@ -1,5 +1,7 @@
 //! Unified fully resident and bounded layer execution for Nemotron-H.
 
+use eredu_runtime::LayerWeightResidency;
+
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
 use eredu_runtime::{
@@ -59,8 +61,8 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
-        StaticUnitBindings, WeightResidency,
+        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
+        WeightResidency,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{

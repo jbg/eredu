@@ -1,12 +1,11 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use eredu::{
-    backend::mlx::realtime::{generate_encoded_greedy, MlxRealtimeBackend},
-    backend::mlx::{
-        architectures::moshi::layerwise::{load_moshi_layerwise_model, MoshiLayerwiseModel},
-        runtime::execution::layerwise::LayerWeightResidency,
+    backend::mlx::architectures::moshi::layerwise::{
+        load_moshi_layerwise_model, MoshiLayerwiseModel,
     },
-    load_realtime_model,
+    backend::mlx::realtime::{generate_encoded_greedy, MlxRealtimeBackend},
+    load_realtime_model, LayerWeightResidency,
 };
 use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, ExecutionContext};
 

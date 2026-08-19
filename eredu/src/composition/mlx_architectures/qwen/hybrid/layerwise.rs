@@ -1,5 +1,7 @@
 //! Shared bounded layer execution for Qwen3-Next and Qwen3.5 text models.
 
+use eredu_runtime::LayerWeightResidency;
+
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
 use eredu_runtime::{
@@ -55,8 +57,8 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
-        StaticUnitBindings, WeightResidency,
+        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter, StaticUnitBindings,
+        WeightResidency,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -1269,7 +1271,7 @@ pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
     let prepared =
         resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, mmproj, weights_stream)?;
     let architecture = crate::core::GgufArchitecture::resolve(&prepared.architecture)?;
-    let residency = options.weight_residency();
+    let residency = WeightResidency::with_layers(options);
     crate::composition::mlx::structural::validate_gguf(
         architecture,
         checkpoint,

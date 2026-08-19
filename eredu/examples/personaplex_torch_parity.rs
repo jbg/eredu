@@ -2,11 +2,9 @@ use std::{collections::HashMap, path::PathBuf};
 
 use eredu::{
     backend::mlx::architectures::moshi::{layerwise, model as moshi, personaplex},
-    backend::mlx::{
-        realtime::{MlxRealtimeBackend, MlxRealtimeInput, MlxRealtimeModel},
-        LayerWeightResidency,
-    },
-    RealtimeModel, RealtimeSampling, RealtimeScheduler, RequestId, SchedulerLimits,
+    backend::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput, MlxRealtimeModel},
+    LayerWeightResidency, RealtimeModel, RealtimeSampling, RealtimeScheduler, RequestId,
+    SchedulerLimits,
 };
 use safemlx::{
     ops::{indexing::TryIndexOp, stack_axis},

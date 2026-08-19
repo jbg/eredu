@@ -1121,16 +1121,10 @@ fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
     let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
     let policies = [
         crate::backend::mlx::runtime::execution::layerwise::WeightResidency::layerwise_host(
-            crate::backend::mlx::runtime::execution::layerwise::LayerwiseLoadOptions::default(),
+            eredu_runtime::LayerwiseLoadOptions::default(),
         ),
         crate::backend::mlx::runtime::execution::layerwise::WeightResidency::dense_disk_stream(
-            crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
-                1 << 20,
-                1 << 20,
-                1,
-                1,
-            )
-            .unwrap(),
+            eredu_runtime::DenseDiskStreamLoadOptions::new(1 << 20, 1 << 20, 1, 1).unwrap(),
         ),
     ];
 

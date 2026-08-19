@@ -1,5 +1,7 @@
 //! Bounded-residency execution for Kimi Linear safetensors and GGUF checkpoints.
 
+use eredu_runtime::LayerWeightResidency;
+
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
 use eredu_runtime::{
@@ -56,8 +58,8 @@ use crate::{
         execution::layerwise::{
             load_layerwise_model, load_layerwise_model_with_quantization,
             load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-            ArchitectureAdapter, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
-            LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
+            ArchitectureAdapter, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+            StaticUnitBindings, WeightResidency,
         },
         residency::{
             expert_cache::{

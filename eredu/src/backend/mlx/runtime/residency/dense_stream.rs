@@ -15,96 +15,10 @@ use std::{
 use crate::{
     backend::mlx::runtime::residency::manager::{ResidencyManager, ResidentUnitLease},
     core::residency::{
-        BackgroundPrefetchReport, CacheEvictionPolicy, MemoryTier, OffloadUnitId,
-        PrefetchAdmission, PrefetchDemandResolution, PrefetchExecutionState,
+        BackgroundPrefetchReport, MemoryTier, OffloadUnitId, PrefetchAdmission,
+        PrefetchDemandResolution, PrefetchExecutionState,
     },
 };
-
-/// Current plus next layer retained by dense streamed execution.
-pub(crate) const DENSE_TRANSFER_WINDOW: usize = 2;
-
-/// Public controls for experimental dense disk streaming.
-///
-/// Device residency always uses a fixed current-plus-next layer window. The
-/// device budget must therefore accommodate the largest adjacent pair of
-/// execution units plus pinned static weights. One-unit groups use one slot.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct DenseDiskStreamLoadOptions {
-    /// Finite logical device parameter budget, including pinned static weights.
-    pub device_budget_bytes: u64,
-    /// Finite charged host-allocation budget. Zero selects direct disk-to-device loading.
-    pub host_budget_bytes: u64,
-    /// Number of current and imminent layer host copies protected from eviction.
-    pub host_lookahead: usize,
-    /// Maximum number of pending background host materializations.
-    pub background_queue_capacity: usize,
-    /// Deterministic ordering used when unprotected cached copies must be evicted.
-    pub eviction_policy: CacheEvictionPolicy,
-    /// Maximum number of checkpoint payload shards retained as mappings.
-    pub max_mapped_shards: usize,
-    /// Reject checkpoint tensors unrelated to the adapter's parameter tree.
-    pub strict_loading: bool,
-    /// Sample MLX allocator memory after a forward pass.
-    pub sample_mlx_memory: bool,
-    /// Sample process memory and page-fault counters after a forward pass.
-    pub sample_process_memory: bool,
-}
-
-impl DenseDiskStreamLoadOptions {
-    /// Creates strict streaming options with finite tier budgets.
-    ///
-    /// `host_lookahead` controls background disk-to-host work. Device
-    /// lookahead is deliberately fixed at two and is not separately tunable.
-    pub fn new(
-        device_budget_bytes: u64,
-        host_budget_bytes: u64,
-        host_lookahead: usize,
-        background_queue_capacity: usize,
-    ) -> Result<Self, DenseStreamError> {
-        let options = Self {
-            device_budget_bytes,
-            host_budget_bytes,
-            host_lookahead,
-            background_queue_capacity,
-            eviction_policy: CacheEvictionPolicy::LeastRecentlyUsed,
-            max_mapped_shards: crate::core::DEFAULT_MAX_MAPPED_SHARDS,
-            strict_loading: true,
-            sample_mlx_memory: false,
-            sample_process_memory: false,
-        };
-        options.validate()?;
-        Ok(options)
-    }
-
-    /// Revalidates public fields after caller customization.
-    pub fn validate(self) -> Result<(), DenseStreamError> {
-        if self.host_budget_bytes == 0 {
-            if self.host_lookahead != 0 || self.background_queue_capacity != 0 {
-                return Err(DenseStreamError::HostDisabledControls);
-            }
-        } else {
-            if self.host_lookahead == 0 {
-                return Err(DenseStreamError::ZeroHostLookahead);
-            }
-            if self.background_queue_capacity == 0 {
-                return Err(DenseStreamError::ZeroQueueCapacity);
-            }
-        }
-        Ok(())
-    }
-
-    /// Selects deterministic cache eviction.
-    pub const fn with_eviction_policy(mut self, policy: CacheEvictionPolicy) -> Self {
-        self.eviction_policy = policy;
-        self
-    }
-}
-
-impl Default for DenseDiskStreamLoadOptions {
-    fn default() -> Self {
-        Self::new(4 << 30, 16 << 30, 2, 2).expect("default dense disk streaming controls are valid")
-    }
-}
 
 #[derive(Debug)]
 enum WorkerMessage {
@@ -144,7 +58,7 @@ impl BackgroundLayerPrefetch {
         operation: HostPrefetchOperation,
     ) -> Result<Self, DenseStreamError> {
         if capacity == 0 {
-            return Err(DenseStreamError::ZeroQueueCapacity);
+            return Err(DenseStreamError::ZeroWorkerCapacity);
         }
         let (sender, receiver) = mpsc::channel();
         let shared = Arc::new((
@@ -335,15 +249,9 @@ fn worker_loop(
 /// Structured validation and worker failures for dense disk streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum DenseStreamError {
-    /// Enabled host caching needs a protected current unit.
-    #[error("dense disk streaming host lookahead must be nonzero when the host budget is enabled")]
-    ZeroHostLookahead,
-    /// Enabled background work requires bounded capacity.
-    #[error("dense disk streaming background queue capacity must be nonzero when host caching is enabled")]
-    ZeroQueueCapacity,
-    /// Direct-to-device mode cannot configure host-only controls.
-    #[error("dense disk streaming with a zero host budget requires zero host lookahead and queue capacity")]
-    HostDisabledControls,
+    /// A physical background worker was constructed without queue capacity.
+    #[error("dense disk streaming worker capacity must be nonzero")]
+    ZeroWorkerCapacity,
     /// Shared worker state was poisoned.
     #[error("dense disk streaming worker state is poisoned")]
     StatePoisoned,
@@ -499,35 +407,6 @@ mod tests {
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         })
-    }
-
-    #[test]
-    fn configuration_requires_meaningful_finite_controls() {
-        assert!(matches!(
-            DenseDiskStreamLoadOptions::new(1, 1, 0, 1),
-            Err(DenseStreamError::ZeroHostLookahead)
-        ));
-        assert!(matches!(
-            DenseDiskStreamLoadOptions::new(1, 1, 1, 0),
-            Err(DenseStreamError::ZeroQueueCapacity)
-        ));
-        assert!(matches!(
-            DenseDiskStreamLoadOptions::new(1, 0, 1, 0),
-            Err(DenseStreamError::HostDisabledControls)
-        ));
-        assert!(DenseDiskStreamLoadOptions::new(1, 0, 0, 0).is_ok());
-    }
-
-    #[test]
-    fn mutated_public_controls_are_revalidated() {
-        let options = DenseDiskStreamLoadOptions {
-            background_queue_capacity: 0,
-            ..DenseDiskStreamLoadOptions::default()
-        };
-        assert!(matches!(
-            options.validate(),
-            Err(DenseStreamError::ZeroQueueCapacity)
-        ));
     }
 
     #[test]

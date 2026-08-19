@@ -8,10 +8,8 @@ use std::{
 
 use eredu::{
     backend::mlx::architectures::moshi::{layerwise as moshi, personaplex},
-    backend::mlx::runtime::{
-        execution::layerwise::LayerWeightResidency,
-        generation::sampler::{DefaultSampler, GenerationSampler},
-    },
+    backend::mlx::runtime::generation::sampler::{DefaultSampler, GenerationSampler},
+    LayerWeightResidency,
 };
 use eredu_codec::mimi::Mimi;
 use safemlx::{random::RandomState, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};

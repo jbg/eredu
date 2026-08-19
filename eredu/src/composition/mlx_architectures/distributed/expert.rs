@@ -76,9 +76,9 @@ use crate::{
 };
 use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
 
-use crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency;
 #[cfg(test)]
 use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;
+use eredu_runtime::LayerWeightResidency;
 
 use crate::{
     backend::mlx::nn::moe::{quantize_expert_bank, PackedSwiGluExperts},
@@ -5155,8 +5155,8 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
     stream: &Stream,
     weights_stream: &Stream,
 ) {
-    use crate::backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions;
     use crate::backend::mlx::DeviceAssignment;
+    use eredu_runtime::DenseDiskStreamLoadOptions;
     use safemlx::DeviceType;
 
     let topology =

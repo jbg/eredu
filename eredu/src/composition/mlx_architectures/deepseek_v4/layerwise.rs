@@ -1,5 +1,7 @@
 //! Checkpoint-format-independent bounded-residency execution for DeepSeek V4.
 
+use eredu_runtime::LayerWeightResidency;
+
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
 use eredu_runtime::{OffloadUnit, WeightBinding};
@@ -42,8 +44,8 @@ use crate::{
         execution::layerwise::{
             load_layerwise_model_with_quantization,
             load_tensor_parallel_layerwise_model_with_quantization, open_safetensors_weight_store,
-            ArchitectureAdapter, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
-            LoadTimeQuantizableAdapter, StaticUnitBindings,
+            ArchitectureAdapter, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+            StaticUnitBindings,
         },
         residency::{
             expert_cache::{
@@ -1623,7 +1625,8 @@ pub(crate) fn load_deepseek_v4_gguf_tensor_parallel_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV4LayerwiseModel, Vec<u32>), Error> {
-    let residency = options.weight_residency();
+    let residency =
+        crate::backend::mlx::runtime::execution::layerwise::WeightResidency::with_layers(options);
     crate::composition::mlx::structural::validate_gguf(
         crate::core::GgufArchitecture::DeepSeek4,
         checkpoint,

@@ -46,8 +46,8 @@ impl ModelLoadOptions {
     }
 
     pub(crate) fn preparation_policy(self) -> Result<eredu_core::PreparationPolicy, Error> {
-        use crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency;
         use eredu_core::{QuantizationRequest, ResidencyRequest};
+        use eredu_runtime::LayerWeightResidency;
 
         if let Some(quantization) = self.quantization {
             quantization.validate()?;
@@ -116,11 +116,10 @@ pub(crate) fn ensure_replicated_load_options(options: ModelLoadOptions) -> Resul
 #[cfg(test)]
 mod tests {
     use eredu_checkpoint::WeightQuantization;
+    use eredu_runtime::LayerwiseLoadOptions;
 
     use super::ModelLoadOptions;
-    use crate::backend::mlx::runtime::execution::layerwise::{
-        LayerwiseLoadOptions, WeightResidency,
-    };
+    use crate::backend::mlx::runtime::execution::layerwise::WeightResidency;
 
     #[test]
     fn deepseek_v4_quantization_composes_with_nonresident_layers() {

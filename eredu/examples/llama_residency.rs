@@ -5,13 +5,11 @@ use std::{path::PathBuf, time::Instant};
 use clap::Parser;
 use eredu::{
     backend::mlx::nn::generation::sample,
-    backend::mlx::runtime::execution::layerwise::LayerwiseLoadOptions,
     backend::mlx::runtime::media::input,
-    backend::mlx::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     backend::mlx::{MlxBackend, ModelLoadOptions, WeightResidency},
     core::residency::{MemoryTier, OffloadConfig, TransferDirection},
     core::{BackendProvider as _, BackendSession as _},
-    load_model,
+    load_model, DenseDiskStreamLoadOptions, LayerwiseLoadOptions,
 };
 use safemlx::{Array, Device, DeviceType, ExecutionContext};
 
@@ -85,7 +83,7 @@ fn main() -> anyhow::Result<()> {
             args.stream_queue_capacity,
         )?;
         dense.max_mapped_shards = args.mapped_shards;
-        dense.sample_mlx_memory = true;
+        dense.sample_backend_memory = true;
         dense.sample_process_memory = true;
         WeightResidency::dense_disk_stream(dense)
     } else {
@@ -97,7 +95,7 @@ fn main() -> anyhow::Result<()> {
         let layerwise = LayerwiseLoadOptions {
             offload: config,
             max_mapped_shards: args.mapped_shards,
-            sample_mlx_memory: true,
+            sample_backend_memory: true,
             sample_process_memory: true,
             ..LayerwiseLoadOptions::default()
         };

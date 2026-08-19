@@ -1,5 +1,7 @@
 //! Bounded layer execution for DeepSeek-V3 and DeepSeek-R1 checkpoints.
 
+use eredu_runtime::LayerWeightResidency;
+
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::CausalModel;
 use eredu_runtime::{
@@ -53,7 +55,7 @@ use crate::{
     backend::mlx::runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         NonExpertWeightResidency, StaticUnitBindings, WeightResidency,
     },
     backend::mlx::runtime::media::input,
@@ -1115,7 +1117,7 @@ pub(crate) fn load_deepseek_v3_gguf_tensor_parallel_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV3LayerwiseModel, Vec<u32>), Error> {
-    let residency = options.weight_residency();
+    let residency = WeightResidency::with_layers(options);
     crate::composition::mlx::structural::validate_gguf(
         crate::core::GgufArchitecture::DeepSeek2,
         checkpoint,
