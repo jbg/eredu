@@ -30,7 +30,7 @@ pub use storage::{
 };
 pub use telemetry::{
     CacheLayerResidencyReport, CacheLayerResidencyStats, CacheResidencyReport,
-    CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+    CacheResidencyTelemetry, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
 };
 
 use serde::{Deserialize, Serialize};

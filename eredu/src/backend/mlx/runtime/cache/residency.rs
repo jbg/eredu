@@ -42,12 +42,12 @@ use eredu_runtime::{
     resolve_prompt_cache_root, safe_prompt_cache_shard_path, CacheBlockLifecycle,
     CacheBlockStorage, CacheHostDemotionOperation, CacheIoAdmission, CacheIoCompletionDisposition,
     CacheIoExecutionState, CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey,
-    CacheIoOperationKind, CacheIoPreparation, CacheIoStartDisposition, CacheLayerResidencyReport,
-    CacheLayerResidencyStats, CacheLifecycleError, CachePoolError, CachePoolMembership,
-    CachePoolReservation, CachePoolResource, CachePoolUsage, CacheResidencyConfigurationError,
-    CacheResidencyPool, CacheResidencyReport, CacheStorageError, CacheStoragePhase,
+    CacheIoOperationKind, CacheIoPreparation, CacheIoStartDisposition, CacheLayerResidencyStats,
+    CacheLifecycleError, CachePoolError, CachePoolMembership, CachePoolReservation,
+    CachePoolResource, CachePoolUsage, CacheResidencyConfigurationError, CacheResidencyPool,
+    CacheResidencyReport, CacheResidencyTelemetry, CacheStorageError, CacheStoragePhase,
     LiveCacheDiskPolicy, MutableCacheTail, PagedCacheOptions, PromptCachePersistenceError,
-    PromptCachePublication, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+    PromptCachePublication,
 };
 
 pub(crate) const PAGED_CACHE_PREFETCH_BLOCKS: usize = 2;
@@ -646,13 +646,13 @@ impl DiskWriteCommit {
                     }
                 }
                 if bytes != 0 {
-                    state.counters.report.transfer_bytes += bytes;
+                    state.telemetry.report.transfer_bytes += bytes;
                     state
                         .layer_activity_mut(self.key.id.global_layer)
                         .transfer_bytes += bytes;
                 }
                 if transitioned_to_disk {
-                    state.counters.report.disk_demotions += 1;
+                    state.telemetry.report.disk_demotions += 1;
                     state
                         .layer_activity_mut(self.key.id.global_layer)
                         .disk_demotions += 1;
@@ -664,7 +664,7 @@ impl DiskWriteCommit {
                 }
             }
             Ok(_) => {
-                state.counters.report.failures += 1;
+                state.telemetry.report.failures += 1;
                 state.layer_activity_mut(self.key.id.global_layer).failures += 1;
                 state.background_disk_error =
                     Some("cache disk worker returned an unexpected write result".into());
@@ -674,7 +674,7 @@ impl DiskWriteCommit {
                 if let Some(record) = state.blocks.get_mut(&self.key.id) {
                     record.physical.fail_io_if_matches(&self.key);
                 }
-                state.counters.report.failures += 1;
+                state.telemetry.report.failures += 1;
                 state.layer_activity_mut(self.key.id.global_layer).failures += 1;
                 state.background_disk_error = Some(error.to_string());
             }
@@ -1284,38 +1284,6 @@ impl CacheBlockRecord {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct CacheLayerActivityCounters {
-    stats: CacheLayerResidencyStats,
-}
-
-impl CacheLayerActivityCounters {
-    fn apply_to(&self, stats: &mut CacheLayerResidencyStats) {
-        stats.host_promotions += self.stats.host_promotions;
-        stats.disk_promotions += self.stats.disk_promotions;
-        stats.host_demotions += self.stats.host_demotions;
-        stats.disk_demotions += self.stats.disk_demotions;
-        stats.transfer_bytes += self.stats.transfer_bytes;
-        stats.transfer_wait += self.stats.transfer_wait;
-        stats.demand_hits += self.stats.demand_hits;
-        stats.demand_misses += self.stats.demand_misses;
-        stats.in_flight_waits += self.stats.in_flight_waits;
-        stats.failures += self.stats.failures;
-        stats.prefill_full_attention_blocks += self.stats.prefill_full_attention_blocks;
-        stats.prefill_full_attention_bytes += self.stats.prefill_full_attention_bytes;
-        stats.decode_full_attention_blocks += self.stats.decode_full_attention_blocks;
-        stats.decode_full_attention_bytes += self.stats.decode_full_attention_bytes;
-        stats.attention_scratch_peak_bytes = stats
-            .attention_scratch_peak_bytes
-            .max(self.stats.attention_scratch_peak_bytes);
-    }
-}
-
-#[derive(Debug, Default)]
-struct CacheCounters {
-    report: CacheResidencyReport,
-}
-
 #[derive(Debug)]
 struct CacheManagerState {
     pool: CacheResidencyPool,
@@ -1328,9 +1296,7 @@ struct CacheManagerState {
     retiring_host_demotions: HashMap<u64, RetiringHostDemotion>,
     retiring_disk_reads: HashMap<CacheIoOperationKey, (usize, u64)>,
     transfer_device: Option<CacheTransferDevice>,
-    layer_activity: BTreeMap<usize, CacheLayerActivityCounters>,
-    layer_activity_overflow: CacheLayerActivityCounters,
-    counters: CacheCounters,
+    telemetry: CacheResidencyTelemetry,
     recent_device_blocks: usize,
     device_budget_bytes: u64,
     host_budget_bytes: u64,
@@ -1339,13 +1305,7 @@ struct CacheManagerState {
 
 impl CacheManagerState {
     fn layer_activity_mut(&mut self, global_layer: usize) -> &mut CacheLayerResidencyStats {
-        if self.layer_activity.contains_key(&global_layer)
-            || self.layer_activity.len() < CACHE_RESIDENCY_LAYER_REPORT_LIMIT
-        {
-            &mut self.layer_activity.entry(global_layer).or_default().stats
-        } else {
-            &mut self.layer_activity_overflow.stats
-        }
+        self.telemetry.layer_activity_mut(global_layer)
     }
 }
 
@@ -1394,8 +1354,7 @@ impl CacheResidencyManager {
             LiveCacheDiskPolicy::Enabled { queue_capacity, .. } => *queue_capacity,
         };
         let effective_queue_capacity = queue_capacity.max(1);
-        let mut counters = CacheCounters::default();
-        counters.report.queue_capacity = effective_queue_capacity;
+        let telemetry = CacheResidencyTelemetry::new(effective_queue_capacity);
         let disk_worker = Some(Arc::new(DiskWorker::new(effective_queue_capacity)?));
         let host_demotion_worker = Arc::new(HostDemotionWorker::new()?);
         let recent_device_blocks = options.recent_device_blocks();
@@ -1426,9 +1385,7 @@ impl CacheResidencyManager {
                     retiring_host_demotions: HashMap::new(),
                     retiring_disk_reads: HashMap::new(),
                     transfer_device: None,
-                    layer_activity: BTreeMap::new(),
-                    layer_activity_overflow: CacheLayerActivityCounters::default(),
-                    counters,
+                    telemetry,
                     recent_device_blocks,
                     device_budget_bytes,
                     host_budget_bytes,
@@ -1491,15 +1448,15 @@ impl CacheResidencyManager {
             .set_tail(layer, MutableCacheTail { bytes, end });
         let allocated = previous.is_none_or(|tail| tail.bytes == 0) && bytes > 0;
         if allocated {
-            state.counters.report.tail_allocations += 1;
+            state.telemetry.report.tail_allocations += 1;
         }
         drop(state);
         if let Err(error) = self.rebalance(None, false) {
             let mut state = self.lock()?;
             state.lifecycle.restore_tail(layer, previous);
             if allocated {
-                state.counters.report.tail_allocations =
-                    state.counters.report.tail_allocations.saturating_sub(1);
+                state.telemetry.report.tail_allocations =
+                    state.telemetry.report.tail_allocations.saturating_sub(1);
             }
             update_report_totals(&mut state);
             return Err(error);
@@ -1552,14 +1509,14 @@ impl CacheResidencyManager {
             let mut state = self.lock()?;
             if let Some(record) = state.blocks.remove(&id) {
                 state.lifecycle.remove(&id)?;
-                cancel_record_operation(&record, &mut state.counters.report);
+                cancel_record_operation(&record, &mut state.telemetry.report);
                 remove_ephemeral_file(&record);
             }
             update_report_totals(&mut state);
             return Err(error);
         }
         let mut state = self.lock()?;
-        state.counters.report.block_seals += 1;
+        state.telemetry.report.block_seals += 1;
         Ok(id)
     }
 
@@ -1741,7 +1698,7 @@ impl CacheResidencyManager {
             };
             let previous = state.blocks.insert(id, record);
             debug_assert!(previous.is_none());
-            state.counters.report.block_seals += 1;
+            state.telemetry.report.block_seals += 1;
         }
         update_report_totals(&mut state);
         drop(state);
@@ -1835,7 +1792,7 @@ impl CacheResidencyManager {
                                     &record.dtypes,
                                 )?;
                                 let required_host_bytes = state
-                                    .counters
+                                    .telemetry
                                     .report
                                     .current_host_bytes
                                     .saturating_add(reserved_host_bytes);
@@ -1906,16 +1863,17 @@ impl CacheResidencyManager {
                     let result = ticket.wait();
                     let mut state = self.lock()?;
                     if joined || outcome.as_ref().is_some_and(|outcome| outcome.joined) {
-                        state.counters.report.in_flight_waits += 1;
+                        state.telemetry.report.in_flight_waits += 1;
                         state.layer_activity_mut(id.global_layer).in_flight_waits += 1;
                     }
                     if let Some(outcome) = &outcome {
-                        state.counters.report.queue_peak_occupancy = state
-                            .counters
+                        state.telemetry.report.queue_peak_occupancy = state
+                            .telemetry
                             .report
                             .queue_peak_occupancy
                             .max(outcome.peak_occupancy);
-                        state.counters.report.queue_backpressure += u64::from(outcome.backpressure);
+                        state.telemetry.report.queue_backpressure +=
+                            u64::from(outcome.backpressure);
                     }
                     let stale = state.generation != ticket.key.generation;
                     match result {
@@ -1976,7 +1934,7 @@ impl CacheResidencyManager {
                             if let Some(record) = state.blocks.get_mut(id) {
                                 record.physical.fail_io_if_matches(&ticket.key);
                             }
-                            state.counters.report.failures += 1;
+                            state.telemetry.report.failures += 1;
                             state.layer_activity_mut(id.global_layer).failures += 1;
                             drop(state);
                             worker.retire(&ticket);
@@ -2015,15 +1973,15 @@ impl CacheResidencyManager {
                         let promotion = record.physical.promote_host(device_arrays.clone())?;
                         (record.bytes, promotion)
                     };
-                    state.counters.report.demand_misses += 1;
+                    state.telemetry.report.demand_misses += 1;
                     if loaded_from_disk {
-                        state.counters.report.disk_promotions += 1;
+                        state.telemetry.report.disk_promotions += 1;
                     } else {
-                        state.counters.report.host_promotions += 1;
+                        state.telemetry.report.host_promotions += 1;
                     }
-                    state.counters.report.transfer_bytes += bytes;
+                    state.telemetry.report.transfer_bytes += bytes;
                     let transfer_wait = started.elapsed();
-                    state.counters.report.transfer_wait += transfer_wait;
+                    state.telemetry.report.transfer_wait += transfer_wait;
                     let activity = state.layer_activity_mut(id.global_layer);
                     activity.demand_misses += 1;
                     if loaded_from_disk {
@@ -2079,9 +2037,9 @@ impl CacheResidencyManager {
                         state.lifecycle.release(id)?;
                         return Err(CacheResidencyError::DiskOperationCancelled { generation });
                     }
-                    state.counters.report.demand_hits += 1;
+                    state.telemetry.report.demand_hits += 1;
                     let transfer_wait = started.elapsed();
-                    state.counters.report.transfer_wait += transfer_wait;
+                    state.telemetry.report.transfer_wait += transfer_wait;
                     let activity = state.layer_activity_mut(id.global_layer);
                     activity.demand_hits += 1;
                     activity.transfer_wait += transfer_wait;
@@ -2139,7 +2097,7 @@ impl CacheResidencyManager {
             if let Some(record) = state.blocks.remove(&id) {
                 state.lifecycle.remove(&id)?;
                 remove_ephemeral_file(&record);
-                state.counters.report.discarded_sliding_blocks += 1;
+                state.telemetry.report.discarded_sliding_blocks += 1;
             }
         }
         update_report_totals(&mut state);
@@ -2168,9 +2126,9 @@ impl CacheResidencyManager {
         let mut state = self.lock()?;
         update_report_totals(&mut state);
         if self.options().process_sampling_enabled() {
-            sample_process(&mut state.counters.report);
+            sample_process(&mut state.telemetry.report);
         }
-        Ok(state.counters.report.clone())
+        Ok(state.telemetry.report.clone())
     }
 
     fn retire_tickets(&self, tickets: &[PendingCacheOperation]) -> Result<(), CacheResidencyError> {
@@ -2224,20 +2182,20 @@ impl CacheResidencyManager {
     ) -> Result<(), CacheResidencyError> {
         let mut state = self.lock()?;
         if prefill {
-            state.counters.report.prefill_full_attention_blocks += blocks;
-            state.counters.report.prefill_full_attention_bytes += bytes;
+            state.telemetry.report.prefill_full_attention_blocks += blocks;
+            state.telemetry.report.prefill_full_attention_bytes += bytes;
             let activity = state.layer_activity_mut(global_layer);
             activity.prefill_full_attention_blocks += blocks;
             activity.prefill_full_attention_bytes += bytes;
         } else {
-            state.counters.report.decode_full_attention_blocks += blocks;
-            state.counters.report.decode_full_attention_bytes += bytes;
+            state.telemetry.report.decode_full_attention_blocks += blocks;
+            state.telemetry.report.decode_full_attention_bytes += bytes;
             let activity = state.layer_activity_mut(global_layer);
             activity.decode_full_attention_blocks += blocks;
             activity.decode_full_attention_bytes += bytes;
         }
-        state.counters.report.attention_scratch_peak_bytes = state
-            .counters
+        state.telemetry.report.attention_scratch_peak_bytes = state
+            .telemetry
             .report
             .attention_scratch_peak_bytes
             .max(scratch_bytes);
@@ -2282,7 +2240,7 @@ impl CacheResidencyManager {
         if record.disk().is_some() {
             let record = state.blocks.get_mut(id).expect("host block exists");
             record.physical.release_host_to_disk()?;
-            state.counters.report.disk_demotions += 1;
+            state.telemetry.report.disk_demotions += 1;
             state.layer_activity_mut(id.global_layer).disk_demotions += 1;
             update_report_totals(&mut state);
             return Ok(HostDemotionProgress::Freed);
@@ -2290,10 +2248,10 @@ impl CacheResidencyManager {
 
         let (directory, budget_bytes) = match self.options().live_disk_policy() {
             LiveCacheDiskPolicy::Disabled => {
-                state.counters.report.failures += 1;
+                state.telemetry.report.failures += 1;
                 state.layer_activity_mut(id.global_layer).failures += 1;
                 return Err(CacheResidencyError::LiveDiskRequired {
-                    required: state.counters.report.current_host_bytes,
+                    required: state.telemetry.report.current_host_bytes,
                     budget: self.options().host_budget_bytes(),
                 });
             }
@@ -2327,7 +2285,7 @@ impl CacheResidencyManager {
             );
         let projected = live_disk_bytes.saturating_add(record.bytes);
         if projected > budget_bytes {
-            state.counters.report.failures += 1;
+            state.telemetry.report.failures += 1;
             state.layer_activity_mut(id.global_layer).failures += 1;
             return Err(CacheResidencyError::BudgetExceeded {
                 tier: CacheTier::Disk,
@@ -2383,7 +2341,7 @@ impl CacheResidencyManager {
                 if let Some(record) = state.blocks.get_mut(&ticket.key.id) {
                     record.physical.fail_io_if_matches(&ticket.key);
                 }
-                state.counters.report.failures += 1;
+                state.telemetry.report.failures += 1;
                 state
                     .layer_activity_mut(ticket.key.id.global_layer)
                     .failures += 1;
@@ -2396,19 +2354,19 @@ impl CacheResidencyManager {
         let enqueue_wait = enqueue_started.elapsed();
         let mut state = self.lock()?;
         if outcome.joined {
-            state.counters.report.in_flight_waits += 1;
+            state.telemetry.report.in_flight_waits += 1;
             state
                 .layer_activity_mut(ticket.key.id.global_layer)
                 .in_flight_waits += 1;
         }
-        state.counters.report.queue_peak_occupancy = state
-            .counters
+        state.telemetry.report.queue_peak_occupancy = state
+            .telemetry
             .report
             .queue_peak_occupancy
             .max(outcome.peak_occupancy);
-        state.counters.report.queue_backpressure += u64::from(outcome.backpressure);
+        state.telemetry.report.queue_backpressure += u64::from(outcome.backpressure);
         if outcome.backpressure {
-            state.counters.report.transfer_wait += enqueue_wait;
+            state.telemetry.report.transfer_wait += enqueue_wait;
             state
                 .layer_activity_mut(ticket.key.id.global_layer)
                 .transfer_wait += enqueue_wait;
@@ -2423,8 +2381,8 @@ impl CacheResidencyManager {
         ticket.wait_for_task_resources()?;
         let elapsed = started.elapsed();
         let mut state = self.lock()?;
-        state.counters.report.in_flight_waits += 1;
-        state.counters.report.transfer_wait += elapsed;
+        state.telemetry.report.in_flight_waits += 1;
+        state.telemetry.report.transfer_wait += elapsed;
         let activity = state.layer_activity_mut(ticket.key.id.global_layer);
         activity.in_flight_waits += 1;
         activity.transfer_wait += elapsed;
@@ -2468,7 +2426,7 @@ impl CacheResidencyManager {
             .clone();
         let reserved_host_bytes = host_cache_capacity_upper_bound(&arrays)?;
         let required_host_bytes = state
-            .counters
+            .telemetry
             .report
             .current_host_bytes
             .saturating_add(reserved_host_bytes);
@@ -2514,8 +2472,8 @@ impl CacheResidencyManager {
         if !matches {
             return Ok(());
         }
-        state.counters.report.in_flight_waits += 1;
-        state.counters.report.transfer_wait += elapsed;
+        state.telemetry.report.in_flight_waits += 1;
+        state.telemetry.report.transfer_wait += elapsed;
         let activity = state.layer_activity_mut(ticket.id.global_layer);
         activity.in_flight_waits += 1;
         activity.transfer_wait += elapsed;
@@ -2528,7 +2486,7 @@ impl CacheResidencyManager {
                         .get_mut(&ticket.id)
                         .expect("demotion block exists");
                     record.physical.fail_host_demotion(ticket.operation_id)?;
-                    state.counters.report.failures += 1;
+                    state.telemetry.report.failures += 1;
                     state.layer_activity_mut(ticket.id.global_layer).failures += 1;
                     update_report_totals(&mut state);
                     return Err(CacheResidencyError::Runtime(format!(
@@ -2548,8 +2506,8 @@ impl CacheResidencyManager {
                 record
                     .physical
                     .finish_host_demotion(ticket.operation_id, block)?;
-                state.counters.report.host_demotions += 1;
-                state.counters.report.transfer_bytes += bytes;
+                state.telemetry.report.host_demotions += 1;
+                state.telemetry.report.transfer_bytes += bytes;
                 let activity = state.layer_activity_mut(ticket.id.global_layer);
                 activity.host_demotions += 1;
                 activity.transfer_bytes += bytes;
@@ -2562,7 +2520,7 @@ impl CacheResidencyManager {
                     .get_mut(&ticket.id)
                     .expect("demotion block exists");
                 record.physical.fail_host_demotion(ticket.operation_id)?;
-                state.counters.report.failures += 1;
+                state.telemetry.report.failures += 1;
                 state.layer_activity_mut(ticket.id.global_layer).failures += 1;
                 update_report_totals(&mut state);
                 Err(error)
@@ -2587,7 +2545,7 @@ impl CacheResidencyManager {
             let pool_device_over =
                 pool_report.current_device_bytes > pool_report.limits.device_bytes();
             let local_device_over =
-                state.counters.report.current_device_bytes > self.options().device_budget_bytes();
+                state.telemetry.report.current_device_bytes > self.options().device_budget_bytes();
             if local_device_over || pool_device_over {
                 if let Some(ticket) = state
                     .blocks
@@ -2622,11 +2580,11 @@ impl CacheResidencyManager {
                     }
                 });
                 let Some(id) = candidate else {
-                    state.counters.report.failures += 1;
+                    state.telemetry.report.failures += 1;
                     if let Some(required) = required {
                         state.layer_activity_mut(required.global_layer).failures += 1;
                     } else {
-                        state.layer_activity_overflow.stats.failures += 1;
+                        state.telemetry.unassigned_activity_mut().failures += 1;
                     }
                     return Err(if pool_device_over && !local_device_over {
                         CachePoolError::BudgetExceeded {
@@ -2638,7 +2596,7 @@ impl CacheResidencyManager {
                     } else {
                         CacheResidencyError::BudgetExceeded {
                             tier: CacheTier::Device,
-                            required: state.counters.report.current_device_bytes,
+                            required: state.telemetry.report.current_device_bytes,
                             budget: self.options().device_budget_bytes(),
                         }
                     });
@@ -2651,7 +2609,7 @@ impl CacheResidencyManager {
                 {
                     let record = state.blocks.get_mut(&id).expect("candidate exists");
                     record.physical.release_device_to_disk()?;
-                    state.counters.report.disk_demotions += 1;
+                    state.telemetry.report.disk_demotions += 1;
                     state.layer_activity_mut(id.global_layer).disk_demotions += 1;
                     continue;
                 }
@@ -2665,13 +2623,13 @@ impl CacheResidencyManager {
                     .transpose()?
                     .ok_or_else(|| CacheResidencyError::MissingResidentArrays(id.clone()))?;
                 let required_host_bytes = state
-                    .counters
+                    .telemetry
                     .report
                     .current_host_bytes
                     .saturating_add(candidate_host_bytes);
                 if required_host_bytes > self.options().host_budget_bytes() {
                     if candidate_host_bytes > self.options().host_budget_bytes() {
-                        state.counters.report.failures += 1;
+                        state.telemetry.report.failures += 1;
                         state.layer_activity_mut(id.global_layer).failures += 1;
                         return Err(CacheResidencyError::BudgetExceeded {
                             tier: CacheTier::Host,
@@ -2716,7 +2674,7 @@ impl CacheResidencyManager {
                         continue;
                     }
                     let mut state = self.lock()?;
-                    state.counters.report.failures += 1;
+                    state.telemetry.report.failures += 1;
                     state.layer_activity_mut(id.global_layer).failures += 1;
                     return Err(match self.options().live_disk_policy() {
                         LiveCacheDiskPolicy::Disabled => CacheResidencyError::LiveDiskRequired {
@@ -2740,7 +2698,7 @@ impl CacheResidencyManager {
             let pool_report = state.pool.report()?;
             let pool_host_over = pool_report.current_host_bytes > pool_report.limits.host_bytes();
             let local_host_over =
-                state.counters.report.current_host_bytes > self.options().host_budget_bytes();
+                state.telemetry.report.current_host_bytes > self.options().host_budget_bytes();
             if local_host_over || pool_host_over {
                 let candidate = eviction_candidate(
                     &state,
@@ -2764,7 +2722,7 @@ impl CacheResidencyManager {
                                 .map(|pending| pending.ticket.clone())
                         })
                     });
-                let required_host_bytes = state.counters.report.current_host_bytes;
+                let required_host_bytes = state.telemetry.report.current_host_bytes;
                 drop(state);
                 if let Some(id) = candidate {
                     match self.begin_host_demotion(&id)? {
@@ -2780,11 +2738,11 @@ impl CacheResidencyManager {
                     continue;
                 }
                 let mut state = self.lock()?;
-                state.counters.report.failures += 1;
+                state.telemetry.report.failures += 1;
                 if let Some(required) = required {
                     state.layer_activity_mut(required.global_layer).failures += 1;
                 } else {
-                    state.layer_activity_overflow.stats.failures += 1;
+                    state.telemetry.unassigned_activity_mut().failures += 1;
                 }
                 return Err(if pool_host_over && !local_host_over {
                     CachePoolError::BudgetExceeded {
@@ -2808,8 +2766,9 @@ impl CacheResidencyManager {
             let proactive = matches!(
                 self.options().live_disk_policy(),
                 LiveCacheDiskPolicy::Enabled { .. }
-            ) && state.counters.report.current_host_bytes != 0
-                && (state.counters.report.current_host_bytes >= self.options().host_budget_bytes()
+            ) && state.telemetry.report.current_host_bytes != 0
+                && (state.telemetry.report.current_host_bytes
+                    >= self.options().host_budget_bytes()
                     || pool_report.current_host_bytes >= pool_report.limits.host_bytes());
             let candidate = if proactive {
                 eviction_candidate(
@@ -2947,8 +2906,8 @@ impl CacheResidencyManager {
             };
             publication.commit(&manifest)?;
             let mut state = self.lock()?;
-            state.counters.report.prompt_cache_saves += 1;
-            state.counters.report.prompt_cache_bytes += logical_bytes;
+            state.telemetry.report.prompt_cache_saves += 1;
+            state.telemetry.report.prompt_cache_bytes += logical_bytes;
             Ok(manifest)
         })();
 
@@ -3183,13 +3142,13 @@ pub(crate) fn open_prompt_cache(
                 return Err(CacheLifecycleError::DuplicateBlock(id).into());
             }
         }
-        state.counters.report.prompt_cache_loads += 1;
-        state.counters.report.prompt_cache_bytes += manifest
+        state.telemetry.report.prompt_cache_loads += 1;
+        state.telemetry.report.prompt_cache_bytes += manifest
             .blocks
             .iter()
             .map(|block| block.logical_bytes)
             .sum::<u64>();
-        state.counters.report.imported_mapped_shards += manifest.blocks.len() as u64;
+        state.telemetry.report.imported_mapped_shards += manifest.blocks.len() as u64;
         update_report_totals(&mut state);
     }
     Ok((manager, manifest))
@@ -3479,7 +3438,7 @@ fn advance_generation_locked(state: &mut CacheManagerState) -> Vec<PendingCacheO
         }
         if let Some(pending) = record.pending_disk().cloned() {
             if pending.ticket.cancel() {
-                state.counters.report.cancellations += 1;
+                state.telemetry.report.cancellations += 1;
             }
             tickets.push(PendingCacheOperation::Disk(pending.ticket.clone()));
             if pending.ticket.key.kind != CacheIoOperationKind::Write {
@@ -3520,7 +3479,7 @@ fn update_report_totals(state: &mut CacheManagerState) {
                 .map(|(_, reservation)| reservation.logical_bytes)
                 .sum(),
         );
-    let report = &mut state.counters.report;
+    let report = &mut state.telemetry.report;
     report.key_value_blocks = 0;
     report.compressed_latent_blocks = 0;
     report.device_blocks = 0;
@@ -3538,9 +3497,6 @@ fn update_report_totals(state: &mut CacheManagerState) {
     report.protected_prefix_blocks = 0;
     report.protected_recent_blocks = 0;
     report.logical_cached_tokens = 0;
-    report.per_layer.clear();
-    report.per_layer_overflow_layers = 0;
-    report.per_layer_overflow = CacheLayerResidencyStats::default();
     let mut per_layer = BTreeMap::<usize, CacheLayerResidencyStats>::new();
     let mut layer_ends: HashMap<usize, i64> = HashMap::new();
     for (layer, tail) in tails {
@@ -3722,51 +3678,13 @@ fn update_report_totals(state: &mut CacheManagerState) {
         per_layer.entry(layer).or_default().protected_recent_blocks = count;
     }
     report.logical_cached_tokens = layer_ends.values().copied().max().unwrap_or(0).max(0) as u64;
-    // Historical counters keep the first observed layer identities stable.
-    // Fill any remaining bounded slots with currently active layers, and fold
-    // both current and historical activity for all other layers into overflow.
-    let mut selected_layers = state.layer_activity.keys().copied().collect::<Vec<_>>();
-    for global_layer in per_layer.keys().copied() {
-        if selected_layers.len() == CACHE_RESIDENCY_LAYER_REPORT_LIMIT {
-            break;
-        }
-        if !state.layer_activity.contains_key(&global_layer) {
-            selected_layers.push(global_layer);
-        }
-    }
-    selected_layers.sort_unstable();
-    for global_layer in selected_layers {
-        let mut stats = per_layer.remove(&global_layer).unwrap_or_default();
-        if let Some(activity) = state.layer_activity.get(&global_layer) {
-            activity.apply_to(&mut stats);
-        }
-        report.per_layer.push(CacheLayerResidencyReport {
-            global_layer,
-            stats,
-        });
-    }
-    for (_, stats) in per_layer {
-        report.per_layer_overflow_layers += 1;
-        report.per_layer_overflow.accumulate(&stats);
-    }
-    state
-        .layer_activity_overflow
-        .apply_to(&mut report.per_layer_overflow);
-    if report.current_device_bytes <= device_budget_bytes {
-        report.peak_device_bytes = report.peak_device_bytes.max(report.current_device_bytes);
-    }
-    if report.current_host_bytes <= host_budget_bytes {
-        report.peak_host_bytes = report.peak_host_bytes.max(report.current_host_bytes);
-    }
-    if disk_budget_bytes.is_none_or(|budget| report.current_disk_bytes <= budget) {
-        report.peak_disk_bytes = report.peak_disk_bytes.max(report.current_disk_bytes);
-    }
-    report.peak_in_flight_write_bytes = report
-        .peak_in_flight_write_bytes
-        .max(report.in_flight_write_bytes);
-    report.peak_in_flight_host_demotion_bytes = report
-        .peak_in_flight_host_demotion_bytes
-        .max(report.in_flight_host_demotion_bytes);
+    state.telemetry.finalize_snapshot(
+        per_layer,
+        device_budget_bytes,
+        host_budget_bytes,
+        disk_budget_bytes,
+    );
+    let report = &state.telemetry.report;
     let pool_usage = CachePoolUsage {
         device_bytes: report.current_device_bytes,
         host_bytes: report.current_host_bytes,
@@ -4335,7 +4253,7 @@ mod tests {
         CacheStoragePhase, CacheTier, DiskLocation, DiskResult, DiskTask, DiskWorker,
         DiskWriteCommit, HostCacheBlock, HostDemotionCompletion, HostDemotionTicket,
         HostWriteReservation, MlxCacheBlockStorage, MlxCacheIoOperation, PagedCacheOptions,
-        StateTensorOwner, StateTensorRole, TemporaryFileGuard, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+        StateTensorOwner, StateTensorRole, TemporaryFileGuard,
     };
     use crate::core::cache::{
         prompt_cache_token_fingerprint, validate_prompt_cache_model_identity, LayerCachePolicy,
@@ -4347,7 +4265,7 @@ mod tests {
     use crate::core::{AttentionPolicy, LayerSchedule};
     use eredu_runtime::{
         CachePoolLimits, CacheResidencyConfigurationError, MutableCacheTail,
-        PromptCachePersistenceError,
+        PromptCachePersistenceError, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
     };
     use safemlx::{
         host_transfer_capacity_upper_bound, transforms::async_eval_with_event, Array, Device,
@@ -5136,7 +5054,7 @@ mod tests {
         )
         .unwrap();
         let state = manager.lock().unwrap();
-        assert_eq!(state.counters.report.imported_mapped_shards, 1);
+        assert_eq!(state.telemetry.report.imported_mapped_shards, 1);
         assert!(state.blocks.values().all(|record| record
             .disk()
             .and_then(|location| location.mapped.as_ref())
@@ -5789,9 +5707,9 @@ mod tests {
         let state = manager.lock().unwrap();
         assert_eq!(state.blocks.get(&older).unwrap().tier(), CacheTier::Disk);
         assert_eq!(state.blocks.get(&recent).unwrap().tier(), CacheTier::Device);
-        assert_eq!(state.counters.report.current_host_bytes, 0);
-        assert_eq!(state.counters.report.current_device_bytes, 16);
-        assert_eq!(state.counters.report.current_disk_bytes, 16);
+        assert_eq!(state.telemetry.report.current_host_bytes, 0);
+        assert_eq!(state.telemetry.report.current_device_bytes, 16);
+        assert_eq!(state.telemetry.report.current_disk_bytes, 16);
     }
 
     #[test]

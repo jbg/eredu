@@ -1,6 +1,6 @@
 //! Backend-neutral mutable-cache residency telemetry.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 /// Maximum number of individually identified layers in a residency report.
 ///
@@ -238,6 +238,139 @@ pub struct CacheResidencyReport {
     pub process_major_page_faults: Option<u64>,
 }
 
+/// Backend-neutral collector for bounded cache activity and snapshot assembly.
+///
+/// Backends update the aggregate report while inspecting their native storage,
+/// then provide exact current per-layer totals to [`Self::finalize_snapshot`].
+/// Historical layer identities and overflow accounting remain runtime-owned.
+#[derive(Debug, Default)]
+pub struct CacheResidencyTelemetry {
+    /// Aggregate current and cumulative report fields.
+    pub report: CacheResidencyReport,
+    layer_activity: BTreeMap<usize, CacheLayerResidencyStats>,
+    layer_activity_overflow: CacheLayerResidencyStats,
+}
+
+impl CacheResidencyTelemetry {
+    /// Creates an empty collector with the effective I/O queue capacity.
+    pub fn new(queue_capacity: usize) -> Self {
+        let mut telemetry = Self::default();
+        telemetry.report.queue_capacity = queue_capacity;
+        telemetry
+    }
+
+    /// Returns cumulative activity storage for one identified layer.
+    ///
+    /// The first bounded set of layer identities remains stable for the life of
+    /// the collector. Later identities are folded into an exact overflow row.
+    pub fn layer_activity_mut(&mut self, global_layer: usize) -> &mut CacheLayerResidencyStats {
+        if self.layer_activity.contains_key(&global_layer)
+            || self.layer_activity.len() < CACHE_RESIDENCY_LAYER_REPORT_LIMIT
+        {
+            self.layer_activity.entry(global_layer).or_default()
+        } else {
+            &mut self.layer_activity_overflow
+        }
+    }
+
+    /// Returns cumulative activity storage for work without a layer identity.
+    pub fn unassigned_activity_mut(&mut self) -> &mut CacheLayerResidencyStats {
+        &mut self.layer_activity_overflow
+    }
+
+    /// Merges exact current per-layer totals with cumulative runtime activity.
+    ///
+    /// Peak aggregate fields advance only when current usage is within the
+    /// configured limit, matching successful-admission semantics.
+    pub fn finalize_snapshot(
+        &mut self,
+        mut current: BTreeMap<usize, CacheLayerResidencyStats>,
+        device_budget_bytes: u64,
+        host_budget_bytes: u64,
+        disk_budget_bytes: Option<u64>,
+    ) {
+        self.report.per_layer.clear();
+        self.report.per_layer_overflow_layers = 0;
+        self.report.per_layer_overflow = CacheLayerResidencyStats::default();
+
+        let mut selected_layers = self.layer_activity.keys().copied().collect::<Vec<_>>();
+        for global_layer in current.keys().copied() {
+            if selected_layers.len() == CACHE_RESIDENCY_LAYER_REPORT_LIMIT {
+                break;
+            }
+            if !self.layer_activity.contains_key(&global_layer) {
+                selected_layers.push(global_layer);
+            }
+        }
+        selected_layers.sort_unstable();
+        for global_layer in selected_layers {
+            let mut stats = current.remove(&global_layer).unwrap_or_default();
+            if let Some(activity) = self.layer_activity.get(&global_layer) {
+                apply_activity(activity, &mut stats);
+            }
+            self.report.per_layer.push(CacheLayerResidencyReport {
+                global_layer,
+                stats,
+            });
+        }
+        for (_, stats) in current {
+            self.report.per_layer_overflow_layers += 1;
+            self.report.per_layer_overflow.accumulate(&stats);
+        }
+        apply_activity(
+            &self.layer_activity_overflow,
+            &mut self.report.per_layer_overflow,
+        );
+
+        if self.report.current_device_bytes <= device_budget_bytes {
+            self.report.peak_device_bytes = self
+                .report
+                .peak_device_bytes
+                .max(self.report.current_device_bytes);
+        }
+        if self.report.current_host_bytes <= host_budget_bytes {
+            self.report.peak_host_bytes = self
+                .report
+                .peak_host_bytes
+                .max(self.report.current_host_bytes);
+        }
+        if disk_budget_bytes.is_none_or(|budget| self.report.current_disk_bytes <= budget) {
+            self.report.peak_disk_bytes = self
+                .report
+                .peak_disk_bytes
+                .max(self.report.current_disk_bytes);
+        }
+        self.report.peak_in_flight_write_bytes = self
+            .report
+            .peak_in_flight_write_bytes
+            .max(self.report.in_flight_write_bytes);
+        self.report.peak_in_flight_host_demotion_bytes = self
+            .report
+            .peak_in_flight_host_demotion_bytes
+            .max(self.report.in_flight_host_demotion_bytes);
+    }
+}
+
+fn apply_activity(activity: &CacheLayerResidencyStats, stats: &mut CacheLayerResidencyStats) {
+    stats.host_promotions += activity.host_promotions;
+    stats.disk_promotions += activity.disk_promotions;
+    stats.host_demotions += activity.host_demotions;
+    stats.disk_demotions += activity.disk_demotions;
+    stats.transfer_bytes += activity.transfer_bytes;
+    stats.transfer_wait += activity.transfer_wait;
+    stats.demand_hits += activity.demand_hits;
+    stats.demand_misses += activity.demand_misses;
+    stats.in_flight_waits += activity.in_flight_waits;
+    stats.failures += activity.failures;
+    stats.prefill_full_attention_blocks += activity.prefill_full_attention_blocks;
+    stats.prefill_full_attention_bytes += activity.prefill_full_attention_bytes;
+    stats.decode_full_attention_blocks += activity.decode_full_attention_blocks;
+    stats.decode_full_attention_bytes += activity.decode_full_attention_bytes;
+    stats.attention_scratch_peak_bytes = stats
+        .attention_scratch_peak_bytes
+        .max(activity.attention_scratch_peak_bytes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +392,41 @@ mod tests {
         assert_eq!(aggregate.current_device_bytes, 9);
         assert_eq!(aggregate.transfer_bytes, 17);
         assert_eq!(aggregate.attention_scratch_peak_bytes, 16);
+    }
+
+    #[test]
+    fn telemetry_keeps_historical_layers_stable_and_folds_current_overflow() {
+        let mut telemetry = CacheResidencyTelemetry::new(3);
+        for layer in 0..CACHE_RESIDENCY_LAYER_REPORT_LIMIT {
+            telemetry.layer_activity_mut(layer).demand_hits = 1;
+        }
+        telemetry.unassigned_activity_mut().failures = 2;
+        telemetry.report.current_device_bytes = 8;
+        telemetry.report.current_host_bytes = 12;
+        telemetry.report.current_disk_bytes = 16;
+        telemetry.finalize_snapshot(
+            BTreeMap::from([(
+                CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+                CacheLayerResidencyStats {
+                    device_blocks: 1,
+                    ..Default::default()
+                },
+            )]),
+            8,
+            12,
+            Some(16),
+        );
+
+        assert_eq!(telemetry.report.queue_capacity, 3);
+        assert_eq!(
+            telemetry.report.per_layer.len(),
+            CACHE_RESIDENCY_LAYER_REPORT_LIMIT
+        );
+        assert_eq!(telemetry.report.per_layer_overflow_layers, 1);
+        assert_eq!(telemetry.report.per_layer_overflow.device_blocks, 1);
+        assert_eq!(telemetry.report.per_layer_overflow.failures, 2);
+        assert_eq!(telemetry.report.peak_device_bytes, 8);
+        assert_eq!(telemetry.report.peak_host_bytes, 12);
+        assert_eq!(telemetry.report.peak_disk_bytes, 16);
     }
 }

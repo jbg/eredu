@@ -166,6 +166,7 @@ fn cache_execution_algorithms_are_runtime_owned() {
         "pub struct CacheLayerResidencyStats",
         "pub struct CacheLayerResidencyReport",
         "pub struct CacheResidencyReport",
+        "pub struct CacheResidencyTelemetry",
     ] {
         assert!(
             telemetry.contains(runtime_owned),
@@ -198,6 +199,7 @@ fn cache_execution_algorithms_are_runtime_owned() {
         "pub struct CacheLayerResidencyStats",
         "pub struct CacheLayerResidencyReport",
         "pub struct CacheResidencyReport",
+        "pub struct CacheResidencyTelemetry",
         "fn inspect_prompt_cache",
         "fn validate_prompt_cache_manifest",
         "fn hash_prompt_cache_shard_payload",
