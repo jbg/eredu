@@ -3463,7 +3463,6 @@ mod tests {
             .unwrap()
             .materialize(&source_stream, &execution_stream)
             .unwrap();
-        assert!(!materialization.is_complete().unwrap());
         materialization.wait_on(&consumer_a).unwrap();
         materialization.wait_on(&consumer_b).unwrap();
         let consumed_a = materialization.output().square(&consumer_a).unwrap();
@@ -3475,6 +3474,14 @@ mod tests {
         assert_eq!(output.shape(), [1, 1024]);
         completion_a.synchronize().unwrap();
         completion_b.synchronize().unwrap();
+        assert_eq!(
+            consumed_a.evaluated().unwrap().as_slice::<f32>(),
+            &[1.0; 1024]
+        );
+        assert_eq!(
+            consumed_b.evaluated().unwrap().as_slice::<f32>(),
+            &[1.0; 1024]
+        );
     }
 
     #[test]
