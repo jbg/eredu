@@ -1,53 +1,37 @@
 //! MLX backend adapter.
 
-/// MLX hardware discovery, planning admission, and plan realization.
-pub mod automatic;
 /// Prompt-cache topology conversion for MLX distributed execution.
 pub(crate) mod cache;
-/// MLX model capability derivation and process resource observation.
-pub mod capability;
-mod config;
+pub(crate) mod config;
 /// Session-owned MLX communicators, transfers, and collectives.
 pub mod distributed;
 /// Errors produced by MLX model loading and execution.
 pub mod error;
-mod family;
-/// MLX artifact admission and structural compatibility inspection.
-pub mod inspection;
-mod loading;
 #[cfg(feature = "mlx-media")]
 mod media;
-mod model;
 /// Reusable MLX neural-network building blocks.
 pub mod nn;
-mod prepared_speculative;
-/// Realtime Moshi/PersonaPlex session execution.
-pub mod realtime;
 /// MLX allocator observations for neutral residency telemetry.
 pub mod residency;
 /// MLX-only tensor, checkpoint, execution, and residency infrastructure.
 pub mod runtime;
-/// MLX stream assignment and exact completion for speculative sessions.
-pub mod speculative;
-/// Exact MLX loader binding against portable checkpoint catalogs.
-pub(crate) mod structural;
 /// MLX process-local device binding for a canonical core rank topology.
 pub mod topology;
-pub(crate) use loading::{gguf_eos_token_ids, validate_gguf_quantization_source};
-/// Architecture-erased model/session execution.
-mod session;
-
-pub use capability::available_memory;
+pub use crate::composition::mlx::automatic;
+pub use crate::composition::mlx::{
+    available_memory, inspect_model, MlxGeneration, MlxInspectionOptions, MlxModelInput,
+    MlxModelOutput, MlxModelSession, MlxSessionCompletion, MlxTextCompletion,
+    MlxTextGenerationState, MlxTextToken, Model, ModelCache,
+};
+pub(crate) use crate::composition::mlx::{
+    gguf_eos_token_ids, resolve_model_config, submit_decode_with_cache, submit_prefill_with_cache,
+    validate_gemma4_drafter, validate_gguf_quantization_source, ModelConfigResolutionError,
+    ResolvedModelConfig,
+};
 pub(crate) use config::ensure_replicated_load_options;
 pub use config::ModelLoadOptions;
 pub(crate) use distributed::MlxDistributedConfig;
 pub use distributed::MlxDistributedSession;
-#[cfg(test)]
-pub(crate) use family::ResolvedModelConfig;
-pub(crate) use family::{resolve_model_config, ModelConfigResolutionError};
-pub use inspection::{inspect_model, MlxInspectionOptions};
-pub(crate) use model::validate_gemma4_drafter;
-pub use model::{Model, ModelCache};
 pub use runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions};
 pub use runtime::distributed::topology::{PlacementPlan, RankPartition};
 pub use runtime::execution::layerwise::{
@@ -56,11 +40,6 @@ pub use runtime::execution::layerwise::{
 };
 pub use runtime::residency::dense_stream::DenseDiskStreamLoadOptions;
 pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
-pub(crate) use session::{submit_decode_with_cache, submit_prefill_with_cache};
-pub use session::{
-    MlxGeneration, MlxModelInput, MlxModelOutput, MlxModelSession, MlxSessionCompletion,
-    MlxTextCompletion, MlxTextGenerationState, MlxTextToken,
-};
 pub use topology::{DeviceAssignment, MlxParallelContext};
 
 use eredu_core::backend::{
@@ -104,7 +83,7 @@ impl MlxModel {
         }
     }
 
-    pub(super) const fn pipeline(model: PipelineModel) -> Self {
+    pub(crate) const fn pipeline(model: PipelineModel) -> Self {
         Self {
             inner: MlxModelKind::Pipeline(model),
             #[cfg(feature = "mlx-media")]
@@ -112,7 +91,7 @@ impl MlxModel {
         }
     }
 
-    pub(super) const fn expert(model: ExpertParallelModel) -> Self {
+    pub(crate) const fn expert(model: ExpertParallelModel) -> Self {
         Self {
             inner: MlxModelKind::Expert(model),
             #[cfg(feature = "mlx-media")]
@@ -222,7 +201,7 @@ impl MlxBackend<'static> {
         }
     }
 
-    pub(super) fn for_execution_plan(
+    pub(crate) fn for_execution_plan(
         stream: &Stream,
         weights_stream: &Stream,
         device_id: String,
@@ -320,7 +299,7 @@ impl<'a> BackendProvider for MlxBackend<'a> {
         &self,
         config: Self::ModelConfig,
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-        loading::materialize_model_plan(
+        crate::composition::mlx::loading::materialize_model_plan(
             config.plan,
             config.options,
             &self.stream,
@@ -399,7 +378,7 @@ impl Drop for MlxCompletion {
 }
 
 impl MlxCompletion {
-    fn submission(output: Array) -> Result<Submission<Array, Self>, Error> {
+    pub(crate) fn submission(output: Array) -> Result<Submission<Array, Self>, Error> {
         let retained = vec![output.clone()];
         let event = async_eval_with_event(retained.iter())?;
         Ok(Submission {

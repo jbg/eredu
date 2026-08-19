@@ -30,7 +30,7 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
     let mut args = model_args_from_gguf_catalog(checkpoint, metadata)?;
     let architecture = args.model_type.clone();
     let gguf_architecture = crate::core::GgufArchitecture::resolve(&architecture)?;
-    crate::backend::mlx::structural::validate_gguf(
+    crate::composition::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
         metadata,

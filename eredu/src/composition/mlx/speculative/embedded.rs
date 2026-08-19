@@ -16,7 +16,7 @@ use safemlx::{
 use crate::{
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::input::ModelInput,
-    backend::mlx::{
+    composition::mlx::{
         speculative::{
             scheduler::MtpComponentTimings, MlxSpeculativeCompletion, MtpExecutionStreams,
         },

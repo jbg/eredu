@@ -39,9 +39,9 @@ pub enum Error {
     #[error(transparent)]
     DenseStream(#[from] crate::backend::mlx::runtime::residency::dense_stream::DenseStreamError),
 
-    /// Invalid unified Llama model configuration or cache usage.
-    #[error(transparent)]
-    LlamaModel(#[from] crate::composition::llama::LlamaModelError),
+    /// Invalid composed architecture configuration or state usage.
+    #[error("architecture model error: {0}")]
+    ArchitectureModel(String),
 
     /// Invalid or failed layerwise model execution.
     #[error(transparent)]

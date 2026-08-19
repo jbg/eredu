@@ -4101,7 +4101,7 @@ pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
     } else {
         crate::core::GgufArchitecture::NemotronH
     };
-    crate::backend::mlx::structural::validate_gguf(
+    crate::composition::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
         metadata,

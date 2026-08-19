@@ -856,7 +856,7 @@ pub(crate) fn prepare_qwen3_vl_gguf_checkpoint(
             )))
         }
     };
-    crate::backend::mlx::structural::validate_qwen3_vl_projector_gguf(
+    crate::composition::mlx::structural::validate_qwen3_vl_projector_gguf(
         checkpoint,
         metadata,
         vision_checkpoint,

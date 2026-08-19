@@ -15,7 +15,7 @@ use serde::Deserialize;
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
+    composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
     composition::mlx_architectures::moshi::model as moshi,
     core::realtime::{RealtimeError, RealtimeScheduler},
     RealtimeModel, RequestId, WorkId,

@@ -15,7 +15,6 @@ use safemlx::{
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::realtime::MlxRealtimeOutput,
     backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::artifact::LoadedArtifactIdentity,
     backend::mlx::runtime::checkpoint::binding::{
@@ -32,6 +31,7 @@ use crate::{
     },
     backend::mlx::runtime::generation::sampler::Sampler,
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
+    composition::mlx::realtime::MlxRealtimeOutput,
     composition::mlx_architectures::moshi::model::{
         self as resident, DepFormerSlice, MoshiLayerwiseStatic, MoshiTransformerLayer,
     },

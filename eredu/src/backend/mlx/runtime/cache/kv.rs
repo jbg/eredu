@@ -3924,8 +3924,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("prompt-cache");
         let descriptor = PromptCacheDescriptor {
-            model_family: "llama".into(),
-            effective_model_type: "llama".into(),
+            model_family: "decoder".into(),
+            effective_model_type: "decoder".into(),
             checkpoint_fingerprint: "sha256:test-checkpoint".into(),
             prefix_content_fingerprint: "tokens:11,12,13,14,15".into(),
             architecture_fingerprint: "sha256:test-architecture".into(),

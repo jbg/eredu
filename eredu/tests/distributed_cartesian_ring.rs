@@ -8,8 +8,8 @@ use std::{
 };
 
 use eredu::{
-    backend::mlx::architectures::distributed::expert::{AllToAllVPlan, RoutedTransport},
     backend::mlx::{DeviceAssignment, MlxBackend, MlxParallelContext},
+    composition::mlx_architectures::distributed::expert::{AllToAllVPlan, RoutedTransport},
     core::{CollectiveScope, DistributedSession},
 };
 use safemlx::{

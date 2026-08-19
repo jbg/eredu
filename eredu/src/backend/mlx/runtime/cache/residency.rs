@@ -5566,8 +5566,8 @@ mod tests {
 
     fn prompt_descriptor() -> PromptCacheDescriptor {
         PromptCacheDescriptor {
-            model_family: "llama".into(),
-            effective_model_type: "llama".into(),
+            model_family: "decoder".into(),
+            effective_model_type: "decoder".into(),
             checkpoint_fingerprint: "checkpoint".into(),
             prefix_content_fingerprint: "text:prefix".into(),
             architecture_fingerprint: "architecture".into(),
@@ -6307,8 +6307,8 @@ mod tests {
         descriptor.layer_count = 2;
         descriptor.global_layer_end = 2;
         let loaded_model = PromptCacheModelIdentity {
-            model_family: "llama".into(),
-            effective_model_type: "llama".into(),
+            model_family: "decoder".into(),
+            effective_model_type: "decoder".into(),
             architecture_fingerprint: descriptor.architecture_fingerprint.clone(),
             layer_count: 1,
             global_layer_start: 0,
@@ -6448,13 +6448,13 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let mut llama = MlxKeyValueState::paged(layout, manager.clone(), None).unwrap();
-        assert!(llama.clear().is_err());
+        let mut state = MlxKeyValueState::paged(layout, manager.clone(), None).unwrap();
+        assert!(state.clear().is_err());
         assert_eq!(manager.lock().unwrap().blocks.len(), 1);
 
         let manager = manager_with_leased_block();
         let mut pipeline = PipelineCache::new(
-            crate::core::ModelKind::Llama,
+            crate::core::ModelKind::Qwen2,
             vec![PipelineLayerCache::KeyValue {
                 global_layer: 0,
                 cache: PipelineKeyValueCache::Paged(

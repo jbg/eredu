@@ -32,7 +32,7 @@ use std::{
 };
 use tokenizers::Tokenizer;
 
-use crate::backend::mlx::structural::GgufArchitectureValidation;
+use crate::composition::mlx::structural::GgufArchitectureValidation;
 use crate::core::cache::{
     derive_prompt_cache_architecture_fingerprint, PromptCacheDescriptor, PromptCacheManifest,
     PromptCacheModelIdentity, PromptCacheOptions,
@@ -5538,7 +5538,7 @@ fn qwen35_gguf_multimodal_geometry(
             "Qwen3-Next GGUF does not define multimodal projector semantics".into(),
         ));
     }
-    crate::backend::mlx::structural::validate_qwen35_projector_gguf(
+    crate::composition::mlx::structural::validate_qwen35_projector_gguf(
         checkpoint,
         metadata,
         &mmproj.checkpoint,

@@ -20,7 +20,7 @@ use crate::backend::mlx::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCach
 use crate::backend::mlx::runtime::execution::inspection::ActivationObserver;
 use crate::backend::mlx::runtime::generation::sampler::SpeculativeSampler;
 use crate::backend::mlx::runtime::media::input;
-use crate::backend::mlx::speculative::{MlxDrafter, MtpExecutionStreams};
+use crate::composition::mlx::speculative::{MlxDrafter, MtpExecutionStreams};
 use crate::composition::mlx_architectures::{
     deepseek_v3::model as deepseek_v3,
     deepseek_v4::model as deepseek_v4,
@@ -174,7 +174,7 @@ impl Model {
                     crate::composition::mlx_architectures::gemma4::mtp::Gemma4MtpExecutor::new(
                         target, assistant,
                     );
-                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                crate::composition::mlx::speculative::scheduler::generate_semantic(
                     &mut executor,
                     cache,
                     input,
@@ -194,7 +194,7 @@ impl Model {
                     crate::composition::mlx_architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
                         target, assistant,
                     );
-                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                crate::composition::mlx::speculative::scheduler::generate_semantic(
                     &mut backend,
                     cache,
                     input,
@@ -257,7 +257,7 @@ impl Model {
             })
             .map_err(|error| Exception::custom(error.to_string()))?;
         let mut synchronized =
-            crate::backend::mlx::speculative::embedded::DistributedEmbeddedMtpSampler::new(
+            crate::composition::mlx::speculative::embedded::DistributedEmbeddedMtpSampler::new(
                 sampler.clone(),
                 sampling_rank,
                 execution.world(),
@@ -271,10 +271,10 @@ impl Model {
                         tensor_group,
                     );
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         &mut target,
                     );
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                crate::composition::mlx::speculative::scheduler::generate_tokens(
                     &mut executor,
                     cache,
                     input,
@@ -293,10 +293,10 @@ impl Model {
                         tensor_group,
                     );
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         &mut target,
                     );
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                crate::composition::mlx::speculative::scheduler::generate_tokens(
                     &mut executor,
                     cache,
                     input,
@@ -315,10 +315,10 @@ impl Model {
                         tensor_group,
                     );
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         &mut target,
                     );
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                crate::composition::mlx::speculative::scheduler::generate_tokens(
                     &mut executor,
                     cache,
                     input,
@@ -338,10 +338,10 @@ impl Model {
                         tensor_group,
                     );
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         &mut target,
                     );
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                crate::composition::mlx::speculative::scheduler::generate_tokens(
                     &mut executor,
                     cache,
                     input,
@@ -403,8 +403,10 @@ impl Model {
         match (self, cache) {
             (Self::DeepSeekV3(target), ModelCache::DeepSeekV3(cache)) => {
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
+                crate::composition::mlx::speculative::scheduler::generate_tokens(
                     &mut executor,
                     cache,
                     input,
@@ -418,10 +420,10 @@ impl Model {
             }
             (Self::DeepSeekV4(target), ModelCache::DeepSeekV4(cache)) => {
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target.as_mut(),
                     );
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                crate::composition::mlx::speculative::scheduler::generate_tokens(
                     &mut executor,
                     cache,
                     input,
@@ -435,10 +437,10 @@ impl Model {
             }
             (Self::DeepSeekV4Layerwise(target), ModelCache::DeepSeekV4(cache)) => {
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target.as_mut(),
                     );
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                crate::composition::mlx::speculative::scheduler::generate_tokens(
                     &mut executor,
                     cache,
                     input,
@@ -452,8 +454,10 @@ impl Model {
             }
             (Self::Inkling(target), ModelCache::Inkling(cache)) => {
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
+                crate::composition::mlx::speculative::scheduler::generate_tokens(
                     &mut executor,
                     cache,
                     input,
@@ -467,8 +471,10 @@ impl Model {
             }
             (Self::NemotronH(target), ModelCache::NemotronH(cache)) => {
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
+                crate::composition::mlx::speculative::scheduler::generate_tokens(
                     &mut executor,
                     cache,
                     input,
@@ -483,8 +489,10 @@ impl Model {
             (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35(target), ModelCache::Qwen35(cache)) => {
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
-                crate::backend::mlx::speculative::scheduler::generate_tokens(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
+                crate::composition::mlx::speculative::scheduler::generate_tokens(
                     &mut executor,
                     cache,
                     input,
@@ -525,8 +533,10 @@ impl Model {
         match (self, cache) {
             (Self::DeepSeekV3(target), ModelCache::DeepSeekV3(cache)) => {
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
-                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
+                crate::composition::mlx::speculative::scheduler::generate_semantic(
                     &mut executor,
                     cache,
                     input,
@@ -542,10 +552,10 @@ impl Model {
             }
             (Self::DeepSeekV4(target), ModelCache::DeepSeekV4(cache)) => {
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target.as_mut(),
                     );
-                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                crate::composition::mlx::speculative::scheduler::generate_semantic(
                     &mut executor,
                     cache,
                     input,
@@ -561,10 +571,10 @@ impl Model {
             }
             (Self::DeepSeekV4Layerwise(target), ModelCache::DeepSeekV4(cache)) => {
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target.as_mut(),
                     );
-                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                crate::composition::mlx::speculative::scheduler::generate_semantic(
                     &mut executor,
                     cache,
                     input,
@@ -580,8 +590,10 @@ impl Model {
             }
             (Self::Inkling(target), ModelCache::Inkling(cache)) => {
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
-                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
+                crate::composition::mlx::speculative::scheduler::generate_semantic(
                     &mut executor,
                     cache,
                     input,
@@ -597,8 +609,10 @@ impl Model {
             }
             (Self::NemotronH(target), ModelCache::NemotronH(cache)) => {
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
-                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
+                crate::composition::mlx::speculative::scheduler::generate_semantic(
                     &mut executor,
                     cache,
                     input,
@@ -615,8 +629,10 @@ impl Model {
             (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35(target), ModelCache::Qwen35(cache)) => {
                 let mut executor =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
-                crate::backend::mlx::speculative::scheduler::generate_semantic(
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
+                crate::composition::mlx::speculative::scheduler::generate_semantic(
                     &mut executor,
                     cache,
                     input,

@@ -53,10 +53,10 @@ use crate::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
         ExpertCatalogEntry, ExpertPass, ExpertRouteBatch,
     },
-    backend::mlx::speculative::embedded::{
+    backend::mlx::{MlxParallelContext, ModelLoadOptions},
+    composition::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
-    backend::mlx::{MlxParallelContext, ModelLoadOptions},
     composition::mlx_architectures::distributed::pipeline::{assign_module, load_deepseek_experts},
     composition::mlx_architectures::{
         deepseek_v3::model as deepseek_v3,
@@ -2313,15 +2313,17 @@ impl ExpertParallelModel {
                 group: expert_group,
             };
             let mut executor =
-                crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
-            let result = crate::backend::mlx::speculative::scheduler::generate_tokens(
+                crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                    &mut target,
+                );
+            let result = crate::composition::mlx::speculative::scheduler::generate_tokens(
                 &mut executor,
                 cache,
                 input,
                 config,
                 prng_key,
                 &mut synchronized,
-                crate::backend::mlx::speculative::MtpExecutionStreams::single(stream),
+                crate::composition::mlx::speculative::MtpExecutionStreams::single(stream),
                 crate::core::generation::MtpSchedulerOptions::default(),
                 |_| Ok(()),
             );
@@ -2334,15 +2336,15 @@ impl ExpertParallelModel {
             expert_group,
         };
         let mut executor =
-            crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
-        let result = crate::backend::mlx::speculative::scheduler::generate_tokens(
+            crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
+        let result = crate::composition::mlx::speculative::scheduler::generate_tokens(
             &mut executor,
             cache,
             input,
             config,
             prng_key,
             &mut synchronized,
-            crate::backend::mlx::speculative::MtpExecutionStreams::single(stream),
+            crate::composition::mlx::speculative::MtpExecutionStreams::single(stream),
             crate::core::generation::MtpSchedulerOptions::default(),
             |_| Ok(()),
         );
@@ -3365,7 +3367,7 @@ fn load_gguf_ep(
         structural_options.parallel = None;
         structural_options.weight_residency =
             crate::backend::mlx::runtime::execution::layerwise::WeightResidency::fully_resident();
-        crate::backend::mlx::structural::validate_gguf(
+        crate::composition::mlx::structural::validate_gguf(
             crate::core::GgufArchitecture::DeepSeek4,
             checkpoint,
             &metadata,

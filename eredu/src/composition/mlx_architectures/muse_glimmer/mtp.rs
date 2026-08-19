@@ -16,7 +16,7 @@ use safemlx::{
 
 use crate::{
     backend::mlx::runtime::cache::KeyValueCache,
-    backend::mlx::{
+    composition::mlx::{
         speculative::{
             scheduler::{MtpComponentTimingEvaluations, MtpComponentTimings},
             MlxSpeculativeCompletion, MtpExecutionStreams,

@@ -1327,3 +1327,9 @@ pub enum LlamaModelError {
         count: i32,
     },
 }
+
+impl From<LlamaModelError> for crate::backend::mlx::error::Error {
+    fn from(error: LlamaModelError) -> Self {
+        Self::ArchitectureModel(error.to_string())
+    }
+}

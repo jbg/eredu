@@ -22,7 +22,7 @@ use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event, Stre
 use crate::{
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::input::{InputPayload, Modality, ModelInput},
-    backend::mlx::{
+    composition::mlx::{
         speculative::{MlxSpeculativeCompletion, MlxSpeculativeSampling, MtpExecutionStreams},
         MlxModelInput,
     },

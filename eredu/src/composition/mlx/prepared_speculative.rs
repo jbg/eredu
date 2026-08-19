@@ -10,12 +10,14 @@ use eredu_core::{
 use safemlx::{error::Exception, Array};
 
 use super::{
-    error::Error,
-    runtime::generation::sampler::{ConstrainedSampler, GenerationSampler},
     speculative::{
         scheduler::MlxMtpScheduler, MlxDrafter, MlxDrafterKind, MlxMtpCache, MtpExecutionStreams,
     },
     validate_gemma4_drafter, MlxBackend, MlxModelInput, Model, ModelCache,
+};
+use crate::backend::mlx::{
+    error::Error,
+    runtime::generation::sampler::{ConstrainedSampler, GenerationSampler},
 };
 use crate::composition::mlx_architectures::{
     deepseek_v3::model as deepseek_v3, gemma4::model as gemma4, inkling::model as inkling,
@@ -124,7 +126,7 @@ fn run_speculative_batch<'a, B, C>(
     options: MtpSchedulerOptions,
 ) -> Result<SpeculativeGenerationBatchOutput, Exception>
 where
-    B: crate::backend::mlx::speculative::scheduler::MlxSpeculativeRuntime<'a>,
+    B: crate::composition::mlx::speculative::scheduler::MlxSpeculativeRuntime<'a>,
     C: SpeculativeTokenFilterController + 'a,
 {
     let mut scheduler = MlxMtpScheduler::new(backend, streams, options)?;
@@ -408,7 +410,9 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         match self.model_and_cache().0 {
             Model::DeepSeekV3(target) => {
                 let mut backend =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
@@ -421,7 +425,9 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             }
             Model::Inkling(target) => {
                 let mut backend =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
@@ -434,7 +440,9 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             }
             Model::NemotronH(target) => {
                 let mut backend =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
@@ -447,7 +455,9 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             }
             Model::Qwen3Next(target) => {
                 let mut backend =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
@@ -460,7 +470,9 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             }
             Model::Qwen35(target) => {
                 let mut backend =
-                    crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(target);
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,

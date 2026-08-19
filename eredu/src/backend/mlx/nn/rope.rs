@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use eredu_nn::RopeValue;
+use eredu_nn::{RopeValue, FREQUENCY_SCALED_ROPE_TYPE};
 use safemlx::macros::ModuleParameters;
 use safemlx::{
     builder::Builder,
@@ -78,7 +78,8 @@ pub(crate) fn validate_rope_scaling_config(
         ));
     };
     match rope_type.as_str() {
-        "default" | "linear" | "llama3" | "proportional" | "yarn" => Ok(()),
+        "default" | "linear" | "proportional" | "yarn" => Ok(()),
+        FREQUENCY_SCALED_ROPE_TYPE => Ok(()),
         "longrope" => Err(Error::UnsupportedArchitecture(
             "RoPE scaling type \"longrope\" is unsupported; LongRoPE is not implemented".into(),
         )),
@@ -88,13 +89,13 @@ pub(crate) fn validate_rope_scaling_config(
     }
 }
 
-/// Llama3-style RoPE with frequency scaling.
+/// Piecewise wavelength-based RoPE frequency scaling.
 ///
 /// Applies piecewise frequency scaling based on wavelength cutoffs derived from
 /// `low_freq_factor`, `high_freq_factor`, `factor`, and `original_max_position_embeddings`.
 // TODO: support derive ModuleParameters for structs with non-param Array fields
 #[derive(Debug, Clone, ModuleParameters)]
-pub struct Llama3Rope {
+pub struct FrequencyScaledRope {
     /// Number of rotary dimensions.
     pub dimensions: i32,
     /// Whether to use traditional pair ordering.
@@ -105,8 +106,8 @@ pub struct Llama3Rope {
     pub freqs: Array,
 }
 
-impl Llama3Rope {
-    /// Builds a Llama 3 RoPE module with frequency scaling.
+impl FrequencyScaledRope {
+    /// Builds a piecewise frequency-scaled RoPE module.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dims: i32,
@@ -182,7 +183,7 @@ impl Llama3Rope {
     }
 }
 
-impl<'a, Input> Module<Input> for Llama3Rope
+impl<'a, Input> Module<Input> for FrequencyScaledRope
 where
     Input: Into<nn::RopeInput<'a>>,
 {
@@ -437,13 +438,13 @@ where
 }
 
 /// Enum wrapping different RoPE variants so that `initialize_rope` can return
-/// either a standard RoPE or a Llama3 RoPE.
+/// either a standard RoPE or a piecewise frequency-scaled RoPE.
 #[derive(Debug, Clone)]
 pub enum RopeVariant {
     /// Standard MLX RoPE.
     Default(nn::Rope),
-    /// Llama 3 scaled RoPE.
-    Llama3(Llama3Rope),
+    /// Piecewise wavelength-scaled RoPE.
+    FrequencyScaled(FrequencyScaledRope),
     /// Proportional RoPE used by Gemma 4.
     Proportional(ProportionalRope),
     /// YaRN scaled RoPE.
@@ -455,7 +456,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
     fn num_parameters(&self) -> usize {
         match self {
             RopeVariant::Default(rope) => rope.num_parameters(),
-            RopeVariant::Llama3(rope) => rope.num_parameters(),
+            RopeVariant::FrequencyScaled(rope) => rope.num_parameters(),
             RopeVariant::Proportional(rope) => rope.num_parameters(),
             RopeVariant::Yarn(rope) => rope.num_parameters(),
         }
@@ -464,7 +465,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
     fn freeze_parameters(&mut self, _recursive: bool) {
         match self {
             RopeVariant::Default(rope) => rope.freeze_parameters(_recursive),
-            RopeVariant::Llama3(rope) => rope.freeze_parameters(_recursive),
+            RopeVariant::FrequencyScaled(rope) => rope.freeze_parameters(_recursive),
             RopeVariant::Proportional(rope) => rope.freeze_parameters(_recursive),
             RopeVariant::Yarn(rope) => rope.freeze_parameters(_recursive),
         }
@@ -473,7 +474,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
     fn unfreeze_parameters(&mut self, _recursive: bool) {
         match self {
             RopeVariant::Default(rope) => rope.unfreeze_parameters(_recursive),
-            RopeVariant::Llama3(rope) => rope.unfreeze_parameters(_recursive),
+            RopeVariant::FrequencyScaled(rope) => rope.unfreeze_parameters(_recursive),
             RopeVariant::Proportional(rope) => rope.unfreeze_parameters(_recursive),
             RopeVariant::Yarn(rope) => rope.unfreeze_parameters(_recursive),
         }
@@ -482,7 +483,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
     fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
         match self {
             RopeVariant::Default(rope) => rope.parameters(),
-            RopeVariant::Llama3(rope) => rope.parameters(),
+            RopeVariant::FrequencyScaled(rope) => rope.parameters(),
             RopeVariant::Proportional(rope) => rope.parameters(),
             RopeVariant::Yarn(rope) => rope.parameters(),
         }
@@ -491,7 +492,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
     fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
         match self {
             RopeVariant::Default(rope) => rope.parameters_mut(),
-            RopeVariant::Llama3(rope) => rope.parameters_mut(),
+            RopeVariant::FrequencyScaled(rope) => rope.parameters_mut(),
             RopeVariant::Proportional(rope) => rope.parameters_mut(),
             RopeVariant::Yarn(rope) => rope.parameters_mut(),
         }
@@ -500,7 +501,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
     fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
         match self {
             RopeVariant::Default(rope) => rope.trainable_parameters(),
-            RopeVariant::Llama3(rope) => rope.trainable_parameters(),
+            RopeVariant::FrequencyScaled(rope) => rope.trainable_parameters(),
             RopeVariant::Proportional(rope) => rope.trainable_parameters(),
             RopeVariant::Yarn(rope) => rope.trainable_parameters(),
         }
@@ -509,7 +510,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
     fn all_frozen(&self) -> Option<bool> {
         match self {
             RopeVariant::Default(rope) => rope.all_frozen(),
-            RopeVariant::Llama3(rope) => rope.all_frozen(),
+            RopeVariant::FrequencyScaled(rope) => rope.all_frozen(),
             RopeVariant::Proportional(rope) => rope.all_frozen(),
             RopeVariant::Yarn(rope) => rope.all_frozen(),
         }
@@ -518,7 +519,7 @@ impl safemlx::module::ModuleParameters for RopeVariant {
     fn any_frozen(&self) -> Option<bool> {
         match self {
             RopeVariant::Default(rope) => rope.any_frozen(),
-            RopeVariant::Llama3(rope) => rope.any_frozen(),
+            RopeVariant::FrequencyScaled(rope) => rope.any_frozen(),
             RopeVariant::Proportional(rope) => rope.any_frozen(),
             RopeVariant::Yarn(rope) => rope.any_frozen(),
         }
@@ -535,7 +536,7 @@ where
     fn forward(&mut self, input: Input, stream: &Stream) -> Result<Self::Output, Self::Error> {
         match self {
             RopeVariant::Default(rope) => rope.forward(input, stream),
-            RopeVariant::Llama3(rope) => rope.forward(input, stream),
+            RopeVariant::FrequencyScaled(rope) => rope.forward(input, stream),
             RopeVariant::Proportional(rope) => rope.forward(input, stream),
             RopeVariant::Yarn(rope) => rope.forward(input, stream),
         }
@@ -546,8 +547,8 @@ where
             RopeVariant::Default(rope) => {
                 <nn::Rope as Module<nn::RopeInput>>::training_mode(rope, mode)
             }
-            RopeVariant::Llama3(rope) => {
-                <Llama3Rope as Module<nn::RopeInput>>::training_mode(rope, mode)
+            RopeVariant::FrequencyScaled(rope) => {
+                <FrequencyScaledRope as Module<nn::RopeInput>>::training_mode(rope, mode)
             }
             RopeVariant::Proportional(rope) => {
                 <ProportionalRope as Module<nn::RopeInput>>::training_mode(rope, mode)
@@ -595,10 +596,10 @@ pub fn initialize_rope(
             .build()
             .expect("Infallible");
         return Ok(RopeVariant::Default(rope));
-    } else if rope_type == FloatOrStr::Str("llama3") {
+    } else if rope_type == FloatOrStr::Str(FREQUENCY_SCALED_ROPE_TYPE) {
         let config = scaling_config
             .as_ref()
-            .ok_or_else(|| Exception::custom("scaling_config is required for llama3 RoPE"))?;
+            .ok_or_else(|| Exception::custom("scaling_config is required for scaled RoPE"))?;
 
         let factor = get_numeric_from_config(config, "factor")?;
         let low_freq_factor = get_numeric_from_config(config, "low_freq_factor")?;
@@ -606,7 +607,7 @@ pub fn initialize_rope(
         let original_max_position_embeddings =
             get_numeric_from_config(config, "original_max_position_embeddings")? as i32;
 
-        let rope = Llama3Rope::new(
+        let rope = FrequencyScaledRope::new(
             dims,
             traditional,
             original_max_position_embeddings,
@@ -616,7 +617,7 @@ pub fn initialize_rope(
             high_freq_factor,
             stream,
         )?;
-        return Ok(RopeVariant::Llama3(rope));
+        return Ok(RopeVariant::FrequencyScaled(rope));
     } else if rope_type == FloatOrStr::Str("proportional") {
         let config = scaling_config
             .as_ref()

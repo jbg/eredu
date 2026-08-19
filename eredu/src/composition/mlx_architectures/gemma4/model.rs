@@ -4395,7 +4395,7 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
     let options = quantization
         .map(crate::backend::mlx::ModelLoadOptions::with_quantization)
         .unwrap_or_default();
-    crate::backend::mlx::structural::validate_gguf(
+    crate::composition::mlx::structural::validate_gguf(
         crate::core::GgufArchitecture::Gemma4,
         checkpoint,
         metadata,
@@ -4439,7 +4439,7 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
 
     let (vision_config, image_token_id, video_token_id, audio_config, audio_token_id) =
         if let Some(projector) = projector {
-            crate::backend::mlx::structural::validate_gemma4_mmproj_gguf(
+            crate::composition::mlx::structural::validate_gemma4_mmproj_gguf(
                 checkpoint, metadata, projector,
             )
             .into_loader_result()?;

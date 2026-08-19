@@ -289,6 +289,9 @@ pub enum RopeValue {
     Bool(bool),
 }
 
+/// Canonical metadata tag for piecewise wavelength-based rotary scaling.
+pub const FREQUENCY_SCALED_ROPE_TYPE: &str = "llama3";
+
 /// Complete backend-neutral rotary-position construction specification.
 #[derive(Debug, Clone, Copy)]
 pub struct RotarySpec<'a> {

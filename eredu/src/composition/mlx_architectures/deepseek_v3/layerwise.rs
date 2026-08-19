@@ -91,7 +91,7 @@ struct DeepSeekMtpLayer {
     #[param]
     shared_norm: nn::RmsNorm,
     #[param]
-    shared_head: crate::backend::mlx::speculative::embedded::EmbeddedMtpVocabHead,
+    shared_head: crate::composition::mlx::speculative::embedded::EmbeddedMtpVocabHead,
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -146,7 +146,7 @@ impl DeepSeekMtpModule {
                         stream,
                     )?,
                     shared_head:
-                        crate::backend::mlx::speculative::embedded::EmbeddedMtpVocabHead::new(
+                        crate::composition::mlx::speculative::embedded::EmbeddedMtpVocabHead::new(
                             args.hidden_size,
                             args.vocab_size as usize,
                             args.weight_quantization_for(&format!(
@@ -179,7 +179,7 @@ impl DeepSeekMtpModule {
             &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
         >,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let layer_count = self.layers.len();
         let cache_count = cache.len();
         let layer = self
@@ -257,7 +257,7 @@ impl DeepSeekMtpModule {
         let normalized = layer.shared_norm.forward(&hidden, stream)?;
         let logits = layer.shared_head.forward(&normalized, execution, stream)?;
         Ok(
-            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
+            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden,
                 tokens: tokens.clone(),
@@ -339,7 +339,7 @@ impl DeepSeekV3LayerwiseModel {
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let (logits, context) = self
             .execution
             .forward_with_context_hook(tokens, cache, stream, |_, _, _| Ok(()))
@@ -348,7 +348,7 @@ impl DeepSeekV3LayerwiseModel {
             Exception::custom("DeepSeek layerwise pass did not retain MTP hidden state")
         })?;
         Ok(
-            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
+            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden,
                 tokens: tokens.clone(),
@@ -363,7 +363,7 @@ impl DeepSeekV3LayerwiseModel {
         depth: usize,
         cache: &mut [crate::backend::mlx::runtime::cache::CompressedLatentCache],
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let adapter = self.execution.adapter_mut();
         let embeddings = adapter.embedding.forward(tokens, stream)?;
         let expert_cache = adapter.expert_cache.as_ref();
@@ -392,7 +392,7 @@ impl DeepSeekV3LayerwiseModel {
         cache: &mut Cache,
         group: &safemlx::distributed::Group,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let (logits, context) = self
             .execution
             .forward_tensor_parallel_with_context(tokens, cache, group, stream)
@@ -401,7 +401,7 @@ impl DeepSeekV3LayerwiseModel {
             Exception::custom("DeepSeek tensor pass did not retain MTP hidden state")
         })?;
         Ok(
-            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
+            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden,
                 tokens: tokens.clone(),
@@ -417,7 +417,7 @@ impl DeepSeekV3LayerwiseModel {
         cache: &mut [crate::backend::mlx::runtime::cache::CompressedLatentCache],
         group: &safemlx::distributed::Group,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let topology = self
             .parallel_info()
             .ok_or_else(|| Exception::custom("DeepSeek MTP target has no parallel topology"))?
@@ -675,7 +675,7 @@ impl DeepSeekV3LayerwiseModel {
         tensor_group: Option<&safemlx::distributed::Group>,
         mut execute: F,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
@@ -721,7 +721,7 @@ impl DeepSeekV3LayerwiseModel {
         }
         .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(
-            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
+            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits,
                 hidden: context.draft_hidden.ok_or_else(|| {
                     Exception::custom("DeepSeek EP pass did not retain MTP hidden state")
@@ -741,7 +741,7 @@ impl DeepSeekV3LayerwiseModel {
         tensor_group: Option<&safemlx::distributed::Group>,
         mut execute: F,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
@@ -821,7 +821,9 @@ impl CausalModel<Cache> for DeepSeekV3LayerwiseModel {
     }
 }
 
-impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for DeepSeekV3LayerwiseModel {
+impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
+    for DeepSeekV3LayerwiseModel
+{
     type Cache = Cache;
     type DraftCache = Vec<crate::backend::mlx::runtime::cache::CompressedLatentCache>;
 
@@ -830,7 +832,7 @@ impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for DeepSeekV
         input: input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let tokens = input::text_token_ids(input, stream)?;
         cache.reset()?;
         self.forward_mtp_target(&tokens, cache, stream)
@@ -841,13 +843,13 @@ impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for DeepSeekV
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         self.forward_mtp_target(tokens, cache, stream)
     }
 
     fn prefill_draft_cache(
         &mut self,
-        output: &crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput,
+        output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
@@ -914,7 +916,9 @@ impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for DeepSeekV
     }
 }
 
-impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for DeepSeekTensorMtpTarget<'_> {
+impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
+    for DeepSeekTensorMtpTarget<'_>
+{
     type Cache = Cache;
     type DraftCache = Vec<crate::backend::mlx::runtime::cache::CompressedLatentCache>;
 
@@ -923,7 +927,7 @@ impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for DeepSeekT
         input: input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         let tokens = input::text_token_ids(input, stream)?;
         cache.reset()?;
         self.model
@@ -935,14 +939,14 @@ impl crate::backend::mlx::speculative::embedded::EmbeddedMtpTarget for DeepSeekT
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         self.model
             .forward_mtp_target_tensor(tokens, cache, self.group, stream)
     }
 
     fn prefill_draft_cache(
         &mut self,
-        output: &crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput,
+        output: &crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput,
         tokens: &Array,
         cache: &mut Cache,
         stream: &Stream,
@@ -1112,7 +1116,7 @@ pub(crate) fn load_deepseek_v3_gguf_tensor_parallel_model(
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV3LayerwiseModel, Vec<u32>), Error> {
     let residency = options.weight_residency();
-    crate::backend::mlx::structural::validate_gguf(
+    crate::composition::mlx::structural::validate_gguf(
         crate::core::GgufArchitecture::DeepSeek2,
         checkpoint,
         metadata,
@@ -1151,7 +1155,7 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV3LayerwiseModel, Vec<u32>), Error> {
-    crate::backend::mlx::structural::validate_gguf(
+    crate::composition::mlx::structural::validate_gguf(
         crate::core::GgufArchitecture::DeepSeek2,
         checkpoint,
         metadata,
@@ -1437,7 +1441,7 @@ impl DeepSeekV3LayerwiseAdapter {
         >,
         external_expert: Option<&mut F>,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {

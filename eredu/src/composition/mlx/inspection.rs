@@ -6,8 +6,8 @@ use std::{
 };
 
 #[cfg(test)]
-use crate::backend::mlx::resolve_model_config;
-use crate::backend::mlx::structural::{self, GgufArchitectureValidation};
+use crate::composition::mlx::resolve_model_config;
+use crate::composition::mlx::structural::{self, GgufArchitectureValidation};
 use eredu_checkpoint::store::WeightStore;
 use eredu_core::{
     ArtifactFormat, ArtifactModality, ArtifactTensorEncoding, GgufArchitecture, InspectionIssue,
@@ -110,7 +110,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
     };
 
     if let Some(config) = &config {
-        match crate::backend::mlx::resolve_model_config(config) {
+        match crate::composition::mlx::resolve_model_config(config) {
             Ok(supported) => {
                 resolved_kind = Some(supported.kind);
                 report.model_kind = Some(supported.kind);
@@ -128,7 +128,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
             }
             Err(error) => {
                 report.architecture_support = match &error {
-                    crate::backend::mlx::ModelConfigResolutionError::Loader(
+                    crate::composition::mlx::ModelConfigResolutionError::Loader(
                         Error::UnsupportedModelType(_),
                     ) => InspectionReadiness::Unsupported,
                     _ => InspectionReadiness::Invalid,
@@ -138,7 +138,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
                 report.requested_load = report.model_loadability;
                 report.issue(
                     match &error {
-                        crate::backend::mlx::ModelConfigResolutionError::Loader(
+                        crate::composition::mlx::ModelConfigResolutionError::Loader(
                             Error::UnsupportedModelType(_),
                         ) => InspectionIssueCode::UnsupportedArchitecture,
                         _ => InspectionIssueCode::InvalidConfiguration,

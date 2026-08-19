@@ -2880,7 +2880,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     is_moe: bool,
 ) -> Result<(DecoderConfig, Vec<u32>), Error> {
     let gguf_architecture = crate::core::GgufArchitecture::resolve(architecture)?;
-    crate::backend::mlx::structural::validate_gguf(
+    crate::composition::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
         metadata,

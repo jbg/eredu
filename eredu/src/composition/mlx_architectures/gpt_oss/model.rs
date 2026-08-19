@@ -1625,7 +1625,7 @@ pub(crate) fn prepare_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports gpt-oss"
         )));
     }
-    crate::backend::mlx::structural::validate_gguf(
+    crate::composition::mlx::structural::validate_gguf(
         crate::core::GgufArchitecture::GptOss,
         checkpoint,
         metadata,

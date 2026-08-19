@@ -830,7 +830,7 @@ fn apply_mmproj_config(
     let Some(mmproj) = mmproj else {
         return Ok(());
     };
-    crate::backend::mlx::structural::validate_muse_glimmer_projector_gguf(
+    crate::composition::mlx::structural::validate_muse_glimmer_projector_gguf(
         checkpoint,
         metadata,
         &mmproj.checkpoint,

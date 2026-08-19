@@ -282,7 +282,7 @@ fn generic_loaded_model_source_does_not_import_backend_implementations() {
         "safemlx::",
         "safemlx_sys::",
         "crate::backend::mlx",
-        "crate::backend::mlx::architectures",
+        "crate::composition::mlx_architectures",
         "cfg(feature = \"mlx\")",
     ] {
         assert!(
@@ -301,7 +301,7 @@ fn portable_api_tests_do_not_depend_on_backend_implementations() {
         "safemlx::",
         "safemlx_sys::",
         "crate::backend::mlx",
-        "crate::backend::mlx::architectures",
+        "crate::composition::mlx_architectures",
         "crate::backend::mlx::nn",
     ] {
         assert!(

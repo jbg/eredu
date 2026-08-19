@@ -12,7 +12,7 @@ use safemlx::{
 
 use crate::{
     backend::mlx::runtime::media::input::ModelInput as RuntimeInput,
-    backend::mlx::{
+    composition::mlx::{
         speculative::{
             scheduler::MtpComponentTimings, MlxSpeculativeCompletion, MtpExecutionStreams,
         },

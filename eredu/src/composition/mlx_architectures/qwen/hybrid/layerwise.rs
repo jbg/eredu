@@ -1272,7 +1272,7 @@ pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
         resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, mmproj, weights_stream)?;
     let architecture = crate::core::GgufArchitecture::resolve(&prepared.architecture)?;
     let residency = options.weight_residency();
-    crate::backend::mlx::structural::validate_gguf(
+    crate::composition::mlx::structural::validate_gguf(
         architecture,
         checkpoint,
         metadata,
@@ -1328,7 +1328,7 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
     let prepared =
         resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, mmproj, weights_stream)?;
     let architecture = crate::core::GgufArchitecture::resolve(&prepared.architecture)?;
-    crate::backend::mlx::structural::validate_gguf(
+    crate::composition::mlx::structural::validate_gguf(
         architecture,
         checkpoint,
         metadata,

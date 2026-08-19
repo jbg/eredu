@@ -34,9 +34,9 @@ use serde_json::Value;
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::realtime,
     backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler},
+    composition::mlx::realtime,
     core::realtime::RealtimeSpeechConfig,
 };
 

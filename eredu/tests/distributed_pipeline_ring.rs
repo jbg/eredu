@@ -10,19 +10,6 @@ use std::{
 };
 
 use eredu::{
-    backend::mlx::architectures::distributed::pipeline::{
-        load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
-    },
-    backend::mlx::architectures::{
-        deepseek_v3::model as deepseek_v3,
-        gemma4,
-        gpt_oss::model as gpt_oss,
-        inkling::model as inkling,
-        kimi_linear::model as kimi_model,
-        lfm2::model as lfm2,
-        nemotron_h::model as nemotron_model,
-        qwen::{dense as dense_qwen, hybrid::qwen3_5 as qwen_hybrid},
-    },
     backend::mlx::runtime::generation::sampler::DefaultSampler,
     backend::mlx::runtime::{
         checkpoint::binding::canonical_checkpoint_name,
@@ -32,6 +19,19 @@ use eredu::{
         CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions,
         LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, MlxParallelContext,
         ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions, WeightResidency,
+    },
+    composition::mlx_architectures::distributed::pipeline::{
+        load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
+    },
+    composition::mlx_architectures::{
+        deepseek_v3::model as deepseek_v3,
+        gemma4,
+        gpt_oss::model as gpt_oss,
+        inkling::model as inkling,
+        kimi_linear::model as kimi_model,
+        lfm2::model as lfm2,
+        nemotron_h::model as nemotron_model,
+        qwen::{dense as dense_qwen, hybrid::qwen3_5 as qwen_hybrid},
     },
     core::{residency::OffloadConfig, BackendProvider as _, BackendSession as _},
     load_model, MtpCapability, MtpCheckpointKind, MtpConfig, PromptCacheDescriptor,
@@ -1001,10 +1001,10 @@ fn assert_final_logits_close(actual: &Array, expected: &[f32], tolerance: f32) {
 }
 
 fn forward_pipeline_model(
-    model: &mut eredu::backend::mlx::architectures::distributed::pipeline::PipelineModel,
+    model: &mut eredu::composition::mlx_architectures::distributed::pipeline::PipelineModel,
     tokens: Option<&Array>,
     step: PipelineStep,
-    cache: &mut eredu::backend::mlx::architectures::distributed::pipeline::PipelineCache,
+    cache: &mut eredu::composition::mlx_architectures::distributed::pipeline::PipelineCache,
     execution: &MlxDistributedSession<'_>,
 ) -> Option<Array> {
     model
@@ -1017,12 +1017,12 @@ fn forward_pipeline_model(
 fn assert_family_cache(
     family: FixtureFamily,
     rank: usize,
-    cache: &eredu::backend::mlx::architectures::distributed::pipeline::PipelineCache,
+    cache: &eredu::composition::mlx_architectures::distributed::pipeline::PipelineCache,
     expected_offset: i32,
 ) {
     let populated = expected_offset > 0;
     let assert_slots =
-        |slots: &[eredu::backend::mlx::architectures::distributed::pipeline::PipelineStateSlot], count| {
+        |slots: &[eredu::composition::mlx_architectures::distributed::pipeline::PipelineStateSlot], count| {
             assert_eq!(slots.len(), count);
             for slot in slots {
                 assert_eq!(slot.value().is_some(), populated);

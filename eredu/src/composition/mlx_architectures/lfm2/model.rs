@@ -2283,7 +2283,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     }
     let is_moe = architecture == "lfm2moe";
     let gguf_architecture = crate::core::GgufArchitecture::resolve(&architecture)?;
-    crate::backend::mlx::structural::validate_gguf(
+    crate::composition::mlx::structural::validate_gguf(
         gguf_architecture,
         checkpoint,
         metadata,

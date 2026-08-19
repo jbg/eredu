@@ -95,12 +95,12 @@ use crate::{
     backend::mlx::runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, ResidencyManager,
     },
-    backend::mlx::speculative::embedded::{
-        DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
-    },
     backend::mlx::MlxParallelContext,
     backend::mlx::ModelLoadOptions,
     composition::llama_mlx as llama,
+    composition::mlx::speculative::embedded::{
+        DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
+    },
     composition::mlx_architectures::{
         deepseek_v3::model as deepseek_v3,
         deepseek_v4::layerwise::DeepSeekV4LayerwiseAdapter,
@@ -1296,7 +1296,7 @@ trait PipelineStageAdapter {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Error>;
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error>;
     fn prefill_embedded_mtp_cache(
         &mut self,
         output: &EmbeddedMtpOutput,
@@ -1458,7 +1458,7 @@ trait PipelineStageSemantics {
         _execution: Option<&ParallelExecutionContext<'_>>,
         _expert_group: Option<&Group>,
         _stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
         Err(Error::UnsupportedArchitecture(format!(
             "pipeline architecture {:?} has no embedded MTP predictor",
             self.model_kind()
@@ -1685,7 +1685,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
         self.0.forward_embedded_mtp_draft(
             hidden,
             tokens,
@@ -2483,7 +2483,7 @@ impl PipelineStageSemantics for DeepSeekStage {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
         let PipelineMtpCache::DeepSeek(cache) = cache else {
             return Err(Error::Parallel(
                 "DeepSeek pipeline MTP cache mismatch".into(),
@@ -4360,7 +4360,7 @@ impl PipelineStageSemantics for NemotronHStage {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
         let PipelineMtpCache::NemotronH(cache) = cache else {
             return Err(Error::Parallel(
                 "Nemotron-H pipeline MTP cache mismatch".into(),
@@ -4645,7 +4645,7 @@ impl PipelineStageSemantics for QwenHybridStage {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
         let PipelineMtpCache::QwenHybrid(cache) = cache else {
             return Err(Error::Parallel("Qwen pipeline MTP cache mismatch".into()));
         };
@@ -4686,7 +4686,7 @@ impl PipelineStageSemantics for QwenHybridStage {
         }
         .map_err(Error::from)?;
         Ok(
-            crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput {
+            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits: output.logits,
                 hidden: output.hidden,
                 tokens: tokens.clone(),
@@ -5060,7 +5060,7 @@ impl PipelineStageSemantics for InklingStage {
         execution: Option<&ParallelExecutionContext<'_>>,
         _expert_group: Option<&Group>,
         stream: &Stream,
-    ) -> Result<crate::backend::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
         let PipelineMtpCache::Inkling(cache) = cache else {
             return Err(Error::Parallel(
                 "Inkling pipeline MTP cache mismatch".into(),
@@ -6271,15 +6271,15 @@ impl PipelineModel {
             execution,
         };
         let mut executor =
-            crate::backend::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
-        let result = crate::backend::mlx::speculative::scheduler::generate_tokens(
+            crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
+        let result = crate::composition::mlx::speculative::scheduler::generate_tokens(
             &mut executor,
             cache,
             input,
             config,
             prng_key,
             &mut synchronized,
-            crate::backend::mlx::speculative::MtpExecutionStreams::single(stream),
+            crate::composition::mlx::speculative::MtpExecutionStreams::single(stream),
             crate::core::generation::MtpSchedulerOptions::default(),
             |_| Ok(()),
         );
@@ -8136,7 +8136,7 @@ pub(crate) fn load_pipeline_model_with_options(
         // nonresident-loader restriction.
         structural_options.weight_residency =
             crate::backend::mlx::runtime::execution::layerwise::WeightResidency::fully_resident();
-        crate::backend::mlx::structural::validate_gguf(
+        crate::composition::mlx::structural::validate_gguf(
             architecture,
             &checkpoint,
             &metadata,

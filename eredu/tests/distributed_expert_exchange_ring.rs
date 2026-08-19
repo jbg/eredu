@@ -9,17 +9,17 @@ use std::{
 };
 
 use eredu::{
-    backend::mlx::architectures::deepseek_v3::model::RoutedExperts,
-    backend::mlx::architectures::distributed::expert::{
-        dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
-        DispatchedRoutes, ExpertAssignment, RoutedTransport, ShardedRouteBlocks,
-    },
     backend::mlx::error::Error,
     backend::mlx::nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
     backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCatalogEntry, ExpertIdentity, ExpertPass,
         ExpertRouteBatch,
+    },
+    composition::mlx_architectures::deepseek_v3::model::RoutedExperts,
+    composition::mlx_architectures::distributed::expert::{
+        dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
+        DispatchedRoutes, ExpertAssignment, RoutedTransport, ShardedRouteBlocks,
     },
     core::residency::OffloadConfig,
 };

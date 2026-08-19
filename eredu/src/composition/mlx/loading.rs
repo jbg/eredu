@@ -38,7 +38,8 @@ pub(crate) fn gguf_eos_token_ids(
 }
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::{structural, MlxModel, Model, ModelLoadOptions},
+    backend::mlx::{MlxModel, ModelLoadOptions},
+    composition::mlx::{structural, Model},
 };
 
 /// MLX arrays/modules plus backend-owned preprocessing from one GGUF artifact.
@@ -274,7 +275,7 @@ fn materialize_gguf_model(
     })
 }
 
-pub(super) fn materialize_model_plan(
+pub(crate) fn materialize_model_plan(
     plan: ModelPreparationPlan,
     options: ModelLoadOptions,
     stream: &Stream,

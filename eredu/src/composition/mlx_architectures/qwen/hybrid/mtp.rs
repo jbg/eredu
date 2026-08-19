@@ -4,7 +4,7 @@ use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::{
     backend::mlx::runtime::media::input::{self, ModelInput},
-    backend::mlx::speculative::embedded::{EmbeddedMtpOutput, EmbeddedMtpTarget},
+    composition::mlx::speculative::embedded::{EmbeddedMtpOutput, EmbeddedMtpTarget},
     composition::mlx_architectures::qwen::hybrid::qwen3_5::{
         Cache, LayerCache, Model, QwenMtpStepOutput,
     },
