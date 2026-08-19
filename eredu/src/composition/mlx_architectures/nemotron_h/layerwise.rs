@@ -1,8 +1,9 @@
 //! Unified fully resident and bounded layer execution for Nemotron-H.
 
 use eredu_runtime::{
-    ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, LayerWeightResidency,
-    NonExpertWeightResidency, StaticUnitBindings, WeightResidency,
+    ExecutionGraph, ExecutionUnitLayout, ExpertCacheLoadOptions, ExpertIdentity, ExpertPass,
+    LayerWeightResidency, LayeredArchitecture, LayeredForwardState, LayerwiseRuntime,
+    NonExpertWeightResidency, ParallelLayeredArchitecture, StaticUnitBindings, WeightResidency,
 };
 
 use eredu_checkpoint::WeightQuantization;
@@ -30,12 +31,13 @@ use safemlx::{
 };
 
 use crate::core::cache::{
-    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    PromptCacheTopology,
+    validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
 };
 
 use crate::{
     backend::mlx::error::Error,
+    backend::mlx::nn::shared::{MlxBackend, MlxParameterTree},
     backend::mlx::nn::{
         self as common,
         linear::project_logits_maybe_quantized,
@@ -47,12 +49,15 @@ use crate::{
     },
     backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::{
-        build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
-        canonical_checkpoint_name, packed_companion_checkpoint_name, populate_module_from_lease,
+        binding_bytes, build_module_binding_plan_with_recipes,
+        build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
+        packed_companion_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::binding_plan::{BindingPlan, PlannedBinding},
-    backend::mlx::runtime::checkpoint::store::{open_gguf_checkpoint_source, TensorSelection},
+    backend::mlx::runtime::checkpoint::store::{
+        open_gguf_checkpoint_source, TensorSelection, WeightStoreBackend,
+    },
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, recipe::DerivedWeightRecipe,
     },
@@ -61,10 +66,15 @@ use crate::{
         register_partitioned_projection_group, register_projection_module,
         register_replicated_module, ParallelPlanBuilder, ProjectionSharding,
     },
-    backend::mlx::runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_quantization,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerwiseModel, LoadTimeQuantizableAdapter,
+    backend::mlx::runtime::execution::{
+        generic::{
+            prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
+            MlxUnitFactory,
+        },
+        layerwise::{
+            open_safetensors_weight_store, quantize_module_store_with_bindings,
+            shard_layer_bindings, ArchitectureAdapter, LoadTimeQuantizableAdapter,
+        },
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{
@@ -589,9 +599,747 @@ fn register_nemotron_layer_parallel_plan_at(
     Ok(())
 }
 
+type NemotronHUnit = MlxParameterTree<TransformerBlock>;
+type NemotronHStatic = MlxParameterTree<NemotronHStaticModules>;
+type NemotronHResidentRuntime =
+    LayerwiseRuntime<NemotronHArchitecture, MlxBackend, Cache, MlxResidentPolicy<NemotronHUnit>>;
+type NemotronHBoundedRuntime = LayerwiseRuntime<
+    NemotronHArchitecture,
+    MlxBackend,
+    Cache,
+    MlxLayerwisePolicy<NemotronHUnit, NemotronHUnitFactory>,
+>;
+
+enum NemotronHRuntime {
+    Resident(NemotronHResidentRuntime),
+    Layerwise(NemotronHBoundedRuntime),
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct NemotronHReplicatedStatic {
+    #[param]
+    embeddings: MaybeQuantized<nn::Embedding>,
+    #[param]
+    norm: nn::RmsNorm,
+    #[param]
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
+    #[param]
+    mtp: Option<NemotronMtpModule>,
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct NemotronHParallelStatic {
+    #[param]
+    embeddings: VocabParallelEmbedding,
+    #[param]
+    norm: nn::RmsNorm,
+    #[param]
+    lm_head: Option<VocabParallelLmHead>,
+    #[param]
+    mtp: Option<NemotronMtpModule>,
+}
+
+#[derive(Debug, Clone)]
+enum NemotronHStaticModules {
+    Replicated(NemotronHReplicatedStatic),
+    Parallel(NemotronHParallelStatic),
+}
+
+macro_rules! nemotron_h_static_parameters {
+    ($self:ident, $method:ident $(, $arg:expr)?) => {
+        match $self {
+            NemotronHStaticModules::Replicated(module) => module.$method($($arg)?),
+            NemotronHStaticModules::Parallel(module) => module.$method($($arg)?),
+        }
+    };
+}
+
+impl ModuleParameters for NemotronHStaticModules {
+    fn num_parameters(&self) -> usize {
+        nemotron_h_static_parameters!(self, num_parameters)
+    }
+    fn parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        nemotron_h_static_parameters!(self, parameters)
+    }
+    fn parameters_mut(&mut self) -> safemlx::module::ModuleParamMut<'_> {
+        nemotron_h_static_parameters!(self, parameters_mut)
+    }
+    fn trainable_parameters(&self) -> safemlx::module::ModuleParamRef<'_> {
+        nemotron_h_static_parameters!(self, trainable_parameters)
+    }
+    fn freeze_parameters(&mut self, recursive: bool) {
+        nemotron_h_static_parameters!(self, freeze_parameters, recursive)
+    }
+    fn unfreeze_parameters(&mut self, recursive: bool) {
+        nemotron_h_static_parameters!(self, unfreeze_parameters, recursive)
+    }
+    fn all_frozen(&self) -> Option<bool> {
+        nemotron_h_static_parameters!(self, all_frozen)
+    }
+    fn any_frozen(&self) -> Option<bool> {
+        nemotron_h_static_parameters!(self, any_frozen)
+    }
+}
+
+struct NemotronHUnitFactory {
+    adapter: NemotronHLayerwiseAdapter,
+    parallel_layout: Option<Arc<eredu_runtime::LocalModelLayout>>,
+}
+
+impl MlxUnitFactory<NemotronHUnit> for NemotronHUnitFactory {
+    fn build(&mut self, ordinal: usize, stream: &Stream) -> Result<NemotronHUnit, Error> {
+        let layer = match self.parallel_layout.as_deref() {
+            Some(layout) => self
+                .adapter
+                .new_parallel_layer(0, ordinal, layout, stream)?,
+            None => self.adapter.new_layer(0, ordinal, stream)?,
+        };
+        let sparse = self.adapter.sparse_expert_cache;
+        MlxParameterTree::new_filtered(layer, "", |name| {
+            !sparse || !name.starts_with("moe.experts.")
+        })
+        .map_err(|error| Error::Parallel(error.to_string()))
+    }
+}
+
+struct NemotronHArchitecture {
+    adapter: NemotronHLayerwiseAdapter,
+    static_modules: NemotronHStatic,
+    parallel_topology: Option<crate::backend::mlx::MlxParallelContext>,
+}
+
+impl NemotronHArchitecture {
+    fn from_adapter(adapter: NemotronHLayerwiseAdapter) -> Result<Self, Error> {
+        let modules = match (&adapter.parallel_embedding, &adapter.parallel_lm_head) {
+            (Some(embeddings), parallel_lm_head) => {
+                NemotronHStaticModules::Parallel(NemotronHParallelStatic {
+                    embeddings: embeddings.clone(),
+                    norm: adapter.norm.clone(),
+                    lm_head: parallel_lm_head.clone(),
+                    mtp: adapter.mtp.clone(),
+                })
+            }
+            _ => NemotronHStaticModules::Replicated(NemotronHReplicatedStatic {
+                embeddings: adapter.embeddings.clone(),
+                norm: adapter.norm.clone(),
+                lm_head: adapter.lm_head.clone(),
+                mtp: adapter.mtp.clone(),
+            }),
+        };
+        Ok(Self {
+            static_modules: MlxParameterTree::new(modules, "")
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+            adapter,
+            parallel_topology: None,
+        })
+    }
+
+    fn sync_adapter_static(&mut self) {
+        match &*self.static_modules {
+            NemotronHStaticModules::Replicated(modules) => {
+                self.adapter.embeddings = modules.embeddings.clone();
+                self.adapter.norm = modules.norm.clone();
+                self.adapter.lm_head = modules.lm_head.clone();
+                self.adapter.mtp = modules.mtp.clone();
+            }
+            NemotronHStaticModules::Parallel(modules) => {
+                self.adapter.parallel_embedding = Some(modules.embeddings.clone());
+                self.adapter.norm = modules.norm.clone();
+                self.adapter.parallel_lm_head = modules.lm_head.clone();
+                self.adapter.mtp = modules.mtp.clone();
+            }
+        }
+    }
+}
+
+impl LayeredArchitecture<MlxBackend, Cache> for NemotronHArchitecture {
+    type Input<'a> = &'a Array;
+    type StaticModules = NemotronHStatic;
+    type Unit = NemotronHUnit;
+    type ForwardContext = NemotronHForwardContext;
+    type RetainedContextValues<'a> = std::iter::Empty<&'a Array>;
+    type Error = Error;
+
+    fn model_identity(&self) -> &str {
+        &self.adapter.args.model_type
+    }
+    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
+        self.adapter.execution_graph()
+    }
+    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
+        self.adapter.layer_count(group)
+    }
+    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
+        if index >= self.group_unit_count(group)? {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Nemotron-H group {group} has no unit {index}"
+            )));
+        }
+        Ok(format!("model.layers.{index}"))
+    }
+    fn static_modules(&self) -> &Self::StaticModules {
+        &self.static_modules
+    }
+    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
+        &mut self.static_modules
+    }
+    fn build_unit(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Unit, Error> {
+        let layer = self.adapter.new_layer(group, index, stream)?;
+        let sparse = self.adapter.sparse_expert_cache;
+        MlxParameterTree::new_filtered(layer, "", |name| {
+            !sparse || !name.starts_with("moe.experts.")
+        })
+        .map_err(|error| Error::Parallel(error.to_string()))
+    }
+    fn begin_forward<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
+        self.sync_adapter_static();
+        self.adapter.validate_cache(cache)?;
+        self.adapter.begin_forward(input, cache, stream)
+    }
+    fn begin_execution_group(
+        &mut self,
+        _group: usize,
+        initial: &Array,
+        _dependencies: &[&Array],
+        _cache: &mut Cache,
+        _forward: &mut Self::ForwardContext,
+        _stream: &Stream,
+    ) -> Result<Array, Error> {
+        Ok(initial.clone())
+    }
+    fn forward_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.adapter
+            .forward_layer(group, index, &mut **unit, hidden, cache, forward, stream)
+    }
+    fn complete_execution_group(
+        &mut self,
+        group: usize,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.adapter
+            .complete_execution_group(group, hidden, cache, forward, stream)
+    }
+    fn finish_forward(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.adapter.finish(hidden, cache, forward, stream)
+    }
+    fn retained_context_values<'a>(
+        &'a self,
+        _forward: &'a Self::ForwardContext,
+        _group: usize,
+        _index: usize,
+    ) -> Self::RetainedContextValues<'a> {
+        std::iter::empty()
+    }
+}
+
+impl ParallelLayeredArchitecture<MlxBackend, Cache> for NemotronHArchitecture {
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
+        self.sync_adapter_static();
+        self.adapter.validate_cache(cache)?;
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Nemotron-H parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        self.adapter
+            .begin_forward_with_execution(input, cache, &execution)
+    }
+    fn forward_unit_parallel(
+        &mut self,
+        group_index: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &mut Self::ForwardContext,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Nemotron-H parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        self.adapter.forward_layer_with_execution(
+            group_index,
+            index,
+            &mut **unit,
+            hidden,
+            cache,
+            forward,
+            &execution,
+        )
+    }
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Cache,
+        forward: &Self::ForwardContext,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("Nemotron-H parallel topology was not configured".into())
+        })?;
+        let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+        self.adapter
+            .finish_with_execution(hidden, cache, forward, &execution)
+    }
+}
+
+struct NemotronHExecution {
+    runtime: NemotronHRuntime,
+    metadata: eredu_runtime::LayerwiseModelMetadata,
+    parallel_info:
+        Option<eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
+    topology: Option<crate::backend::mlx::MlxParallelContext>,
+}
+
+impl NemotronHExecution {
+    fn architecture(&self) -> &NemotronHArchitecture {
+        match &self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime.architecture(),
+            NemotronHRuntime::Layerwise(runtime) => runtime.architecture(),
+        }
+    }
+    fn architecture_mut(&mut self) -> &mut NemotronHArchitecture {
+        match &mut self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime.architecture_mut(),
+            NemotronHRuntime::Layerwise(runtime) => runtime.architecture_mut(),
+        }
+    }
+    fn adapter(&self) -> &NemotronHLayerwiseAdapter {
+        &self.architecture().adapter
+    }
+    fn adapter_mut(&mut self) -> &mut NemotronHLayerwiseAdapter {
+        &mut self.architecture_mut().adapter
+    }
+    fn bind_parallel_topology(&mut self, topology: crate::backend::mlx::MlxParallelContext) {
+        self.topology = Some(topology);
+        self.architecture_mut().parallel_topology = Some(topology);
+    }
+    fn parallel_info(
+        &self,
+    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+        self.parallel_info.as_ref()
+    }
+    fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
+        match &self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime.policy().checkpoint_store(),
+            NemotronHRuntime::Layerwise(runtime) => runtime.policy().checkpoint_store(),
+        }
+    }
+    fn checkpoint_store_arc(&self) -> Arc<dyn eredu_checkpoint::store::CheckpointSource> {
+        match &self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime.policy().checkpoint_store_arc(),
+            NemotronHRuntime::Layerwise(runtime) => runtime.policy().checkpoint_store_arc(),
+        }
+    }
+    fn residency_report(&self) -> Result<ResidencyReport, Error> {
+        match &self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime.policy().residency_report(),
+            NemotronHRuntime::Layerwise(runtime) => runtime.policy().residency_report(),
+        }
+    }
+    fn dense_stream_report(&self) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
+        match &self.runtime {
+            NemotronHRuntime::Resident(_) => Ok(None),
+            NemotronHRuntime::Layerwise(runtime) => runtime.policy().dense_stream_report(),
+        }
+    }
+    fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.adapter().prompt_cache_model_identity(self.topology)
+    }
+    fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        Ok(self.prompt_cache_model_identity()?.layer_layout)
+    }
+    fn prompt_cache_rank_identity(&self) -> Option<crate::core::cache::CacheRankIdentity> {
+        self.topology
+            .map(crate::backend::mlx::cache::prompt_cache_topology)
+            .and_then(|topology| topology.cache_rank_identity())
+    }
+    fn prompt_cache_directory(&self, root: &Path) -> std::path::PathBuf {
+        match self.topology {
+            Some(topology) => root.join(format!("rank-{:05}", topology.global_rank)),
+            None => root.to_path_buf(),
+        }
+    }
+    fn save_prompt_cache(
+        &self,
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(&descriptor, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        self.adapter().save_prompt_cache(
+            cache,
+            &self.prompt_cache_directory(destination.as_ref()),
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+    fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        let identity = self.prompt_cache_model_identity()?;
+        validate_prompt_cache_model_identity(expected, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        self.adapter().load_prompt_cache(
+            &self.prompt_cache_directory(directory.as_ref()),
+            expected,
+            &identity,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+    fn forward(
+        &mut self,
+        input: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match &mut self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime
+                .forward(input, cache, stream)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            NemotronHRuntime::Layerwise(runtime) => runtime
+                .forward(input, cache, stream)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_with_context_hook(
+        &mut self,
+        input: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+        hook: impl FnMut(usize, usize, &mut NemotronHForwardContext) -> Result<(), Error>,
+    ) -> Result<(Array, NemotronHForwardContext), Error> {
+        match &mut self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime
+                .forward_with_context_hook(input, cache, stream, hook)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            NemotronHRuntime::Layerwise(runtime) => runtime
+                .forward_with_context_hook(input, cache, stream, hook)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_tensor_parallel(
+        &mut self,
+        input: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match &mut self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime
+                .forward_parallel(input, cache, group, stream)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            NemotronHRuntime::Layerwise(runtime) => runtime
+                .forward_parallel(input, cache, group, stream)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_tensor_parallel_with_context(
+        &mut self,
+        input: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<(Array, NemotronHForwardContext), Error> {
+        match &mut self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime
+                .forward_parallel_with_context_hook(input, cache, group, stream, |_, _, _| Ok(()))
+                .map_err(|error| Error::Parallel(error.to_string())),
+            NemotronHRuntime::Layerwise(runtime) => runtime
+                .forward_parallel_with_context_hook(input, cache, group, stream, |_, _, _| Ok(()))
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_with_layer_executor<E>(
+        &mut self,
+        input: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+        mut execute: E,
+    ) -> Result<Array, Error>
+    where
+        E: FnMut(
+            &mut NemotronHLayerwiseAdapter,
+            usize,
+            usize,
+            &mut TransformerBlock,
+            &Array,
+            &mut Cache,
+            &mut NemotronHForwardContext,
+            &Stream,
+        ) -> Result<Array, Error>,
+    {
+        let execute = |architecture: &mut NemotronHArchitecture,
+                       group,
+                       index,
+                       unit: &mut NemotronHUnit,
+                       hidden: &Array,
+                       cache: &mut Cache,
+                       forward: &mut NemotronHForwardContext,
+                       stream: &Stream| {
+            execute(
+                &mut architecture.adapter,
+                group,
+                index,
+                &mut **unit,
+                hidden,
+                cache,
+                forward,
+                stream,
+            )
+        };
+        match &mut self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime
+                .forward_with_unit_executor(input, cache, stream, execute)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            NemotronHRuntime::Layerwise(runtime) => runtime
+                .forward_with_unit_executor(input, cache, stream, execute)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_with_layer_executor_and_context<E>(
+        &mut self,
+        input: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+        mut execute: E,
+    ) -> Result<(Array, NemotronHForwardContext), Error>
+    where
+        E: FnMut(
+            &mut NemotronHLayerwiseAdapter,
+            usize,
+            usize,
+            &mut TransformerBlock,
+            &Array,
+            &mut Cache,
+            &mut NemotronHForwardContext,
+            &Stream,
+        ) -> Result<Array, Error>,
+    {
+        let execute = |architecture: &mut NemotronHArchitecture,
+                       group,
+                       index,
+                       unit: &mut NemotronHUnit,
+                       hidden: &Array,
+                       cache: &mut Cache,
+                       forward: &mut NemotronHForwardContext,
+                       stream: &Stream| {
+            execute(
+                &mut architecture.adapter,
+                group,
+                index,
+                &mut **unit,
+                hidden,
+                cache,
+                forward,
+                stream,
+            )
+        };
+        match &mut self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime
+                .forward_with_unit_executor_and_context_hook(
+                    input,
+                    cache,
+                    stream,
+                    execute,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(|error| Error::Parallel(error.to_string())),
+            NemotronHRuntime::Layerwise(runtime) => runtime
+                .forward_with_unit_executor_and_context_hook(
+                    input,
+                    cache,
+                    stream,
+                    execute,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_tensor_parallel_with_layer_executor<E>(
+        &mut self,
+        input: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        mut execute: E,
+    ) -> Result<Array, Error>
+    where
+        E: FnMut(
+            &mut NemotronHLayerwiseAdapter,
+            usize,
+            usize,
+            &mut TransformerBlock,
+            &Array,
+            &mut Cache,
+            &mut NemotronHForwardContext,
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        ) -> Result<Array, Error>,
+    {
+        let topology = self.topology.ok_or_else(|| {
+            Error::Parallel("Nemotron-H parallel topology was not configured".into())
+        })?;
+        let execute = |architecture: &mut NemotronHArchitecture,
+                       group_index,
+                       index,
+                       unit: &mut NemotronHUnit,
+                       hidden: &Array,
+                       cache: &mut Cache,
+                       forward: &mut NemotronHForwardContext,
+                       group: &safemlx::distributed::Group,
+                       stream: &Stream| {
+            let context = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+            execute(
+                &mut architecture.adapter,
+                group_index,
+                index,
+                &mut **unit,
+                hidden,
+                cache,
+                forward,
+                &context,
+            )
+        };
+        match &mut self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime
+                .forward_parallel_with_unit_executor(input, cache, group, stream, execute)
+                .map_err(|error| Error::Parallel(error.to_string())),
+            NemotronHRuntime::Layerwise(runtime) => runtime
+                .forward_parallel_with_unit_executor(input, cache, group, stream, execute)
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn forward_tensor_parallel_with_layer_executor_and_context<E>(
+        &mut self,
+        input: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        mut execute: E,
+    ) -> Result<(Array, NemotronHForwardContext), Error>
+    where
+        E: FnMut(
+            &mut NemotronHLayerwiseAdapter,
+            usize,
+            usize,
+            &mut TransformerBlock,
+            &Array,
+            &mut Cache,
+            &mut NemotronHForwardContext,
+            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        ) -> Result<Array, Error>,
+    {
+        let topology = self.topology.ok_or_else(|| {
+            Error::Parallel("Nemotron-H parallel topology was not configured".into())
+        })?;
+        let execute = |architecture: &mut NemotronHArchitecture,
+                       group_index,
+                       index,
+                       unit: &mut NemotronHUnit,
+                       hidden: &Array,
+                       cache: &mut Cache,
+                       forward: &mut NemotronHForwardContext,
+                       group: &safemlx::distributed::Group,
+                       stream: &Stream| {
+            let context = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
+            execute(
+                &mut architecture.adapter,
+                group_index,
+                index,
+                &mut **unit,
+                hidden,
+                cache,
+                forward,
+                &context,
+            )
+        };
+        match &mut self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime
+                .forward_parallel_with_unit_executor_and_context_hook(
+                    input,
+                    cache,
+                    group,
+                    stream,
+                    execute,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(|error| Error::Parallel(error.to_string())),
+            NemotronHRuntime::Layerwise(runtime) => runtime
+                .forward_parallel_with_unit_executor_and_context_hook(
+                    input,
+                    cache,
+                    group,
+                    stream,
+                    execute,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(|error| Error::Parallel(error.to_string())),
+        }
+    }
+    fn clear_device_group(&self, name: &str) -> Result<(), Error> {
+        let graph = self.architecture().execution_graph()?;
+        let group = graph
+            .groups()
+            .iter()
+            .find(|group| group.id() == name)
+            .ok_or_else(|| Error::Parallel(format!("Nemotron-H has no execution group {name}")))?;
+        match &self.runtime {
+            NemotronHRuntime::Resident(runtime) => runtime.policy().clear_device_group(group.id()),
+            NemotronHRuntime::Layerwise(runtime) => runtime.policy().clear_device_group(group.id()),
+        }
+    }
+}
+
 /// Nemotron-H causal LM using bounded residency for hybrid blocks.
 pub struct NemotronHLayerwiseModel {
-    execution: LayerwiseModel<NemotronHLayerwiseAdapter>,
+    execution: NemotronHExecution,
 }
 
 pub(crate) struct NemotronHTensorMtpTarget<'a> {
@@ -794,7 +1542,15 @@ impl NemotronHLayerwiseModel {
     /// convolution and recurrent tensors remain device resident.
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
         let rank = self.execution.prompt_cache_rank_identity();
-        let cache = Cache::new_with_options_and_rank(self.args(), policy.clone(), rank)?;
+        let cache = match self.execution.adapter().parallel_geometry.as_deref() {
+            Some(geometry) => Cache::new_with_options_geometry_and_rank(
+                self.args(),
+                geometry,
+                policy.clone(),
+                rank,
+            )?,
+            None => Cache::new_with_options_and_rank(self.args(), policy.clone(), rank)?,
+        };
         match (&self.execution.adapter().mtp, policy) {
             (Some(mtp), CacheResidencyPolicy::Device) => Ok(cache.with_mtp_policies(&mtp.policies)),
             (Some(mtp), CacheResidencyPolicy::Paged(_)) => cache
@@ -1365,6 +2121,351 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
     }
 }
 
+fn nemotron_h_execution_layout(
+    adapter: &NemotronHLayerwiseAdapter,
+) -> Result<ExecutionUnitLayout, Error> {
+    let graph = adapter.execution_graph()?;
+    ExecutionUnitLayout::new(&graph, [adapter.layer_count(0)?])
+        .map_err(|error| Error::Parallel(error.to_string()))
+}
+
+fn nemotron_h_static_bindings(
+    adapter: &NemotronHLayerwiseAdapter,
+    modules: &NemotronHStaticModules,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    let qualify =
+        |prefix: &str, bindings: Vec<WeightBinding>| -> Result<Vec<WeightBinding>, Error> {
+            bindings
+                .into_iter()
+                .map(|binding| {
+                    let name = format!("{prefix}.{}", binding.name());
+                    binding.with_name(name).map_err(Into::into)
+                })
+                .collect()
+        };
+    let NemotronHStaticModules::Replicated(modules) = modules else {
+        return Err(Error::Parallel(
+            "global Nemotron-H bindings require replicated static modules".into(),
+        ));
+    };
+    let mut bindings = qualify(
+        "embeddings",
+        build_module_binding_plan_with_recipes(
+            &modules.embeddings,
+            "model.embeddings",
+            store,
+            adapter.recipes_for_module(&modules.embeddings, "model.embeddings", store, None)?,
+        )?
+        .build_bindings(store)?,
+    )?;
+    bindings.extend(qualify(
+        "norm",
+        build_module_binding_plan_with_recipes(
+            &modules.norm,
+            "model.norm_f",
+            store,
+            adapter.recipes_for_module(&modules.norm, "model.norm_f", store, None)?,
+        )?
+        .build_bindings(store)?,
+    )?);
+    if let Some(head) = &modules.lm_head {
+        bindings.extend(qualify(
+            "lm_head",
+            build_module_binding_plan_with_recipes(
+                head,
+                "lm_head",
+                store,
+                adapter.recipes_for_module(head, "lm_head", store, None)?,
+            )?
+            .build_bindings(store)?,
+        )?);
+    }
+    if let Some(mtp) = &modules.mtp {
+        bindings.extend(qualify(
+            "mtp",
+            build_module_binding_plan_with_recipes_excluding(
+                mtp,
+                "",
+                store,
+                adapter.mtp_recipes(store)?,
+                |name| adapter.sparse_expert_cache && name.contains(".moe.experts."),
+            )?
+            .build_bindings(store)?,
+        )?);
+    }
+    Ok(bindings)
+}
+
+fn nemotron_h_raw_unit(
+    adapter: &NemotronHLayerwiseAdapter,
+    ordinal: usize,
+    stream: &Stream,
+) -> Result<TransformerBlock, Error> {
+    adapter.new_layer(0, ordinal, stream)
+}
+
+fn nemotron_h_raw_unit_bindings(
+    adapter: &NemotronHLayerwiseAdapter,
+    ordinal: usize,
+    unit: &TransformerBlock,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, Error> {
+    adapter.layer_bindings(0, ordinal, unit, store)
+}
+
+fn replicated_nemotron_h_static(adapter: &NemotronHLayerwiseAdapter) -> NemotronHStaticModules {
+    NemotronHStaticModules::Replicated(NemotronHReplicatedStatic {
+        embeddings: adapter.embeddings.clone(),
+        norm: adapter.norm.clone(),
+        lm_head: adapter.lm_head.clone(),
+        mtp: adapter.mtp.clone(),
+    })
+}
+
+fn fresh_nemotron_h_adapter(
+    source: &NemotronHLayerwiseAdapter,
+    stream: &Stream,
+) -> Result<NemotronHLayerwiseAdapter, Error> {
+    let mut adapter = NemotronHLayerwiseAdapter::new(source.args.clone(), stream)?;
+    adapter.sparse_expert_cache = source.sparse_expert_cache;
+    adapter.parallel_geometry = source.parallel_geometry.clone();
+    Ok(adapter)
+}
+
+fn resolve_nemotron_h_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    adapter: &NemotronHLayerwiseAdapter,
+) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
+    if store.is_checkpoint_contract_resolved()
+        || store.source_diagnostics()?.backend != WeightStoreBackend::Safetensors
+    {
+        return Ok(store);
+    }
+    let plan = adapter.safetensors_checkpoint_plan()?;
+    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
+        .map_err(|validation| {
+            Error::UnsupportedArchitecture(format!(
+                "Nemotron-H checkpoint contract did not resolve: {validation:?}"
+            ))
+        })?;
+    Ok(Arc::new(
+        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
+    ))
+}
+
+fn quantize_nemotron_h_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    source: &NemotronHLayerwiseAdapter,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<
+    (
+        Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        NemotronHLayerwiseAdapter,
+        eredu_runtime::WeightMaterializationReport,
+    ),
+    Error,
+> {
+    let target = source.load_time_quantized(quantization, stream)?;
+    let source_static = replicated_nemotron_h_static(source);
+    let target_static = replicated_nemotron_h_static(&target);
+    let source_units = fresh_nemotron_h_adapter(source, stream)?;
+    let target_units = fresh_nemotron_h_adapter(&target, stream)?;
+    let static_binding_adapter = fresh_nemotron_h_adapter(source, stream)?;
+    let unit_binding_adapter = fresh_nemotron_h_adapter(source, stream)?;
+    let unit_count = source.args.layer_schedule.len();
+    let (store, report) = quantize_module_store_with_bindings(
+        store,
+        &source_static,
+        &target_static,
+        move |ordinal, stream| nemotron_h_raw_unit(&source_units, ordinal, stream),
+        move |ordinal, stream| nemotron_h_raw_unit(&target_units, ordinal, stream),
+        unit_count,
+        quantization,
+        stream,
+        move |modules, store| nemotron_h_static_bindings(&static_binding_adapter, modules, store),
+        move |ordinal, unit, store| {
+            nemotron_h_raw_unit_bindings(&unit_binding_adapter, ordinal, unit, store)
+        },
+    )?;
+    Ok((store, target, report))
+}
+
+fn load_nemotron_h_with_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    adapter: NemotronHLayerwiseAdapter,
+    options: LayerWeightResidency,
+    quantization: Option<WeightQuantization>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<NemotronHExecution, Error> {
+    let store = resolve_nemotron_h_store(store, &adapter)?;
+    let (store, adapter, materialization) = match quantization {
+        Some(quantization) => {
+            let (store, adapter, report) =
+                quantize_nemotron_h_store(store, &adapter, quantization, stream)?;
+            (store, adapter, Some(report))
+        }
+        None => (store, adapter, None),
+    };
+    let factory = NemotronHUnitFactory {
+        adapter: fresh_nemotron_h_adapter(&adapter, stream)?,
+        parallel_layout: None,
+    };
+    let static_binding_adapter = fresh_nemotron_h_adapter(&adapter, stream)?;
+    let unit_binding_adapter = fresh_nemotron_h_adapter(&adapter, stream)?;
+    let sparse = adapter.sparse_expert_cache;
+    let model_type = adapter.args.model_type.clone();
+    let quantization = adapter.args.quantization;
+    let layout = nemotron_h_execution_layout(&adapter)?;
+    let mut architecture = NemotronHArchitecture::from_adapter(adapter)?;
+    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+        Arc::clone(&store),
+        architecture.static_modules_mut(),
+        factory,
+        layout,
+        options,
+        stream,
+        weights_stream,
+        move |key| sparse && key.contains(".moe.experts."),
+        move |modules, store| {
+            nemotron_h_static_bindings(&static_binding_adapter, &**modules, store)
+        },
+        move |ordinal, unit, store, _| {
+            nemotron_h_raw_unit_bindings(&unit_binding_adapter, ordinal, &unit, store)
+        },
+    )?;
+    metadata.set_model_type(model_type);
+    metadata.set_quantization(quantization);
+    metadata.set_materialization(materialization);
+    let runtime = if options.is_fully_resident() {
+        NemotronHRuntime::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        NemotronHRuntime::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok(NemotronHExecution {
+        runtime,
+        metadata,
+        parallel_info: None,
+        topology: None,
+    })
+}
+
+fn load_nemotron_h_parallel_with_store(
+    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    mut adapter: NemotronHLayerwiseAdapter,
+    options: LayerWeightResidency,
+    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<NemotronHExecution, Error> {
+    let store = resolve_nemotron_h_store(store, &adapter)?;
+    let mut planner = build.planner();
+    adapter.register_parallel_parameters(build, &mut planner, stream)?;
+    let (_, local_layout) = planner.finish()?;
+    adapter.configure_parallel_static(build, &local_layout, stream)?;
+
+    let global_adapter = fresh_nemotron_h_adapter(&adapter, stream)?;
+    let global_static = replicated_nemotron_h_static(&global_adapter);
+    let static_bindings =
+        nemotron_h_static_bindings(&global_adapter, &global_static, store.as_ref())?;
+    let mut global_parameter_bytes = binding_bytes(&static_bindings)?;
+    for ordinal in 0..global_adapter.args.layer_schedule.len() {
+        let unit = nemotron_h_raw_unit(&global_adapter, ordinal, stream)?;
+        global_parameter_bytes = global_parameter_bytes
+            .checked_add(binding_bytes(&nemotron_h_raw_unit_bindings(
+                &global_adapter,
+                ordinal,
+                &unit,
+                store.as_ref(),
+            )?)?)
+            .ok_or_else(|| {
+                Error::Parallel("Nemotron-H global parameter bytes overflowed".into())
+            })?;
+    }
+
+    let shared_layout = Arc::new(local_layout);
+    let mut factory_adapter = fresh_nemotron_h_adapter(&adapter, stream)?;
+    factory_adapter.configure_parallel_static(build, &shared_layout, stream)?;
+    let factory = NemotronHUnitFactory {
+        adapter: factory_adapter,
+        parallel_layout: Some(Arc::clone(&shared_layout)),
+    };
+    let static_layout = Arc::clone(&shared_layout);
+    let unit_layout = Arc::clone(&shared_layout);
+    let unit_binding_adapter = global_adapter;
+    let sparse = adapter.sparse_expert_cache;
+    let model_type = adapter.args.model_type.clone();
+    let quantization = adapter.args.quantization;
+    let layout = nemotron_h_execution_layout(&adapter)?;
+    let mut architecture = NemotronHArchitecture::from_adapter(adapter)?;
+    architecture.parallel_topology = Some(build.topology());
+    let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
+        Arc::clone(&store),
+        architecture.static_modules_mut(),
+        factory,
+        layout,
+        options,
+        stream,
+        weights_stream,
+        move |key| sparse && key.contains(".moe.experts."),
+        move |_, store| shard_layer_bindings(static_bindings, "", store, &static_layout),
+        move |ordinal, _local, store, stream| {
+            let global = nemotron_h_raw_unit(&unit_binding_adapter, ordinal, stream)?;
+            shard_layer_bindings(
+                unit_binding_adapter.layer_bindings(0, ordinal, &global, store)?,
+                &unit_binding_adapter.layer_checkpoint_prefix(0, ordinal),
+                store,
+                &unit_layout,
+            )
+        },
+    )?;
+    metadata.set_model_type(model_type.clone());
+    metadata.set_quantization(quantization);
+    let local_parameter_bytes = metadata
+        .static_device_bytes()
+        .checked_add(metadata.layer_parameter_bytes())
+        .ok_or_else(|| Error::Parallel("Nemotron-H local parameter bytes overflowed".into()))?;
+    let maximum_device_parameter_bytes = metadata
+        .static_device_bytes()
+        .checked_add(metadata.maximum_device_layer_bytes())
+        .ok_or_else(|| Error::Parallel("Nemotron-H device parameter bytes overflowed".into()))?;
+    let info = eredu_runtime::ParallelModelInfo::new(
+        build.topology(),
+        model_type,
+        shared_layout
+            .tensors()
+            .map(|(target, _)| target.to_string())
+            .collect(),
+        local_parameter_bytes,
+        global_parameter_bytes,
+        if options.is_fully_resident() {
+            local_parameter_bytes
+        } else {
+            metadata.static_device_bytes()
+        },
+        maximum_device_parameter_bytes,
+    );
+    let runtime = if options.is_fully_resident() {
+        NemotronHRuntime::Resident(LayerwiseRuntime::new(
+            architecture,
+            policy.into_resident(stream)?,
+        ))
+    } else {
+        NemotronHRuntime::Layerwise(LayerwiseRuntime::new(architecture, policy))
+    };
+    Ok(NemotronHExecution {
+        runtime,
+        metadata,
+        parallel_info: Some(info),
+        topology: Some(build.topology()),
+    })
+}
+
 /// Loads Nemotron-H through the generalized execution engine.
 pub fn load_nemotron_h_layerwise_model(
     model_dir: impl AsRef<Path>,
@@ -1386,7 +2487,7 @@ pub fn load_nemotron_h_layerwise_model(
     let adapter = NemotronHLayerwiseAdapter::new(args, stream)?;
     let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(NemotronHLayerwiseModel {
-        execution: load_layerwise_model_with_quantization(
+        execution: load_nemotron_h_with_store(
             store,
             adapter,
             options,
@@ -1423,7 +2524,7 @@ pub(crate) fn load_nemotron_h_tensor_parallel_model(
         .map(|(model, _)| model);
     }
     Ok(NemotronHLayerwiseModel {
-        execution: load_tensor_parallel_layerwise_model(
+        execution: load_nemotron_h_parallel_with_store(
             open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             NemotronHLayerwiseAdapter::new(
                 resident::get_nemotron_h_model_args(model_dir)?,
@@ -1459,7 +2560,7 @@ pub(crate) fn load_nemotron_h_gguf_tensor_parallel_model(
             resident::translate_gguf_weight_name,
             options.max_mapped_shards(),
         )?);
-    let execution = load_tensor_parallel_layerwise_model(
+    let execution = load_nemotron_h_parallel_with_store(
         store,
         NemotronHLayerwiseAdapter::new(prepared.args, stream)?,
         options,
@@ -1540,7 +2641,7 @@ pub(crate) fn load_nemotron_h_gguf_layerwise_model(
             prepared.eos_token_ids,
         ));
     }
-    let execution = load_layerwise_model_with_quantization(
+    let execution = load_nemotron_h_with_store(
         store,
         NemotronHLayerwiseAdapter::new(args, stream)?,
         residency.layers(),
@@ -1574,10 +2675,10 @@ fn load_nemotron_h_gguf_sparse_with_store(
     }
     let mut adapter = NemotronHLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution = load_layerwise_model_with_quantization(
+    let mut execution = load_nemotron_h_with_store(
         store,
         adapter,
-        non_expert,
+        non_expert.into(),
         quantization,
         stream,
         weights_stream,
@@ -1614,7 +2715,14 @@ pub(crate) fn load_nemotron_h_sparse_ep_base_with_store(
 ) -> Result<NemotronHLayerwiseModel, Error> {
     let mut adapter = NemotronHLayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
-    let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    let execution = load_nemotron_h_with_store(
+        store,
+        adapter,
+        non_expert.into(),
+        None,
+        stream,
+        weights_stream,
+    )?;
     Ok(NemotronHLayerwiseModel { execution })
 }
 
@@ -1629,10 +2737,10 @@ pub(crate) fn load_nemotron_h_sparse_tp_ep_base_with_store(
 ) -> Result<NemotronHLayerwiseModel, Error> {
     let mut adapter = NemotronHLayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
-    let execution = load_tensor_parallel_layerwise_model(
+    let execution = load_nemotron_h_parallel_with_store(
         store,
         adapter,
-        non_expert,
+        non_expert.into(),
         build,
         stream,
         weights_stream,
@@ -1674,10 +2782,10 @@ pub fn load_nemotron_h_expert_cache_model(
     let mut adapter = NemotronHLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
     let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
-    let mut execution = load_layerwise_model_with_quantization(
+    let mut execution = load_nemotron_h_with_store(
         store,
         adapter,
-        non_expert,
+        non_expert.into(),
         quantize_on_load,
         stream,
         weights_stream,
@@ -1896,7 +3004,11 @@ impl NemotronHLayerwiseAdapter {
     }
 
     fn new_cache(&self) -> Cache {
-        let cache = Cache::new(&self.args);
+        let cache = match self.parallel_geometry.as_deref() {
+            Some(geometry) => Cache::new_with_geometry(&self.args, geometry)
+                .expect("validated Nemotron-H parallel cache geometry"),
+            None => Cache::new(&self.args),
+        };
         match &self.mtp {
             Some(mtp) => cache.with_mtp_policies(&mtp.policies),
             None => cache,
@@ -3343,3 +4455,32 @@ fn nemotron_planned_binding(
 /// Nemotron-H token generation iterator using bounded layer execution.
 pub type Generate<'a, S = crate::backend::mlx::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, NemotronHLayerwiseModel, Cache, S>;
+
+#[cfg(test)]
+mod neutral_runtime_tests {
+    #[test]
+    fn production_model_and_loaders_use_the_neutral_layerwise_runtime() {
+        let source = include_str!("layerwise.rs");
+        let wrapper_start = source
+            .find("pub struct NemotronHLayerwiseModel")
+            .expect("Nemotron-H production wrapper");
+        let adapter_start = source
+            .find("/// Adapter shared by Nemotron-H")
+            .expect("pipeline-only legacy adapter marker");
+        let production = &source[wrapper_start..adapter_start];
+        assert!(production.contains("execution: NemotronHExecution"));
+        assert!(production.contains("load_nemotron_h_with_store("));
+        assert!(production.contains("load_nemotron_h_parallel_with_store("));
+        for legacy in [
+            "LayerwiseModel<",
+            "load_layerwise_model(",
+            "load_layerwise_model_with_quantization(",
+            "load_tensor_parallel_layerwise_model(",
+        ] {
+            assert!(
+                !production.contains(legacy),
+                "production Nemotron-H path still references {legacy}"
+            );
+        }
+    }
+}

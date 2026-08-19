@@ -1,7 +1,7 @@
 //! Nemotron-H configuration parsing, runtime blocks, and strict checkpoint loading.
 
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
-use eredu_runtime::CausalModel;
+use eredu_runtime::{CausalModel, RuntimeState, StateError, StateLayout};
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -3343,6 +3343,7 @@ impl LayerCache {
 #[derive(Debug, Clone)]
 /// Heterogeneous cache for Nemotron-H hybrid layers.
 pub struct Cache {
+    layout: StateLayout,
     /// Per-layer cache state.
     pub layers: Vec<LayerCache>,
     /// State owned by checkpoint-embedded prediction operators.
@@ -3352,7 +3353,25 @@ pub struct Cache {
 impl Cache {
     /// Creates an empty cache matching the authoritative layer schedule.
     pub fn new(args: &ModelArgs) -> Self {
+        let layout = StateLayout::new(
+            prompt_cache_layer_layout(args).expect("validated Nemotron-H cache geometry"),
+        )
+        .expect("validated Nemotron-H state layout");
+        Self::new_with_layout(args, layout)
+    }
+
+    pub(crate) fn new_with_geometry(
+        args: &ModelArgs,
+        geometry: &[ParallelLayerGeometry],
+    ) -> Result<Self, Error> {
+        let layout = StateLayout::new(prompt_cache_layer_layout_with_geometry(args, geometry)?)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        Ok(Self::new_with_layout(args, layout))
+    }
+
+    fn new_with_layout(args: &ModelArgs, layout: StateLayout) -> Self {
         Self {
+            layout,
             layers: args
                 .layer_schedule
                 .iter()
@@ -3444,10 +3463,43 @@ impl Cache {
         }
     }
 
+    pub(crate) fn new_with_options_geometry_and_rank(
+        args: &ModelArgs,
+        geometry: &[ParallelLayerGeometry],
+        policy: CacheResidencyPolicy,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let layer_layout = prompt_cache_layer_layout_with_geometry(args, geometry)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let layout =
+            StateLayout::new(layer_layout).map_err(|error| Exception::custom(error.to_string()))?;
+        match policy {
+            CacheResidencyPolicy::Device => Ok(Self::new_with_layout(args, layout)),
+            CacheResidencyPolicy::Paged(options) => {
+                let manager = CacheResidencyManager::new(options)
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                Self::new_paged_with_manager_and_layout(args, manager, rank, layout)
+            }
+        }
+    }
+
     fn new_paged_with_manager(
         args: &ModelArgs,
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let layer_layout = prompt_cache_layer_layout(args)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let layout =
+            StateLayout::new(layer_layout).map_err(|error| Exception::custom(error.to_string()))?;
+        Self::new_paged_with_manager_and_layout(args, manager, rank, layout)
+    }
+
+    fn new_paged_with_manager_and_layout(
+        args: &ModelArgs,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+        layout: StateLayout,
     ) -> Result<Self, Exception> {
         if !args
             .layer_schedule
@@ -3466,6 +3518,7 @@ impl Cache {
             .map(|(layer, policy)| LayerCache::new_paged(policy, manager.clone(), layer, rank))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
+            layout,
             layers,
             mtp_layers: Vec::new(),
         })
@@ -3525,6 +3578,34 @@ impl Cache {
             }
         }
         Ok(())
+    }
+}
+
+impl RuntimeState<crate::backend::mlx::nn::shared::MlxBackend> for Cache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        if address.group() != 0 {
+            return Err(StateError::UnknownLayer {
+                layer: address.group(),
+                count: 1,
+            });
+        }
+        self.layers
+            .get(address.index())
+            .ok_or(StateError::UnknownLayer {
+                layer: address.index(),
+                count: self.layers.len(),
+            })
+            .map(|layer| layer.retained_arrays().into_iter())
     }
 }
 
@@ -3940,8 +4021,14 @@ impl Model {
             .collect::<BTreeMap<_, _>>();
         let end = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Exception::custom("Nemotron-H prompt length exceeds i32"))?;
-        let mut cache =
-            Cache::new_paged_with_manager(args, manager, identity.topology.cache_rank_identity())?;
+        let layout = StateLayout::new(identity.layer_layout.clone())
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut cache = Cache::new_paged_with_manager_and_layout(
+            args,
+            manager,
+            identity.topology.cache_rank_identity(),
+            layout,
+        )?;
         for (layer, layer_cache) in cache.layers.iter_mut().enumerate() {
             if let LayerCache::Mamba(cache) = layer_cache {
                 if args.conv_kernel > 1 {
