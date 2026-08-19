@@ -3,7 +3,9 @@
 use eredu_checkpoint::AffineQuantization;
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
-use eredu_runtime::CausalModel;
+use eredu_runtime::{
+    CausalModel, RuntimeLayerState, RuntimeState, StateError, StateLayout,
+};
 
 use safemlx::{
     builder::Builder,
@@ -897,6 +899,19 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
+pub(crate) fn state_layout(args: &ModelArgs) -> Result<StateLayout, Error> {
+    StateLayout::new(prompt_cache_layer_layout(args)?)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
+pub(crate) fn state_layout_with_geometry(
+    args: &ModelArgs,
+    geometry: &[ParallelLayerGeometry],
+) -> Result<StateLayout, Error> {
+    StateLayout::new(prompt_cache_layer_layout_with_geometry(args, geometry)?)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum QwenWeightFormat {
     Dense,
@@ -1184,6 +1199,8 @@ impl QwenLinear {
 #[derive(Debug, Clone)]
 /// Heterogeneous cache for Qwen3.5 MoE layers.
 pub struct Cache {
+    layout: StateLayout,
+    decoder_group: usize,
     /// One cache entry per transformer layer.
     pub layers: Vec<LayerCache>,
     /// Full-attention caches owned by the embedded MTP layers.
@@ -1195,6 +1212,8 @@ impl Cache {
     pub fn new(args: &ModelArgs) -> Result<Self, Error> {
         validate_text_model_args(args, "Qwen hybrid cache")?;
         Ok(Self {
+            layout: state_layout(args)?,
+            decoder_group: 0,
             layers: args
                 .layer_schedule
                 .iter()
@@ -1252,7 +1271,17 @@ impl Cache {
                     .map(LayerCache::FullAttention)
             })
             .collect::<Result<Vec<_>, Exception>>()?;
-        Ok(Self { layers, mtp_layers })
+        Ok(Self {
+            layout: state_layout(args)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            decoder_group: 0,
+            layers,
+            mtp_layers,
+        })
+    }
+
+    pub(crate) fn set_decoder_group(&mut self, decoder_group: usize) {
+        self.decoder_group = decoder_group;
     }
 
     /// Returns aggregate live full-attention paging observations, if enabled.
@@ -1375,6 +1404,45 @@ impl LayerCache {
                 .chain(cache.recurrent_state.iter())
                 .collect(),
         }
+    }
+}
+
+impl RuntimeLayerState<crate::backend::mlx::nn::shared::MlxBackend> for LayerCache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        self.retained_arrays().into_iter()
+    }
+}
+
+impl RuntimeState<crate::backend::mlx::nn::shared::MlxBackend> for Cache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        if address.group() < self.decoder_group {
+            return Ok(Vec::new().into_iter());
+        }
+        if address.group() > self.decoder_group {
+            return Err(StateError::UnknownLayer {
+                layer: address.group(),
+                count: self.decoder_group + 1,
+            });
+        }
+        self.layers
+            .get(address.index())
+            .ok_or(StateError::UnknownLayer {
+                layer: address.index(),
+                count: self.layers.len(),
+            })
+            .map(RuntimeLayerState::retained_values)
     }
 }
 
