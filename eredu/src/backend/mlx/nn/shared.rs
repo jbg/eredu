@@ -276,6 +276,59 @@ impl<M: Parameterized<Array>> ModuleParameters for MlxModule<M> {
     }
 }
 
+/// Native MLX module exposed through stable neutral parameter identities.
+#[derive(Debug, Clone)]
+pub(crate) struct MlxNamedModule<M> {
+    inner: M,
+    topology: BTreeMap<String, ParameterSpec>,
+}
+
+impl<M: ModuleParameters> MlxNamedModule<M> {
+    /// Attaches one authoritative weight identity and optional bias identity.
+    pub(crate) fn new(
+        inner: M,
+        weight: ParameterSpec,
+        bias: Option<ParameterSpec>,
+    ) -> Result<Self, ComputeError> {
+        let topology = parameter_topology(&inner, weight, bias)?;
+        Ok(Self { inner, topology })
+    }
+}
+
+impl<M> std::ops::Deref for MlxNamedModule<M> {
+    type Target = M;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<M> std::ops::DerefMut for MlxNamedModule<M> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<M: ModuleParameters> Parameterized<Array> for MlxNamedModule<M> {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, Array>,
+    {
+        visit_module_parameters(&self.inner, &self.topology, visitor);
+    }
+
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, Array>,
+    {
+        visit_module_parameters_mut(&mut self.inner, &self.topology, visitor);
+    }
+
+    fn set_trainable(&mut self, trainable: bool) {
+        set_module_trainable(&mut self.inner, trainable);
+    }
+}
+
 macro_rules! delegate_parameters {
     ($type:ty, $field:tt) => {
         impl ModuleParameters for $type {

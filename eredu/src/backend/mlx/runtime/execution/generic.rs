@@ -6,7 +6,7 @@ use std::{
 };
 
 use eredu_nn::{ParameterMetadata, ParameterVisitorMut, Parameterized};
-use eredu_runtime::{LayerwisePolicy, OffloadUnit};
+use eredu_runtime::{LayerwisePolicy, OffloadUnit, WeightBinding};
 use safemlx::{transforms::async_eval_with_event, Array, Event, Stream};
 
 use crate::backend::mlx::{
@@ -200,6 +200,17 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
         self._static_leases.len()
     }
 
+    /// Evicts every temporary execution-device unit after exact completion.
+    pub(crate) fn clear_device_window(&self) -> Result<(), Error> {
+        if let Some(dense) = &self.dense {
+            dense.controller.clear_group(&self.residency, "model")?;
+        }
+        for id in &self.unit_ids {
+            self.residency.evict(id, MemoryTier::Device)?;
+        }
+        Ok(())
+    }
+
     /// Populates every unit once and converts the bounded loader into a
     /// permanently resident policy without changing the architecture loop.
     pub(crate) fn into_resident(mut self, stream: &Stream) -> Result<MlxResidentPolicy<U>, Error>
@@ -377,7 +388,7 @@ fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error>
 pub(crate) fn prepare_layerwise_policy<SM, U, F, I>(
     store: SharedWeightStore,
     static_modules: &mut SM,
-    mut build: F,
+    build: F,
     layer_count: usize,
     options: LayerWeightResidency,
     stream: &Stream,
@@ -389,6 +400,58 @@ where
     U: Parameterized<Array>,
     F: MlxUnitFactory<U>,
     I: Fn(&str) -> bool,
+{
+    prepare_layerwise_policy_with_bindings(
+        store,
+        static_modules,
+        build,
+        layer_count,
+        options,
+        stream,
+        weights_stream,
+        ignored,
+        |modules, store| {
+            build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
+        },
+        |_index, unit, store, _stream| {
+            build_module_bindings(&MlxModule::new(unit), "", store).map_err(Into::into)
+        },
+    )
+}
+
+/// Builds the generic policy from caller-realized local binding selections.
+///
+/// Parallel composition uses this entry point to provide rank-local checkpoint
+/// selections while retaining the same residency, overlap, and completion
+/// algorithm used by replicated execution.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_layerwise_policy_with_bindings<SM, U, F, I, SB, UB>(
+    store: SharedWeightStore,
+    static_modules: &mut SM,
+    mut build: F,
+    layer_count: usize,
+    options: LayerWeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+    ignored: I,
+    static_bindings: SB,
+    mut unit_bindings: UB,
+) -> Result<(MlxLayerwisePolicy<U, F>, LayerwiseModelMetadata), Error>
+where
+    SM: Parameterized<Array>,
+    U: Parameterized<Array>,
+    F: MlxUnitFactory<U>,
+    I: Fn(&str) -> bool,
+    SB: FnOnce(
+        &SM,
+        &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<Vec<WeightBinding>, Error>,
+    UB: FnMut(
+        usize,
+        U,
+        &dyn eredu_checkpoint::store::CheckpointSource,
+        &Stream,
+    ) -> Result<Vec<WeightBinding>, Error>,
 {
     if layer_count == 0 {
         return Err(Error::Parallel(
@@ -404,8 +467,7 @@ where
     let mut consumed = BTreeSet::new();
 
     let static_id = OffloadUnitId::new("model.static")?;
-    let static_bindings =
-        build_module_bindings(&MlxModule::new(static_modules.clone()), "", store.as_ref())?;
+    let static_bindings = static_bindings(static_modules, store.as_ref())?;
     let static_bytes = binding_bytes(&static_bindings)?;
     consumed.extend(
         static_bindings
@@ -426,8 +488,8 @@ where
     let mut total_host_bytes = 0u64;
     let mut maximum_host_bytes = 0u64;
     for index in 0..layer_count {
-        let unit = MlxModule::new(build.build(index, stream)?);
-        let bindings = build_module_bindings(&unit, "", store.as_ref())?;
+        let unit = build.build(index, stream)?;
+        let bindings = unit_bindings(index, unit, store.as_ref(), stream)?;
         let bytes = binding_bytes(&bindings)?;
         layer_parameter_bytes = layer_parameter_bytes
             .checked_add(bytes)

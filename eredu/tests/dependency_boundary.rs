@@ -36,7 +36,6 @@ fn portable_facade_graph_has_no_accelerator_runtime() {
     for forbidden in [
         "safemlx ",
         "safemlx-sys ",
-        "tempfile ",
         "windows-sys ",
         "image ",
         "rustfft ",
@@ -80,6 +79,64 @@ fn mlx_neural_operator_binding_is_architecture_agnostic() {
         assert!(
             !source.contains(forbidden),
             "architecture dependency {forbidden:?} leaked into MLX operators"
+        );
+    }
+}
+
+#[test]
+fn mlx_backend_contains_no_llama_knowledge() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let backend = root.join("src/backend/mlx");
+    let mut sources = Vec::new();
+    rust_sources(&backend, &mut sources);
+    for source in sources {
+        let text = std::fs::read_to_string(&source).expect("MLX source must be readable");
+        for forbidden in ["llama", "Llama", "ModelArgs", "eredu_architectures::llama"] {
+            assert!(
+                !text.contains(forbidden),
+                "Llama dependency {forbidden:?} leaked into MLX backend source {source:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn llama_hot_path_remains_statically_dispatched_and_device_native() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    for relative in [
+        "eredu-runtime/src/layered.rs",
+        "eredu-architectures/src/llama.rs",
+    ] {
+        let path = workspace.join(relative);
+        let source = std::fs::read_to_string(&path).expect("hot-path source must be readable");
+        for forbidden in [
+            "Box<dyn",
+            "&dyn Architecture",
+            "dyn AttentionCache",
+            ".to_bytes(",
+            ".as_bytes(",
+            ".synchronize(",
+            "eval(",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "hot path {path:?} contains forbidden operation {forbidden:?}"
+            );
+        }
+    }
+
+    let composition = std::fs::read_to_string(workspace.join("eredu/src/composition/llama.rs"))
+        .expect("Llama composition source must be readable");
+    for removed in [
+        "ArchitectureAdapter",
+        "LayerwiseModel<",
+        "LlamaAdapterInput",
+    ] {
+        assert!(
+            !composition.contains(removed),
+            "Llama composition retains legacy runtime path {removed:?}"
         );
     }
 }
@@ -267,11 +324,19 @@ fn crate_root_does_not_reexport_mlx_implementation_types() {
             !manifest.join("src").join(removed).exists(),
             "MLX implementation tree remains at crate root: {removed}"
         );
-        assert!(
-            manifest.join("src/backend/mlx").join(removed).is_dir(),
-            "MLX backend does not own implementation tree: {removed}"
-        );
     }
+    assert!(
+        manifest.join("src/backend/mlx/nn").is_dir(),
+        "MLX backend does not own reusable neural capabilities"
+    );
+    assert!(
+        manifest.join("src/composition/mlx_architectures").is_dir(),
+        "high-level MLX model composition is missing"
+    );
+    assert!(
+        !manifest.join("src/backend/mlx/architectures").exists(),
+        "model-family composition leaked back into the MLX backend"
+    );
 }
 
 #[test]

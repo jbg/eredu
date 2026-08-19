@@ -8915,11 +8915,18 @@ fn load_llama_pipeline(
         })
         .transpose()?
         .flatten();
-    let mut target_args = source_args.clone();
-    if let Some(quantization) = quantize_on_load {
-        target_args.quantization = Some(quantization);
-        target_args.quantization_config = None;
-    }
+    let (store, target_args, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, args, report) = crate::composition::llama::quantize_neutral_llama_store(
+                store,
+                &source_args,
+                quantization,
+                stream,
+            )?;
+            (store, args, Some(report))
+        }
+        None => (store, source_args.clone(), None),
+    };
     let range = topology.layer_range(source_args.attention_schedule.len())?;
     let mut info = base_info(
         topology,
@@ -8929,12 +8936,12 @@ fn load_llama_pipeline(
         source_args.hidden_size,
     );
     let binding_adapter =
-        crate::composition::llama::LlamaParallelComposition::new(source_args.clone(), stream)?;
+        crate::composition::llama::LlamaParallelComposition::new(target_args.clone(), stream)?;
     let mut stage = LlamaStage::new(target_args.clone(), range, &info, stream)?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
         let mut planner = build.planner();
-        binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
+        binding_adapter.register_parallel_parameters(&mut planner, stream)?;
         let (_, layout) = planner.finish()?;
         stage.parallel_kv_heads = Some(
             eredu_architectures::llama::local_key_value_heads(&source_args, &layout)
@@ -8987,13 +8994,9 @@ fn load_llama_pipeline(
         .range
         .clone()
         .map(|global_layer| {
-            stage.layer_adapter.new_cartesian_layer(
-                0,
-                global_layer,
-                parallel_layout.as_ref(),
-                None,
-                stream,
-            )
+            stage
+                .layer_adapter
+                .new_cartesian_layer(global_layer, parallel_layout.as_ref(), stream)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let static_roles = selected_pipeline_static_roles([
@@ -9010,31 +9013,9 @@ fn load_llama_pipeline(
             stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
         ),
     ]);
-    let (store, materialization) = match quantize_on_load {
-        Some(quantization) => {
-            let (store, report) = quantize_pipeline_stage_store(
-                store,
-                &binding_adapter,
-                &stage.layer_adapter,
-                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
-                quantization,
-                stream,
-            )?;
-            (store, Some(report))
-        }
-        None => (store, None),
-    };
-    let quantize_on_load = materialization
-        .is_none()
-        .then_some(quantize_on_load)
-        .flatten();
-    let binding_adapter = if materialization.is_some() {
-        &stage.layer_adapter
-    } else {
-        &binding_adapter
-    };
     info.materialization = materialization;
-    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
+    let static_units = binding_adapter.selected_static_units(store.as_ref(), &static_roles)?;
+    let quantize_on_load = None;
     let mut loaded = PipelineLoadAccumulator::new("Llama");
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
@@ -9124,12 +9105,9 @@ fn load_llama_pipeline(
     if dense_stream.is_none() {
         for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
             let bindings = binding_adapter.cartesian_layer_bindings(
-                0,
                 global_layer,
-                layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
-                None,
                 stream,
             )?;
             loaded.load(
@@ -9157,22 +9135,13 @@ fn load_llama_pipeline(
             stream,
             weights_stream,
             |global_layer, stream| {
-                streamed_adapter.new_cartesian_layer(
-                    0,
-                    global_layer,
-                    streamed_layout.as_ref(),
-                    None,
-                    stream,
-                )
+                streamed_adapter.new_cartesian_layer(global_layer, streamed_layout.as_ref(), stream)
             },
-            |global_layer, layer, store| {
+            |global_layer, _layer, store| {
                 binding_adapter.cartesian_layer_bindings(
-                    0,
                     global_layer,
-                    layer,
                     store,
                     streamed_layout.as_ref(),
-                    None,
                     stream,
                 )
             },
@@ -10163,13 +10132,7 @@ impl LlamaStage {
                 stream: execution.stream(),
             },
             |global_layer, stream| {
-                layer_adapter.new_cartesian_layer(
-                    0,
-                    global_layer,
-                    parallel_layout.as_ref(),
-                    None,
-                    stream,
-                )
+                layer_adapter.new_cartesian_layer(global_layer, parallel_layout.as_ref(), stream)
             },
             |global_layer, layer, hidden, cache, stream| {
                 let forwarded = match cache {

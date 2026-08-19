@@ -1093,7 +1093,25 @@ impl<B: NeuralBackend> LayeredModel<B> {
         S::LayerState: AttentionCache<B::Tensor>,
     {
         let expected = state_layout(&self.args)?;
-        if state.layout() != &expected {
+        self.begin_embedded_with_layout(hidden, supplied_mask, state, &expected, context)
+    }
+
+    /// Prepares architecture-owned mask state against an explicitly realized
+    /// state layout, such as the rank-local KV geometry produced by tensor
+    /// parallel planning.
+    pub fn begin_embedded_with_layout<S>(
+        &mut self,
+        hidden: B::Tensor,
+        supplied_mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: RuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        if state.layout() != expected {
             return Err(Error::backend(format!(
                 "Llama runtime state layout {:?} does not match architecture layout {expected:?}",
                 state.layout()

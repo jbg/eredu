@@ -101,6 +101,48 @@ where
     ) -> Self::RetainedContextValues<'a>;
 }
 
+/// Optional statically dispatched parallel lifecycle for a layered architecture.
+///
+/// The runtime owns traversal and exact unit completion while the architecture
+/// owns parallel embedding, block, and output semantics. Backend-native
+/// collective contexts cross this boundary unchanged.
+pub trait ParallelLayeredArchitecture<B, S>: LayeredArchitecture<B, S>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+{
+    /// Embeds input and prepares forward values for rank-local execution.
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error>;
+
+    /// Executes one rank-local unit and its required collectives.
+    fn forward_unit_parallel(
+        &mut self,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>;
+
+    /// Applies the rank-local output projection and returns complete logits.
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>;
+}
+
 /// Fully resident runtime using the same lifecycle as bounded execution.
 pub struct ResidentRuntime<A, B, S>
 where
@@ -353,6 +395,72 @@ where
         let output = self
             .architecture
             .finish_forward(&forward.hidden, state, &forward.context, context)
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        self.policy
+            .finish(&output, context)
+            .map_err(LayerwiseRuntimeError::Policy)?;
+        Ok(output)
+    }
+
+    /// Runs one complete rank-local pass through the neutral parallel lifecycle.
+    pub fn forward_parallel<'a>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+    {
+        let count = self
+            .architecture
+            .unit_count()
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let mut forward = self
+            .architecture
+            .begin_forward_parallel(input, state, parallel, context)
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        self.policy
+            .begin(&forward.hidden, context)
+            .map_err(LayerwiseRuntimeError::Policy)?;
+        for index in 0..count {
+            let mut lease = self
+                .policy
+                .acquire(index, context)
+                .map_err(LayerwiseRuntimeError::Policy)?;
+            forward.hidden = self
+                .architecture
+                .forward_unit_parallel(
+                    index,
+                    &mut lease,
+                    &forward.hidden,
+                    state,
+                    &mut forward.context,
+                    parallel,
+                    context,
+                )
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            let state_values = state
+                .retained_values(index)
+                .map_err(LayerwiseRuntimeError::State)?;
+            let context_values = self
+                .architecture
+                .retained_context_values(&forward.context, index);
+            self.policy
+                .complete(
+                    index,
+                    lease,
+                    &forward.hidden,
+                    state_values,
+                    context_values,
+                    context,
+                )
+                .map_err(LayerwiseRuntimeError::Policy)?;
+        }
+        let output = self
+            .architecture
+            .finish_forward_parallel(&forward.hidden, state, &forward.context, parallel, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
         self.policy
             .finish(&output, context)

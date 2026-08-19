@@ -7,26 +7,26 @@ and an execution backend. It is intended for backend authors and maintainers of
 ## Dependency direction
 
 ```text
-applications
-    ↓
-eredu facade
-    ↓
-eredu-core
-
-backend implementations ──→ eredu-core
+eredu-core        eredu-checkpoint        eredu-nn
+        \                |                /
+                     eredu-runtime
+                           |
+                   eredu-architectures
+                           |
+             eredu composition + backends
 ```
 
-`eredu-core` contains no native accelerator dependency. The
-`eredu` facade is also portable when built with
-`default-features = false`. Its default `mlx` feature adds the MLX adapter and
-model implementations under `eredu::backend::mlx`.
+The neutral crates contain no native accelerator dependency. The `eredu`
+facade is also portable when built with `default-features = false`. Its default
+`mlx` feature adds reusable MLX capabilities under `eredu::backend::mlx` and
+connects them to neutral architectures under `eredu::composition`.
 
 The facade root and `api` namespace expose portable application concepts.
 Backend-native types remain in their backend namespace.
 
 ## Ownership boundary
 
-Core owns semantics that are independent of tensor representation:
+Portable crates split tensor-independent ownership by responsibility:
 
 - artifact identity, header inspection, model-family resolution, tensor
   catalogs, and preparation plans;
@@ -46,19 +46,28 @@ Core owns semantics that are independent of tensor representation:
 - distributed scopes, topology membership, placement, consensus messages, and
   operation capability descriptions.
 
+`eredu-runtime` owns statically dispatched resident and bounded execution,
+parameter binding, residency, mutable state, exact completion, distributed-plan
+realization, and generation-facing causal-model contracts.
+
+`eredu-architectures` owns model-family configuration, checkpoint contracts,
+parameter topology, module construction, state geometry, parallel semantic
+plans, and the complete embedding/layer/output lifecycle. Architecture code is
+generic over `NeuralBackend` and passes backend-native tensor handles through
+unchanged.
+
 A backend owns runtime-specific resources and computation:
 
-- executable models and architecture tensor implementations;
-- tensors, queues or streams, random state, and sampling math;
+- tensors, neural operators, queues or streams, random state, and sampling math;
 - model and request cache storage;
 - checkpoint payload mapping and tensor materialization;
 - native device discovery, allocation measurements, transfers, and kernels;
 - communicators and collective tensor operations; and
 - exact native completion objects and runtime-specific errors.
 
-Core contracts use associated opaque types for these values. They do not use
-`Any`, untyped pointers, string-dispatched operations, or a primitive tensor
-trait.
+Neutral contracts use associated concrete types for these values. They do not
+use `Any`, untyped pointers, string-dispatched operations, or erased calls in
+per-layer and per-token paths.
 
 ## Loading and session creation
 
@@ -177,18 +186,22 @@ consensus submissions with exact completion. Unsupported operations report an
 explicit absent capability. Communicator construction, sharding, movement, and
 collective tensor math remain backend-specific.
 
-## MLX adapter
+## MLX implementation
 
 The default MLX implementation lives under `eredu::backend::mlx`:
 
 - `MlxBackend` owns execution and weight-materialization streams.
 - `MlxModelSession` owns the executable model, cache, processor state, and
   optional distributed context.
-- architecture and neural-network modules implement MLX tensor computation;
+- neural-network modules implement reusable MLX tensor operations;
 - runtime modules implement checkpoint materialization, sampling, caches,
   residency workers, media processing, and collectives; and
 - MLX events provide exact completion while retaining arrays and source
   resources required by submitted work.
+
+Model-family selection and MLX composition live under `eredu::composition`.
+The MLX backend directory contains no Llama configuration, checkpoint names,
+cache geometry, parallel head rules, or layer math.
 
 The adapter translates native failures into structured backend errors and
 populates portable capability, inspection, memory, admission, and telemetry
@@ -199,27 +212,36 @@ appear in core or generic facade signatures.
 
 A new backend should:
 
-1. implement artifact policy and model materialization through
-   `ModelLoadingBackend`;
-2. implement `Backend` and one stateful `BackendSession` with exact completion;
-3. implement `TextGenerationBackend` for ordinary language-model use;
-4. populate portable capability, resource, admission, and telemetry reports;
-5. add optional multimodal, speculative, realtime, transfer, or distributed
+1. implement the `NeuralBackend` operators required by the architectures it
+   intends to run;
+2. implement parameter materialization, binding, transfer, and exact submission
+   completion capabilities;
+3. implement concrete runtime-state/cache storage when cached or paged
+   execution is desired;
+4. implement collective operations when distributed execution is desired;
+5. compose those capabilities with existing neutral architectures and runtime
+   policies in the facade;
+6. populate portable capability, resource, admission, and telemetry reports;
+7. add optional multimodal, speculative, realtime, transfer, or distributed
    capabilities only when supported;
-6. realize portable execution plans through an
+8. realize portable execution plans through an
    `ExecutionPlanBackendFactory`; and
-7. run the reusable non-MLX backend conformance suite.
+9. run the reusable backend and architecture conformance suites.
 
-Architecture computation may be implemented through IREE, Slang, Vulkan, or
-another runtime without changing portable caller code. Backend-specific
-compiler artifacts, buffers, command queues, caches, and completion primitives
-remain associated implementation types.
+Adding a backend never requires implementing Llama, mapping Llama checkpoint
+names, or constructing a Llama-specific cache. Backend-specific compiler
+artifacts, buffers, command queues, caches, and completion primitives remain
+associated implementation types.
 
 ## Enforced guarantees
 
 Tests verify that:
 
 - the core dependency graph contains no `safemlx` or native accelerator runtime;
+- architecture crates contain no backend imports and MLX backend sources contain
+  no model-family knowledge;
+- the neutral Llama hot path has no erased per-layer call, host tensor
+  conversion, or explicit evaluation boundary;
 - the feature-disabled facade compiles and exercises loading, generation,
   capabilities, multimodal preparation, speculative execution, realtime,
   distributed sessions, planning, and residency through a mock backend; and

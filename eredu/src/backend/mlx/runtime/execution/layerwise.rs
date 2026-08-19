@@ -1481,6 +1481,26 @@ pub struct ParallelModelInfo {
 }
 
 impl ParallelModelInfo {
+    pub(crate) fn new(
+        topology: crate::backend::mlx::MlxParallelContext,
+        model_type: impl Into<String>,
+        owned_tensors: Vec<String>,
+        local_parameter_bytes: u64,
+        global_parameter_bytes: u64,
+        pinned_device_parameter_bytes: u64,
+        maximum_device_parameter_bytes: u64,
+    ) -> Self {
+        Self {
+            topology,
+            model_type: model_type.into(),
+            owned_tensors,
+            local_parameter_bytes,
+            global_parameter_bytes,
+            pinned_device_parameter_bytes,
+            maximum_device_parameter_bytes,
+        }
+    }
+
     /// Returns the complete distributed topology and this process's coordinates.
     pub const fn topology(&self) -> crate::backend::mlx::MlxParallelContext {
         self.topology
