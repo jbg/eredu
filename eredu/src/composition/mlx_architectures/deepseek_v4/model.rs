@@ -6,7 +6,7 @@
 //! fused DSpark checkpoints therefore share one validation path.
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_runtime::CausalModel;
+use eredu_runtime::{CausalModel, RuntimeLayerState, RuntimeState, StateError, StateLayout};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -640,6 +640,7 @@ pub fn validate_model_config_value(value: &Value) -> Result<(), Error> {
 /// Per-layer V4 cache state.
 #[derive(Debug, Clone)]
 pub struct Cache {
+    layout: StateLayout,
     pub(crate) layers: Vec<AttentionCache>,
     pub(crate) mtp_layers: Vec<AttentionCache>,
 }
@@ -697,6 +698,42 @@ impl Cache {
             cache.restore_checkpoint(previous, stream)?;
         }
         Ok(())
+    }
+}
+
+impl RuntimeLayerState<crate::backend::mlx::nn::shared::MlxBackend> for AttentionCache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        self.retained_arrays().into_iter()
+    }
+}
+
+impl RuntimeState<crate::backend::mlx::nn::shared::MlxBackend> for Cache {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    fn retained_values(
+        &self,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        if address.group() != 0 {
+            return Err(StateError::UnknownLayer {
+                layer: address.group(),
+                count: 1,
+            });
+        }
+        self.layers
+            .get(address.index())
+            .ok_or(StateError::UnknownLayer {
+                layer: address.index(),
+                count: self.layers.len(),
+            })
+            .map(RuntimeLayerState::retained_values)
     }
 }
 
@@ -1530,6 +1567,14 @@ pub(crate) fn prompt_cache_layer_layout(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
+pub(crate) fn state_layout(args: &ModelArgs) -> Result<StateLayout, Error> {
+    StateLayout::new(prompt_cache_layer_layout(
+        args,
+        0..args.num_hidden_layers as usize,
+    )?)
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
 pub(crate) fn prompt_cache_model_identity(
     args: &ModelArgs,
     topology: PromptCacheTopology,
@@ -1706,6 +1751,7 @@ fn empty_cache_for_args(args: &ModelArgs) -> Result<Cache, Error> {
             .map_err(Error::from)
     };
     Ok(Cache {
+        layout: state_layout(args)?,
         layers: (0..target_count).map(&build).collect::<Result<_, _>>()?,
         mtp_layers: (target_count..target_count + draft_count)
             .map(build)
@@ -1733,6 +1779,7 @@ fn paged_cache_for_args(
         .map_err(Error::from)
     };
     Ok(Cache {
+        layout: state_layout(args)?,
         layers: (0..target_count).map(&build).collect::<Result<_, _>>()?,
         mtp_layers: (target_count..target_count + draft_count)
             .map(build)
