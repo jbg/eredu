@@ -35,9 +35,7 @@ use crate::{
         parallel::{VocabParallelEmbedding, VocabParallelLmHead},
         tensor::{create_attention_mask, AttentionMask},
     },
-    backend::mlx::runtime::cache::residency::{
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
-    },
+    backend::mlx::runtime::cache::residency::CacheResidencyReport,
     backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::{
         build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
@@ -83,6 +81,7 @@ use crate::{
     },
     core::attention::AttentionPolicy,
 };
+use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 use eredu_runtime::ResidencyReport;
 

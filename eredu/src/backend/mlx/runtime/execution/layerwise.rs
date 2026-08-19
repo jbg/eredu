@@ -27,7 +27,6 @@ use crate::core::cache::{
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::runtime::cache::residency::PagedCacheOptions,
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_bindings, is_materialized_module_parameter,
         populate_module_from_lease, ModuleBindingError,
@@ -51,6 +50,7 @@ use crate::{
         ResidencyLedgerError, ResidencyPolicy, TransferDirection,
     },
 };
+use eredu_runtime::PagedCacheOptions;
 
 use eredu_runtime::{ResidencyReport, ResidentLayerGroup, WeightMaterializationReport};
 

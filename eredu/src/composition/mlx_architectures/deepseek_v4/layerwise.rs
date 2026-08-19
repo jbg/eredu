@@ -29,7 +29,6 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::{
-        cache::residency::PagedCacheOptions,
         checkpoint::{
             binding::{
                 build_module_binding_plan_with_recipes,
@@ -56,7 +55,7 @@ use crate::{
     },
 };
 
-use eredu_runtime::ResidencyReport;
+use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions, ResidencyReport};
 
 use super::{
     attention::AttentionCache,
@@ -90,18 +89,11 @@ impl DeepSeekV4LayerwiseModel {
 
     /// Creates resident or explicitly bounded cache state independently of
     /// parameter residency.
-    pub fn new_cache_with_options(
-        &self,
-        policy: crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy,
-    ) -> Result<Cache, Error> {
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
         let rank = self.execution.prompt_cache_rank_identity();
         match policy {
-            crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Device => {
-                self.new_cache().map_err(Into::into)
-            }
-            crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy::Paged(
-                options,
-            ) => {
+            CacheResidencyPolicy::Device => self.new_cache().map_err(Into::into),
+            CacheResidencyPolicy::Paged(options) => {
                 let manager =
                     crate::backend::mlx::runtime::cache::residency::CacheResidencyManager::new(
                         options,

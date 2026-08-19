@@ -37,7 +37,6 @@ use crate::{
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::{
-        cache::residency::PagedCacheOptions,
         checkpoint::{
             binding::{
                 build_module_binding_plan_with_recipes,
@@ -69,6 +68,7 @@ use crate::{
         },
     },
 };
+use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 use eredu_runtime::ResidencyReport;
 
@@ -421,10 +421,7 @@ impl KimiLinearLayerwiseModel {
 
     /// Creates device-resident or blockwise-paged MLA state. KDA's bounded
     /// convolution and recurrent tensors remain resident under either policy.
-    pub fn new_cache_with_options(
-        &self,
-        policy: crate::backend::mlx::runtime::cache::residency::CacheResidencyPolicy,
-    ) -> Result<Cache, Error> {
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
         Cache::new_with_options_and_rank(
             self.args(),
             policy,

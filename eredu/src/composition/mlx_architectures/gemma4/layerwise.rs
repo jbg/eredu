@@ -38,7 +38,7 @@ use crate::{
         parallel::{LinearParallelism, ParallelLinear, VocabParallelLmHead},
         tensor::create_causal_mask,
     },
-    backend::mlx::runtime::cache::{residency::PagedCacheOptions, KeyValueCache},
+    backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::{
         build_module_binding_plan_with_recipes_excluding, canonical_checkpoint_name,
         populate_module_from_lease, populate_module_from_lease_excluding,
@@ -80,6 +80,7 @@ use crate::{
     },
     core::attention::AttentionPolicy,
 };
+use eredu_runtime::PagedCacheOptions;
 
 use eredu_runtime::ResidencyReport;
 

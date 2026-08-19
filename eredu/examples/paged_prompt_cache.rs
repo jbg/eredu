@@ -6,8 +6,8 @@ use clap::Parser;
 use eredu::{
     api::LoadedModel,
     backend::mlx::runtime::media::input::{InputPart, ModelInput},
-    backend::mlx::{CacheResidencyPolicy, PagedCacheOptions},
-    AttentionPolicy, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
+    AttentionPolicy, CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor,
+    PromptCacheOptions, PromptCacheTopology,
 };
 use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext};
 

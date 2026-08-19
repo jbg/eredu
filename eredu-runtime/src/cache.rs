@@ -9,9 +9,13 @@
 
 mod executor;
 mod lifecycle;
+mod policy;
 mod storage;
 
 pub use lifecycle::{CacheBlockLifecycle, CacheLifecycleError, MutableCacheTail};
+pub use policy::{
+    CacheResidencyConfigurationError, CacheResidencyPolicy, LiveCacheDiskPolicy, PagedCacheOptions,
+};
 pub use storage::{
     CacheBlockStorage, CacheHostDemotionOperation, CacheHostPromotion, CacheIoOperation,
     CacheIoOperationKey, CacheIoOperationKind, CacheStorageError, CacheStoragePhase,

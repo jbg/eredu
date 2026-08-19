@@ -125,6 +125,14 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<eredu_runtime::CachePoolReport>(),
     );
     assert_eq!(
+        TypeId::of::<eredu::CacheResidencyPolicy>(),
+        TypeId::of::<eredu_runtime::CacheResidencyPolicy>(),
+    );
+    assert_eq!(
+        TypeId::of::<eredu::PagedCacheOptions>(),
+        TypeId::of::<eredu_runtime::PagedCacheOptions>(),
+    );
+    assert_eq!(
         TypeId::of::<eredu::CacheBlockId>(),
         TypeId::of::<eredu::core::cache::CacheBlockId>(),
     );

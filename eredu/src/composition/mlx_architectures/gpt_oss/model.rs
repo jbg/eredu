@@ -38,8 +38,7 @@ use crate::{
         },
     },
     backend::mlx::runtime::cache::residency::{
-        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions,
+        open_prompt_cache, CacheResidencyManager, CacheResidencyReport,
     },
     backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
     backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
@@ -48,6 +47,7 @@ use crate::{
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::CacheRankIdentity,
 };
+use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 fn default_head_dim() -> i32 {
     64

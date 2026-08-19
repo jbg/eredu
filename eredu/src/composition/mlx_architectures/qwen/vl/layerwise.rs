@@ -40,7 +40,7 @@ use crate::{
         },
         tensor::{create_attention_mask, AttentionMask},
     },
-    backend::mlx::runtime::cache::{residency::PagedCacheOptions, KeyValueCache},
+    backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::{
         build_module_binding_plan_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
@@ -73,6 +73,7 @@ use crate::{
         },
     },
 };
+use eredu_runtime::PagedCacheOptions;
 
 use eredu_runtime::ResidencyReport;
 

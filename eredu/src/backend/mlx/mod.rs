@@ -32,7 +32,6 @@ pub(crate) use config::ensure_replicated_load_options;
 pub use config::ModelLoadOptions;
 pub(crate) use distributed::MlxDistributedConfig;
 pub use distributed::MlxDistributedSession;
-pub use runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions};
 pub use runtime::distributed::topology::{PlacementPlan, RankPartition};
 pub use runtime::execution::layerwise::{
     LayerWeightResidency, LayerwiseLoadOptions, NonExpertWeightResidency, ParallelModelInfo,

@@ -40,10 +40,7 @@ use crate::{
         },
         tensor::{create_attention_mask, AttentionMask},
     },
-    backend::mlx::runtime::cache::{
-        residency::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions},
-        KeyValueCache,
-    },
+    backend::mlx::runtime::cache::{residency::CacheResidencyReport, KeyValueCache},
     backend::mlx::runtime::checkpoint::binding::{
         build_module_binding_plan_with_recipes, build_module_binding_plan_with_recipes_excluding,
         canonical_checkpoint_name, packed_companion_checkpoint_name, populate_module_from_lease,
@@ -76,6 +73,7 @@ use crate::{
         TransformerBlock,
     },
 };
+use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 use eredu_runtime::ResidencyReport;
 

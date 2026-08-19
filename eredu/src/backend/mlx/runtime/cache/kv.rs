@@ -11,10 +11,11 @@ use safemlx::{
 use crate::{
     backend::mlx::nn::shared::MlxBackend,
     backend::mlx::runtime::cache::residency::{
-        CacheBlockArrays, CacheResidencyManager, CacheResidencyReport, PagedCacheOptions,
+        CacheBlockArrays, CacheResidencyManager, CacheResidencyReport,
     },
     core::cache::{CacheBlockId, CacheRankIdentity, CacheRepresentation},
 };
+use eredu_runtime::PagedCacheOptions;
 
 pub(crate) type RetainedArrayIter<'a> =
     std::iter::Chain<std::option::Iter<'a, Array>, std::option::Iter<'a, Array>>;
@@ -2948,13 +2949,13 @@ mod tests {
     use crate::{
         backend::mlx::runtime::cache::residency::{
             inspect_prompt_cache, open_prompt_cache, CacheBlockArrays, CacheResidencyManager,
-            PagedCacheOptions,
         },
         core::cache::{
             CacheRankIdentity, CacheRepresentation, PromptCacheDescriptor,
             PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
         },
     };
+    use eredu_runtime::PagedCacheOptions;
     use safemlx::{
         fast::ScaledDotProductAttentionMask,
         ops::{indexing::TryIndexOp, zeros_dtype},

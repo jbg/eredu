@@ -28,9 +28,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::parallel::{VocabParallelEmbedding, VocabParallelLmHead},
     backend::mlx::nn::shared::{MlxBackend, MlxModule, MlxNamedModule},
-    backend::mlx::runtime::cache::residency::{
-        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, PagedCacheOptions,
-    },
+    backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
     backend::mlx::runtime::cache::state::MlxKeyValueState,
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes, build_module_bindings,
@@ -50,6 +48,7 @@ use crate::{
     backend::mlx::runtime::media::input,
     composition::llama_mlx as resident,
 };
+use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 use eredu_runtime::{ResidencyReport, WeightBinding};
 

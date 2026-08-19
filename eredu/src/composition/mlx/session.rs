@@ -17,10 +17,10 @@ use std::path::Path;
 use crate::backend::mlx::runtime::media::{ModelProcessor, PreparedModelInput};
 use crate::core::generation::MtpConfig;
 use crate::{
+    backend::mlx::error::Error,
     backend::mlx::runtime::execution::inspection::ActivationObserver,
     backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
     backend::mlx::runtime::media::input,
-    backend::mlx::{error::Error, CacheResidencyPolicy, PagedCacheOptions},
     composition::mlx_architectures::distributed::{
         expert::ExpertParallelCache,
         pipeline::{PipelineCache, PipelineStageCompletion, PipelineStep},
@@ -28,6 +28,7 @@ use crate::{
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
 };
 use eredu_core::MtpStats;
+use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 use super::{
     MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, MlxModelKind, Model, ModelCache,

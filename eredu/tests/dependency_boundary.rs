@@ -157,6 +157,20 @@ fn cache_execution_algorithms_are_runtime_owned() {
     assert!(runtime.contains("mod executor;"));
     assert!(runtime.contains("mod lifecycle;"));
     assert!(runtime.contains("mod storage;"));
+
+    let mlx =
+        std::fs::read_to_string(workspace.join("eredu/src/backend/mlx/runtime/cache/residency.rs"))
+            .expect("MLX cache realization must be readable");
+    for runtime_owned in [
+        "pub enum CacheResidencyPolicy",
+        "pub enum LiveCacheDiskPolicy",
+        "pub struct PagedCacheOptions",
+    ] {
+        assert!(
+            !mlx.contains(runtime_owned),
+            "MLX cache realization redefined neutral policy {runtime_owned}"
+        );
+    }
 }
 
 #[test]

@@ -16,9 +16,9 @@ use eredu::{
         media::{input::InputPayload, PreparedModelInput},
     },
     backend::mlx::{
-        CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions,
-        LayerwiseLoadOptions, MlxBackend, MlxDistributedSession, MlxParallelContext,
-        ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions, WeightResidency,
+        DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions, LayerwiseLoadOptions,
+        MlxBackend, MlxDistributedSession, MlxParallelContext, ModelLoadOptions,
+        NonExpertWeightResidency, WeightResidency,
     },
     composition::mlx_architectures::distributed::pipeline::{
         load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
@@ -37,6 +37,7 @@ use eredu::{
     load_model, MtpCapability, MtpCheckpointKind, MtpConfig, PromptCacheDescriptor,
     PromptCacheOptions, PromptCacheTopology,
 };
+use eredu::{CacheResidencyPolicy, PagedCacheOptions};
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_gguf::{GgmlType, TensorInput, Writer};
 use safemlx::{

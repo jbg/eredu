@@ -33,8 +33,7 @@ use crate::core::cache::{
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::cache::residency::{
-        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
-        PagedCacheOptions,
+        open_prompt_cache, CacheResidencyManager, CacheResidencyReport,
     },
     backend::mlx::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
     backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
@@ -77,6 +76,7 @@ use crate::{
     core::ModelKind,
     core::{MtpCapability, MtpCheckpointKind, MtpStats},
 };
+use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 use crate::backend::mlx::runtime::execution::layerwise::LayerWeightResidency;
 #[cfg(test)]

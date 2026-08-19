@@ -45,9 +45,8 @@ use crate::{
         cache::{
             residency::{
                 load_prompt_cache_state_tensors, open_prompt_cache, save_prompt_cache_snapshot,
-                CacheBlockArrays, CacheResidencyManager, CacheResidencyPolicy,
-                CacheResidencyReport, PagedCacheOptions, PromptCacheSnapshotBlock,
-                PromptCacheStateArray,
+                CacheBlockArrays, CacheResidencyManager, CacheResidencyReport,
+                PromptCacheSnapshotBlock, PromptCacheStateArray,
             },
             CompressedLatentCache,
         },
@@ -66,6 +65,7 @@ use crate::{
         StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
 };
+use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 #[cfg(test)]
 use crate::backend::mlx::runtime::cache::residency::open_prompt_cache_snapshot;

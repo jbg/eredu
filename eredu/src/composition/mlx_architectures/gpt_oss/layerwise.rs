@@ -34,9 +34,7 @@ use crate::{
         VocabParallelLmHead,
     },
     backend::mlx::nn::{self as common},
-    backend::mlx::runtime::cache::residency::{
-        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, PagedCacheOptions,
-    },
+    backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
     backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
     backend::mlx::runtime::checkpoint::binding::{
         build_module_binding_plan_with_recipes_excluding, build_module_bindings,
@@ -69,6 +67,7 @@ use crate::{
     },
     core::attention::{AttentionPolicy, LayerSchedule},
 };
+use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 use eredu_runtime::ResidencyReport;
 

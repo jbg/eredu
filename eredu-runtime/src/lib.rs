@@ -31,7 +31,8 @@ pub use cache::{
     CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
     CacheIoPreparation, CacheIoStartDisposition, CacheLifecycleError, CachePoolError,
     CachePoolLimits, CachePoolMembership, CachePoolReport, CachePoolReservation, CachePoolResource,
-    CachePoolUsage, CacheResidencyPool, CacheStorageError, CacheStoragePhase, MutableCacheTail,
+    CachePoolUsage, CacheResidencyConfigurationError, CacheResidencyPolicy, CacheResidencyPool,
+    CacheStorageError, CacheStoragePhase, LiveCacheDiskPolicy, MutableCacheTail, PagedCacheOptions,
 };
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupReadySet,

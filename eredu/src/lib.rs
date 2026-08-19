@@ -108,6 +108,7 @@ pub use eredu_runtime::{
     CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
     CacheIoExecutionStateError, CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
     CacheIoPreparation, CacheIoStartDisposition, CacheLifecycleError, CachePoolError,
-    CachePoolLimits, CachePoolReport, CachePoolResource, CacheResidencyPool, CacheStorageError,
-    CacheStoragePhase, MutableCacheTail,
+    CachePoolLimits, CachePoolReport, CachePoolResource, CacheResidencyConfigurationError,
+    CacheResidencyPolicy, CacheResidencyPool, CacheStorageError, CacheStoragePhase,
+    LiveCacheDiskPolicy, MutableCacheTail, PagedCacheOptions,
 };
