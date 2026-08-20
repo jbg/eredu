@@ -1,5 +1,6 @@
 use eredu_checkpoint::AffineQuantization;
 
+use eredu_architectures::kimi_linear;
 use eredu_checkpoint::WeightQuantization;
 
 use super::*;
@@ -18,8 +19,6 @@ use crate::{
     },
     composition::mlx_architectures::{
         gpt_oss::model as gpt_oss,
-        kimi_linear::model as kimi_linear,
-        lfm2::model as lfm2,
         qwen::{hybrid::qwen3_5, vl::model as qwen3_vl},
     },
     core::generation::MtpSchedulerOptions,
@@ -1638,19 +1637,24 @@ fn tiny_lfm2_neutral_runtime_executes_convolution_and_attention_layers() {
               "tie_word_embeddings":false
             }"#,
     );
-    let args = lfm2::get_model_args(&dir).unwrap();
-    save_zero_checkpoint(&lfm2::Model::new(args, stream).unwrap(), &dir, stream);
+    let args = crate::composition::lfm2::load_model_args(&dir).unwrap();
+    save_zero_checkpoint(
+        &crate::backend::mlx::nn::MlxModule::new(
+            crate::composition::lfm2::Lfm2CheckpointTemplate::new(args, stream).unwrap(),
+        ),
+        &dir,
+        stream,
+    );
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
 
-    let mut resident =
-        crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_layerwise_model(
-            &dir,
-            eredu_runtime::LayerWeightResidency::FullyResident,
-            None,
-            stream,
-            weights_stream,
-        )
-        .unwrap();
+    let mut resident = crate::composition::lfm2::load_lfm2_model(
+        &dir,
+        eredu_runtime::WeightResidency::fully_resident(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
     let mut resident_cache = resident.new_cache();
     let resident_logits = resident
         .forward(&tokens, &mut resident_cache, stream)
@@ -1658,15 +1662,16 @@ fn tiny_lfm2_neutral_runtime_executes_convolution_and_attention_layers() {
     safemlx::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 16]);
 
-    let mut bounded =
-        crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_layerwise_model(
-            &dir,
+    let mut bounded = crate::composition::lfm2::load_lfm2_model(
+        &dir,
+        eredu_runtime::WeightResidency::layerwise_host(
             eredu_runtime::LayerwiseLoadOptions::default(),
-            None,
-            stream,
-            weights_stream,
-        )
-        .unwrap();
+        ),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
     let mut bounded_cache = bounded.new_cache();
     let bounded_logits = bounded
         .forward(&tokens, &mut bounded_cache, stream)
@@ -1851,18 +1856,25 @@ fn tiny_lfm2_moe_neutral_runtime_executes_independent_expert_cache() {
               "norm_topk_prob":true,"use_expert_bias":true
             }"#,
     );
-    let args = lfm2::get_model_args(&dir).unwrap();
-    save_zero_checkpoint(&lfm2::Model::new(args, stream).unwrap(), &dir, stream);
-    let mut model =
-        crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_expert_cache_model(
-            &dir,
+    let args = crate::composition::lfm2::load_model_args(&dir).unwrap();
+    save_zero_checkpoint(
+        &crate::backend::mlx::nn::MlxModule::new(
+            crate::composition::lfm2::Lfm2CheckpointTemplate::new(args, stream).unwrap(),
+        ),
+        &dir,
+        stream,
+    );
+    let mut model = crate::composition::lfm2::load_lfm2_model(
+        &dir,
+        eredu_runtime::WeightResidency::with_expert_cache(
             eredu_runtime::NonExpertWeightResidency::FullyResident,
             eredu_runtime::ExpertCacheLoadOptions::default(),
-            None,
-            stream,
-            weights_stream,
-        )
-        .unwrap();
+        ),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
     let mut cache = model.new_cache();
     let logits = model.forward(&tokens, &mut cache, stream).unwrap();
@@ -1896,10 +1908,11 @@ fn tiny_kimi_linear_neutral_runtime_executes_hybrid_state_and_expert_cache() {
               "num_nextn_predict_layers":0
             }"#,
     );
-    let args = kimi_linear::get_model_args(&dir).unwrap();
-    let plan =
-        crate::composition::mlx_architectures::kimi_linear::checkpoint::safetensors_plan(&args)
-            .unwrap();
+    let args = kimi_linear::model_args_from_config_reader(
+        std::fs::File::open(dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    let plan = kimi_linear::safetensors_plan(&args).unwrap();
     let mut tensors = plan.common_tensors;
     for group in plan.layout_groups {
         let packed = group
@@ -1931,9 +1944,9 @@ fn tiny_kimi_linear_neutral_runtime_executes_hybrid_state_and_expert_cache() {
     .unwrap();
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
 
-    let mut resident = crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_layerwise_model(
+    let mut resident = crate::composition::kimi_linear::load_kimi_linear_model(
         &dir,
-        eredu_runtime::LayerWeightResidency::FullyResident,
+        eredu_runtime::WeightResidency::fully_resident(),
         None,
         stream,
         weights_stream,
@@ -1946,9 +1959,11 @@ fn tiny_kimi_linear_neutral_runtime_executes_hybrid_state_and_expert_cache() {
     safemlx::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 16]);
 
-    let mut bounded = crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_layerwise_model(
+    let mut bounded = crate::composition::kimi_linear::load_kimi_linear_model(
         &dir,
-        eredu_runtime::LayerwiseLoadOptions::default(),
+        eredu_runtime::WeightResidency::layerwise_host(
+            eredu_runtime::LayerwiseLoadOptions::default(),
+        ),
         None,
         stream,
         weights_stream,
@@ -1962,10 +1977,12 @@ fn tiny_kimi_linear_neutral_runtime_executes_hybrid_state_and_expert_cache() {
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
     assert!(bounded.residency_report().unwrap().initialized());
 
-    let mut sparse = crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_expert_cache_model(
+    let mut sparse = crate::composition::kimi_linear::load_kimi_linear_model(
         &dir,
-        eredu_runtime::NonExpertWeightResidency::FullyResident,
-        eredu_runtime::ExpertCacheLoadOptions::default(),
+        eredu_runtime::WeightResidency::with_expert_cache(
+            eredu_runtime::NonExpertWeightResidency::FullyResident,
+            eredu_runtime::ExpertCacheLoadOptions::default(),
+        ),
         None,
         stream,
         weights_stream,
@@ -2291,8 +2308,9 @@ fn tiny_deepseek_v4_dspark_executes_through_shared_draft_boundary() {
     .unwrap();
     EmbeddedMtpTarget::prefill_draft_cache(&mut model, &output, &tokens, &mut state, stream)
         .unwrap();
-    let mut draft =
-        <crate::composition::deepseek::DeepSeekModel as EmbeddedMtpTarget>::draft_cache(&state);
+    let mut draft = <crate::composition::deepseek::DeepSeekModel as EmbeddedMtpTarget>::draft_cache(
+        &model, &state,
+    );
     let proposal =
         EmbeddedMtpTarget::fused_draft_logits(&mut model, &output.hidden, 2, 2, &mut draft, stream)
             .unwrap()

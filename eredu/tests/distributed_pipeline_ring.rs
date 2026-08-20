@@ -9,6 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use eredu::composition::{
+    kimi_linear as neutral_kimi_linear, lfm2, nemotron_h as neutral_nemotron_h,
+};
 use eredu::{
     backend::mlx::runtime::generation::sampler::DefaultSampler,
     backend::mlx::runtime::{
@@ -23,7 +26,6 @@ use eredu::{
     },
     composition::mlx_architectures::{
         gemma4, gpt_oss::model as gpt_oss, inkling::model as inkling,
-        kimi_linear::model as kimi_model, lfm2::model as lfm2, nemotron_h::model as nemotron_model,
         qwen::hybrid::qwen3_5 as qwen_hybrid,
     },
     core::{residency::OffloadConfig, BackendProvider as _, BackendSession as _},
@@ -2051,8 +2053,10 @@ fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
     });
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = lfm2::model_args_from_config_value(&config).unwrap();
-    let mut model = lfm2::Model::new(args, stream).unwrap();
+    let args = eredu_architectures::lfm2::model_args_from_config_value(&config).unwrap();
+    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+        lfm2::Lfm2CheckpointTemplate::new(args, stream).unwrap(),
+    );
     for (name, parameter) in model.parameters_mut().flatten() {
         let shape = parameter.shape().to_vec();
         *parameter = if name.ends_with("norm.weight") {
@@ -2112,8 +2116,10 @@ fn write_lfm2_moe_gguf_fixture(path: &Path) {
     });
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = lfm2::model_args_from_config_value(&config).unwrap();
-    let mut model = lfm2::Model::new(args.clone(), stream).unwrap();
+    let args = eredu_architectures::lfm2::model_args_from_config_value(&config).unwrap();
+    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+        lfm2::Lfm2CheckpointTemplate::new(args.clone(), stream).unwrap(),
+    );
     initialize_fixture(&mut model, stream);
     let mut specs = Vec::new();
     for (runtime_name, value) in model.parameters().flatten() {
@@ -2363,30 +2369,32 @@ fn write_kimi_linear_fixture(directory: &Path) {
     let config = kimi_linear_config();
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = kimi_model::model_args_from_config_value(&config).unwrap();
-    let mut model = kimi_model::Model::new(args, stream).unwrap();
+    let args = eredu_architectures::kimi_linear::model_args_from_config_value(&config).unwrap();
+    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+        neutral_kimi_linear::KimiLinearCheckpointTemplate::new(args.clone(), stream).unwrap(),
+    );
     initialize_fixture(&mut model, stream);
     let mut arrays = Vec::<(String, Array)>::new();
     for (name, value) in model.parameters().flatten() {
         if name.as_ref() == "model.layers.1.mlp.experts.gate_up_proj" {
-            for expert in 0..model.args.num_experts {
+            for expert in 0..args.num_experts {
                 arrays.push((
                     format!("model.layers.1.block_sparse_moe.experts.{expert}.w1.weight"),
                     value
-                        .try_index_device((expert, ..model.args.moe_intermediate_size, ..), stream)
+                        .try_index_device((expert, ..args.moe_intermediate_size, ..), stream)
                         .unwrap(),
                 ));
                 arrays.push((
                     format!("model.layers.1.block_sparse_moe.experts.{expert}.w3.weight"),
                     value
-                        .try_index_device((expert, model.args.moe_intermediate_size.., ..), stream)
+                        .try_index_device((expert, args.moe_intermediate_size.., ..), stream)
                         .unwrap(),
                 ));
             }
             continue;
         }
         if name.as_ref() == "model.layers.1.mlp.experts.down_proj" {
-            for expert in 0..model.args.num_experts {
+            for expert in 0..args.num_experts {
                 arrays.push((
                     format!("model.layers.1.block_sparse_moe.experts.{expert}.w2.weight"),
                     value.try_index_device((expert, .., ..), stream).unwrap(),
@@ -2403,8 +2411,8 @@ fn write_kimi_linear_fixture(directory: &Path) {
             value
                 .reshape(
                     &[
-                        model.args.kda_config.num_heads * model.args.kda_config.head_dim,
-                        model.args.kda_config.short_conv_kernel_size,
+                        args.kda_config.num_heads * args.kda_config.head_dim,
+                        args.kda_config.short_conv_kernel_size,
                     ],
                     stream,
                 )
@@ -2472,7 +2480,10 @@ fn nemotron_quantizable_config() -> serde_json::Value {
     value
 }
 
-fn nemotron_public_name(runtime: &str, args: &nemotron_model::ModelArgs) -> String {
+fn nemotron_public_name(
+    runtime: &str,
+    args: &eredu_architectures::nemotron_h::ModelArgs,
+) -> String {
     if let Some(rest) = runtime.strip_prefix("model.embeddings.") {
         return format!("backbone.embeddings.{rest}");
     }
@@ -2488,10 +2499,10 @@ fn nemotron_public_name(runtime: &str, args: &nemotron_model::ModelArgs) -> Stri
             return format!("backbone.layers.{index}.{rest}");
         }
         let field = match args.layer_schedule.get(index).unwrap() {
-            nemotron_model::LayerPolicy::Mamba => "mamba",
-            nemotron_model::LayerPolicy::SelfAttention(_) => "attention",
-            nemotron_model::LayerPolicy::DenseMlp => "mlp",
-            nemotron_model::LayerPolicy::SparseMoe => "moe",
+            eredu_architectures::nemotron_h::LayerPolicy::Mamba => "mamba",
+            eredu_architectures::nemotron_h::LayerPolicy::SelfAttention(_) => "attention",
+            eredu_architectures::nemotron_h::LayerPolicy::DenseMlp => "mlp",
+            eredu_architectures::nemotron_h::LayerPolicy::SparseMoe => "moe",
         };
         let rest = rest.strip_prefix(&format!("{field}.")).unwrap_or(rest);
         return format!("backbone.layers.{index}.mixer.{rest}");
@@ -2510,30 +2521,32 @@ fn write_nemotron_quantizable_fixture(directory: &Path) {
 fn write_nemotron_fixture_with_config(directory: &Path, config: serde_json::Value) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = nemotron_model::model_args_from_config_value(&config).unwrap();
-    let mut model = nemotron_model::Model::new(args, stream).unwrap();
+    let args = eredu_architectures::nemotron_h::model_args_from_config_value(&config).unwrap();
+    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+        neutral_nemotron_h::NemotronHCheckpointTemplate::new(args.clone(), stream).unwrap(),
+    );
     initialize_fixture(&mut model, stream);
     let mut arrays = Vec::<(String, Array)>::new();
     for (name, value) in model.parameters().flatten() {
         let runtime = canonical_checkpoint_name(&name);
         if runtime.ends_with("moe.experts.up_proj") {
-            let prefix = nemotron_public_name(runtime.trim_end_matches(".up_proj"), &model.args);
-            for expert in 0..model.args.n_routed_experts {
+            let prefix = nemotron_public_name(runtime.trim_end_matches(".up_proj"), &args);
+            for expert in 0..args.n_routed_experts {
                 arrays.push((
                     format!("{prefix}.{expert}.up_proj.weight"),
                     value.try_index_device((expert, .., ..), stream).unwrap(),
                 ));
             }
         } else if runtime.ends_with("moe.experts.down_proj") {
-            let prefix = nemotron_public_name(runtime.trim_end_matches(".down_proj"), &model.args);
-            for expert in 0..model.args.n_routed_experts {
+            let prefix = nemotron_public_name(runtime.trim_end_matches(".down_proj"), &args);
+            for expert in 0..args.n_routed_experts {
                 arrays.push((
                     format!("{prefix}.{expert}.down_proj.weight"),
                     value.try_index_device((expert, .., ..), stream).unwrap(),
                 ));
             }
         } else {
-            arrays.push((nemotron_public_name(&runtime, &model.args), value.clone()));
+            arrays.push((nemotron_public_name(&runtime, &args), value.clone()));
         }
     }
     save_indexed_pipeline_fixture(directory, &arrays, "backbone.layers.", 4);
@@ -2549,8 +2562,10 @@ fn write_nemotron_h_moe_gguf_fixture(path: &Path) {
     config["hybrid_override_pattern"] = serde_json::json!("MEE*");
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = nemotron_model::model_args_from_config_value(&config).unwrap();
-    let mut model = nemotron_model::Model::new(args, stream).unwrap();
+    let args = eredu_architectures::nemotron_h::model_args_from_config_value(&config).unwrap();
+    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+        neutral_nemotron_h::NemotronHCheckpointTemplate::new(args.clone(), stream).unwrap(),
+    );
     initialize_fixture(&mut model, stream);
     let mut specs = Vec::new();
     for (runtime_name, value) in model.parameters().flatten() {

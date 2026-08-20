@@ -71,6 +71,123 @@ fn shared_architectures_do_not_depend_on_accelerator_runtimes() {
 }
 
 #[test]
+fn hybrid_decoder_cutover_has_neutral_ownership_and_no_legacy_trees() {
+    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_root.parent().expect("workspace root");
+    for family in ["kimi_linear", "lfm2", "nemotron_h"] {
+        let legacy = crate_root
+            .join("src/composition/mlx_architectures")
+            .join(family);
+        assert!(
+            !legacy.exists(),
+            "legacy hybrid architecture implementation remains at {legacy:?}"
+        );
+        let neutral = workspace.join("eredu-architectures/src").join(family);
+        assert!(
+            neutral.is_dir(),
+            "neutral family source is missing at {neutral:?}"
+        );
+        let mut sources = Vec::new();
+        rust_sources(&neutral, &mut sources);
+        for source in sources {
+            let text = std::fs::read_to_string(&source).expect("neutral source must be readable");
+            for forbidden in ["safemlx", "backend::mlx", "MlxBackend"] {
+                assert!(
+                    !text.contains(forbidden),
+                    "backend dependency {forbidden:?} leaked into {source:?}"
+                );
+            }
+            for other in ["kimi_linear", "lfm2", "nemotron_h"] {
+                if other != family {
+                    assert!(
+                        !text.contains(&format!("{other}::")),
+                        "cross-family dependency {other:?} leaked into {source:?}"
+                    );
+                }
+            }
+        }
+        let module = std::fs::read_to_string(neutral.join("mod.rs"))
+            .expect("neutral family module must be readable");
+        assert!(
+            module.contains("hybrid_decoder::HybridDecoder")
+                || (family == "nemotron_h"
+                    && std::fs::read_to_string(neutral.join("model.rs"))
+                        .expect("Nemotron model source must be readable")
+                        .contains("hybrid_decoder::HybridDecoder")),
+            "{family} does not consume the shared hybrid decoder assembly"
+        );
+    }
+
+    for general_root in [
+        crate_root.join("src/backend"),
+        workspace.join("eredu-nn/src"),
+        workspace.join("eredu-runtime/src"),
+        workspace.join("eredu-checkpoint/src"),
+    ] {
+        let mut sources = Vec::new();
+        rust_sources(&general_root, &mut sources);
+        for source in sources {
+            let text = std::fs::read_to_string(&source)
+                .expect("general implementation source must be readable")
+                .to_ascii_lowercase();
+            for forbidden in ["kimi", "lfm2", "nemotron"] {
+                assert!(
+                    !text.contains(forbidden),
+                    "family identifier {forbidden:?} leaked into general layer {source:?}"
+                );
+            }
+        }
+    }
+
+    let pipeline = std::fs::read_to_string(
+        crate_root.join("src/composition/mlx_architectures/distributed/pipeline.rs"),
+    )
+    .expect("pipeline source must be readable");
+    assert!(pipeline.contains("struct NeutralHybridPipelineStage<"));
+    for legacy_wrapper in [
+        "struct KimiLinearStage",
+        "struct Lfm2Stage",
+        "struct NemotronHStage",
+    ] {
+        assert!(
+            !pipeline.contains(legacy_wrapper),
+            "family pipeline stage wrapper remains: {legacy_wrapper}"
+        );
+    }
+
+    let model = std::fs::read_to_string(crate_root.join("src/composition/mlx/model.rs"))
+        .expect("MLX model facade must be readable");
+    let expert = std::fs::read_to_string(
+        crate_root.join("src/composition/mlx_architectures/distributed/expert.rs"),
+    )
+    .expect("distributed expert source must be readable");
+    for legacy_cache in [
+        "ModelCache::KimiLinear",
+        "ModelCache::Lfm2",
+        "ModelCache::NemotronH",
+        "ExpertParallelCache::KimiLinear",
+        "ExpertParallelCache::Lfm2",
+        "ExpertParallelCache::NemotronH",
+    ] {
+        assert!(
+            !model.contains(legacy_cache) && !expert.contains(legacy_cache),
+            "family-specific heterogeneous cache variant remains: {legacy_cache}"
+        );
+    }
+    assert!(expert.contains("NeutralHybrid(Box<dyn NeutralHybridExpertArchitecture>)"));
+    for legacy_architecture in [
+        "ExpertArchitecture::KimiLinear",
+        "ExpertArchitecture::Lfm2",
+        "ExpertArchitecture::NemotronH",
+    ] {
+        assert!(
+            !expert.contains(legacy_architecture),
+            "family-specific distributed execution match remains: {legacy_architecture}"
+        );
+    }
+}
+
+#[test]
 fn deepseek_cutover_has_one_neutral_source_of_model_semantics() {
     let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace = crate_root.parent().expect("workspace root");

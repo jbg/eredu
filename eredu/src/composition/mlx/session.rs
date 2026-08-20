@@ -693,13 +693,16 @@ impl<'a> MlxModelSession<'a> {
         let result = match (model, cache) {
             (Model::DeepSeek(model), ModelCache::DeepSeek(cache)) => model
                 .forward_with_observer(input_tokens, mask, cache, stream, observer),
-            (Model::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
+            (Model::KimiLinear(model), ModelCache::Hybrid(cache)) => {
                 if mask.is_some() {
                     return Err(Error::UnsupportedArchitecture(
                         "an explicit Kimi Linear observer mask is unsupported; the adapter constructs the causal mask from cache state".into(),
                     ));
                 }
-                model.forward_with_observer(input_tokens, cache, stream, observer)
+                model.forward_with_observer(input_tokens, mask, cache, stream, observer)
+            }
+            (Model::Lfm2(model), ModelCache::Hybrid(cache)) => {
+                model.forward_with_observer(input_tokens, mask, cache, stream, observer)
             }
             (Model::Llama(model), ModelCache::Llama(cache)) => {
                 model.forward_with_observer(input_tokens, mask, cache, stream, observer)
@@ -1084,7 +1087,7 @@ fn prefill_model(
         (Model::Inkling(model), ModelCache::Inkling(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
+        (Model::KimiLinear(model), ModelCache::Hybrid(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
         (Model::Llama(model), ModelCache::Llama(cache)) => {
@@ -1096,8 +1099,10 @@ fn prefill_model(
         (Model::MuseGlimmer(model), ModelCache::PagedKeyValue(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::Lfm2(model), ModelCache::Lfm2(cache)) => prefill_pair(model, cache, input, stream),
-        (Model::NemotronH(model), ModelCache::NemotronH(cache)) => {
+        (Model::Lfm2(model), ModelCache::Hybrid(cache)) => {
+            prefill_pair(model, cache, input, stream)
+        }
+        (Model::NemotronH(model), ModelCache::Hybrid(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
         (Model::Qwen(model), ModelCache::Qwen(cache)) => prefill_pair(model, cache, input, stream),
@@ -1137,7 +1142,7 @@ fn decode_model(
         (Model::Inkling(model), ModelCache::Inkling(cache)) => {
             decode_pair(model, cache, input, stream)
         }
-        (Model::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
+        (Model::KimiLinear(model), ModelCache::Hybrid(cache)) => {
             decode_pair(model, cache, input, stream)
         }
         (Model::Llama(model), ModelCache::Llama(cache)) => decode_pair(model, cache, input, stream),
@@ -1147,8 +1152,8 @@ fn decode_model(
         (Model::MuseGlimmer(model), ModelCache::PagedKeyValue(cache)) => {
             decode_pair(model, cache, input, stream)
         }
-        (Model::Lfm2(model), ModelCache::Lfm2(cache)) => decode_pair(model, cache, input, stream),
-        (Model::NemotronH(model), ModelCache::NemotronH(cache)) => {
+        (Model::Lfm2(model), ModelCache::Hybrid(cache)) => decode_pair(model, cache, input, stream),
+        (Model::NemotronH(model), ModelCache::Hybrid(cache)) => {
             decode_pair(model, cache, input, stream)
         }
         (Model::Qwen(model), ModelCache::Qwen(cache)) => decode_pair(model, cache, input, stream),
@@ -1304,16 +1309,16 @@ fn forward_model_tensor_parallel(
         (Model::Inkling(model), ModelCache::Inkling(cache)) => {
             model.decode_tensor_parallel(input, cache, group, stream)
         }
-        (Model::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
+        (Model::KimiLinear(model), ModelCache::Hybrid(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
         (Model::Llama(model), ModelCache::Llama(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
-        (Model::Lfm2(model), ModelCache::Lfm2(cache)) => {
+        (Model::Lfm2(model), ModelCache::Hybrid(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
-        (Model::NemotronH(model), ModelCache::NemotronH(cache)) => {
+        (Model::NemotronH(model), ModelCache::Hybrid(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
         (Model::Gemma4(model), ModelCache::Gemma4(cache)) => {

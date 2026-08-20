@@ -91,7 +91,7 @@ pub use residency::{
 };
 pub use state::{
     DeviceState, LayerRuntimeState, ModelStateIdentity, PagedStatePlan, RuntimeLayerState,
-    RuntimeState, StateError, StateLayout, StateResidencyPlan,
+    RuntimeState, RuntimeStateComponents, StateError, StateLayout, StateResidencyPlan,
 };
 pub use weight_residency::{
     DenseDiskStreamLoadOptions, DenseTransferSchedule, DenseTransferScheduleError,

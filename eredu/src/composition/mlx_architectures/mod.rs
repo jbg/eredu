@@ -9,14 +9,9 @@ pub mod gpt_oss;
 /// Inkling multimodal implementations.
 pub mod inkling;
 /// Moonshot Kimi Linear hybrid KDA/MLA implementations.
-pub mod kimi_linear;
-/// LFM2 and LFM2.5 implementations.
-pub mod lfm2;
 /// Moshi and PersonaPlex realtime-token implementations.
 pub mod moshi;
 /// Meta Muse-Glimmer dense multimodal implementations.
 pub mod muse_glimmer;
-/// Nemotron-H implementations.
-pub mod nemotron_h;
 /// Qwen-family implementations.
 pub mod qwen;

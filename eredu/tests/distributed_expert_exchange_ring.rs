@@ -95,13 +95,10 @@ fn full_dispatch_blocks(rank: usize, stream: &Stream) -> ShardedRouteBlocks {
 }
 
 fn relu2_bank(stream: &Stream) -> PackedRelu2Experts {
-    PackedRelu2Experts {
-        num_experts: 2,
-        hidden_size: 1,
-        intermediate_size: 1,
-        up_proj: Param::new(f32_array(&[1.0, 2.0], &[2, 1, 1], stream)),
-        down_proj: Param::new(f32_array(&[1.0, 10.0], &[2, 1, 1], stream)),
-    }
+    let mut bank = PackedRelu2Experts::new(2, 1, 1, [None, None], stream).unwrap();
+    bank.up_proj = Param::new(f32_array(&[1.0, 2.0], &[2, 1, 1], stream));
+    bank.down_proj = Param::new(f32_array(&[1.0, 10.0], &[2, 1, 1], stream));
+    bank
 }
 
 struct ScaledSwiGluExperts;

@@ -1743,11 +1743,11 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for DeepS
         Ok(())
     }
 
-    fn draft_cache(cache: &Self::Cache) -> Self::DraftCache {
+    fn draft_cache(&self, cache: &Self::Cache) -> Self::DraftCache {
         cache.clone()
     }
 
-    fn commit_draft_cache(cache: &mut Self::Cache, draft: &Self::DraftCache) {
+    fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
         cache
             .commit_prediction_layers_from(draft, draft.target_layers)
             .expect("validated DeepSeek draft and target layouts match");

@@ -20,8 +20,7 @@ use crate::backend::mlx::{
     runtime::generation::sampler::{ConstrainedSampler, GenerationSampler},
 };
 use crate::composition::mlx_architectures::{
-    gemma4::model as gemma4, inkling::model as inkling, nemotron_h::model as nemotron_h,
-    qwen::hybrid::qwen3_5,
+    gemma4::model as gemma4, inkling::model as inkling, qwen::hybrid::qwen3_5,
 };
 
 impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
@@ -225,9 +224,11 @@ fn inkling_mtp_cache(cache: &mut ModelCache) -> Option<&mut inkling::Cache> {
     }
 }
 
-fn nemotron_mtp_cache(cache: &mut ModelCache) -> Option<&mut nemotron_h::Cache> {
+fn nemotron_mtp_cache(
+    cache: &mut ModelCache,
+) -> Option<&mut crate::backend::mlx::runtime::cache::state::MlxHybridState> {
     match cache {
-        ModelCache::NemotronH(cache) => Some(cache),
+        ModelCache::Hybrid(cache) => Some(cache),
         _ => None,
     }
 }

@@ -1729,10 +1729,10 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for Inkli
         Ok(())
     }
 
-    fn draft_cache(cache: &Cache) -> Self::DraftCache {
+    fn draft_cache(&self, cache: &Cache) -> Self::DraftCache {
         cache.mtp_layers.clone()
     }
-    fn commit_draft_cache(cache: &mut Cache, draft: &Self::DraftCache) {
+    fn commit_draft_cache(&self, cache: &mut Cache, draft: &Self::DraftCache) {
         cache.mtp_layers.clone_from(draft);
     }
     fn restore_target_checkpoint(
@@ -1834,11 +1834,11 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
         Ok(())
     }
 
-    fn draft_cache(cache: &Cache) -> Self::DraftCache {
+    fn draft_cache(&self, cache: &Cache) -> Self::DraftCache {
         cache.mtp_layers.clone()
     }
 
-    fn commit_draft_cache(cache: &mut Cache, draft: &Self::DraftCache) {
+    fn commit_draft_cache(&self, cache: &mut Cache, draft: &Self::DraftCache) {
         cache.mtp_layers.clone_from(draft);
     }
 

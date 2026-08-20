@@ -22,16 +22,14 @@ use crate::composition::mlx_architectures::{
     gemma4::model as gemma4,
     gpt_oss::model as gpt_oss,
     inkling::model as inkling,
-    kimi_linear::model as kimi_linear,
-    lfm2::model as lfm2,
     muse_glimmer,
-    nemotron_h::model as nemotron_h,
     qwen::{
         hybrid::{qwen3_5, qwen3_next},
         vl::{model as qwen3_vl, moe as qwen3_vl_moe},
     },
 };
 use crate::{LayerCachePolicy, LayerSchedule};
+use eredu_architectures::kimi_linear;
 use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::CacheResidencyReport;
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
@@ -45,9 +43,7 @@ pub enum Model {
     /// OpenAI GPT-OSS model.
     GptOss(crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseModel),
     /// Moonshot Kimi Linear hybrid KDA/MLA sparse decoder.
-    KimiLinear(
-        crate::composition::mlx_architectures::kimi_linear::layerwise::KimiLinearLayerwiseModel,
-    ),
+    KimiLinear(crate::composition::kimi_linear::KimiLinearModel),
     /// Thinking Machines Lab Inkling multimodal model.
     Inkling(crate::composition::mlx_architectures::inkling::layerwise::InklingLayerwiseModel),
     /// Llama-compatible dense model.
@@ -55,11 +51,9 @@ pub enum Model {
     /// Meta Muse-Glimmer dense multimodal model.
     MuseGlimmer(crate::composition::mlx_architectures::muse_glimmer::layerwise::LayerwiseDecoder),
     /// Liquid AI LFM2/LFM2.5 model.
-    Lfm2(crate::composition::mlx_architectures::lfm2::layerwise::Lfm2LayerwiseModel),
+    Lfm2(crate::composition::lfm2::Lfm2Model),
     /// Nemotron-H hybrid model.
-    NemotronH(
-        crate::composition::mlx_architectures::nemotron_h::layerwise::NemotronHLayerwiseModel,
-    ),
+    NemotronH(crate::composition::nemotron_h::NemotronHModel),
     /// Neutral Qwen2/Qwen2.5/Qwen3/Qwen3-MoE model.
     Qwen(crate::composition::qwen::QwenModel),
     /// Qwen3-Next model.
@@ -265,12 +259,11 @@ impl Model {
                     |_| Ok(()),
                 )
             }
-            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
-                let mut target =
-                    crate::composition::mlx_architectures::nemotron_h::layerwise::NemotronHTensorMtpTarget::new(
-                        model,
-                        tensor_group,
-                    );
+            (Self::NemotronH(model), ModelCache::Hybrid(cache)) => {
+                let mut target = crate::composition::nemotron_h::NemotronHTensorMtpTarget::new(
+                    model,
+                    tensor_group,
+                );
                 let mut executor =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         &mut target,
@@ -392,7 +385,7 @@ impl Model {
                     on_token,
                 )
             }
-            (Self::NemotronH(target), ModelCache::NemotronH(cache)) => {
+            (Self::NemotronH(target), ModelCache::Hybrid(cache)) => {
                 let mut executor =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target,
@@ -492,7 +485,7 @@ impl Model {
                     on_event,
                 )
             }
-            (Self::NemotronH(target), ModelCache::NemotronH(cache)) => {
+            (Self::NemotronH(target), ModelCache::Hybrid(cache)) => {
                 let mut executor =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target,
@@ -641,14 +634,16 @@ impl Model {
             Self::KimiLinear(model) => Ok(kimi_linear::prompt_cache_architecture_fingerprint(
                 model.args(),
             )),
-            Self::Lfm2(model) => Ok(lfm2::prompt_cache_architecture_fingerprint(model.args())),
+            Self::Lfm2(model) => model
+                .prompt_cache_architecture_fingerprint()
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::Qwen(model) => Ok(model.prompt_cache_architecture_fingerprint()),
             Self::MuseGlimmer(model) => Ok(muse_glimmer::prompt_cache_architecture_fingerprint(
                 model.args(),
             )),
-            Self::NemotronH(model) => Ok(nemotron_h::prompt_cache_architecture_fingerprint(
-                model.args(),
-            )),
+            Self::NemotronH(model) => model
+                .prompt_cache_architecture_fingerprint()
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::Qwen3Next(model) | Self::Qwen35(model) => {
                 Ok(qwen3_5::prompt_cache_architecture_fingerprint(model.args()))
             }
@@ -737,15 +732,15 @@ impl Model {
             Self::Gemma4(model) => ModelCache::Gemma4(model.new_cache()),
             Self::GptOss(model) => ModelCache::GptOss(model.new_cache()),
             Self::Inkling(model) => ModelCache::Inkling(model.new_cache()),
-            Self::KimiLinear(model) => ModelCache::KimiLinear(model.new_cache()),
+            Self::KimiLinear(model) => ModelCache::Hybrid(model.new_cache()),
             Self::Llama(model) => ModelCache::Llama(model.new_cache()),
-            Self::Lfm2(model) => ModelCache::Lfm2(model.new_cache()),
+            Self::Lfm2(model) => ModelCache::Hybrid(model.new_cache()),
             Self::Qwen(model) => ModelCache::Qwen(model.new_cache()),
             Self::MuseGlimmer(model) => ModelCache::KeyValue(model.new_cache()),
             Self::Qwen3Next(model) => ModelCache::Qwen3Next(model.new_cache()),
             Self::Qwen3Vl(model) => ModelCache::Qwen3Vl(model.new_cache()),
             Self::Qwen3VlMoe(model) => ModelCache::Qwen3VlMoe(model.new_cache()),
-            Self::NemotronH(model) => ModelCache::NemotronH(model.new_cache()),
+            Self::NemotronH(model) => ModelCache::Hybrid(model.new_cache()),
             Self::Qwen35(model) => ModelCache::Qwen35(model.new_cache()),
         }
     }
@@ -768,7 +763,7 @@ impl Model {
                     .map_err(|error| Exception::custom(error.to_string())),
                 Self::KimiLinear(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ModelCache::KimiLinear)
+                    .map(ModelCache::Hybrid)
                     .map_err(|error| Exception::custom(error.to_string())),
                 Self::GptOss(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
@@ -793,11 +788,11 @@ impl Model {
                     .map_err(|error| Exception::custom(error.to_string())),
                 Self::NemotronH(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ModelCache::NemotronH)
+                    .map(ModelCache::Hybrid)
                     .map_err(|error| Exception::custom(error.to_string())),
                 Self::Lfm2(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ModelCache::Lfm2)
+                    .map(ModelCache::Hybrid)
                     .map_err(|error| Exception::custom(error.to_string())),
                 Self::Qwen3Next(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
@@ -841,15 +836,15 @@ impl Model {
             Self::GptOss(model) => load!(model, ModelCache::GptOss),
             Self::Qwen(model) => load!(model, ModelCache::Qwen),
             Self::MuseGlimmer(model) => load!(model, ModelCache::KeyValue),
-            Self::KimiLinear(model) => load!(model, ModelCache::KimiLinear),
+            Self::KimiLinear(model) => load!(model, ModelCache::Hybrid),
             Self::Qwen3Next(model) => load!(model, ModelCache::Qwen3Next),
             Self::Qwen35(model) => load!(model, ModelCache::Qwen35),
             Self::Qwen3Vl(model) => load!(model, ModelCache::Qwen3Vl),
             Self::Qwen3VlMoe(model) => load!(model, ModelCache::Qwen3VlMoe),
             Self::Gemma4(model) => load!(model, ModelCache::Gemma4),
             Self::Inkling(model) => load!(model, ModelCache::Inkling),
-            Self::Lfm2(model) => load!(model, ModelCache::Lfm2),
-            Self::NemotronH(model) => load!(model, ModelCache::NemotronH),
+            Self::Lfm2(model) => load!(model, ModelCache::Hybrid),
+            Self::NemotronH(model) => load!(model, ModelCache::Hybrid),
         }
     }
 
@@ -917,7 +912,7 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
+            (Self::KimiLinear(model), ModelCache::Hybrid(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -929,7 +924,7 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::Lfm2(model), ModelCache::Lfm2(cache)) => {
+            (Self::Lfm2(model), ModelCache::Hybrid(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -941,7 +936,7 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
+            (Self::NemotronH(model), ModelCache::Hybrid(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1099,12 +1094,8 @@ pub enum ModelCache {
     Qwen3VlMoe(qwen3_vl_moe::Cache),
     /// Homogeneous block-addressable key/value cache under one global budget.
     PagedKeyValue(Vec<Option<PagedKeyValueCache>>),
-    /// Heterogeneous Nemotron-H cache.
-    NemotronH(nemotron_h::Cache),
-    /// Heterogeneous LFM2 attention/convolution cache.
-    Lfm2(lfm2::Cache),
-    /// Heterogeneous Kimi Linear KDA/MLA cache.
-    KimiLinear(kimi_linear::Cache),
+    /// Architecture-declared heterogeneous append-only and fixed state.
+    Hybrid(crate::backend::mlx::runtime::cache::state::MlxHybridState),
     /// Heterogeneous Qwen3.5 MoE cache.
     Qwen35(qwen3_5::Cache),
     /// Heterogeneous Qwen3-Next cache.
@@ -1193,8 +1184,7 @@ impl ModelCache {
                 .map_err(|error| Exception::custom(error.to_string())),
             Self::GptOss(cache) => cache.residency_report(),
             Self::Inkling(cache) => cache.residency_report(),
-            Self::KimiLinear(cache) => cache.residency_report(),
-            Self::NemotronH(cache) => cache.residency_report(),
+            Self::Hybrid(cache) => cache.residency_report(),
             _ => Ok(None),
         }
     }

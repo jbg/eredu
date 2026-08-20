@@ -3,7 +3,9 @@
 use std::{collections::BTreeMap, num::NonZeroU8};
 
 use eredu_architectures::{
+    kimi_linear, lfm2,
     llama::ModelArgs as LlamaModelArgs,
+    nemotron_h,
     qwen::{ModelArgs as QwenModelArgs, QwenVariant},
 };
 use eredu_core::{
@@ -22,10 +24,7 @@ use crate::{
         gemma4::model as gemma4,
         gpt_oss::model as gpt_oss,
         inkling::model as inkling,
-        kimi_linear::model as kimi_linear,
-        lfm2::model as lfm2,
         muse_glimmer,
-        nemotron_h::model as nemotron_h,
         qwen::hybrid::qwen3_5::{self, LayerPolicy as QwenHybridLayerPolicy},
     },
     core::attention::AttentionPolicy,

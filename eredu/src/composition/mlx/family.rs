@@ -7,11 +7,8 @@ use crate::composition::mlx_architectures::{
     gemma4::model as gemma4,
     gpt_oss::model as gpt_oss,
     inkling::model as inkling,
-    kimi_linear::model as kimi_linear,
-    lfm2::model as lfm2,
     moshi::personaplex,
     muse_glimmer,
-    nemotron_h::model as nemotron_h,
     qwen::{
         hybrid::{qwen3_5, qwen3_next},
         vl::{model as qwen3_vl, moe as qwen3_vl_moe},
@@ -77,13 +74,23 @@ fn validate_model_config(kind: eredu_core::ModelKind, config: &Value) -> Result<
         ModelKind::Gemma4 => gemma4::validate_model_config_value(config),
         ModelKind::GptOss => gpt_oss::validate_model_config_value(config),
         ModelKind::Inkling => inkling::validate_model_config_value(config),
-        ModelKind::KimiLinear => kimi_linear::validate_model_config_value(config),
+        ModelKind::KimiLinear => {
+            eredu_architectures::kimi_linear::model_args_from_config_value(config)
+                .map(|_| ())
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        }
         ModelKind::Llama => eredu_architectures::llama::model_args_from_config_value(config)
             .map(|_| ())
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
         ModelKind::MuseGlimmer => muse_glimmer::validate_model_config_value(config),
-        ModelKind::Lfm2 => lfm2::validate_model_config_value(config),
-        ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),
+        ModelKind::Lfm2 => eredu_architectures::lfm2::model_args_from_config_value(config)
+            .map(|_| ())
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+        ModelKind::NemotronH => {
+            eredu_architectures::nemotron_h::model_args_from_config_value(config)
+                .map(|_| ())
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        }
         ModelKind::PersonaPlex => personaplex::validate_model_config_value(config),
         ModelKind::Qwen2 | ModelKind::Qwen3 => {
             eredu_architectures::qwen::model_args_from_config_value(config)

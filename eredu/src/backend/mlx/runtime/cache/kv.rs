@@ -414,6 +414,30 @@ impl CompressedLatentCache {
         Self::default()
     }
 
+    /// Forks mutable cache state while retaining the immutable paging catalog.
+    ///
+    /// Resident storage and a paged mutable tail receive independent MLX
+    /// buffers. Sealed paged blocks remain shared through the residency
+    /// manager because they are immutable and addressed by token range.
+    pub(crate) fn deep_clone_state(&self) -> Result<Self, Exception> {
+        let clone_array = |array: &Option<Array>| {
+            array
+                .as_ref()
+                .map(|array| array.clone().deep_clone())
+                .transpose()
+        };
+        let mut clone = self.clone();
+        clone.latent_storage = clone_array(&self.latent_storage)?;
+        clone.rotary_key_storage = clone_array(&self.rotary_key_storage)?;
+        clone.latent = clone_array(&self.latent)?;
+        clone.rotary_key = clone_array(&self.rotary_key)?;
+        if let (Some(clone), Some(source)) = (clone.paged.as_deref_mut(), self.paged.as_deref()) {
+            clone.tail_latent = clone_array(&source.tail_latent)?;
+            clone.tail_rotary = clone_array(&source.tail_rotary)?;
+        }
+        Ok(clone)
+    }
+
     /// Clears local arrays after the shared paging manager has been cleared.
     pub(crate) fn reset_local_after_manager_clear(&mut self) {
         if let Some(paged) = self.paged.as_deref_mut() {
@@ -1509,6 +1533,20 @@ impl PagedKeyValueCache {
         sliding_window: Option<i32>,
     ) -> Result<Self, Exception> {
         Self::new_with_layout(manager, global_layer, sliding_window, 0, None)
+    }
+
+    /// Forks the mutable tail while sharing immutable sealed blocks.
+    pub(crate) fn deep_clone_state(&self) -> Result<Self, Exception> {
+        let clone_array = |array: &Option<Array>| {
+            array
+                .as_ref()
+                .map(|array| array.clone().deep_clone())
+                .transpose()
+        };
+        let mut clone = self.clone();
+        clone.tail_keys = clone_array(&self.tail_keys)?;
+        clone.tail_values = clone_array(&self.tail_values)?;
+        Ok(clone)
     }
 
     /// Creates one layer cache with pinned-prefix and rank-local identity.
@@ -3735,7 +3773,9 @@ mod tests {
         let stream = context.stream();
         // The finite device budget covers one protected block per layer plus
         // the active mutable tail.
-        let options = PagedCacheOptions::new(2, 48, 64, 1)
+        // Host-transfer buffers are page-aligned, so one demoted logical
+        // block consumes one 32 KiB physical host allocation.
+        let options = PagedCacheOptions::new(2, 48, 32 * 1024, 1)
             .unwrap()
             .with_full_attention(true);
         let manager = CacheResidencyManager::new(options).unwrap();
@@ -3752,7 +3792,7 @@ mod tests {
         assert_eq!(report.device_blocks, 3);
         assert_eq!(report.host_blocks, 1);
         assert_eq!(report.current_device_bytes, 48);
-        assert_eq!(report.current_host_bytes, 16);
+        assert_eq!(report.current_host_bytes, 32 * 1024);
         assert!(report.peak_device_bytes <= manager.options().device_budget_bytes());
         assert!(report.peak_host_bytes <= manager.options().host_budget_bytes());
     }
@@ -3937,9 +3977,10 @@ mod tests {
     fn compressed_latent_host_demotion_and_rehydration_preserve_atomic_pairs() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
-        // Each two-token latent/rotary pair occupies 24 bytes. Two blocks fit
-        // on the device and one fits in the finite host tier.
-        let options = PagedCacheOptions::new(2, 48, 24, 1)
+        // Each two-token latent/rotary pair occupies 24 logical bytes. Two
+        // blocks fit on the device and one page-aligned host allocation fits
+        // in the finite host tier.
+        let options = PagedCacheOptions::new(2, 48, 32 * 1024, 1)
             .unwrap()
             .with_full_attention(true);
         let manager = CacheResidencyManager::new(options).unwrap();
@@ -3959,7 +4000,7 @@ mod tests {
         assert_eq!(report.device_blocks, 2);
         assert_eq!(report.host_blocks, 1);
         assert_eq!(report.current_device_bytes, 48);
-        assert_eq!(report.current_host_bytes, 24);
+        assert_eq!(report.current_host_bytes, 32 * 1024);
         assert_eq!(report.host_demotions, 1);
         let first = cache.paged_block_ids().unwrap().unwrap().remove(0);
         assert_eq!(
@@ -3998,7 +4039,7 @@ mod tests {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let directory = tempfile::tempdir().unwrap();
-        let options = PagedCacheOptions::new(2, 48, 24, 1)
+        let options = PagedCacheOptions::new(2, 48, 32 * 1024, 1)
             .unwrap()
             .with_full_attention(true)
             .with_live_disk(directory.path(), 4096, 2)

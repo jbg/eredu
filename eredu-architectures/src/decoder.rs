@@ -232,8 +232,8 @@ pub struct Attention<B: NeuralBackend> {
     pub query_norm: Option<B::Normalization>,
     /// Optional per-head key normalization.
     pub key_norm: Option<B::Normalization>,
-    /// Rotary-position operator.
-    pub rotary: B::Rotary,
+    /// Optional rotary-position operator for positioned attention families.
+    pub rotary: Option<B::Rotary>,
     /// Layer-local sliding window.
     #[parameter(skip)]
     pub sliding_window: Option<i32>,
@@ -248,6 +248,46 @@ struct AttentionProjections<T> {
 }
 
 impl<B: NeuralBackend> Attention<B> {
+    /// Assembles grouped-query attention from architecture-named operators.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        query_heads: i32,
+        key_value_heads: i32,
+        head_dim: i32,
+        query: B::Linear,
+        key: B::Linear,
+        value: B::Linear,
+        output: B::Linear,
+        query_norm: Option<B::Normalization>,
+        key_norm: Option<B::Normalization>,
+        rotary: Option<B::Rotary>,
+        sliding_window: Option<i32>,
+    ) -> Result<Self, Error> {
+        if query_heads <= 0
+            || key_value_heads <= 0
+            || head_dim <= 0
+            || query_heads % key_value_heads != 0
+            || sliding_window.is_some_and(|window| window <= 0)
+        {
+            return Err(Error::backend(format!(
+                "invalid grouped-query attention geometry q={query_heads} kv={key_value_heads} dim={head_dim} window={sliding_window:?}"
+            )));
+        }
+        Ok(Self {
+            query_heads,
+            key_value_heads,
+            scale: (head_dim as f32).sqrt().recip(),
+            query,
+            key,
+            value,
+            output,
+            query_norm,
+            key_norm,
+            rotary,
+            sliding_window,
+        })
+    }
+
     /// Builds unloaded grouped-query attention for one global layer.
     pub fn new<C: Config>(
         config: &C,
@@ -337,7 +377,7 @@ impl<B: NeuralBackend> Attention<B> {
                     )
                 })
                 .transpose()?,
-            rotary: B::rotary(config.rotary_spec(head), context)?,
+            rotary: Some(B::rotary(config.rotary_spec(head), context)?),
             sliding_window: policy
                 .window()
                 .map(|window| i32::try_from(window.get()))
@@ -393,13 +433,16 @@ impl<B: NeuralBackend> Attention<B> {
             sequence,
         } = self.projections(hidden, context)?;
         let offset = cache.as_ref().map_or(0, |cache| cache.offset());
-        let position = rotary_position.unwrap_or(RotaryPosition::Offset(offset));
-        let queries =
-            self.rotary
-                .forward_subspace(&queries, RotarySubspace::Full, position, context)?;
-        let keys = self
-            .rotary
-            .forward_subspace(&keys, RotarySubspace::Full, position, context)?;
+        let (queries, keys) = match &mut self.rotary {
+            Some(rotary) => {
+                let position = rotary_position.unwrap_or(RotaryPosition::Offset(offset));
+                (
+                    rotary.forward_subspace(&queries, RotarySubspace::Full, position, context)?,
+                    rotary.forward_subspace(&keys, RotarySubspace::Full, position, context)?,
+                )
+            }
+            None => (queries, keys),
+        };
         let (keys, values) = match cache.as_mut() {
             Some(cache) => cache.update_for_attention(keys, values, context)?,
             None => (keys, values),
@@ -422,7 +465,8 @@ impl<B: NeuralBackend> Attention<B> {
             .reshape(&[batch, sequence, -1], context)
     }
 
-    fn forward<C: AttentionCache<B::Tensor>>(
+    /// Executes grouped-query attention and its output projection.
+    pub fn forward<C: AttentionCache<B::Tensor>>(
         &mut self,
         input: AttentionInput<'_, B::Tensor, C>,
         context: &<B::Tensor as Tensor>::Context,
@@ -438,7 +482,8 @@ impl<B: NeuralBackend> Attention<B> {
         self.output.forward(&attended, context)
     }
 
-    fn forward_parallel<C: AttentionCache<B::Tensor>>(
+    /// Executes grouped-query attention with a row-parallel output projection.
+    pub fn forward_parallel<C: AttentionCache<B::Tensor>>(
         &mut self,
         input: AttentionInput<'_, B::Tensor, C>,
         parallel: &B::ParallelContext,
@@ -1297,11 +1342,11 @@ pub struct SequentialGroup {
 }
 
 /// Shared declaration for a target group followed by zero or more ordered
-/// single-unit prediction groups.
+/// prediction groups.
 #[derive(Debug, Clone)]
 pub struct SequentialPredictionGroups {
     target: SequentialGroup,
-    prediction_roots: Vec<String>,
+    prediction_paths: Vec<Vec<String>>,
 }
 
 impl SequentialPredictionGroups {
@@ -1313,7 +1358,45 @@ impl SequentialPredictionGroups {
     ) -> Result<Self, Error> {
         Ok(Self {
             target: SequentialGroup::new("target", target_parameter_root, target_units)?,
-            prediction_roots: prediction_roots.into_iter().collect(),
+            prediction_paths: prediction_roots
+                .into_iter()
+                .map(|root| vec![root])
+                .collect(),
+        })
+    }
+
+    /// Creates equally sized appended prediction groups over one physical namespace.
+    pub fn new_pattern(
+        target_parameter_root: &'static str,
+        target_units: usize,
+        prediction_parameter_root: &'static str,
+        prediction_groups: usize,
+        units_per_group: usize,
+    ) -> Result<Self, Error> {
+        if (prediction_groups != 0 && units_per_group == 0) || prediction_parameter_root.is_empty()
+        {
+            return Err(Error::backend(
+                "prediction execution groups require non-empty names and units",
+            ));
+        }
+        let prediction_paths = (0..prediction_groups)
+            .map(|group| {
+                let start = group
+                    .checked_mul(units_per_group)
+                    .ok_or_else(|| Error::backend("prediction physical index overflowed"))?;
+                (0..units_per_group)
+                    .map(|unit| {
+                        start
+                            .checked_add(unit)
+                            .map(|physical| format!("{prediction_parameter_root}.{physical}"))
+                            .ok_or_else(|| Error::backend("prediction physical index overflowed"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            target: SequentialGroup::new("target", target_parameter_root, target_units)?,
+            prediction_paths,
         })
     }
 
@@ -1321,7 +1404,7 @@ impl SequentialPredictionGroups {
     pub fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
         eredu_runtime::ExecutionGraph::chain(
             std::iter::once("target".to_owned())
-                .chain((0..self.prediction_roots.len()).map(|depth| format!("mtp.{depth}"))),
+                .chain((0..self.prediction_paths.len()).map(|depth| format!("mtp.{depth}"))),
         )
         .map_err(Error::backend)
     }
@@ -1330,12 +1413,12 @@ impl SequentialPredictionGroups {
     pub fn unit_count(&self, group: usize) -> Result<usize, Error> {
         if group == 0 {
             self.target.unit_count(0)
-        } else if group <= self.prediction_roots.len() {
-            Ok(1)
+        } else if group <= self.prediction_paths.len() {
+            Ok(self.prediction_paths[group - 1].len())
         } else {
             Err(Error::backend(format!(
                 "execution group {group} is outside target plus {} prediction groups",
-                self.prediction_roots.len()
+                self.prediction_paths.len()
             )))
         }
     }
@@ -1346,12 +1429,15 @@ impl SequentialPredictionGroups {
             return self.target.unit_path(0, index);
         }
         self.unit_count(group)?;
-        if index != 0 {
-            return Err(Error::backend(format!(
-                "prediction group {group} contains one unit, received index {index}"
-            )));
-        }
-        Ok(self.prediction_roots[group - 1].clone())
+        self.prediction_paths[group - 1]
+            .get(index)
+            .cloned()
+            .ok_or_else(|| {
+                Error::backend(format!(
+                    "unit {index} is outside {} units in prediction group {group}",
+                    self.prediction_paths[group - 1].len()
+                ))
+            })
     }
 
     /// Selects the activation carried into a ready chain group.
@@ -1376,7 +1462,7 @@ impl SequentialPredictionGroups {
 
     /// Returns the number of appended prediction groups.
     pub fn prediction_count(&self) -> usize {
-        self.prediction_roots.len()
+        self.prediction_paths.len()
     }
 }
 

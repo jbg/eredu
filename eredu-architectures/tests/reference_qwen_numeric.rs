@@ -1,21 +1,29 @@
-use std::cell::Cell;
+use std::{cell::Cell, collections::BTreeMap};
 
-use eredu_architectures::{deepseek, qwen};
+use eredu_architectures::{deepseek, kimi_linear, lfm2, nemotron_h, qwen};
+use eredu_core::cache::{LayerCachePolicy, StateTensorRole};
 use eredu_nn::{
-    AttentionCache, AttentionMask, BlockwiseAttentionBackend, BlockwiseAttentionSpec,
-    CompressedAttentionBlock, CompressedAttentionCache, CompressedAttentionScan,
-    CompressedAttentionState, CompressedAttentionView, EmbeddingOperator, EmbeddingSpec, Error,
-    HyperConnection, HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState, HyperHead,
+    reference_gated_delta_scan, reference_selective_state_space_scan, AttentionCache,
+    AttentionMask, BlockwiseAttentionBackend, BlockwiseAttentionSpec, CausalDepthwiseConvolution,
+    CausalDepthwiseConvolutionSpec, CompressedAttentionBlock, CompressedAttentionCache,
+    CompressedAttentionScan, CompressedAttentionState, CompressedAttentionView,
+    ConvolutionActivation, EmbeddingOperator, EmbeddingSpec, Error, GatedDeltaScanInput,
+    GatedDeltaScanOutput, GatedShortConvolution, GatedShortConvolutionSpec, HyperConnection,
+    HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState, HyperHead,
     HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, Index, IndexedAttentionInput,
     LinearOperator, LinearSpec, LowRankProjection, LowRankProjectionSpec, NeuralBackend,
     NormalizationOperator, NormalizationSpec, PadMode, ParameterMetadata, ParameterSpec,
     ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
-    PooledPositionInput, PoolingAttentionCache, PoolingOverlap, PoolingWindows, RotaryOperator,
-    RotaryPosition, RotarySpec, RotarySubspace, RoutedNeuralBackend, RoutingOperator,
-    RoutingResult, SwiGluExpertBankOperator, SwiGluExpertBankSpec, SwiGluExpertLayout, Tensor,
-    TopKRouterSpec, TopKRoutingSpec,
+    PooledPositionInput, PoolingAttentionCache, PoolingOverlap, PoolingWindows,
+    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
+    RotarySubspace, RoutedNeuralBackend, RoutingOperator, RoutingResult,
+    SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, SwiGluExpertBankOperator,
+    SwiGluExpertBankSpec, SwiGluExpertLayout, Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
-use eredu_runtime::{DeviceState, LayerRuntimeState, ResidentRuntime, RuntimeLayerState};
+use eredu_runtime::{
+    DeviceState, LayerRuntimeState, ResidentRuntime, RuntimeLayerState, RuntimeStateComponents,
+    StateError,
+};
 
 #[derive(Debug, Clone)]
 struct NumericTensor {
@@ -66,21 +74,40 @@ impl NumericTensor {
     }
 
     fn zip(&self, rhs: &Self, operation: impl Fn(f32, f32) -> f32) -> Result<Self, Error> {
-        if self.shape != rhs.shape {
-            return Err(Error::backend(format!(
-                "numeric tensor shape mismatch: {:?} versus {:?}",
-                self.shape, rhs.shape
-            )));
+        let rank = self.shape.len().max(rhs.shape.len());
+        let mut shape = Vec::with_capacity(rank);
+        for axis in 0..rank {
+            let left = axis
+                .checked_sub(rank - self.shape.len())
+                .map_or(1, |axis| self.shape[axis]);
+            let right = axis
+                .checked_sub(rank - rhs.shape.len())
+                .map_or(1, |axis| rhs.shape[axis]);
+            if left != right && left != 1 && right != 1 {
+                return Err(Error::backend(format!(
+                    "numeric tensor shape mismatch: {:?} versus {:?}",
+                    self.shape, rhs.shape
+                )));
+            }
+            shape.push(left.max(right));
         }
-        Ok(Self::new(
-            self.shape.clone(),
-            self.data
-                .iter()
-                .copied()
-                .zip(rhs.data.iter().copied())
-                .map(|(left, right)| operation(left, right))
-                .collect(),
-        ))
+        let mut data = Vec::with_capacity(elements(&shape));
+        for index in 0..elements(&shape) {
+            let coordinate = unravel(index, &shape);
+            let project = |source: &NumericTensor| {
+                let skip = rank - source.shape.len();
+                coordinate[skip..]
+                    .iter()
+                    .zip(&source.shape)
+                    .map(|(index, dimension)| if *dimension == 1 { 0 } else { *index })
+                    .collect::<Vec<_>>()
+            };
+            data.push(operation(
+                self.data[offset(&project(self), &self.shape)],
+                rhs.data[offset(&project(rhs), &rhs.shape)],
+            ));
+        }
+        Ok(Self::new(shape, data))
     }
 }
 
@@ -935,20 +962,86 @@ impl Tensor for NumericTensor {
         unsupported("argmin_axis")
     }
 
-    fn pad(_: &Self, _: &[(i32, i32)], _: PadMode, _: &NumericContext) -> Result<Self, Error> {
-        unsupported("pad")
+    fn pad(
+        value: &Self,
+        widths: &[(i32, i32)],
+        mode: PadMode,
+        _: &NumericContext,
+    ) -> Result<Self, Error> {
+        if mode != PadMode::Constant || widths.len() != value.shape.len() {
+            return unsupported("non-constant or rank-changing pad");
+        }
+        if widths
+            .iter()
+            .any(|(before, after)| *before < 0 || *after < 0)
+        {
+            return Err(Error::backend("numeric pad widths must be non-negative"));
+        }
+        let shape = value
+            .shape
+            .iter()
+            .zip(widths)
+            .map(|(dimension, (before, after))| dimension + before + after)
+            .collect::<Vec<_>>();
+        let mut output = Self::zeros(shape);
+        for input_index in 0..value.data.len() {
+            let input_coordinate = unravel(input_index, &value.shape);
+            let output_coordinate = input_coordinate
+                .iter()
+                .enumerate()
+                .map(|(axis, coordinate)| coordinate + widths[axis].0 as usize)
+                .collect::<Vec<_>>();
+            let output_index = offset(&output_coordinate, &output.shape);
+            output.data[output_index] = value.data[input_index];
+        }
+        Ok(output)
     }
 
     fn conv1d(
-        _: &Self,
-        _: &Self,
-        _: i32,
-        _: i32,
-        _: i32,
-        _: i32,
+        input: &Self,
+        weight: &Self,
+        stride: i32,
+        padding: i32,
+        dilation: i32,
+        groups: i32,
         _: &NumericContext,
     ) -> Result<Self, Error> {
-        unsupported("conv1d")
+        if input.shape.len() != 3
+            || weight.shape.len() != 3
+            || stride != 1
+            || padding != 0
+            || dilation != 1
+            || groups != input.shape[2]
+            || weight.shape[0] != groups
+            || weight.shape[2] != 1
+        {
+            return unsupported("general conv1d geometry");
+        }
+        let batch = input.shape[0] as usize;
+        let input_tokens = input.shape[1] as usize;
+        let channels = input.shape[2] as usize;
+        let kernel = weight.shape[1] as usize;
+        if kernel > input_tokens {
+            return Err(Error::backend("numeric conv1d kernel exceeds input"));
+        }
+        let output_tokens = input_tokens - kernel + 1;
+        let mut output = Self::zeros(vec![batch as i32, output_tokens as i32, channels as i32]);
+        for batch_index in 0..batch {
+            for token in 0..output_tokens {
+                for channel in 0..channels {
+                    output.data[(batch_index * output_tokens + token) * channels + channel] = (0
+                        ..kernel)
+                        .map(|kernel_index| {
+                            input.data[((batch_index * input_tokens + token + kernel_index)
+                                * channels)
+                                + channel]
+                                * weight.data[(channel * kernel) + kernel_index]
+                        })
+                        .sum();
+                }
+            }
+        }
+        Ok(output)
     }
 
     fn conv_transpose1d(
@@ -1931,6 +2024,137 @@ impl NeuralBackend for NumericBackend {
         Ok(input.map(|value| value / (1.0 + (-value).exp())))
     }
 
+    fn sigmoid(input: Self::Tensor, _: &NumericContext) -> Result<Self::Tensor, Error> {
+        Ok(input.map(|value| 1.0 / (1.0 + (-value).exp())))
+    }
+
+    fn softplus(input: Self::Tensor, _: &NumericContext) -> Result<Self::Tensor, Error> {
+        Ok(input.map(|value| value.exp().ln_1p()))
+    }
+
+    fn exp(input: Self::Tensor, _: &NumericContext) -> Result<Self::Tensor, Error> {
+        Ok(input.map(f32::exp))
+    }
+
+    fn gated_group_rms_norm(
+        input: &NumericTensor,
+        gate: &NumericTensor,
+        weight: &NumericTensor,
+        groups: i32,
+        epsilon: f32,
+        _: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        if input.shape != gate.shape || weight.shape != [*input.shape.last().unwrap()] {
+            return Err(Error::backend("numeric gated RMS geometry mismatch"));
+        }
+        let width = *input.shape.last().unwrap() as usize;
+        let groups = usize::try_from(groups).map_err(Error::backend)?;
+        if groups == 0 || !width.is_multiple_of(groups) {
+            return Err(Error::backend(
+                "numeric gated RMS groups do not divide width",
+            ));
+        }
+        let group_width = width / groups;
+        let gated = input
+            .data
+            .iter()
+            .zip(&gate.data)
+            .map(|(input, gate)| input * gate / (1.0 + (-gate).exp()))
+            .collect::<Vec<_>>();
+        let mut output = vec![0.0; gated.len()];
+        for (group_index, (source, target)) in gated
+            .chunks_exact(group_width)
+            .zip(output.chunks_exact_mut(group_width))
+            .enumerate()
+        {
+            let rms = (source.iter().map(|value| value * value).sum::<f32>() / group_width as f32
+                + epsilon)
+                .sqrt();
+            let group_offset = (group_index * group_width) % width;
+            for (index, (target, source)) in target.iter_mut().zip(source).enumerate() {
+                *target = *source / rms * weight.data[(group_offset + index) % width];
+            }
+        }
+        Ok(NumericTensor::new(input.shape.clone(), output))
+    }
+
+    fn gated_delta_scan(
+        input: GatedDeltaScanInput<'_, NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<GatedDeltaScanOutput<NumericTensor>, Error> {
+        let [batch, sequence, heads, key_dimensions] = input.query.shape.as_slice() else {
+            return Err(Error::backend(
+                "numeric gated-delta query must be rank four",
+            ));
+        };
+        let value_dimensions = *input
+            .value
+            .shape
+            .last()
+            .ok_or_else(|| Error::backend("numeric gated-delta value has no width"))?;
+        let vector_decay = input.log_decay.shape.len() == 4;
+        let (state, output) = reference_gated_delta_scan(
+            *batch as usize,
+            *sequence as usize,
+            *heads as usize,
+            *key_dimensions as usize,
+            value_dimensions as usize,
+            &input.query.data,
+            &input.key.data,
+            &input.value.data,
+            &input.log_decay.data,
+            vector_decay,
+            &input.beta.data,
+            input.initial_state.map(|state| state.data.as_slice()),
+        )?;
+        Ok(GatedDeltaScanOutput {
+            state: NumericTensor::new(
+                vec![*batch, *heads, *key_dimensions, value_dimensions],
+                state,
+            ),
+            output: NumericTensor::new(vec![*batch, *sequence, *heads, value_dimensions], output),
+        })
+    }
+
+    fn selective_state_space_scan(
+        input: SelectiveStateSpaceScanInput<'_, NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<SelectiveStateSpaceScanOutput<NumericTensor>, Error> {
+        let [batch, sequence, heads, head_dimensions] = input.values.shape.as_slice() else {
+            return Err(Error::backend(
+                "numeric selective-scan values must be rank four",
+            ));
+        };
+        let state_dimensions = *input
+            .input_state
+            .shape
+            .last()
+            .ok_or_else(|| Error::backend("numeric selective scan has no state width"))?;
+        let (state, output) = reference_selective_state_space_scan(
+            *batch as usize,
+            *sequence as usize,
+            *heads as usize,
+            *head_dimensions as usize,
+            state_dimensions as usize,
+            &input.values.data,
+            &input.input_state.data,
+            &input.output_state.data,
+            &input.time_step.data,
+            &input.time_step_bias.data,
+            &input.transition_log.data,
+            &input.skip.data,
+            input.time_step_floor,
+            input.initial_state.map(|state| state.data.as_slice()),
+        )?;
+        Ok(SelectiveStateSpaceScanOutput {
+            state: NumericTensor::new(
+                vec![*batch, *heads, *head_dimensions, state_dimensions],
+                state,
+            ),
+            output: NumericTensor::new(vec![*batch, *sequence, *heads, *head_dimensions], output),
+        })
+    }
+
     fn swiglu(
         gate: Self::Tensor,
         up: Self::Tensor,
@@ -2743,6 +2967,89 @@ struct NumericExpertBank {
     limit: Option<eredu_nn::SwiGluLimit>,
 }
 
+#[derive(Debug, Clone)]
+struct NumericRelu2ExpertBank {
+    expert_count: usize,
+    hidden: usize,
+    intermediate: usize,
+    up: (NumericTensor, ParameterMetadata),
+    down: (NumericTensor, ParameterMetadata),
+}
+
+impl Parameterized<NumericTensor> for NumericRelu2ExpertBank {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, NumericTensor>,
+    {
+        visit(&self.up.1, &self.up.0, visitor);
+        visit(&self.down.1, &self.down.0, visitor);
+    }
+
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, NumericTensor>,
+    {
+        visit_mut(&mut self.up.1, &mut self.up.0, visitor);
+        visit_mut(&mut self.down.1, &mut self.down.0, visitor);
+    }
+
+    fn set_trainable(&mut self, trainable: bool) {
+        self.up.1.trainable = trainable;
+        self.down.1.trainable = trainable;
+    }
+}
+
+impl Relu2ExpertBankOperator<NumericTensor> for NumericRelu2ExpertBank {
+    fn forward_routed(
+        &mut self,
+        input: &NumericTensor,
+        routes: &RoutingResult<NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        let tokens = input.data.len() / self.hidden;
+        let top_k = routes.expert_ids.shape[1] as usize;
+        if routes.expert_ids.shape != [tokens as i32, top_k as i32]
+            || routes.route_weights.shape != routes.expert_ids.shape
+        {
+            return Err(Error::backend("numeric ReLU2 route geometry mismatch"));
+        }
+        let mut output = NumericTensor::zeros(input.shape.clone());
+        for token in 0..tokens {
+            let token_input = NumericTensor::new(
+                vec![1, self.hidden as i32],
+                input.data[token * self.hidden..(token + 1) * self.hidden].to_vec(),
+            );
+            for route in 0..top_k {
+                let route_index = token * top_k + route;
+                let expert = routes.expert_ids.data[route_index] as usize;
+                if expert >= self.expert_count {
+                    return Err(Error::backend("numeric ReLU2 expert id is out of range"));
+                }
+                let up_start = expert * self.intermediate * self.hidden;
+                let up = NumericTensor::new(
+                    vec![self.intermediate as i32, self.hidden as i32],
+                    self.up.0.data[up_start..up_start + self.intermediate * self.hidden].to_vec(),
+                );
+                let down_start = expert * self.hidden * self.intermediate;
+                let down = NumericTensor::new(
+                    vec![self.hidden as i32, self.intermediate as i32],
+                    self.down.0.data[down_start..down_start + self.hidden * self.intermediate]
+                        .to_vec(),
+                );
+                let activated =
+                    linear(&token_input, &up, None)?.map(|value| value.max(0.0).powi(2));
+                let expert_output = linear(&activated, &down, None)?;
+                let weight = routes.route_weights.data[route_index];
+                for dimension in 0..self.hidden {
+                    output.data[token * self.hidden + dimension] +=
+                        weight * expert_output.data[dimension];
+                }
+            }
+        }
+        Ok(output)
+    }
+}
+
 impl Parameterized<NumericTensor> for NumericExpertBank {
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
@@ -2885,6 +3192,7 @@ impl HyperNeuralBackend for NumericBackend {
 impl RoutedNeuralBackend for NumericBackend {
     type Router = NumericRouter;
     type SwiGluExpertBank = NumericExpertBank;
+    type Relu2ExpertBank = NumericRelu2ExpertBank;
 
     fn top_k_router(spec: TopKRouterSpec, context: &NumericContext) -> Result<Self::Router, Error> {
         spec.validate()?;
@@ -3014,6 +3322,44 @@ impl RoutedNeuralBackend for NumericBackend {
             limit: spec.limit,
         })
     }
+
+    fn relu2_expert_bank(
+        spec: Relu2ExpertBankSpec,
+        _: &NumericContext,
+    ) -> Result<Self::Relu2ExpertBank, Error> {
+        spec.validate()?;
+        let up = parameter(
+            &spec.up.weight,
+            vec![
+                spec.expert_count,
+                spec.intermediate_dimensions,
+                spec.hidden_dimensions,
+            ],
+            true,
+        );
+        let down = parameter(
+            &spec.down.weight,
+            vec![
+                spec.expert_count,
+                spec.hidden_dimensions,
+                spec.intermediate_dimensions,
+            ],
+            true,
+        );
+        Ok(NumericRelu2ExpertBank {
+            expert_count: spec.expert_count as usize,
+            hidden: spec.hidden_dimensions as usize,
+            intermediate: spec.intermediate_dimensions as usize,
+            up: (
+                up,
+                ParameterMetadata::from_spec(&spec.up.weight, spec.up.weight.trainable),
+            ),
+            down: (
+                down,
+                ParameterMetadata::from_spec(&spec.down.weight, spec.down.weight.trainable),
+            ),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3098,6 +3444,200 @@ impl AttentionCache<NumericTensor> for NumericCache {
             self.window,
             query_offset,
         )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NumericHybridLayerState {
+    attention: Option<NumericCache>,
+    compressed: Option<NumericCompressedCache>,
+    fixed: BTreeMap<StateTensorRole, Option<NumericTensor>>,
+    fixed_offset: i32,
+}
+
+impl NumericHybridLayerState {
+    fn new(policy: &LayerCachePolicy) -> Self {
+        Self {
+            attention: match policy {
+                LayerCachePolicy::KeyValue { attention, .. }
+                | LayerCachePolicy::KeyValueWithFixedState { attention, .. } => {
+                    Some(NumericCache::new(attention.sliding_window_i32().unwrap()))
+                }
+                _ => None,
+            },
+            compressed: matches!(policy, LayerCachePolicy::CompressedLatentRotary { .. })
+                .then(NumericCompressedCache::resident),
+            fixed: policy
+                .fixed_state()
+                .iter()
+                .map(|tensor| (tensor.role, None))
+                .collect(),
+            fixed_offset: 0,
+        }
+    }
+}
+
+impl RuntimeLayerState<NumericBackend> for NumericHybridLayerState {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a NumericTensor>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        let mut values = Vec::new();
+        if let Some(attention) = &self.attention {
+            values.extend(attention.keys.iter());
+            values.extend(attention.values.iter());
+        }
+        if let Some(compressed) = &self.compressed {
+            values.extend(
+                compressed
+                    .state
+                    .iter()
+                    .flat_map(|state| [&state.latent, &state.rotary]),
+            );
+        }
+        values.extend(self.fixed.values().filter_map(Option::as_ref));
+        values.into_iter()
+    }
+}
+
+impl RuntimeStateComponents<NumericBackend> for NumericHybridLayerState {
+    fn position(&self) -> i32 {
+        self.attention
+            .as_ref()
+            .map(AttentionCache::offset)
+            .or_else(|| {
+                self.compressed
+                    .as_ref()
+                    .map(CompressedAttentionCache::offset)
+            })
+            .unwrap_or(self.fixed_offset)
+    }
+
+    fn fixed_component(
+        &mut self,
+        role: StateTensorRole,
+    ) -> Result<&mut Option<NumericTensor>, StateError> {
+        self.fixed
+            .get_mut(&role)
+            .ok_or(StateError::UnknownComponent { role })
+    }
+
+    fn advance_fixed(&mut self, tokens: i32) -> Result<(), StateError> {
+        if self.attention.is_some() || tokens <= 0 {
+            return Err(StateError::InvalidAdvance(format!(
+                "invalid fixed-state advance {tokens}"
+            )));
+        }
+        self.fixed_offset += tokens;
+        Ok(())
+    }
+}
+
+impl CompressedAttentionCache<NumericTensor> for NumericHybridLayerState {
+    type Checkpoint = NumericCompressedCache;
+
+    fn offset(&self) -> i32 {
+        self.position()
+    }
+
+    fn is_paged(&self) -> bool {
+        self.compressed
+            .as_ref()
+            .is_some_and(CompressedAttentionCache::is_paged)
+    }
+
+    fn append(
+        &mut self,
+        state: CompressedAttentionState<NumericTensor>,
+        context: &NumericContext,
+    ) -> Result<CompressedAttentionView<NumericTensor>, Error> {
+        self.compressed
+            .as_mut()
+            .ok_or_else(|| Error::backend("layer has no compressed attention state"))?
+            .append(state, context)
+    }
+
+    fn visit_blocks<F>(
+        &mut self,
+        query_tokens: i32,
+        context: &NumericContext,
+        visitor: F,
+    ) -> Result<CompressedAttentionScan, Error>
+    where
+        F: FnMut(CompressedAttentionBlock<NumericTensor>) -> Result<u64, Error>,
+    {
+        self.compressed
+            .as_mut()
+            .ok_or_else(|| Error::backend("layer has no compressed attention state"))?
+            .visit_blocks(query_tokens, context, visitor)
+    }
+
+    fn checkpoint(&self) -> Self::Checkpoint {
+        self.compressed
+            .as_ref()
+            .expect("compressed checkpoint requested for compressed layer")
+            .clone()
+    }
+
+    fn restore(
+        &mut self,
+        checkpoint: &Self::Checkpoint,
+        context: &NumericContext,
+    ) -> Result<(), Error> {
+        self.compressed
+            .as_mut()
+            .ok_or_else(|| Error::backend("layer has no compressed attention state"))?
+            .restore(checkpoint, context)
+    }
+
+    fn finalize(&mut self) -> Result<(), Error> {
+        self.compressed
+            .as_mut()
+            .ok_or_else(|| Error::backend("layer has no compressed attention state"))?
+            .finalize()
+    }
+
+    fn clear(&mut self) -> Result<(), Error> {
+        self.compressed
+            .as_mut()
+            .ok_or_else(|| Error::backend("layer has no compressed attention state"))?
+            .clear()
+    }
+}
+
+impl AttentionCache<NumericTensor> for NumericHybridLayerState {
+    fn offset(&self) -> i32 {
+        self.position()
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        self.attention.as_ref().and_then(AttentionCache::max_size)
+    }
+
+    fn update_for_attention(
+        &mut self,
+        keys: NumericTensor,
+        values: NumericTensor,
+        context: &NumericContext,
+    ) -> Result<(NumericTensor, NumericTensor), Error> {
+        self.attention
+            .as_mut()
+            .ok_or_else(|| Error::backend("fixed layer has no attention state"))?
+            .update_for_attention(keys, values, context)
+    }
+
+    fn attention(
+        &mut self,
+        queries: NumericTensor,
+        keys: NumericTensor,
+        values: NumericTensor,
+        scale: f32,
+        mask: Option<&NumericTensor>,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        self.attention
+            .as_mut()
+            .ok_or_else(|| Error::backend("fixed layer has no attention state"))?
+            .attention(queries, keys, values, scale, mask, context)
     }
 }
 
@@ -3583,6 +4123,506 @@ fn normalized_low_rank_projection_matches_analytical_reference() {
         .unwrap();
     assert_eq!(output.shape, [1, 1]);
     assert_close(output.data[0], 2.0 / 12.5_f32.sqrt());
+}
+
+#[test]
+fn causal_depthwise_convolution_matches_prefill_and_incremental_reference() {
+    let parameter = |name: &str| ParameterSpec::trainable(name).unwrap();
+    let mut convolution = CausalDepthwiseConvolution::<NumericBackend>::new(
+        CausalDepthwiseConvolutionSpec {
+            channels: 2,
+            kernel_size: 3,
+            weight: parameter("conv.weight"),
+            bias: Some(parameter("conv.bias")),
+            activation: ConvolutionActivation::Identity,
+        },
+        &NumericContext::default(),
+    )
+    .unwrap();
+
+    struct Loader;
+    impl<'a> ParameterVisitorMut<'a, NumericTensor> for Loader {
+        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
+            value.data = match metadata.id.as_str() {
+                "conv.weight" => vec![1.0, 2.0, 1.0, 1.0, 0.0, -1.0],
+                "conv.bias" => vec![0.5, -0.5],
+                unexpected => panic!("unexpected convolution parameter {unexpected}"),
+            };
+        }
+    }
+    convolution.visit_parameters_mut(&mut Loader);
+
+    let prefill = convolution
+        .forward(
+            &NumericTensor::new(
+                vec![1, 4, 2],
+                vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0],
+            ),
+            None,
+            &NumericContext::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        prefill.output.data,
+        [1.5, -10.5, 4.5, -20.5, 8.5, -20.5, 12.5, -20.5]
+    );
+    assert_eq!(
+        prefill.history.as_ref().unwrap().data,
+        [3.0, 30.0, 4.0, 40.0]
+    );
+
+    let decode = convolution
+        .forward(
+            &NumericTensor::new(vec![1, 1, 2], vec![5.0, 50.0]),
+            prefill.history.as_ref(),
+            &NumericContext::default(),
+        )
+        .unwrap();
+    assert_eq!(decode.output.data, [16.5, -20.5]);
+    assert_eq!(
+        decode.history.as_ref().unwrap().data,
+        [4.0, 40.0, 5.0, 50.0]
+    );
+}
+
+#[test]
+fn gated_short_convolution_matches_chunked_state_continuation() {
+    let parameter = |name: &str| ParameterSpec::trainable(name).unwrap();
+    let linear = |input, output, name: &str| LinearSpec {
+        input,
+        output,
+        weight: parameter(name),
+        bias: None,
+        format: eredu_checkpoint::LinearFormat::Dense,
+    };
+    let spec = GatedShortConvolutionSpec {
+        input_dimensions: 2,
+        channels: 2,
+        output_dimensions: 2,
+        input_projection: linear(2, 6, "short.in.weight"),
+        output_projection: linear(2, 2, "short.out.weight"),
+        convolution: CausalDepthwiseConvolutionSpec {
+            channels: 2,
+            kernel_size: 3,
+            weight: parameter("short.conv.weight"),
+            bias: Some(parameter("short.conv.bias")),
+            activation: ConvolutionActivation::Identity,
+        },
+    };
+    let mut unbiased_spec = spec.clone();
+    unbiased_spec.convolution.bias = None;
+    let context = NumericContext::default();
+    let mut whole = GatedShortConvolution::<NumericBackend>::new(spec.clone(), &context).unwrap();
+    let mut chunked = GatedShortConvolution::<NumericBackend>::new(spec, &context).unwrap();
+
+    struct Loader;
+    impl<'a> ParameterVisitorMut<'a, NumericTensor> for Loader {
+        fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut NumericTensor) {
+            value.data = match metadata.id.as_str() {
+                // B=x, C swaps the two channels, and the final projection is identity.
+                "short.in.weight" => {
+                    vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0]
+                }
+                "short.out.weight" => vec![1.0, 0.0, 0.0, 1.0],
+                "short.conv.weight" => vec![0.25, 0.5, 1.0, -0.5, 0.25, 1.0],
+                "short.conv.bias" => vec![0.1, -0.2],
+                unexpected => panic!("unexpected gated short-convolution parameter {unexpected}"),
+            };
+        }
+    }
+    whole.visit_parameters_mut(&mut Loader);
+    chunked.visit_parameters_mut(&mut Loader);
+
+    let input = NumericTensor::new(
+        vec![1, 5, 2],
+        vec![0.5, -1.0, 1.5, 0.25, -0.75, 2.0, 1.0, 1.25, -2.0, 0.5],
+    );
+    let expected = whole.forward(&input, None, &context).unwrap();
+    let mut history = None;
+    let mut outputs = Vec::new();
+    for (start, end) in [(0, 2), (2, 4), (4, 5)] {
+        let next = chunked
+            .forward(&input.axis_slice(1, start, end), history.as_ref(), &context)
+            .unwrap();
+        outputs.push(next.output);
+        history = next.history;
+    }
+    let actual = NumericTensor::concatenate(&outputs, 1, &context).unwrap();
+    assert_eq!(actual.shape, expected.output.shape);
+    for (index, (expected, actual)) in expected.output.data.iter().zip(&actual.data).enumerate() {
+        assert!(
+            (*expected - *actual).abs() <= 1.0e-6,
+            "gated short-convolution output {index}: expected {expected}, got {actual}"
+        );
+    }
+    assert_eq!(history.unwrap().data, expected.history.unwrap().data);
+
+    let mut unbiased_whole =
+        GatedShortConvolution::<NumericBackend>::new(unbiased_spec.clone(), &context).unwrap();
+    let mut unbiased_chunked =
+        GatedShortConvolution::<NumericBackend>::new(unbiased_spec, &context).unwrap();
+    unbiased_whole.visit_parameters_mut(&mut Loader);
+    unbiased_chunked.visit_parameters_mut(&mut Loader);
+    let expected = unbiased_whole.forward(&input, None, &context).unwrap();
+    let first = unbiased_chunked
+        .forward(&input.axis_slice(1, 0, 3), None, &context)
+        .unwrap();
+    let second = unbiased_chunked
+        .forward(&input.axis_slice(1, 3, 5), first.history.as_ref(), &context)
+        .unwrap();
+    let actual = NumericTensor::concatenate(&[first.output, second.output], 1, &context).unwrap();
+    assert_tensor_close(
+        &actual,
+        &expected.output,
+        "unbiased gated short convolution",
+    );
+    assert_eq!(second.history.unwrap().data, expected.history.unwrap().data);
+}
+
+#[test]
+fn lfm2_mixed_schedule_advances_attention_and_fixed_state_together() {
+    let args = lfm2::model_args_from_config_value(&serde_json::json!({
+        "model_type": "lfm2",
+        "vocab_size": 16,
+        "hidden_size": 4,
+        "intermediate_size": 8,
+        "num_hidden_layers": 3,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "max_position_embeddings": 32,
+        "layer_types": ["conv", "full_attention", "conv"],
+        "conv_L_cache": 3,
+        "block_multiple_of": 2,
+        "block_ffn_dim_multiplier": 1.0,
+        "block_auto_adjust_ff_dim": true,
+        "tie_word_embeddings": true
+    }))
+    .unwrap();
+    let layout = lfm2::state_layout(&args).unwrap();
+    let mut state = DeviceState::<NumericBackend, _>::create(layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let context = NumericContext::default();
+    let model = lfm2::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
+    let mut runtime = ResidentRuntime::new(model, &context).unwrap();
+
+    for tokens in [
+        NumericTensor::token_ids(&[1, 3, 2]),
+        NumericTensor::token_ids(&[4]),
+    ] {
+        let output = runtime
+            .forward(
+                eredu_architectures::decoder::LayeredInput {
+                    tokens: &tokens,
+                    mask: None,
+                },
+                &mut state,
+                &context,
+            )
+            .unwrap();
+        assert_eq!(output.shape, [1, tokens.dim(1), 16]);
+        assert!(output.data.iter().all(|value| value.is_finite()));
+    }
+
+    for layer in 0..3 {
+        assert_eq!(state.layer(layer).unwrap().position(), 4);
+    }
+    for layer in [0, 2] {
+        let history = state
+            .layer(layer)
+            .unwrap()
+            .fixed_component(StateTensorRole::Convolution { slot: 0 })
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert_eq!(history.shape, [1, 2, 4]);
+    }
+}
+
+fn assert_tensor_close(actual: &NumericTensor, expected: &NumericTensor, label: &str) {
+    assert_eq!(actual.shape, expected.shape, "{label} shape");
+    for (index, (actual, expected)) in actual.data.iter().zip(&expected.data).enumerate() {
+        assert!(
+            (*actual - *expected).abs() <= 2.0e-4,
+            "{label}[{index}]: expected {expected}, got {actual}"
+        );
+    }
+}
+
+#[test]
+fn kimi_linear_mixed_kda_mla_prefill_decode_uses_one_heterogeneous_state() {
+    let args = kimi_linear::model_args_from_config_value(&serde_json::json!({
+        "model_type":"kimi_linear", "vocab_size":16, "hidden_size":12,
+        "num_hidden_layers":2, "num_attention_heads":3, "num_key_value_heads":3,
+        "intermediate_size":17, "head_dim":4, "model_max_length":64,
+        "linear_attn_config":{
+            "kda_layers":[1], "full_attn_layers":[2], "num_heads":3,
+            "head_dim":4, "short_conv_kernel_size":3
+        },
+        "num_experts":2, "moe_intermediate_size":9, "kv_lora_rank":6,
+        "qk_nope_head_dim":4, "qk_rope_head_dim":2, "v_head_dim":4,
+        "mla_use_nope":true, "num_experts_per_token":1, "num_shared_experts":1,
+        "routed_scaling_factor":1.0, "first_k_dense_replace":1,
+        "num_expert_group":1, "topk_group":1, "tie_word_embeddings":false
+    }))
+    .unwrap();
+    let new_state = || {
+        DeviceState::<NumericBackend, _>::create(
+            kimi_linear::state_layout(&args).unwrap(),
+            |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+        )
+        .unwrap()
+    };
+    let mut state = new_state();
+    let mut whole_state = new_state();
+    let context = NumericContext::default();
+    let model = kimi_linear::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let mut runtime = ResidentRuntime::new(model, &context).unwrap();
+
+    let mut chunked_logits = Vec::new();
+    for tokens in [
+        NumericTensor::token_ids(&[1, 3, 2]),
+        NumericTensor::token_ids(&[4]),
+    ] {
+        let logits = runtime
+            .forward(
+                eredu_architectures::decoder::LayeredInput {
+                    tokens: &tokens,
+                    mask: None,
+                },
+                &mut state,
+                &context,
+            )
+            .unwrap();
+        assert_eq!(logits.shape, [1, tokens.dim(1), 16]);
+        assert!(logits.data.iter().all(|value| value.is_finite()));
+        chunked_logits.push(logits);
+    }
+
+    let mut whole = ResidentRuntime::new(
+        kimi_linear::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let whole_logits = whole
+        .forward(
+            eredu_architectures::decoder::LayeredInput {
+                tokens: &NumericTensor::token_ids(&[1, 3, 2, 4]),
+                mask: None,
+            },
+            &mut whole_state,
+            &context,
+        )
+        .unwrap();
+    let chunked_logits = NumericTensor::concatenate(&chunked_logits, 1, &context).unwrap();
+    assert_tensor_close(&chunked_logits, &whole_logits, "Kimi chunked target logits");
+
+    assert_eq!(state.layer(0).unwrap().position(), 4);
+    for slot in 0..3 {
+        let history = state
+            .layer(0)
+            .unwrap()
+            .fixed_component(StateTensorRole::Convolution { slot })
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert_eq!(history.shape[0], 1);
+        assert_eq!(history.shape[1], 2);
+    }
+    assert!(state
+        .layer(0)
+        .unwrap()
+        .fixed_component(StateTensorRole::Recurrent)
+        .unwrap()
+        .is_some());
+    assert_eq!(state.layer(1).unwrap().position(), 4);
+    assert_eq!(
+        state.layer(1).unwrap().compressed.as_ref().unwrap().offset,
+        4
+    );
+    for layer in 0..2 {
+        assert_eq!(
+            state.layer(layer).unwrap().position(),
+            whole_state.layer(layer).unwrap().position()
+        );
+    }
+}
+
+#[test]
+fn nemotron_h_chunked_target_and_mtp_transactions_are_backend_neutral() {
+    let args = nemotron_h::model_args_from_config_value(&serde_json::json!({
+        "model_type":"nemotron_h", "vocab_size":32, "hidden_size":16,
+        "intermediate_size":24, "num_hidden_layers":4,
+        "hybrid_override_pattern":"M*-E", "num_attention_heads":4,
+        "num_key_value_heads":2, "head_dim":4, "mamba_num_heads":4,
+        "n_groups":2, "mamba_head_dim":4, "ssm_state_size":3,
+        "conv_kernel":3, "chunk_size":2, "n_routed_experts":4,
+        "n_shared_experts":1, "moe_intermediate_size":8,
+        "moe_shared_expert_intermediate_size":8, "num_experts_per_tok":2,
+        "n_group":2, "topk_group":1, "num_nextn_predict_layers":1,
+        "mtp_hybrid_override_pattern":"*E", "tie_word_embeddings":false,
+        "residual_in_fp32":true
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let new_state = || {
+        DeviceState::<NumericBackend, _>::create(
+            nemotron_h::state_layout(&args).unwrap(),
+            |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+        )
+        .unwrap()
+    };
+    let mut whole_state = new_state();
+    let mut chunked_state = new_state();
+    let mut whole = ResidentRuntime::new(
+        nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let mut chunked = ResidentRuntime::new(
+        nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let tokens = NumericTensor::token_ids(&[2, 5, 7]);
+    let expected = whole
+        .forward(
+            nemotron_h::EmbeddedInput::target(&tokens, None),
+            &mut whole_state,
+            &context,
+        )
+        .unwrap();
+    let first_tokens = NumericTensor::token_ids(&[2, 5]);
+    let second_tokens = NumericTensor::token_ids(&[7]);
+    let first = chunked
+        .forward(
+            nemotron_h::EmbeddedInput::target(&first_tokens, None),
+            &mut chunked_state,
+            &context,
+        )
+        .unwrap();
+    let second = chunked
+        .forward(
+            nemotron_h::EmbeddedInput::target(&second_tokens, None),
+            &mut chunked_state,
+            &context,
+        )
+        .unwrap();
+    let actual = NumericTensor::concatenate(&[first, second], 1, &context).unwrap();
+    assert_tensor_close(&actual, &expected, "Nemotron-H chunked target logits");
+    for (layer, expected_position) in [3, 3, 0, 0].into_iter().enumerate() {
+        assert_eq!(
+            whole_state.layer(layer).unwrap().position(),
+            expected_position
+        );
+        assert_eq!(
+            chunked_state.layer(layer).unwrap().position(),
+            expected_position
+        );
+    }
+    for layer in 4..6 {
+        assert_eq!(chunked_state.layer(layer).unwrap().position(), 0);
+    }
+
+    let checkpoint = chunked_state.clone();
+    let mut rollback = eredu_runtime::DraftStateTransaction::fork(&checkpoint);
+    let prior = NumericTensor::new(vec![1, 1, 16], (0..16).map(|i| i as f32 / 16.0).collect());
+    let draft_token = NumericTensor::token_ids(&[11]);
+    let draft_logits = chunked
+        .forward(
+            nemotron_h::EmbeddedInput::draft(&draft_token, &prior, 0),
+            rollback.draft_mut(),
+            &context,
+        )
+        .unwrap();
+    assert_eq!(draft_logits.shape, [1, 1, 32]);
+    assert_eq!(rollback.draft_mut().layer(4).unwrap().position(), 1);
+    assert_eq!(rollback.draft_mut().layer(5).unwrap().position(), 0);
+    let mut canonical = checkpoint.clone();
+    rollback.rollback(&mut canonical);
+    assert_eq!(canonical.layer(4).unwrap().position(), 0);
+    assert_eq!(canonical.layer(5).unwrap().position(), 0);
+
+    let mut commit = eredu_runtime::DraftStateTransaction::fork(&checkpoint);
+    chunked
+        .forward(
+            nemotron_h::EmbeddedInput::draft(&draft_token, &prior, 0),
+            commit.draft_mut(),
+            &context,
+        )
+        .unwrap();
+    commit.commit_draft(&mut canonical);
+    assert_eq!(canonical.layer(4).unwrap().position(), 1);
+    assert_eq!(canonical.layer(5).unwrap().position(), 0);
+    for (layer, expected_position) in [3, 3, 0, 0].into_iter().enumerate() {
+        assert_eq!(
+            canonical.layer(layer).unwrap().position(),
+            expected_position
+        );
+    }
+}
+
+#[test]
+fn nemotron_h_sliding_attention_is_chunk_invariant() {
+    let args = nemotron_h::model_args_from_config_value(&serde_json::json!({
+        "model_type":"nemotron_h", "vocab_size":16, "hidden_size":8,
+        "intermediate_size":12, "num_hidden_layers":1,
+        "hybrid_override_pattern":"*", "num_attention_heads":2,
+        "num_key_value_heads":1, "head_dim":4, "mamba_num_heads":2,
+        "n_groups":1, "mamba_head_dim":4, "ssm_state_size":2,
+        "conv_kernel":3, "chunk_size":2, "sliding_window":2,
+        "n_routed_experts":2, "n_shared_experts":1,
+        "moe_intermediate_size":4, "moe_shared_expert_intermediate_size":4,
+        "num_experts_per_tok":1, "n_group":1, "topk_group":1,
+        "num_nextn_predict_layers":0, "tie_word_embeddings":true,
+        "residual_in_fp32":true
+    }))
+    .unwrap();
+    let new_state = || {
+        DeviceState::<NumericBackend, _>::create(
+            nemotron_h::state_layout(&args).unwrap(),
+            |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+        )
+        .unwrap()
+    };
+    let context = NumericContext::default();
+    let mut whole_state = new_state();
+    let mut chunked_state = new_state();
+    let mut whole = ResidentRuntime::new(
+        nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let mut chunked = ResidentRuntime::new(
+        nemotron_h::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let expected = whole
+        .forward(
+            nemotron_h::EmbeddedInput::target(&NumericTensor::token_ids(&[1, 2, 3, 4]), None),
+            &mut whole_state,
+            &context,
+        )
+        .unwrap();
+    let first = chunked
+        .forward(
+            nemotron_h::EmbeddedInput::target(&NumericTensor::token_ids(&[1, 2]), None),
+            &mut chunked_state,
+            &context,
+        )
+        .unwrap();
+    let second = chunked
+        .forward(
+            nemotron_h::EmbeddedInput::target(&NumericTensor::token_ids(&[3, 4]), None),
+            &mut chunked_state,
+            &context,
+        )
+        .unwrap();
+    let actual = NumericTensor::concatenate(&[first, second], 1, &context).unwrap();
+    assert_tensor_close(&actual, &expected, "Nemotron-H sliding target logits");
+    assert!(context.sliding_attention_calls.get() >= 3);
 }
 
 #[test]

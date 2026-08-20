@@ -1,72 +1,19 @@
-//! Architecture-owned checkpoint contracts for Nemotron-H.
+//! Pure Nemotron-H SafeTensors and GGUF checkpoint plans.
 
-//!
-//! Nemotron-H owns its hybrid layer schedule, public/runtime aliases, MTP
-//! geometry, routed-expert storage alternatives, and GGUF name catalog here.
-//! The generic checkpoint runtime only evaluates the resulting physical
-//! constraints and remains unaware of recurrent, expert, and MTP semantics.
+use std::collections::BTreeSet;
 
+use eredu_checkpoint::schema::{
+    AlternativeLayoutGroup, CatalogPolicy, DepthwiseConvolutionSchema, FusedProjectionSegment,
+    FusedSegmentedProjectionSchema, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
+    LayoutVariant, RecurrentParameterGroupSchema, SafetensorsCheckpointPlan,
+    SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
+};
 use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
-use std::collections::{BTreeSet, HashMap};
+use super::{LayerPolicy, ModelArgs};
 
-use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
-use serde_json::Value;
-
-use super::model::{self, LayerPolicy, ModelArgs};
-use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
-use eredu_checkpoint::schema::{
-    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
-    GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-    StoredDtypeConstraint, TensorOperation,
-};
-use eredu_checkpoint::store::WeightStore;
-use eredu_checkpoint::validation;
-use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum GgufVariant {
-    Dense,
-    Moe,
-}
-
-impl GgufVariant {
-    const fn metadata_name(self) -> &'static str {
-        match self {
-            Self::Dense => "nemotron_h",
-            Self::Moe => "nemotron_h_moe",
-        }
-    }
-}
-
-pub(crate) fn validate_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-) -> CheckpointValidation {
-    let args = match model::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    let plan = match safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) if error.starts_with("quantized tensor ") => {
-            return CheckpointValidation::Invalid(vec![CheckpointIssue {
-                kind: CheckpointIssueKind::CompanionMismatch,
-                detail: error,
-                tensor_name: None,
-                tensor_type_code: None,
-                metadata_key: Some("quantization_config.quant_method".into()),
-            }]);
-        }
-        Err(error) => return invalid_geometry(error),
-    };
-    let mut issues = validation_issues(validation::validate_safetensors_plan(store, &plan));
-    validate_expert_layout_conflicts(store, &args, &mut issues);
-    validate_native_quantized_expert_layouts(store, &args, &mut issues);
-    CheckpointValidation::from_issues(issues)
-}
-
-pub(crate) fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
+/// Builds the strict SafeTensors catalog plan for target and MTP units.
+pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
     let hidden = dimension(args.hidden_size, "hidden size")?;
     let vocab = dimension(args.vocab_size, "vocabulary size")?;
     let mut common = Vec::new();
@@ -238,22 +185,38 @@ fn add_safe_mamba(
     let kernel = dimension(args.conv_kernel, "Mamba convolution width")?;
     let intermediate = checked_mul(heads, head, "Mamba intermediate width")?;
     let grouped_state = checked_mul(groups, state, "Mamba grouped state width")?;
+    let recurrent = RecurrentParameterGroupSchema::new(heads, groups, head, state)?;
     let conv = checked_add(
         intermediate,
         checked_mul(2, grouped_state, "Mamba B/C state width")?,
         "Mamba convolution channels",
     )?;
-    let projection = checked_add(
-        checked_add(intermediate, conv, "Mamba projection content width")?,
-        heads,
-        "Mamba projection width",
+    let projection_schema = FusedSegmentedProjectionSchema::new(
+        hidden,
+        [
+            FusedProjectionSegment::new("gate", intermediate)?,
+            FusedProjectionSegment::new("value", intermediate)?,
+            FusedProjectionSegment::new("input_state", grouped_state)?,
+            FusedProjectionSegment::new("output_state", grouped_state)?,
+            FusedProjectionSegment::new("time_step", heads)?,
+        ],
     )?;
+    let projection = projection_schema.output_width();
+    let convolution = DepthwiseConvolutionSchema::new(conv, kernel, args.use_conv_bias)?;
     for (source, target, shape) in [
-        ("in_proj.weight", "in_proj.weight", vec![projection, hidden]),
-        ("conv1d.weight", "conv1d.weight", vec![conv, 1, kernel]),
-        ("dt_bias", "dt_bias", vec![heads]),
-        ("A_log", "A_log", vec![heads]),
-        ("D", "D", vec![heads]),
+        (
+            "in_proj.weight",
+            "in_proj.weight",
+            projection_schema.matrix_shape(),
+        ),
+        (
+            "conv1d.weight",
+            "conv1d.weight",
+            convolution.storage_shape(),
+        ),
+        ("dt_bias", "dt_bias", recurrent.per_head_shape().to_vec()),
+        ("A_log", "A_log", recurrent.per_head_shape().to_vec()),
+        ("D", "D", recurrent.per_head_shape().to_vec()),
         ("norm.weight", "norm.weight", vec![intermediate]),
         (
             "out_proj.weight",
@@ -275,7 +238,9 @@ fn add_safe_mamba(
             output,
             &format!("{official}.mixer.conv1d.bias"),
             &format!("{canonical}.mamba.conv1d.bias"),
-            vec![conv],
+            convolution
+                .bias_shape()
+                .expect("bias-enabled convolution schema"),
         )?;
     }
     if args.use_bias {
@@ -600,156 +565,8 @@ fn outer_prefix(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-fn validate_native_quantized_expert_layouts(
-    store: &SafetensorsWeightStore,
-    args: &ModelArgs,
-    issues: &mut Vec<CheckpointIssue>,
-) {
-    if args.quantization.is_none() {
-        return;
-    }
-    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
-    for (label, official, canonical) in expert_layout_roots(args) {
-        let split = (0..args.n_routed_experts as usize)
-            .flat_map(|expert| {
-                [
-                    format!("{official}.{expert}.up_proj.weight"),
-                    format!("{canonical}.{expert}.up_proj.weight"),
-                    format!("{official}.{expert}.down_proj.weight"),
-                    format!("{canonical}.{expert}.down_proj.weight"),
-                ]
-            })
-            .find(|name| keys.contains(name));
-        if let Some(name) = split {
-            issues.push(CheckpointIssue {
-                kind: CheckpointIssueKind::ConflictingLayout,
-                detail: format!(
-                    "checkpoint-native quantized Nemotron-H {label} requires packed routed expert banks"
-                ),
-                tensor_name: Some(name),
-                tensor_type_code: None,
-                metadata_key: Some("quantization".into()),
-            });
-        }
-    }
-}
-
-fn validate_expert_layout_conflicts(
-    store: &SafetensorsWeightStore,
-    args: &ModelArgs,
-    issues: &mut Vec<CheckpointIssue>,
-) {
-    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
-    for (label, official, canonical) in expert_layout_roots(args) {
-        let packed = [
-            format!("{official}.up_proj"),
-            format!("{canonical}.up_proj"),
-            format!("{official}.down_proj"),
-            format!("{canonical}.down_proj"),
-        ];
-        let split = (0..args.n_routed_experts as usize)
-            .flat_map(|expert| {
-                [
-                    format!("{official}.{expert}.up_proj.weight"),
-                    format!("{canonical}.{expert}.up_proj.weight"),
-                    format!("{official}.{expert}.down_proj.weight"),
-                    format!("{canonical}.{expert}.down_proj.weight"),
-                ]
-            })
-            .find(|name| keys.contains(name));
-        if packed.iter().any(|name| keys.contains(name)) {
-            if let Some(name) = split {
-                let group_id = format!("Nemotron-H {label} routed experts");
-                issues.retain(|issue| {
-                    !issue.detail.contains(&group_id)
-                        && !issue.tensor_name.as_deref().is_some_and(|name| {
-                            name.starts_with(&format!("{official}."))
-                                || name.starts_with(&format!("{canonical}."))
-                        })
-                });
-                issues.push(CheckpointIssue {
-                    kind: CheckpointIssueKind::ConflictingLayout,
-                    detail: format!(
-                        "Nemotron-H {label} mixes packed and split routed expert tensors"
-                    ),
-                    tensor_name: Some(name),
-                    tensor_type_code: None,
-                    metadata_key: None,
-                });
-            }
-        }
-    }
-}
-
-fn expert_layout_roots(args: &ModelArgs) -> Vec<(String, String, String)> {
-    let mut roots = args
-        .layer_schedule
-        .iter()
-        .enumerate()
-        .filter(|(_, policy)| **policy == LayerPolicy::SparseMoe)
-        .map(|(layer, _)| {
-            (
-                format!("layer {layer}"),
-                format!("backbone.layers.{layer}.mixer.experts"),
-                format!("model.layers.{layer}.moe.experts"),
-            )
-        })
-        .collect::<Vec<_>>();
-    if let Ok(policies) = args.mtp_policies() {
-        roots.extend(
-            policies
-                .iter()
-                .enumerate()
-                .filter(|(_, policy)| **policy == LayerPolicy::SparseMoe)
-                .map(|(layer, _)| {
-                    (
-                        format!("MTP physical layer {layer}"),
-                        format!("mtp.layers.{layer}.mixer.experts"),
-                        format!("model.mtp.layers.{layer}.mixer.experts"),
-                    )
-                }),
-        );
-    }
-    roots
-}
-
-pub(crate) fn validate_gguf(
-    variant: GgufVariant,
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> CheckpointValidation {
-    if let Err(error) = checkpoint
-        .catalog()
-        .translated_outputs(model::translate_gguf_weight_name)
-    {
-        return CheckpointValidation::Invalid(vec![CheckpointIssue {
-            kind: CheckpointIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let args =
-        match model::model_args_from_gguf_catalog(checkpoint, metadata, variant.metadata_name()) {
-            Ok(args) => args,
-            Err(error) => return invalid_geometry(error.to_string()),
-        };
-    if args.num_hidden_layers as usize > checkpoint.catalog().physical_tensor_count() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor GGUF catalog",
-            args.num_hidden_layers,
-            checkpoint.catalog().physical_tensor_count()
-        ));
-    }
-    let plan = match gguf_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    validation::validate_gguf_plan(checkpoint, &plan)
-}
-
-pub(crate) fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
+/// Builds the strict GGUF tensor plan for the normalized physical schedule.
+pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
     let hidden = dimension(args.hidden_size, "hidden size")?;
     let vocab = dimension(args.vocab_size, "vocabulary size")?;
     let mut tensors = vec![
@@ -1043,64 +860,162 @@ fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("Nemotron-H {name} geometry overflows"))
 }
 
-fn validation_issues(validation: CheckpointValidation) -> Vec<CheckpointIssue> {
-    match validation {
-        CheckpointValidation::Exact => Vec::new(),
-        CheckpointValidation::Invalid(issues) => issues,
-        CheckpointValidation::Unverified(issue) => vec![issue],
+/// Translates one physical GGUF tensor name to its canonical parameter identity.
+pub fn translate_gguf_weight_name(name: &str) -> String {
+    const ROOTS: [(&str, &str); 3] = [
+        ("token_embd", "model.embeddings"),
+        ("output_norm", "model.norm_f"),
+        ("output", "lm_head"),
+    ];
+    for (source, target) in ROOTS {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            return name.replacen(source, target, 1);
+        }
     }
-}
 
-fn invalid_geometry(detail: String) -> CheckpointValidation {
-    CheckpointValidation::Invalid(vec![CheckpointIssue {
-        kind: CheckpointIssueKind::InvalidGeometry,
-        detail,
-        tensor_name: None,
-        tensor_type_code: None,
-        metadata_key: None,
-    }])
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return name.to_string();
+    };
+    let Some((layer, parameter)) = rest.split_once('.') else {
+        return name.to_string();
+    };
+
+    const MOE_PARAMETERS: [(&str, &str); 7] = [
+        ("ffn_gate_inp", "gate"),
+        ("exp_probs_b", "gate.e_score_correction_bias"),
+        ("ffn_up_exps", "experts.up_proj"),
+        ("ffn_down_exps", "experts.down_proj"),
+        ("ffn_up_shexp", "shared_experts.up_proj"),
+        ("ffn_down_shexp", "shared_experts.down_proj"),
+        ("ffn_exp_probs_b", "gate.e_score_correction_bias"),
+    ];
+    for (source, target) in MOE_PARAMETERS {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            let suffix = parameter.strip_prefix(source).unwrap_or_default();
+            let suffix = if target == "gate.e_score_correction_bias" && suffix == ".bias" {
+                ""
+            } else if target.starts_with("experts.") {
+                match suffix {
+                    ".weight" => "",
+                    ".scales" => "_scales",
+                    ".biases" => "_biases",
+                    other => other,
+                }
+            } else {
+                suffix
+            };
+            return format!("model.layers.{layer}.moe.{target}{suffix}");
+        }
+    }
+
+    const PARAMETERS: [(&str, &str); 16] = [
+        ("attn_norm", "norm"),
+        ("attn_q", "attention.q_proj"),
+        ("attn_k", "attention.k_proj"),
+        ("attn_v", "attention.v_proj"),
+        ("attn_output", "attention.o_proj"),
+        ("ffn_up", "mlp.up_proj"),
+        ("ffn_down", "mlp.down_proj"),
+        ("ssm_in", "mamba.in_proj"),
+        ("ssm_conv1d", "mamba.conv1d"),
+        ("ssm_dt.bias", "mamba.dt_bias"),
+        ("ssm_a", "mamba.A_log"),
+        ("ssm_d", "mamba.D"),
+        ("ssm_norm", "mamba.norm"),
+        ("ssm_out", "mamba.out_proj"),
+        ("rope_freqs", "rope_freqs"),
+        ("ffn_norm", "ffn_norm"),
+    ];
+    for (source, target) in PARAMETERS {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            return format!(
+                "model.layers.{layer}.{}",
+                parameter.replacen(source, target, 1)
+            );
+        }
+    }
+    name.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn fixture() -> ModelArgs {
+        super::super::config::model_args_from_config_value(&serde_json::json!({
+            "model_type":"nemotron_h", "vocab_size":32, "hidden_size":16,
+            "intermediate_size":24, "num_hidden_layers":4,
+            "hybrid_override_pattern":"M*-E", "num_attention_heads":4,
+            "num_key_value_heads":2, "head_dim":4, "mamba_num_heads":4,
+            "n_groups":2, "mamba_head_dim":4, "ssm_state_size":3,
+            "conv_kernel":3, "n_routed_experts":4, "n_shared_experts":1,
+            "moe_intermediate_size":8, "moe_shared_expert_intermediate_size":8,
+            "num_experts_per_tok":2, "n_group":2, "topk_group":1,
+            "num_nextn_predict_layers":1, "mtp_hybrid_override_pattern":"*E",
+            "tie_word_embeddings":false
+        }))
+        .unwrap()
+    }
+
     #[test]
-    fn expert_layouts_are_architecture_owned_alternatives() {
-        let config = serde_json::json!({
-            "model_type": "nemotron_h",
-            "vocab_size": 32,
-            "tie_word_embeddings": true,
-            "hidden_size": 16,
-            "intermediate_size": 24,
-            "num_hidden_layers": 1,
-            "hybrid_override_pattern": "E",
-            "num_attention_heads": 2,
-            "head_dim": 8,
-            "num_key_value_heads": 1,
-            "ssm_state_size": 4,
-            "mamba_num_heads": 2,
-            "n_groups": 1,
-            "mamba_head_dim": 8,
-            "conv_kernel": 4,
-            "n_routed_experts": 2,
-            "n_shared_experts": 1,
-            "moe_intermediate_size": 12,
-            "moe_shared_expert_intermediate_size": 12,
-            "num_experts_per_tok": 1,
-            "n_group": 1,
-            "topk_group": 1
-        });
-        let args = model::model_args_from_config_value(&config).unwrap();
-        let plan = safetensors_plan(&args).unwrap();
-        assert_eq!(plan.layout_groups.len(), 1);
-        assert_eq!(
-            plan.layout_groups[0]
+    fn safe_plan_covers_all_target_units_mtp_and_expert_layouts() {
+        let plan = safetensors_plan(&fixture()).unwrap();
+        let contains = |name: &str| {
+            plan.common_tensors.iter().any(|tensor| {
+                tensor.key == name || tensor.aliases.iter().any(|alias| alias == name)
+            })
+        };
+        for name in [
+            "model.layers.0.mamba.in_proj.weight",
+            "model.layers.1.attention.q_proj.weight",
+            "model.layers.2.mlp.up_proj.weight",
+            "model.mtp.layers.0.mixer.q_proj.weight",
+            "model.mtp.layers.0.eh_proj.weight",
+            "model.mtp.layers.1.final_layernorm.weight",
+        ] {
+            assert!(contains(name), "missing {name}");
+        }
+        let groups = plan
+            .layout_groups
+            .iter()
+            .map(|group| group.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(groups.iter().any(|group| group.contains("layer 3")));
+        assert!(groups
+            .iter()
+            .any(|group| group.contains("MTP physical layer 1")));
+        assert!(plan.layout_groups.iter().all(|group| {
+            group
                 .variants
                 .iter()
                 .map(|variant| variant.id.as_str())
-                .collect::<Vec<_>>(),
-            ["packed", "split"]
+                .eq(["packed", "split"])
+        }));
+    }
+
+    #[test]
+    fn gguf_plan_and_translation_cover_every_target_operator_kind() {
+        let plan = gguf_plan(&fixture()).unwrap();
+        let names = plan
+            .common_tensors
+            .iter()
+            .map(|tensor| tensor.key.as_str())
+            .collect::<Vec<_>>();
+        for name in [
+            "blk.0.ssm_in.weight",
+            "blk.1.attn_q.weight",
+            "blk.2.ffn_up.weight",
+            "blk.3.ffn_up_exps.weight",
+        ] {
+            assert!(names.contains(&name), "missing {name}");
+        }
+        assert_eq!(
+            translate_gguf_weight_name("blk.0.ssm_dt.bias"),
+            "model.layers.0.mamba.dt_bias"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("blk.3.ffn_up_exps.scales"),
+            "model.layers.3.moe.experts.up_proj_scales"
         );
     }
 }

@@ -1,73 +1,18 @@
-//! Architecture-owned checkpoint contracts for LFM2 and LFM2-MoE.
+//! Pure SafeTensors and GGUF checkpoint plans for LFM2.
 
-//!
-//! LFM2 owns its hybrid operator schedule, short-convolution layouts, expert
-//! storage alternatives, aliases, and quantization exclusions here. The
-//! generic checkpoint runtime evaluates the resulting physical constraints.
-
-use eredu_checkpoint::{StoredDtype, WeightQuantization};
-
-use std::collections::{BTreeSet, HashMap};
-
-use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
-use serde_json::Value;
-
-use super::model::{self, FeedForwardPolicy, ModelArgs, OperatorPolicy};
-use crate::{backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore, AttentionPolicy};
 use eredu_checkpoint::schema::{
-    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
-    GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-    StoredDtypeConstraint, TensorOperation,
+    AlternativeLayoutGroup, CatalogPolicy, DepthwiseConvolutionSchema, FusedProjectionSegment,
+    FusedSegmentedProjectionSchema, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
+    LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
+    TensorOperation,
 };
-use eredu_checkpoint::store::WeightStore;
-use eredu_checkpoint::validation;
-use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
+use eredu_checkpoint::{StoredDtype, WeightQuantization};
+use eredu_core::AttentionPolicy;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum GgufVariant {
-    Dense,
-    Moe,
-}
+use super::config::{FeedForwardPolicy, ModelArgs, OperatorPolicy};
 
-impl GgufVariant {
-    const fn is_moe(self) -> bool {
-        matches!(self, Self::Moe)
-    }
-
-    const fn metadata_name(self) -> &'static str {
-        match self {
-            Self::Dense => "lfm2",
-            Self::Moe => "lfm2moe",
-        }
-    }
-}
-
-pub(crate) fn validate_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-    allow_derived_packed: bool,
-) -> CheckpointValidation {
-    let args = match model::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > store.keys().len() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor checkpoint catalog",
-            args.num_hidden_layers,
-            store.keys().len()
-        ));
-    }
-    let plan = match safetensors_plan(&args, allow_derived_packed) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    let mut issues = validation_issues(validation::validate_safetensors_plan(store, &plan));
-    validate_expert_prefix_catalogs(store, &args, &plan, &mut issues);
-    finish(issues)
-}
-
-pub(crate) fn safetensors_plan(
+/// Builds the complete alternative-layout SafeTensors contract.
+pub fn safetensors_plan(
     args: &ModelArgs,
     allow_derived_packed: bool,
 ) -> Result<SafetensorsCheckpointPlan, String> {
@@ -115,18 +60,35 @@ pub(crate) fn safetensors_plan(
         match policy.operator {
             OperatorPolicy::CausalConvolution => {
                 let kernel = dimension(args.conv_l_cache, "short-convolution width")?;
+                let convolution = DepthwiseConvolutionSchema::new(hidden, kernel, args.conv_bias)?;
+                let fused = FusedSegmentedProjectionSchema::new(
+                    hidden,
+                    ["gate", "value", "convolution"]
+                        .into_iter()
+                        .map(|name| FusedProjectionSegment::new(name, hidden))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )?;
                 common.push(
-                    safe(format!("{root}.conv.conv.weight"), vec![hidden, 1, kernel])
-                        .with_alternate_shapes([vec![hidden, kernel, 1]]),
+                    safe(
+                        format!("{root}.conv.conv.weight"),
+                        convolution.storage_shape(),
+                    )
+                    .with_alternate_shapes([
+                        DepthwiseConvolutionSchema::with_axes(
+                            hidden,
+                            kernel,
+                            eredu_checkpoint::schema::DepthwiseKernelAxes::ChannelsKernelSingleton,
+                            eredu_checkpoint::schema::DepthwiseKernelAxes::ChannelsSingletonKernel,
+                            args.conv_bias,
+                        )?
+                        .storage_shape(),
+                    ]),
                 );
                 add_safe_matrix(
                     args,
                     &mut common,
                     &format!("{root}.conv.in_proj.weight"),
-                    vec![
-                        checked_mul(3, hidden, "short-convolution input width")?,
-                        hidden,
-                    ],
+                    fused.matrix_shape(),
                     true,
                 )?;
                 add_safe_matrix(
@@ -139,10 +101,7 @@ pub(crate) fn safetensors_plan(
                 if args.conv_bias {
                     common.extend([
                         safe(format!("{root}.conv.conv.bias"), vec![hidden]),
-                        safe(
-                            format!("{root}.conv.in_proj.bias"),
-                            vec![checked_mul(3, hidden, "short-convolution bias width")?],
-                        ),
+                        safe(format!("{root}.conv.in_proj.bias"), fused.bias_shape()),
                         safe(format!("{root}.conv.out_proj.bias"), vec![hidden]),
                     ]);
                 }
@@ -409,100 +368,8 @@ fn outer_prefix(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-fn validate_expert_prefix_catalogs(
-    store: &SafetensorsWeightStore,
-    args: &ModelArgs,
-    plan: &SafetensorsCheckpointPlan,
-    issues: &mut Vec<CheckpointIssue>,
-) {
-    let allowed = plan
-        .layout_groups
-        .iter()
-        .flat_map(|group| &group.variants)
-        .flat_map(|variant| &variant.tensors)
-        .flat_map(|tensor| std::iter::once(&tensor.key).chain(&tensor.aliases))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
-            continue;
-        }
-        let prefix = format!("model.layers.{layer}.feed_forward.experts.");
-        for key in store
-            .keys()
-            .into_iter()
-            .filter(|key| key.starts_with(&prefix) && !allowed.contains(key))
-        {
-            issues.push(CheckpointIssue {
-                kind: CheckpointIssueKind::ConflictingLayout,
-                detail: format!(
-                    "expert catalog {:?} contains an unexpected, unsupported, or out-of-range tensor {key:?}",
-                    prefix.trim_end_matches('.')
-                ),
-                tensor_name: Some(key),
-                tensor_type_code: None,
-                metadata_key: None,
-            });
-        }
-    }
-}
-
-pub(crate) fn validate_gguf(
-    variant: GgufVariant,
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> CheckpointValidation {
-    let is_moe = variant.is_moe();
-    let translate = |name: &str| model::translate_gguf_weight_name(name, is_moe);
-    if let Err(error) = checkpoint.catalog().translated_outputs(translate) {
-        return CheckpointValidation::Invalid(vec![CheckpointIssue {
-            kind: CheckpointIssueKind::ConflictingLayout,
-            detail: error.to_string(),
-            tensor_name: None,
-            tensor_type_code: None,
-            metadata_key: None,
-        }]);
-    }
-    let args = match model::args_from_gguf_catalog(
-        checkpoint,
-        metadata,
-        variant.metadata_name(),
-        is_moe,
-    ) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > checkpoint.catalog().physical_tensor_count() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor GGUF catalog",
-            args.num_hidden_layers,
-            checkpoint.catalog().physical_tensor_count()
-        ));
-    }
-    let plan = match gguf_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    let mut issues = validation_issues(validation::validate_gguf_plan(checkpoint, &plan));
-    if is_moe {
-        issues.extend(validation::validate_matching_gguf_encodings(
-            checkpoint,
-            args.layer_schedule
-                .iter()
-                .enumerate()
-                .filter_map(|(layer, policy)| {
-                    (policy.feed_forward == FeedForwardPolicy::SparseMoe).then_some((
-                        format!("blk.{layer}.ffn_gate_exps.weight"),
-                        format!("blk.{layer}.ffn_up_exps.weight"),
-                    ))
-                }),
-            "LFM2 MoE",
-        ));
-    }
-    finish(issues)
-}
-
-pub(crate) fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
+/// Builds the complete physical GGUF tensor contract.
+pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
     let hidden = dimension(args.hidden_size, "hidden size")?;
     let vocab = dimension(args.vocab_size, "vocabulary size")?;
     let heads = dimension(args.num_attention_heads, "attention head count")?;
@@ -705,98 +572,129 @@ fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("LFM2 {name} geometry overflows"))
 }
 
-fn validation_issues(validation: CheckpointValidation) -> Vec<CheckpointIssue> {
-    match validation {
-        CheckpointValidation::Exact => Vec::new(),
-        CheckpointValidation::Invalid(issues) => issues,
-        CheckpointValidation::Unverified(issue) => vec![issue],
+/// Translates one physical GGUF tensor name to its canonical parameter identity.
+pub fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
+    for (source, target) in [
+        ("token_embd", "model.embed_tokens"),
+        ("token_embd_norm", "model.embedding_norm"),
+        ("output", "lm_head"),
+    ] {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            return name.replacen(source, target, 1);
+        }
     }
-}
-
-fn finish(issues: Vec<CheckpointIssue>) -> CheckpointValidation {
-    CheckpointValidation::from_issues(issues)
-}
-
-fn invalid_geometry(detail: String) -> CheckpointValidation {
-    CheckpointValidation::Invalid(vec![CheckpointIssue {
-        kind: CheckpointIssueKind::InvalidGeometry,
-        detail,
-        tensor_name: None,
-        tensor_type_code: None,
-        metadata_key: None,
-    }])
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return name.to_string();
+    };
+    let Some((layer, parameter)) = rest.split_once('.') else {
+        return name.to_string();
+    };
+    if is_moe {
+        for (source, target) in [
+            ("ffn_gate_inp", "feed_forward.gate"),
+            ("ffn_gate_exps", "feed_forward.experts.gate_proj"),
+            ("ffn_up_exps", "feed_forward.experts.up_proj"),
+            ("ffn_down_exps", "feed_forward.experts.down_proj"),
+            ("ffn_exp_probs_b", "feed_forward.expert_bias"),
+            ("exp_probs_b", "feed_forward.expert_bias"),
+        ] {
+            if parameter == source || parameter.starts_with(&format!("{source}.")) {
+                let suffix = parameter.strip_prefix(source).unwrap_or_default();
+                let suffix = if target.ends_with("expert_bias") && suffix == ".bias" {
+                    ""
+                } else if target.contains("experts.") {
+                    match suffix {
+                        ".weight" => "",
+                        ".scales" => "_scales",
+                        ".biases" => "_biases",
+                        other => other,
+                    }
+                } else {
+                    suffix
+                };
+                return format!("model.layers.{layer}.{target}{suffix}");
+            }
+        }
+    }
+    for (source, target) in [
+        ("shortconv.conv", "conv.conv"),
+        ("shortconv.in_proj", "conv.in_proj"),
+        ("shortconv.out_proj", "conv.out_proj"),
+        ("attn_q_norm", "self_attn.q_layernorm"),
+        ("attn_k_norm", "self_attn.k_layernorm"),
+        ("attn_q", "self_attn.q_proj"),
+        ("attn_k", "self_attn.k_proj"),
+        ("attn_v", "self_attn.v_proj"),
+        ("attn_output", "self_attn.out_proj"),
+        ("attn_norm", "operator_norm"),
+        ("ffn_norm", "ffn_norm"),
+        ("ffn_gate", "feed_forward.w1"),
+        ("ffn_down", "feed_forward.w2"),
+        ("ffn_up", "feed_forward.w3"),
+    ] {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            return format!(
+                "model.layers.{layer}.{}",
+                parameter.replacen(source, target, 1)
+            );
+        }
+    }
+    name.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_checkpoint::AffineQuantization;
 
-    #[test]
-    fn affine_constraints_exclude_runtime_shape_from_packed_storage() {
-        let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
-        let constraints = safe_matrix_constraints(
-            "model.layers.0.feed_forward.w1.weight",
-            vec![8, 64],
-            Some(quantization),
-        )
-        .unwrap();
-        assert_eq!(constraints[0].shape, [8, 8]);
-        assert_eq!(
-            constraints[0].dtype,
-            StoredDtypeConstraint::Exact(StoredDtype::U32)
-        );
-        assert_eq!(constraints[1].shape, [8, 2]);
-    }
-
-    #[test]
-    fn plan_uses_each_feed_forward_policy_in_schedule_order() {
-        let mut args = model::model_args_from_config_value(&serde_json::json!({
+    fn fixture() -> ModelArgs {
+        super::super::config::model_args_from_config_value(&serde_json::json!({
             "model_type": "lfm2_moe", "vocab_size": 32, "hidden_size": 16,
             "intermediate_size": 24, "num_hidden_layers": 3,
             "num_attention_heads": 4, "num_key_value_heads": 2,
-            "max_position_embeddings": 64, "norm_eps": 1e-5,
+            "max_position_embeddings": 128,
             "layer_types": ["conv", "full_attention", "conv"],
             "conv_L_cache": 3, "block_auto_adjust_ff_dim": false,
-            "moe_intermediate_size": 8, "num_dense_layers": 1,
-            "num_experts": 2, "num_experts_per_tok": 1
+            "num_dense_layers": 1, "moe_intermediate_size": 8,
+            "num_experts": 4, "num_experts_per_tok": 2,
+            "use_expert_bias": true
         }))
-        .unwrap();
-        args.layer_schedule = crate::LayerSchedule::new(
-            3,
-            vec![
-                super::super::model::LayerPolicy {
-                    operator: OperatorPolicy::CausalConvolution,
-                    feed_forward: FeedForwardPolicy::SparseMoe,
-                },
-                super::super::model::LayerPolicy {
-                    operator: OperatorPolicy::SelfAttention(AttentionPolicy::Full),
-                    feed_forward: FeedForwardPolicy::Dense,
-                },
-                super::super::model::LayerPolicy {
-                    operator: OperatorPolicy::CausalConvolution,
-                    feed_forward: FeedForwardPolicy::SparseMoe,
-                },
-            ],
-        )
-        .unwrap();
-        let plan = safetensors_plan(&args, true).unwrap();
-        let names = plan
+        .unwrap()
+    }
+
+    #[test]
+    fn plans_every_scheduled_operator_and_feed_forward_policy() {
+        let args = fixture();
+        let safe = safetensors_plan(&args, true).unwrap();
+        let safe_names = safe
             .common_tensors
             .iter()
             .map(|tensor| tensor.key.as_str())
-            .chain(
-                plan.layout_groups
-                    .iter()
-                    .flat_map(|group| &group.variants)
-                    .flat_map(|variant| &variant.tensors)
-                    .map(|tensor| tensor.key.as_str()),
-            )
-            .collect::<BTreeSet<_>>();
-        assert!(names.contains("model.layers.0.feed_forward.gate.weight"));
-        assert!(!names.contains("model.layers.0.feed_forward.w1.weight"));
-        assert!(names.contains("model.layers.1.feed_forward.w1.weight"));
-        assert!(!names.contains("model.layers.1.feed_forward.gate.weight"));
-        assert!(names.contains("model.layers.2.feed_forward.gate.weight"));
+            .collect::<Vec<_>>();
+        assert!(safe_names.contains(&"model.layers.0.conv.conv.weight"));
+        assert!(safe_names.contains(&"model.layers.1.self_attn.q_proj.weight"));
+        assert!(safe_names.contains(&"model.layers.0.feed_forward.w1.weight"));
+        assert!(safe_names.contains(&"model.layers.1.feed_forward.gate.weight"));
+
+        let gguf = gguf_plan(&args).unwrap();
+        let gguf_names = gguf
+            .common_tensors
+            .iter()
+            .map(|tensor| tensor.key.as_str())
+            .collect::<Vec<_>>();
+        assert!(gguf_names.contains(&"blk.0.shortconv.conv.weight"));
+        assert!(gguf_names.contains(&"blk.1.attn_q.weight"));
+        assert!(gguf_names.contains(&"blk.1.ffn_gate_exps.weight"));
+    }
+
+    #[test]
+    fn translates_dense_sparse_and_short_convolution_names() {
+        assert_eq!(
+            translate_gguf_weight_name("blk.2.shortconv.in_proj.weight", false),
+            "model.layers.2.conv.in_proj.weight"
+        );
+        assert_eq!(
+            translate_gguf_weight_name("blk.2.ffn_gate_exps.weight", true),
+            "model.layers.2.feed_forward.experts.gate_proj"
+        );
     }
 }

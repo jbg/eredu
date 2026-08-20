@@ -11,17 +11,23 @@ use std::{
 use eredu_core::Completion;
 use eredu_nn::{
     validate_parameter_topology, AttentionCache, BlockwiseAttentionBackend, BlockwiseAttentionSpec,
-    EmbeddingOperator, EmbeddingSpec, Error as ComputeError, HyperConnectionOperator,
-    HyperConnectionSpec, HyperConnectionState, HyperHeadOperator, HyperHeadSpec,
-    HyperNeuralBackend, IndexedAttentionInput, LinearFormat, LinearOperator, LinearSpec,
-    NeuralBackend, NormalizationOperator, NormalizationSpec, ParameterMetadata, ParameterSpec,
-    ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
-    PooledPositionInput, RopeValue, RotaryOperator, RotaryPosition, RotarySpec,
-    RoutedNeuralBackend, RoutingOperator, RoutingResult, RoutingScoring, SwiGluExpertBankOperator,
-    SwiGluExpertBankSpec, SwiGluExpertLayout, SwiGluLimit, Tensor, TopKRouterSpec,
+    EmbeddingOperator, EmbeddingSpec, Error as ComputeError, GatedDeltaScanInput,
+    GatedDeltaScanOutput, HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState,
+    HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, IndexedAttentionInput, LinearFormat,
+    LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec,
+    ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized,
+    PooledAttentionInput, PooledPositionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec,
+    RopeValue, RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend, RoutingOperator,
+    RoutingResult, RoutingScoring, SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput,
+    SwiGluExpertBankOperator, SwiGluExpertBankSpec, SwiGluExpertLayout, SwiGluLimit, Tensor,
+    TopKRouterSpec,
 };
 use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
-use safemlx::ops::{argpartition_axis, broadcast_to, einsum, indexing::take_along_axis, maximum};
+use safemlx::ops::{
+    argpartition_axis, broadcast_to, einsum,
+    indexing::{take_along_axis, NewAxis, TryIndexOp},
+    maximum,
+};
 use safemlx::{
     builder::Builder,
     distributed::Group,
@@ -956,6 +962,68 @@ impl SwiGluExpertBankOperator<Array> for MlxSwiGluExpertBank {
     }
 }
 
+/// MLX packed execution bank for backend-neutral routed ReLU2 experts.
+#[derive(Debug, Clone)]
+pub struct MlxRelu2ExpertBank {
+    module: MlxParameterTree<common::moe::PackedRelu2Experts>,
+}
+
+impl Parameterized<Array> for MlxRelu2ExpertBank {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, Array>,
+    {
+        self.module.visit_parameters(visitor);
+    }
+
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, Array>,
+    {
+        self.module.visit_parameters_mut(visitor);
+    }
+
+    fn set_trainable(&mut self, trainable: bool) {
+        self.module.set_trainable(trainable);
+    }
+}
+
+impl Relu2ExpertBankOperator<Array> for MlxRelu2ExpertBank {
+    fn forward_routed(
+        &mut self,
+        input: &Array,
+        routes: &RoutingResult<Array>,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        let shape = input.shape();
+        let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
+        let output = compute(self.module.forward(
+            &flattened,
+            &routes.expert_ids,
+            &routes.route_weights,
+            context,
+        ))?;
+        compute(output.reshape(shape, context))
+    }
+}
+
+impl crate::backend::mlx::runtime::distributed::expert::LocalExpertBank for MlxRelu2ExpertBank {
+    fn execute_local_routes(
+        &mut self,
+        hidden: &Array,
+        local_expert_ids: &Array,
+        stream: &Stream,
+    ) -> Result<Array, crate::backend::mlx::error::Error> {
+        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
+        let weights = crate::backend::mlx::runtime::distributed::expert::unit_route_weights(
+            hidden.dim(0),
+            hidden.dtype(),
+            stream,
+        )?;
+        Ok(self.module.forward(hidden, &ids, &weights, stream)?)
+    }
+}
+
 impl crate::backend::mlx::runtime::distributed::expert::LocalExpertBank for MlxSwiGluExpertBank {
     fn execute_local_routes(
         &mut self,
@@ -1248,6 +1316,179 @@ impl NeuralBackend for MlxBackend {
 
     fn silu(input: Array, context: &Stream) -> Result<Array, ComputeError> {
         compute(common::layers::silu(input, context))
+    }
+
+    fn sigmoid(input: Array, context: &Stream) -> Result<Array, ComputeError> {
+        compute(safemlx::ops::sigmoid(input, context))
+    }
+
+    fn softplus(input: Array, context: &Stream) -> Result<Array, ComputeError> {
+        compute(nn::softplus(input, context))
+    }
+
+    fn exp(input: Array, context: &Stream) -> Result<Array, ComputeError> {
+        compute(safemlx::ops::exp(input, context))
+    }
+
+    fn gated_group_rms_norm(
+        input: &Array,
+        gate: &Array,
+        weight: &Array,
+        groups: i32,
+        epsilon: f32,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        let dtype = input.dtype();
+        let shape = input.shape().to_vec();
+        let width = *shape
+            .last()
+            .ok_or_else(|| ComputeError::backend("gated RMS input has no feature axis"))?;
+        if groups <= 0 || width % groups != 0 || gate.shape() != shape || weight.shape() != [width]
+        {
+            return Err(ComputeError::backend(
+                "invalid gated grouped RMS normalization geometry",
+            ));
+        }
+        let input = compute(input.as_dtype(Dtype::Float32, context))?;
+        let gate = compute(gate.as_dtype(Dtype::Float32, context))?;
+        let gate =
+            compute(gate.multiply(compute(safemlx::ops::sigmoid(&gate, context))?, context))?;
+        let gated = compute(input.multiply(&gate, context))?;
+        let grouped = compute(gated.reshape(&[-1, groups, width / groups], context))?;
+        let variance = compute(safemlx::ops::mean_axis(
+            compute(grouped.square(context))?,
+            -1,
+            true,
+            context,
+        ))?;
+        let scale = compute(safemlx::ops::rsqrt(
+            compute(variance.add(Array::from_f32(epsilon), context))?,
+            context,
+        ))?;
+        let normalized = compute(grouped.multiply(&scale, context))?;
+        let normalized = compute(normalized.reshape(&shape, context))?;
+        let normalized = compute(normalized.as_dtype(dtype, context))?;
+        compute(normalized.multiply(weight, context))
+    }
+
+    fn add_residual(
+        residual: &Array,
+        branch: &Array,
+        fp32: bool,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        if fp32 {
+            let residual = compute(residual.as_dtype(Dtype::Float32, context))?;
+            let branch = compute(branch.as_dtype(Dtype::Float32, context))?;
+            compute(residual.add(branch, context))
+        } else {
+            compute(residual.add(branch, context))
+        }
+    }
+
+    fn gated_delta_scan(
+        input: GatedDeltaScanInput<'_, Array>,
+        context: &Stream,
+    ) -> Result<GatedDeltaScanOutput<Array>, ComputeError> {
+        let (state, output) = compute(crate::backend::mlx::nn::gated_delta::gated_delta_scan(
+            input.query,
+            input.key,
+            input.value,
+            input.log_decay,
+            input.beta,
+            input.initial_state.cloned(),
+            context,
+        ))?;
+        Ok(GatedDeltaScanOutput { state, output })
+    }
+
+    fn selective_state_space_scan(
+        input: SelectiveStateSpaceScanInput<'_, Array>,
+        context: &Stream,
+    ) -> Result<SelectiveStateSpaceScanOutput<Array>, ComputeError> {
+        let shape = input.values.shape();
+        if shape.len() != 4 || input.chunk_size == 0 {
+            return Err(ComputeError::backend(
+                "selective state-space scan expects rank-four values and nonzero chunks",
+            ));
+        }
+        let [batch, sequence, heads, head_dimensions] =
+            <[i32; 4]>::try_from(shape).expect("validated rank-four shape");
+        let state_dimensions = input.input_state.dim(3);
+        let mut state = match input.initial_state {
+            Some(state) => compute(state.as_dtype(Dtype::Float32, context))?,
+            None => compute(safemlx::ops::zeros::<f32>(
+                &[batch, heads, head_dimensions, state_dimensions],
+                context,
+            ))?,
+        };
+        let values = compute(input.values.as_dtype(Dtype::Float32, context))?;
+        let input_state = compute(input.input_state.as_dtype(Dtype::Float32, context))?;
+        let output_state = compute(input.output_state.as_dtype(Dtype::Float32, context))?;
+        let transition = compute(safemlx::ops::exp(
+            compute(input.transition_log.as_dtype(Dtype::Float32, context))?,
+            context,
+        ))?;
+        let transition = compute(transition.multiply(Array::from_f32(-1.0), context))?
+            .reshape(&[1, heads, 1, 1], context)
+            .map_err(ComputeError::backend)?;
+        let skip = compute(input.skip.as_dtype(Dtype::Float32, context))?
+            .reshape(&[1, heads, 1], context)
+            .map_err(ComputeError::backend)?;
+        let bias = compute(input.time_step_bias.as_dtype(Dtype::Float32, context))?
+            .reshape(&[1, 1, heads], context)
+            .map_err(ComputeError::backend)?;
+        let mut outputs = Vec::with_capacity(sequence as usize);
+        let chunk = i32::try_from(input.chunk_size).unwrap_or(i32::MAX).max(1);
+        let mut chunk_start = 0;
+        while chunk_start < sequence {
+            let chunk_end = (chunk_start + chunk).min(sequence);
+            for token in chunk_start..chunk_end {
+                let value = compute(values.try_index_device((.., token, .., ..), context))?;
+                let b = compute(input_state.try_index_device((.., token, .., ..), context))?;
+                let c = compute(output_state.try_index_device((.., token, .., ..), context))?;
+                let dt = compute(
+                    input
+                        .time_step
+                        .try_index_device((.., token..token + 1, ..), context),
+                )?;
+                let dt = compute(dt.add(&bias, context))?;
+                let dt = compute(nn::softplus(dt, context))?;
+                let floor = Array::from_f32(input.time_step_floor);
+                let dt = compute(maximum(dt, floor, context))?;
+                let dt = compute(dt.as_dtype(Dtype::Float32, context))?
+                    .reshape(&[batch, heads], context)
+                    .map_err(ComputeError::backend)?;
+                let dt_transition = compute(dt.reshape(&[batch, heads, 1, 1], context))?;
+                let decay = compute(safemlx::ops::exp(
+                    compute(dt_transition.multiply(&transition, context))?,
+                    context,
+                ))?;
+                let dt_input = compute(dt.reshape(&[batch, heads, 1], context))?;
+                let discretized_b = compute(dt_input.multiply(&b, context))?;
+                let value_column = compute(value.try_index_device((.., .., .., NewAxis), context))?;
+                let input_row =
+                    compute(discretized_b.try_index_device((.., .., NewAxis, ..), context))?;
+                let update = compute(value_column.multiply(&input_row, context))?;
+                state = compute(compute(state.multiply(&decay, context))?.add(&update, context))?;
+                let output_row = compute(c.try_index_device((.., .., NewAxis, ..), context))?;
+                let projected = compute(safemlx::ops::sum_axis(
+                    compute(state.multiply(&output_row, context))?,
+                    -1,
+                    false,
+                    context,
+                ))?;
+                let output =
+                    compute(projected.add(&compute(value.multiply(&skip, context))?, context))?;
+                outputs.push(compute(
+                    output.try_index_device((.., NewAxis, .., ..), context),
+                )?);
+            }
+            chunk_start = chunk_end;
+        }
+        let output = compute(safemlx::ops::concatenate_axis(&outputs, 1, context))?;
+        let output = compute(output.as_dtype(input.values.dtype(), context))?;
+        Ok(SelectiveStateSpaceScanOutput { state, output })
     }
 
     fn swiglu(
@@ -1551,6 +1792,14 @@ impl NeuralBackend for MlxBackend {
     ) -> Result<Array, ComputeError> {
         compute(linear.module.forward_row_parallel(input, parallel, context))
     }
+
+    fn sum_parallel(
+        value: Array,
+        parallel: &Group,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        compute(safemlx::distributed::all_sum(&value, parallel, context))
+    }
 }
 
 impl HyperNeuralBackend for MlxBackend {
@@ -1604,6 +1853,7 @@ impl HyperNeuralBackend for MlxBackend {
 impl RoutedNeuralBackend for MlxBackend {
     type Router = MlxTopKRouter;
     type SwiGluExpertBank = MlxSwiGluExpertBank;
+    type Relu2ExpertBank = MlxRelu2ExpertBank;
 
     fn top_k_router(spec: TopKRouterSpec, context: &Stream) -> Result<Self::Router, ComputeError> {
         spec.validate()?;
@@ -1697,6 +1947,40 @@ impl RoutedNeuralBackend for MlxBackend {
             module = compute(module.with_swiglu_limit(limit.get()))?;
         }
         Ok(MlxSwiGluExpertBank {
+            module: MlxParameterTree::new(module, prefix)?,
+        })
+    }
+
+    fn relu2_expert_bank(
+        spec: Relu2ExpertBankSpec,
+        context: &Stream,
+    ) -> Result<Self::Relu2ExpertBank, ComputeError> {
+        spec.validate()?;
+        let prefix = spec
+            .up
+            .weight
+            .id
+            .as_str()
+            .strip_suffix(".up_proj")
+            .ok_or_else(|| {
+                ComputeError::backend("packed ReLU2 up identity must end in .up_proj")
+            })?;
+        if spec.down.weight.id.as_str() != format!("{prefix}.down_proj") {
+            return Err(ComputeError::backend(
+                "packed ReLU2 projections must share one parameter prefix",
+            ));
+        }
+        let module = compute(common::moe::PackedRelu2Experts::new(
+            spec.expert_count,
+            spec.hidden_dimensions,
+            spec.intermediate_dimensions,
+            [
+                spec.up.format.weight_quantization(),
+                spec.down.format.weight_quantization(),
+            ],
+            context,
+        ))?;
+        Ok(MlxRelu2ExpertBank {
             module: MlxParameterTree::new(module, prefix)?,
         })
     }

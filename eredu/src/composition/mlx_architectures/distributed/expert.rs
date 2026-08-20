@@ -8,6 +8,7 @@
 //! the resulting token buffer. Sharded-token dispatch uses compact native or
 //! topology-routed variable-count all-to-all payload exchange.
 
+use eredu_architectures::kimi_linear;
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::ShardingPolicy;
@@ -34,7 +35,7 @@ use crate::core::cache::{
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::runtime::cache::state::MlxKeyValueState,
+    backend::mlx::runtime::cache::state::{MlxHybridState, MlxKeyValueState},
     backend::mlx::runtime::checkpoint::store::{
         open_gguf_checkpoint_source, SafetensorsWeightStore,
     },
@@ -53,15 +54,14 @@ use crate::{
         gemma4::model as gemma4,
         gpt_oss::model as gpt_oss,
         inkling::model as inkling,
-        kimi_linear::model as kimi_linear,
-        lfm2::model as lfm2,
-        nemotron_h::model as nemotron_h,
         qwen::{
             hybrid::{qwen3_5, qwen3_next},
             vl::model as qwen3_vl,
         },
     },
-    core::cache::CacheRankIdentity,
+    composition::{
+        kimi_linear as neutral_kimi_linear, lfm2 as neutral_lfm2, nemotron_h as neutral_nemotron_h,
+    },
     core::generation::MtpConfig,
     core::ModelKind,
     core::{MtpCapability, MtpCheckpointKind, MtpStats},
@@ -78,19 +78,6 @@ use crate::backend::mlx::nn::moe::PackedSwiGluExperts;
 pub use crate::backend::mlx::runtime::distributed::expert::*;
 
 impl LocalExpertBank for gpt_oss::Experts {
-    fn execute_local_routes(
-        &mut self,
-        hidden: &Array,
-        local_expert_ids: &Array,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
-        let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
-        Ok(self.forward(hidden, &ids, &weights, stream)?)
-    }
-}
-
-impl LocalExpertBank for nemotron_h::Experts {
     fn execute_local_routes(
         &mut self,
         hidden: &Array,
@@ -175,18 +162,14 @@ pub struct ExpertParallelInfo {
 pub enum ExpertParallelCache {
     /// Neutral DeepSeek V3/V4 architecture state.
     DeepSeek(crate::composition::deepseek::DeepSeekState),
-    /// Kimi Linear heterogeneous KDA/MLA cache.
-    KimiLinear(kimi_linear::Cache),
+    /// Architecture-declared heterogeneous attention and fixed state.
+    Hybrid(MlxHybridState),
     /// Neutral Qwen key/value state, device-resident or paged.
     Qwen(MlxKeyValueState),
     /// GPT-OSS cache following its canonical per-layer attention schedule.
     GptOss(gpt_oss::Cache),
     /// Inkling attention and convolution cache.
     Inkling(inkling::Cache),
-    /// LFM2 heterogeneous attention/convolution cache.
-    Lfm2(lfm2::Cache),
-    /// Nemotron-H heterogeneous recurrent/attention cache.
-    NemotronH(nemotron_h::Cache),
     /// Qwen3-Next/Qwen3.5 heterogeneous attention cache.
     QwenHybrid(qwen3_5::Cache),
     /// Qwen3-VL-MoE multimodal-RoPE text cache.
@@ -200,12 +183,10 @@ impl ExpertParallelCache {
     pub fn reset(&mut self) -> Result<(), Error> {
         match self {
             Self::DeepSeek(cache) => cache.clear()?,
-            Self::KimiLinear(cache) => cache.reset()?,
+            Self::Hybrid(cache) => cache.clear()?,
             Self::Qwen(cache) => cache.clear()?,
             Self::GptOss(cache) => cache.reset()?,
             Self::Inkling(cache) => cache.reset()?,
-            Self::Lfm2(cache) => cache.reset()?,
-            Self::NemotronH(cache) => cache.reset()?,
             Self::QwenHybrid(cache) => cache.reset()?,
             Self::Qwen3Vl(cache) => cache.reset(),
             Self::Gemma4(cache) => cache.clear()?,
@@ -219,12 +200,10 @@ impl ExpertParallelCache {
     pub(crate) fn offset(&self) -> i32 {
         match self {
             Self::DeepSeek(cache) => cache.offset(),
-            Self::KimiLinear(cache) => cache.offset(),
+            Self::Hybrid(cache) => cache.offset(),
             Self::Qwen(cache) => cache.offset(),
             Self::GptOss(cache) => cache.offset(),
             Self::Inkling(cache) => cache.offset(),
-            Self::Lfm2(cache) => cache.offset(),
-            Self::NemotronH(cache) => cache.offset(),
             Self::QwenHybrid(cache) => cache.offset(),
             Self::Qwen3Vl(cache) => cache.kv.first().and_then(Option::as_ref).map_or(
                 0,
@@ -235,21 +214,316 @@ impl ExpertParallelCache {
     }
 }
 
+trait NeutralHybridExpertArchitecture {
+    fn dense_stream_report(&self) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error>;
+    fn new_cache(&self) -> MlxHybridState;
+    fn new_cache_with_options(&self, policy: CacheResidencyPolicy)
+        -> Result<MlxHybridState, Error>;
+    fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error>;
+    fn save_prompt_cache(
+        &self,
+        cache: &mut MlxHybridState,
+        directory: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        identity: &PromptCacheModelIdentity,
+    ) -> Result<PromptCacheManifest, Error>;
+    fn load_prompt_cache(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        identity: &PromptCacheModelIdentity,
+        stream: &Stream,
+    ) -> Result<(MlxHybridState, PromptCacheManifest), Error>;
+    #[allow(clippy::too_many_arguments)]
+    fn forward_expert_parallel(
+        &mut self,
+        tokens: &Array,
+        mask: Option<&Array>,
+        cache: &mut MlxHybridState,
+        tensor_group: Option<&Group>,
+        expert_group: &Group,
+        assignment: &ExpertAssignment,
+        expert_cache: &ExpertCache,
+        pass: ExpertPass,
+        statistics: &mut RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Error>;
+    fn mtp_len(&self) -> usize {
+        0
+    }
+    fn mtp_state_start(&self) -> Option<usize> {
+        None
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn forward_mtp_target(
+        &mut self,
+        _tokens: &Array,
+        _cache: &mut MlxHybridState,
+        _tensor_group: Option<&Group>,
+        _expert_group: &Group,
+        _assignment: &ExpertAssignment,
+        _expert_cache: &ExpertCache,
+        _statistics: &mut RoutingStatistics,
+        _stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        Err(Exception::custom(
+            "neutral hybrid architecture has no embedded prediction groups",
+        ))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn forward_mtp_draft(
+        &mut self,
+        _hidden: &Array,
+        _tokens: &Array,
+        _depth: usize,
+        _cache: &mut MlxHybridState,
+        _tensor_group: Option<&Group>,
+        _expert_group: &Group,
+        _assignment: &ExpertAssignment,
+        _expert_cache: &ExpertCache,
+        _statistics: &mut RoutingStatistics,
+        _stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        Err(Exception::custom(
+            "neutral hybrid architecture has no embedded prediction groups",
+        ))
+    }
+}
+
+macro_rules! impl_neutral_hybrid_expert_architecture {
+    ($model:ty, $execute:path $(, $extra:item)*) => {
+        impl NeutralHybridExpertArchitecture for $model {
+            fn dense_stream_report(
+                &self,
+            ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
+                self.dense_stream_report()
+            }
+
+            fn new_cache(&self) -> MlxHybridState {
+                self.new_cache()
+            }
+
+            fn new_cache_with_options(
+                &self,
+                policy: CacheResidencyPolicy,
+            ) -> Result<MlxHybridState, Error> {
+                self.new_cache_with_options(policy)
+            }
+
+            fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+                self.prompt_cache_model_identity()
+            }
+
+            fn save_prompt_cache(
+                &self,
+                cache: &mut MlxHybridState,
+                directory: &Path,
+                descriptor: PromptCacheDescriptor,
+                prefix_token_ids: &[u32],
+                options: &PromptCacheOptions,
+                identity: &PromptCacheModelIdentity,
+            ) -> Result<PromptCacheManifest, Error> {
+                self.save_prompt_cache_with_identity(
+                    cache,
+                    directory,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    identity,
+                )
+            }
+
+            fn load_prompt_cache(
+                &self,
+                directory: &Path,
+                expected: &PromptCacheDescriptor,
+                prefix_token_ids: &[u32],
+                options: PagedCacheOptions,
+                identity: &PromptCacheModelIdentity,
+                stream: &Stream,
+            ) -> Result<(MlxHybridState, PromptCacheManifest), Error> {
+                self.load_prompt_cache_with_identity(
+                    directory,
+                    expected,
+                    prefix_token_ids,
+                    options,
+                    identity,
+                    stream,
+                )
+            }
+
+            fn forward_expert_parallel(
+                &mut self,
+                tokens: &Array,
+                mask: Option<&Array>,
+                cache: &mut MlxHybridState,
+                tensor_group: Option<&Group>,
+                expert_group: &Group,
+                assignment: &ExpertAssignment,
+                expert_cache: &ExpertCache,
+                pass: ExpertPass,
+                statistics: &mut RoutingStatistics,
+                stream: &Stream,
+            ) -> Result<Array, Error> {
+                let args = self.args().clone();
+                let mut execute =
+                    |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                        let returned = dispatch_replicated_with(
+                            hidden,
+                            ids,
+                            weights,
+                            assignment,
+                            expert_group,
+                            stream,
+                            |routes, stream| {
+                                $execute(&args, layer, routes, pass, expert_cache, stream)
+                            },
+                        )
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                        statistics.accumulate(&returned.statistics);
+                        Ok(returned.reduced_output)
+                    };
+                match tensor_group {
+                    Some(tensor_group) => self.forward_tensor_expert_parallel(
+                        tokens,
+                        mask,
+                        cache,
+                        tensor_group,
+                        &mut execute,
+                        stream,
+                    ),
+                    None => self.forward_with_expert_executor(
+                        tokens,
+                        mask,
+                        cache,
+                        &mut execute,
+                        stream,
+                    ),
+                }
+            }
+
+            $($extra)*
+        }
+    };
+}
+
+impl_neutral_hybrid_expert_architecture!(
+    neutral_kimi_linear::KimiLinearModel,
+    execute_cached_kimi_linear
+);
+impl_neutral_hybrid_expert_architecture!(neutral_lfm2::Lfm2Model, execute_cached_lfm2);
+impl_neutral_hybrid_expert_architecture!(
+    neutral_nemotron_h::NemotronHModel,
+    execute_cached_nemotron_h,
+    fn mtp_len(&self) -> usize {
+        self.mtp_len()
+    },
+    fn mtp_state_start(&self) -> Option<usize> {
+        Some(self.args().num_hidden_layers as usize)
+    },
+    fn forward_mtp_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut MlxHybridState,
+        tensor_group: Option<&Group>,
+        expert_group: &Group,
+        assignment: &ExpertAssignment,
+        expert_cache: &ExpertCache,
+        statistics: &mut RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        let args = self.args().clone();
+        self.forward_mtp_target_with_expert_executor(
+            tokens,
+            cache,
+            tensor_group,
+            |layer, hidden, ids, weights, stream| {
+                let returned = dispatch_replicated_with(
+                    hidden,
+                    ids,
+                    weights,
+                    assignment,
+                    expert_group,
+                    stream,
+                    |routes, stream| {
+                        execute_cached_nemotron_h(
+                            &args,
+                            layer,
+                            routes,
+                            ExpertPass::Decode,
+                            expert_cache,
+                            stream,
+                        )
+                    },
+                )
+                .map_err(|error| Exception::custom(error.to_string()))?;
+                statistics.accumulate(&returned.statistics);
+                Ok(returned.reduced_output)
+            },
+            stream,
+        )
+    },
+    fn forward_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut MlxHybridState,
+        tensor_group: Option<&Group>,
+        expert_group: &Group,
+        assignment: &ExpertAssignment,
+        expert_cache: &ExpertCache,
+        statistics: &mut RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        let args = self.args().clone();
+        self.forward_mtp_draft_with_expert_executor(
+            hidden,
+            tokens,
+            depth,
+            cache,
+            tensor_group,
+            |layer, hidden, ids, weights, stream| {
+                let returned = dispatch_replicated_with(
+                    hidden,
+                    ids,
+                    weights,
+                    assignment,
+                    expert_group,
+                    stream,
+                    |routes, stream| {
+                        execute_cached_nemotron_h(
+                            &args,
+                            layer,
+                            routes,
+                            ExpertPass::Decode,
+                            expert_cache,
+                            stream,
+                        )
+                    },
+                )
+                .map_err(|error| Exception::custom(error.to_string()))?;
+                statistics.accumulate(&returned.statistics);
+                Ok(returned.reduced_output)
+            },
+            stream,
+        )
+    }
+);
+
 enum ExpertArchitecture {
     DeepSeek(Box<crate::composition::deepseek::DeepSeekModel>),
-    KimiLinearLayerwise(
-        Box<crate::composition::mlx_architectures::kimi_linear::layerwise::KimiLinearLayerwiseModel>,
-    ),
+    NeutralHybrid(Box<dyn NeutralHybridExpertArchitecture>),
     Qwen(Box<crate::composition::qwen::QwenModel>),
     GptOssLayerwise(
         Box<crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseModel>,
     ),
     InklingLayerwise(
         Box<crate::composition::mlx_architectures::inkling::layerwise::InklingLayerwiseModel>,
-    ),
-    Lfm2Layerwise(Box<crate::composition::mlx_architectures::lfm2::layerwise::Lfm2LayerwiseModel>),
-    NemotronHLayerwise(
-        Box<crate::composition::mlx_architectures::nemotron_h::layerwise::NemotronHLayerwiseModel>,
     ),
     QwenHybridLayerwise(
         Box<crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel>,
@@ -266,12 +540,10 @@ impl ExpertArchitecture {
     fn bind_parallel_topology(&mut self, topology: MlxParallelContext) {
         match self {
             Self::DeepSeek(_) => {}
-            Self::KimiLinearLayerwise(model) => model.bind_parallel_topology(topology),
+            Self::NeutralHybrid(_) => {}
             Self::Qwen(_) => {}
             Self::GptOssLayerwise(model) => model.bind_parallel_topology(topology),
             Self::InklingLayerwise(model) => model.bind_parallel_topology(topology),
-            Self::Lfm2Layerwise(model) => model.bind_parallel_topology(topology),
-            Self::NemotronHLayerwise(model) => model.bind_parallel_topology(topology),
             Self::QwenHybridLayerwise(model) => model.bind_parallel_topology(topology),
             Self::Qwen3VlLayerwise(model) => model.bind_parallel_topology(topology),
             Self::Gemma4Layerwise(model) => model.bind_parallel_topology(topology),
@@ -299,7 +571,7 @@ struct ExpertParallelQwenMtpTarget<'a> {
 enum ExpertParallelMtpDraftCache {
     DeepSeek(crate::composition::deepseek::DeepSeekState),
     Inkling(Vec<inkling::LayerCache>),
-    NemotronH(Vec<nemotron_h::LayerCache>),
+    Hybrid(MlxHybridState),
 }
 
 struct ExpertParallelEmbeddedMtpTarget<'a> {
@@ -460,7 +732,7 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
             .hidden
             .try_index_device((.., ..sequence - 1, ..), stream)?;
         let next = tokens.try_index_device((.., 1..), stream)?;
-        let mut draft = Self::draft_cache(cache);
+        let mut draft = self.draft_cache(cache);
         for depth in 0..self.max_draft_tokens() {
             let _ = self.model.forward_embedded_mtp_draft(
                 &hidden,
@@ -472,11 +744,11 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
                 stream,
             )?;
         }
-        Self::commit_draft_cache(cache, &draft);
+        self.commit_draft_cache(cache, &draft);
         Ok(())
     }
 
-    fn draft_cache(cache: &Self::Cache) -> Self::DraftCache {
+    fn draft_cache(&self, cache: &Self::Cache) -> Self::DraftCache {
         match cache {
             ExpertParallelCache::DeepSeek(cache) => {
                 ExpertParallelMtpDraftCache::DeepSeek(cache.clone())
@@ -484,14 +756,16 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
             ExpertParallelCache::Inkling(cache) => {
                 ExpertParallelMtpDraftCache::Inkling(cache.mtp_layers.clone())
             }
-            ExpertParallelCache::NemotronH(cache) => {
-                ExpertParallelMtpDraftCache::NemotronH(cache.mtp_layers.clone())
-            }
+            ExpertParallelCache::Hybrid(cache) => ExpertParallelMtpDraftCache::Hybrid(
+                cache
+                    .deep_clone_state()
+                    .expect("evaluated Nemotron-H EP draft state must be forkable"),
+            ),
             _ => unreachable!("capability preflight rejects non-shared embedded MTP caches"),
         }
     }
 
-    fn commit_draft_cache(cache: &mut Self::Cache, draft: &Self::DraftCache) {
+    fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
         match (cache, draft) {
             (
                 ExpertParallelCache::DeepSeek(cache),
@@ -500,11 +774,34 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
             (ExpertParallelCache::Inkling(cache), ExpertParallelMtpDraftCache::Inkling(draft)) => {
                 cache.mtp_layers.clone_from(draft)
             }
-            (
-                ExpertParallelCache::NemotronH(cache),
-                ExpertParallelMtpDraftCache::NemotronH(draft),
-            ) => cache.mtp_layers.clone_from(draft),
+            (ExpertParallelCache::Hybrid(cache), ExpertParallelMtpDraftCache::Hybrid(draft)) => {
+                let ExpertArchitecture::NeutralHybrid(model) = &self.model.architecture else {
+                    unreachable!("hybrid draft cache requires a neutral hybrid model")
+                };
+                let start = model
+                    .mtp_state_start()
+                    .expect("embedded hybrid draft has appended prediction state");
+                cache
+                    .commit_layer_range_from(draft, start)
+                    .expect("validated neutral hybrid EP draft state layout")
+            }
             _ => unreachable!("embedded MTP draft-cache type changed after preflight"),
+        }
+    }
+
+    fn restore_target_checkpoint(
+        cache: &mut Self::Cache,
+        checkpoint: &Self::Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        match (cache, checkpoint) {
+            (ExpertParallelCache::Hybrid(cache), ExpertParallelCache::Hybrid(checkpoint)) => {
+                cache.restore_checkpoint(checkpoint, stream)
+            }
+            (cache, checkpoint) => {
+                cache.clone_from(checkpoint);
+                Ok(())
+            }
         }
     }
 
@@ -576,7 +873,7 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
         match &self.model.architecture {
             ExpertArchitecture::DeepSeek(model) => model.mtp_len(),
             ExpertArchitecture::InklingLayerwise(model) => model.mtp_len(),
-            ExpertArchitecture::NemotronHLayerwise(model) => model.mtp_len(),
+            ExpertArchitecture::NeutralHybrid(model) => model.mtp_len(),
             _ => 0,
         }
     }
@@ -599,7 +896,7 @@ impl ExpertParallelModel {
                     checkpoint: MtpCheckpointKind::Embedded,
                 }
             }
-            ExpertArchitecture::NemotronHLayerwise(model) if model.mtp_len() > 0 => {
+            ExpertArchitecture::NeutralHybrid(model) if model.mtp_len() > 0 => {
                 MtpCapability::Ready {
                     checkpoint: MtpCheckpointKind::Embedded,
                 }
@@ -626,12 +923,10 @@ impl ExpertParallelModel {
     ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
         match &self.architecture {
             ExpertArchitecture::DeepSeek(model) => model.dense_stream_report(),
-            ExpertArchitecture::KimiLinearLayerwise(model) => model.dense_stream_report(),
+            ExpertArchitecture::NeutralHybrid(model) => model.dense_stream_report(),
             ExpertArchitecture::Qwen(model) => model.dense_stream_report(),
             ExpertArchitecture::GptOssLayerwise(model) => model.dense_stream_report(),
             ExpertArchitecture::InklingLayerwise(model) => model.dense_stream_report(),
-            ExpertArchitecture::Lfm2Layerwise(model) => model.dense_stream_report(),
-            ExpertArchitecture::NemotronHLayerwise(model) => model.dense_stream_report(),
             ExpertArchitecture::QwenHybridLayerwise(model) => model.dense_stream_report(),
             ExpertArchitecture::Qwen3VlLayerwise(model) => model.dense_stream_report(),
             ExpertArchitecture::Gemma4Layerwise(model) => model.dense_stream_report(),
@@ -646,8 +941,8 @@ impl ExpertParallelModel {
                     .new_state()
                     .expect("validated DeepSeek distributed state geometry"),
             ),
-            ExpertArchitecture::KimiLinearLayerwise(model) => {
-                ExpertParallelCache::KimiLinear(model.new_cache())
+            ExpertArchitecture::NeutralHybrid(model) => {
+                ExpertParallelCache::Hybrid(model.new_cache())
             }
             ExpertArchitecture::Qwen(model) => ExpertParallelCache::Qwen(model.new_cache()),
             ExpertArchitecture::GptOssLayerwise(model) => {
@@ -655,12 +950,6 @@ impl ExpertParallelModel {
             }
             ExpertArchitecture::InklingLayerwise(model) => {
                 ExpertParallelCache::Inkling(model.new_cache())
-            }
-            ExpertArchitecture::Lfm2Layerwise(model) => {
-                ExpertParallelCache::Lfm2(model.new_cache())
-            }
-            ExpertArchitecture::NemotronHLayerwise(model) => {
-                ExpertParallelCache::NemotronH(model.new_cache())
             }
             ExpertArchitecture::QwenHybridLayerwise(model) => {
                 ExpertParallelCache::QwenHybrid(model.new_cache())
@@ -690,9 +979,9 @@ impl ExpertParallelModel {
                 ExpertArchitecture::DeepSeek(model) => model
                     .new_state_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::DeepSeek),
-                ExpertArchitecture::KimiLinearLayerwise(model) => model
+                ExpertArchitecture::NeutralHybrid(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ExpertParallelCache::KimiLinear),
+                    .map(ExpertParallelCache::Hybrid),
                 ExpertArchitecture::GptOssLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::GptOss),
@@ -702,12 +991,6 @@ impl ExpertParallelModel {
                 ExpertArchitecture::InklingLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::Inkling),
-                ExpertArchitecture::NemotronHLayerwise(model) => model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ExpertParallelCache::NemotronH),
-                ExpertArchitecture::Lfm2Layerwise(model) => model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ExpertParallelCache::Lfm2),
                 ExpertArchitecture::QwenHybridLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::QwenHybrid),
@@ -727,11 +1010,9 @@ impl ExpertParallelModel {
         match cache {
             ExpertParallelCache::DeepSeek(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::GptOss(cache) => cache.residency_report().map_err(Into::into),
-            ExpertParallelCache::KimiLinear(cache) => cache.residency_report().map_err(Into::into),
+            ExpertParallelCache::Hybrid(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::Qwen(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::Inkling(cache) => cache.residency_report().map_err(Into::into),
-            ExpertParallelCache::NemotronH(cache) => cache.residency_report().map_err(Into::into),
-            ExpertParallelCache::Lfm2(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::QwenHybrid(cache) => cache.residency_report().map_err(Into::into),
             _ => Ok(None),
         }
@@ -751,12 +1032,6 @@ impl ExpertParallelModel {
         validate_prompt_cache_model_identity(&descriptor, &identity)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let directory = self.prompt_cache_rank_directory(root.as_ref());
-        let rank = Some(CacheRankIdentity {
-            pipeline_rank: None,
-            tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
-                .then_some(self.topology.tensor_parallel_rank),
-            expert_parallel_rank: Some(self.topology.expert_parallel_rank),
-        });
         match (&self.architecture, cache) {
             (ExpertArchitecture::DeepSeek(model), ExpertParallelCache::DeepSeek(cache)) => {
                 model.save_prompt_cache(cache, directory, descriptor, prefix_token_ids, options)
@@ -764,30 +1039,15 @@ impl ExpertParallelModel {
             (ExpertArchitecture::GptOssLayerwise(_), ExpertParallelCache::GptOss(cache)) => cache
                 .save_prompt_cache(directory, descriptor, prefix_token_ids, options)
                 .map_err(Into::into),
-            (
-                ExpertArchitecture::KimiLinearLayerwise(_),
-                ExpertParallelCache::KimiLinear(cache),
-            ) => kimi_linear::Model::save_prompt_cache_with_rank(
-                cache,
-                directory,
-                descriptor,
-                prefix_token_ids,
-                options,
-                rank,
-            )
-            .map_err(Into::into),
-            (ExpertArchitecture::Lfm2Layerwise(_), ExpertParallelCache::Lfm2(cache)) => {
-                lfm2::Model::save_prompt_cache_with_rank(
+            (ExpertArchitecture::NeutralHybrid(model), ExpertParallelCache::Hybrid(cache)) => model
+                .save_prompt_cache(
                     cache,
-                    directory,
+                    &directory,
                     descriptor,
                     prefix_token_ids,
                     options,
-                    rank,
-                    stream,
-                )
-                .map_err(Into::into)
-            }
+                    &identity,
+                ),
             (ExpertArchitecture::InklingLayerwise(_), ExpertParallelCache::Inkling(cache)) => {
                 inkling::Model::save_prompt_cache(
                     cache,
@@ -795,18 +1055,6 @@ impl ExpertParallelModel {
                     descriptor,
                     prefix_token_ids,
                     options,
-                    stream,
-                )
-                .map_err(Into::into)
-            }
-            (ExpertArchitecture::NemotronHLayerwise(_), ExpertParallelCache::NemotronH(cache)) => {
-                nemotron_h::Model::save_prompt_cache_with_rank(
-                    cache,
-                    directory,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    rank,
                     stream,
                 )
                 .map_err(Into::into)
@@ -863,31 +1111,16 @@ impl ExpertParallelModel {
             ExpertArchitecture::DeepSeek(model) => model
                 .load_prompt_cache(&directory, expected, prefix_token_ids, options, stream)
                 .map(|(cache, manifest)| (ExpertParallelCache::DeepSeek(cache), manifest)),
-            ExpertArchitecture::KimiLinearLayerwise(model) => {
-                kimi_linear::Model::load_paged_prompt_cache_with_identity(
-                    model.args(),
+            ExpertArchitecture::NeutralHybrid(model) => model
+                .load_prompt_cache(
                     &directory,
                     expected,
                     prefix_token_ids,
-                    &identity,
                     options,
+                    &identity,
                     stream,
                 )
-                .map(|(cache, manifest)| (ExpertParallelCache::KimiLinear(cache), manifest))
-                .map_err(Into::into)
-            }
-            ExpertArchitecture::Lfm2Layerwise(model) => {
-                lfm2::Model::load_prompt_cache_with_identity(
-                    model.args(),
-                    &directory,
-                    expected,
-                    prefix_token_ids,
-                    identity,
-                    stream,
-                )
-                .map(|(cache, manifest)| (ExpertParallelCache::Lfm2(cache), manifest))
-                .map_err(Into::into)
-            }
+                .map(|(cache, manifest)| (ExpertParallelCache::Hybrid(cache), manifest)),
             ExpertArchitecture::InklingLayerwise(model) => {
                 inkling::Model::load_prompt_cache_with_identity(
                     model.args(),
@@ -898,19 +1131,6 @@ impl ExpertParallelModel {
                     stream,
                 )
                 .map(|(cache, manifest)| (ExpertParallelCache::Inkling(cache), manifest))
-                .map_err(Into::into)
-            }
-            ExpertArchitecture::NemotronHLayerwise(model) => {
-                nemotron_h::Model::load_paged_prompt_cache_with_identity(
-                    model.args(),
-                    &directory,
-                    expected,
-                    prefix_token_ids,
-                    &identity,
-                    options,
-                    stream,
-                )
-                .map(|(cache, manifest)| (ExpertParallelCache::NemotronH(cache), manifest))
                 .map_err(Into::into)
             }
             ExpertArchitecture::Qwen(model) => model
@@ -965,14 +1185,10 @@ impl ExpertParallelModel {
     pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         let mut identity = match &self.architecture {
             ExpertArchitecture::DeepSeek(model) => model.prompt_cache_identity()?,
-            ExpertArchitecture::KimiLinearLayerwise(model) => {
-                model.prompt_cache_model_identity()?
-            }
+            ExpertArchitecture::NeutralHybrid(model) => model.prompt_cache_model_identity()?,
             ExpertArchitecture::Qwen(model) => model.prompt_cache_model_identity()?,
             ExpertArchitecture::GptOssLayerwise(model) => model.prompt_cache_model_identity()?,
             ExpertArchitecture::InklingLayerwise(model) => model.prompt_cache_model_identity()?,
-            ExpertArchitecture::Lfm2Layerwise(model) => model.prompt_cache_model_identity()?,
-            ExpertArchitecture::NemotronHLayerwise(model) => model.prompt_cache_model_identity()?,
             ExpertArchitecture::QwenHybridLayerwise(model) => {
                 model.prompt_cache_model_identity()?
             }
@@ -1093,52 +1309,19 @@ impl ExpertParallelModel {
                         };
                     model.forward_with_expert_executor(tokens, cache, &mut execute, stream)?
                 }
-                (
-                    ExpertArchitecture::KimiLinearLayerwise(model),
-                    ExpertParallelCache::KimiLinear(cache),
-                ) => {
-                    let args = model.args().clone();
-                    let mut execute =
-                        |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_kimi_linear(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        };
-                    match tensor_group {
-                        Some(tensor_group) => model.forward_tensor_expert_parallel(
-                            tokens,
-                            mask,
-                            cache,
-                            tensor_group,
-                            &mut execute,
-                            stream,
-                        )?,
-                        None => model.forward_with_expert_executor(
-                            tokens,
-                            mask,
-                            cache,
-                            &mut execute,
-                            stream,
-                        )?,
-                    }
+                (ExpertArchitecture::NeutralHybrid(model), ExpertParallelCache::Hybrid(cache)) => {
+                    model.forward_expert_parallel(
+                        tokens,
+                        mask,
+                        cache,
+                        tensor_group,
+                        group,
+                        assignment,
+                        expert_cache,
+                        pass,
+                        &mut statistics,
+                        stream,
+                    )?
                 }
                 (ExpertArchitecture::Qwen(model), ExpertParallelCache::Qwen(cache)) => {
                     let args = model.args().clone();
@@ -1245,93 +1428,6 @@ impl ExpertParallelModel {
                                 stream,
                                 |routes, stream| {
                                     execute_cached_inkling(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        };
-                    match tensor_group {
-                        Some(tensor_group) => model.forward_tensor_expert_parallel(
-                            tokens,
-                            cache,
-                            tensor_group,
-                            &mut execute,
-                            stream,
-                        )?,
-                        None => model.forward_with_expert_executor(
-                            tokens,
-                            cache,
-                            &mut execute,
-                            stream,
-                        )?,
-                    }
-                }
-                (ExpertArchitecture::Lfm2Layerwise(model), ExpertParallelCache::Lfm2(cache)) => {
-                    let args = model.args().clone();
-                    let mut execute =
-                        |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_lfm2(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        };
-                    match tensor_group {
-                        Some(tensor_group) => model.forward_tensor_expert_parallel(
-                            tokens,
-                            cache,
-                            tensor_group,
-                            &mut execute,
-                            stream,
-                        )?,
-                        None => model.forward_with_expert_executor(
-                            tokens,
-                            cache,
-                            &mut execute,
-                            stream,
-                        )?,
-                    }
-                }
-                (
-                    ExpertArchitecture::NemotronHLayerwise(model),
-                    ExpertParallelCache::NemotronH(cache),
-                ) => {
-                    let args = model.args().clone();
-                    let mut execute =
-                        |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_nemotron_h(
                                         &args,
                                         layer,
                                         routes,
@@ -1621,41 +1717,17 @@ impl ExpertParallelModel {
                     stream,
                 )?
             }
-            (
-                ExpertArchitecture::NemotronHLayerwise(model),
-                ExpertParallelCache::NemotronH(cache),
-            ) => {
-                let args = model.args().clone();
-                model.forward_mtp_target_with_expert_executor(
+            (ExpertArchitecture::NeutralHybrid(model), ExpertParallelCache::Hybrid(cache)) => model
+                .forward_mtp_target(
                     tokens,
                     cache,
                     tensor_group,
-                    |layer, hidden, ids, weights, stream| {
-                        let returned = dispatch_replicated_with(
-                            hidden,
-                            ids,
-                            weights,
-                            assignment,
-                            expert_group,
-                            stream,
-                            |routes, stream| {
-                                execute_cached_nemotron_h(
-                                    &args,
-                                    layer,
-                                    routes,
-                                    pass,
-                                    expert_cache,
-                                    stream,
-                                )
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                        statistics.accumulate(&returned.statistics);
-                        Ok(returned.reduced_output)
-                    },
+                    expert_group,
+                    assignment,
+                    expert_cache,
+                    &mut statistics,
                     stream,
-                )?
-            }
+                )?,
             _ => {
                 return Err(Exception::custom(
                     "embedded MTP architecture/cache mismatch for EP execution",
@@ -1745,42 +1817,20 @@ impl ExpertParallelModel {
                 stream,
             )?,
             (
-                ExpertArchitecture::NemotronHLayerwise(model),
-                ExpertParallelMtpDraftCache::NemotronH(cache),
-            ) => {
-                let args = model.args().clone();
-                model.forward_mtp_draft_with_expert_executor(
-                    hidden,
-                    tokens,
-                    depth,
-                    cache,
-                    tensor_group,
-                    |layer, hidden, ids, weights, stream| {
-                        let returned = dispatch_replicated_with(
-                            hidden,
-                            ids,
-                            weights,
-                            assignment,
-                            expert_group,
-                            stream,
-                            |routes, stream| {
-                                execute_cached_nemotron_h(
-                                    &args,
-                                    layer,
-                                    routes,
-                                    pass,
-                                    expert_cache,
-                                    stream,
-                                )
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                        statistics.accumulate(&returned.statistics);
-                        Ok(returned.reduced_output)
-                    },
-                    stream,
-                )?
-            }
+                ExpertArchitecture::NeutralHybrid(model),
+                ExpertParallelMtpDraftCache::Hybrid(cache),
+            ) => model.forward_mtp_draft(
+                hidden,
+                tokens,
+                depth,
+                cache,
+                tensor_group,
+                expert_group,
+                assignment,
+                expert_cache,
+                &mut statistics,
+                stream,
+            )?,
             _ => {
                 return Err(Exception::custom(
                     "embedded MTP draft-cache architecture mismatch for EP execution",
@@ -2573,7 +2623,7 @@ pub(crate) fn execute_cached_inkling(
 }
 
 pub(crate) fn execute_cached_lfm2(
-    args: &lfm2::ModelArgs,
+    args: &eredu_architectures::lfm2::ModelArgs,
     layer: usize,
     routes: &DispatchedRoutes,
     pass: ExpertPass,
@@ -2613,54 +2663,35 @@ pub(crate) fn execute_cached_lfm2(
 }
 
 pub(crate) fn execute_cached_nemotron_h(
-    args: &nemotron_h::ModelArgs,
+    args: &eredu_architectures::nemotron_h::ModelArgs,
     layer: usize,
     routes: &DispatchedRoutes,
     pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    Ok(cache.execute_routes_bounded(
-        ExpertRouteBatch::new(
-            layer,
-            &routes.hidden,
-            &routes.global_expert_ids,
-            &routes.weights,
-            pass,
-        ),
-        stream,
-        |hidden, acquired, _weights, stream| {
-            let started = Instant::now();
-            let prefix = format!("model.layers.{layer}.moe.experts");
-            let mut bank = nemotron_h::Experts::new(
-                acquired.identities().len() as i32,
-                args.hidden_size,
-                args.moe_intermediate_size,
-                [
-                    args.weight_quantization_for(&format!("{prefix}.up_proj")),
-                    args.weight_quantization_for(&format!("{prefix}.down_proj")),
-                ],
-                stream,
-            )?;
-            bank.up_proj = Param::new(acquired.compact_binding("up_proj", stream)?);
-            bank.up_proj_scales =
-                Param::new(acquired.optional_compact_binding("up_proj_scales", stream)?);
-            bank.up_proj_biases =
-                Param::new(acquired.optional_compact_binding("up_proj_biases", stream)?);
-            bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
-            bank.down_proj_scales =
-                Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
-            bank.down_proj_biases =
-                Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
-            cache.record_compact_bank(
-                acquired.pass(),
-                acquired.scratch_bytes(),
-                started.elapsed(),
-            )?;
-            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
-            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
+    let prefix = if layer < args.num_hidden_layers as usize {
+        format!("model.layers.{layer}.moe.experts")
+    } else {
+        format!(
+            "model.mtp.layers.{}.mixer.experts",
+            layer - args.num_hidden_layers as usize
+        )
+    };
+    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_relu2_dispatched(
+        cache,
+        crate::backend::mlx::runtime::residency::expert_provider::CachedRelu2BankSpec {
+            hidden_dimensions: args.hidden_size,
+            intermediate_dimensions: args.moe_intermediate_size,
+            up_quantization: args.weight_quantization_for(&format!("{prefix}.up_proj")),
+            down_quantization: args.weight_quantization_for(&format!("{prefix}.down_proj")),
         },
-    )?)
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        pass,
+        stream,
+    )
 }
 
 pub(crate) fn execute_cached_qwen_hybrid(
@@ -2940,27 +2971,21 @@ fn load_external_gguf_ep(
 ) -> Result<ExpertParallelModel, Error> {
     match architecture {
         "kimi-linear" => {
-            let prepared = kimi_linear::prepare_gguf_checkpoint(
-                checkpoint,
-                metadata,
-                None,
-                weights_stream,
-            )?;
+            let prepared = neutral_kimi_linear::prepare_gguf(checkpoint, metadata)?;
             let args = prepared.args;
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
-            let gguf_plan = crate::composition::mlx_architectures::kimi_linear::checkpoint::gguf_plan(&args)
+            let gguf_plan = eredu_architectures::kimi_linear::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
             let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
                 std::sync::Arc::new(open_gguf_checkpoint_source(
                     checkpoint.clone(),
                     &gguf_plan,
-                    kimi_linear::translate_gguf_weight_name,
+                    eredu_architectures::kimi_linear::translate_gguf_weight_name,
                     max_mapped_shards,
                 )?);
             let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::kimi_linear::layerwise::
-                    load_kimi_linear_sparse_tp_ep_base_with_store(
+                neutral_kimi_linear::load_external_expert_parallel_base_with_store(
                         store.clone(),
                         args.clone(),
                         non_expert,
@@ -2969,8 +2994,7 @@ fn load_external_gguf_ep(
                         weights_stream,
                     )?
             } else {
-                crate::composition::mlx_architectures::kimi_linear::layerwise::
-                    load_kimi_linear_sparse_ep_base_with_store(
+                neutral_kimi_linear::load_external_expert_base_with_store(
                         store.clone(),
                         args.clone(),
                         non_expert,
@@ -2979,18 +3003,14 @@ fn load_external_gguf_ep(
                     )?
             };
             let store = model.checkpoint_store_arc();
-            let entries =
-                crate::composition::mlx_architectures::kimi_linear::layerwise::kimi_expert_catalog(
-                    &args,
-                    store.as_ref(),
-                )?;
+            let entries = neutral_kimi_linear::expert_catalog(&args, store.as_ref())?;
             let replicated_parameter_bytes =
                 planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::KimiLinear,
                 assignment,
-                ExpertArchitecture::KimiLinearLayerwise(Box::new(model)),
+                ExpertArchitecture::NeutralHybrid(Box::new(model)),
                 store,
                 entries,
                 expert_residency,
@@ -3377,21 +3397,21 @@ fn load_external_gguf_ep(
             )
         }
         "lfm2moe" => {
-            let prepared = lfm2::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+            let prepared = neutral_lfm2::prepare_gguf(checkpoint, metadata)?;
             let args = prepared.args;
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
-            let gguf_plan = crate::composition::mlx_architectures::lfm2::checkpoint::gguf_plan(&args)
+            let gguf_plan = eredu_architectures::lfm2::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
             let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
                 std::sync::Arc::new(open_gguf_checkpoint_source(
                     checkpoint.clone(),
                     &gguf_plan,
-                    |name| lfm2::translate_gguf_weight_name(name, true),
+                    |name| eredu_architectures::lfm2::translate_gguf_weight_name(name, true),
                     max_mapped_shards,
                 )?);
             let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_sparse_tp_ep_base_with_store(
+                neutral_lfm2::load_external_expert_parallel_base_with_store(
                     store.clone(),
                     args.clone(),
                     non_expert,
@@ -3400,7 +3420,7 @@ fn load_external_gguf_ep(
                     weights_stream,
                 )?
             } else {
-                crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_sparse_ep_base_with_store(
+                neutral_lfm2::load_external_expert_base_with_store(
                     store.clone(),
                     args.clone(),
                     non_expert,
@@ -3409,18 +3429,14 @@ fn load_external_gguf_ep(
                 )?
             };
             let store = model.checkpoint_store_arc();
-            let entries =
-                crate::composition::mlx_architectures::lfm2::layerwise::lfm2_expert_catalog(
-                    &args,
-                    store.as_ref(),
-                )?;
+            let entries = neutral_lfm2::expert_catalog(&args, store.as_ref())?;
             let replicated_parameter_bytes =
                 planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::Lfm2,
                 assignment,
-                ExpertArchitecture::Lfm2Layerwise(Box::new(model)),
+                ExpertArchitecture::NeutralHybrid(Box::new(model)),
                 store,
                 entries,
                 expert_residency,
@@ -3430,23 +3446,21 @@ fn load_external_gguf_ep(
             )
         }
         "nemotron_h_moe" => {
-            let prepared =
-                nemotron_h::prepare_nemotron_h_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+            let prepared = neutral_nemotron_h::prepare_gguf(checkpoint, metadata)?;
             let args = prepared.args;
             let assignment =
                 resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
-            let gguf_plan = crate::composition::mlx_architectures::nemotron_h::checkpoint::gguf_plan(&args)
+            let gguf_plan = eredu_architectures::nemotron_h::gguf_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
             let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
                 std::sync::Arc::new(open_gguf_checkpoint_source(
                     checkpoint.clone(),
                     &gguf_plan,
-                    nemotron_h::translate_gguf_weight_name,
+                    eredu_architectures::nemotron_h::translate_gguf_weight_name,
                     max_mapped_shards,
                 )?);
             let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::nemotron_h::layerwise::
-                    load_nemotron_h_sparse_tp_ep_base_with_store(
+                neutral_nemotron_h::load_external_expert_parallel_base_with_store(
                         store.clone(),
                         args.clone(),
                         non_expert,
@@ -3455,8 +3469,7 @@ fn load_external_gguf_ep(
                         weights_stream,
                     )?
             } else {
-                crate::composition::mlx_architectures::nemotron_h::layerwise::
-                    load_nemotron_h_sparse_ep_base_with_store(
+                neutral_nemotron_h::load_external_expert_base_with_store(
                         store.clone(),
                         args.clone(),
                         non_expert,
@@ -3465,18 +3478,14 @@ fn load_external_gguf_ep(
                     )?
             };
             let store = model.checkpoint_store_arc();
-            let entries =
-                crate::composition::mlx_architectures::nemotron_h::layerwise::nemotron_h_expert_catalog(
-                    &args,
-                    store.as_ref(),
-                )?;
+            let entries = neutral_nemotron_h::expert_catalog(&args, store.as_ref())?;
             let replicated_parameter_bytes =
                 planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::NemotronH,
                 assignment,
-                ExpertArchitecture::NemotronHLayerwise(Box::new(model)),
+                ExpertArchitecture::NeutralHybrid(Box::new(model)),
                 store,
                 entries,
                 expert_residency,
@@ -3649,14 +3658,16 @@ fn load_kimi_linear_external_ep(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
-    let args = kimi_linear::get_model_args(model_dir)?;
-    args.validate()?;
+    let args = eredu_architectures::kimi_linear::model_args_from_config_reader(
+        std::fs::File::open(model_dir.join("config.json"))?,
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let assignment = resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
     let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> = std::sync::Arc::new(
         SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
     );
     let model = if topology.tensor_parallel_size > 1 {
-        crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_sparse_tp_ep_base_with_store(
+        neutral_kimi_linear::load_external_expert_parallel_base_with_store(
             store.clone(),
             args.clone(),
             non_expert,
@@ -3665,7 +3676,7 @@ fn load_kimi_linear_external_ep(
             weights_stream,
         )?
     } else {
-        crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_sparse_ep_base_with_store(
+        neutral_kimi_linear::load_external_expert_base_with_store(
             store.clone(),
             args.clone(),
             non_expert,
@@ -3674,17 +3685,13 @@ fn load_kimi_linear_external_ep(
         )?
     };
     let store = model.checkpoint_store_arc();
-    let entries =
-        crate::composition::mlx_architectures::kimi_linear::layerwise::kimi_expert_catalog(
-            &args,
-            store.as_ref(),
-        )?;
+    let entries = neutral_kimi_linear::expert_catalog(&args, store.as_ref())?;
     let replicated_parameter_bytes = planned_replicated_bytes(&model.residency_report()?)?;
     finish_external_ep(
         topology,
         ModelKind::KimiLinear,
         assignment,
-        ExpertArchitecture::KimiLinearLayerwise(Box::new(model)),
+        ExpertArchitecture::NeutralHybrid(Box::new(model)),
         store,
         entries,
         expert_residency,
@@ -4275,7 +4282,7 @@ fn load_additional_external_ep(
             )
         }
         ModelKind::Lfm2 => {
-            let args = lfm2::get_model_args(model_dir)?;
+            let args = neutral_lfm2::load_model_args(model_dir)?;
             if !args.has_sparse_moe_layers() {
                 return Err(Error::UnsupportedArchitecture(
                     "expert parallelism requires an LFM2 MoE checkpoint".into(),
@@ -4284,7 +4291,7 @@ fn load_additional_external_ep(
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
             let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_sparse_tp_ep_base_with_store(
+                neutral_lfm2::load_external_expert_parallel_base_with_store(
                     store.clone(),
                     args.clone(),
                     non_expert,
@@ -4293,7 +4300,7 @@ fn load_additional_external_ep(
                     weights_stream,
                 )?
             } else {
-                crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_sparse_ep_base_with_store(
+                neutral_lfm2::load_external_expert_base_with_store(
                     store.clone(),
                     args.clone(),
                     non_expert,
@@ -4302,27 +4309,19 @@ fn load_additional_external_ep(
                 )?
             };
             let store = model.checkpoint_store_arc();
-            let entries =
-                crate::composition::mlx_architectures::lfm2::layerwise::lfm2_expert_catalog(
-                    &args,
-                    store.as_ref(),
-                )?;
+            let entries = neutral_lfm2::expert_catalog(&args, store.as_ref())?;
             let replicated = planned_replicated_bytes(&model.residency_report()?)?;
             (
                 assignment,
-                ExpertArchitecture::Lfm2Layerwise(Box::new(model)),
+                ExpertArchitecture::NeutralHybrid(Box::new(model)),
                 store,
                 entries,
                 replicated,
             )
         }
         ModelKind::NemotronH => {
-            let args = nemotron_h::get_nemotron_h_model_args(model_dir)?;
-            if !args
-                .layer_schedule
-                .iter()
-                .any(|policy| *policy == nemotron_h::LayerPolicy::SparseMoe)
-            {
+            let args = neutral_nemotron_h::load_model_args(model_dir)?;
+            if !args.has_sparse_moe_layers() {
                 return Err(Error::UnsupportedArchitecture(
                     "expert parallelism requires a Nemotron-H MoE checkpoint".into(),
                 ));
@@ -4330,34 +4329,29 @@ fn load_additional_external_ep(
             let assignment =
                 resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
             let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::nemotron_h::layerwise::
-                    load_nemotron_h_sparse_tp_ep_base_with_store(
-                        store.clone(),
-                        args.clone(),
-                        non_expert,
-                        ParallelBuildContext::new(topology, ShardingPolicy::Require),
-                        stream,
-                        weights_stream,
-                    )?
+                neutral_nemotron_h::load_external_expert_parallel_base_with_store(
+                    store.clone(),
+                    args.clone(),
+                    non_expert,
+                    ParallelBuildContext::new(topology, ShardingPolicy::Require),
+                    stream,
+                    weights_stream,
+                )?
             } else {
-                crate::composition::mlx_architectures::nemotron_h::layerwise::
-                    load_nemotron_h_sparse_ep_base_with_store(
-                        store.clone(),
-                        args.clone(),
-                        non_expert,
-                        stream,
-                        weights_stream,
-                    )?
+                neutral_nemotron_h::load_external_expert_base_with_store(
+                    store.clone(),
+                    args.clone(),
+                    non_expert,
+                    stream,
+                    weights_stream,
+                )?
             };
             let store = model.checkpoint_store_arc();
-            let entries = crate::composition::mlx_architectures::nemotron_h::layerwise::nemotron_h_expert_catalog(
-                &args,
-                store.as_ref(),
-            )?;
+            let entries = neutral_nemotron_h::expert_catalog(&args, store.as_ref())?;
             let replicated = planned_replicated_bytes(&model.residency_report()?)?;
             (
                 assignment,
-                ExpertArchitecture::NemotronHLayerwise(Box::new(model)),
+                ExpertArchitecture::NeutralHybrid(Box::new(model)),
                 store,
                 entries,
                 replicated,

@@ -1,6 +1,8 @@
 //! Runtime ownership boundary for routed expert acquisition and residency.
 
-use eredu_nn::{RoutedNeuralBackend, RoutingResult, SwiGluExpertBankOperator, Tensor};
+use eredu_nn::{
+    Relu2ExpertBankOperator, RoutedNeuralBackend, RoutingResult, SwiGluExpertBankOperator, Tensor,
+};
 
 use crate::ExpertPass;
 
@@ -29,10 +31,23 @@ where
     /// Provider-specific acquisition or execution failure.
     type Error;
 
+    /// Whether the returned expert output is a rank-local tensor-parallel partial.
+    fn output_is_tensor_parallel_partial(&self) -> bool {
+        false
+    }
+
     /// Executes one typed route batch while retaining its acquired resources.
     fn forward_routed(
         &mut self,
         resident_bank: &mut B::SwiGluExpertBank,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>;
+
+    /// Executes one ReLU-squared route batch through the same residency boundary.
+    fn forward_relu2_routed(
+        &mut self,
+        resident_bank: &mut B::Relu2ExpertBank,
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
@@ -48,9 +63,22 @@ where
 {
     type Error = eredu_nn::Error;
 
+    fn output_is_tensor_parallel_partial(&self) -> bool {
+        true
+    }
+
     fn forward_routed(
         &mut self,
         resident_bank: &mut B::SwiGluExpertBank,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        resident_bank.forward_routed(request.input, request.routes, context)
+    }
+
+    fn forward_relu2_routed(
+        &mut self,
+        resident_bank: &mut B::Relu2ExpertBank,
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {

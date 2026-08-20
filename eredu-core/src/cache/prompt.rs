@@ -545,7 +545,11 @@ impl PromptCacheManifest {
             let tokens =
                 layer_prefix_tokens(self.total_prefix_tokens, self.layer_prefix_offsets[index])?;
             for policy in layer.fixed_state() {
-                if policy.is_required_for(tokens) || actual.contains(&(owner, policy.role)) {
+                // A zero-token frontier has no materialized recurrent value,
+                // even when that value is required once execution begins.
+                if (tokens != 0 && policy.is_required_for(tokens))
+                    || actual.contains(&(owner, policy.role))
+                {
                     expected.push((owner, policy, tokens));
                 }
             }
@@ -872,6 +876,29 @@ mod tests {
         let restored: PromptCacheManifest = serde_json::from_str(&json).unwrap();
         restored.validate().unwrap();
         assert_eq!(restored, manifest);
+    }
+
+    #[test]
+    fn zero_frontier_prediction_state_needs_no_materialized_tensor() {
+        let recurrent = crate::cache::StateTensorPolicy::new(
+            StateTensorRole::Recurrent,
+            vec![crate::cache::StateTensorDimension::Batch],
+            crate::cache::StateTensorDtype::Floating,
+            crate::cache::MutableStateResidency::LayerScopedOffloadable,
+        )
+        .unwrap();
+        let mut value = manifest();
+        value.total_prefix_tokens = 1;
+        value.prefix_sha256 = prompt_cache_token_fingerprint(&[7]);
+        value.layer_prefix_offsets = vec![-1];
+        value.layer_layout = LayerSchedule::new(
+            1,
+            vec![LayerCachePolicy::fixed_only(vec![recurrent]).unwrap()],
+        )
+        .unwrap();
+        value.blocks.clear();
+        value.state_tensors.clear();
+        value.validate().unwrap();
     }
 
     #[test]

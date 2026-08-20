@@ -231,7 +231,7 @@ pub struct TopKRouterConfig {
     pub n_group: i32,
     /// Number of routing groups selected before expert top-k.
     pub topk_group: i32,
-    /// Whether to allocate Nemotron-style expert score correction bias.
+    /// Whether to allocate a selection-only expert score correction bias.
     pub score_correction_bias: bool,
 }
 
@@ -772,44 +772,173 @@ pub fn weighted_route_sum(
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-/// Packed routed expert bank for ReLU2 experts with `up_proj` and `down_proj` weights.
+/// Packed routed ReLU2 expert bank with dense, affine, MXFP4, or GGUF-native IQ storage.
 pub struct PackedRelu2Experts {
     /// Number of routed experts.
     pub num_experts: i32,
-    /// Model hidden size.
+    /// Model hidden dimension.
     pub hidden_size: i32,
-    /// Expert intermediate size.
+    /// Per-expert intermediate dimension.
     pub intermediate_size: i32,
+    /// Optional affine or MXFP4 settings for the up-projection bank.
+    pub up_quantization: Option<WeightQuantization>,
+    /// Optional affine or MXFP4 settings for the down-projection bank.
+    pub down_quantization: Option<WeightQuantization>,
+    /// Optional checkpoint-native IQ settings for the up-projection bank.
+    pub up_iquant: Option<WeightQuantization>,
+    /// Optional checkpoint-native IQ settings for the down-projection bank.
+    pub down_iquant: Option<WeightQuantization>,
     #[param]
-    /// Packed expert up-projection weights, shaped `[experts, intermediate, hidden]`.
+    /// Expert up-projection weights.
     pub up_proj: Param<Array>,
     #[param]
-    /// Packed expert down-projection weights, shaped `[experts, hidden, intermediate]`.
+    /// Expert up-projection packed scales.
+    pub up_proj_scales: Param<Option<Array>>,
+    #[param]
+    /// Expert up-projection affine biases, absent for MXFP4.
+    pub up_proj_biases: Param<Option<Array>>,
+    #[param]
+    /// Expert down-projection weights.
     pub down_proj: Param<Array>,
+    #[param]
+    /// Expert down-projection packed scales.
+    pub down_proj_scales: Param<Option<Array>>,
+    #[param]
+    /// Expert down-projection affine biases, absent for MXFP4.
+    pub down_proj_biases: Param<Option<Array>>,
 }
 
 impl PackedRelu2Experts {
-    /// Creates an unloaded packed expert bank.
+    /// Creates an unloaded dense, packed, or checkpoint-native IQ expert bank.
     pub fn new(
         num_experts: i32,
         hidden_size: i32,
         intermediate_size: i32,
+        quantization: [Option<WeightQuantization>; 2],
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::new_with_dtype(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            quantization,
+            Dtype::Float32,
+            stream,
+        )
+    }
+
+    /// Creates an unloaded expert bank with an explicit dense weight dtype.
+    pub fn new_with_dtype(
+        num_experts: i32,
+        hidden_size: i32,
+        intermediate_size: i32,
+        quantization: [Option<WeightQuantization>; 2],
+        dense_dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let split = |quantization| {
+            Ok::<_, Exception>(match quantization {
+                Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
+                packed => (packed, None),
+            })
+        };
+        let (up_quantization, up_iquant) = split(quantization[0])?;
+        let (down_quantization, down_iquant) = split(quantization[1])?;
+        let projection = |out_features: i32,
+                          in_features: i32,
+                          quantization: Option<WeightQuantization>,
+                          iquant: Option<WeightQuantization>|
+         -> Result<ExpertProjectionParams, Exception> {
+            if let Some(iquant) = iquant {
+                let (ggml_type, _) = iquant.gguf_iquant().expect("IQ expert format");
+                let (block_values, block_bytes) = ggml_type
+                    .block_and_bytes()
+                    .expect("canonical IQ block geometry");
+                return Ok((
+                    Param::<Array>::unloaded(
+                        &[
+                            num_experts,
+                            out_features,
+                            in_features / block_values as i32 * block_bytes as i32,
+                        ],
+                        Dtype::Uint8,
+                        stream,
+                    )?,
+                    Param::new(None),
+                    Param::new(None),
+                ));
+            }
+            match quantization {
+                Some(quantization) => Ok((
+                    Param::<Array>::unloaded(
+                        &[
+                            num_experts,
+                            out_features,
+                            quantized_packed_dimension(in_features, quantization.bits()),
+                        ],
+                        Dtype::Uint32,
+                        stream,
+                    )?,
+                    Param::<Option<Array>>::unloaded_some(
+                        &[
+                            num_experts,
+                            out_features,
+                            in_features / quantization.group_size(),
+                        ],
+                        if quantization == WeightQuantization::MxFp4 {
+                            Dtype::Uint8
+                        } else {
+                            Dtype::Float16
+                        },
+                        stream,
+                    )?,
+                    if quantization.has_biases() {
+                        Param::<Option<Array>>::unloaded_some(
+                            &[
+                                num_experts,
+                                out_features,
+                                in_features / quantization.group_size(),
+                            ],
+                            Dtype::Float16,
+                            stream,
+                        )?
+                    } else {
+                        Param::new(None)
+                    },
+                )),
+                None => Ok((
+                    Param::<Array>::unloaded(
+                        &[num_experts, out_features, in_features],
+                        dense_dtype,
+                        stream,
+                    )?,
+                    Param::new(None),
+                    Param::new(None),
+                )),
+            }
+        };
+        let (up_proj, up_proj_scales, up_proj_biases) =
+            projection(intermediate_size, hidden_size, up_quantization, up_iquant)?;
+        let (down_proj, down_proj_scales, down_proj_biases) = projection(
+            hidden_size,
+            intermediate_size,
+            down_quantization,
+            down_iquant,
+        )?;
         Ok(Self {
             num_experts,
             hidden_size,
             intermediate_size,
-            up_proj: Param::<Array>::unloaded(
-                &[num_experts, intermediate_size, hidden_size],
-                Dtype::Float32,
-                stream,
-            )?,
-            down_proj: Param::<Array>::unloaded(
-                &[num_experts, hidden_size, intermediate_size],
-                Dtype::Float32,
-                stream,
-            )?,
+            up_quantization,
+            down_quantization,
+            up_iquant,
+            down_iquant,
+            up_proj,
+            up_proj_scales,
+            up_proj_biases,
+            down_proj,
+            down_proj_scales,
+            down_proj_biases,
         })
     }
 
@@ -824,40 +953,76 @@ impl PackedRelu2Experts {
         let num_tokens = hidden_states.dim(0);
         let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
-        let up_weights = self.up_proj.as_ref().swap_axes(-1, -2, stream)?;
-        let hidden = grouped_matmul(&hidden, &up_weights, &plan.sorted_group_ids, true, stream)?;
+        let hidden = if let Some(iquant) = self.up_iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.up_proj.value.clone(),
+                &[self.num_experts, self.intermediate_size, self.hidden_size],
+                ggml_type,
+                endian,
+            )?;
+            native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
+        } else {
+            match self.up_quantization {
+                Some(quantization) => packed_grouped_linear(
+                    &hidden,
+                    &self.up_proj,
+                    self.up_proj_scales
+                        .as_ref()
+                        .as_ref()
+                        .expect("quantized expert scales"),
+                    self.up_proj_biases.as_ref().as_ref(),
+                    &plan.sorted_group_ids,
+                    quantization,
+                    stream,
+                )?,
+                None => grouped_matmul(
+                    &hidden,
+                    &self.up_proj.as_ref().swap_axes(-1, -2, stream)?,
+                    &plan.sorted_group_ids,
+                    true,
+                    stream,
+                )?,
+            }
+        };
         let hidden = relu2(hidden, stream)?;
-        let down_weights = self.down_proj.as_ref().swap_axes(-1, -2, stream)?;
-        let current = grouped_matmul(&hidden, &down_weights, &plan.sorted_group_ids, true, stream)?;
+        let current = if let Some(iquant) = self.down_iquant {
+            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ expert format");
+            let native = NativeQuantizedTensor::from_iq_array(
+                self.down_proj.value.clone(),
+                &[self.num_experts, self.hidden_size, self.intermediate_size],
+                ggml_type,
+                endian,
+            )?;
+            native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
+        } else {
+            match self.down_quantization {
+                Some(quantization) => packed_grouped_linear(
+                    &hidden,
+                    &self.down_proj,
+                    self.down_proj_scales
+                        .as_ref()
+                        .as_ref()
+                        .expect("quantized expert scales"),
+                    self.down_proj_biases.as_ref().as_ref(),
+                    &plan.sorted_group_ids,
+                    quantization,
+                    stream,
+                )?,
+                None => grouped_matmul(
+                    &hidden,
+                    &self.down_proj.as_ref().swap_axes(-1, -2, stream)?,
+                    &plan.sorted_group_ids,
+                    true,
+                    stream,
+                )?,
+            }
+        };
         weighted_route_sum(current, top_k_weights, &plan, num_tokens, stream)
     }
 
     /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
-}
-
-#[cfg(test)]
-mod tests {
-    use super::weighted_route_sum;
-    use safemlx::{ops::topk_route_plan, Array, Device, DeviceType, ExecutionContext};
-
-    #[test]
-    fn weighted_route_sum_restores_original_topk_order() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let stream = context.stream();
-        let expert_ids = Array::from_slice(&[2i32, 0, 1, 2, 0, 1], &[3, 2]);
-        let plan = topk_route_plan(&expert_ids, 3, stream).unwrap();
-
-        // The plan orders original routes [1, 4, 2, 5, 0, 3] by expert id.
-        let expert_major = Array::from_slice(&[2.0f32, 5.0, 3.0, 6.0, 1.0, 4.0], &[6, 1]);
-        let weights = Array::ones::<f32>(&[3, 2], stream).unwrap();
-        let reduced = weighted_route_sum(expert_major, &weights, &plan, 3, stream).unwrap();
-
-        assert_eq!(
-            reduced.evaluated().unwrap().as_slice::<f32>(),
-            &[3.0, 7.0, 11.0]
-        );
-    }
 }
 
 const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;

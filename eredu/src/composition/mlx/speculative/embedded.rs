@@ -1,6 +1,7 @@
 //! MLX executor adapter for checkpoint-embedded prediction heads.
 
 use eredu_core::{SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission};
+use eredu_runtime::DraftStateTransaction;
 use safemlx::{distributed::Group, error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::{
@@ -127,8 +128,8 @@ pub(crate) trait EmbeddedMtpTarget {
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<(), Exception>;
-    fn draft_cache(cache: &Self::Cache) -> Self::DraftCache;
-    fn commit_draft_cache(cache: &mut Self::Cache, draft: &Self::DraftCache);
+    fn draft_cache(&self, cache: &Self::Cache) -> Self::DraftCache;
+    fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache);
     fn restore_target_checkpoint(
         cache: &mut Self::Cache,
         checkpoint: &Self::Cache,
@@ -182,9 +183,9 @@ pub(crate) struct EmbeddedTargetState<C> {
 }
 
 #[derive(Clone)]
-pub(crate) struct EmbeddedDraftState<C> {
+pub(crate) struct EmbeddedDraftState<C: Clone> {
     hidden: Array,
-    draft_cache: C,
+    draft_cache: DraftStateTransaction<C>,
     depth: usize,
     fused_logits: Option<Array>,
     fused_cursor: usize,
@@ -263,7 +264,12 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
             let logits = output
                 .logits
                 .try_index_device((.., sequence - 1, ..), stream)?;
-            let state = Self::state_at(&output, sequence - 1, T::draft_cache(cache), stream)?;
+            let state = Self::state_at(
+                &output,
+                sequence - 1,
+                self.target.draft_cache(cache),
+                stream,
+            )?;
             Ok(SpeculativePrefill {
                 logits,
                 state,
@@ -279,12 +285,12 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
         proposal_capacity: usize,
         streams: MtpExecutionStreams<'_>,
     ) -> Result<Self::DraftState, Exception> {
-        let mut draft_cache = state.draft_cache.clone();
+        let mut draft_cache = DraftStateTransaction::fork(&state.draft_cache);
         let fused_logits = self.target.fused_draft_logits(
             &state.hidden,
             last_token,
             proposal_capacity,
-            &mut draft_cache,
+            draft_cache.draft_mut(),
             streams.draft(),
         )?;
         Ok(EmbeddedDraftState {
@@ -318,7 +324,7 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
             &state.hidden,
             last_token,
             state.depth,
-            &mut state.draft_cache,
+            state.draft_cache.draft_mut(),
             stream,
         )?;
         state.hidden = hidden;
@@ -392,7 +398,7 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
             self.target.advance_draft_cache(
                 &hidden,
                 &tokens,
-                &mut draft_state.draft_cache,
+                draft_state.draft_cache.draft_mut(),
                 stream,
             )?;
         }
@@ -408,11 +414,12 @@ impl<T: EmbeddedMtpTarget> SpeculativeExecutor for EmbeddedMtpExecutor<'_, T> {
                 verified_inputs,
             )
         };
-        T::commit_draft_cache(cache, &draft_state.draft_cache);
+        self.target
+            .commit_draft_cache(cache, draft_state.draft_cache.draft());
         let state = Self::state_at(
             &committed,
             verified_inputs as i32 - 1,
-            T::draft_cache(cache),
+            self.target.draft_cache(cache),
             stream,
         )?;
         Ok(SpeculativeCommit {

@@ -55,14 +55,14 @@ fn materialize_gguf_model(
     let (model, _architecture_eos_token_ids) = match gguf_architecture {
         GgufArchitecture::KimiLinear => {
             let (loaded, eos_token_ids) =
-                        crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_gguf_layerwise_model(
-                            checkpoint,
-                            metadata,
-                            options.weight_residency,
-                            options.quantization,
-                            stream,
-                            weights_stream,
-                        )?;
+                crate::composition::kimi_linear::load_kimi_linear_gguf_model(
+                    checkpoint,
+                    metadata,
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
             (Model::KimiLinear(loaded), eos_token_ids)
         }
         GgufArchitecture::DeepSeek2 => {
@@ -179,27 +179,26 @@ fn materialize_gguf_model(
             (Model::MuseGlimmer(loaded), eos_token_ids)
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
-            let (loaded, eos_token_ids) =
-                    crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_gguf_layerwise_model(
-                        checkpoint,
-                        metadata,
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
+            let (loaded, eos_token_ids) = crate::composition::lfm2::load_lfm2_gguf_model(
+                checkpoint,
+                metadata,
+                options.weight_residency,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
             (Model::Lfm2(loaded), eos_token_ids)
         }
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
             let (loaded, eos_token_ids) =
-                    crate::composition::mlx_architectures::nemotron_h::layerwise::load_nemotron_h_gguf_layerwise_model(
-                        checkpoint,
-                        metadata,
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
+                crate::composition::nemotron_h::load_nemotron_h_gguf_model(
+                    checkpoint,
+                    metadata,
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
             (Model::NemotronH(loaded), eos_token_ids)
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
@@ -444,7 +443,7 @@ fn materialize_tensor_parallel(
             )?,
         )),
         ModelKind::KimiLinear => Ok(Model::KimiLinear(
-            crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_tensor_parallel_model(
+            crate::composition::kimi_linear::load_kimi_linear_tensor_parallel_model(
                 path,
                 execution,
                 build,
@@ -471,7 +470,7 @@ fn materialize_tensor_parallel(
             )?,
         )),
         ModelKind::Lfm2 => Ok(Model::Lfm2(
-            crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_tensor_parallel_model(
+            crate::composition::lfm2::load_lfm2_tensor_parallel_model(
                 path,
                 execution,
                 build,
@@ -480,7 +479,7 @@ fn materialize_tensor_parallel(
             )?,
         )),
         ModelKind::NemotronH => Ok(Model::NemotronH(
-            crate::composition::mlx_architectures::nemotron_h::layerwise::load_nemotron_h_tensor_parallel_model(
+            crate::composition::nemotron_h::load_nemotron_h_tensor_parallel_model(
                 path,
                 execution,
                 build,
@@ -653,7 +652,15 @@ fn materialize_gguf_tensor_parallel(
     );
     match architecture {
         GgufArchitecture::KimiLinear => {
-            let (model, eos) = crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_gguf_tensor_parallel_model(checkpoint, metadata, residency, build, stream, weights_stream)?;
+            let (model, eos) =
+                crate::composition::kimi_linear::load_kimi_linear_gguf_tensor_parallel_model(
+                    checkpoint,
+                    metadata,
+                    residency,
+                    build,
+                    stream,
+                    weights_stream,
+                )?;
             Ok((Model::KimiLinear(model), eos))
         }
         GgufArchitecture::DeepSeek2 | GgufArchitecture::DeepSeek4 => {
@@ -732,8 +739,19 @@ fn materialize_gguf_tensor_parallel(
             Ok((Model::MuseGlimmer(model), eos))
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
+            let (model, eos) = crate::composition::lfm2::load_lfm2_gguf_tensor_parallel_model(
+                checkpoint,
+                metadata,
+                residency,
+                build,
+                stream,
+                weights_stream,
+            )?;
+            Ok((Model::Lfm2(model), eos))
+        }
+        GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
             let (model, eos) =
-                crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_gguf_tensor_parallel_model(
+                crate::composition::nemotron_h::load_nemotron_h_gguf_tensor_parallel_model(
                     checkpoint,
                     metadata,
                     residency,
@@ -741,10 +759,6 @@ fn materialize_gguf_tensor_parallel(
                     stream,
                     weights_stream,
                 )?;
-            Ok((Model::Lfm2(model), eos))
-        }
-        GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
-            let (model, eos) = crate::composition::mlx_architectures::nemotron_h::layerwise::load_nemotron_h_gguf_tensor_parallel_model(checkpoint, metadata, residency, build, stream, weights_stream)?;
             Ok((Model::NemotronH(model), eos))
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
@@ -846,8 +860,12 @@ pub(super) fn materialize_safetensors(
     ) {
         return match kind {
             ModelKind::KimiLinear => Ok(Model::KimiLinear(
-                crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_expert_cache_model(
-                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
+                crate::composition::kimi_linear::load_kimi_linear_model(
+                    model_dir,
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    options.quantization,
+                    stream,
+                    weights_stream,
                 )?,
             )),
             ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => {
@@ -875,13 +893,21 @@ pub(super) fn materialize_safetensors(
                 )?,
             )),
             ModelKind::Lfm2 => Ok(Model::Lfm2(
-                crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_expert_cache_model(
-                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
+                crate::composition::lfm2::load_lfm2_model(
+                    model_dir,
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    options.quantization,
+                    stream,
+                    weights_stream,
                 )?,
             )),
             ModelKind::NemotronH => Ok(Model::NemotronH(
-                crate::composition::mlx_architectures::nemotron_h::layerwise::load_nemotron_h_expert_cache_model(
-                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
+                crate::composition::nemotron_h::load_nemotron_h_model(
+                    model_dir,
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    options.quantization,
+                    stream,
+                    weights_stream,
                 )?,
             )),
             ModelKind::Qwen2 => Err(Error::UnsupportedArchitecture(
@@ -952,9 +978,9 @@ pub(super) fn materialize_safetensors(
             )?,
         )),
         ModelKind::KimiLinear => Ok(Model::KimiLinear(
-            crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_layerwise_model(
+            crate::composition::kimi_linear::load_kimi_linear_model(
                 model_dir,
-                execution,
+                eredu_runtime::WeightResidency::with_layers(execution),
                 options.quantization,
                 stream,
                 weights_stream,
@@ -999,18 +1025,18 @@ pub(super) fn materialize_safetensors(
             )?,
         )),
         ModelKind::Lfm2 => Ok(Model::Lfm2(
-            crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_layerwise_model(
+            crate::composition::lfm2::load_lfm2_model(
                 model_dir,
-                execution,
+                eredu_runtime::WeightResidency::with_layers(execution),
                 options.quantization,
                 stream,
                 weights_stream,
             )?,
         )),
         ModelKind::NemotronH => Ok(Model::NemotronH(
-            crate::composition::mlx_architectures::nemotron_h::layerwise::load_nemotron_h_layerwise_model(
+            crate::composition::nemotron_h::load_nemotron_h_model(
                 model_dir,
-                execution,
+                eredu_runtime::WeightResidency::with_layers(execution),
                 options.quantization,
                 stream,
                 weights_stream,

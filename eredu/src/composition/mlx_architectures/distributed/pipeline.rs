@@ -12,10 +12,11 @@
 
 use eredu_architectures::llama::ModelArgs as LlamaModelArgs;
 use eredu_checkpoint::WeightQuantization;
+use eredu_nn::{EmbeddingOperator, LinearOperator, NormalizationOperator, ParameterSpec};
 use eredu_runtime::{
-    DenseDiskStreamLoadOptions, LayerWeightResidency, LayerwiseLoadOptions, OffloadUnit,
-    ResidencyReport, ShardingPolicy, StaticUnitBindings, WeightBinding,
-    WeightMaterializationReport, DENSE_TRANSFER_WINDOW,
+    DenseDiskStreamLoadOptions, LayerRuntimeState, LayerWeightResidency, LayerwiseLoadOptions,
+    OffloadUnit, ResidencyReport, RuntimeStateComponents, ShardingPolicy, StaticUnitBindings,
+    WeightBinding, WeightMaterializationReport, DENSE_TRANSFER_WINDOW,
 };
 
 mod placement;
@@ -53,7 +54,9 @@ use safemlx::{
 use crate::backend::mlx::runtime::checkpoint::quantization::quantize_tensor;
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::nn::shared::{MlxBackend, MlxModule},
+    backend::mlx::nn::shared::{
+        MlxBackend, MlxEmbedding, MlxLinear, MlxModule, MlxNamedModule, MlxRmsNorm,
+    },
     backend::mlx::nn::{attention::AttentionInput, linear, linear::project_logits_maybe_quantized},
     backend::mlx::nn::{
         parallel::{
@@ -67,8 +70,8 @@ use crate::{
         PromptCacheStateArray,
     },
     backend::mlx::runtime::cache::{
-        state::MlxPoolingAttentionCache, CompressedLatentCache, ConcatKeyValueCache, KeyValueCache,
-        PagedKeyValueCache,
+        state::{MlxHybridLayerState, MlxHybridState, MlxPoolingAttentionCache},
+        CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_bindings, materialize_module_bindings,
@@ -96,6 +99,7 @@ use crate::{
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheReport, ExpertCatalogEntry,
     },
+    backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider,
     backend::mlx::runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, ResidencyManager,
     },
@@ -111,14 +115,8 @@ use crate::{
         gpt_oss::model as gpt_oss,
         inkling::layerwise::{InklingLayer, InklingLayerwiseAdapter},
         inkling::model as inkling,
-        kimi_linear::layerwise::KimiLinearLayerwiseAdapter,
-        kimi_linear::model as kimi_linear,
-        lfm2::layerwise::Lfm2LayerwiseAdapter,
-        lfm2::model as lfm2,
         muse_glimmer,
         muse_glimmer::layerwise::{MuseGlimmerLayer, MuseGlimmerLayerwiseAdapter},
-        nemotron_h::layerwise::NemotronHLayerwiseAdapter,
-        nemotron_h::model as nemotron_h,
         qwen::{
             hybrid::{
                 layerwise::{QwenHybridLayer, QwenHybridLayerwiseAdapter},
@@ -127,6 +125,10 @@ use crate::{
             vl::layerwise::{Qwen3VlLayer, Qwen3VlLayerwiseAdapter, Qwen3VlPipelinePrepared},
             vl::model as qwen3_vl,
         },
+    },
+    composition::{
+        kimi_linear::KimiLinearPipelineAdapter, lfm2::Lfm2PipelineAdapter,
+        nemotron_h::NemotronHPipelineAdapter,
     },
     core::cache::{CacheRankIdentity, StateTensorOwner, StateTensorPolicy, StateTensorRole},
     core::generation::MtpConfig,
@@ -248,16 +250,25 @@ macro_rules! impl_pipeline_quantization_adapter {
 }
 
 impl_pipeline_quantization_adapter!(MuseGlimmerLayerwiseAdapter, MuseGlimmerLayer);
-impl_pipeline_quantization_adapter!(KimiLinearLayerwiseAdapter, kimi_linear::DecoderLayer);
+impl_pipeline_quantization_adapter!(
+    KimiLinearPipelineAdapter,
+    MlxModule<eredu_architectures::kimi_linear::Block<MlxBackend>>
+);
 impl_pipeline_quantization_adapter!(QwenHybridLayerwiseAdapter, QwenHybridLayer);
 impl_pipeline_quantization_adapter!(Qwen3VlLayerwiseAdapter, Qwen3VlLayer);
 impl_pipeline_quantization_adapter!(
     crate::composition::qwen::QwenParallelComposition,
     MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>
 );
-impl_pipeline_quantization_adapter!(Lfm2LayerwiseAdapter, lfm2::DecoderLayer);
+impl_pipeline_quantization_adapter!(
+    Lfm2PipelineAdapter,
+    MlxModule<eredu_architectures::lfm2::Block<MlxBackend>>
+);
 impl_pipeline_quantization_adapter!(Gemma4LayerwiseAdapter, Gemma4Layer);
-impl_pipeline_quantization_adapter!(NemotronHLayerwiseAdapter, nemotron_h::TransformerBlock);
+impl_pipeline_quantization_adapter!(
+    NemotronHPipelineAdapter,
+    MlxModule<eredu_architectures::nemotron_h::Unit<MlxBackend>>
+);
 impl_pipeline_quantization_adapter!(InklingLayerwiseAdapter, InklingLayer);
 impl_pipeline_quantization_adapter!(
     crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter,
@@ -946,7 +957,7 @@ enum PipelineMtpCache {
     DeepSeek(Vec<CompressedLatentCache>),
     NeutralDeepSeekV4(Vec<MlxPoolingAttentionCache>),
     Inkling(Vec<inkling::LayerCache>),
-    NemotronH(Vec<nemotron_h::LayerCache>),
+    Hybrid(MlxHybridState),
     QwenHybrid(Vec<qwen_hybrid::LayerCache>),
 }
 
@@ -1075,6 +1086,154 @@ impl PipelineLayerCache {
                 .chain(slots.iter().filter_map(PipelineStateSlot::value))
                 .collect(),
             Self::PoolingAttention { cache, .. } => cache.retained_arrays(),
+        }
+    }
+}
+
+struct PipelineHybridLayerState<'a>(&'a mut PipelineLayerCache);
+
+fn validate_pipeline_hybrid_cache_layer(
+    cache: &PipelineLayerCache,
+    expected: usize,
+) -> Result<(), Error> {
+    let actual = match cache {
+        PipelineLayerCache::StateSlots { global_layer, .. }
+        | PipelineLayerCache::KeyValue { global_layer, .. }
+        | PipelineLayerCache::CompressedLatent { global_layer, .. }
+        | PipelineLayerCache::PoolingAttention { global_layer, .. } => *global_layer,
+    };
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(Error::Parallel(format!(
+            "hybrid pipeline cache owns global layer {actual}, expected {expected}"
+        )))
+    }
+}
+
+impl eredu_runtime::RuntimeLayerState<MlxBackend> for PipelineHybridLayerState<'_> {
+    type RetainedValues<'a>
+        = std::vec::IntoIter<&'a Array>
+    where
+        Self: 'a;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        self.0.retained_arrays().into_iter()
+    }
+}
+
+impl eredu_runtime::RuntimeStateComponents<MlxBackend> for PipelineHybridLayerState<'_> {
+    fn position(&self) -> i32 {
+        match &*self.0 {
+            PipelineLayerCache::KeyValue { cache, .. } => match cache {
+                PipelineKeyValueCache::Standard(cache) => KeyValueCache::offset(cache),
+                PipelineKeyValueCache::Paged(cache) => KeyValueCache::offset(cache),
+            },
+            PipelineLayerCache::StateSlots { slots, .. } => {
+                slots.first().map_or(0, |slot| slot.offset)
+            }
+            _ => 0,
+        }
+    }
+
+    fn fixed_component(
+        &mut self,
+        role: StateTensorRole,
+    ) -> Result<&mut Option<Array>, eredu_runtime::StateError> {
+        let slots = match self.0 {
+            PipelineLayerCache::StateSlots { slots, .. }
+            | PipelineLayerCache::KeyValue { slots, .. } => slots,
+            _ => return Err(eredu_runtime::StateError::UnknownComponent { role }),
+        };
+        slots
+            .iter_mut()
+            .find(|slot| slot.policy.role == role)
+            .map(|slot| &mut slot.value)
+            .ok_or(eredu_runtime::StateError::UnknownComponent { role })
+    }
+
+    fn advance_fixed(&mut self, tokens: i32) -> Result<(), eredu_runtime::StateError> {
+        if tokens <= 0 {
+            return Err(eredu_runtime::StateError::InvalidAdvance(format!(
+                "token count must be positive, got {tokens}"
+            )));
+        }
+        let slots = match self.0 {
+            PipelineLayerCache::StateSlots { slots, .. } => slots,
+            _ => {
+                return Err(eredu_runtime::StateError::InvalidAdvance(
+                    "attention-backed pipeline state advances through cache append".into(),
+                ))
+            }
+        };
+        for slot in slots {
+            slot.offset = slot.offset.checked_add(tokens).ok_or_else(|| {
+                eredu_runtime::StateError::InvalidAdvance(
+                    "pipeline fixed-state token frontier overflowed".into(),
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl eredu_nn::AttentionCache<Array> for PipelineHybridLayerState<'_> {
+    fn offset(&self) -> i32 {
+        eredu_runtime::RuntimeStateComponents::<MlxBackend>::position(self)
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        match &*self.0 {
+            PipelineLayerCache::KeyValue { cache, .. } => match cache {
+                PipelineKeyValueCache::Standard(cache) => eredu_nn::AttentionCache::max_size(cache),
+                PipelineKeyValueCache::Paged(cache) => eredu_nn::AttentionCache::max_size(cache),
+            },
+            _ => None,
+        }
+    }
+
+    fn update_for_attention(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), eredu_nn::Error> {
+        match self.0 {
+            PipelineLayerCache::KeyValue { cache, .. } => match cache {
+                PipelineKeyValueCache::Standard(cache) => {
+                    eredu_nn::AttentionCache::update_for_attention(cache, keys, values, stream)
+                }
+                PipelineKeyValueCache::Paged(cache) => {
+                    eredu_nn::AttentionCache::update_for_attention(cache, keys, values, stream)
+                }
+            },
+            _ => Err(eredu_nn::Error::backend(
+                "fixed-state hybrid pipeline layer has no attention cache",
+            )),
+        }
+    }
+
+    fn attention(
+        &mut self,
+        queries: Array,
+        keys: Array,
+        values: Array,
+        scale: f32,
+        mask: Option<&Array>,
+        stream: &Stream,
+    ) -> Result<Array, eredu_nn::Error> {
+        match self.0 {
+            PipelineLayerCache::KeyValue { cache, .. } => match cache {
+                PipelineKeyValueCache::Standard(cache) => eredu_nn::AttentionCache::attention(
+                    cache, queries, keys, values, scale, mask, stream,
+                ),
+                PipelineKeyValueCache::Paged(cache) => eredu_nn::AttentionCache::attention(
+                    cache, queries, keys, values, scale, mask, stream,
+                ),
+            },
+            _ => Err(eredu_nn::Error::backend(
+                "fixed-state hybrid pipeline layer has no attention cache",
+            )),
         }
     }
 }
@@ -1254,45 +1413,48 @@ impl PipelineExpertStorage {
     }
 }
 
-struct Lfm2Stage {
-    args: lfm2::ModelArgs,
-    layer_adapter: Lfm2LayerwiseAdapter,
+/// Shared pipeline ownership for neutral heterogeneous decoder families.
+/// Family types supply equations, binding, and placement geometry; this shell
+/// owns the common static modules, resident units, residency, and EP state.
+struct NeutralHybridPipelineStage<Args, Adapter, Unit, Geometry> {
+    args: Args,
+    layer_adapter: Adapter,
     range: Range<usize>,
-    embedding: Option<MaybeQuantized<nn::Embedding>>,
-    output_embedding: Option<MaybeQuantized<nn::Embedding>>,
-    layers: Vec<lfm2::DecoderLayer>,
+    embedding: Option<MlxModule<MlxEmbedding>>,
+    output_embedding: Option<MlxModule<MlxEmbedding>>,
+    layers: Vec<MlxModule<Unit>>,
+    prediction_layers: Vec<Vec<MlxModule<Unit>>>,
     dense_layers: Option<PipelineLayerStorage>,
-    norm: Option<nn::RmsNorm>,
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
-    parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
-    parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
-    parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
+    norm: Option<MlxModule<MlxRmsNorm>>,
+    lm_head: Option<MlxModule<MlxLinear>>,
+    parallel_embedding: Option<
+        MlxModule<MlxNamedModule<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>>,
+    >,
+    parallel_output_embedding: Option<
+        MlxModule<MlxNamedModule<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>>,
+    >,
+    parallel_lm_head:
+        Option<MlxModule<MlxNamedModule<crate::backend::mlx::nn::parallel::VocabParallelLmHead>>>,
     parallel_layout: Option<eredu_runtime::LocalModelLayout>,
-    parallel_cache_geometry: Option<Vec<lfm2::Lfm2LayerCacheGeometry>>,
+    parallel_geometry: Option<Vec<Geometry>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
 }
 
-struct NemotronHStage {
-    args: nemotron_h::ModelArgs,
-    layer_adapter: NemotronHLayerwiseAdapter,
-    range: Range<usize>,
-    embedding: Option<MaybeQuantized<nn::Embedding>>,
-    output_embedding: Option<MaybeQuantized<nn::Embedding>>,
-    layers: Vec<nemotron_h::TransformerBlock>,
-    dense_layers: Option<PipelineLayerStorage>,
-    norm: Option<nn::RmsNorm>,
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
-    parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
-    parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
-    parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
-    parallel_geometry: Option<Vec<nemotron_h::ParallelLayerGeometry>>,
-    expert_assignment: Option<ExpertAssignment>,
-    expert_storage: PipelineExpertStorage,
-    routing_statistics: RoutingStatistics,
-}
+type Lfm2Stage = NeutralHybridPipelineStage<
+    eredu_architectures::lfm2::ModelArgs,
+    Lfm2PipelineAdapter,
+    eredu_architectures::lfm2::Block<MlxBackend>,
+    eredu_architectures::lfm2::LayerCacheGeometry,
+>;
+
+type NemotronHStage = NeutralHybridPipelineStage<
+    eredu_architectures::nemotron_h::ModelArgs,
+    NemotronHPipelineAdapter,
+    eredu_architectures::nemotron_h::Unit<MlxBackend>,
+    eredu_architectures::nemotron_h::LayerGeometry,
+>;
 
 struct QwenHybridStage {
     args: qwen_hybrid::ModelArgs,
@@ -1318,24 +1480,37 @@ struct QwenHybridStage {
     routing_statistics: RoutingStatistics,
 }
 
-struct KimiLinearStage {
-    args: kimi_linear::ModelArgs,
-    layer_adapter: KimiLinearLayerwiseAdapter,
-    range: Range<usize>,
-    embedding: Option<MaybeQuantized<nn::Embedding>>,
-    output_embedding: Option<MaybeQuantized<nn::Embedding>>,
-    layers: Vec<kimi_linear::DecoderLayer>,
-    dense_layers: Option<PipelineLayerStorage>,
-    norm: Option<nn::RmsNorm>,
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
-    parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
-    parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
-    parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
-    parallel_cache_geometry: Option<Vec<kimi_linear::KimiLayerCacheGeometry>>,
-    expert_assignment: Option<ExpertAssignment>,
-    expert_storage: PipelineExpertStorage,
-    routing_statistics: RoutingStatistics,
+type KimiLinearStage = NeutralHybridPipelineStage<
+    eredu_architectures::kimi_linear::ModelArgs,
+    KimiLinearPipelineAdapter,
+    eredu_architectures::kimi_linear::Block<MlxBackend>,
+    eredu_architectures::kimi_linear::LayerCacheGeometry,
+>;
+
+fn named_pipeline_parallel_embedding(
+    module: crate::backend::mlx::nn::parallel::VocabParallelEmbedding,
+    weight: &str,
+) -> Result<
+    MlxModule<MlxNamedModule<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>>,
+    Error,
+> {
+    let weight =
+        ParameterSpec::trainable(weight).map_err(|error| Error::Parallel(error.to_string()))?;
+    MlxNamedModule::new(module, weight, None)
+        .map(MlxModule::new)
+        .map_err(|error| Error::Parallel(error.to_string()))
+}
+
+fn named_pipeline_parallel_lm_head(
+    module: crate::backend::mlx::nn::parallel::VocabParallelLmHead,
+    weight: &str,
+) -> Result<MlxModule<MlxNamedModule<crate::backend::mlx::nn::parallel::VocabParallelLmHead>>, Error>
+{
+    let weight =
+        ParameterSpec::trainable(weight).map_err(|error| Error::Parallel(error.to_string()))?;
+    MlxNamedModule::new(module, weight, None)
+        .map(MlxModule::new)
+        .map_err(|error| Error::Parallel(error.to_string()))
 }
 
 struct InklingStage {
@@ -1420,6 +1595,7 @@ trait PipelineStageAdapter {
     ) -> Result<PipelinePayload, Error>;
 
     fn embedded_mtp_len(&self) -> usize;
+    fn embedded_mtp_state_start(&self) -> Option<usize>;
     fn new_embedded_mtp_cache(
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
@@ -1581,6 +1757,9 @@ trait PipelineStageSemantics {
     }
     fn embedded_mtp_len(&self) -> usize {
         0
+    }
+    fn embedded_mtp_state_start(&self) -> Option<usize> {
+        None
     }
     fn new_embedded_mtp_cache(
         &self,
@@ -1809,6 +1988,10 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
 
     fn embedded_mtp_len(&self) -> usize {
         self.0.embedded_mtp_len()
+    }
+
+    fn embedded_mtp_state_start(&self) -> Option<usize> {
+        self.0.embedded_mtp_state_start()
     }
 
     fn new_embedded_mtp_cache(
@@ -2842,6 +3025,7 @@ impl PipelineStageSemantics for NeutralDeepSeekV3Stage {
     fn embedded_mtp_len(&self) -> usize {
         self.args.num_nextn_predict_layers as usize
     }
+
     fn new_embedded_mtp_cache(
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
@@ -5453,7 +5637,7 @@ impl PipelineStageSemantics for Lfm2Stage {
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let replicated_geometry;
-        let geometry = match &self.parallel_cache_geometry {
+        let geometry = match &self.parallel_geometry {
             Some(geometry) => geometry,
             None => {
                 replicated_geometry = self
@@ -5461,23 +5645,29 @@ impl PipelineStageSemantics for Lfm2Stage {
                     .layer_schedule
                     .iter()
                     .map(|policy| match policy.operator {
-                        lfm2::OperatorPolicy::CausalConvolution => lfm2::Lfm2LayerCacheGeometry {
-                            kv_heads: None,
-                            convolution_channels: Some(self.args.hidden_size),
-                        },
-                        lfm2::OperatorPolicy::SelfAttention(_) => lfm2::Lfm2LayerCacheGeometry {
-                            kv_heads: Some(self.args.num_key_value_heads),
-                            convolution_channels: None,
-                        },
+                        eredu_architectures::lfm2::OperatorPolicy::CausalConvolution => {
+                            eredu_architectures::lfm2::LayerCacheGeometry {
+                                kv_heads: None,
+                                convolution_channels: Some(self.args.hidden_size),
+                            }
+                        }
+                        eredu_architectures::lfm2::OperatorPolicy::SelfAttention(_) => {
+                            eredu_architectures::lfm2::LayerCacheGeometry {
+                                kv_heads: Some(self.args.num_key_value_heads),
+                                convolution_channels: None,
+                            }
+                        }
                     })
                     .collect::<Vec<_>>();
                 &replicated_geometry
             }
         };
-        let complete = lfm2::prompt_cache_layer_layout_with_geometry(&self.args, geometry)?;
+        let complete = eredu_architectures::lfm2::state_layout_with_geometry(&self.args, geometry)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let layout = crate::LayerSchedule::new(
             self.range.len(),
             complete
+                .layers()
                 .iter()
                 .skip(self.range.start)
                 .take(self.range.len())
@@ -5489,7 +5679,7 @@ impl PipelineStageSemantics for Lfm2Stage {
             topology,
             "lfm2",
             &self.args.model_type,
-            lfm2::prompt_cache_architecture_fingerprint(&self.args),
+            eredu_architectures::lfm2::prompt_cache_architecture_fingerprint(&self.args),
             self.args.layer_schedule.len(),
             self.range.clone(),
             layout,
@@ -5564,16 +5754,62 @@ impl PipelineStageSemantics for NemotronHStage {
     }
 
     fn embedded_mtp_len(&self) -> usize {
-        self.layer_adapter.embedded_mtp_len()
+        self.args.num_nextn_predict_layers as usize
+    }
+
+    fn embedded_mtp_state_start(&self) -> Option<usize> {
+        Some(self.args.num_hidden_layers as usize)
     }
 
     fn new_embedded_mtp_cache(
         &self,
-        _paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
-        Ok(PipelineMtpCache::NemotronH(
-            self.layer_adapter.embedded_mtp_cache(),
-        ))
+        let layout = match &self.parallel_geometry {
+            Some(geometry) => {
+                eredu_architectures::nemotron_h::state_layout_with_geometry(&self.args, geometry)
+            }
+            None => eredu_architectures::nemotron_h::state_layout(&self.args),
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let state = match paged {
+            Some((manager, rank)) => MlxHybridState::paged(layout, manager, rank)?,
+            None => MlxHybridState::device(layout)?,
+        };
+        Ok(PipelineMtpCache::Hybrid(state))
+    }
+
+    fn new_cache_layers(
+        &self,
+        identity: &PromptCacheModelIdentity,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<Vec<PipelineLayerCache>, Error> {
+        // The final rank owns appended prediction state in its persisted
+        // identity, but ordinary pipeline execution addresses target units
+        // only; prediction groups use the transactional hybrid cache below.
+        let target_owned = self.range.len();
+        let mut target_identity = identity.clone();
+        target_identity.global_layer_end = target_identity
+            .global_layer_start
+            .checked_add(target_owned)
+            .ok_or_else(|| Error::Parallel("pipeline target cache range overflowed".into()))?;
+        target_identity.layer_layout = crate::LayerSchedule::new(
+            target_owned,
+            identity
+                .layer_layout
+                .iter()
+                .take(target_owned)
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        target_identity.layer_prefix_offsets = identity
+            .layer_prefix_offsets
+            .iter()
+            .take(target_owned)
+            .copied()
+            .collect();
+        materialize_pipeline_cache_layers(&target_identity, paged)
     }
 
     fn forward_embedded_mtp_draft(
@@ -5586,16 +5822,24 @@ impl PipelineStageSemantics for NemotronHStage {
         expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let PipelineMtpCache::NemotronH(cache) = cache else {
+        let PipelineMtpCache::Hybrid(cache) = cache else {
             return Err(Error::Parallel(
                 "Nemotron-H pipeline MTP cache mismatch".into(),
             ));
         };
-        if let Some(expert_cache) = self.expert_storage.cache() {
-            let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+        if matches!(self.expert_storage, PipelineExpertStorage::External(_)) {
+            let assignment = self.expert_assignment.clone().ok_or_else(|| {
                 Error::Parallel("Nemotron-H pipeline MTP expert cache has no assignment".into())
             })?;
+            let storage = std::mem::replace(
+                &mut self.expert_storage,
+                PipelineExpertStorage::ExternalEmpty,
+            );
+            let PipelineExpertStorage::External(expert_cache) = storage else {
+                unreachable!("checked external Nemotron-H expert storage")
+            };
             let args = self.args.clone();
+            let mut statistics = std::mem::take(&mut self.routing_statistics);
             let mut execute =
                 |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
                     execute_pipeline_cached_nemotron_h(
@@ -5605,37 +5849,35 @@ impl PipelineStageSemantics for NemotronHStage {
                         ids,
                         weights,
                         ExpertPass::Decode,
-                        expert_cache,
-                        assignment,
+                        expert_cache.as_ref(),
+                        &assignment,
                         expert_group,
-                        &mut self.routing_statistics,
+                        &mut statistics,
                         stream,
                     )
                     .map_err(|error| Exception::custom(error.to_string()))
                 };
-            return self
-                .layer_adapter
-                .forward_pipeline_mtp(
-                    hidden,
-                    tokens,
-                    depth,
-                    cache,
-                    execution,
-                    Some(&mut execute),
-                    stream,
-                )
-                .map_err(Into::into);
+            let result = self.forward_mtp_draft_neutral(
+                hidden,
+                tokens,
+                depth,
+                cache,
+                execution,
+                Some(&mut execute),
+                stream,
+            );
+            self.routing_statistics = statistics;
+            self.expert_storage = PipelineExpertStorage::External(expert_cache);
+            return result;
         }
-        if expert_group.is_some() {
+        if expert_group.is_some() && self.mtp_depth_has_sparse(depth)? {
             return Err(Error::Parallel(
                 "Nemotron-H pipeline MTP with EP requires rank-owned expert residency".into(),
             ));
         }
-        self.layer_adapter
-            .forward_pipeline_mtp::<
+        self.forward_mtp_draft_neutral::<
                 fn(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
             >(hidden, tokens, depth, cache, execution, None, stream)
-            .map_err(Into::into)
     }
 
     fn prompt_cache_model_identity(
@@ -5644,30 +5886,45 @@ impl PipelineStageSemantics for NemotronHStage {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let complete = match &self.parallel_geometry {
             Some(geometry) => {
-                nemotron_h::prompt_cache_layer_layout_with_geometry(&self.args, geometry)?
+                eredu_architectures::nemotron_h::state_layout_with_geometry(&self.args, geometry)
             }
-            None => nemotron_h::prompt_cache_layer_layout(&self.args)?,
-        };
-        let layout = crate::LayerSchedule::new(
-            self.range.len(),
-            complete
-                .iter()
-                .skip(self.range.start)
-                .take(self.range.len())
-                .cloned()
-                .collect(),
-        )
+            None => eredu_architectures::nemotron_h::state_layout(&self.args),
+        }
         .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
+        let target = usize::try_from(self.args.num_hidden_layers)
+            .map_err(|_| Error::Parallel("invalid Nemotron-H layer count".into()))?;
+        let owns_prediction_groups = self.range.end == target;
+        let mut policies = complete
+            .layers()
+            .iter()
+            .skip(self.range.start)
+            .take(self.range.len())
+            .cloned()
+            .collect::<Vec<_>>();
+        if owns_prediction_groups {
+            policies.extend(complete.layers().iter().skip(target).cloned());
+        }
+        let layout = crate::LayerSchedule::new(policies.len(), policies)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let total = complete.len();
+        let owned_end = if owns_prediction_groups {
+            total
+        } else {
+            self.range.end
+        };
+        let mut identity = pipeline_prompt_cache_identity(
             topology,
             "nemotron_h",
             &self.args.model_type,
-            nemotron_h::prompt_cache_architecture_fingerprint(&self.args),
-            usize::try_from(self.args.num_hidden_layers)
-                .map_err(|_| Error::Parallel("invalid Nemotron-H layer count".into()))?,
-            self.range.clone(),
+            eredu_architectures::nemotron_h::prompt_cache_architecture_fingerprint(&self.args),
+            total,
+            self.range.start..owned_end,
             layout,
-        ))
+        );
+        if owns_prediction_groups {
+            identity.layer_prefix_offsets[self.range.len()..].fill(-1);
+        }
+        Ok(identity)
     }
 
     fn forward(
@@ -6053,15 +6310,18 @@ impl PipelineStageSemantics for KimiLinearStage {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let complete = match &self.parallel_cache_geometry {
+        let complete = match &self.parallel_geometry {
             Some(geometry) => {
-                kimi_linear::prompt_cache_layer_layout_with_geometry(&self.args, geometry)?
+                eredu_architectures::kimi_linear::state_layout_with_geometry(&self.args, geometry)
             }
-            None => kimi_linear::prompt_cache_layer_layout(&self.args)?,
+            None => eredu_architectures::kimi_linear::state_layout(&self.args),
         };
+        let complete =
+            complete.map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let layout = crate::LayerSchedule::new(
             self.range.len(),
             complete
+                .layers()
                 .iter()
                 .skip(self.range.start)
                 .take(self.range.len())
@@ -6073,7 +6333,7 @@ impl PipelineStageSemantics for KimiLinearStage {
             topology,
             "kimi_linear",
             &self.args.model_type,
-            kimi_linear::prompt_cache_architecture_fingerprint(&self.args),
+            eredu_architectures::kimi_linear::prompt_cache_architecture_fingerprint(&self.args),
             self.args.num_hidden_layers as usize,
             self.range.clone(),
             layout,
@@ -6778,6 +7038,20 @@ impl PipelineModel {
                 }
             }
         }
+        if let (PipelineMtpCache::Hybrid(mtp), Some(start)) =
+            (&mut cache.mtp, self.stage.embedded_mtp_state_start())
+        {
+            let target_owned = cache.layers.len();
+            let offsets = identity
+                .layer_prefix_offsets
+                .get(target_owned..)
+                .ok_or_else(|| Error::Parallel("pipeline MTP prompt offsets are missing".into()))?;
+            state_arrays.extend(mtp.prompt_cache_state_arrays_range(
+                start..start + offsets.len(),
+                expected_offset,
+                offsets,
+            )?);
+        }
         manager
             .ok_or_else(|| {
                 Error::Parallel("pipeline prompt persistence requires a paged cache".into())
@@ -6870,11 +7144,6 @@ impl PipelineModel {
                 }
             }
         }
-        if !restored_state.is_empty() {
-            return Err(Error::Parallel(
-                "persisted pipeline cache contains unexpected fixed state".into(),
-            ));
-        }
         let mut cache =
             PipelineCache::with_residency_manager(self.info.model_kind, layers, manager.clone());
         if self.info.is_last {
@@ -6886,6 +7155,28 @@ impl PipelineModel {
                     .then_some(self.topology.expert_parallel_rank),
             });
             cache.mtp = self.stage.new_embedded_mtp_cache(Some((manager, rank)))?;
+            if let (PipelineMtpCache::Hybrid(mtp), Some(start)) =
+                (&mut cache.mtp, self.stage.embedded_mtp_state_start())
+            {
+                let target_owned = cache.layers.len();
+                let offsets = identity
+                    .layer_prefix_offsets
+                    .get(target_owned..)
+                    .ok_or_else(|| {
+                        Error::Parallel("pipeline MTP prompt offsets are missing".into())
+                    })?;
+                mtp.restore_prompt_cache_state_range(
+                    &mut restored_state,
+                    start..start + offsets.len(),
+                    offset,
+                    offsets,
+                )?;
+            }
+        }
+        if !restored_state.is_empty() {
+            return Err(Error::Parallel(
+                "persisted pipeline cache contains unexpected fixed state".into(),
+            ));
         }
         Ok((cache, manifest))
     }
@@ -8097,7 +8388,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
             .hidden
             .try_index_device((.., ..sequence - 1, ..), stream)?;
         let next = tokens.try_index_device((.., 1..), stream)?;
-        let mut draft = cache.mtp.clone();
+        let mut draft = self.draft_cache(cache);
         for depth in 0..self.max_draft_tokens() {
             let _ = self.forward_draft(&hidden, &next, depth, &mut draft, stream)?;
         }
@@ -8105,7 +8396,7 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
         Ok(())
     }
 
-    fn draft_cache(cache: &Self::Cache) -> Self::DraftCache {
+    fn draft_cache(&self, cache: &Self::Cache) -> Self::DraftCache {
         match &cache.mtp {
             PipelineMtpCache::NeutralDeepSeekV4(caches) => PipelineMtpCache::NeutralDeepSeekV4(
                 caches
@@ -8114,12 +8405,30 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
                     .collect::<Result<Vec<_>, _>>()
                     .expect("evaluated neutral V4 MTP cache must be forkable"),
             ),
+            PipelineMtpCache::Hybrid(state) => PipelineMtpCache::Hybrid(
+                state
+                    .deep_clone_state()
+                    .expect("evaluated hybrid MTP cache must be forkable"),
+            ),
             cache => cache.clone(),
         }
     }
 
-    fn commit_draft_cache(cache: &mut Self::Cache, draft: &Self::DraftCache) {
-        cache.mtp.clone_from(draft);
+    fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
+        match (
+            &mut cache.mtp,
+            draft,
+            self.model.stage.embedded_mtp_state_start(),
+        ) {
+            (
+                PipelineMtpCache::Hybrid(canonical),
+                PipelineMtpCache::Hybrid(source),
+                Some(start),
+            ) => canonical
+                .commit_layer_range_from(source, start)
+                .expect("validated hybrid MTP draft state layout"),
+            (canonical, source, _) => canonical.clone_from(source),
+        }
     }
 
     fn draft_logits(
@@ -9662,17 +9971,14 @@ pub(crate) fn load_pipeline_model_with_options(
             }
             architecture @ (crate::core::GgufArchitecture::Lfm2
             | crate::core::GgufArchitecture::Lfm2Moe) => {
-                let prepared =
-                    lfm2::prepare_gguf_checkpoint(&checkpoint, &metadata, weights_stream)?;
+                let prepared = crate::composition::lfm2::prepare_gguf(&checkpoint, &metadata)?;
                 let is_moe = architecture == crate::core::GgufArchitecture::Lfm2Moe;
-                let gguf_plan = crate::composition::mlx_architectures::lfm2::checkpoint::gguf_plan(
-                    &prepared.args,
-                )
-                .map_err(Error::UnsupportedArchitecture)?;
+                let gguf_plan = eredu_architectures::lfm2::gguf_plan(&prepared.args)
+                    .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
-                    move |name| lfm2::translate_gguf_weight_name(name, is_moe),
+                    move |name| eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe),
                     max_mapped_shards,
                 )?);
                 load_lfm2_pipeline(
@@ -9688,20 +9994,14 @@ pub(crate) fn load_pipeline_model_with_options(
             }
             architecture @ (crate::core::GgufArchitecture::NemotronH
             | crate::core::GgufArchitecture::NemotronHMoe) => {
-                let prepared = nemotron_h::prepare_nemotron_h_gguf_checkpoint(
-                    &checkpoint,
-                    &metadata,
-                    weights_stream,
-                )?;
-                let gguf_plan =
-                    crate::composition::mlx_architectures::nemotron_h::checkpoint::gguf_plan(
-                        &prepared.args,
-                    )
+                let prepared =
+                    crate::composition::nemotron_h::prepare_gguf(&checkpoint, &metadata)?;
+                let gguf_plan = eredu_architectures::nemotron_h::gguf_plan(&prepared.args)
                     .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
-                    nemotron_h::translate_gguf_weight_name,
+                    eredu_architectures::nemotron_h::translate_gguf_weight_name,
                     max_mapped_shards,
                 )?);
                 let _ = architecture;
@@ -9762,21 +10062,14 @@ pub(crate) fn load_pipeline_model_with_options(
                 )
             }
             crate::core::GgufArchitecture::KimiLinear => {
-                let prepared = kimi_linear::prepare_gguf_checkpoint(
-                    &checkpoint,
-                    &metadata,
-                    options.quantization,
-                    weights_stream,
-                )?;
-                let gguf_plan =
-                    crate::composition::mlx_architectures::kimi_linear::checkpoint::gguf_plan(
-                        &prepared.args,
-                    )
+                let prepared =
+                    crate::composition::kimi_linear::prepare_gguf(&checkpoint, &metadata)?;
+                let gguf_plan = eredu_architectures::kimi_linear::gguf_plan(&prepared.args)
                     .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
-                    kimi_linear::translate_gguf_weight_name,
+                    eredu_architectures::kimi_linear::translate_gguf_weight_name,
                     max_mapped_shards,
                 )?);
                 load_kimi_linear_pipeline(
@@ -10085,7 +10378,7 @@ pub(crate) fn load_pipeline_model_with_options(
         }
         Some("lfm2" | "lfm2_moe") => {
             load_lfm2_pipeline(
-                lfm2::get_model_args(model_dir)?,
+                crate::composition::lfm2::load_model_args(model_dir)?,
                 store,
                 topology,
                 options.quantization,
@@ -10097,7 +10390,7 @@ pub(crate) fn load_pipeline_model_with_options(
         }
         Some("nemotron_h") => {
             load_nemotron_h_pipeline(
-                nemotron_h::get_nemotron_h_model_args(model_dir)?,
+                crate::composition::nemotron_h::load_model_args(model_dir)?,
                 store,
                 topology,
                 options.quantization,
@@ -10143,7 +10436,10 @@ pub(crate) fn load_pipeline_model_with_options(
         }
         Some("kimi_linear") => {
             load_kimi_linear_pipeline(
-                kimi_linear::get_model_args(model_dir)?,
+                eredu_architectures::kimi_linear::model_args_from_config_reader(
+                    std::fs::File::open(model_dir.join("config.json"))?,
+                )
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
                 store,
                 topology,
                 options.quantization,
@@ -11101,7 +11397,7 @@ fn load_qwen_pipeline(
                     quantize_on_load,
                     weights_stream,
                     stream,
-                    &|name| name.starts_with("mlp.experts."),
+                    &|name| name.contains("mlp.experts."),
                 )?;
             } else {
                 loaded.load(
@@ -11904,7 +12200,7 @@ fn load_qwen3_vl_pipeline(
                     quantize_on_load,
                     weights_stream,
                     stream,
-                    &|name| name.starts_with("mlp.experts."),
+                    &|name| name.contains("mlp.experts."),
                 )?;
             } else {
                 loaded.load(
@@ -13034,7 +13330,7 @@ fn execute_pipeline_cached_neutral_deepseek(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_lfm2(
-    args: &lfm2::ModelArgs,
+    args: &eredu_architectures::lfm2::ModelArgs,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -13092,7 +13388,7 @@ fn execute_pipeline_cached_qwen_hybrid(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_kimi_linear(
-    args: &kimi_linear::ModelArgs,
+    args: &eredu_architectures::kimi_linear::ModelArgs,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -13150,7 +13446,7 @@ fn execute_pipeline_cached_inkling(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_nemotron_h(
-    args: &nemotron_h::ModelArgs,
+    args: &eredu_architectures::nemotron_h::ModelArgs,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -13234,6 +13530,8 @@ fn load_gpt_oss_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    let expert_cache_options = expert_cache_options
+        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
     let binding_adapter = if expert_cache_options.is_some() {
         crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new_external_experts(
             source_args.clone(),
@@ -13477,7 +13775,7 @@ fn load_gpt_oss_pipeline(
                     quantize_on_load,
                     weights_stream,
                     stream,
-                    &|name| name.starts_with("mlp.experts."),
+                    &|name| name.contains("mlp.experts."),
                 )?;
             } else {
                 loaded.load(
@@ -14191,7 +14489,7 @@ impl GptOssStage {
 
 #[allow(clippy::too_many_arguments)]
 fn load_lfm2_pipeline(
-    source_args: lfm2::ModelArgs,
+    source_args: eredu_architectures::lfm2::ModelArgs,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -14200,10 +14498,12 @@ fn load_lfm2_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    let expert_cache_options = expert_cache_options
+        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
     let binding_adapter = if expert_cache_options.is_some() {
-        Lfm2LayerwiseAdapter::new_external_experts(source_args.clone(), stream)?
+        Lfm2PipelineAdapter::new_external_experts(source_args.clone(), stream)?
     } else {
-        Lfm2LayerwiseAdapter::new(source_args.clone(), stream)?
+        Lfm2PipelineAdapter::new(source_args.clone(), stream)?
     };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
@@ -14230,9 +14530,9 @@ fn load_lfm2_pipeline(
     }
     let expert_quantization = quantize_on_load;
     let target_binding_adapter = if expert_cache_options.is_some() {
-        Lfm2LayerwiseAdapter::new_external_experts(target_args.clone(), stream)?
+        Lfm2PipelineAdapter::new_external_experts(target_args.clone(), stream)?
     } else {
-        Lfm2LayerwiseAdapter::new(target_args.clone(), stream)?
+        Lfm2PipelineAdapter::new(target_args.clone(), stream)?
     };
     let range = topology.layer_range(source_args.layer_schedule.len())?;
     let mut info = base_info(
@@ -14253,10 +14553,9 @@ fn load_lfm2_pipeline(
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
         if stage.range.clone().any(|layer| {
-            source_args
-                .layer_schedule
-                .get(layer)
-                .is_some_and(|policy| policy.feed_forward == lfm2::FeedForwardPolicy::SparseMoe)
+            source_args.layer_schedule.get(layer).is_some_and(|policy| {
+                policy.feed_forward == eredu_architectures::lfm2::FeedForwardPolicy::SparseMoe
+            })
         }) {
             info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
         }
@@ -14269,33 +14568,34 @@ fn load_lfm2_pipeline(
         let head_dim = source_args.hidden_size / source_args.num_attention_heads;
         let kv_heads = planned_optional_kv_head_layout(
             &layout,
-            source_args
-                .layer_schedule
-                .iter()
-                .map(|policy| matches!(policy.operator, lfm2::OperatorPolicy::SelfAttention(_))),
+            source_args.layer_schedule.iter().map(|policy| {
+                matches!(
+                    policy.operator,
+                    eredu_architectures::lfm2::OperatorPolicy::SelfAttention(_)
+                )
+            }),
             head_dim,
             "model.layers",
         )?;
         let convolution_channels = planned_optional_partition_widths(
             &layout,
-            source_args
-                .layer_schedule
-                .iter()
-                .map(|policy| policy.operator == lfm2::OperatorPolicy::CausalConvolution),
+            source_args.layer_schedule.iter().map(|policy| {
+                policy.operator == eredu_architectures::lfm2::OperatorPolicy::CausalConvolution
+            }),
             1,
             "model.layers",
             "conv.conv",
         )?;
-        stage.parallel_cache_geometry = Some(
+        stage.parallel_geometry = Some(
             kv_heads
                 .into_iter()
                 .zip(convolution_channels)
-                .map(
-                    |(kv_heads, convolution_channels)| lfm2::Lfm2LayerCacheGeometry {
+                .map(|(kv_heads, convolution_channels)| {
+                    eredu_architectures::lfm2::LayerCacheGeometry {
                         kv_heads,
                         convolution_channels,
-                    },
-                )
+                    }
+                })
                 .collect(),
         );
         stage.parallel_embedding = info
@@ -14308,6 +14608,9 @@ fn load_lfm2_pipeline(
                     build,
                     stream,
                 )
+                .and_then(|module| {
+                    named_pipeline_parallel_embedding(module, "model.embed_tokens.weight")
+                })
             })
             .transpose()?;
         stage.parallel_output_embedding =
@@ -14320,6 +14623,9 @@ fn load_lfm2_pipeline(
                         build,
                         stream,
                     )
+                    .and_then(|module| {
+                        named_pipeline_parallel_embedding(module, "model.embed_tokens.weight")
+                    })
                 })
                 .transpose()?;
         stage.parallel_lm_head = (info.is_last && !target_args.tie_word_embeddings)
@@ -14331,6 +14637,7 @@ fn load_lfm2_pipeline(
                     build,
                     stream,
                 )
+                .and_then(|module| named_pipeline_parallel_lm_head(module, "lm_head.weight"))
             })
             .transpose()?;
         stage.embedding = None;
@@ -14402,7 +14709,7 @@ fn load_lfm2_pipeline(
             parallel_layout.as_ref().expect("TP layout"),
         )?;
         loaded.load(
-            module.inner_mut(),
+            module,
             store.as_ref(),
             &bindings,
             quantize_on_load,
@@ -14427,7 +14734,7 @@ fn load_lfm2_pipeline(
             parallel_layout.as_ref().expect("TP layout"),
         )?;
         loaded.load(
-            module.inner_mut(),
+            module,
             store.as_ref(),
             &bindings,
             quantize_on_load,
@@ -14462,7 +14769,7 @@ fn load_lfm2_pipeline(
             parallel_layout.as_ref().expect("TP layout"),
         )?;
         loaded.load(
-            module.inner_mut(),
+            module,
             store.as_ref(),
             &bindings,
             quantize_on_load,
@@ -14498,7 +14805,7 @@ fn load_lfm2_pipeline(
                     quantize_on_load,
                     weights_stream,
                     stream,
-                    &|name| name.starts_with("feed_forward.experts."),
+                    &|name| name.contains("feed_forward.experts."),
                 )?;
             } else {
                 loaded.load(
@@ -14562,18 +14869,15 @@ fn load_lfm2_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if let Some(options) = expert_cache_options {
-        let entries = crate::composition::mlx_architectures::lfm2::layerwise::lfm2_expert_catalog(
-            &source_args,
-            store.as_ref(),
-        )?
-        .into_iter()
-        .filter(|entry| stage.range.contains(&entry.identity().layer))
-        .filter(|entry| {
-            stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+        let entries = crate::composition::lfm2::expert_catalog(&source_args, store.as_ref())?
+            .into_iter()
+            .filter(|entry| stage.range.contains(&entry.identity().layer))
+            .filter(|entry| {
+                stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>();
         if !entries.is_empty() {
             let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
@@ -14599,24 +14903,24 @@ fn load_lfm2_pipeline(
 
 impl Lfm2Stage {
     fn new(
-        args: lfm2::ModelArgs,
+        args: eredu_architectures::lfm2::ModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
         external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
         let layer_adapter = if external_experts {
-            Lfm2LayerwiseAdapter::new_external_experts(args.clone(), stream)?
+            Lfm2PipelineAdapter::new_external_experts(args.clone(), stream)?
         } else {
-            Lfm2LayerwiseAdapter::new(args.clone(), stream)?
+            Lfm2PipelineAdapter::new(args.clone(), stream)?
         };
-        let complete = lfm2::Model::new(args.clone(), stream)?;
-        let lfm2::Model { model, lm_head, .. } = complete;
-        let lfm2::Lfm2Model {
-            embed_tokens,
-            layers,
-            embedding_norm,
-        } = model;
+        let architecture =
+            eredu_architectures::lfm2::LayeredModel::<MlxBackend>::new(args.clone(), stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let static_modules = architecture.static_modules().clone();
+        let embed_tokens = MlxModule::new(static_modules.embeddings);
+        let embedding_norm = MlxModule::new(static_modules.norm);
+        let lm_head = static_modules.lm_head.map(MlxModule::new);
         let mut embedding = None;
         let mut output_embedding = None;
         if info.is_first {
@@ -14624,11 +14928,10 @@ impl Lfm2Stage {
         } else if info.is_last && args.tie_word_embeddings {
             output_embedding = Some(embed_tokens);
         }
-        let layers = layers
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, layer)| range.contains(&index).then_some(layer))
-            .collect();
+        let layers = range
+            .clone()
+            .map(|index| layer_adapter.new_layer(0, index, stream))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             args,
             layer_adapter,
@@ -14636,6 +14939,7 @@ impl Lfm2Stage {
             embedding,
             output_embedding,
             layers,
+            prediction_layers: Vec::new(),
             dense_layers: None,
             norm: info.is_last.then_some(embedding_norm),
             lm_head: info.is_last.then_some(lm_head).flatten(),
@@ -14643,7 +14947,7 @@ impl Lfm2Stage {
             parallel_output_embedding: None,
             parallel_lm_head: None,
             parallel_layout: None,
-            parallel_cache_geometry: None,
+            parallel_geometry: None,
             expert_assignment: None,
             expert_storage: if external_experts {
                 PipelineExpertStorage::ExternalEmpty
@@ -14655,77 +14959,22 @@ impl Lfm2Stage {
     }
 
     fn forward_layer(
-        layer: &mut lfm2::DecoderLayer,
+        layer: &mut MlxModule<eredu_architectures::lfm2::Block<MlxBackend>>,
         global_layer: usize,
         hidden: &Array,
         mask: Option<&Array>,
         cache: &mut PipelineLayerCache,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        match (layer.layer_policy.operator, cache) {
-            (
-                lfm2::OperatorPolicy::SelfAttention(_),
-                PipelineLayerCache::KeyValue {
-                    global_layer: cached,
-                    cache,
-                    slots,
-                },
-            ) if *cached == global_layer && slots.is_empty() => {
-                let cache: &mut dyn KeyValueCache = match cache {
-                    PipelineKeyValueCache::Standard(cache) => cache,
-                    PipelineKeyValueCache::Paged(cache) => cache,
-                };
-                layer
-                    .forward_with_operator_cache(
-                        hidden,
-                        mask,
-                        Some(lfm2::OperatorCache::Attention(cache)),
-                        stream,
-                    )
-                    .map_err(Into::into)
-            }
-            (
-                lfm2::OperatorPolicy::CausalConvolution,
-                PipelineLayerCache::StateSlots {
-                    global_layer: cached,
-                    slots,
-                },
-            ) if *cached == global_layer && slots.is_empty() => layer
-                .forward_with_operator_cache(hidden, mask, None, stream)
-                .map_err(Into::into),
-            (
-                lfm2::OperatorPolicy::CausalConvolution,
-                PipelineLayerCache::StateSlots {
-                    global_layer: cached,
-                    slots,
-                },
-            ) if *cached == global_layer
-                && slots.len() == 1
-                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 }) =>
-            {
-                let slot = &mut slots[0];
-                let mut local = crate::backend::mlx::nn::convolution::CausalConv1dCache {
-                    state: slot.value.take(),
-                    offset: slot.offset,
-                };
-                let output = layer.forward_with_operator_cache(
-                    hidden,
-                    mask,
-                    Some(lfm2::OperatorCache::Convolution(&mut local)),
-                    stream,
-                )?;
-                slot.value = local.state;
-                slot.offset = local.offset;
-                Ok(output)
-            }
-            _ => Err(Error::Parallel(format!(
-                "LFM2 pipeline cache does not match global layer {global_layer}"
-            ))),
-        }
+        validate_pipeline_hybrid_cache_layer(cache, global_layer)?;
+        let mut state = PipelineHybridLayerState(cache);
+        layer
+            .forward(hidden, mask, &mut state, stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 
     fn forward_layer_tensor_parallel(
-        layer: &mut lfm2::DecoderLayer,
+        layer: &mut MlxModule<eredu_architectures::lfm2::Block<MlxBackend>>,
         global_layer: usize,
         hidden: &Array,
         mask: Option<&Array>,
@@ -14733,208 +14982,52 @@ impl Lfm2Stage {
         group: &Group,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        match cache {
-            PipelineLayerCache::KeyValue {
-                global_layer: cached,
-                cache,
-                slots,
-            } if *cached == global_layer && slots.is_empty() => {
-                let cache: &mut dyn KeyValueCache = match cache {
-                    PipelineKeyValueCache::Standard(cache) => cache,
-                    PipelineKeyValueCache::Paged(cache) => cache,
-                };
-                Ok(layer.forward_tensor_parallel_with_operator_cache(
-                    hidden,
-                    mask,
-                    Some(lfm2::OperatorCache::Attention(cache)),
-                    group,
-                    stream,
-                )?)
-            }
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            } if *cached == global_layer && slots.is_empty() => Ok(layer
-                .forward_tensor_parallel_with_operator_cache(hidden, mask, None, group, stream)?),
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            } if *cached == global_layer
-                && slots.len() == 1
-                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 }) =>
-            {
-                let slot = &mut slots[0];
-                let mut local = crate::backend::mlx::nn::convolution::CausalConv1dCache {
-                    state: slot.value.take(),
-                    offset: slot.offset,
-                };
-                let output = layer.forward_tensor_parallel_with_operator_cache(
-                    hidden,
-                    mask,
-                    Some(lfm2::OperatorCache::Convolution(&mut local)),
-                    group,
-                    stream,
-                )?;
-                slot.value = local.state;
-                slot.offset = local.offset;
-                Ok(output)
-            }
-            _ => Err(Error::Parallel(format!(
-                "LFM2 TP+PP cache does not match global layer {global_layer}"
-            ))),
-        }
+        validate_pipeline_hybrid_cache_layer(cache, global_layer)?;
+        let mut state = PipelineHybridLayerState(cache);
+        layer
+            .forward_parallel(hidden, mask, &mut state, group, stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn forward_layer_expert_parallel(
-        layer: &mut lfm2::DecoderLayer,
-        global_layer: usize,
-        hidden: &Array,
-        mask: Option<&Array>,
-        cache: &mut PipelineLayerCache,
-        assignment: &ExpertAssignment,
-        group: &Group,
-        statistics: &mut RoutingStatistics,
-        stream: &Stream,
+        _layer: &mut MlxModule<eredu_architectures::lfm2::Block<MlxBackend>>,
+        _global_layer: usize,
+        _hidden: &Array,
+        _mask: Option<&Array>,
+        _cache: &mut PipelineLayerCache,
+        _assignment: &ExpertAssignment,
+        _group: &Group,
+        _statistics: &mut RoutingStatistics,
+        _stream: &Stream,
     ) -> Result<Array, Error> {
-        match cache {
-            PipelineLayerCache::KeyValue {
-                global_layer: cached,
-                cache,
-                slots,
-            } if *cached == global_layer && slots.is_empty() => {
-                let cache: &mut dyn KeyValueCache = match cache {
-                    PipelineKeyValueCache::Standard(cache) => cache,
-                    PipelineKeyValueCache::Paged(cache) => cache,
-                };
-                Ok(layer.forward_expert_parallel_with_operator_cache(
-                    hidden,
-                    mask,
-                    Some(lfm2::OperatorCache::Attention(cache)),
-                    assignment,
-                    group,
-                    statistics,
-                    stream,
-                )?)
-            }
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            } if *cached == global_layer && slots.is_empty() => Ok(layer
-                .forward_expert_parallel_with_operator_cache(
-                    hidden, mask, None, assignment, group, statistics, stream,
-                )?),
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            } if *cached == global_layer
-                && slots.len() == 1
-                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 }) =>
-            {
-                let slot = &mut slots[0];
-                let mut local = crate::backend::mlx::nn::convolution::CausalConv1dCache {
-                    state: slot.value.take(),
-                    offset: slot.offset,
-                };
-                let output = layer.forward_expert_parallel_with_operator_cache(
-                    hidden,
-                    mask,
-                    Some(lfm2::OperatorCache::Convolution(&mut local)),
-                    assignment,
-                    group,
-                    statistics,
-                    stream,
-                )?;
-                slot.value = local.state;
-                slot.offset = local.offset;
-                Ok(output)
-            }
-            _ => Err(Error::Parallel(format!(
-                "LFM2 PP+EP cache does not match global layer {global_layer}"
-            ))),
-        }
+        Err(Error::Parallel(
+            "neutral LFM2 pipeline EP requires external expert residency".into(),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn forward_layer_tensor_expert_parallel(
-        layer: &mut lfm2::DecoderLayer,
-        global_layer: usize,
-        hidden: &Array,
-        mask: Option<&Array>,
-        cache: &mut PipelineLayerCache,
-        tensor_group: &Group,
-        assignment: &ExpertAssignment,
-        expert_group: &Group,
-        statistics: &mut RoutingStatistics,
-        stream: &Stream,
+        _layer: &mut MlxModule<eredu_architectures::lfm2::Block<MlxBackend>>,
+        _global_layer: usize,
+        _hidden: &Array,
+        _mask: Option<&Array>,
+        _cache: &mut PipelineLayerCache,
+        _tensor_group: &Group,
+        _assignment: &ExpertAssignment,
+        _expert_group: &Group,
+        _statistics: &mut RoutingStatistics,
+        _stream: &Stream,
     ) -> Result<Array, Error> {
-        let forward = |layer: &mut lfm2::DecoderLayer,
-                       cache: Option<lfm2::OperatorCache<'_>>,
-                       statistics: &mut RoutingStatistics| {
-            layer.forward_tensor_expert_parallel_with_operator_cache(
-                hidden,
-                mask,
-                cache,
-                tensor_group,
-                assignment,
-                expert_group,
-                statistics,
-                stream,
-            )
-        };
-        match cache {
-            PipelineLayerCache::KeyValue {
-                global_layer: cached,
-                cache,
-                slots,
-            } if *cached == global_layer && slots.is_empty() => {
-                let cache: &mut dyn KeyValueCache = match cache {
-                    PipelineKeyValueCache::Standard(cache) => cache,
-                    PipelineKeyValueCache::Paged(cache) => cache,
-                };
-                Ok(forward(
-                    layer,
-                    Some(lfm2::OperatorCache::Attention(cache)),
-                    statistics,
-                )?)
-            }
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            } if *cached == global_layer && slots.is_empty() => {
-                Ok(forward(layer, None, statistics)?)
-            }
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            } if *cached == global_layer
-                && slots.len() == 1
-                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 }) =>
-            {
-                let slot = &mut slots[0];
-                let mut local = crate::backend::mlx::nn::convolution::CausalConv1dCache {
-                    state: slot.value.take(),
-                    offset: slot.offset,
-                };
-                let output = forward(
-                    layer,
-                    Some(lfm2::OperatorCache::Convolution(&mut local)),
-                    statistics,
-                )?;
-                slot.value = local.state;
-                slot.offset = local.offset;
-                Ok(output)
-            }
-            _ => Err(Error::Parallel(format!(
-                "LFM2 TP+PP+EP cache does not match global layer {global_layer}"
-            ))),
-        }
+        Err(Error::Parallel(
+            "neutral LFM2 TP+PP+EP requires external expert residency".into(),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn forward_layer_external_experts(
-        args: &lfm2::ModelArgs,
-        layer: &mut lfm2::DecoderLayer,
+        args: &eredu_architectures::lfm2::ModelArgs,
+        layer: &mut MlxModule<eredu_architectures::lfm2::Block<MlxBackend>>,
         global_layer: usize,
         hidden: &Array,
         mask: Option<&Array>,
@@ -14947,13 +15040,12 @@ impl Lfm2Stage {
         statistics: &mut RoutingStatistics,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let forward = |layer: &mut lfm2::DecoderLayer,
-                       cache: Option<lfm2::OperatorCache<'_>>,
-                       statistics: &mut RoutingStatistics| {
-            let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+        validate_pipeline_hybrid_cache_layer(cache, global_layer)?;
+        let mut execute =
+            |layer_index: usize, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
                 execute_pipeline_cached_lfm2(
                     args,
-                    global_layer,
+                    layer_index,
                     hidden,
                     ids,
                     weights,
@@ -14966,62 +15058,36 @@ impl Lfm2Stage {
                 )
                 .map_err(|error| Exception::custom(error.to_string()))
             };
-            match tensor_group {
-                Some(group) => layer.forward_tensor_with_operator_cache_and_expert_executor(
-                    hidden, mask, cache, group, stream, execute,
-                ),
-                None => layer.forward_with_operator_cache_and_expert_executor(
-                    hidden, mask, cache, stream, execute,
-                ),
-            }
+        let mut provider = ExpertExecutorProvider::new(&mut execute);
+        let mut state = PipelineHybridLayerState(cache);
+        let result = match tensor_group {
+            Some(group) => layer.forward_parallel_with_feed_forward(
+                hidden,
+                mask,
+                &mut state,
+                group,
+                stream,
+                |policy, normalized, group, stream| {
+                    policy.forward_parallel_with_provider(
+                        normalized,
+                        pass,
+                        group,
+                        stream,
+                        &mut provider,
+                    )
+                },
+            ),
+            None => layer.forward_with_feed_forward(
+                hidden,
+                mask,
+                &mut state,
+                stream,
+                |policy, normalized, stream| {
+                    policy.forward_with_provider(normalized, pass, stream, &mut provider)
+                },
+            ),
         };
-        match cache {
-            PipelineLayerCache::KeyValue {
-                global_layer: cached,
-                cache,
-                slots,
-            } if *cached == global_layer && slots.is_empty() => {
-                let cache: &mut dyn KeyValueCache = match cache {
-                    PipelineKeyValueCache::Standard(cache) => cache,
-                    PipelineKeyValueCache::Paged(cache) => cache,
-                };
-                Ok(forward(
-                    layer,
-                    Some(lfm2::OperatorCache::Attention(cache)),
-                    statistics,
-                )?)
-            }
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            } if *cached == global_layer && slots.is_empty() => {
-                Ok(forward(layer, None, statistics)?)
-            }
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            } if *cached == global_layer
-                && slots.len() == 1
-                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 }) =>
-            {
-                let slot = &mut slots[0];
-                let mut local = crate::backend::mlx::nn::convolution::CausalConv1dCache {
-                    state: slot.value.take(),
-                    offset: slot.offset,
-                };
-                let output = forward(
-                    layer,
-                    Some(lfm2::OperatorCache::Convolution(&mut local)),
-                    statistics,
-                )?;
-                slot.value = local.state;
-                slot.offset = local.offset;
-                Ok(output)
-            }
-            _ => Err(Error::Parallel(format!(
-                "LFM2 pipeline external-expert cache does not match global layer {global_layer}"
-            ))),
-        }
+        result.map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 
     fn forward(
@@ -15056,7 +15122,7 @@ impl Lfm2Stage {
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
         let mask = explicit_mask.or(generated_mask.as_ref());
-        let args = &self.args;
+        let layer_adapter = &self.layer_adapter;
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -15067,7 +15133,9 @@ impl Lfm2Stage {
                 hidden,
                 stream,
             },
-            |global_layer, stream| lfm2::DecoderLayer::new(args, global_layer as i32, stream),
+            |global_layer, stream| {
+                layer_adapter.new_cartesian_layer(0, global_layer, None, None, stream)
+            },
             |global_layer, layer, hidden, cache, stream| {
                 Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)
             },
@@ -15075,11 +15143,11 @@ impl Lfm2Stage {
         let output = if let Some(norm) = &mut self.norm {
             hidden = norm.forward(&hidden, stream)?;
             let logits = if let Some(head) = &mut self.lm_head {
-                head.forward(&hidden, stream)?
+                LinearOperator::forward(&mut **head, &hidden, stream)?
             } else {
-                project_logits_maybe_quantized(
-                    &mut self.lm_head,
-                    self.output_embedding
+                EmbeddingOperator::as_linear(
+                    &mut **self
+                        .output_embedding
                         .as_mut()
                         .or(self.embedding.as_mut())
                         .expect("last tied LFM2 stage output embedding"),
@@ -15361,11 +15429,11 @@ impl Lfm2Stage {
         if let Some(norm) = &mut self.norm {
             hidden = norm.forward(&hidden, stream)?;
             let logits = if let Some(head) = &mut self.lm_head {
-                head.forward(&hidden, stream)?
+                LinearOperator::forward(&mut **head, &hidden, stream)?
             } else {
-                project_logits_maybe_quantized(
-                    &mut self.lm_head,
-                    self.output_embedding
+                EmbeddingOperator::as_linear(
+                    &mut **self
+                        .output_embedding
                         .as_mut()
                         .or(self.embedding.as_mut())
                         .expect("last tied LFM2 PP+EP stage output embedding"),
@@ -15706,7 +15774,7 @@ impl GemmaStage {
 
 #[allow(clippy::too_many_arguments)]
 fn load_nemotron_h_pipeline(
-    source_args: nemotron_h::ModelArgs,
+    source_args: eredu_architectures::nemotron_h::ModelArgs,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -15715,11 +15783,14 @@ fn load_nemotron_h_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
-    let mut binding_adapter = if external_experts {
-        NemotronHLayerwiseAdapter::new_external_experts(source_args.clone(), stream)?
+    let explicit_expert_cache = expert_cache_options.is_some();
+    let expert_cache_options = expert_cache_options
+        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
+    let external_experts = expert_cache_options.is_some();
+    let binding_adapter = if external_experts {
+        NemotronHPipelineAdapter::new_external_experts(source_args.clone(), stream)?
     } else {
-        NemotronHLayerwiseAdapter::new(source_args.clone(), stream)?
+        NemotronHPipelineAdapter::new(source_args.clone(), stream)?
     };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
@@ -15728,12 +15799,11 @@ fn load_nemotron_h_pipeline(
             .as_ref()
             .map(ExpertAssignment::global_expert_count),
     )?;
-    let existing = source_args.quantization;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Nemotron-H pipeline",
-                existing,
+                source_args.weight_quantization,
                 requested,
             )
             .map(|required| required.then_some(requested))
@@ -15742,15 +15812,14 @@ fn load_nemotron_h_pipeline(
         .flatten();
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
-        target_args.quantization = Some(quantization);
-        target_args.quantized_weights = None;
+        target_args.weight_quantization = Some(quantization);
         target_args.quantized_weight_configs = None;
     }
     let expert_quantization = quantize_on_load;
-    let mut target_binding_adapter = if external_experts {
-        NemotronHLayerwiseAdapter::new_external_experts(target_args.clone(), stream)?
+    let target_binding_adapter = if external_experts {
+        NemotronHPipelineAdapter::new_external_experts(target_args.clone(), stream)?
     } else {
-        NemotronHLayerwiseAdapter::new(target_args.clone(), stream)?
+        NemotronHPipelineAdapter::new(target_args.clone(), stream)?
     };
     let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
     let mut info = base_info(
@@ -15766,7 +15835,8 @@ fn load_nemotron_h_pipeline(
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
         if stage.range.clone().any(|layer| {
-            source_args.layer_schedule.get(layer) == Some(&nemotron_h::LayerPolicy::SparseMoe)
+            source_args.layer_schedule.get(layer)
+                == Some(&eredu_architectures::nemotron_h::LayerPolicy::SparseMoe)
         }) {
             info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
         }
@@ -15776,12 +15846,10 @@ fn load_nemotron_h_pipeline(
         let mut planner = build.planner();
         binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
         let (_, layout) = planner.finish()?;
-        binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
-        target_binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
-        stage
-            .layer_adapter
-            .configure_cartesian_layout(build, &layout, stream)?;
-        stage.parallel_geometry = stage.layer_adapter.parallel_geometry().map(<[_]>::to_vec);
+        stage.parallel_geometry = Some(
+            eredu_architectures::nemotron_h::local_state_geometry(&source_args, &layout)
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+        );
         stage.parallel_embedding = info
             .is_first
             .then(|| {
@@ -15792,6 +15860,9 @@ fn load_nemotron_h_pipeline(
                     build,
                     stream,
                 )
+                .and_then(|module| {
+                    named_pipeline_parallel_embedding(module, "model.embeddings.weight")
+                })
             })
             .transpose()?;
         stage.parallel_output_embedding =
@@ -15804,6 +15875,9 @@ fn load_nemotron_h_pipeline(
                         build,
                         stream,
                     )
+                    .and_then(|module| {
+                        named_pipeline_parallel_embedding(module, "model.embeddings.weight")
+                    })
                 })
                 .transpose()?;
         stage.parallel_lm_head = (info.is_last && !target_args.tie_word_embeddings)
@@ -15815,6 +15889,7 @@ fn load_nemotron_h_pipeline(
                     build,
                     stream,
                 )
+                .and_then(|module| named_pipeline_parallel_lm_head(module, "lm_head.weight"))
             })
             .transpose()?;
         stage.embedding = None;
@@ -15845,6 +15920,24 @@ fn load_nemotron_h_pipeline(
     } else {
         0
     };
+    if owns_mtp {
+        for group in 1..=stage.args.num_nextn_predict_layers as usize {
+            let count = stage.layer_adapter.layer_count(group)?;
+            stage.prediction_layers.push(
+                (0..count)
+                    .map(|index| {
+                        stage.layer_adapter.new_cartesian_layer(
+                            group,
+                            index,
+                            parallel_layout.as_ref(),
+                            stage.expert_assignment.as_ref(),
+                            stream,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+    }
     let requested = quantize_on_load;
     let static_roles = selected_pipeline_static_roles([
         (
@@ -15852,23 +15945,29 @@ fn load_nemotron_h_pipeline(
             stage.embedding.is_some()
                 || stage.output_embedding.is_some()
                 || stage.parallel_embedding.is_some()
-                || stage.parallel_output_embedding.is_some()
-                || owns_mtp,
+                || stage.parallel_output_embedding.is_some(),
         ),
         ("norm", stage.norm.is_some()),
         (
             "output",
-            stage.lm_head.is_some() || stage.parallel_lm_head.is_some() || owns_mtp,
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
         ),
-        ("mtp", owns_mtp),
     ]);
     let (store, materialization) = match requested {
         Some(quantization) => {
+            let mut selection =
+                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone());
+            if owns_mtp {
+                for group in 1..=stage.args.num_nextn_predict_layers as usize {
+                    selection = selection
+                        .with_layer_group(group, 0..stage.layer_adapter.layer_count(group)?);
+                }
+            }
             let (store, report) = quantize_pipeline_stage_store(
                 store,
                 &binding_adapter,
                 &target_binding_adapter,
-                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                selection,
                 quantization,
                 stream,
             )?;
@@ -15885,43 +15984,6 @@ fn load_nemotron_h_pipeline(
     info.materialization = materialization;
     let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Nemotron-H");
-    if owns_mtp {
-        for role in ["embedding", "output", "mtp"] {
-            if stage.layer_adapter.pipeline_static_mut(role).is_none() {
-                continue;
-            }
-            let bindings = pipeline_cartesian_static_bindings(
-                &static_units,
-                role,
-                store.as_ref(),
-                parallel_layout.as_ref(),
-            )?;
-            let target = stage
-                .layer_adapter
-                .pipeline_static_mut(role)
-                .expect("selected Nemotron-H MTP static target");
-            if external_experts && role == "mtp" {
-                loaded.load_excluding(
-                    target,
-                    store.as_ref(),
-                    &bindings,
-                    requested,
-                    weights_stream,
-                    stream,
-                    &|name| name.contains(".moe.experts."),
-                )?;
-            } else {
-                loaded.load(
-                    target,
-                    store.as_ref(),
-                    &bindings,
-                    requested,
-                    weights_stream,
-                    stream,
-                )?;
-            }
-        }
-    }
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
             pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
@@ -15930,7 +15992,7 @@ fn load_nemotron_h_pipeline(
             parallel_layout.as_ref().expect("TP layout"),
         )?;
         loaded.load(
-            module.inner_mut(),
+            module,
             store.as_ref(),
             &bindings,
             requested,
@@ -15955,7 +16017,7 @@ fn load_nemotron_h_pipeline(
             parallel_layout.as_ref().expect("TP layout"),
         )?;
         loaded.load(
-            module.inner_mut(),
+            module,
             store.as_ref(),
             &bindings,
             requested,
@@ -15990,7 +16052,7 @@ fn load_nemotron_h_pipeline(
             parallel_layout.as_ref().expect("TP layout"),
         )?;
         loaded.load(
-            module.inner_mut(),
+            module,
             store.as_ref(),
             &bindings,
             requested,
@@ -16026,7 +16088,7 @@ fn load_nemotron_h_pipeline(
                     requested,
                     weights_stream,
                     stream,
-                    &|name| name.starts_with("moe.experts."),
+                    &|name| name.contains(".experts."),
                 )?;
             } else {
                 loaded.load(
@@ -16040,7 +16102,44 @@ fn load_nemotron_h_pipeline(
             }
         }
     }
+    if owns_mtp {
+        for (depth, layers) in stage.prediction_layers.iter_mut().enumerate() {
+            let group = depth + 1;
+            for (index, layer) in layers.iter_mut().enumerate() {
+                let bindings = binding_adapter.cartesian_layer_bindings(
+                    group,
+                    index,
+                    layer,
+                    store.as_ref(),
+                    parallel_layout.as_ref(),
+                    stage.expert_assignment.as_ref(),
+                    stream,
+                )?;
+                if external_experts {
+                    loaded.load_excluding(
+                        layer,
+                        store.as_ref(),
+                        &bindings,
+                        requested,
+                        weights_stream,
+                        stream,
+                        &|name| name.contains(".experts."),
+                    )?;
+                } else {
+                    loaded.load(
+                        layer,
+                        store.as_ref(),
+                        &bindings,
+                        requested,
+                        weights_stream,
+                        stream,
+                    )?;
+                }
+            }
+        }
+    }
     let static_bytes = loaded.finish(&mut info)?;
+    let checkpoint_diagnostics_before_deferred = store.source_diagnostics()?;
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
@@ -16089,20 +16188,19 @@ fn load_nemotron_h_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if external_experts {
-        let entries =
-            crate::composition::mlx_architectures::nemotron_h::layerwise::nemotron_h_pipeline_expert_catalog(
-                &source_args,
-                store.as_ref(),
-                stage.range.clone(),
-                info.is_last,
-            )?
-            .into_iter()
-            .filter(|entry| {
-                stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
-                })
+        let target_layers = source_args.num_hidden_layers as usize;
+        let entries = crate::composition::nemotron_h::expert_catalog_selected(
+            &source_args,
+            store.as_ref(),
+            |layer| stage.range.contains(&layer) || (owns_mtp && layer >= target_layers),
+        )?
+        .into_iter()
+        .filter(|entry| {
+            stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
             })
-            .collect::<Vec<_>>();
+        })
+        .collect::<Vec<_>>();
         if !entries.is_empty() {
             let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
@@ -16121,385 +16219,52 @@ fn load_nemotron_h_pipeline(
             stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
         }
     }
-    let checkpoint_diagnostics = store.source_diagnostics()?;
+    let checkpoint_diagnostics = if explicit_expert_cache {
+        store.source_diagnostics()?
+    } else {
+        checkpoint_diagnostics_before_deferred
+    };
     info.opened_checkpoint_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
     PipelineModel::from_adapter(topology, info, PipelineStage(stage))
 }
 
-fn forward_nemotron_tensor_layer(
-    layer: &mut nemotron_h::TransformerBlock,
-    global_layer: usize,
-    hidden: &Array,
-    mask: Option<&Array>,
-    cache: &mut PipelineLayerCache,
-    group: &Group,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    match (layer.policy, cache) {
-        (
-            nemotron_h::LayerPolicy::SelfAttention(_),
-            PipelineLayerCache::KeyValue {
-                global_layer: cached,
-                cache,
-                slots,
-            },
-        ) if *cached == global_layer && slots.is_empty() => {
-            let cache: &mut dyn KeyValueCache = match cache {
-                PipelineKeyValueCache::Standard(cache) => cache,
-                PipelineKeyValueCache::Paged(cache) => cache,
-            };
-            Ok(layer.forward_tensor_parallel_with_operator_cache(
-                hidden,
-                mask,
-                Some(nemotron_h::OperatorCache::Attention(cache)),
-                group,
-                stream,
-            )?)
-        }
-        (
-            nemotron_h::LayerPolicy::Mamba,
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            },
-        ) if *cached == global_layer
-            && slots.len() == 2
-            && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
-            && slots[1].policy.role == StateTensorRole::Recurrent =>
-        {
-            let (conv, recurrent) = slots.split_at_mut(1);
-            let mut local = nemotron_h::Mamba2Cache {
-                conv_state: conv[0].value.take(),
-                ssm_state: recurrent[0].value.take(),
-                offset: conv[0].offset,
-            };
-            if recurrent[0].offset != local.offset {
-                return Err(Error::Parallel(format!(
-                    "Nemotron-H TP+PP Mamba state offsets disagree at global layer {global_layer}"
-                )));
-            }
-            let output = layer.forward_tensor_parallel_with_operator_cache(
-                hidden,
-                mask,
-                Some(nemotron_h::OperatorCache::Mamba(&mut local)),
-                group,
-                stream,
-            )?;
-            conv[0].value = local.conv_state;
-            conv[0].offset = local.offset;
-            recurrent[0].value = local.ssm_state;
-            recurrent[0].offset = local.offset;
-            Ok(output)
-        }
-        (
-            nemotron_h::LayerPolicy::DenseMlp | nemotron_h::LayerPolicy::SparseMoe,
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            },
-        ) if *cached == global_layer && slots.is_empty() => {
-            Ok(layer
-                .forward_tensor_parallel_with_operator_cache(hidden, mask, None, group, stream)?)
-        }
-        _ => Err(Error::Parallel(format!(
-            "Nemotron-H TP+PP cache does not match global layer {global_layer}"
-        ))),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn forward_nemotron_expert_layer(
-    layer: &mut nemotron_h::TransformerBlock,
-    global_layer: usize,
-    hidden: &Array,
-    mask: Option<&Array>,
-    cache: &mut PipelineLayerCache,
-    assignment: &ExpertAssignment,
-    group: &Group,
-    statistics: &mut RoutingStatistics,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    match (layer.policy, cache) {
-        (
-            nemotron_h::LayerPolicy::SelfAttention(_),
-            PipelineLayerCache::KeyValue {
-                global_layer: cached,
-                cache,
-                slots,
-            },
-        ) if *cached == global_layer && slots.is_empty() => {
-            let cache: &mut dyn KeyValueCache = match cache {
-                PipelineKeyValueCache::Standard(cache) => cache,
-                PipelineKeyValueCache::Paged(cache) => cache,
-            };
-            Ok(layer.forward_expert_parallel_with_operator_cache(
-                hidden,
-                mask,
-                Some(nemotron_h::OperatorCache::Attention(cache)),
-                assignment,
-                group,
-                statistics,
-                stream,
-            )?)
-        }
-        (
-            nemotron_h::LayerPolicy::Mamba,
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            },
-        ) if *cached == global_layer
-            && slots.len() == 2
-            && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
-            && slots[1].policy.role == StateTensorRole::Recurrent =>
-        {
-            let (conv, recurrent) = slots.split_at_mut(1);
-            let mut local = nemotron_h::Mamba2Cache {
-                conv_state: conv[0].value.take(),
-                ssm_state: recurrent[0].value.take(),
-                offset: conv[0].offset,
-            };
-            if recurrent[0].offset != local.offset {
-                return Err(Error::Parallel(format!(
-                    "Nemotron-H PP+EP Mamba state offsets disagree at global layer {global_layer}"
-                )));
-            }
-            let output = layer.forward_expert_parallel_with_operator_cache(
-                hidden,
-                mask,
-                Some(nemotron_h::OperatorCache::Mamba(&mut local)),
-                assignment,
-                group,
-                statistics,
-                stream,
-            )?;
-            conv[0].value = local.conv_state;
-            conv[0].offset = local.offset;
-            recurrent[0].value = local.ssm_state;
-            recurrent[0].offset = local.offset;
-            Ok(output)
-        }
-        (
-            nemotron_h::LayerPolicy::DenseMlp | nemotron_h::LayerPolicy::SparseMoe,
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            },
-        ) if *cached == global_layer && slots.is_empty() => Ok(layer
-            .forward_expert_parallel_with_operator_cache(
-                hidden, mask, None, assignment, group, statistics, stream,
-            )?),
-        _ => Err(Error::Parallel(format!(
-            "Nemotron-H PP+EP cache does not match global layer {global_layer}"
-        ))),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn forward_nemotron_tensor_expert_layer(
-    layer: &mut nemotron_h::TransformerBlock,
-    global_layer: usize,
-    hidden: &Array,
-    mask: Option<&Array>,
-    cache: &mut PipelineLayerCache,
-    tensor_group: &Group,
-    assignment: &ExpertAssignment,
-    expert_group: &Group,
-    statistics: &mut RoutingStatistics,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    let forward = |layer: &mut nemotron_h::TransformerBlock,
-                   cache: Option<nemotron_h::OperatorCache<'_>>,
-                   statistics: &mut RoutingStatistics| {
-        layer.forward_tensor_expert_parallel_with_operator_cache(
-            hidden,
-            mask,
-            cache,
-            tensor_group,
-            assignment,
-            expert_group,
-            statistics,
-            stream,
-        )
-    };
-    match cache {
-        PipelineLayerCache::KeyValue {
-            global_layer: cached,
-            cache,
-            slots,
-        } if *cached == global_layer && slots.is_empty() => {
-            let cache: &mut dyn KeyValueCache = match cache {
-                PipelineKeyValueCache::Standard(cache) => cache,
-                PipelineKeyValueCache::Paged(cache) => cache,
-            };
-            Ok(forward(
-                layer,
-                Some(nemotron_h::OperatorCache::Attention(cache)),
-                statistics,
-            )?)
-        }
-        PipelineLayerCache::StateSlots {
-            global_layer: cached,
-            slots,
-        } if *cached == global_layer && slots.is_empty() => Ok(forward(layer, None, statistics)?),
-        PipelineLayerCache::StateSlots {
-            global_layer: cached,
-            slots,
-        } if *cached == global_layer
-            && slots.len() == 2
-            && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
-            && slots[1].policy.role == StateTensorRole::Recurrent =>
-        {
-            let (conv, recurrent) = slots.split_at_mut(1);
-            let mut local = nemotron_h::Mamba2Cache {
-                conv_state: conv[0].value.take(),
-                ssm_state: recurrent[0].value.take(),
-                offset: conv[0].offset,
-            };
-            if recurrent[0].offset != local.offset {
-                return Err(Error::Parallel(format!(
-                    "Nemotron-H TP+PP+EP Mamba state offsets disagree at global layer {global_layer}"
-                )));
-            }
-            let output = forward(
-                layer,
-                Some(nemotron_h::OperatorCache::Mamba(&mut local)),
-                statistics,
-            )?;
-            conv[0].value = local.conv_state;
-            conv[0].offset = local.offset;
-            recurrent[0].value = local.ssm_state;
-            recurrent[0].offset = local.offset;
-            Ok(output)
-        }
-        _ => Err(Error::Parallel(format!(
-            "Nemotron-H TP+PP+EP cache does not match global layer {global_layer}"
-        ))),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn forward_nemotron_external_expert_layer(
-    args: &nemotron_h::ModelArgs,
-    layer: &mut nemotron_h::TransformerBlock,
-    global_layer: usize,
-    hidden: &Array,
-    mask: Option<&Array>,
-    cache: &mut PipelineLayerCache,
-    tensor_group: Option<&Group>,
-    assignment: &ExpertAssignment,
-    expert_group: Option<&Group>,
-    pass: ExpertPass,
-    expert_cache: &ExpertCache,
-    statistics: &mut RoutingStatistics,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    let forward = |layer: &mut nemotron_h::TransformerBlock,
-                   cache: Option<nemotron_h::OperatorCache<'_>>,
-                   statistics: &mut RoutingStatistics| {
-        let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-            execute_pipeline_cached_nemotron_h(
-                args,
-                global_layer,
-                hidden,
-                ids,
-                weights,
-                pass,
-                expert_cache,
-                assignment,
-                expert_group,
-                statistics,
-                stream,
-            )
-            .map_err(|error| Exception::custom(error.to_string()))
-        };
-        match tensor_group {
-            Some(group) => layer.forward_tensor_with_operator_cache_and_expert_executor(
-                hidden, mask, cache, group, stream, execute,
-            ),
-            None => layer.forward_with_operator_cache_and_expert_executor(
-                hidden, mask, cache, stream, execute,
-            ),
-        }
-    };
-    match cache {
-        PipelineLayerCache::KeyValue {
-            global_layer: cached,
-            cache,
-            slots,
-        } if *cached == global_layer && slots.is_empty() => {
-            let cache: &mut dyn KeyValueCache = match cache {
-                PipelineKeyValueCache::Standard(cache) => cache,
-                PipelineKeyValueCache::Paged(cache) => cache,
-            };
-            Ok(forward(
-                layer,
-                Some(nemotron_h::OperatorCache::Attention(cache)),
-                statistics,
-            )?)
-        }
-        PipelineLayerCache::StateSlots {
-            global_layer: cached,
-            slots,
-        } if *cached == global_layer && slots.is_empty() => Ok(forward(layer, None, statistics)?),
-        PipelineLayerCache::StateSlots {
-            global_layer: cached,
-            slots,
-        } if *cached == global_layer
-            && slots.len() == 2
-            && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
-            && slots[1].policy.role == StateTensorRole::Recurrent =>
-        {
-            let (conv, recurrent) = slots.split_at_mut(1);
-            let mut local = nemotron_h::Mamba2Cache {
-                conv_state: conv[0].value.take(),
-                ssm_state: recurrent[0].value.take(),
-                offset: conv[0].offset,
-            };
-            if recurrent[0].offset != local.offset {
-                return Err(Error::Parallel(format!(
-                    "Nemotron-H external-expert Mamba state offsets disagree at global layer {global_layer}"
-                )));
-            }
-            let output = forward(
-                layer,
-                Some(nemotron_h::OperatorCache::Mamba(&mut local)),
-                statistics,
-            )?;
-            conv[0].value = local.conv_state;
-            conv[0].offset = local.offset;
-            recurrent[0].value = local.ssm_state;
-            recurrent[0].offset = local.offset;
-            Ok(output)
-        }
-        _ => Err(Error::Parallel(format!(
-            "Nemotron-H pipeline external-expert cache does not match global layer {global_layer}"
-        ))),
-    }
-}
-
 impl NemotronHStage {
+    fn mtp_depth_has_sparse(&self, depth: usize) -> Result<bool, Error> {
+        let layers = self.prediction_layers.get(depth).ok_or_else(|| {
+            Error::Parallel(format!("Nemotron-H has no MTP prediction depth {depth}"))
+        })?;
+        Ok(layers.iter().any(|layer| {
+            matches!(
+                &**layer,
+                eredu_architectures::nemotron_h::Unit::Prediction(unit)
+                    if matches!(
+                        &unit.block.operator,
+                        eredu_architectures::nemotron_h::Operator::Sparse(_)
+                    )
+            )
+        }))
+    }
+
     fn new(
-        args: nemotron_h::ModelArgs,
+        args: eredu_architectures::nemotron_h::ModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
         external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
         let layer_adapter = if external_experts {
-            NemotronHLayerwiseAdapter::new_external_experts(args.clone(), stream)?
+            NemotronHPipelineAdapter::new_external_experts(args.clone(), stream)?
         } else {
-            NemotronHLayerwiseAdapter::new(args.clone(), stream)?
+            NemotronHPipelineAdapter::new(args.clone(), stream)?
         };
-        let complete = nemotron_h::Model::new(args.clone(), stream)?;
-        let nemotron_h::Model { model, lm_head, .. } = complete;
-        let nemotron_h::NemotronHModel {
-            embeddings,
-            layers,
-            norm_f,
-            ..
-        } = model;
+        let architecture =
+            eredu_architectures::nemotron_h::LayeredModel::<MlxBackend>::new(args.clone(), stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let static_modules = architecture.static_modules().clone();
+        let embeddings = MlxModule::new(static_modules.embeddings);
+        let norm = MlxModule::new(static_modules.norm);
+        let lm_head = static_modules.lm_head.map(MlxModule::new);
         let mut embedding = None;
         let mut output_embedding = None;
         if info.is_first {
@@ -16507,11 +16272,10 @@ impl NemotronHStage {
         } else if info.is_last && args.tie_word_embeddings {
             output_embedding = Some(embeddings);
         }
-        let layers = layers
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, layer)| range.contains(&index).then_some(layer))
-            .collect();
+        let layers = range
+            .clone()
+            .map(|index| layer_adapter.new_layer(0, index, stream))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             args,
             layer_adapter,
@@ -16519,8 +16283,9 @@ impl NemotronHStage {
             embedding,
             output_embedding,
             layers,
+            prediction_layers: Vec::new(),
             dense_layers: None,
-            norm: info.is_last.then_some(norm_f),
+            norm: info.is_last.then_some(norm),
             lm_head: info.is_last.then_some(lm_head).flatten(),
             parallel_embedding: None,
             parallel_output_embedding: None,
@@ -16537,89 +16302,96 @@ impl NemotronHStage {
         })
     }
 
-    fn forward_layer(
-        layer: &mut nemotron_h::TransformerBlock,
+    #[allow(clippy::too_many_arguments)]
+    fn forward_target_layer(
+        args: &eredu_architectures::nemotron_h::ModelArgs,
+        layer: &mut MlxModule<eredu_architectures::nemotron_h::Unit<MlxBackend>>,
         global_layer: usize,
         hidden: &Array,
         mask: Option<&Array>,
         cache: &mut PipelineLayerCache,
+        tensor_group: Option<&Group>,
+        assignment: Option<&ExpertAssignment>,
+        expert_group: Option<&Group>,
+        pass: ExpertPass,
+        expert_cache: Option<&ExpertCache>,
+        statistics: &mut RoutingStatistics,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        match (layer.policy, cache) {
-            (
-                nemotron_h::LayerPolicy::SelfAttention(_),
-                PipelineLayerCache::KeyValue {
-                    global_layer: cached,
-                    cache,
-                    slots,
-                },
-            ) if *cached == global_layer && slots.is_empty() => {
-                let cache: &mut dyn KeyValueCache = match cache {
-                    PipelineKeyValueCache::Standard(cache) => cache,
-                    PipelineKeyValueCache::Paged(cache) => cache,
-                };
-                Ok(layer.forward_with_operator_cache(
+        validate_pipeline_hybrid_cache_layer(cache, global_layer)?;
+        let eredu_architectures::nemotron_h::Unit::Target(block) = &mut **layer else {
+            return Err(Error::Parallel(format!(
+                "Nemotron-H target stage contains prediction unit {global_layer}"
+            )));
+        };
+        let mut state = PipelineHybridLayerState(cache);
+        let result = if let Some(expert_cache) = expert_cache {
+            let assignment = assignment.ok_or_else(|| {
+                Error::Parallel("Nemotron-H external experts have no assignment".into())
+            })?;
+            let mut execute = |layer_index: usize,
+                               hidden: &Array,
+                               ids: &Array,
+                               weights: &Array,
+                               stream: &Stream| {
+                execute_pipeline_cached_nemotron_h(
+                    args,
+                    layer_index,
                     hidden,
-                    mask,
-                    Some(nemotron_h::OperatorCache::Attention(cache)),
+                    ids,
+                    weights,
+                    pass,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    statistics,
                     stream,
-                )?)
-            }
-            (
-                nemotron_h::LayerPolicy::Mamba,
-                PipelineLayerCache::StateSlots {
-                    global_layer: cached,
-                    slots,
-                },
-            ) if *cached == global_layer
-                && slots.len() == 2
-                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
-                && slots[1].policy.role == StateTensorRole::Recurrent =>
-            {
-                let (conv, recurrent) = slots.split_at_mut(1);
-                let mut local = nemotron_h::Mamba2Cache {
-                    conv_state: conv[0].value.take(),
-                    ssm_state: recurrent[0].value.take(),
-                    offset: conv[0].offset,
-                };
-                if recurrent[0].offset != local.offset {
-                    return Err(Error::Parallel(format!(
-                        "Nemotron-H Mamba state offsets disagree at global layer {global_layer}"
-                    )));
+                )
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            match tensor_group {
+                Some(group) => {
+                    block.forward_parallel(hidden, mask, &mut state, group, stream, &mut provider)
                 }
-                let output = layer.forward_with_operator_cache(
+                None => {
+                    block.forward_with_provider(hidden, mask, &mut state, stream, &mut provider)
+                }
+            }
+        } else {
+            if assignment.is_some()
+                && matches!(
+                    &block.operator,
+                    eredu_architectures::nemotron_h::Operator::Sparse(_)
+                )
+            {
+                return Err(Error::Parallel(
+                    "neutral Nemotron-H pipeline EP requires external expert residency".into(),
+                ));
+            }
+            match tensor_group {
+                Some(group) => block.forward_parallel(
                     hidden,
                     mask,
-                    Some(nemotron_h::OperatorCache::Mamba(&mut local)),
+                    &mut state,
+                    group,
                     stream,
-                )?;
-                conv[0].value = local.conv_state;
-                conv[0].offset = local.offset;
-                recurrent[0].value = local.ssm_state;
-                recurrent[0].offset = local.offset;
-                Ok(output)
+                    &mut eredu_runtime::ResidentExpertProvider,
+                ),
+                None => block.forward(hidden, mask, &mut state, stream),
             }
-            (
-                nemotron_h::LayerPolicy::DenseMlp | nemotron_h::LayerPolicy::SparseMoe,
-                PipelineLayerCache::StateSlots {
-                    global_layer: cached,
-                    slots,
-                },
-            ) if *cached == global_layer && slots.is_empty() => {
-                Ok(layer.forward_with_operator_cache(hidden, mask, None, stream)?)
-            }
-            _ => Err(Error::Parallel(format!(
-                "Nemotron-H pipeline cache does not match global layer {global_layer}"
-            ))),
-        }
+        };
+        result.map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 
-    fn forward(
+    fn forward_target(
         &mut self,
         input: PipelineStageInput<'_>,
         step: PipelineStep,
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if caches.len() != self.layers.len() {
@@ -16629,14 +16401,31 @@ impl NemotronHStage {
                 self.layers.len()
             )));
         }
+        let tensor_group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .and_then(ParallelExecutionContext::group);
         let (mut hidden, auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) => (
-                self.embedding
-                    .as_mut()
-                    .expect("first Nemotron-H stage embedding")
-                    .forward(tokens, stream)?,
-                PipelineAuxiliaryState::default(),
-            ),
+            PipelineStageInput::Tokens(tokens) => {
+                let hidden = match execution.filter(|execution| execution.is_tensor_parallel()) {
+                    Some(execution) => self
+                        .parallel_embedding
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::Parallel(
+                                "first Nemotron-H TP+PP stage has no embedding shard".into(),
+                            )
+                        })?
+                        .forward(tokens, execution)?,
+                    None => self
+                        .embedding
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::Parallel("first Nemotron-H stage has no embedding".into())
+                        })?
+                        .forward(tokens, stream)?,
+                };
+                (hidden, PipelineAuxiliaryState::default())
+            }
             PipelineStageInput::Hidden(payload) => {
                 (payload.hidden.clone(), payload.auxiliary.clone())
             }
@@ -16646,93 +16435,8 @@ impl NemotronHStage {
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
         let mask = explicit_mask.or(generated_mask.as_ref());
-        let args = &self.args;
-        hidden = execute_pipeline_layer_range(
-            PipelineLayerExecution {
-                range: self.range.clone(),
-                resident_layers: &mut self.layers,
-                dense_layers: self.dense_layers.as_ref(),
-                step,
-                caches,
-                hidden,
-                stream,
-            },
-            |global_layer, stream| nemotron_h::TransformerBlock::new(args, global_layer, stream),
-            |global_layer, layer, hidden, cache, stream| {
-                Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)
-            },
-        )?;
-        let output = if let Some(norm) = &mut self.norm {
-            let mtp_hidden = hidden.clone();
-            hidden = norm.forward(&hidden, stream)?;
-            let logits = if let Some(head) = &mut self.lm_head {
-                head.forward(&hidden, stream)?
-            } else {
-                project_logits_maybe_quantized(
-                    &mut self.lm_head,
-                    self.output_embedding
-                        .as_mut()
-                        .or(self.embedding.as_mut())
-                        .expect("last tied Nemotron-H stage output embedding"),
-                    &hidden,
-                    stream,
-                )?
-            };
-            PipelineStageOutput::EmbeddedMtpLogits {
-                logits,
-                hidden: mtp_hidden,
-            }
-        } else {
-            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
-        };
-        Ok(output)
-    }
-
-    fn forward_tensor_parallel(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        explicit_mask: Option<&Array>,
-        caches: &mut [PipelineLayerCache],
-        execution: &ParallelExecutionContext<'_>,
-        expert_group: Option<&Group>,
-    ) -> Result<PipelineStageOutput, Error> {
-        let group = execution.group().ok_or_else(|| {
-            Error::Parallel(
-                "tensor-sharded Nemotron-H pipeline stage has no TP communicator".into(),
-            )
-        })?;
-        if caches.len() != self.layers.len() {
-            return Err(Error::Parallel(format!(
-                "Nemotron-H TP+PP stage cache has {} entries, expected {}",
-                caches.len(),
-                self.layers.len()
-            )));
-        }
-        let stream = execution.stream();
-        let (mut hidden, auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) => (
-                self.parallel_embedding
-                    .as_mut()
-                    .ok_or_else(|| {
-                        Error::Parallel(
-                            "first Nemotron-H TP+PP stage has no embedding shard".into(),
-                        )
-                    })?
-                    .forward(tokens, execution)?,
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Hidden(payload) => {
-                (payload.hidden.clone(), payload.auxiliary.clone())
-            }
-        };
-        let offset = pipeline_state_offset("Nemotron-H TP+PP", caches)?;
-        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
-            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
-            .transpose()?;
-        let mask = explicit_mask.or(generated_mask.as_ref());
-        let expert_assignment = self.expert_assignment.clone();
-        if let Some(assignment) = expert_assignment.as_ref() {
+        let assignment = self.expert_assignment.clone();
+        if let Some(assignment) = assignment.as_ref() {
             validate_pipeline_expert_dispatch(
                 assignment,
                 expert_group,
@@ -16748,7 +16452,7 @@ impl NemotronHStage {
         let args = self.args.clone();
         let expert_cache = self.expert_storage.cache();
         let layer_adapter = &self.layer_adapter;
-        let parallel_layout = self.parallel_layout.clone();
+        let parallel_layout = tensor_group.and(self.parallel_layout.as_ref()).cloned();
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -16764,221 +16468,70 @@ impl NemotronHStage {
                     0,
                     global_layer,
                     parallel_layout.as_ref(),
-                    expert_assignment.as_ref(),
+                    assignment.as_ref(),
                     stream,
                 )
             },
             |global_layer, layer, hidden, cache, stream| {
-                let forwarded = match (
-                    expert_assignment.as_ref(),
-                    self.expert_storage.is_external(),
+                let forwarded = Self::forward_target_layer(
+                    &args,
+                    layer,
+                    global_layer,
+                    hidden,
+                    mask,
+                    cache,
+                    tensor_group,
+                    assignment.as_ref(),
+                    expert_group,
+                    pass,
                     expert_cache,
-                ) {
-                    (Some(assignment), true, Some(expert_cache)) => {
-                        forward_nemotron_external_expert_layer(
-                            &args,
-                            layer,
-                            global_layer,
-                            hidden,
-                            mask,
-                            cache,
-                            Some(group),
-                            assignment,
-                            expert_group,
-                            pass,
-                            expert_cache,
-                            &mut self.routing_statistics,
+                    &mut self.routing_statistics,
+                    stream,
+                )?;
+                synchronize_outputs([&forwarded])?;
+                Ok(forwarded)
+            },
+        )?;
+        if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
+            hidden = NormalizationOperator::forward(&mut **norm, &hidden, stream)?;
+            let logits = match execution.filter(|execution| execution.is_tensor_parallel()) {
+                Some(execution) => {
+                    let sharded = if let Some(head) = &mut self.parallel_lm_head {
+                        head.forward(&hidden, execution)?
+                    } else {
+                        self.parallel_output_embedding
+                            .as_mut()
+                            .or(self.parallel_embedding.as_mut())
+                            .ok_or_else(|| {
+                                Error::Parallel(
+                                    "last tied Nemotron-H TP+PP stage has no embedding shard"
+                                        .into(),
+                                )
+                            })?
+                            .project_logits(&hidden, execution)?
+                    };
+                    sharded.all_gather(execution)?
+                }
+                None => {
+                    if let Some(head) = &mut self.lm_head {
+                        LinearOperator::forward(&mut **head, &hidden, stream)?
+                    } else {
+                        EmbeddingOperator::as_linear(
+                            &mut **self
+                                .output_embedding
+                                .as_mut()
+                                .or(self.embedding.as_mut())
+                                .ok_or_else(|| {
+                                    Error::Parallel(
+                                        "last tied Nemotron-H stage has no embedding".into(),
+                                    )
+                                })?,
+                            &hidden,
                             stream,
                         )?
                     }
-                    (Some(_), true, None) | (None, true, None) => forward_nemotron_tensor_layer(
-                        layer,
-                        global_layer,
-                        hidden,
-                        mask,
-                        cache,
-                        group,
-                        stream,
-                    )?,
-                    (Some(assignment), false, None) => forward_nemotron_tensor_expert_layer(
-                        layer,
-                        global_layer,
-                        hidden,
-                        mask,
-                        cache,
-                        group,
-                        assignment,
-                        expert_group.expect("validated resident Nemotron-H EP group"),
-                        &mut self.routing_statistics,
-                        stream,
-                    )?,
-                    (None, false, _) => forward_nemotron_tensor_layer(
-                        layer,
-                        global_layer,
-                        hidden,
-                        mask,
-                        cache,
-                        group,
-                        stream,
-                    )?,
-                    (None, true, Some(_)) | (Some(_), false, Some(_)) => {
-                        unreachable!(
-                            "Nemotron-H expert storage and assignment are internally coherent"
-                        )
-                    }
-                };
-                synchronize_outputs([&forwarded])?;
-                Ok(forwarded)
-            },
-        )?;
-        if let Some(norm) = &mut self.norm {
-            let mtp_hidden = hidden.clone();
-            hidden = norm.forward(&hidden, stream)?;
-            let sharded = if let Some(head) = &mut self.parallel_lm_head {
-                head.forward(&hidden, execution)?
-            } else {
-                self.parallel_output_embedding
-                    .as_mut()
-                    .or(self.parallel_embedding.as_mut())
-                    .ok_or_else(|| {
-                        Error::Parallel(
-                            "last tied Nemotron-H TP+PP stage has no embedding shard".into(),
-                        )
-                    })?
-                    .project_logits(&hidden, execution)?
-            };
-            Ok(PipelineStageOutput::EmbeddedMtpLogits {
-                logits: sharded.all_gather(execution)?,
-                hidden: mtp_hidden,
-            })
-        } else {
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden,
-                auxiliary,
-            }))
-        }
-    }
-
-    fn forward_expert_parallel(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        explicit_mask: Option<&Array>,
-        caches: &mut [PipelineLayerCache],
-        group: Option<&Group>,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
-            Error::Parallel("Nemotron-H PP+EP stage has no rank-local expert assignment".into())
-        })?;
-        validate_pipeline_expert_dispatch(assignment, group, self.expert_storage.is_external())?;
-        if caches.len() != self.layers.len() {
-            return Err(Error::Parallel(format!(
-                "Nemotron-H PP+EP stage cache has {} entries, expected {}",
-                caches.len(),
-                self.layers.len()
-            )));
-        }
-        let (mut hidden, auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) => (
-                self.embedding
-                    .as_mut()
-                    .expect("first Nemotron-H PP+EP stage embedding")
-                    .forward(tokens, stream)?,
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Hidden(payload) => {
-                (payload.hidden.clone(), payload.auxiliary.clone())
-            }
-        };
-        let offset = pipeline_state_offset("Nemotron-H PP+EP", caches)?;
-        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
-            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
-            .transpose()?;
-        let mask = explicit_mask.or(generated_mask.as_ref());
-        self.routing_statistics = RoutingStatistics::default();
-        let layer_adapter = &self.layer_adapter;
-        let expert_assignment = assignment.clone();
-        let expert_cache = self.expert_storage.cache();
-        let pass = if step.sequence_length > 1 {
-            ExpertPass::Prefill
-        } else {
-            ExpertPass::Decode
-        };
-        let args = self.args.clone();
-        hidden = execute_pipeline_layer_range(
-            PipelineLayerExecution {
-                range: self.range.clone(),
-                resident_layers: &mut self.layers,
-                dense_layers: self.dense_layers.as_ref(),
-                step,
-                caches,
-                hidden,
-                stream,
-            },
-            |global_layer, stream| {
-                layer_adapter.new_cartesian_layer(
-                    0,
-                    global_layer,
-                    None,
-                    Some(&expert_assignment),
-                    stream,
-                )
-            },
-            |global_layer, layer, hidden, cache, stream| {
-                let forwarded = match (self.expert_storage.is_external(), expert_cache) {
-                    (true, Some(expert_cache)) => forward_nemotron_external_expert_layer(
-                        &args,
-                        layer,
-                        global_layer,
-                        hidden,
-                        mask,
-                        cache,
-                        None,
-                        &expert_assignment,
-                        group,
-                        pass,
-                        expert_cache,
-                        &mut self.routing_statistics,
-                        stream,
-                    )?,
-                    (true, None) => {
-                        Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)?
-                    }
-                    (false, None) => forward_nemotron_expert_layer(
-                        layer,
-                        global_layer,
-                        hidden,
-                        mask,
-                        cache,
-                        &expert_assignment,
-                        group.expect("validated resident Nemotron-H EP group"),
-                        &mut self.routing_statistics,
-                        stream,
-                    )?,
-                    (false, Some(_)) => {
-                        unreachable!("resident Nemotron-H stage cannot own expert cache")
-                    }
-                };
-                synchronize_outputs([&forwarded])?;
-                Ok(forwarded)
-            },
-        )?;
-        if let Some(norm) = &mut self.norm {
-            let mtp_hidden = hidden.clone();
-            hidden = norm.forward(&hidden, stream)?;
-            let logits = if let Some(head) = &mut self.lm_head {
-                head.forward(&hidden, stream)?
-            } else {
-                project_logits_maybe_quantized(
-                    &mut self.lm_head,
-                    self.output_embedding
-                        .as_mut()
-                        .or(self.embedding.as_mut())
-                        .expect("last tied Nemotron-H PP+EP stage output embedding"),
-                    &hidden,
-                    stream,
-                )?
+                }
             };
             Ok(PipelineStageOutput::EmbeddedMtpLogits {
                 logits,
@@ -16990,6 +16543,196 @@ impl NemotronHStage {
                 auxiliary,
             }))
         }
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.forward_target(input, step, mask, caches, None, None, stream)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        execution: &ParallelExecutionContext<'_>,
+        expert_group: Option<&Group>,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.forward_target(
+            input,
+            step,
+            mask,
+            caches,
+            Some(execution),
+            expert_group,
+            execution.stream(),
+        )
+    }
+
+    fn forward_expert_parallel(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.forward_target(input, step, mask, caches, None, expert_group, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_mtp_draft_neutral<F>(
+        &mut self,
+        prior: &Array,
+        tokens: &Array,
+        depth: usize,
+        state: &mut MlxHybridState,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        mut execute: Option<&mut F>,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let layers = self.prediction_layers.get_mut(depth).ok_or_else(|| {
+            Error::Parallel(format!("Nemotron-H has no MTP prediction depth {depth}"))
+        })?;
+        let tensor = execution.filter(|execution| execution.is_tensor_parallel());
+        let embedded = match tensor {
+            Some(execution) => self
+                .parallel_output_embedding
+                .as_mut()
+                .or(self.parallel_embedding.as_mut())
+                .ok_or_else(|| {
+                    Error::Parallel("Nemotron-H MTP has no parallel embedding shard".into())
+                })?
+                .forward(tokens, execution)?,
+            None => EmbeddingOperator::forward(
+                &mut **self
+                    .output_embedding
+                    .as_mut()
+                    .or(self.embedding.as_mut())
+                    .ok_or_else(|| Error::Parallel("Nemotron-H MTP has no embedding".into()))?,
+                tokens,
+                stream,
+            )?,
+        };
+        let pattern = layers.len();
+        if pattern == 0 {
+            return Err(Error::Parallel(format!(
+                "Nemotron-H MTP prediction depth {depth} is empty"
+            )));
+        }
+        let start =
+            (self.args.num_hidden_layers as usize)
+                .checked_add(depth.checked_mul(pattern).ok_or_else(|| {
+                    Error::Parallel("Nemotron-H MTP state index overflowed".into())
+                })?)
+                .ok_or_else(|| Error::Parallel("Nemotron-H MTP state index overflowed".into()))?;
+        let offset = RuntimeStateComponents::<MlxBackend>::position(
+            state
+                .layer(start)
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+        );
+        let generated_mask = (tokens.shape()[1] > 1)
+            .then(|| create_causal_mask(tokens.shape()[1], Some(offset), None, None, stream))
+            .transpose()?;
+        let mut hidden = prior.clone();
+        let tensor_group = tensor.and_then(ParallelExecutionContext::group);
+        for (relative, layer) in layers.iter_mut().enumerate() {
+            let state = state
+                .layer(start + relative)
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            let eredu_architectures::nemotron_h::Unit::Prediction(unit) = &mut **layer else {
+                return Err(Error::Parallel(format!(
+                    "Nemotron-H MTP depth {depth} contains a target unit"
+                )));
+            };
+            hidden = if let Some(execute) = execute.as_deref_mut() {
+                let mut provider = ExpertExecutorProvider::new(execute);
+                match tensor_group {
+                    Some(group) => unit.forward_parallel_with_provider(
+                        &hidden,
+                        &embedded,
+                        generated_mask.as_ref(),
+                        state,
+                        group,
+                        stream,
+                        &mut provider,
+                    ),
+                    None => unit.forward_with_provider(
+                        &hidden,
+                        &embedded,
+                        generated_mask.as_ref(),
+                        state,
+                        stream,
+                        &mut provider,
+                    ),
+                }
+            } else {
+                match tensor_group {
+                    Some(group) => unit.forward_parallel_with_provider(
+                        &hidden,
+                        &embedded,
+                        generated_mask.as_ref(),
+                        state,
+                        group,
+                        stream,
+                        &mut eredu_runtime::ResidentExpertProvider,
+                    ),
+                    None => {
+                        unit.forward(&hidden, &embedded, generated_mask.as_ref(), state, stream)
+                    }
+                }
+            }
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        }
+        let logits = match tensor {
+            Some(execution) => {
+                let sharded = if let Some(head) = &mut self.parallel_lm_head {
+                    head.forward(&hidden, execution)?
+                } else {
+                    self.parallel_output_embedding
+                        .as_mut()
+                        .or(self.parallel_embedding.as_mut())
+                        .ok_or_else(|| {
+                            Error::Parallel("Nemotron-H MTP has no parallel output shard".into())
+                        })?
+                        .project_logits(&hidden, execution)?
+                };
+                sharded.all_gather(execution)?
+            }
+            None => {
+                if let Some(head) = &mut self.lm_head {
+                    LinearOperator::forward(&mut **head, &hidden, stream)?
+                } else {
+                    EmbeddingOperator::as_linear(
+                        &mut **self
+                            .output_embedding
+                            .as_mut()
+                            .or(self.embedding.as_mut())
+                            .ok_or_else(|| {
+                                Error::Parallel("Nemotron-H MTP has no output embedding".into())
+                            })?,
+                        &hidden,
+                        stream,
+                    )?
+                }
+            }
+        };
+        Ok(EmbeddedMtpOutput {
+            logits,
+            hidden,
+            tokens: tokens.clone(),
+        })
     }
 }
 
@@ -17263,7 +17006,7 @@ fn load_qwen_hybrid_pipeline(
                     quantize_on_load,
                     weights_stream,
                     stream,
-                    &|name| name.contains(".mlp.experts."),
+                    &|name| name.contains("mlp.experts."),
                 )?;
             } else {
                 loaded.load(
@@ -17446,7 +17189,7 @@ fn load_qwen_hybrid_pipeline(
                     quantize_on_load,
                     weights_stream,
                     stream,
-                    &|name| name.starts_with("mlp.experts."),
+                    &|name| name.contains("mlp.experts."),
                 )?;
             } else {
                 loaded.load(
@@ -18565,7 +18308,7 @@ impl QwenHybridStage {
 
 #[allow(clippy::too_many_arguments)]
 fn load_kimi_linear_pipeline(
-    source_args: kimi_linear::ModelArgs,
+    source_args: eredu_architectures::kimi_linear::ModelArgs,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -18574,10 +18317,12 @@ fn load_kimi_linear_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    let expert_cache_options = expert_cache_options
+        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
     let binding_adapter = if expert_cache_options.is_some() {
-        KimiLinearLayerwiseAdapter::new_external_experts(source_args.clone(), stream)?
+        KimiLinearPipelineAdapter::new_external_experts(source_args.clone(), stream)?
     } else {
-        KimiLinearLayerwiseAdapter::new(source_args.clone(), stream)?
+        KimiLinearPipelineAdapter::new(source_args.clone(), stream)?
     };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
@@ -18590,7 +18335,7 @@ fn load_kimi_linear_pipeline(
         .map(|requested| {
             crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Kimi Linear pipeline",
-                source_args.quantization,
+                source_args.weight_quantization,
                 requested,
             )
             .map(|required| required.then_some(requested))
@@ -18599,13 +18344,13 @@ fn load_kimi_linear_pipeline(
         .flatten();
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
-        target_args.quantization = Some(quantization);
+        target_args.weight_quantization = Some(quantization);
         target_args.quantized_weight_configs = None;
     }
     let target_binding_adapter = if expert_cache_options.is_some() {
-        KimiLinearLayerwiseAdapter::new_external_experts(target_args.clone(), stream)?
+        KimiLinearPipelineAdapter::new_external_experts(target_args.clone(), stream)?
     } else {
-        KimiLinearLayerwiseAdapter::new(target_args.clone(), stream)?
+        KimiLinearPipelineAdapter::new(target_args.clone(), stream)?
     };
     let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
     let mut info = base_info(
@@ -18624,14 +18369,15 @@ fn load_kimi_linear_pipeline(
     )?;
     if expert_cache_options.is_some() {
         stage.layer_adapter =
-            KimiLinearLayerwiseAdapter::new_external_experts(target_args.clone(), stream)?;
+            KimiLinearPipelineAdapter::new_external_experts(target_args.clone(), stream)?;
     }
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
         if stage.range.clone().any(|layer| {
             source_args.layer_policy(layer).is_some_and(|policy| {
-                policy.feed_forward == kimi_linear::FeedForwardPolicy::SparseMoe
+                policy.feed_forward
+                    == eredu_architectures::kimi_linear::FeedForwardPolicy::SparseMoe
             })
         }) {
             info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
@@ -18644,18 +18390,17 @@ fn load_kimi_linear_pipeline(
         let (_, layout) = planner.finish()?;
         let kda_heads = planned_optional_partition_widths(
             &layout,
-            source_args
-                .layer_schedule
-                .iter()
-                .map(|policy| policy.attention == kimi_linear::AttentionKind::Kda),
+            source_args.layer_schedule.iter().map(|policy| {
+                policy.attention == eredu_architectures::kimi_linear::AttentionKind::Kda
+            }),
             source_args.kda_config.head_dim,
             "model.layers",
             "self_attn.q_proj",
         )?;
-        stage.parallel_cache_geometry = Some(
+        stage.parallel_geometry = Some(
             kda_heads
                 .into_iter()
-                .map(|kda_heads| kimi_linear::KimiLayerCacheGeometry { kda_heads })
+                .map(|kda_heads| eredu_architectures::kimi_linear::LayerCacheGeometry { kda_heads })
                 .collect(),
         );
         stage.parallel_embedding = info
@@ -18668,6 +18413,9 @@ fn load_kimi_linear_pipeline(
                     build,
                     stream,
                 )
+                .and_then(|module| {
+                    named_pipeline_parallel_embedding(module, "model.embed_tokens.weight")
+                })
             })
             .transpose()?;
         stage.parallel_output_embedding =
@@ -18680,6 +18428,9 @@ fn load_kimi_linear_pipeline(
                         build,
                         stream,
                     )
+                    .and_then(|module| {
+                        named_pipeline_parallel_embedding(module, "model.embed_tokens.weight")
+                    })
                 })
                 .transpose()?;
         stage.parallel_lm_head = (info.is_last && !target_args.tie_word_embeddings)
@@ -18691,6 +18442,7 @@ fn load_kimi_linear_pipeline(
                     build,
                     stream,
                 )
+                .and_then(|module| named_pipeline_parallel_lm_head(module, "lm_head.weight"))
             })
             .transpose()?;
         stage.embedding = None;
@@ -18763,7 +18515,7 @@ fn load_kimi_linear_pipeline(
             parallel_layout.as_ref().expect("TP layout"),
         )?;
         loaded.load(
-            module.inner_mut(),
+            module,
             store.as_ref(),
             &bindings,
             quantize_on_load,
@@ -18788,7 +18540,7 @@ fn load_kimi_linear_pipeline(
             parallel_layout.as_ref().expect("TP layout"),
         )?;
         loaded.load(
-            module.inner_mut(),
+            module,
             store.as_ref(),
             &bindings,
             quantize_on_load,
@@ -18823,7 +18575,7 @@ fn load_kimi_linear_pipeline(
             parallel_layout.as_ref().expect("TP layout"),
         )?;
         loaded.load(
-            module.inner_mut(),
+            module,
             store.as_ref(),
             &bindings,
             quantize_on_load,
@@ -18859,7 +18611,7 @@ fn load_kimi_linear_pipeline(
                     quantize_on_load,
                     weights_stream,
                     stream,
-                    &|name| name.starts_with("mlp.experts."),
+                    &|name| name.contains("mlp.experts."),
                 )?;
             } else {
                 loaded.load(
@@ -18924,18 +18676,16 @@ fn load_kimi_linear_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if let Some(options) = expert_cache_options {
-        let entries = crate::composition::mlx_architectures::kimi_linear::layerwise::kimi_expert_catalog_for_layers(
-            &source_args,
-            store.as_ref(),
-            stage.range.clone(),
-        )?
-        .into_iter()
-        .filter(|entry| {
-            stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
-            })
-        })
-        .collect::<Vec<_>>();
+        let entries =
+            crate::composition::kimi_linear::expert_catalog(&source_args, store.as_ref())?
+                .into_iter()
+                .filter(|entry| stage.range.contains(&entry.identity().layer))
+                .filter(|entry| {
+                    stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                        assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                    })
+                })
+                .collect::<Vec<_>>();
         if !entries.is_empty() {
             let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
@@ -18960,21 +18710,10 @@ fn load_kimi_linear_pipeline(
 }
 
 enum KimiCartesianLayerExecution<'a> {
+    Resident,
     Tensor(&'a Group),
-    Expert {
-        assignment: &'a ExpertAssignment,
-        group: &'a Group,
-        statistics: &'a mut RoutingStatistics,
-    },
-    TensorExpert {
-        tensor_group: &'a Group,
-        assignment: &'a ExpertAssignment,
-        expert_group: &'a Group,
-        statistics: &'a mut RoutingStatistics,
-    },
     External {
-        args: &'a kimi_linear::ModelArgs,
-        global_layer: usize,
+        args: &'a eredu_architectures::kimi_linear::ModelArgs,
         tensor_group: Option<&'a Group>,
         assignment: &'a ExpertAssignment,
         expert_group: Option<&'a Group>,
@@ -18985,53 +18724,22 @@ enum KimiCartesianLayerExecution<'a> {
 }
 
 fn forward_kimi_cartesian_operator(
-    layer: &mut kimi_linear::DecoderLayer,
+    layer: &mut MlxModule<eredu_architectures::kimi_linear::Block<MlxBackend>>,
     hidden: &Array,
     mask: Option<&Array>,
-    cache: kimi_linear::OperatorCache<'_>,
+    state: &mut MlxHybridLayerState,
     execution: &mut KimiCartesianLayerExecution<'_>,
     stream: &Stream,
 ) -> Result<Array, Error> {
     match execution {
-        KimiCartesianLayerExecution::Tensor(group) => Ok(layer
-            .forward_tensor_parallel_with_operator_cache(
-                hidden,
-                mask,
-                Some(cache),
-                group,
-                stream,
-            )?),
-        KimiCartesianLayerExecution::Expert {
-            assignment,
-            group,
-            statistics,
-        } => Ok(layer.forward_expert_parallel_with_operator_cache(
-            hidden,
-            mask,
-            Some(cache),
-            assignment,
-            group,
-            statistics,
-            stream,
-        )?),
-        KimiCartesianLayerExecution::TensorExpert {
-            tensor_group,
-            assignment,
-            expert_group,
-            statistics,
-        } => Ok(layer.forward_tensor_expert_parallel_with_operator_cache(
-            hidden,
-            mask,
-            Some(cache),
-            tensor_group,
-            assignment,
-            expert_group,
-            statistics,
-            stream,
-        )?),
+        KimiCartesianLayerExecution::Resident => layer
+            .forward(hidden, mask, state, stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+        KimiCartesianLayerExecution::Tensor(group) => layer
+            .forward_parallel(hidden, mask, state, group, stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
         KimiCartesianLayerExecution::External {
             args,
-            global_layer,
             tensor_group,
             assignment,
             expert_group,
@@ -19039,10 +18747,14 @@ fn forward_kimi_cartesian_operator(
             cache: expert_cache,
             statistics,
         } => {
-            let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+            let execute = |layer_index: usize,
+                           hidden: &Array,
+                           ids: &Array,
+                           weights: &Array,
+                           stream: &Stream| {
                 execute_pipeline_cached_kimi_linear(
                     args,
-                    *global_layer,
+                    layer_index,
                     hidden,
                     ids,
                     weights,
@@ -19055,31 +18767,45 @@ fn forward_kimi_cartesian_operator(
                 )
                 .map_err(|error| Exception::custom(error.to_string()))
             };
+            let mut execute = execute;
+            let mut provider = ExpertExecutorProvider::new(&mut execute);
             match tensor_group {
-                Some(group) => Ok(
-                    layer.forward_tensor_with_expert_executor_and_operator_cache(
+                Some(group) => layer
+                    .forward_parallel_with_feed_forward(
                         hidden,
                         mask,
-                        Some(cache),
+                        state,
                         group,
                         stream,
-                        execute,
-                    )?,
-                ),
-                None => Ok(layer.forward_with_expert_executor_and_operator_cache(
-                    hidden,
-                    mask,
-                    Some(cache),
-                    stream,
-                    execute,
-                )?),
+                        |policy, normalized, group, stream| {
+                            policy.forward_parallel_with_provider(
+                                normalized,
+                                *pass,
+                                group,
+                                stream,
+                                &mut provider,
+                            )
+                        },
+                    )
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+                None => layer
+                    .forward_with_feed_forward(
+                        hidden,
+                        mask,
+                        state,
+                        stream,
+                        |policy, normalized, stream| {
+                            policy.forward_with_provider(normalized, *pass, stream, &mut provider)
+                        },
+                    )
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
             }
         }
     }
 }
 
 fn forward_kimi_cartesian_layer(
-    layer: &mut kimi_linear::DecoderLayer,
+    layer: &mut MlxModule<eredu_architectures::kimi_linear::Block<MlxBackend>>,
     global_layer: usize,
     hidden: &Array,
     mask: Option<&Array>,
@@ -19087,19 +18813,15 @@ fn forward_kimi_cartesian_layer(
     execution: &mut KimiCartesianLayerExecution<'_>,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    match cache {
+    let mut state = match cache {
         PipelineLayerCache::CompressedLatent {
             global_layer: cached,
             cache,
             slots,
-        } if *cached == global_layer && slots.is_empty() => forward_kimi_cartesian_operator(
-            layer,
-            hidden,
-            mask,
-            kimi_linear::OperatorCache::Mla(cache),
-            execution,
-            stream,
-        ),
+        } if *cached == global_layer && slots.is_empty() => {
+            let cache = std::mem::replace(cache, CompressedLatentCache::new());
+            MlxHybridLayerState::from_pipeline_parts(Some(cache), BTreeMap::new(), 0)
+        }
         PipelineLayerCache::StateSlots {
             global_layer: cached,
             slots,
@@ -19116,67 +18838,59 @@ fn forward_kimi_cartesian_layer(
                     "Kimi Cartesian state offsets disagree at global layer {global_layer}"
                 )));
             }
-            let mut local = kimi_linear::KdaCache {
-                q_conv: crate::backend::mlx::nn::convolution::CausalConv1dCache {
-                    state: slots[0].value.take(),
-                    offset,
-                },
-                k_conv: crate::backend::mlx::nn::convolution::CausalConv1dCache {
-                    state: slots[1].value.take(),
-                    offset,
-                },
-                v_conv: crate::backend::mlx::nn::convolution::CausalConv1dCache {
-                    state: slots[2].value.take(),
-                    offset,
-                },
-                recurrent_state: slots[3].value.take(),
-            };
-            let output = forward_kimi_cartesian_operator(
-                layer,
-                hidden,
-                mask,
-                kimi_linear::OperatorCache::Kda(&mut local),
-                execution,
-                stream,
-            )?;
-            slots[0].value = local.q_conv.state;
-            slots[1].value = local.k_conv.state;
-            slots[2].value = local.v_conv.state;
-            slots[3].value = local.recurrent_state;
-            if local.k_conv.offset != local.q_conv.offset
-                || local.v_conv.offset != local.q_conv.offset
-            {
-                return Err(Error::Parallel(format!(
-                    "Kimi Cartesian convolution offsets disagree at global layer {global_layer}"
-                )));
-            }
-            slots
-                .iter_mut()
-                .for_each(|slot| slot.offset = local.q_conv.offset);
-            Ok(output)
+            MlxHybridLayerState::from_pipeline_parts(
+                None,
+                slots
+                    .iter_mut()
+                    .map(|slot| (slot.policy.role, slot.value.take()))
+                    .collect(),
+                offset,
+            )
         }
-        _ => Err(Error::Parallel(format!(
-            "Kimi Cartesian cache does not match global layer {global_layer}"
-        ))),
+        _ => {
+            return Err(Error::Parallel(format!(
+                "Kimi Cartesian cache does not match global layer {global_layer}"
+            )))
+        }
+    };
+    let output =
+        forward_kimi_cartesian_operator(layer, hidden, mask, &mut state, execution, stream)?;
+    let (compressed, mut fixed, offset) = state.into_pipeline_parts();
+    match cache {
+        PipelineLayerCache::CompressedLatent { cache, .. } => {
+            *cache = compressed.expect("MLA block preserves compressed state");
+        }
+        PipelineLayerCache::StateSlots { slots, .. } => {
+            for slot in slots {
+                slot.value = fixed.remove(&slot.policy.role).unwrap_or(None);
+                slot.offset = offset;
+            }
+        }
+        _ => unreachable!("validated Kimi pipeline cache"),
     }
+    Ok(output)
 }
 
 impl KimiLinearStage {
     fn new(
-        args: kimi_linear::ModelArgs,
+        args: eredu_architectures::kimi_linear::ModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
         external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let layer_adapter = KimiLinearLayerwiseAdapter::new(args.clone(), stream)?;
-        let complete = kimi_linear::Model::new(args.clone(), stream)?;
-        let kimi_linear::Model { model, lm_head, .. } = complete;
-        let kimi_linear::TextModel {
-            embed_tokens,
-            layers,
-            norm,
-        } = model;
+        let layer_adapter = if external_experts {
+            KimiLinearPipelineAdapter::new_external_experts(args.clone(), stream)?
+        } else {
+            KimiLinearPipelineAdapter::new(args.clone(), stream)?
+        };
+        let architecture =
+            eredu_architectures::kimi_linear::LayeredModel::<MlxBackend>::new(args.clone(), stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let static_modules = architecture.static_modules().clone();
+        let embed_tokens = MlxModule::new(static_modules.embeddings);
+        let norm = MlxModule::new(static_modules.norm);
+        let lm_head = static_modules.lm_head.map(MlxModule::new);
         let mut embedding = None;
         let mut output_embedding = None;
         if info.is_first {
@@ -19184,11 +18898,10 @@ impl KimiLinearStage {
         } else if info.is_last && args.tie_word_embeddings {
             output_embedding = Some(embed_tokens);
         }
-        let layers = layers
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, layer)| range.contains(&index).then_some(layer))
-            .collect();
+        let layers = range
+            .clone()
+            .map(|index| layer_adapter.new_layer(0, index, stream))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             args,
             layer_adapter,
@@ -19196,6 +18909,7 @@ impl KimiLinearStage {
             embedding,
             output_embedding,
             layers,
+            prediction_layers: Vec::new(),
             dense_layers: None,
             norm: info.is_last.then_some(norm),
             lm_head: info.is_last.then_some(lm_head).flatten(),
@@ -19203,7 +18917,7 @@ impl KimiLinearStage {
             parallel_output_embedding: None,
             parallel_lm_head: None,
             parallel_layout: None,
-            parallel_cache_geometry: None,
+            parallel_geometry: None,
             expert_assignment: None,
             expert_storage: if external_experts {
                 PipelineExpertStorage::ExternalEmpty
@@ -19215,79 +18929,23 @@ impl KimiLinearStage {
     }
 
     fn forward_layer(
-        layer: &mut kimi_linear::DecoderLayer,
+        layer: &mut MlxModule<eredu_architectures::kimi_linear::Block<MlxBackend>>,
         global_layer: usize,
         hidden: &Array,
         mask: Option<&Array>,
         cache: &mut PipelineLayerCache,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        match cache {
-            PipelineLayerCache::CompressedLatent {
-                global_layer: cached,
-                cache,
-                slots,
-            } if *cached == global_layer && slots.is_empty() => Ok(layer
-                .forward_with_operator_cache(
-                    hidden,
-                    mask,
-                    Some(kimi_linear::OperatorCache::Mla(cache)),
-                    stream,
-                )?),
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            } if *cached == global_layer
-                && slots.len() == 4
-                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
-                && slots[1].policy.role == (StateTensorRole::Convolution { slot: 1 })
-                && slots[2].policy.role == (StateTensorRole::Convolution { slot: 2 })
-                && slots[3].policy.role == StateTensorRole::Recurrent =>
-            {
-                let offset = slots[0].offset;
-                if slots.iter().any(|slot| slot.offset != offset) {
-                    return Err(Error::Parallel(format!(
-                        "Kimi Linear KDA state offsets disagree at global layer {global_layer}"
-                    )));
-                }
-                let mut local = kimi_linear::KdaCache {
-                    q_conv: crate::backend::mlx::nn::convolution::CausalConv1dCache {
-                        state: slots[0].value.take(),
-                        offset,
-                    },
-                    k_conv: crate::backend::mlx::nn::convolution::CausalConv1dCache {
-                        state: slots[1].value.take(),
-                        offset,
-                    },
-                    v_conv: crate::backend::mlx::nn::convolution::CausalConv1dCache {
-                        state: slots[2].value.take(),
-                        offset,
-                    },
-                    recurrent_state: slots[3].value.take(),
-                };
-                let output = layer.forward_with_operator_cache(
-                    hidden,
-                    mask,
-                    Some(kimi_linear::OperatorCache::Kda(&mut local)),
-                    stream,
-                )?;
-                slots[0].value = local.q_conv.state;
-                slots[1].value = local.k_conv.state;
-                slots[2].value = local.v_conv.state;
-                slots[3].value = local.recurrent_state;
-                let offset = local.q_conv.offset;
-                if local.k_conv.offset != offset || local.v_conv.offset != offset {
-                    return Err(Error::Parallel(format!(
-                        "Kimi Linear KDA convolution offsets disagree at global layer {global_layer}"
-                    )));
-                }
-                slots.iter_mut().for_each(|slot| slot.offset = offset);
-                Ok(output)
-            }
-            _ => Err(Error::Parallel(format!(
-                "Kimi Linear pipeline cache does not match global layer {global_layer}"
-            ))),
-        }
+        let mut execution = KimiCartesianLayerExecution::Resident;
+        forward_kimi_cartesian_layer(
+            layer,
+            global_layer,
+            hidden,
+            mask,
+            cache,
+            &mut execution,
+            stream,
+        )
     }
 
     fn forward(
@@ -19322,7 +18980,7 @@ impl KimiLinearStage {
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
         let mask = explicit_mask.or(generated_mask.as_ref());
-        let args = &self.args;
+        let layer_adapter = &self.layer_adapter;
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -19333,9 +18991,7 @@ impl KimiLinearStage {
                 hidden,
                 stream,
             },
-            |global_layer, stream| {
-                kimi_linear::DecoderLayer::new(args, global_layer, stream).map_err(Into::into)
-            },
+            |global_layer, stream| layer_adapter.new_layer(0, global_layer, stream),
             |global_layer, layer, hidden, cache, stream| {
                 Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)
             },
@@ -19345,9 +19001,9 @@ impl KimiLinearStage {
             let logits = if let Some(head) = &mut self.lm_head {
                 head.forward(&hidden, stream)?
             } else {
-                project_logits_maybe_quantized(
-                    &mut self.lm_head,
-                    self.output_embedding
+                EmbeddingOperator::as_linear(
+                    &mut **self
+                        .output_embedding
                         .as_mut()
                         .or(self.embedding.as_mut())
                         .expect("last tied Kimi Linear stage output embedding"),
@@ -19449,7 +19105,6 @@ impl KimiLinearStage {
                     (Some(assignment), true, Some(expert_cache)) => {
                         KimiCartesianLayerExecution::External {
                             args: &args,
-                            global_layer,
                             tensor_group: Some(group),
                             assignment,
                             expert_group,
@@ -19461,13 +19116,12 @@ impl KimiLinearStage {
                     (Some(_), true, None) | (None, true, None) => {
                         KimiCartesianLayerExecution::Tensor(group)
                     }
-                    (Some(assignment), false, None) => KimiCartesianLayerExecution::TensorExpert {
-                        tensor_group: group,
-                        assignment,
-                        expert_group: expert_group
-                            .expect("validated resident Kimi Linear EP group"),
-                        statistics: &mut self.routing_statistics,
-                    },
+                    (Some(_), false, None) => {
+                        return Err(Error::Parallel(
+                            "neutral Kimi Linear TP+PP+EP requires external expert residency"
+                                .into(),
+                        ))
+                    }
                     (None, false, _) => KimiCartesianLayerExecution::Tensor(group),
                     (None, true, Some(_)) | (Some(_), false, Some(_)) => unreachable!(
                         "Kimi Linear expert storage and assignment are internally coherent"
@@ -19581,7 +19235,6 @@ impl KimiLinearStage {
                     (true, Some(expert_cache)) => {
                         let mut mode = KimiCartesianLayerExecution::External {
                             args: &args,
-                            global_layer,
                             tensor_group: None,
                             assignment: &expert_assignment,
                             expert_group: group,
@@ -19603,20 +19256,9 @@ impl KimiLinearStage {
                         Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)?
                     }
                     (false, None) => {
-                        let mut mode = KimiCartesianLayerExecution::Expert {
-                            assignment: &expert_assignment,
-                            group: group.expect("validated resident Kimi Linear EP group"),
-                            statistics: &mut self.routing_statistics,
-                        };
-                        forward_kimi_cartesian_layer(
-                            layer,
-                            global_layer,
-                            hidden,
-                            mask,
-                            cache,
-                            &mut mode,
-                            stream,
-                        )?
+                        return Err(Error::Parallel(
+                            "neutral Kimi Linear PP+EP requires external expert residency".into(),
+                        ))
                     }
                     (false, Some(_)) => {
                         unreachable!("resident Kimi Linear stage cannot own expert cache")
@@ -19631,9 +19273,9 @@ impl KimiLinearStage {
             let logits = if let Some(head) = &mut self.lm_head {
                 head.forward(&hidden, stream)?
             } else {
-                project_logits_maybe_quantized(
-                    &mut self.lm_head,
-                    self.output_embedding
+                EmbeddingOperator::as_linear(
+                    &mut **self
+                        .output_embedding
                         .as_mut()
                         .or(self.embedding.as_mut())
                         .expect("last tied Kimi Linear PP+EP stage output embedding"),
@@ -23216,7 +22858,7 @@ fn load_neutral_deepseek_v3_pipeline(
                     None,
                     weights_stream,
                     stream,
-                    &|name| name.contains(".mlp.experts."),
+                    &|name| name.contains("mlp.experts."),
                 )?;
             } else {
                 loaded.load(
@@ -23271,7 +22913,7 @@ fn load_neutral_deepseek_v3_pipeline(
                 None,
                 weights_stream,
                 stream,
-                &|name| name.contains(".mlp.experts."),
+                &|name| name.contains("mlp.experts."),
             )?;
         } else {
             loaded.load(

@@ -154,11 +154,11 @@ impl<T: QwenMtpTarget> EmbeddedMtpTarget for T {
         Ok(())
     }
 
-    fn draft_cache(cache: &Self::Cache) -> Self::DraftCache {
+    fn draft_cache(&self, cache: &Self::Cache) -> Self::DraftCache {
         cache.mtp_layers.clone()
     }
 
-    fn commit_draft_cache(cache: &mut Self::Cache, draft: &Self::DraftCache) {
+    fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
         cache.mtp_layers.clone_from(draft);
     }
 

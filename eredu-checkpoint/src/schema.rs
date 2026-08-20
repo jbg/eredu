@@ -8,6 +8,213 @@ use eredu_gguf::GgmlType as GgufType;
 
 use crate::{BlockFp8ScaleEncoding, LinearFormat, StoredDtype};
 
+/// One named output segment in a fused projection.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FusedProjectionSegment {
+    pub semantic: String,
+    pub width: usize,
+}
+
+impl FusedProjectionSegment {
+    pub fn new(semantic: impl Into<String>, width: usize) -> Result<Self, String> {
+        let semantic = semantic.into();
+        if semantic.trim().is_empty() || width == 0 {
+            return Err("fused projection segments require a name and positive width".into());
+        }
+        Ok(Self { semantic, width })
+    }
+}
+
+/// Family-neutral geometry for a projection whose output contains ordered
+/// semantic segments sharing one input and partition domain.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FusedSegmentedProjectionSchema {
+    input_width: usize,
+    segments: Vec<FusedProjectionSegment>,
+    output_width: usize,
+}
+
+impl FusedSegmentedProjectionSchema {
+    pub fn new(
+        input_width: usize,
+        segments: impl IntoIterator<Item = FusedProjectionSegment>,
+    ) -> Result<Self, String> {
+        if input_width == 0 {
+            return Err("fused projection input width must be positive".into());
+        }
+        let segments = segments.into_iter().collect::<Vec<_>>();
+        if segments.is_empty() {
+            return Err("fused projection requires at least one segment".into());
+        }
+        let mut names = BTreeSet::new();
+        let mut output_width = 0usize;
+        for segment in &segments {
+            if segment.semantic.trim().is_empty()
+                || segment.width == 0
+                || !names.insert(segment.semantic.clone())
+            {
+                return Err("fused projection segments must be positive and uniquely named".into());
+            }
+            output_width = output_width
+                .checked_add(segment.width)
+                .ok_or_else(|| "fused projection output width overflows".to_string())?;
+        }
+        Ok(Self {
+            input_width,
+            segments,
+            output_width,
+        })
+    }
+
+    pub const fn input_width(&self) -> usize {
+        self.input_width
+    }
+
+    pub const fn output_width(&self) -> usize {
+        self.output_width
+    }
+
+    pub fn matrix_shape(&self) -> Vec<usize> {
+        vec![self.output_width, self.input_width]
+    }
+
+    pub fn bias_shape(&self) -> Vec<usize> {
+        vec![self.output_width]
+    }
+
+    pub fn segment_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        let mut start = 0;
+        self.segments
+            .iter()
+            .map(|segment| {
+                let range = start..start + segment.width;
+                start = range.end;
+                range
+            })
+            .collect()
+    }
+}
+
+/// Physical axis convention for a depthwise causal-convolution kernel.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DepthwiseKernelAxes {
+    /// `[channels, 1, kernel]`.
+    ChannelsSingletonKernel,
+    /// `[channels, kernel, 1]`.
+    ChannelsKernelSingleton,
+}
+
+/// Explicit storage and execution geometry for a depthwise convolution.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DepthwiseConvolutionSchema {
+    channels: usize,
+    kernel: usize,
+    storage_axes: DepthwiseKernelAxes,
+    execution_axes: DepthwiseKernelAxes,
+    bias: bool,
+}
+
+impl DepthwiseConvolutionSchema {
+    pub fn new(channels: usize, kernel: usize, bias: bool) -> Result<Self, String> {
+        Self::with_axes(
+            channels,
+            kernel,
+            DepthwiseKernelAxes::ChannelsSingletonKernel,
+            DepthwiseKernelAxes::ChannelsSingletonKernel,
+            bias,
+        )
+    }
+
+    pub fn with_axes(
+        channels: usize,
+        kernel: usize,
+        storage_axes: DepthwiseKernelAxes,
+        execution_axes: DepthwiseKernelAxes,
+        bias: bool,
+    ) -> Result<Self, String> {
+        if channels == 0 || kernel == 0 {
+            return Err("depthwise convolution channels and kernel must be positive".into());
+        }
+        Ok(Self {
+            channels,
+            kernel,
+            storage_axes,
+            execution_axes,
+            bias,
+        })
+    }
+
+    pub fn storage_shape(self) -> Vec<usize> {
+        self.shape(self.storage_axes)
+    }
+
+    pub fn execution_shape(self) -> Vec<usize> {
+        self.shape(self.execution_axes)
+    }
+
+    pub fn bias_shape(self) -> Option<Vec<usize>> {
+        self.bias.then(|| vec![self.channels])
+    }
+
+    pub const fn element_count(self) -> usize {
+        self.channels * self.kernel
+    }
+
+    fn shape(self, axes: DepthwiseKernelAxes) -> Vec<usize> {
+        match axes {
+            DepthwiseKernelAxes::ChannelsSingletonKernel => vec![self.channels, 1, self.kernel],
+            DepthwiseKernelAxes::ChannelsKernelSingleton => vec![self.channels, self.kernel, 1],
+        }
+    }
+}
+
+/// Reusable head/group geometry for recurrent state-space parameter groups.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RecurrentParameterGroupSchema {
+    pub heads: usize,
+    pub groups: usize,
+    pub head_width: usize,
+    pub state_width: usize,
+}
+
+impl RecurrentParameterGroupSchema {
+    pub fn new(
+        heads: usize,
+        groups: usize,
+        head_width: usize,
+        state_width: usize,
+    ) -> Result<Self, String> {
+        if heads == 0
+            || groups == 0
+            || head_width == 0
+            || state_width == 0
+            || !heads.is_multiple_of(groups)
+        {
+            return Err(
+                "recurrent parameter groups require positive widths and whole groups".into(),
+            );
+        }
+        Ok(Self {
+            heads,
+            groups,
+            head_width,
+            state_width,
+        })
+    }
+
+    pub const fn per_head_shape(self) -> [usize; 1] {
+        [self.heads]
+    }
+
+    pub const fn grouped_state_width(self) -> usize {
+        self.groups * self.state_width
+    }
+
+    pub const fn recurrent_state_shape(self) -> [usize; 3] {
+        [self.heads, self.head_width, self.state_width]
+    }
+}
+
 /// Architecture-supplied physical names for a block-FP8 scale companion.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MatrixScaleNames {
@@ -964,5 +1171,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sibling_shared.layout_groups[0].variants.len(), 2);
+    }
+
+    #[test]
+    fn hybrid_operator_schemas_freeze_segments_convolution_axes_and_recurrent_groups() {
+        let projection = FusedSegmentedProjectionSchema::new(
+            16,
+            [
+                FusedProjectionSegment::new("gate", 8).unwrap(),
+                FusedProjectionSegment::new("state", 6).unwrap(),
+                FusedProjectionSegment::new("time", 2).unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(projection.matrix_shape(), [16, 16]);
+        assert_eq!(projection.segment_ranges(), [0..8, 8..14, 14..16]);
+        assert!(FusedSegmentedProjectionSchema::new(
+            4,
+            [
+                FusedProjectionSegment::new("same", 2).unwrap(),
+                FusedProjectionSegment::new("same", 2).unwrap(),
+            ]
+        )
+        .is_err());
+
+        let convolution = DepthwiseConvolutionSchema::with_axes(
+            12,
+            3,
+            DepthwiseKernelAxes::ChannelsKernelSingleton,
+            DepthwiseKernelAxes::ChannelsSingletonKernel,
+            true,
+        )
+        .unwrap();
+        assert_eq!(convolution.storage_shape(), [12, 3, 1]);
+        assert_eq!(convolution.execution_shape(), [12, 1, 3]);
+        assert_eq!(convolution.bias_shape(), Some(vec![12]));
+        assert_eq!(convolution.element_count(), 36);
+
+        let recurrent = RecurrentParameterGroupSchema::new(8, 2, 4, 3).unwrap();
+        assert_eq!(recurrent.per_head_shape(), [8]);
+        assert_eq!(recurrent.grouped_state_width(), 6);
+        assert_eq!(recurrent.recurrent_state_shape(), [8, 4, 3]);
+        assert!(RecurrentParameterGroupSchema::new(7, 2, 4, 3).is_err());
     }
 }

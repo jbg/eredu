@@ -8,12 +8,20 @@
 
 /// Shared decoder mechanics used by backend-neutral text architectures.
 pub mod decoder;
+/// Shared assembly for heterogeneous stateful text decoders.
+pub mod hybrid_decoder;
 
 /// DeepSeek V3/R1 and V4 compressed-attention decoder family.
 pub mod deepseek;
 
 /// Llama and Mistral-compatible decoder architecture.
 pub mod llama;
+
+/// Kimi Linear hybrid KDA/MLA decoder family.
+pub mod kimi_linear;
+/// LFM2 and LFM2-MoE hybrid decoder architecture.
+pub mod lfm2;
+pub mod nemotron_h;
 
 /// Qwen2, Qwen3, and Qwen3-MoE text decoder architecture.
 pub mod qwen;

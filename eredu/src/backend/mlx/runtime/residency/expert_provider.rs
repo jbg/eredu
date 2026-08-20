@@ -6,7 +6,7 @@ use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
 use safemlx::{module::Param, Array, Stream};
 
-use crate::backend::mlx::nn::moe::PackedSwiGluExperts;
+use crate::backend::mlx::nn::moe::{PackedRelu2Experts, PackedSwiGluExperts};
 use crate::backend::mlx::nn::shared::MlxBackend;
 use crate::backend::mlx::runtime::residency::expert_cache::{ExpertCache, ExpertRouteBatch};
 use crate::backend::mlx::Error;
@@ -19,6 +19,66 @@ pub(crate) struct CachedSwiGluBankSpec {
     pub(crate) gate_up_quantization: Option<WeightQuantization>,
     pub(crate) down_quantization: Option<WeightQuantization>,
     pub(crate) limit: Option<f32>,
+}
+
+/// Backend geometry and physical encoding for one cached ReLU2 bank.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CachedRelu2BankSpec {
+    pub(crate) hidden_dimensions: i32,
+    pub(crate) intermediate_dimensions: i32,
+    pub(crate) up_quantization: Option<WeightQuantization>,
+    pub(crate) down_quantization: Option<WeightQuantization>,
+}
+
+/// Executes independently cached ReLU2 experts through a layer-spec factory.
+pub(crate) struct CachedRelu2ExpertProvider<'a, F> {
+    cache: &'a ExpertCache,
+    spec_for_layer: F,
+}
+
+impl<'a, F> CachedRelu2ExpertProvider<'a, F> {
+    pub(crate) const fn new(cache: &'a ExpertCache, spec_for_layer: F) -> Self {
+        Self {
+            cache,
+            spec_for_layer,
+        }
+    }
+}
+
+impl<F> RoutedExpertProvider<MlxBackend> for CachedRelu2ExpertProvider<'_, F>
+where
+    F: FnMut(usize) -> CachedRelu2BankSpec,
+{
+    type Error = Error;
+
+    fn forward_routed(
+        &mut self,
+        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::SwiGluExpertBank,
+        _request: RoutedExpertRequest<'_, Array>,
+        _stream: &Stream,
+    ) -> Result<Array, Self::Error> {
+        Err(Error::UnsupportedArchitecture(
+            "a ReLU2 expert cache cannot execute a SwiGLU expert bank".into(),
+        ))
+    }
+
+    fn forward_relu2_routed(
+        &mut self,
+        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        request: RoutedExpertRequest<'_, Array>,
+        stream: &Stream,
+    ) -> Result<Array, Self::Error> {
+        execute_cached_relu2(
+            self.cache,
+            (self.spec_for_layer)(request.layer),
+            request.layer,
+            request.input,
+            &request.routes.expert_ids,
+            &request.routes.route_weights,
+            request.pass,
+            stream,
+        )
+    }
 }
 
 /// Executes independently cached SwiGLU experts through a layer-spec factory.
@@ -59,6 +119,17 @@ where
             stream,
         )
     }
+
+    fn forward_relu2_routed(
+        &mut self,
+        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _request: RoutedExpertRequest<'_, Array>,
+        _stream: &Stream,
+    ) -> Result<Array, Self::Error> {
+        Err(Error::UnsupportedArchitecture(
+            "a SwiGLU expert cache cannot execute a ReLU2 expert bank".into(),
+        ))
+    }
 }
 
 /// Adapts a distributed callback that owns expert acquisition and collectives.
@@ -70,6 +141,36 @@ impl<'a, F> ExpertExecutorProvider<'a, F> {
     pub(crate) const fn new(execute: &'a mut F) -> Self {
         Self { execute }
     }
+}
+
+fn execute_routed_callback<F>(
+    execute: &mut F,
+    request: RoutedExpertRequest<'_, Array>,
+    stream: &Stream,
+) -> Result<Array, safemlx::error::Exception>
+where
+    F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, safemlx::error::Exception>,
+{
+    if request.input.ndim() < 2 {
+        return Err(safemlx::error::Exception::custom(format!(
+            "routed expert input must have a hidden dimension, got {:?}",
+            request.input.shape()
+        )));
+    }
+    let original_shape = request.input.shape().to_vec();
+    let hidden = request
+        .input
+        .reshape(&[-1, request.input.dim(-1)], stream)?;
+    let expert_ids = request
+        .routes
+        .expert_ids
+        .reshape(&[-1, request.routes.expert_ids.dim(-1)], stream)?;
+    let route_weights = request
+        .routes
+        .route_weights
+        .reshape(&[-1, request.routes.route_weights.dim(-1)], stream)?;
+    let output = execute(request.layer, &hidden, &expert_ids, &route_weights, stream)?;
+    Ok(output.reshape(&original_shape, stream)?)
 }
 
 impl<F> RoutedExpertProvider<MlxBackend> for ExpertExecutorProvider<'_, F>
@@ -84,13 +185,16 @@ where
         request: RoutedExpertRequest<'_, Array>,
         stream: &Stream,
     ) -> Result<Array, Self::Error> {
-        (self.execute)(
-            request.layer,
-            request.input,
-            &request.routes.expert_ids,
-            &request.routes.route_weights,
-            stream,
-        )
+        execute_routed_callback(self.execute, request, stream)
+    }
+
+    fn forward_relu2_routed(
+        &mut self,
+        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        request: RoutedExpertRequest<'_, Array>,
+        stream: &Stream,
+    ) -> Result<Array, Self::Error> {
+        execute_routed_callback(self.execute, request, stream)
     }
 }
 
@@ -130,6 +234,17 @@ where
             &request.routes.route_weights,
             stream,
         )
+    }
+
+    fn forward_relu2_routed(
+        &mut self,
+        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _request: RoutedExpertRequest<'_, Array>,
+        _stream: &Stream,
+    ) -> Result<Array, Self::Error> {
+        Err(safemlx::error::Exception::custom(
+            "a resident SwiGLU executor cannot execute a ReLU2 expert bank",
+        ))
     }
 }
 
@@ -187,6 +302,81 @@ pub(crate) fn execute_cached_swiglu(
         },
     )?;
     Ok(output.reshape(&original_shape, stream)?)
+}
+
+/// Executes one cached ReLU2 route batch with a compact acquired bank.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_cached_relu2(
+    cache: &ExpertCache,
+    spec: CachedRelu2BankSpec,
+    layer: usize,
+    hidden: &Array,
+    expert_ids: &Array,
+    route_weights: &Array,
+    pass: ExpertPass,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let original_shape = hidden.shape().to_vec();
+    let flattened = hidden.reshape(&[-1, hidden.dim(-1)], stream)?;
+    let output = cache.execute_routes_bounded(
+        ExpertRouteBatch::new(layer, &flattened, expert_ids, route_weights, pass),
+        stream,
+        |hidden, acquired, weights, stream| {
+            let started = Instant::now();
+            let load_time = cache.weight_quantization();
+            let mut bank = PackedRelu2Experts::new(
+                acquired.identities().len() as i32,
+                spec.hidden_dimensions,
+                spec.intermediate_dimensions,
+                [
+                    load_time.or(spec.up_quantization),
+                    load_time.or(spec.down_quantization),
+                ],
+                stream,
+            )?;
+            bank.up_proj = Param::new(acquired.compact_binding("up_proj", stream)?);
+            bank.up_proj_scales =
+                Param::new(acquired.optional_compact_binding("up_proj_scales", stream)?);
+            bank.up_proj_biases =
+                Param::new(acquired.optional_compact_binding("up_proj_biases", stream)?);
+            bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+            bank.down_proj_scales =
+                Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+            bank.down_proj_biases =
+                Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+            cache.record_compact_bank(
+                acquired.pass(),
+                acquired.scratch_bytes(),
+                started.elapsed(),
+            )?;
+            Ok(bank.forward(hidden, acquired.compact_routes(), weights, stream)?)
+        },
+    )?;
+    Ok(output.reshape(&original_shape, stream)?)
+}
+
+/// Executes ReLU2 route rows already compacted by distributed ownership dispatch.
+pub(crate) fn execute_cached_relu2_dispatched(
+    cache: &ExpertCache,
+    spec: CachedRelu2BankSpec,
+    layer: usize,
+    hidden: &Array,
+    global_expert_ids: &Array,
+    pass: ExpertPass,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let expert_ids = global_expert_ids.reshape(&[-1, 1], stream)?;
+    let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+    execute_cached_relu2(
+        cache,
+        spec,
+        layer,
+        hidden,
+        &expert_ids,
+        &weights,
+        pass,
+        stream,
+    )
 }
 
 /// Executes route rows already compacted by distributed ownership dispatch.

@@ -1,15 +1,19 @@
 //! Reusable MLX realization of architecture-declared key/value state.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, ops::Range, path::Path};
 
 use eredu_core::cache::{
     LayerCachePolicy, PoolingStateComponent, PromptCacheDescriptor, PromptCacheManifest,
     PromptCacheOptions, StateTensorOwner, StateTensorRole,
 };
-use eredu_nn::{Error as ComputeError, PoolingAttentionCache, PoolingOverlap, PoolingWindows};
+use eredu_nn::{
+    AttentionCache, CompressedAttentionBlock, CompressedAttentionCache, CompressedAttentionScan,
+    CompressedAttentionState, CompressedAttentionView, Error as ComputeError,
+    PoolingAttentionCache, PoolingOverlap, PoolingWindows,
+};
 use eredu_runtime::{
-    CacheResidencyReport, LayerRuntimeState, RuntimeLayerState, RuntimeState, StateError,
-    StateLayout,
+    CacheResidencyReport, LayerRuntimeState, RuntimeLayerState, RuntimeState,
+    RuntimeStateComponents, StateError, StateLayout,
 };
 use safemlx::{
     error::Exception,
@@ -25,10 +29,12 @@ use crate::{
         nn::shared::MlxBackend,
         runtime::cache::{
             kv::{
-                ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, PoolingCacheState,
-                RetainedArrayIter,
+                CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+                PoolingCacheState, RetainedArrayIter,
             },
-            residency::{CacheResidencyManager, PromptCacheStateArray},
+            residency::{
+                CacheResidencyManager, LoadedPromptCacheStateTensor, PromptCacheStateArray,
+            },
             LiveKeyValueCache, PoolingCache,
         },
     },
@@ -559,15 +565,15 @@ impl MlxKeyValueLayerState {
 impl KeyValueCache for MlxKeyValueLayerState {
     fn offset(&self) -> i32 {
         match self {
-            Self::Device(cache) => cache.offset(),
-            Self::Paged(cache) => cache.offset(),
+            Self::Device(cache) => KeyValueCache::offset(cache),
+            Self::Paged(cache) => KeyValueCache::offset(cache),
         }
     }
 
     fn max_size(&self) -> Option<i32> {
         match self {
-            Self::Device(cache) => cache.max_size(),
-            Self::Paged(cache) => cache.max_size(),
+            Self::Device(cache) => KeyValueCache::max_size(cache),
+            Self::Paged(cache) => KeyValueCache::max_size(cache),
         }
     }
 
@@ -603,8 +609,8 @@ impl KeyValueCache for MlxKeyValueLayerState {
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         match self {
-            Self::Device(cache) => cache.update_for_attention(keys, values, stream),
-            Self::Paged(cache) => cache.update_for_attention(keys, values, stream),
+            Self::Device(cache) => KeyValueCache::update_for_attention(cache, keys, values, stream),
+            Self::Paged(cache) => KeyValueCache::update_for_attention(cache, keys, values, stream),
         }
     }
 
@@ -777,6 +783,849 @@ fn key_value_window(layer: usize, policy: &LayerCachePolicy) -> Result<Option<i3
             .map_err(|error| Exception::custom(error.to_string())),
         _ => Err(Exception::custom(format!(
             "MLX key/value state cannot realize non-key/value policy at layer {layer}: {policy:?}"
+        ))),
+    }
+}
+
+/// Append-only attention state selected independently from fixed components.
+#[derive(Debug, Clone)]
+enum MlxHybridAttentionState {
+    KeyValue(MlxKeyValueLayerState),
+    Compressed(CompressedLatentCache),
+}
+
+impl MlxHybridAttentionState {
+    fn deep_clone_state(&self) -> Result<Self, Exception> {
+        match self {
+            Self::KeyValue(MlxKeyValueLayerState::Device(cache)) => cache
+                .deep_clone_state()
+                .map(MlxKeyValueLayerState::Device)
+                .map(Self::KeyValue),
+            Self::KeyValue(MlxKeyValueLayerState::Paged(cache)) => cache
+                .deep_clone_state()
+                .map(MlxKeyValueLayerState::Paged)
+                .map(Self::KeyValue),
+            Self::Compressed(cache) => cache.deep_clone_state().map(Self::Compressed),
+        }
+    }
+
+    fn offset(&self) -> i32 {
+        match self {
+            Self::KeyValue(cache) => AttentionCache::offset(cache),
+            Self::Compressed(cache) => CompressedAttentionCache::offset(cache),
+        }
+    }
+
+    fn clear(&mut self) -> Result<(), Exception> {
+        match self {
+            Self::KeyValue(cache) => cache.clear(),
+            Self::Compressed(cache) => CompressedAttentionCache::clear(cache)
+                .map_err(|error| Exception::custom(error.to_string())),
+        }
+    }
+
+    fn retained_values(&self) -> Vec<&Array> {
+        match self {
+            Self::KeyValue(cache) => {
+                RuntimeLayerState::<MlxBackend>::retained_values(cache).collect()
+            }
+            Self::Compressed(cache) => {
+                RuntimeLayerState::<MlxBackend>::retained_values(cache).collect()
+            }
+        }
+    }
+
+    fn manager(&self) -> Option<&CacheResidencyManager> {
+        match self {
+            Self::KeyValue(MlxKeyValueLayerState::Paged(cache)) => Some(cache.manager()),
+            Self::Compressed(cache) => cache.residency_manager(),
+            Self::KeyValue(MlxKeyValueLayerState::Device(_)) => None,
+        }
+    }
+
+    fn finalize(&mut self) -> Result<(), Exception> {
+        match self {
+            Self::KeyValue(MlxKeyValueLayerState::Paged(cache)) => cache.finalize(),
+            Self::Compressed(cache) if cache.is_paged() => cache.finalize(),
+            _ => Err(Exception::custom(
+                "prompt-cache persistence requires paged attention state",
+            )),
+        }
+    }
+
+    fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
+        match (self, checkpoint) {
+            (
+                Self::KeyValue(MlxKeyValueLayerState::Device(current)),
+                Self::KeyValue(MlxKeyValueLayerState::Device(previous)),
+            ) => match previous.snapshot_arrays(stream)? {
+                Some((keys, values)) => {
+                    current.restore_resident(keys, values, KeyValueCache::offset(previous))
+                }
+                None => {
+                    current.clear();
+                    Ok(())
+                }
+            },
+            (
+                Self::KeyValue(MlxKeyValueLayerState::Paged(current)),
+                Self::KeyValue(MlxKeyValueLayerState::Paged(previous)),
+            ) => current.restore_checkpoint(previous, stream),
+            (Self::Compressed(current), Self::Compressed(previous)) => current
+                .restore(&previous.checkpoint(), stream)
+                .map_err(|error| Exception::custom(error.to_string())),
+            _ => Err(Exception::custom(
+                "hybrid attention checkpoint representation changed",
+            )),
+        }
+    }
+}
+
+/// One MLX realization of a heterogeneous attention/fixed-state layer.
+#[derive(Debug, Clone)]
+pub struct MlxHybridLayerState {
+    attention: Option<MlxHybridAttentionState>,
+    fixed: BTreeMap<StateTensorRole, Option<Array>>,
+    fixed_offset: i32,
+}
+
+impl MlxHybridLayerState {
+    fn deep_clone_state(&self) -> Result<Self, Exception> {
+        let attention = self
+            .attention
+            .as_ref()
+            .map(MlxHybridAttentionState::deep_clone_state)
+            .transpose()?;
+        let fixed = self
+            .fixed
+            .iter()
+            .map(|(role, value)| {
+                value
+                    .as_ref()
+                    .map(|array| array.clone().deep_clone())
+                    .transpose()
+                    .map(|value| (*role, value))
+            })
+            .collect::<Result<_, Exception>>()?;
+        Ok(Self {
+            attention,
+            fixed,
+            fixed_offset: self.fixed_offset,
+        })
+    }
+
+    /// Reconstitutes a layer from stage-local compressed-attention and fixed state.
+    pub(crate) fn from_pipeline_parts(
+        compressed: Option<CompressedLatentCache>,
+        fixed: BTreeMap<StateTensorRole, Option<Array>>,
+        fixed_offset: i32,
+    ) -> Self {
+        Self {
+            attention: compressed.map(MlxHybridAttentionState::Compressed),
+            fixed,
+            fixed_offset,
+        }
+    }
+
+    /// Returns stage-local components after a neutral block has advanced them.
+    pub(crate) fn into_pipeline_parts(
+        self,
+    ) -> (
+        Option<CompressedLatentCache>,
+        BTreeMap<StateTensorRole, Option<Array>>,
+        i32,
+    ) {
+        let compressed = match self.attention {
+            Some(MlxHybridAttentionState::Compressed(cache)) => Some(cache),
+            None => None,
+            Some(MlxHybridAttentionState::KeyValue(_)) => {
+                unreachable!("compressed pipeline state cannot contain key/value attention")
+            }
+        };
+        (compressed, self.fixed, self.fixed_offset)
+    }
+
+    fn device(layer: usize, policy: &LayerCachePolicy) -> Result<Self, Exception> {
+        let attention = hybrid_attention_policy(layer, policy)?.map(|policy| match policy {
+            HybridAttentionPolicy::KeyValue(window) => {
+                MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(match window {
+                    Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
+                    None => ConcatKeyValueCache::new(),
+                }))
+            }
+            HybridAttentionPolicy::Compressed => {
+                MlxHybridAttentionState::Compressed(CompressedLatentCache::new())
+            }
+        });
+        Ok(Self {
+            attention,
+            fixed: policy
+                .fixed_state()
+                .iter()
+                .map(|tensor| (tensor.role, None))
+                .collect(),
+            fixed_offset: 0,
+        })
+    }
+
+    fn paged(
+        layer: usize,
+        policy: &LayerCachePolicy,
+        manager: &CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let attention = hybrid_attention_policy(layer, policy)?
+            .map(|policy| match policy {
+                HybridAttentionPolicy::KeyValue(window) => {
+                    PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
+                        .map(MlxKeyValueLayerState::Paged)
+                        .map(MlxHybridAttentionState::KeyValue)
+                }
+                HybridAttentionPolicy::Compressed => {
+                    CompressedLatentCache::new_paged(manager.clone(), layer, rank)
+                        .map(MlxHybridAttentionState::Compressed)
+                }
+            })
+            .transpose()?;
+        Ok(Self {
+            attention,
+            fixed: policy
+                .fixed_state()
+                .iter()
+                .map(|tensor| (tensor.role, None))
+                .collect(),
+            fixed_offset: 0,
+        })
+    }
+
+    /// Clears attention and fixed components while retaining their policies.
+    pub fn clear(&mut self) -> Result<(), Exception> {
+        if let Some(attention) = &mut self.attention {
+            attention.clear()?;
+        }
+        for component in self.fixed.values_mut() {
+            *component = None;
+        }
+        self.fixed_offset = 0;
+        Ok(())
+    }
+}
+
+impl RuntimeLayerState<MlxBackend> for MlxHybridLayerState {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn retained_values(&self) -> Self::RetainedValues<'_> {
+        let mut retained = self
+            .attention
+            .as_ref()
+            .map(MlxHybridAttentionState::retained_values)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        retained.extend(self.fixed.values().filter_map(Option::as_ref));
+        retained.into_iter()
+    }
+}
+
+impl RuntimeStateComponents<MlxBackend> for MlxHybridLayerState {
+    fn position(&self) -> i32 {
+        self.attention
+            .as_ref()
+            .map_or(self.fixed_offset, MlxHybridAttentionState::offset)
+    }
+
+    fn fixed_component(&mut self, role: StateTensorRole) -> Result<&mut Option<Array>, StateError> {
+        self.fixed
+            .get_mut(&role)
+            .ok_or(StateError::UnknownComponent { role })
+    }
+
+    fn advance_fixed(&mut self, tokens: i32) -> Result<(), StateError> {
+        if self.attention.is_some() {
+            return Err(StateError::InvalidAdvance(
+                "attention-backed layers advance through cache append".into(),
+            ));
+        }
+        if tokens <= 0 {
+            return Err(StateError::InvalidAdvance(format!(
+                "token count must be positive, got {tokens}"
+            )));
+        }
+        self.fixed_offset = self.fixed_offset.checked_add(tokens).ok_or_else(|| {
+            StateError::InvalidAdvance("fixed-state token frontier overflowed".into())
+        })?;
+        Ok(())
+    }
+}
+
+impl AttentionCache<Array> for MlxHybridLayerState {
+    fn offset(&self) -> i32 {
+        self.position()
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        match self.attention.as_ref() {
+            Some(MlxHybridAttentionState::KeyValue(cache)) => AttentionCache::max_size(cache),
+            _ => None,
+        }
+    }
+
+    fn update_for_attention(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), ComputeError> {
+        AttentionCache::update_for_attention(
+            match self.attention.as_mut() {
+                Some(MlxHybridAttentionState::KeyValue(cache)) => cache,
+                _ => {
+                    return Err(ComputeError::backend(
+                        "layer has no key/value attention cache",
+                    ))
+                }
+            },
+            keys,
+            values,
+            stream,
+        )
+    }
+
+    fn attention(
+        &mut self,
+        queries: Array,
+        keys: Array,
+        values: Array,
+        scale: f32,
+        mask: Option<&Array>,
+        stream: &Stream,
+    ) -> Result<Array, ComputeError> {
+        AttentionCache::attention(
+            match self.attention.as_mut() {
+                Some(MlxHybridAttentionState::KeyValue(cache)) => cache,
+                _ => {
+                    return Err(ComputeError::backend(
+                        "layer has no key/value attention cache",
+                    ))
+                }
+            },
+            queries,
+            keys,
+            values,
+            scale,
+            mask,
+            stream,
+        )
+    }
+}
+
+impl CompressedAttentionCache<Array> for MlxHybridLayerState {
+    type Checkpoint = CompressedLatentCache;
+
+    fn offset(&self) -> i32 {
+        self.position()
+    }
+
+    fn is_paged(&self) -> bool {
+        matches!(
+            self.attention.as_ref(),
+            Some(MlxHybridAttentionState::Compressed(cache)) if cache.is_paged()
+        )
+    }
+
+    fn append(
+        &mut self,
+        state: CompressedAttentionState<Array>,
+        context: &Stream,
+    ) -> Result<CompressedAttentionView<Array>, ComputeError> {
+        match self.attention.as_mut() {
+            Some(MlxHybridAttentionState::Compressed(cache)) => cache.append(state, context),
+            _ => Err(ComputeError::backend(
+                "layer has no compressed-latent attention cache",
+            )),
+        }
+    }
+
+    fn visit_blocks<F>(
+        &mut self,
+        query_tokens: i32,
+        context: &Stream,
+        visitor: F,
+    ) -> Result<CompressedAttentionScan, ComputeError>
+    where
+        F: FnMut(CompressedAttentionBlock<Array>) -> Result<u64, ComputeError>,
+    {
+        match self.attention.as_mut() {
+            Some(MlxHybridAttentionState::Compressed(cache)) => {
+                cache.visit_blocks(query_tokens, context, visitor)
+            }
+            _ => Err(ComputeError::backend(
+                "layer has no compressed-latent attention cache",
+            )),
+        }
+    }
+
+    fn checkpoint(&self) -> Self::Checkpoint {
+        match self.attention.as_ref() {
+            Some(MlxHybridAttentionState::Compressed(cache)) => cache.checkpoint(),
+            _ => panic!("layer has no compressed-latent attention cache"),
+        }
+    }
+
+    fn restore(
+        &mut self,
+        checkpoint: &Self::Checkpoint,
+        context: &Stream,
+    ) -> Result<(), ComputeError> {
+        match self.attention.as_mut() {
+            Some(MlxHybridAttentionState::Compressed(cache)) => cache.restore(checkpoint, context),
+            _ => Err(ComputeError::backend(
+                "layer has no compressed-latent attention cache",
+            )),
+        }
+    }
+
+    fn finalize(&mut self) -> Result<(), ComputeError> {
+        match self.attention.as_mut() {
+            Some(MlxHybridAttentionState::Compressed(cache)) => {
+                CompressedAttentionCache::finalize(cache)
+            }
+            _ => Err(ComputeError::backend(
+                "layer has no compressed-latent attention cache",
+            )),
+        }
+    }
+
+    fn clear(&mut self) -> Result<(), ComputeError> {
+        match self.attention.as_mut() {
+            Some(MlxHybridAttentionState::Compressed(cache)) => {
+                CompressedAttentionCache::clear(cache)
+            }
+            _ => Err(ComputeError::backend(
+                "layer has no compressed-latent attention cache",
+            )),
+        }
+    }
+}
+
+/// MLX state realization for a schedule mixing attention and fixed components.
+#[derive(Debug, Clone)]
+pub struct MlxHybridState {
+    layout: StateLayout,
+    layers: Vec<MlxHybridLayerState>,
+}
+
+impl MlxHybridState {
+    /// Creates device-resident attention and fixed state from a neutral layout.
+    pub fn device(layout: StateLayout) -> Result<Self, Exception> {
+        let layers = layout
+            .layers()
+            .iter()
+            .enumerate()
+            .map(|(layer, policy)| MlxHybridLayerState::device(layer, policy))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { layout, layers })
+    }
+
+    /// Creates paged attention with device-resident fixed components.
+    pub fn paged(
+        layout: StateLayout,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let layers = layout
+            .layers()
+            .iter()
+            .enumerate()
+            .map(|(layer, policy)| MlxHybridLayerState::paged(layer, policy, &manager, rank))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { layout, layers })
+    }
+
+    /// Returns the common absolute token frontier.
+    pub fn offset(&self) -> i32 {
+        self.layers
+            .first()
+            .map_or(0, RuntimeStateComponents::position)
+    }
+
+    /// Clears every heterogeneous component.
+    pub fn clear(&mut self) -> Result<(), Exception> {
+        for layer in &mut self.layers {
+            layer.clear()?;
+        }
+        Ok(())
+    }
+
+    /// Creates an independently advanceable speculative fork.
+    ///
+    /// Mutable device arrays are copied. Paged forks share only immutable
+    /// sealed blocks and the architecture-independent residency manager.
+    pub(crate) fn deep_clone_state(&self) -> Result<Self, Exception> {
+        Ok(Self {
+            layout: self.layout.clone(),
+            layers: self
+                .layers
+                .iter()
+                .map(MlxHybridLayerState::deep_clone_state)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// Restores append-only and fixed state to an exact speculative checkpoint.
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        if self.layout != checkpoint.layout || self.layers.len() != checkpoint.layers.len() {
+            return Err(Exception::custom(
+                "hybrid state checkpoint layout does not match canonical state",
+            ));
+        }
+        for (current, previous) in self.layers.iter_mut().zip(&checkpoint.layers) {
+            match (&mut current.attention, &previous.attention) {
+                (Some(current), Some(previous)) => {
+                    current.restore_checkpoint(previous, stream)?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(Exception::custom(
+                        "hybrid state checkpoint attention policy changed",
+                    ))
+                }
+            }
+            current.fixed.clone_from(&previous.fixed);
+            current.fixed_offset = previous.fixed_offset;
+        }
+        Ok(())
+    }
+
+    /// Commits a contiguous architecture-owned execution-group state range.
+    pub(crate) fn commit_layer_range_from(
+        &mut self,
+        source: &Self,
+        start: usize,
+    ) -> Result<(), Exception> {
+        if self.layout != source.layout || start > self.layers.len() {
+            return Err(Exception::custom(
+                "hybrid draft state layout does not match canonical state",
+            ));
+        }
+        self.layers[start..].clone_from_slice(&source.layers[start..]);
+        Ok(())
+    }
+
+    /// Returns aggregate telemetry when this state contains paged attention.
+    pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        self.layers
+            .iter()
+            .filter_map(|layer| layer.attention.as_ref())
+            .find_map(MlxHybridAttentionState::manager)
+            .map(CacheResidencyManager::report)
+            .transpose()
+            .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    /// Restores all fixed components materialized from a validated manifest.
+    pub(crate) fn restore_prompt_cache_state(
+        &mut self,
+        tensors: Vec<LoadedPromptCacheStateTensor>,
+        processed_tokens: i32,
+        layer_prefix_offsets: &[i32],
+    ) -> Result<(), Exception> {
+        if processed_tokens < 0 {
+            return Err(Exception::custom(format!(
+                "prompt-cache token frontier must be non-negative, got {processed_tokens}"
+            )));
+        }
+        if layer_prefix_offsets.len() != self.layers.len() {
+            return Err(Exception::custom(format!(
+                "prompt-cache supplied {} layer frontiers for {} hybrid state layers",
+                layer_prefix_offsets.len(),
+                self.layers.len()
+            )));
+        }
+        let mut tensors = tensors
+            .into_iter()
+            .map(|tensor| ((tensor.owner, tensor.role), tensor.array))
+            .collect::<BTreeMap<_, _>>();
+        for (layer, ((state, policy), delta)) in self
+            .layers
+            .iter_mut()
+            .zip(self.layout.layers().iter())
+            .zip(layer_prefix_offsets)
+            .enumerate()
+        {
+            let frontier = processed_tokens.checked_add(*delta).ok_or_else(|| {
+                Exception::custom(format!(
+                    "prompt-cache frontier overflowed at hybrid state layer {layer}"
+                ))
+            })?;
+            if frontier < 0 {
+                return Err(Exception::custom(format!(
+                    "prompt-cache frontier is negative at hybrid state layer {layer}"
+                )));
+            }
+            for (role, slot) in &mut state.fixed {
+                let owner = StateTensorOwner::Layer(layer);
+                let restored = tensors.remove(&(owner, *role));
+                let state_policy = policy
+                    .fixed_state()
+                    .iter()
+                    .find(|candidate| candidate.role == *role)
+                    .expect("realized fixed state comes from its canonical policy");
+                if restored.is_none()
+                    && frontier != 0
+                    && state_policy.is_required_for(frontier as usize)
+                {
+                    return Err(Exception::custom(format!(
+                        "prompt cache is missing required fixed state {owner:?}/{role:?}"
+                    )));
+                }
+                *slot = restored;
+            }
+            if state.attention.is_none() {
+                state.fixed_offset = frontier;
+            }
+        }
+        if let Some(((owner, role), _)) = tensors.into_iter().next() {
+            return Err(Exception::custom(format!(
+                "prompt cache contains undeclared fixed state {owner:?}/{role:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Restores one architecture-owned state range from a shared prompt catalog.
+    pub(crate) fn restore_prompt_cache_state_range(
+        &mut self,
+        tensors: &mut BTreeMap<(StateTensorOwner, StateTensorRole), Array>,
+        range: Range<usize>,
+        processed_tokens: i32,
+        layer_prefix_offsets: &[i32],
+    ) -> Result<(), Exception> {
+        if range.end > self.layers.len() || layer_prefix_offsets.len() != range.len() {
+            return Err(Exception::custom(
+                "prompt-cache state range does not match hybrid state layout",
+            ));
+        }
+        for (relative, layer) in range.enumerate() {
+            let state = &mut self.layers[layer];
+            let policy = self
+                .layout
+                .layers()
+                .get(layer)
+                .expect("validated hybrid state range is inside its layout");
+            let frontier = processed_tokens
+                .checked_add(layer_prefix_offsets[relative])
+                .ok_or_else(|| Exception::custom("prompt-cache layer frontier overflowed"))?;
+            if frontier < 0 {
+                return Err(Exception::custom(format!(
+                    "prompt-cache frontier is negative at hybrid state layer {layer}"
+                )));
+            }
+            for (role, slot) in &mut state.fixed {
+                let owner = StateTensorOwner::Layer(layer);
+                let restored = tensors.remove(&(owner, *role));
+                let state_policy = policy
+                    .fixed_state()
+                    .iter()
+                    .find(|candidate| candidate.role == *role)
+                    .expect("realized fixed state comes from its canonical policy");
+                if restored.is_none()
+                    && frontier != 0
+                    && state_policy.is_required_for(frontier as usize)
+                {
+                    return Err(Exception::custom(format!(
+                        "prompt cache is missing required fixed state {owner:?}/{role:?}"
+                    )));
+                }
+                *slot = restored;
+            }
+            if state.attention.is_none() {
+                state.fixed_offset = frontier;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalizes and catalogs fixed tensors for one architecture-owned range.
+    pub(crate) fn prompt_cache_state_arrays_range(
+        &mut self,
+        range: Range<usize>,
+        processed_tokens: i32,
+        layer_prefix_offsets: &[i32],
+    ) -> Result<Vec<PromptCacheStateArray<'_>>, Exception> {
+        if range.end > self.layers.len() || layer_prefix_offsets.len() != range.len() {
+            return Err(Exception::custom(
+                "prompt-cache state range does not match hybrid state layout",
+            ));
+        }
+        for (relative, layer) in range.clone().enumerate() {
+            let state = &mut self.layers[layer];
+            let frontier = processed_tokens
+                .checked_add(layer_prefix_offsets[relative])
+                .ok_or_else(|| Exception::custom("prompt-cache layer frontier overflowed"))?;
+            if frontier < 0 || state.position() != frontier {
+                return Err(Exception::custom(format!(
+                    "hybrid state layer {layer} is at {}, expected prefix frontier {frontier}",
+                    state.position()
+                )));
+            }
+            if let Some(attention) = &mut state.attention {
+                attention.finalize()?;
+                if attention.manager().is_none() {
+                    return Err(Exception::custom(
+                        "prompt persistence requires paged hybrid attention state",
+                    ));
+                }
+            }
+        }
+        Ok(range
+            .flat_map(|layer| {
+                self.layers[layer]
+                    .fixed
+                    .iter()
+                    .filter_map(move |(role, value)| {
+                        value.as_ref().map(|array| PromptCacheStateArray {
+                            owner: StateTensorOwner::Layer(layer),
+                            role: *role,
+                            array,
+                        })
+                    })
+            })
+            .collect())
+    }
+
+    /// Finalizes paged attention and persists every declared fixed component.
+    pub fn save_prompt_cache(
+        &mut self,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Exception> {
+        let expected = i32::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("prompt-cache prefix length exceeds i32"))?;
+        if descriptor.layer_prefix_offsets.len() != self.layers.len() {
+            return Err(Exception::custom(format!(
+                "prompt-cache descriptor supplied {} layer frontiers for {} hybrid state layers",
+                descriptor.layer_prefix_offsets.len(),
+                self.layers.len()
+            )));
+        }
+        let mut manager = None;
+        for (layer, (state, delta)) in self
+            .layers
+            .iter_mut()
+            .zip(&descriptor.layer_prefix_offsets)
+            .enumerate()
+        {
+            let layer_expected = expected.checked_add(*delta).ok_or_else(|| {
+                Exception::custom(format!(
+                    "prompt-cache frontier overflowed at hybrid state layer {layer}"
+                ))
+            })?;
+            if layer_expected < 0 || state.position() != layer_expected {
+                return Err(Exception::custom(format!(
+                    "hybrid state layer {layer} is at {}, expected prefix frontier {layer_expected}",
+                    state.position(),
+                )));
+            }
+            if let Some(attention) = &mut state.attention {
+                attention.finalize()?;
+                manager.get_or_insert_with(|| {
+                    attention
+                        .manager()
+                        .expect("finalized paged attention has a manager")
+                        .clone()
+                });
+            }
+        }
+        let state_arrays = self
+            .layers
+            .iter()
+            .enumerate()
+            .flat_map(|(layer, state)| {
+                state.fixed.iter().filter_map(move |(role, value)| {
+                    value.as_ref().map(|array| PromptCacheStateArray {
+                        owner: StateTensorOwner::Layer(layer),
+                        role: *role,
+                        array,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        manager
+            .ok_or_else(|| Exception::custom("cannot persist hybrid state without attention"))?
+            .save_prompt_cache(
+                destination,
+                descriptor,
+                prefix_token_ids,
+                &state_arrays,
+                options,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))
+    }
+}
+
+impl RuntimeState<MlxBackend> for MlxHybridState {
+    type RetainedValues<'a> = std::vec::IntoIter<&'a Array>;
+
+    fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    fn retained_values(
+        &self,
+        ordinal: usize,
+        _address: eredu_runtime::ExecutionUnitAddress,
+    ) -> Result<Self::RetainedValues<'_>, StateError> {
+        self.layers
+            .get(ordinal)
+            .map(RuntimeLayerState::retained_values)
+            .ok_or(StateError::UnknownLayer {
+                layer: ordinal,
+                count: self.layers.len(),
+            })
+    }
+}
+
+impl LayerRuntimeState<MlxBackend> for MlxHybridState {
+    type LayerState = MlxHybridLayerState;
+
+    fn layer(&mut self, layer: usize) -> Result<&mut Self::LayerState, StateError> {
+        let count = self.layers.len();
+        self.layers
+            .get_mut(layer)
+            .ok_or(StateError::UnknownLayer { layer, count })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HybridAttentionPolicy {
+    KeyValue(Option<i32>),
+    Compressed,
+}
+
+fn hybrid_attention_policy(
+    layer: usize,
+    policy: &LayerCachePolicy,
+) -> Result<Option<HybridAttentionPolicy>, Exception> {
+    match policy {
+        LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => Ok(None),
+        LayerCachePolicy::KeyValue { attention, .. }
+        | LayerCachePolicy::KeyValueWithFixedState { attention, .. } => attention
+            .sliding_window_i32()
+            .map(HybridAttentionPolicy::KeyValue)
+            .map(Some)
+            .map_err(|error| Exception::custom(error.to_string())),
+        LayerCachePolicy::CompressedLatentRotary { .. } => {
+            Ok(Some(HybridAttentionPolicy::Compressed))
+        }
+        other => Err(Exception::custom(format!(
+            "MLX hybrid state does not support cache policy at layer {layer}: {other:?}"
         ))),
     }
 }

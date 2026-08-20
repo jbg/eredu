@@ -1,79 +1,16 @@
-//! Architecture-owned checkpoint contracts for Kimi Linear.
+//! Pure Kimi Linear SafeTensors/GGUF checkpoint plans.
 
-//!
-//! Kimi Linear owns its alternating KDA/MLA geometry, expert layouts, aliases,
-//! and quantization policy. The generic runtime only evaluates these physical
-//! constraints and materializes architecture-supplied recipes.
-
+use eredu_checkpoint::schema::{
+    AlternativeLayoutGroup, CatalogPolicy, DepthwiseConvolutionSchema, GgufCheckpointPlan,
+    GgufTensorConstraint, GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
+    SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
+};
 use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
-use std::collections::HashMap;
+use super::{AttentionKind, FeedForwardPolicy, ModelArgs};
 
-use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
-use serde_json::Value;
-
-use super::model::{self, AttentionKind, FeedForwardPolicy, ModelArgs};
-use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
-use eredu_checkpoint::schema::{
-    AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
-    GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-    StoredDtypeConstraint, TensorOperation,
-};
-use eredu_checkpoint::store::WeightStore;
-use eredu_checkpoint::validation;
-use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
-
-pub(crate) fn validate_safetensors(
-    config: &Value,
-    store: &SafetensorsWeightStore,
-) -> CheckpointValidation {
-    let args = match model::model_args_from_config_value(config) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if args.num_hidden_layers as usize > store.keys().len() {
-        return invalid_geometry(format!(
-            "configured layer count {} exceeds the entire {}-tensor checkpoint catalog",
-            args.num_hidden_layers,
-            store.keys().len()
-        ));
-    }
-    let plan = match safetensors_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    let mut issues = Vec::new();
-    if args.quantization.is_some() {
-        for (layer, policy) in args.layer_schedule.iter().enumerate() {
-            if policy.feed_forward != FeedForwardPolicy::SparseMoe {
-                continue;
-            }
-            let split = format!("model.layers.{layer}.mlp.experts.0.w1.weight");
-            if let Some(raw) = store
-                .keys()
-                .into_iter()
-                .find(|key| canonical_name(key) == split)
-            {
-                issues.push(CheckpointIssue {
-                    kind: CheckpointIssueKind::ConflictingLayout,
-                    detail: format!(
-                        "checkpoint-native quantized Kimi Linear layer {layer} requires packed expert banks"
-                    ),
-                    tensor_name: Some(raw),
-                    tensor_type_code: None,
-                    metadata_key: Some("quantization".into()),
-                });
-            }
-        }
-    }
-    append_validation(
-        validation::validate_safetensors_plan(store, &plan),
-        &mut issues,
-    );
-    finish(issues)
-}
-
-pub(crate) fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
+/// Builds the strict SafeTensors catalog plan.
+pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
     let hidden = dimension(args.hidden_size, "hidden size")?;
     let vocab = dimension(args.vocab_size, "vocabulary size")?;
     let mut common = Vec::new();
@@ -156,9 +93,10 @@ fn add_safe_kda(
         safe_aliases(&format!("{prefix}.o_norm.weight"), vec![head]),
     ]);
     let convolution_elements = checked_mul(projection, kernel, "KDA convolution elements")?;
+    let convolution = DepthwiseConvolutionSchema::new(projection, kernel, false)?;
     for name in ["q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"] {
         output.push(
-            safe_aliases(&format!("{prefix}.{name}"), vec![projection, 1, kernel])
+            safe_aliases(&format!("{prefix}.{name}"), convolution.storage_shape())
                 .with_element_count(convolution_elements),
         );
     }
@@ -465,51 +403,8 @@ fn outer_prefix(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-fn canonical_name(name: &str) -> String {
-    name.replace(".block_sparse_moe.", ".mlp.")
-        .replace(".inner.weight", ".weight")
-}
-
-pub(crate) fn validate_gguf(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> CheckpointValidation {
-    if let Err(error) = checkpoint
-        .catalog()
-        .translated_outputs(model::translate_gguf_weight_name)
-    {
-        return invalid_geometry(error.to_string());
-    }
-    let args = match model::model_args_from_gguf_catalog(checkpoint, metadata) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    if let Err(error) = args.validate() {
-        return invalid_geometry(error.to_string());
-    }
-    let plan = match gguf_plan(&args) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    let mut issues = Vec::new();
-    append_validation(
-        validation::validate_gguf_plan(checkpoint, &plan),
-        &mut issues,
-    );
-    issues.extend(validation::validate_matching_gguf_encodings(
-        checkpoint,
-        (0..args.num_hidden_layers as usize).map(|layer| {
-            (
-                format!("blk.{layer}.ffn_gate_exps.weight"),
-                format!("blk.{layer}.ffn_up_exps.weight"),
-            )
-        }),
-        "Kimi Linear GGUF",
-    ));
-    finish(issues)
-}
-
-pub(crate) fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
+/// Builds the GGUF physical catalog plan.
+pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
     let hidden = dimension(args.hidden_size, "hidden size")?;
     let vocab = dimension(args.vocab_size, "vocabulary size")?;
     let mut tensors = vec![
@@ -814,58 +709,173 @@ fn checked_mul(left: usize, right: usize, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("Kimi Linear {name} geometry overflows"))
 }
 
-fn append_validation(validation: CheckpointValidation, issues: &mut Vec<CheckpointIssue>) {
-    match validation {
-        CheckpointValidation::Exact => {}
-        CheckpointValidation::Invalid(mut found) => issues.append(&mut found),
-        CheckpointValidation::Unverified(issue) => issues.push(issue),
+/// Translates a physical GGUF tensor name to canonical Kimi parameter identity.
+pub fn translate_gguf_weight_name(name: &str) -> String {
+    for (source, target) in [
+        ("token_embd", "model.embed_tokens"),
+        ("output_norm", "model.norm"),
+        ("output", "lm_head"),
+    ] {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            return name.replacen(source, target, 1);
+        }
     }
-}
-
-fn finish(issues: Vec<CheckpointIssue>) -> CheckpointValidation {
-    if issues.is_empty() {
-        CheckpointValidation::Exact
-    } else {
-        CheckpointValidation::Invalid(issues)
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return name.to_owned();
+    };
+    let Some((layer, parameter)) = rest.split_once('.') else {
+        return name.to_owned();
+    };
+    for (source, target) in [
+        ("ffn_gate_exps", "mlp.experts.gate_proj"),
+        ("ffn_up_exps", "mlp.experts.up_proj"),
+        ("ffn_down_exps", "mlp.experts.down_proj"),
+    ] {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            let suffix = match parameter.strip_prefix(source).unwrap_or_default() {
+                ".weight" => "",
+                ".scales" => "_scales",
+                ".biases" => "_biases",
+                other => other,
+            };
+            return format!("model.layers.{layer}.{target}{suffix}");
+        }
     }
-}
-
-fn invalid_geometry(detail: String) -> CheckpointValidation {
-    CheckpointValidation::Invalid(vec![CheckpointIssue {
-        kind: CheckpointIssueKind::InvalidGeometry,
-        detail,
-        tensor_name: None,
-        tensor_type_code: None,
-        metadata_key: None,
-    }])
+    if matches!(parameter, "exp_probs_b.bias" | "ffn_exp_probs_b.bias") {
+        return format!("model.layers.{layer}.mlp.gate.e_score_correction_bias");
+    }
+    for (source, target) in [
+        ("attn_q", "self_attn.q_proj"),
+        ("attn_k", "self_attn.k_proj"),
+        ("attn_v", "self_attn.v_proj"),
+        ("attn_q_a", "self_attn.q_a_proj"),
+        ("attn_q_b", "self_attn.q_b_proj"),
+        ("attn_kv_a_mqa", "self_attn.kv_a_proj_with_mqa"),
+        ("attn_kv_b", "self_attn.kv_b_proj"),
+        ("attn_k_b", "self_attn.k_b_proj"),
+        ("attn_v_b", "self_attn.v_b_proj"),
+        ("attn_q_a_norm", "self_attn.q_a_layernorm"),
+        ("attn_kv_a_norm", "self_attn.kv_a_layernorm"),
+        ("attn_output", "self_attn.o_proj"),
+        ("ssm_conv1d_q", "self_attn.q_conv1d"),
+        ("ssm_conv1d_k", "self_attn.k_conv1d"),
+        ("ssm_conv1d_v", "self_attn.v_conv1d"),
+        ("ssm_f_a", "self_attn.f_a_proj"),
+        ("ssm_f_b", "self_attn.f_b_proj"),
+        ("ssm_beta", "self_attn.b_proj"),
+        ("ssm_g_a", "self_attn.g_a_proj"),
+        ("ssm_g_b", "self_attn.g_b_proj"),
+        ("ssm_norm", "self_attn.o_norm"),
+        ("attn_norm", "input_layernorm"),
+        ("ffn_norm", "post_attention_layernorm"),
+        ("ffn_gate", "mlp.gate_proj"),
+        ("ffn_up", "mlp.up_proj"),
+        ("ffn_down", "mlp.down_proj"),
+        ("ffn_gate_shexp", "mlp.shared_experts.gate_proj"),
+        ("ffn_up_shexp", "mlp.shared_experts.up_proj"),
+        ("ffn_down_shexp", "mlp.shared_experts.down_proj"),
+        ("ffn_gate_inp", "mlp.gate"),
+    ] {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            return format!(
+                "model.layers.{layer}.{}",
+                parameter.replacen(source, target, 1)
+            );
+        }
+    }
+    if parameter == "ssm_a" || parameter.starts_with("ssm_a.") {
+        let suffix = parameter.strip_prefix("ssm_a").unwrap_or_default();
+        let suffix = if suffix == ".weight" { "" } else { suffix };
+        return format!("model.layers.{layer}.self_attn.A_log{suffix}");
+    }
+    if parameter == "ssm_dt.bias" || parameter == "ssm_dt" {
+        return format!("model.layers.{layer}.self_attn.dt_bias");
+    }
+    name.to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_checkpoint::AffineQuantization;
+
+    fn fixture(split_kv_b: bool, q_lora_rank: Option<i32>) -> ModelArgs {
+        let mut value = serde_json::json!({
+            "model_type":"kimi_linear", "vocab_size":16, "hidden_size":12,
+            "num_hidden_layers":2, "num_attention_heads":3, "num_key_value_heads":3,
+            "intermediate_size":17, "head_dim":4, "model_max_length":64,
+            "linear_attn_config":{"kda_layers":[1],"full_attn_layers":[2],"num_heads":3,"head_dim":4,"short_conv_kernel_size":3},
+            "num_experts":2, "moe_intermediate_size":9, "kv_lora_rank":6,
+            "qk_nope_head_dim":4, "qk_rope_head_dim":2, "v_head_dim":4,
+            "mla_use_nope":true, "num_experts_per_token":1, "num_shared_experts":1,
+            "routed_scaling_factor":1.0, "first_k_dense_replace":1,
+            "num_expert_group":1, "topk_group":1, "tie_word_embeddings":false,
+            "split_kv_b": split_kv_b
+        });
+        if let Some(rank) = q_lora_rank {
+            value["q_lora_rank"] = rank.into();
+        }
+        let mut args = super::super::config::model_args_from_config_value(&value).unwrap();
+        args.split_kv_b = split_kv_b;
+        args
+    }
 
     #[test]
-    fn affine_matrix_constraints_keep_packed_storage_and_runtime_geometry_distinct() {
-        let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
-        let constraints = safe_matrix_constraints(
-            "model.layers.0.mlp.gate_proj.weight",
-            vec![8, 64],
-            Some(quantization),
-        )
-        .unwrap();
-        assert_eq!(constraints[0].shape, [8, 8]);
+    fn plans_kda_mla_low_rank_and_alternative_expert_artifacts() {
+        for (split, query_rank) in [(false, None), (true, Some(5))] {
+            let plan = safetensors_plan(&fixture(split, query_rank)).unwrap();
+            let names = plan
+                .common_tensors
+                .iter()
+                .map(|tensor| tensor.key.as_str())
+                .collect::<Vec<_>>();
+            assert!(names.contains(&"model.layers.0.self_attn.q_conv1d.weight"));
+            assert!(names.contains(&"model.layers.0.self_attn.A_log"));
+            assert_eq!(
+                names.contains(&"model.layers.1.self_attn.kv_b_proj.weight"),
+                !split
+            );
+            assert_eq!(
+                names.contains(&"model.layers.1.self_attn.k_b_proj.weight"),
+                split
+            );
+            assert_eq!(
+                names.contains(&"model.layers.1.self_attn.q_a_proj.weight"),
+                query_rank.is_some()
+            );
+            let experts = plan
+                .layout_groups
+                .iter()
+                .find(|group| group.id.contains("expert storage"))
+                .unwrap();
+            assert_eq!(
+                experts
+                    .variants
+                    .iter()
+                    .map(|variant| variant.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["packed", "split"]
+            );
+        }
+    }
+
+    #[test]
+    fn gguf_plan_and_translation_cover_hybrid_physical_names() {
+        let plan = gguf_plan(&fixture(false, None)).unwrap();
+        let names = plan
+            .common_tensors
+            .iter()
+            .map(|tensor| tensor.key.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"blk.0.ssm_conv1d_q.weight"));
+        assert!(names.contains(&"blk.1.attn_kv_b.weight"));
+        assert!(names.contains(&"blk.1.ffn_gate_exps.weight"));
         assert_eq!(
-            constraints[0].dtype,
-            StoredDtypeConstraint::Exact(StoredDtype::U32)
+            translate_gguf_weight_name("blk.0.ssm_a.weight"),
+            "model.layers.0.self_attn.A_log"
         );
-        assert_eq!(constraints[1].shape, [8, 2]);
         assert_eq!(
-            constraints[1].role,
-            eredu_checkpoint::schema::TensorRole::Companion
+            translate_gguf_weight_name("blk.1.ffn_gate_exps.scales"),
+            "model.layers.1.mlp.experts.gate_proj_scales"
         );
-        assert!(constraints[0]
-            .aliases
-            .contains(&"model.layers.0.block_sparse_moe.gate_proj.inner.weight".into()));
     }
 }

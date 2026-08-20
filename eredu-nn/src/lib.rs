@@ -942,12 +942,53 @@ pub trait SwiGluExpertBankOperator<T: Tensor>: Clone + Debug + Parameterized<T> 
     ) -> Result<T, Error>;
 }
 
+/// Complete construction specification for packed routed ReLU-squared experts.
+#[derive(Debug, Clone)]
+pub struct Relu2ExpertBankSpec {
+    /// Number of routed experts.
+    pub expert_count: i32,
+    /// Input and output hidden width.
+    pub hidden_dimensions: i32,
+    /// Per-expert intermediate width.
+    pub intermediate_dimensions: i32,
+    /// Packed up-projection identity and physical format.
+    pub up: SwiGluExpertProjection,
+    /// Packed down-projection identity and physical format.
+    pub down: SwiGluExpertProjection,
+}
+
+impl Relu2ExpertBankSpec {
+    /// Validates positive geometry.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.expert_count <= 0
+            || self.hidden_dimensions <= 0
+            || self.intermediate_dimensions <= 0
+        {
+            return Err(Error::backend("invalid ReLU2 expert-bank geometry"));
+        }
+        Ok(())
+    }
+}
+
+/// Statically dispatched routed ReLU-squared expert bank.
+pub trait Relu2ExpertBankOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
+    /// Executes selected experts and combines their outputs by route weight.
+    fn forward_routed(
+        &mut self,
+        input: &T,
+        routes: &RoutingResult<T>,
+        context: &T::Context,
+    ) -> Result<T, Error>;
+}
+
 /// Neural backend extension for routed expert architectures.
 pub trait RoutedNeuralBackend: NeuralBackend {
     /// Concrete top-k router.
     type Router: RoutingOperator<Self::Tensor>;
     /// Concrete packed or independently materialized expert bank.
     type SwiGluExpertBank: SwiGluExpertBankOperator<Self::Tensor>;
+    /// Concrete packed routed ReLU-squared expert bank.
+    type Relu2ExpertBank: Relu2ExpertBankOperator<Self::Tensor>;
 
     /// Builds a router with architecture-selected top-k semantics.
     fn top_k_router(
@@ -960,6 +1001,12 @@ pub trait RoutedNeuralBackend: NeuralBackend {
         spec: SwiGluExpertBankSpec,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::SwiGluExpertBank, Error>;
+
+    /// Builds a routed ReLU-squared expert bank.
+    fn relu2_expert_bank(
+        spec: Relu2ExpertBankSpec,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Relu2ExpertBank, Error>;
 }
 
 /// Complete construction specification for one multi-stream residual mix.
@@ -1474,6 +1521,82 @@ pub trait NeuralBackend: Sized + 'static {
         input: Self::Tensor,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
+    /// Applies the logistic sigmoid elementwise.
+    fn sigmoid(
+        input: Self::Tensor,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        let _ = (input, context);
+        Err(Error::backend("sigmoid is not implemented by this backend"))
+    }
+    /// Applies softplus elementwise.
+    fn softplus(
+        input: Self::Tensor,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        let _ = (input, context);
+        Err(Error::backend(
+            "softplus is not implemented by this backend",
+        ))
+    }
+    /// Applies the natural exponential elementwise.
+    fn exp(
+        input: Self::Tensor,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        let _ = (input, context);
+        Err(Error::backend(
+            "exponential is not implemented by this backend",
+        ))
+    }
+    /// Applies SiLU gating followed by grouped RMS normalization and scale.
+    fn gated_group_rms_norm(
+        input: &Self::Tensor,
+        gate: &Self::Tensor,
+        weight: &Self::Tensor,
+        groups: i32,
+        epsilon: f32,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        let _ = (input, gate, weight, groups, epsilon, context);
+        Err(Error::backend(
+            "gated grouped RMS normalization is not implemented by this backend",
+        ))
+    }
+    /// Adds a residual branch, optionally retaining the accumulator in FP32.
+    fn add_residual(
+        residual: &Self::Tensor,
+        branch: &Self::Tensor,
+        fp32: bool,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        let _ = fp32;
+        residual.add(branch, context)
+    }
+    /// Executes a gated-delta recurrent scan over projected head-major values.
+    ///
+    /// Inputs are `[batch, sequence, heads, dimensions]` except `beta`, which
+    /// is `[batch, sequence, heads]`. The optional initial and returned state
+    /// are `[batch, heads, dimensions, dimensions]` in FP32 semantic storage.
+    fn gated_delta_scan(
+        input: GatedDeltaScanInput<'_, Self::Tensor>,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<GatedDeltaScanOutput<Self::Tensor>, Error> {
+        let _ = (input, context);
+        Err(Error::backend(
+            "gated-delta scan is not implemented by this backend",
+        ))
+    }
+    /// Executes a grouped selective state-space recurrence in FP32 state.
+    fn selective_state_space_scan(
+        input: SelectiveStateSpaceScanInput<'_, Self::Tensor>,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<SelectiveStateSpaceScanOutput<Self::Tensor>, Error> {
+        let _ = (input, context);
+        Err(Error::backend(
+            "selective state-space scan is not implemented by this backend",
+        ))
+    }
     /// Runs sparse attention over bounded local state and caller-selected
     /// compressed positions, optionally sharing softmax normalization with
     /// learned attention sinks.
@@ -1604,6 +1727,350 @@ pub trait NeuralBackend: Sized + 'static {
         parallel: &Self::ParallelContext,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
+    /// Sums a rank-local tensor contribution across the tensor-parallel group.
+    fn sum_parallel(
+        value: Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        let _ = (value, parallel, context);
+        Err(Error::backend(
+            "tensor-parallel sum is not implemented by this backend",
+        ))
+    }
+}
+
+/// Projected inputs to one gated-delta recurrent scan.
+#[derive(Debug, Clone, Copy)]
+pub struct GatedDeltaScanInput<'a, T> {
+    /// Normalized queries `[batch, sequence, heads, dimensions]`.
+    pub query: &'a T,
+    /// Normalized keys `[batch, sequence, heads, dimensions]`.
+    pub key: &'a T,
+    /// Values `[batch, sequence, heads, dimensions]`.
+    pub value: &'a T,
+    /// Log transition decay, scalar- or vector-valued per head.
+    pub log_decay: &'a T,
+    /// Update strength `[batch, sequence, heads]`.
+    pub beta: &'a T,
+    /// Optional FP32 recurrent matrix.
+    pub initial_state: Option<&'a T>,
+}
+
+/// Final state and per-token output of a gated-delta scan.
+#[derive(Debug, Clone)]
+pub struct GatedDeltaScanOutput<T> {
+    /// FP32 recurrent state after the final token.
+    pub state: T,
+    /// Recurrent output `[batch, sequence, heads, dimensions]`.
+    pub output: T,
+}
+
+/// Projected inputs to one Mamba-style selective state-space scan.
+#[derive(Debug, Clone, Copy)]
+pub struct SelectiveStateSpaceScanInput<'a, T> {
+    /// Values `[batch, sequence, heads, head_dimensions]`.
+    pub values: &'a T,
+    /// Expanded input state vectors `[batch, sequence, heads, state_dimensions]`.
+    pub input_state: &'a T,
+    /// Expanded output state vectors `[batch, sequence, heads, state_dimensions]`.
+    pub output_state: &'a T,
+    /// Unnormalized timesteps `[batch, sequence, heads]`.
+    pub time_step: &'a T,
+    /// Per-head timestep bias `[heads]`.
+    pub time_step_bias: &'a T,
+    /// Per-head logarithmic transition magnitude `[heads]`.
+    pub transition_log: &'a T,
+    /// Per-head direct skip coefficient `[heads]`.
+    pub skip: &'a T,
+    /// Optional FP32 state `[batch, heads, head_dimensions, state_dimensions]`.
+    pub initial_state: Option<&'a T>,
+    /// Lower bound applied after softplus timestep discretization.
+    pub time_step_floor: f32,
+    /// Maximum number of prefill tokens processed per backend chunk.
+    pub chunk_size: usize,
+}
+
+/// Final state and per-token output of a selective state-space scan.
+#[derive(Debug, Clone)]
+pub struct SelectiveStateSpaceScanOutput<T> {
+    /// FP32 recurrent state after the final token.
+    pub state: T,
+    /// Scan output `[batch, sequence, heads, head_dimensions]`.
+    pub output: T,
+}
+
+/// Deterministic host reference for the selective state-space recurrence.
+#[allow(clippy::too_many_arguments)]
+pub fn reference_selective_state_space_scan(
+    batch: usize,
+    sequence: usize,
+    heads: usize,
+    head_dimensions: usize,
+    state_dimensions: usize,
+    values: &[f32],
+    input_state: &[f32],
+    output_state: &[f32],
+    time_step: &[f32],
+    time_step_bias: &[f32],
+    transition_log: &[f32],
+    skip: &[f32],
+    time_step_floor: f32,
+    initial_state: Option<&[f32]>,
+) -> Result<(Vec<f32>, Vec<f32>), Error> {
+    let groups = batch * sequence * heads;
+    let values_len = groups * head_dimensions;
+    let vectors_len = groups * state_dimensions;
+    let state_len = batch * heads * head_dimensions * state_dimensions;
+    if values.len() != values_len
+        || input_state.len() != vectors_len
+        || output_state.len() != vectors_len
+        || time_step.len() != groups
+        || time_step_bias.len() != heads
+        || transition_log.len() != heads
+        || skip.len() != heads
+        || initial_state.is_some_and(|state| state.len() != state_len)
+        || !time_step_floor.is_finite()
+        || time_step_floor < 0.0
+    {
+        return Err(Error::backend(
+            "invalid selective state-space reference geometry",
+        ));
+    }
+    let mut state = initial_state.map_or_else(|| vec![0.0; state_len], <[f32]>::to_vec);
+    let mut output = vec![0.0; values_len];
+    for batch_index in 0..batch {
+        for token in 0..sequence {
+            for head in 0..heads {
+                let group = (batch_index * sequence + token) * heads + head;
+                let dt =
+                    ((time_step[group] + time_step_bias[head]).exp().ln_1p()).max(time_step_floor);
+                let transition = (-transition_log[head].exp() * dt).exp();
+                let vector_base = group * state_dimensions;
+                for dimension in 0..head_dimensions {
+                    let value_index = group * head_dimensions + dimension;
+                    let state_base =
+                        (batch_index * heads + head) * head_dimensions * state_dimensions
+                            + dimension * state_dimensions;
+                    let value = values[value_index];
+                    let mut projected = 0.0f32;
+                    for state_dimension in 0..state_dimensions {
+                        let state_index = state_base + state_dimension;
+                        state[state_index] = state[state_index] * transition
+                            + dt * input_state[vector_base + state_dimension] * value;
+                        projected +=
+                            state[state_index] * output_state[vector_base + state_dimension];
+                    }
+                    output[value_index] = projected + value * skip[head];
+                }
+            }
+        }
+    }
+    Ok((state, output))
+}
+
+/// Deterministic host reference for the gated-delta recurrence.
+///
+/// Query, key, and value use flattened `[batch, sequence, heads, dimensions]`
+/// storage. Decay is either `[batch, sequence, heads]` or the same vector
+/// shape as query/key. Returned state is `[batch, heads, key_dim, value_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn reference_gated_delta_scan(
+    batch: usize,
+    sequence: usize,
+    heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    log_decay: &[f32],
+    vector_decay: bool,
+    beta: &[f32],
+    initial_state: Option<&[f32]>,
+) -> Result<(Vec<f32>, Vec<f32>), Error> {
+    let key_values = batch * sequence * heads * key_dim;
+    let values = batch * sequence * heads * value_dim;
+    let groups = batch * sequence * heads;
+    let state_values = batch * heads * key_dim * value_dim;
+    if query.len() != key_values
+        || key.len() != key_values
+        || value.len() != values
+        || beta.len() != groups
+        || log_decay.len() != if vector_decay { key_values } else { groups }
+        || initial_state.is_some_and(|state| state.len() != state_values)
+    {
+        return Err(Error::backend("invalid gated-delta reference geometry"));
+    }
+    let mut state = initial_state.map_or_else(|| vec![0.0; state_values], <[f32]>::to_vec);
+    let mut output = vec![0.0; values];
+    for batch_index in 0..batch {
+        for token in 0..sequence {
+            for head in 0..heads {
+                let group = (batch_index * sequence + token) * heads + head;
+                let state_group = (batch_index * heads + head) * key_dim * value_dim;
+                for value_index in 0..value_dim {
+                    let mut memory = 0.0f32;
+                    for key_index in 0..key_dim {
+                        let vector_index = group * key_dim + key_index;
+                        let decay = if vector_decay {
+                            log_decay[vector_index]
+                        } else {
+                            log_decay[group]
+                        }
+                        .exp();
+                        let state_index = state_group + key_index * value_dim + value_index;
+                        state[state_index] *= decay;
+                        memory += state[state_index] * key[vector_index];
+                    }
+                    let value_index_flat = group * value_dim + value_index;
+                    let delta = (value[value_index_flat] - memory) * beta[group];
+                    let mut accumulated = 0.0f32;
+                    for key_index in 0..key_dim {
+                        let vector_index = group * key_dim + key_index;
+                        let state_index = state_group + key_index * value_dim + value_index;
+                        state[state_index] += key[vector_index] * delta;
+                        accumulated += state[state_index] * query[vector_index];
+                    }
+                    output[value_index_flat] = accumulated;
+                }
+            }
+        }
+    }
+    Ok((state, output))
+}
+
+#[cfg(test)]
+mod gated_delta_reference_tests {
+    use super::reference_gated_delta_scan;
+
+    #[test]
+    fn chunked_continuation_matches_one_scan() {
+        let query = [0.5, -0.25, 0.1, 0.2, -0.4, 0.8];
+        let key = [0.3, 0.4, -0.2, 0.7, 0.6, -0.1];
+        let value = [1.0, -0.5, 0.25, 0.75, -0.3, 0.9];
+        let decay = [-0.2, -0.1, -0.4, -0.3, -0.5, -0.25];
+        let beta = [0.8, 0.6, 0.4];
+        let (expected_state, expected) = reference_gated_delta_scan(
+            1, 3, 1, 2, 2, &query, &key, &value, &decay, true, &beta, None,
+        )
+        .unwrap();
+        let (state, mut actual) = reference_gated_delta_scan(
+            1,
+            2,
+            1,
+            2,
+            2,
+            &query[..4],
+            &key[..4],
+            &value[..4],
+            &decay[..4],
+            true,
+            &beta[..2],
+            None,
+        )
+        .unwrap();
+        let (actual_state, tail) = reference_gated_delta_scan(
+            1,
+            1,
+            1,
+            2,
+            2,
+            &query[4..],
+            &key[4..],
+            &value[4..],
+            &decay[4..],
+            true,
+            &beta[2..],
+            Some(&state),
+        )
+        .unwrap();
+        actual.extend(tail);
+        assert!(expected
+            .iter()
+            .zip(actual)
+            .all(|(left, right)| (left - right).abs() < 1e-6));
+        assert!(expected_state
+            .iter()
+            .zip(actual_state)
+            .all(|(left, right)| (left - right).abs() < 1e-6));
+    }
+}
+
+#[cfg(test)]
+mod selective_state_space_reference_tests {
+    use super::reference_selective_state_space_scan;
+
+    #[test]
+    fn continuation_matches_one_scan() {
+        let values = [0.2, -0.4, 0.8, 0.5, -0.3, 0.7];
+        let input_state = [0.1, 0.3, -0.2, 0.4, 0.6, -0.5];
+        let output_state = [0.7, -0.1, 0.2, 0.5, -0.4, 0.9];
+        let time_step = [-0.3, 0.1, -0.2];
+        let bias = [0.05];
+        let transition = [-0.4];
+        let skip = [0.25];
+        let (expected_state, expected) = reference_selective_state_space_scan(
+            1,
+            3,
+            1,
+            2,
+            2,
+            &values,
+            &input_state,
+            &output_state,
+            &time_step,
+            &bias,
+            &transition,
+            &skip,
+            0.001,
+            None,
+        )
+        .unwrap();
+        let (state, mut actual) = reference_selective_state_space_scan(
+            1,
+            2,
+            1,
+            2,
+            2,
+            &values[..4],
+            &input_state[..4],
+            &output_state[..4],
+            &time_step[..2],
+            &bias,
+            &transition,
+            &skip,
+            0.001,
+            None,
+        )
+        .unwrap();
+        let (actual_state, tail) = reference_selective_state_space_scan(
+            1,
+            1,
+            1,
+            2,
+            2,
+            &values[4..],
+            &input_state[4..],
+            &output_state[4..],
+            &time_step[2..],
+            &bias,
+            &transition,
+            &skip,
+            0.001,
+            Some(&state),
+        )
+        .unwrap();
+        actual.extend(tail);
+        assert!(expected
+            .iter()
+            .zip(actual)
+            .all(|(left, right)| (left - right).abs() < 1e-6));
+        assert!(expected_state
+            .iter()
+            .zip(actual_state)
+            .all(|(left, right)| (left - right).abs() < 1e-6));
+    }
 }
 
 /// Opaque tensor handle and the neural operations required by shared Eredu
@@ -1953,6 +2420,333 @@ impl<T: 'static, M: Parameterized<T>> Parameterized<T> for Option<M> {
         if let Some(module) = self {
             module.set_trainable(trainable);
         }
+    }
+}
+
+/// Post-convolution activation selected by architecture policy.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ConvolutionActivation {
+    /// Preserve the affine convolution output.
+    Identity,
+    /// Apply the sigmoid linear unit.
+    Silu,
+}
+
+/// Geometry and parameter identity for a causal depthwise convolution.
+#[derive(Debug, Clone)]
+pub struct CausalDepthwiseConvolutionSpec {
+    /// Number of independent channels.
+    pub channels: i32,
+    /// Causal kernel width, including the current token.
+    pub kernel_size: i32,
+    /// Checkpoint-facing kernel stored as `[channels, 1, kernel]`.
+    pub weight: ParameterSpec,
+    /// Optional per-channel affine bias.
+    pub bias: Option<ParameterSpec>,
+    /// Activation applied after convolution and bias.
+    pub activation: ConvolutionActivation,
+}
+
+impl CausalDepthwiseConvolutionSpec {
+    /// Validates positive geometry before allocating backend parameters.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.channels <= 0 {
+            return Err(Error::backend(format!(
+                "causal depthwise convolution channels must be positive, got {}",
+                self.channels
+            )));
+        }
+        if self.kernel_size <= 0 {
+            return Err(Error::backend(format!(
+                "causal depthwise convolution kernel size must be positive, got {}",
+                self.kernel_size
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Output and exact bounded history produced by one causal convolution call.
+#[derive(Debug, Clone)]
+pub struct CausalDepthwiseConvolutionOutput<T> {
+    /// Activated convolution output shaped like the input.
+    pub output: T,
+    /// Last `kernel_size - 1` inputs, or `None` for a width-one kernel.
+    pub history: Option<T>,
+}
+
+/// Backend-neutral causal depthwise convolution.
+///
+/// The layer owns only parameters and equations. Callers keep the returned
+/// bounded history in their runtime state realization.
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct CausalDepthwiseConvolution<B: NeuralBackend> {
+    /// Checkpoint-layout kernel shaped `[channels, 1, kernel]`.
+    pub weight: Parameter<B::Tensor>,
+    /// Optional per-channel bias.
+    pub bias: Option<Parameter<B::Tensor>>,
+    #[parameter(skip)]
+    channels: i32,
+    #[parameter(skip)]
+    kernel_size: i32,
+    #[parameter(skip)]
+    activation: ConvolutionActivation,
+}
+
+impl<B: NeuralBackend> CausalDepthwiseConvolution<B> {
+    /// Creates unloaded convolution parameters.
+    pub fn new(
+        spec: CausalDepthwiseConvolutionSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        spec.validate()?;
+        Ok(Self {
+            weight: Parameter::unloaded(
+                spec.weight,
+                &[spec.channels, 1, spec.kernel_size],
+                context,
+            )?,
+            bias: spec
+                .bias
+                .map(|bias| Parameter::unloaded(bias, &[spec.channels], context))
+                .transpose()?,
+            channels: spec.channels,
+            kernel_size: spec.kernel_size,
+            activation: spec.activation,
+        })
+    }
+
+    /// Returns the exact retained causal-history length.
+    pub const fn history_len(&self) -> i32 {
+        self.kernel_size - 1
+    }
+
+    /// Applies the convolution and returns the replacement bounded history.
+    pub fn forward(
+        &self,
+        input: &B::Tensor,
+        history: Option<&B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<CausalDepthwiseConvolutionOutput<B::Tensor>, Error> {
+        let shape = input.shape();
+        if shape.len() != 3 || shape[0] <= 0 || shape[1] <= 0 || shape[2] != self.channels {
+            return Err(Error::backend(format!(
+                "causal depthwise convolution expects [batch, sequence, {}], got {shape:?}",
+                self.channels
+            )));
+        }
+        let history_len = self.history_len();
+        let padded = if history_len == 0 {
+            if history.is_some() {
+                return Err(Error::backend(
+                    "width-one causal convolution does not accept history",
+                ));
+            }
+            input.clone()
+        } else if let Some(history) = history {
+            let expected = [shape[0], history_len, self.channels];
+            if history.shape() != expected {
+                return Err(Error::backend(format!(
+                    "causal depthwise convolution history must have shape {expected:?}, got {:?}",
+                    history.shape()
+                )));
+            }
+            B::Tensor::concatenate(&[history.clone(), input.clone()], 1, context)?
+        } else {
+            B::Tensor::pad(
+                input,
+                &[(0, 0), (history_len, 0), (0, 0)],
+                PadMode::Constant,
+                context,
+            )?
+        };
+        let execution_weight = self.weight.as_ref().swap_axes(1, 2, context)?;
+        let mut output =
+            B::Tensor::conv1d(&padded, &execution_weight, 1, 0, 1, self.channels, context)?;
+        if output.shape() != shape {
+            return Err(Error::backend(format!(
+                "causal depthwise convolution backend returned shape {:?}, expected {shape:?}",
+                output.shape()
+            )));
+        }
+        if let Some(bias) = &self.bias {
+            let bias = bias
+                .as_ref()
+                .reshape(&[1, 1, self.channels], context)?
+                .broadcast_to(shape, context)?;
+            output = output.add(&bias, context)?;
+        }
+        if self.activation == ConvolutionActivation::Silu {
+            output = B::silu(output, context)?;
+        }
+        let history = (history_len > 0)
+            .then(|| {
+                padded.index(
+                    &[
+                        Index::Full,
+                        Index::Range(shape[1], shape[1] + history_len),
+                        Index::Full,
+                    ],
+                    context,
+                )
+            })
+            .transpose()?;
+        Ok(CausalDepthwiseConvolutionOutput { output, history })
+    }
+}
+
+/// Construction policy for a gated causal short convolution.
+#[derive(Debug, Clone)]
+pub struct GatedShortConvolutionSpec {
+    /// Hidden width accepted by the fused input projection.
+    pub input_dimensions: i32,
+    /// Rank-local convolution channel count.
+    pub channels: i32,
+    /// Hidden width returned by the output projection.
+    pub output_dimensions: i32,
+    /// Fused B/C/x projection with output width `3 * channels`.
+    pub input_projection: LinearSpec,
+    /// Projection from convolution channels to the output width.
+    pub output_projection: LinearSpec,
+    /// Shared causal depthwise convolution parameters.
+    pub convolution: CausalDepthwiseConvolutionSpec,
+}
+
+impl GatedShortConvolutionSpec {
+    /// Validates the fused segment and convolution geometry.
+    pub fn validate(&self) -> Result<(), Error> {
+        self.convolution.validate()?;
+        let fused = self
+            .channels
+            .checked_mul(3)
+            .ok_or_else(|| Error::backend("gated short-convolution width overflowed"))?;
+        if self.input_dimensions <= 0
+            || self.channels <= 0
+            || self.output_dimensions <= 0
+            || self.convolution.channels != self.channels
+            || self.input_projection.input != self.input_dimensions
+            || self.input_projection.output != fused
+            || self.output_projection.input != self.channels
+            || self.output_projection.output != self.output_dimensions
+        {
+            return Err(Error::backend(format!(
+                "invalid gated short-convolution geometry input={} channels={} output={} fused_projection={}x{} output_projection={}x{} convolution_channels={}",
+                self.input_dimensions,
+                self.channels,
+                self.output_dimensions,
+                self.input_projection.input,
+                self.input_projection.output,
+                self.output_projection.input,
+                self.output_projection.output,
+                self.convolution.channels,
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Output and replacement bounded state from a gated short convolution.
+#[derive(Debug, Clone)]
+pub struct GatedShortConvolutionOutput<T> {
+    /// Projected hidden states.
+    pub output: T,
+    /// Last causal input values retained by the depthwise convolution.
+    pub history: Option<T>,
+}
+
+/// Fused gated short-convolution layer shared by hybrid decoders.
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct GatedShortConvolution<B: NeuralBackend> {
+    /// Fused B/C/x input projection.
+    pub input_projection: B::Linear,
+    /// Shared causal depthwise convolution.
+    pub convolution: CausalDepthwiseConvolution<B>,
+    /// Output projection.
+    pub output_projection: B::Linear,
+    #[parameter(skip)]
+    channels: i32,
+}
+
+impl<B: NeuralBackend> GatedShortConvolution<B> {
+    /// Builds one unloaded gated short convolution.
+    pub fn new(
+        spec: GatedShortConvolutionSpec,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        spec.validate()?;
+        Ok(Self {
+            input_projection: B::linear(spec.input_projection, context)?,
+            convolution: CausalDepthwiseConvolution::new(spec.convolution, context)?,
+            output_projection: B::linear(spec.output_projection, context)?,
+            channels: spec.channels,
+        })
+    }
+
+    fn hidden(
+        &mut self,
+        input: &B::Tensor,
+        history: Option<&B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, Option<B::Tensor>), Error> {
+        let projected = self.input_projection.forward(input, context)?;
+        let rank = projected.shape().len();
+        if rank == 0 || projected.shape()[rank - 1] != 3 * self.channels {
+            return Err(Error::backend(format!(
+                "gated short-convolution projection returned shape {:?}, expected final width {}",
+                projected.shape(),
+                3 * self.channels
+            )));
+        }
+        let mut segment = vec![Index::Full; rank];
+        segment[rank - 1] = Index::Range(0, self.channels);
+        let b = projected.index(&segment, context)?;
+        segment[rank - 1] = Index::Range(self.channels, 2 * self.channels);
+        let c = projected.index(&segment, context)?;
+        segment[rank - 1] = Index::Range(2 * self.channels, 3 * self.channels);
+        let x = projected.index(&segment, context)?;
+        let convolution = self
+            .convolution
+            .forward(&b.multiply(&x, context)?, history, context)?;
+        Ok((
+            c.multiply(&convolution.output, context)?,
+            convolution.history,
+        ))
+    }
+
+    /// Executes the replicated layer and returns replacement bounded state.
+    pub fn forward(
+        &mut self,
+        input: &B::Tensor,
+        history: Option<&B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<GatedShortConvolutionOutput<B::Tensor>, Error> {
+        let (hidden, history) = self.hidden(input, history, context)?;
+        Ok(GatedShortConvolutionOutput {
+            output: self.output_projection.forward(&hidden, context)?,
+            history,
+        })
+    }
+
+    /// Executes the same layer with a row-parallel output projection.
+    pub fn forward_parallel(
+        &mut self,
+        input: &B::Tensor,
+        history: Option<&B::Tensor>,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<GatedShortConvolutionOutput<B::Tensor>, Error> {
+        let (hidden, history) = self.hidden(input, history, context)?;
+        Ok(GatedShortConvolutionOutput {
+            output: B::row_parallel_linear(
+                &mut self.output_projection,
+                &hidden,
+                parallel,
+                context,
+            )?,
+            history,
+        })
     }
 }
 

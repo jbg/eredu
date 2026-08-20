@@ -18,11 +18,8 @@ use crate::composition::{
         gemma4::{checkpoint as gemma4_checkpoint, model as gemma4},
         gpt_oss::checkpoint as gpt_oss_checkpoint,
         inkling::{checkpoint as inkling_checkpoint, model as inkling},
-        kimi_linear::checkpoint as kimi_linear_checkpoint,
-        lfm2::checkpoint as lfm2_checkpoint,
         moshi::personaplex_checkpoint,
         muse_glimmer::checkpoint as muse_glimmer_checkpoint,
-        nemotron_h::checkpoint as nemotron_h_checkpoint,
         qwen::{
             hybrid::checkpoint as qwen_hybrid_checkpoint, vl::checkpoint as qwen_vl_checkpoint,
         },
@@ -178,15 +175,11 @@ pub(crate) fn validate_safetensors(
             ),
             ModelKind::GptOss => gpt_oss_checkpoint::validate_safetensors(config, store),
             ModelKind::Inkling => inkling_checkpoint::validate_safetensors(config, store),
-            ModelKind::KimiLinear => kimi_linear_checkpoint::validate_safetensors(config, store),
-            ModelKind::Lfm2 => lfm2_checkpoint::validate_safetensors(
-                config,
-                store,
-                !options.weight_residency.is_fully_resident(),
-            ),
+            ModelKind::KimiLinear => validate_neutral_kimi_safetensors(config, store),
+            ModelKind::Lfm2 => validate_neutral_lfm2_safetensors(config, store),
             ModelKind::Llama => llama_checkpoint::validate_safetensors(config, store),
             ModelKind::MuseGlimmer => muse_glimmer_checkpoint::validate_safetensors(config, store),
-            ModelKind::NemotronH => nemotron_h_checkpoint::validate_safetensors(config, store),
+            ModelKind::NemotronH => validate_neutral_nemotron_safetensors(config, store),
             ModelKind::PersonaPlex => personaplex_checkpoint::validate_safetensors(config, store),
             ModelKind::Qwen2 | ModelKind::Qwen3 => validate_neutral_qwen_safetensors(config, store),
             ModelKind::Qwen3Next => qwen_hybrid_checkpoint::validate_qwen3_next_safetensors(
@@ -251,12 +244,7 @@ pub(crate) fn validate_gguf(
                 }
             }
             GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
-                let variant = if architecture == GgufArchitecture::Lfm2Moe {
-                    lfm2_checkpoint::GgufVariant::Moe
-                } else {
-                    lfm2_checkpoint::GgufVariant::Dense
-                };
-                lfm2_checkpoint::validate_gguf(variant, checkpoint, metadata)
+                validate_neutral_lfm2_gguf(checkpoint, metadata)
             }
             GgufArchitecture::Llama | GgufArchitecture::Mistral => {
                 llama_checkpoint::validate_gguf(checkpoint, metadata)
@@ -268,12 +256,7 @@ pub(crate) fn validate_gguf(
                 if let Err(error) = architecture.validate_load_policy(options) {
                     invalid_geometry(error.to_string())
                 } else {
-                    let variant = if architecture == GgufArchitecture::NemotronHMoe {
-                        nemotron_h_checkpoint::GgufVariant::Moe
-                    } else {
-                        nemotron_h_checkpoint::GgufVariant::Dense
-                    };
-                    nemotron_h_checkpoint::validate_gguf(variant, checkpoint, metadata)
+                    validate_neutral_nemotron_gguf(checkpoint, metadata)
                 }
             }
             GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
@@ -291,9 +274,7 @@ pub(crate) fn validate_gguf(
                     qwen_vl_checkpoint::validate_gguf(variant, checkpoint, metadata)
                 }
             }
-            GgufArchitecture::KimiLinear => {
-                kimi_linear_checkpoint::validate_gguf(checkpoint, metadata)
-            }
+            GgufArchitecture::KimiLinear => validate_neutral_kimi_gguf(checkpoint, metadata),
             GgufArchitecture::Qwen35
             | GgufArchitecture::Qwen35Moe
             | GgufArchitecture::Qwen3Next => {
@@ -329,6 +310,159 @@ fn validate_neutral_qwen_safetensors(
         Err(error) => return invalid_geometry(error),
     };
     eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+fn validate_neutral_lfm2_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let args = match eredu_architectures::lfm2::model_args_from_config_value(config) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::lfm2::safetensors_plan(&args, true) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+fn validate_neutral_nemotron_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let args = match eredu_architectures::nemotron_h::model_args_from_config_value(config) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::nemotron_h::safetensors_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+fn validate_neutral_kimi_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let args = match eredu_architectures::kimi_linear::model_args_from_config_value(config) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::kimi_linear::safetensors_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+struct NeutralKimiGgufCatalog<'a>(&'a GgufCheckpoint);
+
+impl eredu_architectures::kimi_linear::GgufTensorCatalog for NeutralKimiGgufCatalog<'_> {
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains_gguf_tensor(name)
+    }
+
+    fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool {
+        self.0.any_gguf_tensor(predicate)
+    }
+}
+
+fn validate_neutral_kimi_gguf(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    let args = match eredu_architectures::kimi_linear::model_args_from_gguf_catalog(
+        &NeutralKimiGgufCatalog(checkpoint),
+        metadata,
+    ) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    if let Err(error) = checkpoint
+        .catalog()
+        .translated_outputs(eredu_architectures::kimi_linear::translate_gguf_weight_name)
+    {
+        return invalid_geometry(error.to_string());
+    }
+    let plan = match eredu_architectures::kimi_linear::gguf_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
+}
+
+struct NeutralLfm2GgufCatalog<'a>(&'a GgufCheckpoint);
+
+impl eredu_architectures::lfm2::GgufTensorCatalog for NeutralLfm2GgufCatalog<'_> {
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains_gguf_tensor(name)
+    }
+
+    fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool {
+        self.0.any_gguf_tensor(predicate)
+    }
+}
+
+fn validate_neutral_lfm2_gguf(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    let args = match eredu_architectures::lfm2::model_args_from_gguf_catalog(
+        &NeutralLfm2GgufCatalog(checkpoint),
+        metadata,
+    ) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let is_moe = args.model_type == "lfm2_moe";
+    if let Err(error) = checkpoint.catalog().translated_outputs(|name| {
+        eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe)
+    }) {
+        return invalid_geometry(error.to_string());
+    }
+    let plan = match eredu_architectures::lfm2::gguf_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
+}
+
+struct NeutralNemotronGgufCatalog<'a>(&'a GgufCheckpoint);
+
+impl eredu_architectures::nemotron_h::GgufTensorCatalog for NeutralNemotronGgufCatalog<'_> {
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains_gguf_tensor(name)
+    }
+
+    fn any(&self, predicate: impl FnMut(&str) -> bool) -> bool {
+        self.0.any_gguf_tensor(predicate)
+    }
+}
+
+fn validate_neutral_nemotron_gguf(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    let args = match eredu_architectures::nemotron_h::model_args_from_gguf_catalog(
+        &NeutralNemotronGgufCatalog(checkpoint),
+        metadata,
+    ) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    if let Err(error) = checkpoint
+        .catalog()
+        .translated_outputs(eredu_architectures::nemotron_h::translate_gguf_weight_name)
+    {
+        return invalid_geometry(error.to_string());
+    }
+    let plan = match eredu_architectures::nemotron_h::gguf_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
 }
 
 fn validate_neutral_deepseek_v3_safetensors(

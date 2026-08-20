@@ -25,7 +25,7 @@ use safemlx::{
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::nn::{convolution::DepthwiseConv1d, layers::silu, linear},
+    backend::mlx::nn::{layers::silu, linear},
     backend::mlx::runtime::distributed::parallel::{
         aligned_partition_units, partitioned_projection_members,
         register_partitioned_projection_group, register_projection_module,
@@ -214,97 +214,6 @@ pub(crate) fn register_swiglu_projection_group(
         ],
         units,
     )
-}
-
-/// Registers a fused gated depthwise-convolution block as one logical channel
-/// domain. The three input-projection segments, depthwise kernel, recurrent
-/// channel state, and row projection therefore receive the identical range.
-pub(crate) fn register_gated_depthwise_conv_group(
-    planner: &mut ParallelPlanBuilder,
-    prefix: &str,
-    input_projection: &MaybeQuantized<nn::Linear>,
-    convolution: &DepthwiseConv1d,
-    output_projection: &MaybeQuantized<nn::Linear>,
-    channels: i32,
-) -> Result<(), Error> {
-    let channels = usize::try_from(channels)
-        .map_err(|_| Error::Parallel("convolution channel count exceeds usize".into()))?;
-    let units = aligned_partition_units(
-        prefix,
-        channels,
-        1,
-        row_partition_alignment(output_projection)?,
-    )?;
-    let output_prefix = format!("{prefix}.out_proj");
-    let (units, mut members) = partitioned_projection_members(
-        &[(
-            output_projection,
-            output_prefix.as_str(),
-            ProjectionSharding::Row,
-        )],
-        units,
-    )?;
-    let segments = vec![
-        0..channels,
-        channels..2 * channels,
-        2 * channels..3 * channels,
-    ];
-    for (name, parameter) in input_projection.parameters().flatten() {
-        let shape = parameter
-            .shape()
-            .iter()
-            .map(|dimension| {
-                usize::try_from(*dimension).map_err(|_| {
-                    Error::Parallel(format!(
-                        "parameter {prefix}.in_proj.{name} has negative dimension {dimension}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if shape.first().copied() != Some(3 * channels) {
-            return Err(Error::Parallel(format!(
-                "parameter {prefix}.in_proj.{name} has shape {shape:?}, expected a fused three-segment channel axis of length {}",
-                3 * channels
-            )));
-        }
-        members.push(ParameterMemberSpec::new(
-            format!("{prefix}.in_proj.{name}"),
-            shape,
-            MemberSharding::PartitionedSegments {
-                axis: 0,
-                segments: segments.clone(),
-            },
-        ));
-    }
-    for (name, parameter) in convolution.parameters().flatten() {
-        let shape = parameter
-            .shape()
-            .iter()
-            .map(|dimension| {
-                usize::try_from(*dimension).map_err(|_| {
-                    Error::Parallel(format!(
-                        "parameter {prefix}.conv.{name} has negative dimension {dimension}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if shape.first().copied() != Some(channels) {
-            return Err(Error::Parallel(format!(
-                "parameter {prefix}.conv.{name} has shape {shape:?}, expected channel axis length {channels}"
-            )));
-        }
-        members.push(ParameterMemberSpec::new(
-            format!("{prefix}.conv.{name}"),
-            shape,
-            MemberSharding::Partitioned { axis: 0 },
-        ));
-    }
-    planner.register(ParameterGroupSpec::partitioned(
-        format!("{prefix}.channels"),
-        ParameterRole::Channels,
-        units,
-        members,
-    )?)
 }
 
 /// Returns the exact rank-local KV-head count selected for each decoder layer.

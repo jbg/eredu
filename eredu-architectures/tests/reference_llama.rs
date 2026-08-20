@@ -6,9 +6,10 @@ use eredu_core::{AttentionPolicy, Completion, LayerSchedule};
 use eredu_nn::{
     AttentionCache, AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator,
     LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode,
-    ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized, RotaryOperator,
-    RotaryPosition, RotarySpec, RoutedNeuralBackend, RoutingOperator, RoutingResult,
-    SwiGluExpertBankOperator, SwiGluExpertBankSpec, Tensor, TopKRouterSpec,
+    ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized,
+    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
+    RoutedNeuralBackend, RoutingOperator, RoutingResult, SwiGluExpertBankOperator,
+    SwiGluExpertBankSpec, Tensor, TopKRouterSpec,
 };
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, DeviceState, ExpertPass, LayerRuntimeState,
@@ -280,6 +281,17 @@ impl SwiGluExpertBankOperator<ReferenceTensor> for ReferenceLinear {
     }
 }
 
+impl Relu2ExpertBankOperator<ReferenceTensor> for ReferenceLinear {
+    fn forward_routed(
+        &mut self,
+        input: &ReferenceTensor,
+        _: &RoutingResult<ReferenceTensor>,
+        _: &(),
+    ) -> Result<ReferenceTensor, Error> {
+        Ok(input.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ReferenceEmbedding {
     vocabulary: i32,
@@ -458,6 +470,7 @@ impl NeuralBackend for ReferenceBackend {
 impl RoutedNeuralBackend for ReferenceBackend {
     type Router = ReferenceLinear;
     type SwiGluExpertBank = ReferenceLinear;
+    type Relu2ExpertBank = ReferenceLinear;
 
     fn top_k_router(spec: TopKRouterSpec, _: &()) -> Result<Self::Router, Error> {
         Ok(ReferenceLinear {
@@ -483,6 +496,22 @@ impl RoutedNeuralBackend for ReferenceBackend {
                 spec.input_dimensions,
             ]),
             metadata: ParameterMetadata::from_spec(&weight, weight.trainable),
+        })
+    }
+
+    fn relu2_expert_bank(
+        spec: Relu2ExpertBankSpec,
+        _: &(),
+    ) -> Result<Self::Relu2ExpertBank, Error> {
+        spec.validate()?;
+        Ok(ReferenceLinear {
+            output: spec.hidden_dimensions,
+            weight: ReferenceTensor(vec![
+                spec.expert_count,
+                spec.intermediate_dimensions,
+                spec.hidden_dimensions,
+            ]),
+            metadata: ParameterMetadata::from_spec(&spec.up.weight, spec.up.weight.trainable),
         })
     }
 }
@@ -908,6 +937,21 @@ impl RoutedExpertProvider<ReferenceBackend> for ProbeExpertProvider {
     type Error = std::convert::Infallible;
 
     fn forward_routed(
+        &mut self,
+        _resident_bank: &mut ReferenceLinear,
+        request: RoutedExpertRequest<'_, ReferenceTensor>,
+        _: &(),
+    ) -> Result<ReferenceTensor, Self::Error> {
+        self.calls.push((
+            request.layer,
+            request.pass,
+            request.input.shape().to_vec(),
+            request.routes.expert_ids.shape().to_vec(),
+        ));
+        Ok(request.input.clone())
+    }
+
+    fn forward_relu2_routed(
         &mut self,
         _resident_bank: &mut ReferenceLinear,
         request: RoutedExpertRequest<'_, ReferenceTensor>,

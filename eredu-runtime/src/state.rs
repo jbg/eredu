@@ -9,7 +9,7 @@ use std::marker::PhantomData;
 use eredu_core::{
     cache::{
         LayerCachePolicy, PromptCacheError, PromptCacheModelIdentity, PromptCacheTopology,
-        StateComponentPolicy,
+        StateComponentPolicy, StateTensorRole,
     },
     LayerSchedule,
 };
@@ -133,6 +133,25 @@ pub trait RuntimeLayerState<B: NeuralBackend> {
 
     /// Borrows tensors that must remain alive through this layer's submission.
     fn retained_values(&self) -> Self::RetainedValues<'_>;
+}
+
+/// Mutable access to architecture-declared fixed state components.
+///
+/// Operators address semantic roles rather than backend storage. Concrete
+/// realizations keep native tensors and may combine these slots with an
+/// append-only attention cache in the same layer state.
+pub trait RuntimeStateComponents<B: NeuralBackend>: RuntimeLayerState<B> {
+    /// Current absolute token frontier for this layer.
+    fn position(&self) -> i32;
+
+    /// Borrows the optional tensor slot for one declared fixed component.
+    fn fixed_component(
+        &mut self,
+        role: StateTensorRole,
+    ) -> Result<&mut Option<B::Tensor>, StateError>;
+
+    /// Advances a fixed-state-only layer after a successful operator call.
+    fn advance_fixed(&mut self, tokens: i32) -> Result<(), StateError>;
 }
 
 /// Mutable state realization consumed by generic resident and layerwise engines.
@@ -339,6 +358,15 @@ pub enum StateError {
         /// Realized layer count.
         count: usize,
     },
+    /// A layer state does not declare the requested fixed component.
+    #[error("runtime state layer does not declare fixed component {role:?}")]
+    UnknownComponent {
+        /// Requested semantic component.
+        role: StateTensorRole,
+    },
+    /// A fixed-state token frontier could not be advanced safely.
+    #[error("invalid fixed-state advance: {0}")]
+    InvalidAdvance(String),
 }
 
 #[cfg(test)]
