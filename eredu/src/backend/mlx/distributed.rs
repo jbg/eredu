@@ -266,13 +266,20 @@ impl<'a> MlxDistributedSession<'a> {
 
     fn value_dtype(value: &ValueDescriptor) -> Result<Dtype, Error> {
         match &value.dtype {
+            TensorDtype::Bool => Ok(Dtype::Bool),
             TensorDtype::F32 => Ok(Dtype::Float32),
             TensorDtype::F16 => Ok(Dtype::Float16),
             TensorDtype::Bf16 => Ok(Dtype::Bfloat16),
             TensorDtype::I8 => Ok(Dtype::Int8),
             TensorDtype::U8 => Ok(Dtype::Uint8),
+            TensorDtype::U16 => Ok(Dtype::Uint16),
             TensorDtype::U32 => Ok(Dtype::Uint32),
+            TensorDtype::U64 => Ok(Dtype::Uint64),
+            TensorDtype::I16 => Ok(Dtype::Int16),
             TensorDtype::I32 => Ok(Dtype::Int32),
+            TensorDtype::I64 => Ok(Dtype::Int64),
+            TensorDtype::F64 => Ok(Dtype::Float64),
+            TensorDtype::Complex64 => Ok(Dtype::Complex64),
             TensorDtype::Encoded(name) => Err(Error::Backend(BackendError::Unsupported {
                 backend: "mlx".into(),
                 capability: format!("receiving encoded dtype {name}"),

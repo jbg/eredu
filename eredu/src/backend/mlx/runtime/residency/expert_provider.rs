@@ -18,6 +18,7 @@ pub(crate) struct CachedSwiGluBankSpec {
     pub(crate) intermediate_dimensions: i32,
     pub(crate) gate_up_quantization: Option<WeightQuantization>,
     pub(crate) down_quantization: Option<WeightQuantization>,
+    pub(crate) activation: eredu_nn::GatedExpertActivation,
     pub(crate) limit: Option<f32>,
 }
 
@@ -279,7 +280,8 @@ pub(crate) fn execute_cached_swiglu(
                 load_time.or(spec.gate_up_quantization),
                 load_time.or(spec.down_quantization),
                 stream,
-            )?;
+            )?
+            .with_activation(spec.activation);
             if let Some(limit) = spec.limit {
                 bank = bank.with_swiglu_limit(limit)?;
             }

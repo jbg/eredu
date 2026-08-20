@@ -568,7 +568,7 @@ where
         input: A::Input<'a>,
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        mut execute: E,
+        execute: E,
         mut hook: H,
     ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
@@ -583,6 +583,42 @@ where
             &<B::Tensor as eredu_nn::Tensor>::Context,
         ) -> Result<B::Tensor, A::Error>,
         H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), A::Error>,
+    {
+        self.forward_with_unit_executor_and_activation_hook(
+            input,
+            state,
+            context,
+            execute,
+            |group, index, _hidden, forward| hook(group, index, forward),
+        )
+    }
+
+    /// Runs one pass with a custom unit executor and exposes each post-unit
+    /// activation together with the mutable architecture context.
+    ///
+    /// The activation is the ordinary output of the execution unit. Target
+    /// state taps and inspection therefore observe the production forward
+    /// without requiring a second family-specific model path.
+    pub fn forward_with_unit_executor_and_activation_hook<'a, E, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        mut hook: H,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+        H: FnMut(usize, usize, &B::Tensor, &mut A::ForwardContext) -> Result<(), A::Error>,
     {
         let graph = self
             .architecture
@@ -694,7 +730,7 @@ where
                         executor,
                     )
                     .map_err(LayerwiseRuntimeError::Architecture)?;
-                    hook(group, index, &mut forward_context)
+                    hook(group, index, &hidden, &mut forward_context)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let state_values = state
                         .retained_values(ordinal, address)

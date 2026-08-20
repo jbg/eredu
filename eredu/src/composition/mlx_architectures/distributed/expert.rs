@@ -51,9 +51,7 @@ use crate::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
     composition::mlx_architectures::{
-        gemma4::model as gemma4,
         gpt_oss::model as gpt_oss,
-        inkling::model as inkling,
         qwen::{
             hybrid::{qwen3_5, qwen3_next},
             vl::model as qwen3_vl,
@@ -100,19 +98,6 @@ impl LocalExpertBank for qwen3_5::Experts {
         let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
         let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
         Ok(self.forward_chunked(hidden, &ids, &weights, stream)?)
-    }
-}
-
-impl LocalExpertBank for gemma4::GemmaExperts {
-    fn execute_local_routes(
-        &mut self,
-        hidden: &Array,
-        local_expert_ids: &Array,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
-        let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
-        Ok(self.forward(hidden, &ids, &weights, stream)?)
     }
 }
 
@@ -168,14 +153,10 @@ pub enum ExpertParallelCache {
     Qwen(MlxKeyValueState),
     /// GPT-OSS cache following its canonical per-layer attention schedule.
     GptOss(gpt_oss::Cache),
-    /// Inkling attention and convolution cache.
-    Inkling(inkling::Cache),
     /// Qwen3-Next/Qwen3.5 heterogeneous attention cache.
     QwenHybrid(qwen3_5::Cache),
     /// Qwen3-VL-MoE multimodal-RoPE text cache.
     Qwen3Vl(qwen3_vl::Cache),
-    /// Gemma 4 alternating/shared key/value state.
-    Gemma4(gemma4::Cache),
 }
 
 impl ExpertParallelCache {
@@ -186,10 +167,8 @@ impl ExpertParallelCache {
             Self::Hybrid(cache) => cache.clear()?,
             Self::Qwen(cache) => cache.clear()?,
             Self::GptOss(cache) => cache.reset()?,
-            Self::Inkling(cache) => cache.reset()?,
             Self::QwenHybrid(cache) => cache.reset()?,
             Self::Qwen3Vl(cache) => cache.reset(),
-            Self::Gemma4(cache) => cache.clear()?,
         }
         Ok(())
     }
@@ -203,13 +182,11 @@ impl ExpertParallelCache {
             Self::Hybrid(cache) => cache.offset(),
             Self::Qwen(cache) => cache.offset(),
             Self::GptOss(cache) => cache.offset(),
-            Self::Inkling(cache) => cache.offset(),
             Self::QwenHybrid(cache) => cache.offset(),
             Self::Qwen3Vl(cache) => cache.kv.first().and_then(Option::as_ref).map_or(
                 0,
                 crate::backend::mlx::runtime::cache::KeyValueCache::offset,
             ),
-            Self::Gemma4(cache) => i32::try_from(cache.mtp_len()).unwrap_or(i32::MAX),
         }
     }
 }
@@ -522,17 +499,11 @@ enum ExpertArchitecture {
     GptOssLayerwise(
         Box<crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseModel>,
     ),
-    InklingLayerwise(
-        Box<crate::composition::mlx_architectures::inkling::layerwise::InklingLayerwiseModel>,
-    ),
     QwenHybridLayerwise(
         Box<crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel>,
     ),
     Qwen3VlLayerwise(
         Box<crate::composition::mlx_architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel>,
-    ),
-    Gemma4Layerwise(
-        Box<crate::composition::mlx_architectures::gemma4::layerwise::Gemma4LayerwiseModel>,
     ),
 }
 
@@ -543,10 +514,8 @@ impl ExpertArchitecture {
             Self::NeutralHybrid(_) => {}
             Self::Qwen(_) => {}
             Self::GptOssLayerwise(model) => model.bind_parallel_topology(topology),
-            Self::InklingLayerwise(model) => model.bind_parallel_topology(topology),
             Self::QwenHybridLayerwise(model) => model.bind_parallel_topology(topology),
             Self::Qwen3VlLayerwise(model) => model.bind_parallel_topology(topology),
-            Self::Gemma4Layerwise(model) => model.bind_parallel_topology(topology),
         }
     }
 }
@@ -570,7 +539,6 @@ struct ExpertParallelQwenMtpTarget<'a> {
 #[derive(Clone)]
 enum ExpertParallelMtpDraftCache {
     DeepSeek(crate::composition::deepseek::DeepSeekState),
-    Inkling(Vec<inkling::LayerCache>),
     Hybrid(MlxHybridState),
 }
 
@@ -753,9 +721,6 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
             ExpertParallelCache::DeepSeek(cache) => {
                 ExpertParallelMtpDraftCache::DeepSeek(cache.clone())
             }
-            ExpertParallelCache::Inkling(cache) => {
-                ExpertParallelMtpDraftCache::Inkling(cache.mtp_layers.clone())
-            }
             ExpertParallelCache::Hybrid(cache) => ExpertParallelMtpDraftCache::Hybrid(
                 cache
                     .deep_clone_state()
@@ -771,9 +736,6 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
                 ExpertParallelCache::DeepSeek(cache),
                 ExpertParallelMtpDraftCache::DeepSeek(draft),
             ) => *cache = draft.clone(),
-            (ExpertParallelCache::Inkling(cache), ExpertParallelMtpDraftCache::Inkling(draft)) => {
-                cache.mtp_layers.clone_from(draft)
-            }
             (ExpertParallelCache::Hybrid(cache), ExpertParallelMtpDraftCache::Hybrid(draft)) => {
                 let ExpertArchitecture::NeutralHybrid(model) = &self.model.architecture else {
                     unreachable!("hybrid draft cache requires a neutral hybrid model")
@@ -872,7 +834,6 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
     fn max_draft_tokens(&self) -> usize {
         match &self.model.architecture {
             ExpertArchitecture::DeepSeek(model) => model.mtp_len(),
-            ExpertArchitecture::InklingLayerwise(model) => model.mtp_len(),
             ExpertArchitecture::NeutralHybrid(model) => model.mtp_len(),
             _ => 0,
         }
@@ -891,11 +852,6 @@ impl ExpertParallelModel {
             ExpertArchitecture::DeepSeek(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
             },
-            ExpertArchitecture::InklingLayerwise(model) if model.mtp_len() > 0 => {
-                MtpCapability::Ready {
-                    checkpoint: MtpCheckpointKind::Embedded,
-                }
-            }
             ExpertArchitecture::NeutralHybrid(model) if model.mtp_len() > 0 => {
                 MtpCapability::Ready {
                     checkpoint: MtpCheckpointKind::Embedded,
@@ -926,10 +882,8 @@ impl ExpertParallelModel {
             ExpertArchitecture::NeutralHybrid(model) => model.dense_stream_report(),
             ExpertArchitecture::Qwen(model) => model.dense_stream_report(),
             ExpertArchitecture::GptOssLayerwise(model) => model.dense_stream_report(),
-            ExpertArchitecture::InklingLayerwise(model) => model.dense_stream_report(),
             ExpertArchitecture::QwenHybridLayerwise(model) => model.dense_stream_report(),
             ExpertArchitecture::Qwen3VlLayerwise(model) => model.dense_stream_report(),
-            ExpertArchitecture::Gemma4Layerwise(model) => model.dense_stream_report(),
         }
     }
 
@@ -948,17 +902,11 @@ impl ExpertParallelModel {
             ExpertArchitecture::GptOssLayerwise(model) => {
                 ExpertParallelCache::GptOss(model.new_cache())
             }
-            ExpertArchitecture::InklingLayerwise(model) => {
-                ExpertParallelCache::Inkling(model.new_cache())
-            }
             ExpertArchitecture::QwenHybridLayerwise(model) => {
                 ExpertParallelCache::QwenHybrid(model.new_cache())
             }
             ExpertArchitecture::Qwen3VlLayerwise(model) => {
                 ExpertParallelCache::Qwen3Vl(model.new_cache())
-            }
-            ExpertArchitecture::Gemma4Layerwise(model) => {
-                ExpertParallelCache::Gemma4(model.new_cache())
             }
         }
     }
@@ -988,9 +936,6 @@ impl ExpertParallelModel {
                 ExpertArchitecture::Qwen(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::Qwen),
-                ExpertArchitecture::InklingLayerwise(model) => model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ExpertParallelCache::Inkling),
                 ExpertArchitecture::QwenHybridLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::QwenHybrid),
@@ -1012,7 +957,6 @@ impl ExpertParallelModel {
             ExpertParallelCache::GptOss(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::Hybrid(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::Qwen(cache) => cache.residency_report().map_err(Into::into),
-            ExpertParallelCache::Inkling(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::QwenHybrid(cache) => cache.residency_report().map_err(Into::into),
             _ => Ok(None),
         }
@@ -1048,17 +992,6 @@ impl ExpertParallelModel {
                     options,
                     &identity,
                 ),
-            (ExpertArchitecture::InklingLayerwise(_), ExpertParallelCache::Inkling(cache)) => {
-                inkling::Model::save_prompt_cache(
-                    cache,
-                    directory,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    stream,
-                )
-                .map_err(Into::into)
-            }
             (ExpertArchitecture::Qwen(model), ExpertParallelCache::Qwen(cache)) => model
                 .save_prompt_cache(
                     cache,
@@ -1072,16 +1005,6 @@ impl ExpertParallelModel {
                 model.save_prompt_cache_with_validated_identity(
                     cache,
                     &directory,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    stream,
-                )
-            }
-            (ExpertArchitecture::Gemma4Layerwise(model), ExpertParallelCache::Gemma4(cache)) => {
-                model.save_prompt_cache(
-                    cache,
-                    directory,
                     descriptor,
                     prefix_token_ids,
                     options,
@@ -1121,18 +1044,6 @@ impl ExpertParallelModel {
                     stream,
                 )
                 .map(|(cache, manifest)| (ExpertParallelCache::Hybrid(cache), manifest)),
-            ExpertArchitecture::InklingLayerwise(model) => {
-                inkling::Model::load_prompt_cache_with_identity(
-                    model.args(),
-                    &directory,
-                    expected,
-                    prefix_token_ids,
-                    &identity,
-                    stream,
-                )
-                .map(|(cache, manifest)| (ExpertParallelCache::Inkling(cache), manifest))
-                .map_err(Into::into)
-            }
             ExpertArchitecture::Qwen(model) => model
                 .load_prompt_cache(&directory, expected, prefix_token_ids, options, stream)
                 .map(|(cache, manifest)| (ExpertParallelCache::Qwen(cache), manifest)),
@@ -1152,9 +1063,6 @@ impl ExpertParallelModel {
                     stream,
                 )
                 .map(|(cache, manifest)| (ExpertParallelCache::Qwen3Vl(cache), manifest)),
-            ExpertArchitecture::Gemma4Layerwise(model) => model
-                .load_prompt_cache(&directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ExpertParallelCache::Gemma4(cache), manifest)),
         }
     }
 
@@ -1188,12 +1096,10 @@ impl ExpertParallelModel {
             ExpertArchitecture::NeutralHybrid(model) => model.prompt_cache_model_identity()?,
             ExpertArchitecture::Qwen(model) => model.prompt_cache_model_identity()?,
             ExpertArchitecture::GptOssLayerwise(model) => model.prompt_cache_model_identity()?,
-            ExpertArchitecture::InklingLayerwise(model) => model.prompt_cache_model_identity()?,
             ExpertArchitecture::QwenHybridLayerwise(model) => {
                 model.prompt_cache_model_identity()?
             }
             ExpertArchitecture::Qwen3VlLayerwise(model) => model.prompt_cache_model_identity()?,
-            ExpertArchitecture::Gemma4Layerwise(model) => model.prompt_cache_model_identity()?,
         };
         identity.topology = crate::backend::mlx::cache::prompt_cache_topology(self.topology);
         Ok(identity)
@@ -1413,51 +1319,6 @@ impl ExpertParallelModel {
                     }
                 }
                 (
-                    ExpertArchitecture::InklingLayerwise(model),
-                    ExpertParallelCache::Inkling(cache),
-                ) => {
-                    let args = model.args().clone();
-                    let mut execute =
-                        |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_inkling(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        };
-                    match tensor_group {
-                        Some(tensor_group) => model.forward_tensor_expert_parallel(
-                            tokens,
-                            cache,
-                            tensor_group,
-                            &mut execute,
-                            stream,
-                        )?,
-                        None => model.forward_with_expert_executor(
-                            tokens,
-                            cache,
-                            &mut execute,
-                            stream,
-                        )?,
-                    }
-                }
-                (
                     ExpertArchitecture::QwenHybridLayerwise(model),
                     ExpertParallelCache::QwenHybrid(cache),
                 ) => {
@@ -1524,54 +1385,6 @@ impl ExpertParallelModel {
                             stream,
                             |routes, stream| {
                                 execute_cached_neutral_qwen3(
-                                    &args,
-                                    layer,
-                                    routes,
-                                    pass,
-                                    expert_cache,
-                                    stream,
-                                )
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                        statistics.accumulate(&returned.statistics);
-                        Ok(returned.reduced_output)
-                    };
-                    match tensor_group {
-                        Some(tensor_group) => model.decode_tensor_expert_parallel(
-                            tokens,
-                            cache,
-                            tensor_group,
-                            &mut execute,
-                            stream,
-                        )?,
-                        None => model.decode_with_expert_executor(
-                            tokens,
-                            cache,
-                            &mut execute,
-                            stream,
-                        )?,
-                    }
-                }
-                (
-                    ExpertArchitecture::Gemma4Layerwise(model),
-                    ExpertParallelCache::Gemma4(cache),
-                ) => {
-                    let args = model.args().clone();
-                    let mut execute = |layer: usize,
-                                       hidden: &Array,
-                                       ids: &Array,
-                                       weights: &Array,
-                                       stream: &Stream| {
-                        let returned = dispatch_replicated_with(
-                            hidden,
-                            ids,
-                            weights,
-                            assignment,
-                            group,
-                            stream,
-                            |routes, stream| {
-                                execute_cached_gemma4(
                                     &args,
                                     layer,
                                     routes,
@@ -1685,38 +1498,6 @@ impl ExpertParallelModel {
                     tokens: tokens.clone(),
                 }
             }
-            (ExpertArchitecture::InklingLayerwise(model), ExpertParallelCache::Inkling(cache)) => {
-                let args = model.args().clone();
-                model.forward_mtp_target_with_expert_executor(
-                    tokens,
-                    cache,
-                    tensor_group,
-                    |layer, hidden, ids, weights, stream| {
-                        let returned = dispatch_replicated_with(
-                            hidden,
-                            ids,
-                            weights,
-                            assignment,
-                            expert_group,
-                            stream,
-                            |routes, stream| {
-                                execute_cached_inkling(
-                                    &args,
-                                    layer,
-                                    routes,
-                                    pass,
-                                    expert_cache,
-                                    stream,
-                                )
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                        statistics.accumulate(&returned.statistics);
-                        Ok(returned.reduced_output)
-                    },
-                    stream,
-                )?
-            }
             (ExpertArchitecture::NeutralHybrid(model), ExpertParallelCache::Hybrid(cache)) => model
                 .forward_mtp_target(
                     tokens,
@@ -1805,17 +1586,6 @@ impl ExpertParallelModel {
                     tokens: tokens.clone(),
                 }
             }
-            (
-                ExpertArchitecture::InklingLayerwise(model),
-                ExpertParallelMtpDraftCache::Inkling(cache),
-            ) => model.forward_mtp_draft_cartesian(
-                hidden,
-                tokens,
-                depth,
-                cache,
-                tensor_group,
-                stream,
-            )?,
             (
                 ExpertArchitecture::NeutralHybrid(model),
                 ExpertParallelMtpDraftCache::Hybrid(cache),
@@ -2130,10 +1900,6 @@ fn load_expert_parallel_model_impl(
                     | "qwen3"
                     | "qwen3_moe"
                     | "gpt_oss"
-                    | "gemma4"
-                    | "gemma4_text"
-                    | "gemma4_unified"
-                    | "gemma4_unified_text"
                     | "lfm2_moe"
                     | "nemotron_h"
                     | "qwen3_next"
@@ -2189,17 +1955,6 @@ fn load_expert_parallel_model_impl(
         Some("gpt_oss") => load_additional_ep(
             model_dir, topology, options, assignment, ModelKind::GptOss, stream, weights_stream,
         ),
-        Some("gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text") => {
-            load_additional_ep(
-                model_dir,
-                topology,
-                options,
-                assignment,
-                ModelKind::Gemma4,
-                stream,
-                weights_stream,
-            )
-        }
         Some("inkling_mm_model") => load_additional_ep(
             model_dir, topology, options, assignment, ModelKind::Inkling, stream, weights_stream,
         ),
@@ -2401,31 +2156,38 @@ fn execute_cached_neutral_deepseek(
     )
 }
 
-pub(crate) fn execute_cached_gemma4(
-    args: &gemma4::ModelArgs,
+pub(crate) fn execute_cached_neutral_gemma4(
+    args: &eredu_architectures::gemma4::ModelArgs,
     layer: usize,
     routes: &DispatchedRoutes,
     pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    Ok(cache.execute_routes_bounded(
-        ExpertRouteBatch::new(
-            layer,
-            &routes.hidden,
-            &routes.global_expert_ids,
-            &routes.weights,
-            pass,
-        ),
+    let prefix = format!("model.language_model.layers.{layer}.experts.switch_glu");
+    let spec = crate::backend::mlx::runtime::residency::expert_provider::CachedSwiGluBankSpec {
+        hidden_dimensions: args.hidden_size,
+        intermediate_dimensions: args.moe_intermediate_size.ok_or_else(|| {
+            Error::UnsupportedArchitecture("Gemma 4 sparse layer has no expert width".into())
+        })?,
+        gate_up_quantization: args
+            .linear_format_for(&format!("{prefix}.gate_up_proj"))
+            .weight_quantization(),
+        down_quantization: args
+            .linear_format_for(&format!("{prefix}.down_proj"))
+            .weight_quantization(),
+        activation: eredu_nn::GatedExpertActivation::GeluApproximate,
+        limit: None,
+    };
+    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_swiglu_dispatched(
+        cache,
+        spec,
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        pass,
         stream,
-        |hidden, acquired, weights, stream| {
-            Ok(
-                crate::composition::mlx_architectures::gemma4::layerwise::execute_acquired_gemma_experts(
-                    args, layer, hidden, acquired, weights, cache, stream,
-                )?,
-            )
-        },
-    )?)
+    )
 }
 
 pub(crate) fn execute_cached_kimi_linear(
@@ -2571,55 +2333,43 @@ pub(crate) fn execute_cached_gpt_oss_at(
     )?)
 }
 
-pub(crate) fn execute_cached_inkling(
-    args: &inkling::ModelArgs,
-    layer: usize,
+pub(crate) fn execute_cached_neutral_inkling(
+    args: &eredu_architectures::inkling::ModelArgs,
+    cache_layer: usize,
     routes: &DispatchedRoutes,
     pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    Ok(cache.execute_routes_bounded(
-        ExpertRouteBatch::new(
-            layer,
-            &routes.hidden,
-            &routes.global_expert_ids,
-            &routes.weights,
-            pass,
-        ),
-        stream,
-        |hidden, acquired, _weights, stream| {
-            let started = Instant::now();
-            let text = &args.text_config;
-            let prefix = format!("model.layers.{layer}.moe.experts");
-            let mut bank = PackedSwiGluExperts::new_with_dtype(
-                acquired.identities().len() as i32,
-                text.hidden_size,
-                text.moe_intermediate_size(),
-                text.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
-                text.weight_quantization_for(&format!("{prefix}.down_proj")),
-                text.weight_dtype(),
-                stream,
-            )?;
-            bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
-            bank.gate_up_proj_scales =
-                Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
-            bank.gate_up_proj_biases =
-                Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
-            bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
-            bank.down_proj_scales =
-                Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
-            bank.down_proj_biases =
-                Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
-            cache.record_compact_bank(
-                acquired.pass(),
-                acquired.scratch_bytes(),
-                started.elapsed(),
-            )?;
-            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
-            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
+    let layers = args.text_config.num_hidden_layers as usize;
+    let (layer, bank) = if cache_layer < layers {
+        (cache_layer, "experts")
+    } else {
+        (cache_layer - layers, "shared_experts")
+    };
+    let prefix = format!("model.layers.{layer}.moe.{bank}");
+    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_swiglu_dispatched(
+        cache,
+        crate::backend::mlx::runtime::residency::expert_provider::CachedSwiGluBankSpec {
+            hidden_dimensions: args.text_config.hidden_size,
+            intermediate_dimensions: args.text_config.moe_intermediate_size(),
+            gate_up_quantization: args
+                .text_config
+                .linear_format_for(&format!("{prefix}.gate_up_proj"))
+                .weight_quantization(),
+            down_quantization: args
+                .text_config
+                .linear_format_for(&format!("{prefix}.down_proj"))
+                .weight_quantization(),
+            activation: eredu_nn::GatedExpertActivation::Silu,
+            limit: None,
         },
-    )?)
+        cache_layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        pass,
+        stream,
+    )
 }
 
 pub(crate) fn execute_cached_lfm2(
@@ -2660,6 +2410,37 @@ pub(crate) fn execute_cached_lfm2(
             Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
         },
     )?)
+}
+
+pub(crate) fn execute_cached_muse_glimmer(
+    args: &eredu_architectures::muse_glimmer::DecoderConfig,
+    layer: usize,
+    routes: &DispatchedRoutes,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let prefix = format!("model.layers.{layer}.mlp.experts");
+    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_swiglu_dispatched(
+        cache,
+        crate::backend::mlx::runtime::residency::expert_provider::CachedSwiGluBankSpec {
+            hidden_dimensions: args.hidden_size,
+            intermediate_dimensions: args.moe_intermediate_size,
+            gate_up_quantization: args
+                .linear_format_for(&format!("{prefix}.gate_up_proj"))
+                .weight_quantization(),
+            down_quantization: args
+                .linear_format_for(&format!("{prefix}.down_proj"))
+                .weight_quantization(),
+            activation: eredu_nn::GatedExpertActivation::Silu,
+            limit: None,
+        },
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        pass,
+        stream,
+    )
 }
 
 pub(crate) fn execute_cached_nemotron_h(
@@ -2866,7 +2647,6 @@ fn load_gguf_ep(
                 | "qwen3moe"
                 | "qwen3vlmoe"
                 | "gpt-oss"
-                | "gemma4"
                 | "lfm2moe"
                 | "nemotron_h_moe"
                 | "qwen35moe"
@@ -2875,7 +2655,7 @@ fn load_gguf_ep(
             || options.weight_residency.expert_cache().is_some()))
     {
         return Err(Error::Parallel(format!(
-            "GGUF TP+EP preflight requires kimi-linear, deepseek2, inkling, qwen3moe, qwen3vlmoe, gpt-oss, gemma4, lfm2moe, nemotron_h_moe, qwen35moe, or qwen3next with fully resident weights or non-expert residency plus an independent expert cache, got architecture {architecture} and residency {:?}",
+            "GGUF TP+EP preflight requires kimi-linear, deepseek2, inkling, qwen3moe, qwen3vlmoe, gpt-oss, lfm2moe, nemotron_h_moe, qwen35moe, or qwen3next with fully resident weights or non-expert residency plus an independent expert cache, got architecture {architecture} and residency {:?}",
             options.weight_residency
         )));
     }
@@ -2896,11 +2676,6 @@ fn load_gguf_ep(
         )
         .into_loader_result()?;
     }
-    let inkling_mmproj = if architecture == "inkling" {
-        inkling::open_sibling_mmproj(gguf_file)?
-    } else {
-        None
-    };
     let qwen3_vl_mmproj = if architecture == "qwen3vlmoe" {
         Some(qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?)
     } else {
@@ -2917,7 +2692,6 @@ fn load_gguf_ep(
             architecture,
             checkpoint,
             &metadata,
-            inkling_mmproj.as_ref(),
             qwen3_vl_mmproj.as_deref(),
             qwen35_mmproj.as_ref(),
             topology,
@@ -2940,7 +2714,6 @@ fn load_gguf_ep(
         architecture,
         checkpoint,
         &metadata,
-        inkling_mmproj.as_ref(),
         qwen3_vl_mmproj.as_deref(),
         qwen35_mmproj.as_ref(),
         topology,
@@ -2958,7 +2731,6 @@ fn load_external_gguf_ep(
     architecture: &str,
     checkpoint: &GgufCheckpoint,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
-    inkling_mmproj: Option<&inkling::InklingMmprojGguf>,
     qwen3_vl_mmproj: Option<&Path>,
     qwen35_mmproj: Option<&qwen3_5::Qwen35MmprojGguf>,
     topology: MlxParallelContext,
@@ -3214,72 +2986,6 @@ fn load_external_gguf_ep(
                 weights_stream,
             )
         }
-        "gemma4" => {
-            let prepared = gemma4::prepare_gemma4_gguf_checkpoint(
-                checkpoint,
-                metadata,
-                None,
-                None,
-            )?;
-            let args = prepared.args;
-            let global_experts = args.num_experts.ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "Gemma 4 GGUF expert parallelism requires routed MoE layers".into(),
-                )
-            })?;
-            let assignment = resolve_model_assignment(
-                assignment,
-                usize::try_from(global_experts)
-                    .map_err(|_| Error::Parallel("Gemma 4 expert count is negative".into()))?,
-                topology,
-            )?;
-            let store = crate::composition::mlx_architectures::gemma4::layerwise::gemma4_gguf_store(
-                checkpoint,
-                None,
-                &args,
-                prepared.vision_config.as_ref(),
-                prepared.audio_config.as_ref(),
-                max_mapped_shards,
-            )?;
-            let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::gemma4::layerwise::
-                    load_gemma4_sparse_tp_ep_base_with_store(
-                        store.clone(),
-                        args.clone(),
-                        non_expert,
-                        ParallelBuildContext::new(topology, ShardingPolicy::Require),
-                        stream,
-                        weights_stream,
-                    )?
-            } else {
-                crate::composition::mlx_architectures::gemma4::layerwise::load_gemma4_sparse_ep_base_with_store(
-                    store.clone(),
-                    args.clone(),
-                    non_expert,
-                    stream,
-                    weights_stream,
-                )?
-            };
-            let store = model.checkpoint_store_arc();
-            let entries = crate::composition::mlx_architectures::gemma4::layerwise::gemma4_expert_catalog(
-                &args,
-                store.as_ref(),
-            )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
-            finish_external_ep(
-                topology,
-                ModelKind::Gemma4,
-                assignment,
-                ExpertArchitecture::Gemma4Layerwise(Box::new(model)),
-                store,
-                entries,
-                expert_residency,
-                replicated_parameter_bytes,
-                stream,
-                weights_stream,
-            )
-        }
         "gpt-oss" => {
             let prepared =
                 gpt_oss::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
@@ -3338,64 +3044,9 @@ fn load_external_gguf_ep(
                 weights_stream,
             )
         }
-        "inkling" => {
-            let prepared = inkling::prepare_gguf_checkpoint_with_mmproj(
-                checkpoint,
-                metadata,
-                inkling_mmproj,
-            )?;
-            let args = prepared.args;
-            let assignment = resolve_model_assignment(
-                assignment,
-                args.text_config.n_routed_experts as usize,
-                topology,
-            )?;
-            let store = crate::composition::mlx_architectures::inkling::layerwise::inkling_gguf_store(
-                checkpoint,
-                inkling_mmproj,
-                &args,
-                max_mapped_shards,
-            )?;
-            let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::inkling::layerwise::
-                    load_inkling_sparse_tp_ep_base_with_store(
-                        store.clone(),
-                        args.clone(),
-                        non_expert,
-                        ParallelBuildContext::new(topology, ShardingPolicy::Require),
-                        stream,
-                        weights_stream,
-                    )?
-            } else {
-                crate::composition::mlx_architectures::inkling::layerwise::
-                    load_inkling_sparse_ep_base_with_store(
-                    store.clone(),
-                    args.clone(),
-                    non_expert,
-                    stream,
-                    weights_stream,
-                )?
-            };
-            let store = model.checkpoint_store_arc();
-            let entries = crate::composition::mlx_architectures::inkling::layerwise::inkling_expert_catalog(
-                &args,
-                store.as_ref(),
-            )?;
-            let replicated_parameter_bytes =
-                planned_replicated_bytes(&model.residency_report()?)?;
-            finish_external_ep(
-                topology,
-                ModelKind::Inkling,
-                assignment,
-                ExpertArchitecture::InklingLayerwise(Box::new(model)),
-                store,
-                entries,
-                expert_residency,
-                replicated_parameter_bytes,
-                stream,
-                weights_stream,
-            )
-        }
+        "inkling" => Err(Error::Parallel(
+            "Inkling expert parallelism is served by the neutral pipeline runtime".into(),
+        )),
         "lfm2moe" => {
             let prepared = neutral_lfm2::prepare_gguf(checkpoint, metadata)?;
             let args = prepared.args;
@@ -3569,7 +3220,7 @@ fn load_external_gguf_ep(
             )
         }
         other => Err(Error::Parallel(format!(
-            "external-expert GGUF architecture {other} is unsupported; registered architectures are kimi-linear, deepseek2, gemma4, gpt-oss, inkling, qwen3moe, qwen3vlmoe, lfm2moe, nemotron_h_moe, qwen35moe, and qwen3next"
+            "external-expert GGUF architecture {other} is unsupported; registered architectures are kimi-linear, deepseek2, gpt-oss, inkling, qwen3moe, qwen3vlmoe, lfm2moe, nemotron_h_moe, qwen35moe, and qwen3next"
         ))),
     }
 }
@@ -4140,61 +3791,6 @@ fn load_additional_external_ep(
 ) -> Result<ExpertParallelModel, Error> {
     let store = open_external_safetensors_store(model_dir, max_mapped_shards)?;
     let (assignment, architecture, store, entries, replicated_parameter_bytes) = match kind {
-        ModelKind::Gemma4 => {
-            let (args, _, _, _, _, _) = gemma4::get_gemma4_model_config(model_dir)?;
-            let global_experts = args.num_experts.ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "expert parallelism requires Gemma 4 routed MoE text layers".into(),
-                )
-            })?;
-            if !args
-                .layer_schedule
-                .iter()
-                .any(|policy| policy.feed_forward == gemma4::FeedForwardPolicy::DenseWithSparseMoe)
-            {
-                return Err(Error::UnsupportedArchitecture(
-                    "expert parallelism requires Gemma 4 routed MoE text layers".into(),
-                ));
-            }
-            let assignment = resolve_model_assignment(
-                assignment,
-                usize::try_from(global_experts)
-                    .map_err(|_| Error::Parallel("Gemma 4 expert count is negative".into()))?,
-                topology,
-            )?;
-            let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::gemma4::layerwise::load_gemma4_sparse_tp_ep_base_with_store(
-                    store.clone(),
-                    args.clone(),
-                    non_expert,
-                    ParallelBuildContext::new(topology, ShardingPolicy::Require),
-                    stream,
-                    weights_stream,
-                )?
-            } else {
-                crate::composition::mlx_architectures::gemma4::layerwise::load_gemma4_sparse_ep_base_with_store(
-                    store.clone(),
-                    args.clone(),
-                    non_expert,
-                    stream,
-                    weights_stream,
-                )?
-            };
-            let store = model.checkpoint_store_arc();
-            let entries =
-                crate::composition::mlx_architectures::gemma4::layerwise::gemma4_expert_catalog(
-                    &args,
-                    store.as_ref(),
-                )?;
-            let replicated = planned_replicated_bytes(&model.residency_report()?)?;
-            (
-                assignment,
-                ExpertArchitecture::Gemma4Layerwise(Box::new(model)),
-                store,
-                entries,
-                replicated,
-            )
-        }
         ModelKind::GptOss => {
             let args = gpt_oss::get_model_args(model_dir)?;
             let assignment =
@@ -4233,53 +3829,9 @@ fn load_additional_external_ep(
             )
         }
         ModelKind::Inkling => {
-            let args = inkling::get_model_args(model_dir)?;
-            let global_experts = usize::try_from(args.text_config.n_routed_experts)
-                .map_err(|_| Error::Parallel("Inkling routed expert count is negative".into()))?;
-            if global_experts == 0
-                || !args.text_config.layer_schedule.iter().any(|policy| {
-                    policy.feed_forward
-                        == crate::composition::mlx_architectures::inkling::model::FeedForwardPolicy::SparseMoe
-                })
-            {
-                return Err(Error::UnsupportedArchitecture(
-                    "expert parallelism requires an Inkling checkpoint with routed MoE layers"
-                        .into(),
-                ));
-            }
-            let assignment = resolve_model_assignment(assignment, global_experts, topology)?;
-            let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::inkling::layerwise::load_inkling_sparse_tp_ep_base_with_store(
-                    store.clone(),
-                    args.clone(),
-                    non_expert,
-                    ParallelBuildContext::new(topology, ShardingPolicy::Require),
-                    stream,
-                    weights_stream,
-                )?
-            } else {
-                crate::composition::mlx_architectures::inkling::layerwise::load_inkling_sparse_ep_base_with_store(
-                    store.clone(),
-                    args.clone(),
-                    non_expert,
-                    stream,
-                    weights_stream,
-                )?
-            };
-            let store = model.checkpoint_store_arc();
-            let entries =
-                crate::composition::mlx_architectures::inkling::layerwise::inkling_expert_catalog(
-                    &args,
-                    store.as_ref(),
-                )?;
-            let replicated = planned_replicated_bytes(&model.residency_report()?)?;
-            (
-                assignment,
-                ExpertArchitecture::InklingLayerwise(Box::new(model)),
-                store,
-                entries,
-                replicated,
-            )
+            return Err(Error::Parallel(
+                "Inkling expert parallelism is served by the neutral pipeline runtime".into(),
+            ))
         }
         ModelKind::Lfm2 => {
             let args = neutral_lfm2::load_model_args(model_dir)?;

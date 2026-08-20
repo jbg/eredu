@@ -148,12 +148,7 @@ impl SamplingBackend for MlxSamplingBackend {
             return Ok(logits.clone());
         };
         let vocab_size = logits.dim(-1) as usize;
-        if allowed.len() != vocab_size {
-            return Err(Exception::custom(format!(
-                "token filter vocabulary size {} does not match logits vocabulary size {vocab_size}",
-                allowed.len()
-            )));
-        }
+        let allowed = effective_allowed_mask(allowed, vocab_size).map_err(Exception::custom)?;
         let row_count = logits.size() / vocab_size;
         let invalid = (0..row_count)
             .flat_map(|_| allowed.iter().map(|allowed| !allowed))
@@ -249,6 +244,21 @@ impl SamplingBackend for MlxSamplingBackend {
     }
 }
 
+fn effective_allowed_mask(allowed: &[bool], vocab_size: usize) -> Result<&[bool], String> {
+    let Some(allowed) = allowed.get(..vocab_size) else {
+        return Err(format!(
+            "token filter vocabulary size {} is smaller than logits vocabulary size {vocab_size}",
+            allowed.len()
+        ));
+    };
+    if !allowed.iter().any(|allowed| *allowed) {
+        return Err(format!(
+            "token filter permits no token in the logits vocabulary prefix of size {vocab_size}"
+        ));
+    }
+    Ok(allowed)
+}
+
 fn sample_categorical(
     logits: &Array,
     random: Option<&mut RandomState>,
@@ -263,4 +273,19 @@ fn sample_categorical(
 fn mask_logits(mask: Array, logits: Array, stream: &Stream) -> Result<Array, Exception> {
     let minimum = Array::from_f32(logits.dtype().finfo_min()? as f32);
     safemlx::ops::r#where(mask, minimum, logits, stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_allowed_mask;
+
+    #[test]
+    fn token_filter_accepts_a_truncated_output_vocabulary_prefix() {
+        assert_eq!(
+            effective_allowed_mask(&[false, true, false, true], 3).unwrap(),
+            &[false, true, false]
+        );
+        assert!(effective_allowed_mask(&[false, false, true], 2).is_err());
+        assert!(effective_allowed_mask(&[true], 2).is_err());
+    }
 }

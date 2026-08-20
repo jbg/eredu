@@ -44,7 +44,7 @@ use eredu_core::backend::{
 use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};
 
 #[cfg(feature = "mlx-media")]
-use crate::backend::mlx::runtime::media::ModelProcessor;
+use crate::composition::mlx::ModelProcessor;
 use crate::{
     backend::mlx::error::Error,
     composition::mlx_architectures::distributed::{

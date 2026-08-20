@@ -1,20 +1,22 @@
-//! Bounded, out-of-core load-time weight quantization.
+//! Bounded load-time weight quantization into resident memory.
 
 //!
 //! A [`BoundedQuantizedWeightStore`](crate::backend::mlx::runtime::checkpoint::bounded_quantization::BoundedQuantizedWeightStore)
 //! overlays packed tensors on an existing
 //! checkpoint store. Source matrices are selected in row tiles, quantized on
-//! explicit conversion streams, and written directly into temporary SafeTensors
-//! shards. A fixed two-slot completion window spans tensor boundaries and
-//! overlaps the next tile with the prior tile's host write when both slots fit
+//! explicit conversion streams, and written directly into final in-memory
+//! encoded tensors. A fixed two-slot completion window spans tensor boundaries and
+//! overlaps the next tile with the prior tile's host copy when both slots fit
 //! the admitted working set, and otherwise falls back to one slot. The
-//! process never requires a complete dense matrix or a complete packed matrix
-//! in active memory: tile size is admitted against an explicit byte bound. The
+//! process never requires a complete dense matrix in active memory: tile size is
+//! admitted against an explicit byte bound, while final packed storage remains
+//! resident for the subsequent model load. The
 //! ordinary residency machinery subsequently sees only the final packed tensor
 //! geometry.
 
 use eredu_checkpoint::store::{
-    CheckpointLease, CheckpointSource, StoreError, TensorReadRequest, WeightStoreDiagnostics,
+    CheckpointLease, CheckpointSource, MemoryWeightStore, StoreError, TensorReadRequest,
+    WeightStoreDiagnostics,
 };
 use eredu_checkpoint::WeightQuantization;
 #[cfg(test)]
@@ -22,16 +24,15 @@ use eredu_checkpoint::{store::WeightStoreBackend, AffineQuantization};
 use eredu_runtime::WeightMaterializationReport;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    fs::{File, OpenOptions},
-    io::{Seek, SeekFrom, Write},
-    path::Path,
+    collections::{BTreeSet, VecDeque},
+    path::PathBuf,
     sync::Arc,
 };
 
 use safemlx::{memory, transforms::async_eval_with_event, Array, Dtype, Event, Stream};
-use safetensors::tensor::{Dtype as SafeDtype, TensorInfo};
-use serde::Serialize;
+use safetensors::tensor::Dtype as SafeDtype;
+
+#[cfg(test)]
 use tempfile::TempDir;
 
 #[cfg(test)]
@@ -42,14 +43,17 @@ use crate::{
         quantization::quantize_tensor,
         recipe::{DerivedWeightRecipe, MlxWeightRecipeExt, RecipeDtype},
         store::{
-            MlxParameterMaterializationContext, PendingWeightMaterialization,
-            SafetensorsWeightStore, TensorSelection,
+            MlxParameterMaterializationContext, PendingWeightMaterialization, TensorSelection,
         },
     },
 };
 
+#[cfg(test)]
+use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
+
 const BOUNDED_QUANTIZATION_TILE_BUFFERS: usize = 2;
 const BOUNDED_QUANTIZATION_MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_QUANTIZATION_SUBMISSION_ELEMENTS: usize = i32::MAX as usize;
 
 /// One dense semantic weight that will be replaced by its packed representation.
 ///
@@ -141,7 +145,7 @@ impl BoundedQuantizationTarget {
     }
 }
 
-/// A validated collection of out-of-core weight transformations.
+/// A validated collection of source-bounded, memory-resident transformations.
 #[derive(Debug, Clone)]
 pub struct BoundedQuantizationPlan {
     quantization: WeightQuantization,
@@ -208,18 +212,18 @@ impl BoundedQuantizationPlan {
     }
 }
 
-/// A source checkpoint overlaid with disk-backed, load-time-quantized weights.
+/// A source checkpoint overlaid with memory-backed, load-time-quantized weights.
 ///
-/// The temporary packed store lives as long as this value. Runtime acquisitions
-/// of transformed keys use ordinary bounded SafeTensors leases; all other keys
+/// The packed store lives as long as this value. Runtime acquisitions of
+/// transformed keys use bounded in-memory leases; all other keys
 /// delegate to the original store.
 pub struct BoundedQuantizedWeightStore {
     source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-    transformed: SafetensorsWeightStore,
+    transformed: MemoryWeightStore,
     transformed_keys: BTreeSet<String>,
     materialized_source_keys: BTreeSet<String>,
+    materialized_source_shards: BTreeSet<PathBuf>,
     report: WeightMaterializationReport,
-    _directory: TempDir,
 }
 
 impl std::fmt::Debug for BoundedQuantizedWeightStore {
@@ -240,7 +244,7 @@ impl std::fmt::Debug for BoundedQuantizedWeightStore {
 }
 
 impl BoundedQuantizedWeightStore {
-    /// Executes `plan` without materializing a complete source or destination matrix.
+    /// Executes `plan` without materializing a complete dense source matrix.
     ///
     /// Conversion runs on the supplied stream's device, allowing model loads
     /// to use the accelerator quantizer while retaining CPU fallback. Source
@@ -270,11 +274,17 @@ impl BoundedQuantizedWeightStore {
             .iter()
             .flat_map(|target| target.source.source_keys())
             .map(ToString::to_string)
-            .collect();
-        let directory = tempfile::Builder::new()
-            .prefix("safemlx-bounded-quantization-")
-            .tempdir()?;
-        let mut index = BTreeMap::<String, String>::new();
+            .collect::<BTreeSet<_>>();
+        let mut materialized_source_shards = source
+            .materialized_source_shards()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for key in &materialized_source_keys {
+            if let Some(path) = source.source_metadata(key)?.backing_shard {
+                materialized_source_shards.insert(path);
+            }
+        }
+        let mut transformed_keys = BTreeSet::new();
         let mut report = WeightMaterializationReport {
             admitted_working_set_bytes: plan.max_working_set_bytes,
             ..WeightMaterializationReport::default()
@@ -284,42 +294,44 @@ impl BoundedQuantizedWeightStore {
         let mut pending_tiles = VecDeque::with_capacity(BOUNDED_QUANTIZATION_TILE_BUFFERS);
         allocator_cache.begin()?;
 
-        for (ordinal, target) in plan.targets.iter().enumerate() {
-            let shard_name = format!("quantized-{ordinal:05}.safetensors");
+        for target in &plan.targets {
             transform_target(
                 source.as_ref(),
                 target,
                 &plan,
                 &tile_contexts,
-                &directory.path().join(&shard_name),
                 &mut output_shards,
                 &mut pending_tiles,
                 &mut allocator_cache,
                 &mut report,
             )?;
             for name in output_names_for(target, plan.quantization)? {
-                index.insert(name, shard_name.clone());
+                transformed_keys.insert(name);
             }
         }
         while !pending_tiles.is_empty() {
             write_oldest_tile(&mut pending_tiles, &mut output_shards, &mut allocator_cache)?;
         }
-        debug_assert!(output_shards.iter().all(|shard| shard.file.is_none()));
+        debug_assert!(output_shards
+            .iter()
+            .all(|shard| shard.sealed && shard.pending_tiles == 0));
         allocator_cache.finish()?;
 
-        write_index(directory.path(), &index, report.output_bytes)?;
-        let transformed = SafetensorsWeightStore::open_with_max_mapped_shards(
-            directory.path(),
-            index.len().max(1),
-        )?;
-        let transformed_keys = index.into_keys().collect();
+        let transformed =
+            MemoryWeightStore::from_safetensors(output_shards.into_iter().flat_map(|shard| {
+                shard
+                    .layouts
+                    .into_iter()
+                    .zip(shard.buffers)
+                    .map(|(layout, bytes)| (layout.name, layout.dtype, layout.shape, bytes))
+            }))?;
         Ok(Self {
             source,
             transformed,
             transformed_keys,
             materialized_source_keys,
+            materialized_source_shards,
             report,
-            _directory: directory,
         })
     }
 
@@ -353,6 +365,10 @@ impl CheckpointSource for BoundedQuantizedWeightStore {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    fn materialized_source_shards(&self) -> Vec<PathBuf> {
+        self.materialized_source_shards.iter().cloned().collect()
     }
 
     fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
@@ -424,13 +440,11 @@ struct OutputLayout {
     shape: Vec<usize>,
     row_bytes: u64,
     byte_len: u64,
-    data_offset: u64,
 }
 
 struct OutputShard {
-    file: Option<File>,
-    payload_offset: u64,
     layouts: Vec<OutputLayout>,
+    buffers: Vec<Vec<u8>>,
     pending_tiles: usize,
     sealed: bool,
 }
@@ -546,14 +560,6 @@ impl OutputShard {
     }
 
     fn close_if_complete(&mut self) -> Result<(), Error> {
-        if self.sealed && self.pending_tiles == 0 {
-            // These shards are process-local scratch data consumed immediately
-            // below. Per-shard durability would serialize unnecessary disk syncs.
-            self.file
-                .take()
-                .expect("an incomplete output shard retains its file")
-                .flush()?;
-        }
         Ok(())
     }
 }
@@ -563,7 +569,6 @@ fn transform_target(
     target: &BoundedQuantizationTarget,
     plan: &BoundedQuantizationPlan,
     tile_contexts: &[MlxParameterMaterializationContext; BOUNDED_QUANTIZATION_TILE_BUFFERS],
-    path: &Path,
     output_shards: &mut Vec<OutputShard>,
     pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
     allocator_cache: &mut BoundedAllocatorCache,
@@ -658,131 +663,228 @@ fn transform_target(
         }
     }
     let tile_budget = plan.max_working_set_bytes / tile_buffers as u64;
-    let payload_offset = create_shard(path, &layouts)?;
     let output_bytes = layouts.iter().try_fold(0u64, |total, layout| {
         total
             .checked_add(layout.byte_len)
             .ok_or_else(|| quantization_error("quantized output telemetry overflow"))
     })?;
     let output_shard = output_shards.len();
+    let buffers = layouts
+        .iter()
+        .map(|layout| allocate_output_buffer(&layout.name, layout.byte_len))
+        .collect::<Result<Vec<_>, _>>()?;
     output_shards.push(OutputShard {
-        file: Some(OpenOptions::new().write(true).open(path)?),
-        payload_offset,
         layouts,
+        buffers,
         pending_tiles: 0,
         sealed: false,
     });
-    for matrix in 0..leading {
-        let mut start = 0usize;
-        while start < rows {
-            // TP segmented placements can have discontinuities in their compact
-            // row space. Admit each tile at its actual start so no tile crosses a
-            // semantic segment boundary with a larger peak than the first tile.
-            let mut end = start + 1;
-            let mut rejected_end = rows.saturating_add(1);
-            while end + 1 < rejected_end {
-                let candidate_end = end + (rejected_end - end) / 2;
-                let candidate = target.source.select_bounded_matrix_rows(
+    let complete_rows = leading
+        .checked_mul(rows)
+        .ok_or_else(|| quantization_error("complete target row count overflow"))?;
+    let complete_elements = complete_rows
+        .checked_mul(columns)
+        .ok_or_else(|| quantization_error("complete target element count overflow"))?;
+    let complete_peak = target
+        .source
+        .peak_materialization_bytes(source)?
+        .checked_add(output_bytes)
+        .ok_or_else(|| quantization_error("complete target working-set overflow"))?;
+    let leading_batch_admissible = if row_axis == 1 {
+        let one_matrix = target.source.select_bounded(
+            source,
+            TensorSelection::Range {
+                axis: 0,
+                start: 0,
+                end: 1,
+            },
+        )?;
+        let one_matrix_output = output_row_bytes
+            .checked_mul(rows as u64)
+            .ok_or_else(|| quantization_error("one-matrix output size overflow"))?;
+        one_matrix
+            .peak_materialization_bytes(source)?
+            .checked_add(one_matrix_output)
+            .is_some_and(|peak| peak <= tile_budget)
+            && rows
+                .checked_mul(columns)
+                .is_some_and(|elements| elements <= MAX_QUANTIZATION_SUBMISSION_ELEMENTS)
+    } else {
+        false
+    };
+    if complete_peak <= tile_budget && complete_elements <= MAX_QUANTIZATION_SUBMISSION_ELEMENTS {
+        target.source.preflight_bounded(source)?;
+        submit_quantization_tile(
+            source,
+            &target.source,
+            target,
+            plan.quantization,
+            tile_contexts,
+            tile_buffers,
+            output_shard,
+            0,
+            complete_rows,
+            complete_peak,
+            output_bytes,
+            output_shards,
+            pending_tiles,
+            allocator_cache,
+            report,
+        )?;
+    } else if leading_batch_admissible {
+        let mut matrix_start = 0usize;
+        while matrix_start < leading {
+            let mut matrix_end = matrix_start + 1;
+            let mut rejected_end = leading.saturating_add(1);
+            while matrix_end + 1 < rejected_end {
+                let candidate_end = matrix_end + (rejected_end - matrix_end) / 2;
+                let candidate = target.source.select_bounded(
                     source,
-                    matrix,
-                    start,
-                    candidate_end,
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: matrix_start,
+                        end: candidate_end,
+                    },
                 )?;
                 candidate.preflight_bounded(source)?;
-                let candidate_rows = candidate_end - start;
-                let output_bytes = output_row_bytes
+                let candidate_rows = (candidate_end - matrix_start)
+                    .checked_mul(rows)
+                    .ok_or_else(|| quantization_error("expert batch row count overflow"))?;
+                let candidate_elements = candidate_rows
+                    .checked_mul(columns)
+                    .ok_or_else(|| quantization_error("expert batch element count overflow"))?;
+                let candidate_output_bytes = output_row_bytes
                     .checked_mul(candidate_rows as u64)
-                    .ok_or_else(|| quantization_error("candidate tile output size overflow"))?;
-                let peak = candidate
+                    .ok_or_else(|| quantization_error("expert batch output size overflow"))?;
+                let candidate_peak = candidate
                     .peak_materialization_bytes(source)?
-                    .checked_add(output_bytes)
-                    .ok_or_else(|| quantization_error("candidate tile working-set overflow"))?;
-                if peak <= tile_budget {
-                    end = candidate_end;
+                    .checked_add(candidate_output_bytes)
+                    .ok_or_else(|| quantization_error("expert batch working-set overflow"))?;
+                if candidate_elements <= MAX_QUANTIZATION_SUBMISSION_ELEMENTS
+                    && candidate_peak <= tile_budget
+                {
+                    matrix_end = candidate_end;
                 } else {
                     rejected_end = candidate_end;
                 }
             }
-            let tile_rows = end - start;
-            let tile_recipe = target
-                .source
-                .select_bounded_matrix_rows(source, matrix, start, end)?;
-            tile_recipe.preflight_bounded(source)?;
-            let tile_metadata = tile_recipe.infer(source)?;
-            let tile_output_bytes = output_row_bytes
-                .checked_mul(tile_rows as u64)
-                .ok_or_else(|| quantization_error("quantized tile output size overflow"))?;
-            let tile_peak = tile_recipe
+            let recipe = target.source.select_bounded(
+                source,
+                TensorSelection::Range {
+                    axis: 0,
+                    start: matrix_start,
+                    end: matrix_end,
+                },
+            )?;
+            recipe.preflight_bounded(source)?;
+            let batch_rows = (matrix_end - matrix_start)
+                .checked_mul(rows)
+                .ok_or_else(|| quantization_error("expert batch row count overflow"))?;
+            let batch_output_bytes = output_row_bytes
+                .checked_mul(batch_rows as u64)
+                .ok_or_else(|| quantization_error("expert batch output size overflow"))?;
+            let batch_peak = recipe
                 .peak_materialization_bytes(source)?
-                .checked_add(tile_output_bytes)
-                .ok_or_else(|| quantization_error("conversion tile working-set overflow"))?;
-            if tile_peak > tile_budget {
+                .checked_add(batch_output_bytes)
+                .ok_or_else(|| quantization_error("expert batch working-set overflow"))?;
+            if batch_peak > tile_budget {
                 return Err(quantization_error(format!(
+                    "bounded quantization target {:?} cannot admit one leading matrix within the {}-byte tile slot",
+                    target.weight_name, tile_budget
+                )));
+            }
+            submit_quantization_tile(
+                source,
+                &recipe,
+                target,
+                plan.quantization,
+                tile_contexts,
+                tile_buffers,
+                output_shard,
+                matrix_start * rows,
+                batch_rows,
+                batch_peak,
+                batch_output_bytes,
+                output_shards,
+                pending_tiles,
+                allocator_cache,
+                report,
+            )?;
+            matrix_start = matrix_end;
+        }
+    } else {
+        for matrix in 0..leading {
+            let mut start = 0usize;
+            while start < rows {
+                // TP segmented placements can have discontinuities in their compact
+                // row space. Admit each tile at its actual start so no tile crosses a
+                // semantic segment boundary with a larger peak than the first tile.
+                let mut end = start + 1;
+                let mut rejected_end = rows.saturating_add(1);
+                while end + 1 < rejected_end {
+                    let candidate_end = end + (rejected_end - end) / 2;
+                    let candidate = target.source.select_bounded_matrix_rows(
+                        source,
+                        matrix,
+                        start,
+                        candidate_end,
+                    )?;
+                    candidate.preflight_bounded(source)?;
+                    let candidate_rows = candidate_end - start;
+                    let output_bytes = output_row_bytes
+                        .checked_mul(candidate_rows as u64)
+                        .ok_or_else(|| quantization_error("candidate tile output size overflow"))?;
+                    let peak = candidate
+                        .peak_materialization_bytes(source)?
+                        .checked_add(output_bytes)
+                        .ok_or_else(|| quantization_error("candidate tile working-set overflow"))?;
+                    if peak <= tile_budget {
+                        end = candidate_end;
+                    } else {
+                        rejected_end = candidate_end;
+                    }
+                }
+                let tile_rows = end - start;
+                let tile_recipe = target
+                    .source
+                    .select_bounded_matrix_rows(source, matrix, start, end)?;
+                tile_recipe.preflight_bounded(source)?;
+                let tile_output_bytes = output_row_bytes
+                    .checked_mul(tile_rows as u64)
+                    .ok_or_else(|| quantization_error("quantized tile output size overflow"))?;
+                let tile_peak = tile_recipe
+                    .peak_materialization_bytes(source)?
+                    .checked_add(tile_output_bytes)
+                    .ok_or_else(|| quantization_error("conversion tile working-set overflow"))?;
+                if tile_peak > tile_budget {
+                    return Err(quantization_error(format!(
                     "bounded quantization planner admitted {} rows for {:?}, but their {}-byte working set exceeds the {}-byte tile slot",
                     tile_rows, target.weight_name, tile_peak, tile_budget
                 )));
+                }
+                let output_start = matrix
+                    .checked_mul(rows)
+                    .and_then(|offset| offset.checked_add(start))
+                    .ok_or_else(|| quantization_error("quantized output row offset overflow"))?;
+                submit_quantization_tile(
+                    source,
+                    &tile_recipe,
+                    target,
+                    plan.quantization,
+                    tile_contexts,
+                    tile_buffers,
+                    output_shard,
+                    output_start,
+                    tile_rows,
+                    tile_peak,
+                    tile_output_bytes,
+                    output_shards,
+                    pending_tiles,
+                    allocator_cache,
+                    report,
+                )?;
+                start = end;
             }
-            allocator_cache
-                .prepare_submission(queued_working_set_bytes(pending_tiles)?, tile_peak)?;
-
-            let tile_context = &tile_contexts[report.source_tiles % tile_buffers];
-            let tile_stream = tile_context.source_stream();
-            let pending = tile_recipe.prepare_borrowed_materialization(source, tile_context)?;
-            let (dense, source_mappings) = pending.into_parts();
-            let quantized = quantize_tensor(&dense, plan.quantization, tile_stream)?;
-            let companion_dtype = match target.affine_companion_dtype {
-                RecipeDtype::F16 => Dtype::Float16,
-                RecipeDtype::BF16 => Dtype::Bfloat16,
-                RecipeDtype::F32 => Dtype::Float32,
-                _ => unreachable!("validated bounded companion dtype"),
-            };
-            let scales = if matches!(plan.quantization, WeightQuantization::MxFp4) {
-                quantized.scales
-            } else {
-                quantized.scales.as_dtype(companion_dtype, tile_stream)?
-            };
-            let mut outputs = vec![quantized.weight, scales];
-            if let Some(biases) = quantized.biases {
-                outputs.push(biases.as_dtype(companion_dtype, tile_stream)?);
-            }
-            let completion = async_eval_with_event(outputs.iter())?;
-            let output_start = matrix
-                .checked_mul(rows)
-                .and_then(|offset| offset.checked_add(start))
-                .ok_or_else(|| quantization_error("quantized output row offset overflow"))?;
-            let submitted = SubmittedQuantizationTile {
-                outputs,
-                _dense: dense,
-                source_mappings,
-                completion: Some(completion),
-                output_start,
-                rows: tile_rows,
-                planned_working_set_bytes: tile_peak,
-                output_shard,
-            };
-            output_shards[output_shard].tile_submitted();
-            pending_tiles.push_back(submitted);
-            report.peak_in_flight_tiles = report.peak_in_flight_tiles.max(pending_tiles.len());
-
-            report.source_tiles = report.source_tiles.saturating_add(1);
-            report.source_bytes_read = report
-                .source_bytes_read
-                .checked_add(tile_metadata.byte_len())
-                .ok_or_else(|| quantization_error("source-read telemetry overflow"))?;
-            let queued_working_set = queued_working_set_bytes(pending_tiles)?;
-            report.peak_planned_working_set_bytes = report
-                .peak_planned_working_set_bytes
-                .max(queued_working_set);
-            report.largest_source_tile_bytes = report
-                .largest_source_tile_bytes
-                .max(tile_metadata.byte_len());
-            report.largest_output_tile_bytes =
-                report.largest_output_tile_bytes.max(tile_output_bytes);
-
-            if pending_tiles.len() == tile_buffers {
-                write_oldest_tile(pending_tiles, output_shards, allocator_cache)?;
-            }
-            start = end;
         }
     }
     output_shards[output_shard].seal()?;
@@ -801,6 +903,88 @@ fn transform_target(
         )?
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_quantization_tile(
+    source: &dyn CheckpointSource,
+    recipe: &DerivedWeightRecipe,
+    target: &BoundedQuantizationTarget,
+    quantization: WeightQuantization,
+    tile_contexts: &[MlxParameterMaterializationContext; BOUNDED_QUANTIZATION_TILE_BUFFERS],
+    tile_buffers: usize,
+    output_shard: usize,
+    output_start: usize,
+    rows: usize,
+    planned_working_set_bytes: u64,
+    output_bytes: u64,
+    output_shards: &mut [OutputShard],
+    pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
+    allocator_cache: &mut BoundedAllocatorCache,
+    report: &mut WeightMaterializationReport,
+) -> Result<(), Error> {
+    allocator_cache.prepare_submission(
+        queued_working_set_bytes(pending_tiles)?,
+        planned_working_set_bytes,
+    )?;
+    let metadata = recipe.infer(source)?;
+    let tile_context = &tile_contexts[report.source_tiles % tile_buffers];
+    let tile_stream = tile_context.source_stream();
+    let pending = recipe.prepare_borrowed_materialization(source, tile_context)?;
+    let (dense, source_mappings) = pending.into_parts();
+    let outputs = quantize_tile_outputs(&dense, quantization, target, tile_stream)?;
+    let completion = async_eval_with_event(outputs.iter())?;
+    output_shards[output_shard].tile_submitted();
+    pending_tiles.push_back(SubmittedQuantizationTile {
+        outputs,
+        _dense: dense,
+        source_mappings,
+        completion: Some(completion),
+        output_start,
+        rows,
+        planned_working_set_bytes,
+        output_shard,
+    });
+    report.peak_in_flight_tiles = report.peak_in_flight_tiles.max(pending_tiles.len());
+    report.source_tiles = report.source_tiles.saturating_add(1);
+    report.source_bytes_read = report
+        .source_bytes_read
+        .checked_add(metadata.byte_len())
+        .ok_or_else(|| quantization_error("source-read telemetry overflow"))?;
+    report.peak_planned_working_set_bytes = report
+        .peak_planned_working_set_bytes
+        .max(queued_working_set_bytes(pending_tiles)?);
+    report.largest_source_tile_bytes = report.largest_source_tile_bytes.max(metadata.byte_len());
+    report.largest_output_tile_bytes = report.largest_output_tile_bytes.max(output_bytes);
+    if pending_tiles.len() == tile_buffers {
+        write_oldest_tile(pending_tiles, output_shards, allocator_cache)?;
+    }
+    Ok(())
+}
+
+fn quantize_tile_outputs(
+    dense: &Array,
+    quantization: WeightQuantization,
+    target: &BoundedQuantizationTarget,
+    stream: &Stream,
+) -> Result<Vec<Array>, Error> {
+    let quantized = quantize_tensor(dense, quantization, stream)?;
+    let companion_dtype = match target.affine_companion_dtype {
+        RecipeDtype::F16 => Dtype::Float16,
+        RecipeDtype::BF16 => Dtype::Bfloat16,
+        RecipeDtype::F32 => Dtype::Float32,
+        _ => unreachable!("validated bounded companion dtype"),
+    };
+    let scales = if matches!(quantization, WeightQuantization::MxFp4) {
+        quantized.scales
+    } else {
+        quantized.scales.as_dtype(companion_dtype, stream)?
+    };
+    let mut outputs = vec![quantized.weight, scales];
+    if let Some(biases) = quantized.biases {
+        outputs.push(biases.as_dtype(companion_dtype, stream)?);
+    }
+    Ok(outputs)
 }
 
 fn output_layouts(
@@ -867,13 +1051,6 @@ fn output_layouts(
         )?);
     }
 
-    let mut offset = 0u64;
-    for layout in &mut layouts {
-        layout.data_offset = offset;
-        offset = offset
-            .checked_add(layout.byte_len)
-            .ok_or_else(|| quantization_error("SafeTensors payload offset overflow"))?;
-    }
     Ok(layouts)
 }
 
@@ -898,57 +1075,20 @@ fn layout(
         shape: prefix,
         row_bytes,
         byte_len,
-        data_offset: 0,
     })
 }
 
-fn create_shard(path: &Path, layouts: &[OutputLayout]) -> Result<u64, Error> {
-    let metadata = layouts
-        .iter()
-        .map(|layout| {
-            let start = usize::try_from(layout.data_offset)
-                .map_err(|_| quantization_error("SafeTensors offset is not representable"))?;
-            let end = usize::try_from(
-                layout
-                    .data_offset
-                    .checked_add(layout.byte_len)
-                    .ok_or_else(|| quantization_error("SafeTensors offset overflow"))?,
-            )
-            .map_err(|_| quantization_error("SafeTensors offset is not representable"))?;
-            Ok((
-                layout.name.clone(),
-                TensorInfo {
-                    dtype: layout.dtype,
-                    shape: layout.shape.clone(),
-                    data_offsets: (start, end),
-                },
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, Error>>()?;
-    let mut header = serde_json::to_vec(&metadata)?;
-    let aligned = header
-        .len()
-        .checked_add(7)
-        .map(|length| length & !7)
-        .ok_or_else(|| quantization_error("SafeTensors header size overflow"))?;
-    header.resize(aligned, b' ');
-    let payload_offset = 8u64
-        .checked_add(header.len() as u64)
-        .ok_or_else(|| quantization_error("SafeTensors payload offset overflow"))?;
-    let payload_bytes = layouts.iter().try_fold(0u64, |total, layout| {
-        total
-            .checked_add(layout.byte_len)
-            .ok_or_else(|| quantization_error("SafeTensors payload size overflow"))
+fn allocate_output_buffer(name: &str, byte_len: u64) -> Result<Vec<u8>, Error> {
+    let byte_len = usize::try_from(byte_len)
+        .map_err(|_| quantization_error(format!("output {name:?} is too large for memory")))?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(byte_len).map_err(|error| {
+        quantization_error(format!(
+            "cannot allocate {byte_len} bytes for in-memory quantized output {name:?}: {error}"
+        ))
     })?;
-    let file_len = payload_offset
-        .checked_add(payload_bytes)
-        .ok_or_else(|| quantization_error("SafeTensors shard size overflow"))?;
-    let mut file = File::create(path)?;
-    file.write_all(&(header.len() as u64).to_le_bytes())?;
-    file.write_all(&header)?;
-    file.set_len(file_len)?;
-    file.flush()?;
-    Ok(payload_offset)
+    bytes.resize(byte_len, 0);
+    Ok(bytes)
 }
 
 struct SubmittedQuantizationTile {
@@ -965,18 +1105,13 @@ struct SubmittedQuantizationTile {
 impl SubmittedQuantizationTile {
     fn write(mut self, shard: &mut OutputShard) -> Result<(), Error> {
         self.complete()?;
-        for (layout, output) in shard.layouts.iter().zip(&self.outputs) {
-            write_tile(
-                shard
-                    .file
-                    .as_mut()
-                    .expect("a pending output tile retains its shard file"),
-                shard.payload_offset,
-                layout,
-                self.output_start,
-                self.rows,
-                output,
-            )?;
+        for ((layout, output), buffer) in shard
+            .layouts
+            .iter()
+            .zip(&self.outputs)
+            .zip(&mut shard.buffers)
+        {
+            write_tile(buffer, layout, self.output_start, self.rows, output)?;
         }
         Ok(())
     }
@@ -1031,8 +1166,7 @@ impl Drop for SubmittedQuantizationTile {
 }
 
 fn write_tile(
-    file: &mut File,
-    payload_offset: u64,
+    buffer: &mut [u8],
     layout: &OutputLayout,
     start_row: usize,
     rows: usize,
@@ -1052,61 +1186,49 @@ fn write_tile(
             expected_bytes
         )));
     }
-    let offset = payload_offset
-        .checked_add(layout.data_offset)
-        .and_then(|offset| offset.checked_add(layout.row_bytes.checked_mul(start_row as u64)?))
-        .ok_or_else(|| quantization_error("quantized tile file offset overflow"))?;
-    file.seek(SeekFrom::Start(offset))?;
+    let offset = layout
+        .row_bytes
+        .checked_mul(start_row as u64)
+        .ok_or_else(|| quantization_error("quantized tile memory offset overflow"))?;
+    let offset = usize::try_from(offset)
+        .map_err(|_| quantization_error("quantized tile memory offset is not representable"))?;
+    let expected_bytes = usize::try_from(expected_bytes)
+        .map_err(|_| quantization_error("quantized tile byte count is not representable"))?;
+    let destination = buffer
+        .get_mut(offset..offset + expected_bytes)
+        .ok_or_else(|| {
+            quantization_error(format!(
+                "quantized output {:?} tile rows {}..{} exceed its in-memory buffer",
+                layout.name,
+                start_row,
+                start_row + rows
+            ))
+        })?;
     let evaluated = output.evaluated()?;
-    match output.dtype() {
-        Dtype::Uint32 => write_native_slice(file, evaluated.as_slice::<u32>())?,
-        Dtype::Float16 => write_native_slice(file, evaluated.as_slice::<half::f16>())?,
-        Dtype::Bfloat16 => write_native_slice(file, evaluated.as_slice::<half::bf16>())?,
-        Dtype::Float32 => write_native_slice(file, evaluated.as_slice::<f32>())?,
-        Dtype::Uint8 => file.write_all(evaluated.as_slice::<u8>())?,
+    let source = match output.dtype() {
+        Dtype::Uint32 => native_slice_bytes(evaluated.as_slice::<u32>()),
+        Dtype::Float16 => native_slice_bytes(evaluated.as_slice::<half::f16>()),
+        Dtype::Bfloat16 => native_slice_bytes(evaluated.as_slice::<half::bf16>()),
+        Dtype::Float32 => native_slice_bytes(evaluated.as_slice::<f32>()),
+        Dtype::Uint8 => evaluated.as_slice::<u8>(),
         dtype => {
             return Err(quantization_error(format!(
                 "quantized output {:?} has unsupported dtype {dtype:?}",
                 layout.name
             )))
         }
-    }
+    };
+    destination.copy_from_slice(source);
     Ok(())
 }
 
-fn write_native_slice<T>(file: &mut File, values: &[T]) -> Result<(), std::io::Error> {
-    let bytes = unsafe {
+fn native_slice_bytes<T>(values: &[T]) -> &[u8] {
+    unsafe {
         // SAFETY: `values` is a valid initialized slice, and its byte view has
         // the identical lifetime. The public constructor rejects big-endian
         // hosts because SafeTensors payloads are little-endian.
         std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-    };
-    file.write_all(bytes)
-}
-
-#[derive(Serialize)]
-struct SafetensorsIndex<'a> {
-    metadata: IndexMetadata,
-    weight_map: &'a BTreeMap<String, String>,
-}
-
-#[derive(Serialize)]
-struct IndexMetadata {
-    total_size: u64,
-}
-
-fn write_index(
-    directory: &Path,
-    weight_map: &BTreeMap<String, String>,
-    total_size: u64,
-) -> Result<(), Error> {
-    let index = SafetensorsIndex {
-        metadata: IndexMetadata { total_size },
-        weight_map,
-    };
-    let file = File::create(directory.join("model.safetensors.index.json"))?;
-    serde_json::to_writer(file, &index)?;
-    Ok(())
+    }
 }
 
 fn preflight_source_collisions(
@@ -1622,6 +1744,47 @@ mod tests {
                 .logical_shape,
             vec![2, 4, 8]
         );
+        let expected = quantize_tensor(
+            &Array::from_slice(&values, &[2, 4, 64]),
+            AffineQuantization::default(),
+            context.stream(),
+        )
+        .unwrap();
+        let actual = materialize(&transformed, "model.experts.weight", context.stream());
+        assert_eq!(actual.shape(), &[2, 4, 8]);
+        assert_eq!(
+            actual.evaluated().unwrap().as_slice::<u32>(),
+            expected.weight.evaluated().unwrap().as_slice::<u32>()
+        );
+    }
+
+    #[test]
+    fn complete_rank_three_expert_bank_uses_one_submission_when_admitted() {
+        let directory = tempfile::tempdir().unwrap();
+        let values = matrix_values(2, 4, 64);
+        let bytes = float_bytes(&values);
+        serialize_to_file(
+            [(
+                "model.experts.weight",
+                TensorView::new(SafeDtype::F32, vec![2, 4, 64], &bytes).unwrap(),
+            )],
+            None,
+            &directory.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let source = Arc::new(SafetensorsWeightStore::open(directory.path()).unwrap());
+        let context = cpu_context();
+        let plan = BoundedQuantizationPlan::new(
+            AffineQuantization::default(),
+            5_000,
+            [BoundedQuantizationTarget::direct("model.experts.weight").unwrap()],
+        )
+        .unwrap();
+        let transformed =
+            BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+
+        assert_eq!(transformed.report().source_tiles, 1);
+        assert_eq!(transformed.report().source_bytes_read, 2_048);
         let expected = quantize_tensor(
             &Array::from_slice(&values, &[2, 4, 64]),
             AffineQuantization::default(),

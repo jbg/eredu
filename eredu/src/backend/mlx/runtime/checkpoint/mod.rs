@@ -24,8 +24,6 @@ pub mod binding;
 pub(crate) mod binding_plan;
 /// Out-of-core transformation of dense bindings into packed weight stores.
 pub mod bounded_quantization;
-/// GGUF tokenizer metadata conversion.
-pub(crate) mod gguf;
 /// Strict checkpoint loading and validation.
 pub mod load;
 /// Generic affine checkpoint quantization and conversion.

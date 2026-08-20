@@ -245,14 +245,15 @@ where
 
     fn retained_values(
         &self,
-        ordinal: usize,
-        _address: crate::ExecutionUnitAddress,
+        _ordinal: usize,
+        address: crate::ExecutionUnitAddress,
     ) -> Result<Self::RetainedValues<'_>, StateError> {
+        let layer = address.index();
         self.layers
-            .get(ordinal)
+            .get(layer)
             .map(RuntimeLayerState::retained_values)
             .ok_or(StateError::UnknownLayer {
-                layer: ordinal,
+                layer,
                 count: self.layers.len(),
             })
     }

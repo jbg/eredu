@@ -89,7 +89,7 @@ pub fn frame_timestamps(indices: &[usize], source_fps: f64) -> Result<Vec<f64>, 
         .collect())
 }
 
-/// Formats a timestamp using Gemma-style zero-padded `mm:ss` text.
+/// Formats a timestamp as zero-padded `mm:ss` text.
 pub fn format_mm_ss(timestamp: f64) -> Result<String, Error> {
     if !timestamp.is_finite() || timestamp < 0.0 {
         return Err(Error::Processor(format!(

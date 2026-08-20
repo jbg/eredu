@@ -231,7 +231,7 @@ where
     fn training_mode(&mut self, _mode: bool) {}
 }
 
-/// Proportional RoPE used by Gemma 4 full-attention layers.
+/// Proportional RoPE over a configurable prefix of each attention head.
 ///
 /// Proportional RoPE keeps the full head dimension so non-traditional
 /// half-rotation pairs match Hugging Face's layout. Frequency slots outside the
@@ -445,7 +445,7 @@ pub enum RopeVariant {
     Default(nn::Rope),
     /// Piecewise wavelength-scaled RoPE.
     FrequencyScaled(FrequencyScaledRope),
-    /// Proportional RoPE used by Gemma 4.
+    /// Proportional-prefix RoPE.
     Proportional(ProportionalRope),
     /// YaRN scaled RoPE.
     Yarn(YarnRope),

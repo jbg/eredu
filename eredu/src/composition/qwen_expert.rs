@@ -42,6 +42,7 @@ fn cached_bank_spec(args: &ModelArgs, layer: usize) -> CachedSwiGluBankSpec {
         intermediate_dimensions: args.moe_intermediate_size,
         gate_up_quantization: args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
         down_quantization: args.weight_quantization_for(&format!("{prefix}.down_proj")),
+        activation: eredu_nn::GatedExpertActivation::Silu,
         limit: None,
     }
 }

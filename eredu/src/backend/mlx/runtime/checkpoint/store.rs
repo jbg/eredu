@@ -15,7 +15,10 @@ use eredu_checkpoint::{
         GgufLease as NeutralGgufLease, GgufWeightStore as NeutralGgufWeightStore,
         GgufWeightStoreBuilder as NeutralGgufWeightStoreBuilder,
     },
-    store::{CheckpointLease, EncodedTensorLease, SafetensorsLease as NeutralSafetensorsLease},
+    store::{
+        CheckpointLease, EncodedTensorLease, MemoryLease as NeutralMemoryLease,
+        SafetensorsLease as NeutralSafetensorsLease,
+    },
     StoredDtype,
 };
 
@@ -486,6 +489,7 @@ pub(crate) fn neutral_store_error(error: eredu_checkpoint::store::StoreError) ->
 enum WeightLeaseSource {
     Safetensors(NeutralSafetensorsLease),
     Gguf(Box<GgufLeaseSource>),
+    Memory(NeutralMemoryLease),
 }
 
 #[derive(Debug, Clone)]
@@ -532,6 +536,13 @@ impl WeightLease {
             CheckpointLease::Gguf(_) => {
                 selected_byte_len(&key, &metadata, &selection, &output_shape)?
             }
+            CheckpointLease::Memory(lease) => {
+                usize::try_from(lease.bounded_read_proof().length_bytes).map_err(|_| {
+                    WeightStoreError::Overflow {
+                        context: format!("selected byte length for tensor {key:?}"),
+                    }
+                })?
+            }
         };
         let source = match lease {
             CheckpointLease::Safetensors(lease) => WeightLeaseSource::Safetensors(lease),
@@ -539,6 +550,7 @@ impl WeightLease {
                 lease,
                 converted_groups,
             })),
+            CheckpointLease::Memory(lease) => WeightLeaseSource::Memory(lease),
         };
         Ok(Self {
             key,
@@ -589,6 +601,7 @@ impl WeightLease {
                 .lease
                 .backing_path()
                 .expect("GGUF catalog entries always identify their shard"),
+            WeightLeaseSource::Memory(_) => Path::new("<memory>"),
         }
     }
 
@@ -625,6 +638,9 @@ impl WeightLease {
             WeightLeaseSource::Gguf(source) => {
                 self.prepare_gguf(*source, source_stream, execution_stream)
             }
+            WeightLeaseSource::Memory(source) => {
+                self.prepare_encoded(source, source_stream, execution_stream)
+            }
         }
     }
 
@@ -644,12 +660,23 @@ impl WeightLease {
             WeightLeaseSource::Gguf(source) => {
                 self.prepare_gguf(*source, source_stream, source_stream)
             }
+            WeightLeaseSource::Memory(source) => {
+                self.prepare_borrowed_encoded(source, source_stream)
+            }
         }
     }
 
     fn prepare_borrowed_safetensors(
         self,
         source: NeutralSafetensorsLease,
+        source_stream: &Stream,
+    ) -> Result<PendingWeightMaterialization, WeightStoreError> {
+        self.prepare_borrowed_encoded(source, source_stream)
+    }
+
+    fn prepare_borrowed_encoded(
+        self,
+        source: impl EncodedTensorLease,
         source_stream: &Stream,
     ) -> Result<PendingWeightMaterialization, WeightStoreError> {
         let dtype = safetensors_dtype(&self.key, &self.metadata.stored_dtype)?;
@@ -697,6 +724,15 @@ impl WeightLease {
     fn prepare_safetensors(
         self,
         source: NeutralSafetensorsLease,
+        source_stream: &Stream,
+        execution_stream: &Stream,
+    ) -> Result<PendingWeightMaterialization, WeightStoreError> {
+        self.prepare_encoded(source, source_stream, execution_stream)
+    }
+
+    fn prepare_encoded(
+        self,
+        source: impl EncodedTensorLease,
         source_stream: &Stream,
         execution_stream: &Stream,
     ) -> Result<PendingWeightMaterialization, WeightStoreError> {
@@ -1441,7 +1477,9 @@ mod tests {
                         }
                     })
             }
-            WeightLeaseSource::Safetensors(_) => panic!("expected GGUF lease"),
+            WeightLeaseSource::Safetensors(_) | WeightLeaseSource::Memory(_) => {
+                panic!("expected GGUF lease")
+            }
         }
     }
 

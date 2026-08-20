@@ -809,7 +809,9 @@ fn inspect_safetensors_header(path: &Path) -> Result<Vec<TensorDescriptor>, Arti
     let mut output = Vec::with_capacity(entries.len());
     let mut expected_offset = 0_u64;
     for (name, info) in entries {
-        if info.shape.is_empty() || info.shape.contains(&0) {
+        // SafeTensors rank-zero tensors are scalar parameters with one stored
+        // element. Gemma media clipping bounds use this representation.
+        if info.shape.contains(&0) {
             return Err(ArtifactError::InvalidArtifact(format!(
                 "SafeTensors tensor {name:?} has an invalid shape"
             )));
@@ -988,6 +990,28 @@ mod tests {
             plan.into_parts().0,
             ModelArtifact::SafeTensors { .. }
         ));
+    }
+
+    #[test]
+    fn safetensors_inspection_accepts_rank_zero_scalar_parameters() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("config.json"),
+            r#"{"model_type":"gemma4"}"#,
+        )
+        .unwrap();
+        let header = br#"{"clip.output_max":{"dtype":"F32","shape":[],"data_offsets":[0,4]}}"#;
+        let mut file = File::create(root.path().join("model.safetensors")).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header).unwrap();
+        file.write_all(&0.0_f32.to_le_bytes()).unwrap();
+
+        let inspection = inspect_artifact(root.path()).unwrap();
+        assert_eq!(
+            inspection.tensors().get("clip.output_max").unwrap().shape,
+            Vec::<usize>::new()
+        );
     }
 
     #[test]

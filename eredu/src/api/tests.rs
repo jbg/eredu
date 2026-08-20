@@ -2430,10 +2430,11 @@ fn inkling_native_tools_render_constrain_and_parse_protocol() {
 #[test]
 #[ignore = "requires SAFEMLX_INKLING_MODEL_DIR pointing to a local Inkling checkpoint"]
 fn inkling_real_checkpoint_template_is_recognized() {
-    let model_dir = std::path::PathBuf::from(
-        std::env::var("SAFEMLX_INKLING_MODEL_DIR")
-            .expect("set SAFEMLX_INKLING_MODEL_DIR to a local Inkling snapshot"),
-    );
+    let Ok(model_dir) = std::env::var("SAFEMLX_INKLING_MODEL_DIR") else {
+        eprintln!("skipping real Inkling checkpoint test: SAFEMLX_INKLING_MODEL_DIR is not set");
+        return;
+    };
+    let model_dir = std::path::PathBuf::from(model_dir);
     let template = load_chat_template(&model_dir)
         .unwrap()
         .expect("Inkling checkpoint must provide a chat template");

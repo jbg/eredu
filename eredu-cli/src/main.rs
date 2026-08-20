@@ -474,13 +474,6 @@ struct Cli {
     /// Write stable structured execution telemetry to this JSON file.
     #[arg(long, value_name = "PATH")]
     telemetry_json: Option<PathBuf>,
-
-    /// Synchronize Gemma 4 component boundaries and report component timings.
-    ///
-    /// This changes scheduling and should be used for diagnosis, not headline
-    /// throughput measurements.
-    #[arg(long)]
-    profile_components: bool,
 }
 
 const AUTOMATIC_OVERRIDE_ARGUMENTS: &[&str] = &[
@@ -2243,11 +2236,6 @@ fn main() -> Result<()> {
 
     let eos_token_ids = model.eos_token_ids().to_vec();
     let mut output_ids = Vec::with_capacity(max_tokens);
-    let profile_gemma4 = args.profile_components && model.model_type() == "gemma4";
-    if profile_gemma4 {
-        eredu::composition::mlx_architectures::gemma4::model::set_perf_profiling(true);
-        eredu::composition::mlx_architectures::gemma4::model::reset_perf_stats();
-    }
     let generation_started = Instant::now();
     let mut time_to_first_token = None;
     let mut mtp_stats: Option<MtpStats> = None;
@@ -2556,23 +2544,6 @@ fn main() -> Result<()> {
                 stats.q8_0_tensor_count,
                 format_bytes(stats.q8_0_bytes as usize),
             );
-        }
-        if profile_gemma4 {
-            if let Some(stats) = eredu::composition::mlx_architectures::gemma4::model::perf_stats()
-            {
-                eprintln!(
-                    "gemma4_components_s: embed={:.6}, per_layer_inputs={:.6}, attention={:.6}, mlp={:.6}, per_layer_residual={:.6}, final_norm={:.6}, lm_head={:.6}, total={:.6}",
-                    stats.embed_s,
-                    stats.per_layer_inputs_s,
-                    stats.attention_s,
-                    stats.mlp_s,
-                    stats.per_layer_residual_s,
-                    stats.final_norm_s,
-                    stats.lm_head_s,
-                    stats.component_total_s(),
-                );
-            }
-            eredu::composition::mlx_architectures::gemma4::model::set_perf_profiling(false);
         }
         if let Some(report) = model.runtime().session().residency_report()? {
             let offload = report.offload();

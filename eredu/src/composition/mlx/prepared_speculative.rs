@@ -13,15 +13,13 @@ use super::{
     speculative::{
         scheduler::MlxMtpScheduler, MlxDrafter, MlxDrafterKind, MlxMtpCache, MtpExecutionStreams,
     },
-    validate_gemma4_drafter, MlxBackend, MlxModelInput, Model, ModelCache,
+    MlxBackend, MlxModelInput, Model, ModelCache,
 };
 use crate::backend::mlx::{
     error::Error,
     runtime::generation::sampler::{ConstrainedSampler, GenerationSampler},
 };
-use crate::composition::mlx_architectures::{
-    gemma4::model as gemma4, inkling::model as inkling, qwen::hybrid::qwen3_5,
-};
+use crate::composition::mlx_architectures::qwen::hybrid::qwen3_5;
 
 impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
     type Drafter = MlxDrafter;
@@ -80,7 +78,37 @@ pub(crate) fn validate_external_drafter(
     let model = runtime.session().complete_model();
     match (model, drafter.kind()) {
         (Model::Gemma4(target), MlxDrafterKind::Gemma4Assistant) => {
-            validate_gemma4_drafter(target.args(), drafter.gemma4())?
+            let assistant = drafter.gemma4();
+            let target = &target.args().text;
+            let draft = &assistant.config.text_config;
+            if assistant.config.backbone_hidden_size != target.hidden_size
+                || draft.vocab_size != target.vocab_size
+                || assistant.max_proposals() == 0
+            {
+                return Err(Error::UnsupportedArchitecture(
+                    "Gemma 4 assistant hidden width, vocabulary, or block size does not match the target"
+                        .into(),
+                ));
+            }
+            for (layer, draft_policy) in draft.layer_schedule.iter().enumerate() {
+                let Some(target_policy) = target.layer_schedule.iter().find(|policy| {
+                    policy.attention == draft_policy.attention && policy.key_value.publishes_state()
+                }) else {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "Gemma 4 assistant layer {layer} requires {:?} shared state with no target publisher",
+                        draft_policy.attention
+                    )));
+                };
+                if draft_policy.num_key_value_heads != target_policy.num_key_value_heads
+                    || draft_policy.head_dim != target_policy.head_dim
+                    || draft.rope_theta_for(draft_policy.attention).to_bits()
+                        != target.rope_theta_for(target_policy.attention).to_bits()
+                {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "Gemma 4 assistant layer {layer} shared-KV or rotary geometry does not match its target publisher"
+                    )));
+                }
+            }
         }
         (Model::MuseGlimmer(target), MlxDrafterKind::MuseGlimmerDFlash) => {
             let assistant = drafter.muse_glimmer();
@@ -183,15 +211,31 @@ where
     })
 }
 
-fn gemma4_mtp_cache(cache: &mut ModelCache) -> Option<&mut gemma4::Cache> {
+fn neutral_gemma_mtp_cache(
+    cache: &mut ModelCache,
+) -> Option<&mut crate::backend::mlx::runtime::cache::state::MlxHybridState> {
     match cache {
-        ModelCache::Gemma4(cache) => Some(cache),
+        ModelCache::Hybrid(cache) => Some(cache),
         _ => None,
     }
 }
 
-fn model_mtp_cache(cache: &mut ModelCache) -> Option<&mut ModelCache> {
-    Some(cache)
+fn neutral_muse_mtp_cache(
+    cache: &mut ModelCache,
+) -> Option<&mut crate::backend::mlx::runtime::cache::state::MlxKeyValueState> {
+    match cache {
+        ModelCache::MuseGlimmer(cache) => Some(cache),
+        _ => None,
+    }
+}
+
+fn neutral_inkling_mtp_cache(
+    cache: &mut ModelCache,
+) -> Option<&mut crate::composition::inkling::InklingState> {
+    match cache {
+        ModelCache::Inkling(cache) => Some(cache),
+        _ => None,
+    }
 }
 
 fn qwen_next_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5::Cache> {
@@ -213,13 +257,6 @@ fn neutral_deepseek_mtp_cache(
 ) -> Option<&mut crate::composition::deepseek::DeepSeekState> {
     match cache {
         ModelCache::DeepSeek(cache) => Some(cache),
-        _ => None,
-    }
-}
-
-fn inkling_mtp_cache(cache: &mut ModelCache) -> Option<&mut inkling::Cache> {
-    match cache {
-        ModelCache::Inkling(cache) => Some(cache),
         _ => None,
     }
 }
@@ -356,44 +393,42 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         let mut cache = self.new_mtp_cache(lanes.len());
         let prepared_lanes = self.prepare_speculative_batch_lanes(lanes, &mut cache)?;
 
-        match self.model_and_cache().0 {
-            Model::Gemma4(target) => {
-                let assistant = drafter.gemma4_mut();
-                validate_gemma4_drafter(target.args(), assistant)?;
+        match (self.model_and_cache().0, drafter.kind()) {
+            (Model::Gemma4(target), MlxDrafterKind::Gemma4Assistant) => {
                 let mut backend =
-                    crate::composition::mlx_architectures::gemma4::mtp::Gemma4MtpExecutor::new(
-                        target, assistant,
+                    crate::composition::mlx::speculative::external::Gemma4ExternalExecutor::new(
+                        target,
+                        drafter.gemma4_mut(),
                     );
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
-                    gemma4_mtp_cache,
-                    "Gemma 4",
+                    neutral_gemma_mtp_cache,
+                    "Gemma 4 external assistant",
                     streams,
                     scheduler,
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
-            Model::MuseGlimmer(target) => {
-                let assistant = drafter.muse_glimmer_mut();
-                let mut backend =
-                    crate::composition::mlx_architectures::muse_glimmer::mtp::MuseGlimmerMtpExecutor::new(
-                        target, assistant,
-                    );
+            (Model::MuseGlimmer(target), MlxDrafterKind::MuseGlimmerDFlash) => {
+                let mut backend = crate::composition::mlx::speculative::external::MuseGlimmerExternalExecutor::new(
+                    target,
+                    drafter.muse_glimmer_mut(),
+                );
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
-                    model_mtp_cache,
+                    neutral_muse_mtp_cache,
                     "Muse-Glimmer DFlash",
                     streams,
                     scheduler,
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
-            model => Err(Error::Speculative(format!(
+            (model, kind) => Err(Error::Speculative(format!(
                 "MTP runtime adapter is unavailable for model type {} ({:?})",
                 model.model_type(),
-                model.mtp_capability()
+                kind
             ))),
         }
     }
@@ -426,21 +461,6 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
-            Model::Inkling(target) => {
-                let mut backend =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        target,
-                    );
-                run_speculative_batch(
-                    &mut backend,
-                    prepared_lanes,
-                    inkling_mtp_cache,
-                    "Inkling embedded",
-                    streams,
-                    scheduler,
-                )
-                .map_err(|error| Error::Speculative(error.to_string()))
-            }
             Model::NemotronH(target) => {
                 let mut backend =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
@@ -451,6 +471,21 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                     prepared_lanes,
                     nemotron_mtp_cache,
                     "Nemotron-H embedded",
+                    streams,
+                    scheduler,
+                )
+                .map_err(|error| Error::Speculative(error.to_string()))
+            }
+            Model::Inkling(target) => {
+                let mut backend =
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+                        target,
+                    );
+                run_speculative_batch(
+                    &mut backend,
+                    prepared_lanes,
+                    neutral_inkling_mtp_cache,
+                    "Inkling embedded",
                     streams,
                     scheduler,
                 )

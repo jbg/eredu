@@ -1,4 +1,93 @@
-//! Backend-neutral activation and routed-expert observation contracts.
+//! Backend-neutral activation, target-state, and routed-expert observation contracts.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+/// One ordinary block output selected for a target/draft consumer.
+pub struct TargetStateTap<'a, T> {
+    /// Architecture block ordinal.
+    pub layer: usize,
+    /// Backend-native block output.
+    pub value: &'a T,
+}
+
+/// Ordered target-state capture without backend storage or family policy.
+#[derive(Debug, Clone)]
+pub struct TargetStateCapture<T> {
+    requested: Vec<usize>,
+    captured: BTreeMap<usize, T>,
+}
+
+impl<T> TargetStateCapture<T> {
+    /// Creates a capture plan with exact, ordered layer identities.
+    pub fn new(
+        requested: impl IntoIterator<Item = usize>,
+    ) -> Result<Self, TargetStateCaptureError> {
+        let requested = requested.into_iter().collect::<Vec<_>>();
+        if requested.is_empty() {
+            return Err(TargetStateCaptureError::Empty);
+        }
+        let mut unique = BTreeSet::new();
+        if let Some(duplicate) = requested.iter().find(|layer| !unique.insert(**layer)) {
+            return Err(TargetStateCaptureError::DuplicateRequest(*duplicate));
+        }
+        Ok(Self {
+            requested,
+            captured: BTreeMap::new(),
+        })
+    }
+
+    /// Returns whether this plan requests one block output.
+    pub fn wants(&self, layer: usize) -> bool {
+        self.requested.contains(&layer)
+    }
+
+    /// Captures one requested block output exactly once.
+    pub fn capture(&mut self, tap: TargetStateTap<'_, T>) -> Result<(), TargetStateCaptureError>
+    where
+        T: Clone,
+    {
+        if !self.wants(tap.layer) {
+            return Err(TargetStateCaptureError::Unrequested(tap.layer));
+        }
+        if self.captured.insert(tap.layer, tap.value.clone()).is_some() {
+            return Err(TargetStateCaptureError::DuplicateCapture(tap.layer));
+        }
+        Ok(())
+    }
+
+    /// Returns captured values in declared request order, rejecting omissions.
+    pub fn into_ordered(mut self) -> Result<Vec<T>, TargetStateCaptureError> {
+        let mut ordered = Vec::with_capacity(self.requested.len());
+        for layer in self.requested {
+            ordered.push(
+                self.captured
+                    .remove(&layer)
+                    .ok_or(TargetStateCaptureError::Missing(layer))?,
+            );
+        }
+        Ok(ordered)
+    }
+}
+
+/// Invalid target-state capture lifecycle.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum TargetStateCaptureError {
+    /// At least one state tap must be requested.
+    #[error("target-state capture requires at least one layer")]
+    Empty,
+    /// One layer was requested more than once.
+    #[error("target-state layer {0} was requested more than once")]
+    DuplicateRequest(usize),
+    /// A block emitted a state that was not requested.
+    #[error("target-state layer {0} was not requested")]
+    Unrequested(usize),
+    /// A requested state was captured more than once.
+    #[error("target-state layer {0} was captured more than once")]
+    DuplicateCapture(usize),
+    /// A requested block never emitted its output.
+    #[error("target-state layer {0} was not captured")]
+    Missing(usize),
+}
 
 /// Normalized routed-expert data emitted by architecture implementations.
 pub struct RoutingObservation<'a, T> {
@@ -108,5 +197,53 @@ mod tests {
         let output = observe_and_intervene(&mut observer, "model.layers.0.output", &3).unwrap();
         assert_eq!(output, 7);
         assert_eq!(observer.observed, ["model.layers.0.output"]);
+    }
+
+    #[test]
+    fn target_states_are_captured_once_in_request_order() {
+        let mut capture = TargetStateCapture::new([5, 1, 3]).unwrap();
+        assert!(capture.wants(1));
+        assert!(!capture.wants(2));
+        capture
+            .capture(TargetStateTap {
+                layer: 1,
+                value: &10,
+            })
+            .unwrap();
+        capture
+            .capture(TargetStateTap {
+                layer: 5,
+                value: &50,
+            })
+            .unwrap();
+        capture
+            .capture(TargetStateTap {
+                layer: 3,
+                value: &30,
+            })
+            .unwrap();
+        assert_eq!(capture.into_ordered().unwrap(), [50, 10, 30]);
+    }
+
+    #[test]
+    fn target_state_capture_rejects_duplicates_omissions_and_unrequested_layers() {
+        assert_eq!(
+            TargetStateCapture::<i32>::new([2, 2]).unwrap_err(),
+            TargetStateCaptureError::DuplicateRequest(2)
+        );
+        let mut capture = TargetStateCapture::new([2]).unwrap();
+        assert_eq!(
+            capture
+                .capture(TargetStateTap {
+                    layer: 3,
+                    value: &7,
+                })
+                .unwrap_err(),
+            TargetStateCaptureError::Unrequested(3)
+        );
+        assert_eq!(
+            capture.into_ordered().unwrap_err(),
+            TargetStateCaptureError::Missing(2)
+        );
     }
 }

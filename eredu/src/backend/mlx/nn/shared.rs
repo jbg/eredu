@@ -8,15 +8,17 @@ use std::{
     sync::Arc,
 };
 
+use eredu_checkpoint::WeightQuantization;
 use eredu_core::Completion;
 use eredu_nn::{
     validate_parameter_topology, AttentionCache, BlockwiseAttentionBackend, BlockwiseAttentionSpec,
     EmbeddingOperator, EmbeddingSpec, Error as ComputeError, GatedDeltaScanInput,
     GatedDeltaScanOutput, HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState,
-    HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, IndexedAttentionInput, LinearFormat,
-    LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec,
-    ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized,
-    PooledAttentionInput, PooledPositionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec,
+    HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, IndexedAttentionInput,
+    JointExpertRoutingInput, JointExpertRoutingResult, LinearFormat, LinearOperator, LinearSpec,
+    NeuralBackend, NormalizationOperator, NormalizationSpec, ParameterMetadata, ParameterSpec,
+    ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
+    PooledPositionInput, RelativeAttentionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec,
     RopeValue, RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend, RoutingOperator,
     RoutingResult, RoutingScoring, SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput,
     SwiGluExpertBankOperator, SwiGluExpertBankSpec, SwiGluExpertLayout, SwiGluLimit, Tensor,
@@ -24,9 +26,9 @@ use eredu_nn::{
 };
 use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
 use safemlx::ops::{
-    argpartition_axis, broadcast_to, einsum,
+    arange, argpartition_axis, broadcast_to, clip, concatenate_axis, einsum,
     indexing::{take_along_axis, NewAxis, TryIndexOp},
-    maximum,
+    matmul, maximum, r#where, sigmoid, softmax_axis,
 };
 use safemlx::{
     builder::Builder,
@@ -367,6 +369,56 @@ impl<M: Parameterized<Array>> ModuleParameters for MlxModule<M> {
     }
 }
 
+/// Borrowed SafeMLX parameter view over a backend-neutral module.
+///
+/// This lets residency/loading policy populate one architecture-owned static
+/// component without cloning it or giving the architecture a SafeMLX trait.
+pub(crate) struct MlxModuleRef<'a, M> {
+    inner: &'a mut M,
+}
+
+impl<'a, M> MlxModuleRef<'a, M> {
+    pub(crate) const fn new(inner: &'a mut M) -> Self {
+        Self { inner }
+    }
+}
+
+impl<M: Parameterized<Array>> ModuleParameters for MlxModuleRef<'_, M> {
+    fn num_parameters(&self) -> usize {
+        neutral_parameter_refs(&*self.inner, false).entries.len()
+    }
+
+    fn parameters(&self) -> ModuleParamRef<'_> {
+        neutral_parameter_refs(&*self.inner, false)
+    }
+
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
+        neutral_parameter_refs_mut(&mut *self.inner)
+    }
+
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        neutral_parameter_refs(&*self.inner, true)
+    }
+
+    fn freeze_parameters(&mut self, _recursive: bool) {
+        self.inner.set_trainable(false);
+    }
+
+    fn unfreeze_parameters(&mut self, _recursive: bool) {
+        self.inner.set_trainable(true);
+    }
+
+    fn all_frozen(&self) -> Option<bool> {
+        let states = neutral_parameter_states(&*self.inner);
+        (!states.is_empty()).then(|| states.iter().all(|trainable| !trainable))
+    }
+
+    fn any_frozen(&self) -> Option<bool> {
+        let states = neutral_parameter_states(&*self.inner);
+        (!states.is_empty()).then(|| states.iter().any(|trainable| !trainable))
+    }
+}
+
 /// Native MLX module exposed through stable neutral parameter identities.
 #[derive(Debug, Clone)]
 pub(crate) struct MlxNamedModule<M> {
@@ -382,6 +434,14 @@ impl<M: ModuleParameters> MlxNamedModule<M> {
         bias: Option<ParameterSpec>,
     ) -> Result<Self, ComputeError> {
         let topology = parameter_topology(&inner, weight, bias)?;
+        Ok(Self { inner, topology })
+    }
+
+    fn with_exact_topology(
+        inner: M,
+        specs: impl IntoIterator<Item = (&'static str, ParameterSpec)>,
+    ) -> Result<Self, ComputeError> {
+        let topology = exact_parameter_topology(&inner, specs)?;
         Ok(Self { inner, topology })
     }
 }
@@ -1528,6 +1588,149 @@ impl NeuralBackend for MlxBackend {
         ))
     }
 
+    fn relative_attention(
+        input: RelativeAttentionInput<'_, Array>,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        input.validate()?;
+        let query_shape = input.queries.shape();
+        let key_shape = input.keys.shape();
+        let batch = query_shape[0];
+        let heads = query_shape[1];
+        let query_len = query_shape[2];
+        let dimensions = query_shape[3];
+        let kv_heads = key_shape[1];
+        let key_len = key_shape[2];
+        let repeats = heads / kv_heads;
+        let repeat_kv = |value: &Array| -> Result<Array, ComputeError> {
+            if repeats == 1 {
+                return Ok(value.clone());
+            }
+            let expanded =
+                compute(value.reshape(&[batch, kv_heads, 1, key_len, dimensions], context))?;
+            let expanded = compute(broadcast_to(
+                &expanded,
+                &[batch, kv_heads, repeats, key_len, dimensions],
+                context,
+            ))?;
+            compute(expanded.reshape(&[batch, heads, key_len, dimensions], context))
+        };
+        let keys = repeat_kv(input.keys)?;
+        let values = repeat_kv(input.values)?;
+        let query_positions = compute(arange::<i32, i32>(
+            input.query_offset,
+            input.query_offset + query_len,
+            1,
+            context,
+        ))?;
+        let query_positions = compute(query_positions.try_index_device((.., NewAxis), context))?;
+        let key_positions = compute(arange::<i32, i32>(
+            input.key_offset,
+            input.key_offset + key_len,
+            1,
+            context,
+        ))?;
+        let key_positions = compute(key_positions.try_index_device((NewAxis, ..), context))?;
+        let distances = compute(query_positions.subtract(key_positions, context))?;
+        let mut valid = compute(distances.ge(Array::from_int(0), context))?;
+        if let Some(window) = input.window {
+            valid = compute(valid.logical_and(
+                &compute(distances.lt(Array::from_int(window), context))?,
+                context,
+            ))?;
+        }
+        let extent = input.profiles.dim(3);
+        let gather = compute(clip(&distances, (0, extent - 1), context))?;
+        let gather = compute(gather.as_dtype(Dtype::Int32, context))?;
+        let gather = compute(gather.try_index_device((NewAxis, NewAxis, .., ..), context))?;
+        let gather = compute(broadcast_to(
+            &gather,
+            &[batch, heads, query_len, key_len],
+            context,
+        ))?;
+        let mut bias = compute(take_along_axis(input.profiles, &gather, -1, context))?;
+        let relative_valid = compute(
+            compute(distances.ge(Array::from_int(0), context))?.logical_and(
+                &compute(distances.lt(Array::from_int(extent), context))?,
+                context,
+            ),
+        )?;
+        bias = compute(r#where(
+            &relative_valid,
+            bias,
+            Array::from_f32(0.0),
+            context,
+        ))?;
+        let mut queries = input.queries.clone();
+        if input.window.is_none() {
+            if let Some(floor) = input.log_scaling_floor {
+                let positions = compute(arange::<i32, i32>(
+                    input.query_offset + 1,
+                    input.query_offset + query_len + 1,
+                    1,
+                    context,
+                ))?;
+                let positions = compute(positions.as_dtype(Dtype::Float32, context))?;
+                let ratio = compute(positions.divide(Array::from_f32(floor as f32), context))?;
+                let ratio = compute(maximum(ratio, Array::from_f32(1.0), context))?;
+                let tau = compute(ratio.log(context))?;
+                let tau = compute(tau.multiply(Array::from_f32(input.log_scaling_alpha), context))?;
+                let tau = compute(tau.add(Array::from_f32(1.0), context))?;
+                let tau = compute(tau.reshape(&[1, 1, query_len, 1], context))?;
+                queries = compute(queries.multiply(&tau, context))?;
+                bias = compute(bias.multiply(&tau, context))?;
+            }
+        }
+        let scaled = compute(queries.multiply(Array::from_f32(1.0 / dimensions as f32), context))?;
+        let scores = compute(matmul(
+            &scaled,
+            &compute(keys.swap_axes(-1, -2, context))?,
+            context,
+        ))?;
+        let scores = compute(scores.add(bias, context))?;
+        let scores = compute(r#where(
+            &valid,
+            scores,
+            Array::from_f32(f32::NEG_INFINITY),
+            context,
+        ))?;
+        let probabilities = compute(softmax_axis(scores, -1, true, context))?;
+        compute(matmul(probabilities, values, context))
+    }
+
+    fn joint_expert_routing(
+        input: JointExpertRoutingInput<'_, Array>,
+        context: &Stream,
+    ) -> Result<JointExpertRoutingResult<Array>, ComputeError> {
+        input.validate()?;
+        let hidden_width = input.hidden.dim(-1);
+        let flat = compute(input.hidden.reshape(&[-1, hidden_width], context))?;
+        let logits = compute(matmul(
+            &flat,
+            &compute(input.weight.transpose(context))?,
+            context,
+        ))?;
+        let routed = compute(logits.try_index_device((.., ..input.routed_experts), context))?;
+        let shared = compute(logits.try_index_device((.., input.routed_experts..), context))?;
+        let choice = compute(sigmoid(&routed, context))?;
+        let choice = compute(choice.add(input.correction_bias, context))?;
+        let routed_ids = compute(argpartition_axis(choice, -input.top_k, -1, context))?;
+        let routed_ids = compute(routed_ids.try_index_device((.., -input.top_k..), context))?;
+        let selected_logits = compute(take_along_axis(&routed, &routed_ids, -1, context))?;
+        let all_logits = compute(concatenate_axis(&[selected_logits, shared], -1, context))?;
+        let weights = compute(nn::log_sigmoid(all_logits, context))?;
+        let weights = compute(softmax_axis(weights, -1, true, context))?;
+        let weights = compute(weights.multiply(Array::from_f32(input.route_scale), context))?;
+        let weights = compute(weights.multiply(input.global_scale, context))?;
+        let routed_weights = compute(weights.try_index_device((.., ..input.top_k), context))?;
+        let shared_weights = compute(weights.try_index_device((.., input.top_k..), context))?;
+        Ok(JointExpertRoutingResult {
+            routed_ids,
+            routed_weights,
+            shared_weights,
+        })
+    }
+
     fn indexed_attention(
         input: IndexedAttentionInput<'_, Array>,
         context: &Stream,
@@ -1859,6 +2062,9 @@ impl RoutedNeuralBackend for MlxBackend {
         spec.validate()?;
         let score_function = match spec.routing.scoring() {
             RoutingScoring::Softmax => common::moe::TopKRouterScoreFunction::Softmax,
+            RoutingScoring::SelectedSoftmax => {
+                common::moe::TopKRouterScoreFunction::SelectedSoftmax
+            }
             RoutingScoring::Sigmoid => common::moe::TopKRouterScoreFunction::Sigmoid,
             RoutingScoring::SqrtSoftplus => common::moe::TopKRouterScoreFunction::SqrtSoftplus,
         };
@@ -1874,12 +2080,41 @@ impl RoutedNeuralBackend for MlxBackend {
                 n_group: spec.routing.expert_groups(),
                 topk_group: spec.routing.selected_groups(),
                 score_correction_bias: spec.correction_bias.is_some(),
+                input_rms_epsilon: spec
+                    .input_transform
+                    .as_ref()
+                    .map(|transform| transform.epsilon),
+                input_inverse_sqrt_dimensions: spec
+                    .input_transform
+                    .as_ref()
+                    .is_some_and(|transform| transform.inverse_sqrt_dimensions),
+                route_scale: spec.route_scale.is_some(),
             },
             spec.quantization,
             context,
         ))?;
+        let weight = spec.weight;
+        let mut topology = vec![("weight", weight.clone())];
+        if let Some(quantization) = spec
+            .quantization
+            .filter(|format| !matches!(format, WeightQuantization::GgufIQuant { .. }))
+        {
+            topology.push(("scales", companion_spec(&weight, "scales")));
+            if quantization.has_biases() {
+                topology.push(("biases", companion_spec(&weight, "biases")));
+            }
+        }
+        if let Some(correction_bias) = spec.correction_bias {
+            topology.push(("e_score_correction_bias", correction_bias));
+        }
+        if let Some(transform) = spec.input_transform {
+            topology.push(("input_scale", transform.scale));
+        }
+        if let Some(route_scale) = spec.route_scale {
+            topology.push(("route_scale", route_scale));
+        }
         Ok(MlxTopKRouter {
-            module: MlxNamedModule::new(module, spec.weight, spec.correction_bias)?,
+            module: MlxNamedModule::with_exact_topology(module, topology)?,
         })
     }
 
@@ -1940,6 +2175,7 @@ impl RoutedNeuralBackend for MlxBackend {
             down.format.weight_quantization(),
             context,
         ))?;
+        module = module.with_activation(spec.activation);
         if native_fp8 {
             module = compute(module.with_native_fp8_e8m0(context))?;
         }
@@ -2039,3 +2275,81 @@ impl_attention_cache!(ConcatKeyValueCache);
 impl_attention_cache!(SlidingKeyValueCache);
 impl_attention_cache!(PagedKeyValueCache);
 impl_attention_cache!(crate::backend::mlx::runtime::cache::state::MlxKeyValueLayerState);
+
+impl eredu_nn::AuxiliaryConvolutionState<Array>
+    for crate::backend::mlx::runtime::cache::state::MlxHybridLayerState
+{
+    fn convolution_state(&mut self, slot: u32) -> Result<&mut Option<Array>, ComputeError> {
+        eredu_runtime::RuntimeStateComponents::fixed_component(
+            self,
+            eredu_core::cache::StateTensorRole::Convolution { slot },
+        )
+        .map_err(ComputeError::backend)
+    }
+}
+
+#[cfg(test)]
+mod neutral_semantic_operator_tests {
+    use eredu_nn::{JointExpertRoutingInput, NeuralBackend, RelativeAttentionInput};
+    use safemlx::{Array, Device, DeviceType, ExecutionContext};
+
+    use super::MlxBackend;
+
+    #[test]
+    fn relative_attention_gathers_causal_distance_profiles() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let queries = Array::from_slice(&[0.0_f32], &[1, 1, 1, 1]);
+        let keys = Array::from_slice(&[1.0_f32, 2.0], &[1, 1, 2, 1]);
+        let values = Array::from_slice(&[10.0_f32, 20.0], &[1, 1, 2, 1]);
+        let profiles = Array::from_slice(&[0.0_f32, 3.0_f32.ln()], &[1, 1, 1, 2]);
+        let output = <MlxBackend as NeuralBackend>::relative_attention(
+            RelativeAttentionInput {
+                queries: &queries,
+                keys: &keys,
+                values: &values,
+                profiles: &profiles,
+                query_offset: 1,
+                key_offset: 0,
+                window: None,
+                log_scaling_floor: None,
+                log_scaling_alpha: 0.0,
+            },
+            stream,
+        )
+        .unwrap();
+        let output = output.evaluated().unwrap();
+        assert!((output.as_slice::<f32>()[0] - 12.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn joint_routing_selects_with_bias_but_weights_unbiased_logits() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let hidden = Array::from_slice(&[1.0_f32], &[1, 1]);
+        let weight = Array::from_slice(&[0.0_f32, 1.0, 2.0], &[3, 1]);
+        let correction = Array::from_slice(&[10.0_f32, 0.0], &[2]);
+        let global = Array::from_slice(&[0.5_f32], &[1]);
+        let routes = <MlxBackend as NeuralBackend>::joint_expert_routing(
+            JointExpertRoutingInput {
+                hidden: &hidden,
+                weight: &weight,
+                correction_bias: &correction,
+                global_scale: &global,
+                routed_experts: 2,
+                shared_experts: 1,
+                top_k: 1,
+                route_scale: 2.0,
+            },
+            stream,
+        )
+        .unwrap();
+        let ids = routes.routed_ids.evaluated().unwrap();
+        let routed = routes.routed_weights.evaluated().unwrap();
+        let shared = routes.shared_weights.evaluated().unwrap();
+        assert_eq!(ids.as_slice::<u32>(), &[0]);
+        let expected = 0.5 / (0.5 + 1.0 / (1.0 + (-2.0_f32).exp()));
+        assert!((routed.as_slice::<f32>()[0] - expected).abs() < 1e-5);
+        assert!((routed.as_slice::<f32>()[0] + shared.as_slice::<f32>()[0] - 1.0).abs() < 1e-5);
+    }
+}

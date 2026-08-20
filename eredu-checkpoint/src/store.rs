@@ -118,6 +118,8 @@ pub enum CheckpointLease {
     Safetensors(SafetensorsLease),
     /// Lazily read portable GGUF payload.
     Gguf(crate::gguf_store::GgufLease),
+    /// Immutable in-memory encoded bytes.
+    Memory(MemoryLease),
 }
 
 impl EncodedTensorLease for CheckpointLease {
@@ -125,6 +127,7 @@ impl EncodedTensorLease for CheckpointLease {
         match self {
             Self::Safetensors(lease) => lease.metadata(),
             Self::Gguf(lease) => lease.metadata(),
+            Self::Memory(lease) => lease.metadata(),
         }
     }
 
@@ -132,6 +135,7 @@ impl EncodedTensorLease for CheckpointLease {
         match self {
             Self::Safetensors(lease) => lease.selection(),
             Self::Gguf(lease) => lease.selection(),
+            Self::Memory(lease) => lease.selection(),
         }
     }
 
@@ -139,6 +143,7 @@ impl EncodedTensorLease for CheckpointLease {
         match self {
             Self::Safetensors(lease) => lease.output_shape(),
             Self::Gguf(lease) => lease.output_shape(),
+            Self::Memory(lease) => lease.output_shape(),
         }
     }
 
@@ -146,6 +151,7 @@ impl EncodedTensorLease for CheckpointLease {
         match self {
             Self::Safetensors(lease) => lease.bounded_read_proof(),
             Self::Gguf(lease) => lease.bounded_read_proof(),
+            Self::Memory(lease) => lease.bounded_read_proof(),
         }
     }
 
@@ -153,6 +159,7 @@ impl EncodedTensorLease for CheckpointLease {
         match self {
             Self::Safetensors(lease) => lease.backing_path(),
             Self::Gguf(lease) => lease.backing_path(),
+            Self::Memory(lease) => lease.backing_path(),
         }
     }
 
@@ -160,7 +167,178 @@ impl EncodedTensorLease for CheckpointLease {
         match self {
             Self::Safetensors(lease) => lease.encoded_bytes(),
             Self::Gguf(lease) => lease.encoded_bytes(),
+            Self::Memory(lease) => lease.encoded_bytes(),
         }
+    }
+}
+
+#[derive(Debug)]
+struct MemoryTensor {
+    metadata: TensorMetadata,
+    dtype: Dtype,
+    bytes: Vec<u8>,
+}
+
+/// Encoded tensor selection retaining immutable in-memory storage.
+#[derive(Debug, Clone)]
+pub struct MemoryLease {
+    tensor: Arc<MemoryTensor>,
+    selection: TensorSelection,
+    output_shape: Vec<usize>,
+    proof: BoundedReadProof,
+    span: Range<usize>,
+    selected_bytes: Option<Arc<[u8]>>,
+}
+
+impl EncodedTensorLease for MemoryLease {
+    fn metadata(&self) -> &TensorMetadata {
+        &self.tensor.metadata
+    }
+
+    fn selection(&self) -> &TensorSelection {
+        &self.selection
+    }
+
+    fn output_shape(&self) -> &[usize] {
+        &self.output_shape
+    }
+
+    fn bounded_read_proof(&self) -> &BoundedReadProof {
+        &self.proof
+    }
+
+    fn backing_path(&self) -> Option<&Path> {
+        None
+    }
+
+    fn encoded_bytes(&self) -> Option<&[u8]> {
+        match &self.selected_bytes {
+            Some(bytes) => Some(bytes),
+            None => self.tensor.bytes.get(self.span.clone()),
+        }
+    }
+}
+
+/// Immutable in-memory SafeTensors-compatible encoded tensors.
+#[derive(Debug, Default)]
+pub struct MemoryWeightStore {
+    tensors: BTreeMap<String, Arc<MemoryTensor>>,
+}
+
+impl MemoryWeightStore {
+    /// Creates a store from owned encoded tensor payloads.
+    pub fn from_safetensors(
+        tensors: impl IntoIterator<Item = (String, Dtype, Vec<usize>, Vec<u8>)>,
+    ) -> Result<Self, StoreError> {
+        let mut catalog = BTreeMap::new();
+        for (name, dtype, shape, bytes) in tensors {
+            let mut metadata =
+                metadata_for_parts(&name, Path::new("<memory>"), dtype, &shape, bytes.len())?;
+            metadata.backing_shard = None;
+            let tensor = Arc::new(MemoryTensor {
+                metadata,
+                dtype,
+                bytes,
+            });
+            if catalog.insert(name.clone(), tensor).is_some() {
+                return Err(StoreError::Internal(format!(
+                    "duplicate in-memory tensor {name:?}"
+                )));
+            }
+        }
+        Ok(Self { tensors: catalog })
+    }
+}
+
+impl WeightStore for MemoryWeightStore {
+    type Lease = MemoryLease;
+
+    fn keys(&self) -> Vec<String> {
+        self.tensors.keys().cloned().collect()
+    }
+
+    fn metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        self.tensors
+            .get(key)
+            .map(|tensor| tensor.metadata.clone())
+            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
+    }
+
+    fn acquire(&self, request: TensorReadRequest) -> Result<Self::Lease, StoreError> {
+        let tensor =
+            self.tensors
+                .get(&request.key)
+                .cloned()
+                .ok_or_else(|| StoreError::UnknownTensor {
+                    key: request.key.clone(),
+                })?;
+        let output_shape = validate_selection(
+            &request.key,
+            &tensor.metadata.logical_shape,
+            &request.selection,
+        )?;
+        let (span, selected_bytes) = select_safetensors_bytes(
+            &request.key,
+            tensor.dtype,
+            &tensor.metadata.logical_shape,
+            &tensor.bytes,
+            &request.selection,
+            &output_shape,
+            request.policy,
+        )?;
+        let length = selected_bytes
+            .as_ref()
+            .map_or(span.len(), |bytes| bytes.len());
+        let full_selection = matches!(request.selection, TensorSelection::Full);
+        Ok(MemoryLease {
+            tensor,
+            selection: request.selection,
+            output_shape,
+            proof: BoundedReadProof {
+                physically_bounded: matches!(request.policy, ReadPolicy::RequireBounded)
+                    || full_selection,
+                offset_bytes: u64::try_from(span.start).map_err(|_| StoreError::Overflow {
+                    context: "in-memory selection byte offset".into(),
+                })?,
+                length_bytes: u64::try_from(length).map_err(|_| StoreError::Overflow {
+                    context: "in-memory selection byte length".into(),
+                })?,
+            },
+            span,
+            selected_bytes: selected_bytes.map(Arc::from),
+        })
+    }
+
+    fn diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+        Ok(WeightStoreDiagnostics {
+            backend: WeightStoreBackend::Memory,
+            mapping_hits: 0,
+            mapping_misses: 0,
+            evictions: 0,
+            currently_mapped_shards: 0,
+            touched_shard_paths: Vec::new(),
+            physical_reads: 0,
+            physical_read_bytes: 0,
+            coalesced_group_hits: 0,
+        })
+    }
+}
+
+impl CheckpointSource for MemoryWeightStore {
+    fn source_keys(&self) -> Vec<String> {
+        WeightStore::keys(self)
+    }
+
+    fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        WeightStore::metadata(self, key)
+    }
+
+    fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+        WeightStore::acquire(self, request).map(CheckpointLease::Memory)
+    }
+
+    fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+        WeightStore::diagnostics(self)
     }
 }
 
@@ -177,6 +355,16 @@ pub trait CheckpointSource: Send + Sync {
 
     /// Returns physical source keys consumed to synthesize overlay bindings.
     fn materialized_source_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Returns physical source shards whose payloads were consumed to build
+    /// materialized overlay bindings.
+    ///
+    /// This is distinct from `touched_shard_paths`: catalog inspection may
+    /// map shards solely to read tensor metadata, while this list records only
+    /// the source payloads selected by an actual materialization plan.
+    fn materialized_source_shards(&self) -> Vec<PathBuf> {
         Vec::new()
     }
 
@@ -275,6 +463,10 @@ impl CheckpointSource for ResolvedCheckpointSource {
             .into_iter()
             .filter(|key| self.contract.source_keys().contains(key))
             .collect()
+    }
+
+    fn materialized_source_shards(&self) -> Vec<PathBuf> {
+        self.source.materialized_source_shards()
     }
 
     fn unclaimed_checkpoint_keys(&self) -> Vec<String> {

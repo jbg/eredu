@@ -14,7 +14,7 @@ use safemlx::ops::{concatenate_axis, stack_axis};
 use safemlx::{
     module::{FlattenedModuleParamMut, ModuleParameters},
     native_quantization::NativeQuantizationFormat,
-    ops::{GgufCheckpoint, GgufMetadataValue, GgufTensor},
+    ops::{GgufCheckpoint, GgufMetadataValue},
     transforms::async_eval_with_event,
     Array, Stream,
 };
@@ -193,90 +193,6 @@ where
         }
     }
     Ok(configs)
-}
-
-pub(crate) fn load_gguf_strict<M, F>(
-    model: &mut M,
-    checkpoint: &GgufCheckpoint,
-    quantization: Option<(WeightQuantization, &Stream)>,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-    mut transform: F,
-) -> Result<(), Error>
-where
-    M: ModuleParameters,
-    F: FnMut(String, Array) -> Result<(String, Array), Error>,
-{
-    let mut params = model.parameters_mut().flatten();
-    for tensor in checkpoint.converted_tensors() {
-        let tensor = tensor?;
-        let is_iq = matches!(tensor, GgufTensor::IQuant(_));
-        for (name, value) in tensor.into_arrays() {
-            let (name, value) = transform(name, value)?;
-            if is_iq {
-                if quantization.is_some() {
-                    return Err(Error::Quantization(
-                        "requantizing checkpoint-native GGML block tensors on load is unsupported"
-                            .into(),
-                    ));
-                }
-                load_iq_array_strict(&mut params, name, value, config, report);
-                continue;
-            }
-            if let Some((quantization, stream)) = quantization {
-                load_array_quantized_strict(
-                    &mut params,
-                    name,
-                    value,
-                    stream,
-                    quantization,
-                    config,
-                    report,
-                )?;
-            } else {
-                load_array_strict(&mut params, name, value, config, report);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn load_iq_array_strict(
-    params: &mut FlattenedModuleParamMut<'_>,
-    key: String,
-    value: Array,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) {
-    let Some(candidate) = config
-        .candidates(&key)
-        .into_iter()
-        .find(|candidate| params.contains_key(candidate.as_str()))
-    else {
-        report.record_unused(key);
-        return;
-    };
-    let Some(param) = params.get_mut(candidate.as_str()) else {
-        report.record_unused(key);
-        return;
-    };
-    let expected_shape = param.shape().to_vec();
-    let actual_shape = value.shape().to_vec();
-    if expected_shape != actual_shape {
-        report.record_shape_mismatch(key, candidate, expected_shape, actual_shape);
-        return;
-    }
-    **param = value;
-    report.record_loaded(candidate.clone());
-    let prefix = candidate
-        .strip_suffix(".inner.weight")
-        .or_else(|| candidate.strip_suffix(".weight"));
-    if let Some(prefix) = prefix {
-        let scales = format!("{prefix}.scales");
-        if params.contains_key(scales.as_str()) {
-            report.record_loaded(scales);
-        }
-    }
 }
 
 #[cfg(test)]

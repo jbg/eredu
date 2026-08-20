@@ -128,6 +128,7 @@ fn unloaded_expert_bank(
             input_dimensions: args.hidden_size,
             intermediate_dimensions: intermediate,
             output_dimensions: args.hidden_size,
+            activation: eredu_nn::GatedExpertActivation::Silu,
             limit: None,
             layout: SwiGluExpertLayout::Packed {
                 gate_up: SwiGluExpertProjection {
@@ -503,9 +504,9 @@ where
                 input::Modality::Image | input::Modality::Video,
                 input::InputPayload::Tensor(tensor),
             ) => {
-                let grid = part.metadata.qwen_grid_thw.ok_or_else(|| {
+                let grid = part.metadata.patch_grid.ok_or_else(|| {
                     Error::UnsupportedArchitecture(format!(
-                        "Qwen3-VL {} input requires qwen_grid_thw metadata",
+                        "Qwen3-VL {} input requires patch_grid metadata",
                         part.modality.as_str()
                     ))
                 })?;
@@ -2611,8 +2612,8 @@ impl Qwen3VlLayerwiseAdapter {
                         "Qwen3-VL continuation requires tensor media payloads".into(),
                     ));
                 };
-                let grid = part.metadata.qwen_grid_thw.ok_or_else(|| {
-                    Error::Parallel("Qwen3-VL continuation omitted qwen_grid_thw".into())
+                let grid = part.metadata.patch_grid.ok_or_else(|| {
+                    Error::Parallel("Qwen3-VL continuation omitted patch_grid".into())
                 })?;
                 pixels.push(tensor.clone());
                 grids.push(grid.clone());
@@ -3034,9 +3035,9 @@ impl Qwen3VlLayerwiseAdapter {
                     input::Modality::Image | input::Modality::Video,
                     input::InputPayload::Tensor(tensor),
                 ) => {
-                    let grid = part.metadata.qwen_grid_thw.ok_or_else(|| {
+                    let grid = part.metadata.patch_grid.ok_or_else(|| {
                         Error::UnsupportedArchitecture(format!(
-                            "Qwen3-VL {} input requires qwen_grid_thw metadata",
+                            "Qwen3-VL {} input requires patch_grid metadata",
                             part.modality.as_str()
                         ))
                     })?;

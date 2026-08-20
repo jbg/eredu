@@ -25,8 +25,7 @@ use eredu::{
         load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
     },
     composition::mlx_architectures::{
-        gemma4, gpt_oss::model as gpt_oss, inkling::model as inkling,
-        qwen::hybrid::qwen3_5 as qwen_hybrid,
+        gpt_oss::model as gpt_oss, qwen::hybrid::qwen3_5 as qwen_hybrid,
     },
     core::{residency::OffloadConfig, BackendProvider as _, BackendSession as _},
     load_model, DenseDiskStreamLoadOptions, ExpertCacheLoadOptions, LayerwiseLoadOptions,
@@ -36,7 +35,7 @@ use eredu::{
 use eredu::{CacheResidencyPolicy, PagedCacheOptions};
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_gguf::{GgmlType, TensorInput, Writer};
-use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized};
+use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized};
 use safemlx::{
     distributed::{self, Backend},
     module::ModuleParameters,
@@ -55,6 +54,10 @@ const CARTESIAN_AXES: &str = "EREDU_PIPELINE_CARTESIAN_AXES";
 const EXPERT_CACHE: &str = "EREDU_PIPELINE_EXPERT_CACHE";
 const REQUANTIZE: &str = "EREDU_PIPELINE_REQUANTIZE";
 const OPAQUE_SESSION: &str = "EREDU_PIPELINE_OPAQUE_SESSION";
+const OPAQUE_MUSE_IMAGE: &str = "EREDU_PIPELINE_OPAQUE_MUSE_IMAGE";
+const OPAQUE_INKLING_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MEDIA";
+const OPAQUE_INKLING_MTP: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MTP";
+const OPAQUE_GEMMA4_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_GEMMA4_MEDIA";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FixtureFamily {
@@ -63,6 +66,7 @@ enum FixtureFamily {
     DeepSeekV4,
     DeepSeekGguf,
     Gemma,
+    MuseGlimmer,
     Qwen2,
     Qwen3,
     Qwen3Moe,
@@ -96,6 +100,7 @@ impl FixtureFamily {
             Self::DeepSeekV4 => "deepseek-v4",
             Self::DeepSeekGguf => "deepseek-gguf",
             Self::Gemma => "gemma",
+            Self::MuseGlimmer => "muse-glimmer",
             Self::Qwen2 => "qwen2",
             Self::Qwen3 => "qwen3",
             Self::Qwen3Moe => "qwen3-moe",
@@ -129,6 +134,7 @@ impl FixtureFamily {
             Self::DeepSeekV4,
             Self::DeepSeekGguf,
             Self::Gemma,
+            Self::MuseGlimmer,
             Self::Qwen2,
             Self::Qwen3,
             Self::Qwen3Moe,
@@ -183,7 +189,7 @@ impl FixtureFamily {
             | Self::Qwen35
             | Self::Qwen35Moe
             | Self::Qwen35Multimodal => 2,
-            Self::Qwen35MoeMultimodal => 2,
+            Self::Qwen35MoeMultimodal | Self::MuseGlimmer => 2,
             Self::Gemma | Self::NemotronH | Self::NemotronHGguf => 4,
             Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => 3,
         }
@@ -222,6 +228,7 @@ impl FixtureFamily {
             Self::DeepSeek | Self::DeepSeekGguf => ("deepseek_v3", "deepseek_v3"),
             Self::DeepSeekV4 => ("deepseek_v4", "deepseek_v4"),
             Self::Gemma => ("gemma4", "gemma4"),
+            Self::MuseGlimmer => ("muse_glimmer", "muse_glimmer_text"),
             Self::Qwen2 => ("qwen", "qwen2"),
             Self::Qwen3 => ("qwen", "qwen3"),
             Self::Qwen3Moe | Self::Qwen3MoeTied | Self::Qwen3MoeGguf => ("qwen", "qwen3_moe"),
@@ -244,7 +251,7 @@ impl FixtureFamily {
 
     const fn layer_prefix(self) -> &'static str {
         match self {
-            Self::Gemma => "model.language_model.layers.",
+            Self::Gemma | Self::MuseGlimmer => "model.language_model.layers.",
             Self::DeepSeekV4 => "layers.",
             Self::NemotronH | Self::NemotronHGguf => "backbone.layers.",
             Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => "model.llm.layers.",
@@ -326,17 +333,20 @@ fn pipeline_ring_worker() {
     let prompt_cache_root = PathBuf::from(std::env::var_os(PROMPT_CACHE_ROOT).unwrap());
     let group = distributed::init(true, Backend::Ring).unwrap();
     let cartesian_axes = std::env::var(CARTESIAN_AXES).ok();
-    let (tensor_parallel_size, expert_parallel_size) = match cartesian_axes.as_deref() {
-        None => (1, 1),
-        Some("tp-pp") => (2, 1),
-        Some("pp-ep") => (1, 2),
-        Some("tp-pp-ep") => (2, 2),
-        Some(other) => panic!("unexpected Cartesian pipeline axes {other:?}"),
-    };
+    let (tensor_parallel_size, pipeline_parallel_size, expert_parallel_size) =
+        match cartesian_axes.as_deref() {
+            None => (1, 2, 1),
+            Some("tp") => (2, 1, 1),
+            Some("ep") => (1, 1, 2),
+            Some("tp-pp") => (2, 2, 1),
+            Some("pp-ep") => (1, 2, 2),
+            Some("tp-pp-ep") => (2, 2, 2),
+            Some(other) => panic!("unexpected Cartesian pipeline axes {other:?}"),
+        };
     let topology = MlxParallelContext::for_group(
         &group,
         tensor_parallel_size,
-        2,
+        pipeline_parallel_size,
         expert_parallel_size,
         DeviceAssignment::new(DeviceType::Cpu, 0),
     )
@@ -359,26 +369,190 @@ fn pipeline_ring_worker() {
         session
             .configure_cache(CacheResidencyPolicy::Paged(paged))
             .unwrap();
+        use eredu::backend::mlx::runtime::media::input::{
+            InputMetadata, InputPart, InputPayload, Modality, ModelInput,
+        };
+        let image_mode = std::env::var_os(OPAQUE_MUSE_IMAGE).is_some();
+        let inkling_media_mode = std::env::var_os(OPAQUE_INKLING_MEDIA).is_some();
+        let inkling_mtp_mode = std::env::var_os(OPAQUE_INKLING_MTP).is_some();
+        let gemma4_media_mode = std::env::var_os(OPAQUE_GEMMA4_MEDIA).is_some();
         let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-        let parts =
-            [eredu::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
+        let text_before = Array::from_slice(&[1u32], &[1, 1]);
+        let text_after = Array::from_slice(&[2u32], &[1, 1]);
+        let image_grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
+        let image_pixels = Array::from_slice(&[0.01f32; 48], &[4, 12]);
+        let inkling_image = Array::from_slice(&[0.01f32; 16], &[1, 1, 16]);
+        let inkling_audio = Array::from_slice(&[0u32, 1, 2, 3, 4, 5], &[1, 3, 2]);
+        let gemma4_patches = Array::from_slice(&[0.01f32; 192], &[1, 4, 48]);
+        let gemma4_positions = Array::from_slice(&[0i32, 0, 0, 1, 1, 0, 1, 1], &[1, 4, 2]);
+        let gemma4_grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
+        let gemma4_audio = Array::from_slice(&[0.01f32; 512], &[1, 4, 128]);
+        let gemma4_audio_mask = Array::from_slice(&[true, true, true, true], &[1, 4]);
+        let parts = if image_mode {
+            vec![
+                InputPart::text_token_ids(&text_before),
+                InputPart::image_tensor(&image_pixels, InputMetadata::patch_grid(&image_grid)),
+                InputPart::text_token_ids(&text_after),
+            ]
+        } else if inkling_media_mode {
+            vec![
+                InputPart::text_token_ids(&prompt),
+                InputPart {
+                    modality: Modality::Image,
+                    payload: InputPayload::Embeddings(&inkling_image),
+                    metadata: InputMetadata::empty(),
+                },
+                InputPart::audio_tensor(&inkling_audio, InputMetadata::empty()),
+            ]
+        } else if gemma4_media_mode {
+            vec![
+                InputPart::text_token_ids(&prompt),
+                InputPart::image_tensor(
+                    &gemma4_patches,
+                    InputMetadata::patch_layout(&gemma4_grid, &gemma4_positions, [1, 2, 2]),
+                ),
+                InputPart::audio_tensor(
+                    &gemma4_audio,
+                    InputMetadata::audio_layout(&gemma4_audio_mask, 4),
+                ),
+            ]
+        } else {
+            vec![InputPart::text_token_ids(&prompt)]
+        };
+        let prefix_tokens = if image_mode {
+            vec![1, 22, 2]
+        } else if inkling_media_mode {
+            vec![1, 2, 21, 20, 20, 20]
+        } else if gemma4_media_mode {
+            vec![1, 2, 30, 31]
+        } else {
+            vec![1, 2]
+        };
+        if inkling_mtp_mode {
+            assert!(session
+                .prompt_cache_layer_prefix_offsets()
+                .unwrap()
+                .contains(&-1));
+            let (generated, stats) = session
+                .generate_embedded_mtp(
+                    &backend,
+                    ModelInput::new(&parts).into(),
+                    &MtpConfig {
+                        max_tokens: 3,
+                        max_draft_tokens: 2,
+                        temperature: 0.0,
+                        eos_token_ids: Vec::new(),
+                    },
+                    None,
+                    &mut DefaultSampler,
+                )
+                .unwrap();
+            assert_eq!(generated.len(), 3);
+            assert_eq!(stats.emitted_tokens, 3);
+            assert!(stats.draft_tokens > 0);
+            return;
+        }
         let mut output = session
-            .prefill(
-                &backend,
-                eredu::backend::mlx::runtime::media::input::ModelInput::new(&parts).into(),
-            )
+            .prefill(&backend, ModelInput::new(&parts).into())
             .unwrap()
             .wait()
             .unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap())
+                .unwrap();
+        let outer_model_type = config["model_type"].as_str().unwrap();
+        let effective_model_type = if outer_model_type == "muse_glimmer" {
+            config["text_config"]["model_type"].as_str().unwrap()
+        } else {
+            outer_model_type
+        };
+        let model_family = match outer_model_type {
+            "gemma4" | "gemma4_unified" => "gemma4",
+            "muse_glimmer" => "muse_glimmer",
+            _ => "inkling",
+        };
+        let layer_layout = session.prompt_cache_layer_layout().unwrap();
+        let layer_prefix_offsets = session.prompt_cache_layer_prefix_offsets().unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: model_family.into(),
+            effective_model_type: effective_model_type.into(),
+            checkpoint_fingerprint: "opaque-ring-fixture".into(),
+            prefix_content_fingerprint: format!("tokens:{prefix_tokens:?}"),
+            architecture_fingerprint: session.prompt_cache_architecture_fingerprint().unwrap(),
+            layer_count: layer_layout.len(),
+            global_layer_start: 0,
+            global_layer_end: layer_layout.len(),
+            batch_size: 1,
+            layer_prefix_offsets,
+            layer_layout,
+            sink_tokens: 0,
+            topology: PromptCacheTopology {
+                pipeline: (pipeline_parallel_size > 1)
+                    .then_some((pipeline_parallel_size, pipeline_rank)),
+                tensor_parallel: (tensor_parallel_size > 1)
+                    .then_some((tensor_parallel_size, topology.tensor_parallel_rank)),
+                expert_parallel: (expert_parallel_size > 1)
+                    .then_some((expert_parallel_size, topology.expert_parallel_rank)),
+                expert_parallel_cache_replicated: true,
+            },
+        };
+        let rank_prompt_cache = prompt_cache_root.join(format!("rank-{expected_rank}"));
+        session
+            .save_prompt_cache(
+                &backend,
+                &rank_prompt_cache,
+                descriptor.clone(),
+                &prefix_tokens,
+                &PromptCacheOptions::default(),
+            )
+            .unwrap();
+        let continuity_token = session
+            .sample_and_synchronize(output.logits(), 1, &mut DefaultSampler, 0.0, None, false)
+            .unwrap()
+            .token;
+        let uninterrupted = session
+            .decode(&backend, continuity_token.clone())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let uninterrupted_logits = uninterrupted
+            .logits()
+            .map(|logits| logits.evaluated().unwrap().as_slice::<f32>().to_vec());
+        session
+            .load_prompt_cache(
+                &backend,
+                &rank_prompt_cache,
+                &descriptor,
+                &prefix_tokens,
+                PagedCacheOptions::new(1, 32768, 32768, 1)
+                    .unwrap()
+                    .with_full_attention(true),
+            )
+            .unwrap();
+        output = session
+            .decode(&backend, continuity_token)
+            .unwrap()
+            .wait()
+            .unwrap();
+        let restored_logits = output
+            .logits()
+            .map(|logits| logits.evaluated().unwrap().as_slice::<f32>().to_vec());
+        assert_eq!(uninterrupted_logits, restored_logits);
         for _ in 0..2 {
-            assert_eq!(output.logits().is_some(), pipeline_rank == 1);
+            assert_eq!(
+                output.logits().is_some(),
+                pipeline_rank + 1 == pipeline_parallel_size
+            );
             let token = session
                 .sample_and_synchronize(output.logits(), 1, &mut DefaultSampler, 0.0, None, false)
                 .unwrap()
                 .token;
             output = session.decode(&backend, token).unwrap().wait().unwrap();
         }
-        assert_eq!(output.logits().is_some(), pipeline_rank == 1);
+        assert_eq!(
+            output.logits().is_some(),
+            pipeline_rank + 1 == pipeline_parallel_size
+        );
         return;
     }
     let execution = MlxBackend::new(&stream, &stream)
@@ -616,9 +790,14 @@ fn pipeline_ring_worker() {
                         | FixtureFamily::Qwen35MoeMultimodal
                 ),
         ) * info.embedded_mtp_layers;
-        let expected_experts = (family.expert_layer_count(expected_range.clone())
-            + predictor_expert_layers)
-            * info.local_expert_ids.len();
+        let expert_layers = family.expert_layer_count(expected_range.clone());
+        let shared_inkling_experts = usize::from(matches!(
+            family,
+            FixtureFamily::Inkling | FixtureFamily::InklingMultimodal | FixtureFamily::InklingGguf
+        )) * expert_layers;
+        let expected_experts = (expert_layers + predictor_expert_layers)
+            * info.local_expert_ids.len()
+            + shared_inkling_experts;
         assert_eq!(report.is_some(), expected_experts > 0);
         if let Some(report) = report {
             assert_eq!(report.owned_experts, expected_experts);
@@ -938,7 +1117,7 @@ fn inkling_multimodal_prepared_input() -> PreparedModelInput {
 
     let text = Array::from_slice(&[1u32, 2], &[1, 2]);
     let image = Array::from_slice(&[0.01f32; 16], &[1, 1, 16]);
-    let audio = Array::from_slice(&[0u32, 1, 2, 3, 4, 5], &[3, 2]);
+    let audio = Array::from_slice(&[0u32, 1, 2, 3, 4, 5], &[1, 3, 2]);
     let audio_mask = Array::from_slice(&[true, true, false], &[1, 3]);
     let parts = [
         InputPart::text_token_ids(&text),
@@ -947,7 +1126,7 @@ fn inkling_multimodal_prepared_input() -> PreparedModelInput {
             payload: InputPayload::Embeddings(&image),
             metadata: InputMetadata::empty(),
         },
-        InputPart::audio_tensor(&audio, InputMetadata::audio_mask(&audio_mask)),
+        InputPart::audio_tensor(&audio, InputMetadata::audio_layout(&audio_mask, 2)),
     ];
     PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
 }
@@ -960,7 +1139,7 @@ fn qwen35_multimodal_prepared_input() -> PreparedModelInput {
     let pixels = Array::from_slice(&[0.01f32; 96], &[8, 12]);
     let parts = [
         InputPart::text_token_ids(&text),
-        InputPart::image_tensor(&pixels, InputMetadata::qwen_grid_thw(&grid)),
+        InputPart::image_tensor(&pixels, InputMetadata::patch_grid(&grid)),
     ];
     PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
 }
@@ -1508,24 +1687,53 @@ fn write_gemma_fixture(directory: &Path) {
     let config = gemma_config();
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
-    let mut args = gemma4::model::model_args_from_config_value(&config["text_config"]).unwrap();
-    args.model_type = "gemma4".into();
-    args.tie_word_embeddings = true;
-    let mut model = gemma4::model::Model::new(args, stream).unwrap();
-    for (name, parameter) in model.parameters_mut().flatten() {
-        let shape = parameter.shape().to_vec();
-        *parameter = if name.ends_with("norm.weight") {
-            Array::ones::<f32>(&shape, stream).unwrap()
-        } else {
-            Array::full::<f32>(&shape, Array::from_f32(0.01), stream).unwrap()
-        };
+    let args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
+        &serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    type Architecture =
+        eredu_architectures::gemma4::LayeredModel<eredu::backend::mlx::nn::shared::MlxBackend>;
+    type State = eredu::backend::mlx::runtime::cache::state::MlxHybridState;
+    struct Collector<'a> {
+        stream: &'a Stream,
+        arrays: Vec<(String, Array)>,
     }
-    let arrays = model
-        .parameters()
-        .flatten()
-        .into_iter()
-        .map(|(name, value)| (canonical_checkpoint_name(&name), value.clone()))
-        .collect::<Vec<_>>();
+    impl<'tensor> ParameterVisitor<'tensor, Array> for Collector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+            let value = if metadata.id.as_str().ends_with("norm.weight") {
+                Array::ones::<f32>(parameter.shape(), self.stream).unwrap()
+            } else {
+                Array::full::<f32>(parameter.shape(), Array::from_f32(0.01), self.stream).unwrap()
+            };
+            self.arrays.push((metadata.id.to_string(), value));
+        }
+    }
+    let architecture = Architecture::new(args, stream).unwrap();
+    let mut collector = Collector {
+        stream,
+        arrays: Vec::new(),
+    };
+    <Architecture as eredu_runtime::LayeredArchitecture<
+        eredu::backend::mlx::nn::shared::MlxBackend,
+        State,
+    >>::static_modules(&architecture)
+    .visit_parameters(&mut collector);
+    for group in 0..3 {
+        let count = <Architecture as eredu_runtime::LayeredArchitecture<
+            eredu::backend::mlx::nn::shared::MlxBackend,
+            State,
+        >>::group_unit_count(&architecture, group)
+        .unwrap();
+        for index in 0..count {
+            <Architecture as eredu_runtime::LayeredArchitecture<
+                eredu::backend::mlx::nn::shared::MlxBackend,
+                State,
+            >>::build_unit(&architecture, group, index, stream)
+            .unwrap()
+            .visit_parameters(&mut collector);
+        }
+    }
+    let arrays = collector.arrays;
     Array::save_safetensors(
         arrays.iter().map(|(name, value)| (name.as_str(), value)),
         None,
@@ -2915,6 +3123,350 @@ fn write_inkling_fixture(directory: &Path) {
     write_inkling_fixture_with_config(directory, inkling_config());
 }
 
+fn write_inkling_mtp_fixture(directory: &Path) {
+    let mut config = inkling_config();
+    config["text_config"]["num_hidden_layers"] = 1.into();
+    config["text_config"]["layer_types"] = serde_json::json!(["sliding_attention"]);
+    config["text_config"]["dense_mlp_idx"] = 0.into();
+    config["mtp_config"] = serde_json::json!({
+        "num_nextn_predict_layers": 2,
+        "local_layer_ids": [1],
+        "chain_hidden_post_norm": true,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 4,
+        "swa_num_attention_heads": 4,
+        "swa_num_key_value_heads": 2,
+        "swa_head_dim": 4,
+        "dense_intermediate_size": 16,
+        "sconv_kernel_size": 3
+    });
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let args = eredu_architectures::inkling::ModelArgs::from_hf_json(
+        &serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    type Architecture =
+        eredu_architectures::inkling::LayeredModel<eredu::backend::mlx::nn::shared::MlxBackend>;
+    type State = eredu::backend::mlx::runtime::cache::state::MlxHybridState;
+    let architecture = Architecture::new(args, stream).unwrap();
+    let mut arrays = Vec::<(String, Array)>::new();
+    struct Collector<'a> {
+        stream: &'a Stream,
+        arrays: &'a mut Vec<(String, Array)>,
+    }
+    impl<'tensor> ParameterVisitor<'tensor, Array> for Collector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+            self.arrays.push((
+                metadata.id.to_string(),
+                safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
+                    .unwrap(),
+            ));
+        }
+    }
+    let mut collector = Collector {
+        stream,
+        arrays: &mut arrays,
+    };
+    <Architecture as eredu_runtime::LayeredArchitecture<
+        eredu::backend::mlx::nn::shared::MlxBackend,
+        State,
+    >>::static_modules(&architecture)
+    .visit_parameters(&mut collector);
+    let graph = <Architecture as eredu_runtime::LayeredArchitecture<
+        eredu::backend::mlx::nn::shared::MlxBackend,
+        State,
+    >>::execution_graph(&architecture)
+    .unwrap();
+    for group in 0..graph.groups().len() {
+        let count = <Architecture as eredu_runtime::LayeredArchitecture<
+            eredu::backend::mlx::nn::shared::MlxBackend,
+            State,
+        >>::group_unit_count(&architecture, group)
+        .unwrap();
+        for index in 0..count {
+            <Architecture as eredu_runtime::LayeredArchitecture<
+                eredu::backend::mlx::nn::shared::MlxBackend,
+                State,
+            >>::build_unit(&architecture, group, index, stream)
+            .unwrap()
+            .visit_parameters(&mut collector);
+        }
+    }
+    Array::save_safetensors(
+        arrays.iter().map(|(name, array)| (name.as_str(), array)),
+        None,
+        directory.join("model.safetensors"),
+    )
+    .unwrap();
+}
+
+fn write_gemma4_tensor_parallel_fixture(directory: &Path) {
+    write_gemma4_tensor_parallel_fixture_with_options(directory, false, false);
+}
+
+fn write_gemma4_tensor_parallel_fixture_with_tied_embeddings(directory: &Path, tied: bool) {
+    write_gemma4_tensor_parallel_fixture_with_options(directory, tied, false);
+}
+
+fn write_gemma4_multimodal_tensor_parallel_fixture(directory: &Path) {
+    write_gemma4_tensor_parallel_fixture_with_options(directory, false, true);
+}
+
+fn write_gemma4_tensor_parallel_fixture_with_options(
+    directory: &Path,
+    tied: bool,
+    multimodal: bool,
+) {
+    let mut config = serde_json::json!({
+        "model_type": "gemma4",
+        "tie_word_embeddings": tied,
+        "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "intermediate_size": 16,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 32,
+            "max_position_embeddings": 128,
+            "tie_word_embeddings": tied,
+            "attention_k_eq_v": false,
+            "layer_types": ["full_attention", "sliding_attention"],
+            "sliding_window": 8
+        }
+    });
+    if multimodal {
+        config["model_type"] = "gemma4_unified".into();
+        config["image_token_id"] = 30.into();
+        config["audio_token_id"] = 31.into();
+        config["vision_config"] = serde_json::json!({
+            "hidden_size": 16,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "patch_size": 4,
+            "pooling_kernel_size": 2,
+            "position_embedding_size": 4,
+            "rms_norm_eps": 0.00001
+        });
+        config["audio_config"] = serde_json::json!({
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "output_proj_dims": 8,
+            "conv_kernel_size": 3,
+            "attention_chunk_size": 4,
+            "attention_context_left": 5,
+            "attention_context_right": 0,
+            "attention_invalid_logits_value": -1000000000.0,
+            "attention_logit_cap": 50.0,
+            "residual_weight": 0.5,
+            "rms_norm_eps": 0.00001,
+            "subsampling_conv_channels": [4, 8]
+        });
+    }
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
+        &serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    type Architecture =
+        eredu_architectures::gemma4::LayeredModel<eredu::backend::mlx::nn::shared::MlxBackend>;
+    type State = eredu::backend::mlx::runtime::cache::state::MlxHybridState;
+    let architecture = Architecture::new(args, stream).unwrap();
+    let mut arrays = Vec::<(String, Array)>::new();
+    struct Collector<'a> {
+        stream: &'a Stream,
+        arrays: &'a mut Vec<(String, Array)>,
+    }
+    impl<'tensor> ParameterVisitor<'tensor, Array> for Collector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+            self.arrays.push((
+                metadata.id.to_string(),
+                safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
+                    .unwrap(),
+            ));
+        }
+    }
+    let mut collector = Collector {
+        stream,
+        arrays: &mut arrays,
+    };
+    <Architecture as eredu_runtime::LayeredArchitecture<
+        eredu::backend::mlx::nn::shared::MlxBackend,
+        State,
+    >>::static_modules(&architecture)
+    .visit_parameters(&mut collector);
+    for group in 0..3 {
+        let count = <Architecture as eredu_runtime::LayeredArchitecture<
+            eredu::backend::mlx::nn::shared::MlxBackend,
+            State,
+        >>::group_unit_count(&architecture, group)
+        .unwrap();
+        for index in 0..count {
+            <Architecture as eredu_runtime::LayeredArchitecture<
+                eredu::backend::mlx::nn::shared::MlxBackend,
+                State,
+            >>::build_unit(&architecture, group, index, stream)
+            .unwrap()
+            .visit_parameters(&mut collector);
+        }
+    }
+    // MLX's SafeTensors writer promotes rank-zero arrays to `[1]`, while the
+    // released clipped media bounds and their neutral schema are true
+    // scalars. Preserve the authoritative parameter shapes in this fixture.
+    let tensors = arrays
+        .iter()
+        .map(|(name, array)| {
+            let shape = if ["input_min", "input_max", "output_min", "output_max"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+            {
+                Vec::new()
+            } else {
+                array
+                    .shape()
+                    .iter()
+                    .map(|dimension| usize::try_from(*dimension).unwrap())
+                    .collect()
+            };
+            (name.as_str(), shape, 0.0)
+        })
+        .collect::<Vec<_>>();
+    write_f32_shard(&directory.join("model.safetensors"), &tensors);
+}
+
+fn write_muse_glimmer_tensor_parallel_fixture(directory: &Path) {
+    let config = serde_json::json!({
+        "architectures": ["MuseGlimmerForConditionalGeneration"],
+        "model_type": "muse_glimmer",
+        "image_token_id": 22,
+        "video_token_id": 23,
+        "out_hidden_size": 32,
+        "projector_hidden_size": 16,
+        "text_config": {
+            "model_type": "muse_glimmer_text",
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "intermediate_size": 16,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "rms_norm_eps": 0.00001,
+            "post_norm_eps": 0.00001,
+            "vocab_size": 32,
+            "max_position_embeddings": 64,
+            "rope_theta": 10000.0,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "layer_rope_theta": [10000.0, 0.0],
+            "sliding_window": 8,
+            "tie_word_embeddings": false,
+            "hidden_act": "silu",
+            "attention_dropout": 0.0,
+            "qk_scale_factor": 1.0,
+            "output_multiplier": 1.0,
+            "final_logit_softcapping": 30.0
+        },
+        "vision_config": {
+            "model_type": "muse_glimmer_vision",
+            "hidden_size": 8,
+            "intermediate_size": 8,
+            "num_attention_heads": 2,
+            "num_hidden_layers": 1,
+            "patch_size": 2,
+            "patch_temporal": 1,
+            "merge_size": 2,
+            "pos_emb_height": 2,
+            "pos_emb_width": 2,
+            "max_position_embeddings": 4,
+            "layer_norm_eps": 0.00001,
+            "hidden_act": "gelu",
+            "layer_types": ["full_attention"],
+            "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
+        }
+    });
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let args = eredu_architectures::muse_glimmer::DecoderConfig::from_hf_json(
+        &serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    type Architecture = eredu_architectures::muse_glimmer::LayeredModel<
+        eredu::backend::mlx::nn::shared::MlxBackend,
+    >;
+    type State = eredu::backend::mlx::runtime::cache::state::MlxKeyValueState;
+    let architecture = Architecture::new(args, stream).unwrap();
+    let mut arrays = Vec::<(String, Array)>::new();
+    struct Collector<'a> {
+        stream: &'a Stream,
+        arrays: &'a mut Vec<(String, Array)>,
+    }
+    impl<'tensor> ParameterVisitor<'tensor, Array> for Collector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+            self.arrays.push((
+                metadata.id.to_string(),
+                safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
+                    .unwrap(),
+            ));
+        }
+    }
+    let mut collector = Collector {
+        stream,
+        arrays: &mut arrays,
+    };
+    <Architecture as eredu_runtime::LayeredArchitecture<
+        eredu::backend::mlx::nn::shared::MlxBackend,
+        State,
+    >>::static_modules(&architecture)
+    .visit_parameters(&mut collector);
+    for group in 0..2 {
+        let count = <Architecture as eredu_runtime::LayeredArchitecture<
+            eredu::backend::mlx::nn::shared::MlxBackend,
+            State,
+        >>::group_unit_count(&architecture, group)
+        .unwrap();
+        for index in 0..count {
+            <Architecture as eredu_runtime::LayeredArchitecture<
+                eredu::backend::mlx::nn::shared::MlxBackend,
+                State,
+            >>::build_unit(&architecture, group, index, stream)
+            .unwrap()
+            .visit_parameters(&mut collector);
+        }
+    }
+    Array::save_safetensors(
+        arrays.iter().map(|(name, array)| (name.as_str(), array)),
+        None,
+        directory.join("model.safetensors"),
+    )
+    .unwrap();
+}
+
 fn write_inkling_quantizable_fixture(directory: &Path) {
     write_inkling_fixture_with_config(directory, inkling_quantizable_config());
 }
@@ -2923,16 +3475,97 @@ fn write_inkling_multimodal_fixture(directory: &Path) {
     write_inkling_fixture_with_config(directory, inkling_multimodal_config());
 }
 
+fn initialized_inkling_parameters(
+    config: &serde_json::Value,
+    stream: &Stream,
+) -> (
+    eredu_architectures::inkling::ModelArgs,
+    BTreeMap<String, Array>,
+) {
+    type Architecture =
+        eredu_architectures::inkling::LayeredModel<eredu::backend::mlx::nn::shared::MlxBackend>;
+    type State = eredu::backend::mlx::runtime::cache::state::MlxHybridState;
+
+    struct Initializer<'a> {
+        stream: &'a Stream,
+        parameters: &'a mut BTreeMap<String, Array>,
+    }
+
+    impl<'tensor> ParameterVisitorMut<'tensor, Array> for Initializer<'_> {
+        fn visit_mut(&mut self, metadata: ParameterMetadata, parameter: &'tensor mut Array) {
+            let name = metadata.id.to_string();
+            let shape = parameter.shape().to_vec();
+            let value = if name.ends_with("norm.weight")
+                || name.ends_with("layernorm.weight")
+                || name.ends_with("o_norm.weight")
+                || name.ends_with("global_scale")
+                || name == "model.norm_f.weight"
+            {
+                Array::ones::<f32>(&shape, self.stream).unwrap()
+            } else if name.ends_with("A_log") {
+                Array::full::<f32>(&shape, Array::from_f32(-0.2), self.stream).unwrap()
+            } else {
+                let ordinal = name.bytes().fold(0u32, |sum, byte| sum + u32::from(byte)) % 29;
+                Array::full::<f32>(
+                    &shape,
+                    Array::from_f32(0.002 + ordinal as f32 * 0.0002),
+                    self.stream,
+                )
+                .unwrap()
+            }
+            .as_dtype(parameter.dtype(), self.stream)
+            .unwrap();
+            *parameter = value;
+            self.parameters.insert(name, parameter.clone());
+        }
+    }
+
+    let args =
+        eredu_architectures::inkling::ModelArgs::from_hf_json(&serde_json::to_vec(config).unwrap())
+            .unwrap();
+    let mut architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut parameters = BTreeMap::new();
+    <Architecture as eredu_runtime::LayeredArchitecture<
+        eredu::backend::mlx::nn::shared::MlxBackend,
+        State,
+    >>::static_modules_mut(&mut architecture)
+    .visit_parameters_mut(&mut Initializer {
+        stream,
+        parameters: &mut parameters,
+    });
+    let graph = <Architecture as eredu_runtime::LayeredArchitecture<
+        eredu::backend::mlx::nn::shared::MlxBackend,
+        State,
+    >>::execution_graph(&architecture)
+    .unwrap();
+    for group in 0..graph.groups().len() {
+        let count = <Architecture as eredu_runtime::LayeredArchitecture<
+            eredu::backend::mlx::nn::shared::MlxBackend,
+            State,
+        >>::group_unit_count(&architecture, group)
+        .unwrap();
+        for index in 0..count {
+            let mut unit = <Architecture as eredu_runtime::LayeredArchitecture<
+                eredu::backend::mlx::nn::shared::MlxBackend,
+                State,
+            >>::build_unit(&architecture, group, index, stream)
+            .unwrap();
+            unit.visit_parameters_mut(&mut Initializer {
+                stream,
+                parameters: &mut parameters,
+            });
+        }
+    }
+    (args, parameters)
+}
+
 fn write_inkling_fixture_with_config(directory: &Path, config: serde_json::Value) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = inkling::model_args_from_config_value(&config).unwrap();
-    let mut model = inkling::Model::new(args, stream).unwrap();
-    initialize_fixture(&mut model, stream);
-    let parameters = model.parameters().flatten();
+    let (args, parameters) = initialized_inkling_parameters(&config, stream);
     let mut arrays = Vec::<(String, Array)>::new();
     for (name, value) in &parameters {
-        let name = name.as_ref();
+        let name = name.as_str();
         if name.ends_with(".dense.up_proj.weight") {
             continue;
         }
@@ -2947,7 +3580,7 @@ fn write_inkling_fixture_with_config(directory: &Path, config: serde_json::Value
             continue;
         }
         if let Some(prefix) = name.strip_suffix(".moe.experts.gate_up_proj") {
-            let intermediate = model.args.text_config.moe_intermediate_size.unwrap();
+            let intermediate = args.text_config.moe_intermediate_size.unwrap();
             let gate = value
                 .try_index_device((.., ..intermediate, ..), stream)
                 .unwrap();
@@ -2964,7 +3597,7 @@ fn write_inkling_fixture_with_config(directory: &Path, config: serde_json::Value
             continue;
         }
         if let Some(prefix) = name.strip_suffix(".moe.shared_experts.gate_up_proj") {
-            let intermediate = model.args.text_config.moe_intermediate_size.unwrap();
+            let intermediate = args.text_config.moe_intermediate_size.unwrap();
             let gate = value
                 .try_index_device((.., ..intermediate, ..), stream)
                 .unwrap();
@@ -3134,13 +3767,10 @@ fn write_inkling_gguf_fixture(path: &Path) {
     let config = inkling_config();
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = inkling::model_args_from_config_value(&config).unwrap();
-    let mut model = inkling::Model::new(args, stream).unwrap();
-    initialize_fixture(&mut model, stream);
-    let parameters = model.parameters().flatten();
+    let (_args, parameters) = initialized_inkling_parameters(&config, stream);
     let mut specs = Vec::new();
     for (runtime, value) in &parameters {
-        let runtime = runtime.as_ref();
+        let runtime = runtime.as_str();
         for (suffix, gate_name, up_name) in [
             (
                 ".moe.experts.gate_up_proj",
@@ -4543,6 +5173,235 @@ fn ring_qwen3_moe_tensor_pipeline_opaque_session() {
     );
 }
 
+/// Exercises the public complete-model loader and opaque session through the
+/// neutral Inkling tensor-parallel composition without pipeline partitioning.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_inkling_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Inkling,
+        "tp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Exercises the public complete-model loader and sparse neutral Inkling
+/// decoder on a pure two-rank expert-parallel topology without PP or TP.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_inkling_expert_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Inkling,
+        "ep",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Exercises ordered projected image embeddings plus the native dMel tower
+/// through the public neutral Inkling TP session and prompt-cache lifecycle.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_inkling_multimodal_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::InklingMultimodal,
+        "tp",
+        WorkerMode::OpaqueInklingMedia,
+    );
+}
+
+/// Exercises the neutral embedded predictor through the complete public TP
+/// loader, rank-synchronized scheduler, sharded vocabulary, and MTP state.
+#[test]
+#[ignore = "spawns local processes, opens loopback sockets, and initializes MLX; run explicitly"]
+fn ring_two_process_inkling_mtp_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Inkling,
+        "tp",
+        WorkerMode::OpaqueInklingMtp,
+    );
+}
+
+/// Persists embedded Inkling predictor KV and all four convolution histories
+/// as globally addressed neutral state, then reopens the complete manifest.
+#[test]
+#[ignore = "initializes MLX and executes embedded MTP; run explicitly"]
+fn inkling_mtp_prompt_round_trip() {
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_inkling_mtp_fixture(checkpoint.path());
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let backend = MlxBackend::new(stream, stream);
+    let model = load_model(&backend, checkpoint.path(), ModelLoadOptions::default()).unwrap();
+    let mut session = backend.create_session(model).unwrap();
+    let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
+        .unwrap()
+        .with_full_attention(true);
+    session
+        .configure_cache(CacheResidencyPolicy::Paged(paged.clone()))
+        .unwrap();
+    let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let parts = [eredu::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
+    let (generated, _) = session
+        .generate_embedded_mtp(
+            &backend,
+            eredu::backend::mlx::runtime::media::input::ModelInput::new(&parts).into(),
+            &MtpConfig {
+                max_tokens: 1,
+                max_draft_tokens: 1,
+                temperature: 0.0,
+                eos_token_ids: Vec::new(),
+            },
+            None,
+            &mut DefaultSampler,
+        )
+        .unwrap();
+    assert_eq!(generated.len(), 1);
+    let prefix_ids = vec![1, 2];
+    let layer_layout = session.prompt_cache_layer_layout().unwrap();
+    let layer_prefix_offsets = session.prompt_cache_layer_prefix_offsets().unwrap();
+    assert!(layer_prefix_offsets.contains(&-1));
+    let target_layers = layer_prefix_offsets
+        .iter()
+        .take_while(|offset| **offset == 0)
+        .count();
+    let descriptor = PromptCacheDescriptor {
+        model_family: "inkling".into(),
+        effective_model_type: "inkling_mm_model".into(),
+        checkpoint_fingerprint: "opaque-mtp-fixture".into(),
+        prefix_content_fingerprint: format!("tokens:{prefix_ids:?}"),
+        architecture_fingerprint: session.prompt_cache_architecture_fingerprint().unwrap(),
+        layer_count: layer_layout.len(),
+        global_layer_start: 0,
+        global_layer_end: layer_layout.len(),
+        batch_size: 1,
+        layer_prefix_offsets,
+        layer_layout,
+        sink_tokens: 0,
+        topology: PromptCacheTopology::default(),
+    };
+    let prompt_cache = tempfile::tempdir().unwrap();
+    let destination = prompt_cache.path().join("cache");
+    let manifest = session
+        .save_prompt_cache(
+            &backend,
+            &destination,
+            descriptor.clone(),
+            &prefix_ids,
+            &PromptCacheOptions::default(),
+        )
+        .unwrap();
+    assert!(manifest
+        .blocks
+        .iter()
+        .any(|block| block.global_layer >= target_layers));
+    assert!(manifest.state_tensors.iter().any(|tensor| {
+        matches!(tensor.owner, eredu::StateTensorOwner::Layer(layer) if layer >= target_layers)
+    }));
+    session
+        .load_prompt_cache(&backend, destination, &descriptor, &prefix_ids, paged)
+        .unwrap();
+}
+
+/// Exercises the neutral Gemma 4 text binder through the public loader and
+/// opaque session on a pure two-rank tensor-parallel topology.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_gemma4_tensor_parallel_opaque_session() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_gemma4_tensor_parallel_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Gemma,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Exercises Gemma 4 Unified's neutral image and audio towers, ordered media
+/// assembly, per-layer inputs, TP decoder, and prompt-cache continuation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_gemma4_multimodal_tensor_parallel_opaque_session() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_gemma4_multimodal_tensor_parallel_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Gemma,
+        WorkerMode::OpaqueGemma4Media,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Verifies that a tied Gemma 4 checkpoint without an `lm_head` is bound and
+/// projected through the rank-local vocabulary embedding by the public path.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_gemma4_tied_tensor_parallel_opaque_session() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_gemma4_tensor_parallel_fixture_with_tied_embeddings(checkpoint.path(), true);
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Gemma,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Exercises the neutral Muse-Glimmer text binder through the public loader
+/// and opaque session on a pure two-rank tensor-parallel topology.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_muse_glimmer_tensor_parallel_opaque_session() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_muse_glimmer_tensor_parallel_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::MuseGlimmer,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Exercises Muse-Glimmer's neutral vision tower and media assembly through
+/// the public loader on a pure two-rank tensor-parallel topology, including a
+/// paged prompt-cache save/open/continue round trip.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_muse_glimmer_image_tensor_parallel_opaque_session() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_muse_glimmer_tensor_parallel_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::MuseGlimmer,
+        WorkerMode::OpaqueMuseImage,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
 /// Verifies Inkling's uneven 2+1 stage placement and combined KV/convolution
 /// state against the resident text decoder.
 #[test]
@@ -4819,6 +5678,9 @@ fn run_ring_cartesian_pipeline_mode(
             {
                 write_inkling_quantizable_fixture(checkpoint.path())
             }
+            FixtureFamily::Inkling if mode == WorkerMode::OpaqueInklingMtp => {
+                write_inkling_mtp_fixture(checkpoint.path())
+            }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
             FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
             FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
@@ -4899,6 +5761,10 @@ enum WorkerMode {
     ExpertCacheRequantize,
     Requantize,
     OpaqueSession,
+    OpaqueMuseImage,
+    OpaqueInklingMedia,
+    OpaqueInklingMtp,
+    OpaqueGemma4Media,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -4983,6 +5849,7 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
             FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
             FixtureFamily::DeepSeekGguf
+            | FixtureFamily::MuseGlimmer
             | FixtureFamily::Qwen3MoeGguf
             | FixtureFamily::GptOssGguf
             | FixtureFamily::Lfm2MoeGguf
@@ -5013,6 +5880,7 @@ fn run_ring_pipeline_processes(
     let prompt_cache = tempfile::tempdir().unwrap();
     let world_size = match cartesian_axes {
         Some("tp-pp-ep") => 8,
+        Some("tp" | "ep") => 2,
         Some(_) => 4,
         None => 2,
     };
@@ -5074,6 +5942,22 @@ fn run_ring_pipeline_processes(
             }
             WorkerMode::OpaqueSession => {
                 command.env(OPAQUE_SESSION, "1");
+            }
+            WorkerMode::OpaqueMuseImage => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(OPAQUE_MUSE_IMAGE, "1");
+            }
+            WorkerMode::OpaqueInklingMedia => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(OPAQUE_INKLING_MEDIA, "1");
+            }
+            WorkerMode::OpaqueInklingMtp => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(OPAQUE_INKLING_MTP, "1");
+            }
+            WorkerMode::OpaqueGemma4Media => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(OPAQUE_GEMMA4_MEDIA, "1");
             }
         }
         children.children.push(command.spawn().unwrap());

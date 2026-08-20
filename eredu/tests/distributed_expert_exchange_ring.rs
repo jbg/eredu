@@ -155,6 +155,7 @@ fn execute_cached_qwen_routes(
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
             let mut bank = PackedSwiGluExperts {
+                activation: eredu_nn::GatedExpertActivation::Silu,
                 num_experts: acquired.identities().len() as i32,
                 hidden_dim: 1,
                 intermediate_dim: 1,
@@ -323,6 +324,7 @@ fn expert_exchange_ring_worker() {
     let qwen_ids = i32_array(&[0, 1, 2, 3], &[2, 2], &stream);
     let qwen_weights = f32_array(&[0.25, 0.75, 0.4, 0.6], &[2, 2], &stream);
     let mut full_qwen = PackedSwiGluExperts {
+        activation: eredu_nn::GatedExpertActivation::Silu,
         num_experts: 4,
         hidden_dim: 1,
         intermediate_dim: 1,

@@ -108,14 +108,17 @@ pub enum InputPayload<'a> {
 /// Optional metadata carried by an input part.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InputMetadata<'a> {
-    /// Qwen image/video grid metadata shaped as expected by the checkpoint.
-    pub qwen_grid_thw: Option<&'a Array>,
     /// Architecture-neutral `(time, height, width)` vision grids shaped `[items, 3]`.
-    pub vision_grid_thw: Option<&'a Array>,
+    pub patch_grid: Option<&'a Array>,
     /// Image or video-frame patch positions shaped `[batch, patches, 2]`, with negative coordinates for padding.
-    pub patch_position_ids: Option<&'a Array>,
+    pub patch_positions: Option<&'a Array>,
     /// Valid-frame mask for model-native audio features.
     pub audio_mask: Option<&'a Array>,
+    /// Host-known `(time, height, width)` patch extent. This avoids a device
+    /// synchronization when planning pooling and placeholder counts.
+    pub patch_extent: Option<[i32; 3]>,
+    /// Host-known number of valid, unpadded audio frames.
+    pub audio_valid_frames: Option<i32>,
 }
 
 impl<'a> InputMetadata<'a> {
@@ -124,41 +127,55 @@ impl<'a> InputMetadata<'a> {
         Self::default()
     }
 
-    /// Creates metadata carrying Qwen `grid_thw`.
-    pub fn qwen_grid_thw(grid_thw: &'a Array) -> Self {
-        Self {
-            qwen_grid_thw: Some(grid_thw),
-            vision_grid_thw: None,
-            patch_position_ids: None,
-            audio_mask: None,
-        }
-    }
-
     /// Creates metadata carrying architecture-neutral vision `(t, h, w)` grids.
-    pub fn vision_grid_thw(grid_thw: &'a Array) -> Self {
+    pub fn patch_grid(grid_thw: &'a Array) -> Self {
         Self {
-            vision_grid_thw: Some(grid_thw),
+            patch_grid: Some(grid_thw),
             ..Self::default()
         }
     }
 
     /// Creates metadata carrying generic 2-D patch positions.
-    pub fn patch_position_ids(position_ids: &'a Array) -> Self {
+    pub fn patch_positions(position_ids: &'a Array) -> Self {
         Self {
-            qwen_grid_thw: None,
-            vision_grid_thw: None,
-            patch_position_ids: Some(position_ids),
+            patch_grid: None,
+            patch_positions: Some(position_ids),
             audio_mask: None,
+            patch_extent: None,
+            audio_valid_frames: None,
         }
     }
 
     /// Creates metadata carrying a valid-frame mask for audio features.
     pub fn audio_mask(mask: &'a Array) -> Self {
         Self {
-            qwen_grid_thw: None,
-            vision_grid_thw: None,
-            patch_position_ids: None,
+            patch_grid: None,
+            patch_positions: None,
             audio_mask: Some(mask),
+            patch_extent: None,
+            audio_valid_frames: None,
+        }
+    }
+
+    /// Creates complete vision layout metadata with a host-known grid extent.
+    pub fn patch_layout(grid_thw: &'a Array, position_ids: &'a Array, extent: [i32; 3]) -> Self {
+        Self {
+            patch_grid: Some(grid_thw),
+            patch_positions: Some(position_ids),
+            audio_mask: None,
+            patch_extent: Some(extent),
+            audio_valid_frames: None,
+        }
+    }
+
+    /// Creates complete audio metadata with a host-known valid-frame count.
+    pub fn audio_layout(mask: &'a Array, valid_frames: i32) -> Self {
+        Self {
+            patch_grid: None,
+            patch_positions: None,
+            audio_mask: Some(mask),
+            patch_extent: None,
+            audio_valid_frames: Some(valid_frames),
         }
     }
 }
@@ -415,6 +432,34 @@ pub fn text_token_ids(input: ModelInput<'_>, stream: &Stream) -> Result<Array, E
 /// Converts a slice of token IDs to a batch-1 text input array.
 pub fn token_ids_array(token_ids: &[u32], stream: &Stream) -> Result<Array, Exception> {
     Array::from(token_ids).try_index_device(NewAxis, stream)
+}
+
+/// Reads validated `(time, height, width)` patch-grid rows from a small metadata tensor.
+pub fn patch_grid_from_array(
+    patch_grid: &Array,
+    stream: &Stream,
+) -> Result<Vec<(i32, i32, i32)>, Exception> {
+    let shape = patch_grid.shape();
+    if shape.len() != 2 || shape[1] != 3 || shape[0] <= 0 {
+        return Err(Exception::custom(format!(
+            "patch grid must be shaped [items, 3], got {shape:?}"
+        )));
+    }
+    let mut grid = Vec::with_capacity(shape[0] as usize);
+    for index in 0..shape[0] {
+        grid.push((
+            patch_grid
+                .try_index_device((index, 0), stream)?
+                .item::<i32>(stream),
+            patch_grid
+                .try_index_device((index, 1), stream)?
+                .item::<i32>(stream),
+            patch_grid
+                .try_index_device((index, 2), stream)?
+                .item::<i32>(stream),
+        ));
+    }
+    Ok(grid)
 }
 
 fn concatenate_token_parts(parts: &[Array], stream: &Stream) -> Result<Array, Exception> {

@@ -17,6 +17,10 @@ pub use eredu_nn_macros::Parameterized;
 
 #[cfg(feature = "mlx")]
 mod mlx;
+/// Reusable patch projection and multi-axis position operations.
+pub mod multimodal;
+/// Pure sequence layouts shared by patch-based encoders.
+pub mod sequence_layout;
 
 /// Backend operation failure.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -64,6 +68,75 @@ pub enum AttentionMask<'a, T> {
     Causal,
     /// Backend tensor added to attention logits.
     Tensor(&'a T),
+}
+
+/// Value source for an attention unit that owns key/value state.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum AttentionValueSource {
+    /// Values are produced by an independent projection.
+    Projected,
+    /// Projected keys are reused as values.
+    ReuseKey,
+}
+
+/// Typed source and publication policy for attention key/value state.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum AttentionStateSource {
+    /// Own projections and retain state only for this attention unit.
+    Local {
+        /// Value projection topology.
+        value: AttentionValueSource,
+    },
+    /// Own projections and publish state for later consumers.
+    Publish {
+        /// Value projection topology.
+        value: AttentionValueSource,
+    },
+    /// Consume state published by another unit or supplied externally.
+    Shared,
+}
+
+impl AttentionStateSource {
+    /// Returns whether the attention unit owns projections and mutable state.
+    pub const fn owns_state(self) -> bool {
+        !matches!(self, Self::Shared)
+    }
+
+    /// Returns whether the resulting state must be published.
+    pub const fn publishes_state(self) -> bool {
+        matches!(self, Self::Publish { .. })
+    }
+
+    /// Returns the value source for a state-owning unit.
+    pub const fn value(self) -> Option<AttentionValueSource> {
+        match self {
+            Self::Local { value } | Self::Publish { value } => Some(value),
+            Self::Shared => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod attention_state_source_tests {
+    use super::{AttentionStateSource, AttentionValueSource};
+
+    #[test]
+    fn ownership_publication_and_key_as_value_are_independent() {
+        let local = AttentionStateSource::Local {
+            value: AttentionValueSource::Projected,
+        };
+        let publisher = AttentionStateSource::Publish {
+            value: AttentionValueSource::ReuseKey,
+        };
+        assert!(local.owns_state());
+        assert!(!local.publishes_state());
+        assert_eq!(local.value(), Some(AttentionValueSource::Projected));
+        assert!(publisher.owns_state());
+        assert!(publisher.publishes_state());
+        assert_eq!(publisher.value(), Some(AttentionValueSource::ReuseKey));
+        assert!(!AttentionStateSource::Shared.owns_state());
+        assert_eq!(AttentionStateSource::Shared.value(), None);
+    }
 }
 
 /// Typed sparse/indexed attention request.
@@ -136,6 +209,65 @@ pub struct PooledPositionInput<'a, T> {
     pub scale: f32,
     /// Head-weight multiplier applied before reducing the head axis.
     pub head_scale: f32,
+}
+
+/// Causal attention with a learned relative-position profile.
+///
+/// Architecture code projects per-token relative features into `profiles`;
+/// the backend owns position-index gathering and score materialization so no
+/// device values cross the host boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct RelativeAttentionInput<'a, T> {
+    /// Normalized queries shaped `[batch, heads, query_tokens, dimensions]`.
+    pub queries: &'a T,
+    /// Normalized keys shaped `[batch, kv_heads, key_tokens, dimensions]`.
+    pub keys: &'a T,
+    /// Values shaped `[batch, kv_heads, key_tokens, dimensions]`.
+    pub values: &'a T,
+    /// Learned profiles shaped `[batch, heads, query_tokens, relative_extent]`.
+    pub profiles: &'a T,
+    /// Absolute position of the first query token.
+    pub query_offset: i32,
+    /// Absolute position of the first retained key token.
+    pub key_offset: i32,
+    /// Optional causal sliding-window width.
+    pub window: Option<i32>,
+    /// Optional position floor for logarithmic global-attention scaling.
+    pub log_scaling_floor: Option<i32>,
+    /// Multiplier applied to the logarithmic scale above the floor.
+    pub log_scaling_alpha: f32,
+}
+
+impl<T: Tensor> RelativeAttentionInput<'_, T> {
+    /// Validates exact head, sequence, and relative-profile geometry.
+    pub fn validate(&self) -> Result<(), Error> {
+        let query = self.queries.shape();
+        let key = self.keys.shape();
+        let value = self.values.shape();
+        let profiles = self.profiles.shape();
+        if query.len() != 4
+            || key.len() != 4
+            || value.len() != 4
+            || profiles.len() != 4
+            || query[0] != key[0]
+            || key != value
+            || query[2] != profiles[2]
+            || query[0] != profiles[0]
+            || query[1] != profiles[1]
+            || query[3] != key[3]
+            || query[1] % key[1] != 0
+            || profiles[3] <= 0
+            || self.window.is_some_and(|window| window <= 0)
+            || self.log_scaling_floor.is_some_and(|floor| floor <= 0)
+            || !self.log_scaling_alpha.is_finite()
+        {
+            return Err(Error::backend(format!(
+                "invalid relative attention geometry q={query:?} k={key:?} v={value:?} profiles={profiles:?} window={:?} floor={:?} alpha={}",
+                self.window, self.log_scaling_floor, self.log_scaling_alpha
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl<T: Tensor> IndexedAttentionInput<'_, T> {
@@ -646,6 +778,8 @@ impl<T> Clone for RotaryPosition<'_, T> {
 pub enum RoutingScoring {
     /// Apply softmax across all expert logits before selecting routes.
     Softmax,
+    /// Select the largest raw logits, then softmax only the selected routes.
+    SelectedSoftmax,
     /// Apply elementwise sigmoid scores before grouped selection.
     Sigmoid,
     /// Apply the square root of softplus before selection.
@@ -675,10 +809,26 @@ pub struct TopKRouterSpec {
     /// Optional correction bias used only to choose expert IDs. Gathered
     /// route scores remain unbiased.
     pub correction_bias: Option<ParameterSpec>,
+    /// Optional learned scaling applied after weightless RMS normalization of
+    /// the router input.
+    pub input_transform: Option<RouterInputTransformSpec>,
+    /// Optional learned per-expert multiplier gathered after route selection.
+    pub route_scale: Option<ParameterSpec>,
     /// Optional physical encoding of the router projection.
     pub quantization: Option<WeightQuantization>,
     /// Architecture-selected scoring and selection semantics.
     pub routing: TopKRoutingSpec,
+}
+
+/// Learned normalization and scale applied before a router projection.
+#[derive(Debug, Clone)]
+pub struct RouterInputTransformSpec {
+    /// Weightless RMS-normalization epsilon.
+    pub epsilon: f32,
+    /// Learned feature-wise multiplier.
+    pub scale: ParameterSpec,
+    /// Whether to additionally multiply by `1 / sqrt(input_dimensions)`.
+    pub inverse_sqrt_dimensions: bool,
 }
 
 impl TopKRouterSpec {
@@ -689,6 +839,15 @@ impl TopKRouterSpec {
                 "router input dimensions must be positive, got {}",
                 self.input_dimensions
             )));
+        }
+        if self
+            .input_transform
+            .as_ref()
+            .is_some_and(|transform| !transform.epsilon.is_finite() || transform.epsilon < 0.0)
+        {
+            return Err(Error::backend(
+                "router input RMS epsilon must be finite and nonnegative",
+            ));
         }
         Ok(())
     }
@@ -814,6 +973,71 @@ pub struct RoutingResult<T> {
     pub route_weights: T,
 }
 
+/// Joint sigmoid routing request with selected routed experts and always-on
+/// shared experts normalized in one probability distribution.
+#[derive(Debug, Clone, Copy)]
+pub struct JointExpertRoutingInput<'a, T> {
+    /// Hidden states shaped `[..., hidden]`.
+    pub hidden: &'a T,
+    /// Projection shaped `[routed_experts + shared_experts, hidden]`.
+    pub weight: &'a T,
+    /// Correction bias used only for routed top-k selection.
+    pub correction_bias: &'a T,
+    /// Learned scalar multiplier applied to all final route weights.
+    pub global_scale: &'a T,
+    /// Number of selectable routed experts.
+    pub routed_experts: i32,
+    /// Number of always-on shared experts.
+    pub shared_experts: i32,
+    /// Number of routed experts selected per token.
+    pub top_k: i32,
+    /// Fixed multiplier applied before the learned global scale.
+    pub route_scale: f32,
+}
+
+impl<T: Tensor> JointExpertRoutingInput<'_, T> {
+    /// Validates exact projection, bias, and scalar geometry.
+    pub fn validate(&self) -> Result<(), Error> {
+        let hidden = self.hidden.shape();
+        let weight = self.weight.shape();
+        let bias = self.correction_bias.shape();
+        let scale = self.global_scale.shape();
+        let hidden_width = hidden.last().copied().unwrap_or(0);
+        if hidden.len() < 2
+            || weight != [self.routed_experts + self.shared_experts, hidden_width]
+            || bias != [self.routed_experts]
+            || scale != [1]
+            || self.routed_experts <= 0
+            || self.shared_experts <= 0
+            || self.top_k <= 0
+            || self.top_k > self.routed_experts
+            || !self.route_scale.is_finite()
+            || self.route_scale <= 0.0
+        {
+            return Err(Error::backend(format!(
+                "invalid joint expert routing geometry hidden={hidden:?} weight={weight:?} bias={bias:?} scale={scale:?} routed={} shared={} top_k={} route_scale={}",
+                self.routed_experts,
+                self.shared_experts,
+                self.top_k,
+                self.route_scale
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Backend-native result of joint routed and shared expert weighting.
+#[derive(Debug, Clone)]
+pub struct JointExpertRoutingResult<T> {
+    /// Selected routed expert IDs shaped `[tokens, top_k]`; integer dtype is
+    /// backend-defined and accepted by the corresponding expert operator.
+    pub routed_ids: T,
+    /// Routed expert weights shaped `[tokens, top_k]`.
+    pub routed_weights: T,
+    /// Always-on shared expert weights shaped `[tokens, shared_experts]`.
+    pub shared_weights: T,
+}
+
 /// Optional bound applied to the inputs of a SwiGLU product.
 ///
 /// The gate branch is capped above before SiLU and the up branch is clamped
@@ -897,10 +1121,21 @@ pub struct SwiGluExpertBankSpec {
     pub intermediate_dimensions: i32,
     /// Output hidden width.
     pub output_dimensions: i32,
+    /// Gate activation applied before multiplying by the up projection.
+    pub activation: GatedExpertActivation,
     /// Optional pre-activation bound shared by every expert.
     pub limit: Option<SwiGluLimit>,
     /// Stable logical parameter identities and storage organization.
     pub layout: SwiGluExpertLayout,
+}
+
+/// Activation used by a gated routed-expert bank.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GatedExpertActivation {
+    /// Sigmoid linear unit.
+    Silu,
+    /// Approximate Gaussian error linear unit.
+    GeluApproximate,
 }
 
 impl SwiGluExpertBankSpec {
@@ -1244,6 +1479,15 @@ pub trait AttentionCache<T: Tensor> {
         mask: Option<&T>,
         context: &T::Context,
     ) -> Result<T, Error>;
+}
+
+/// Attention cache with a fixed set of bounded causal-convolution histories.
+///
+/// Slot identity is architecture policy; storage, persistence, and device
+/// realization remain runtime/backend concerns.
+pub trait AuxiliaryConvolutionState<T: Tensor>: AttentionCache<T> {
+    /// Borrows one bounded convolution-history slot.
+    fn convolution_state(&mut self, slot: u32) -> Result<&mut Option<T>, Error>;
 }
 
 /// Semantic latent and rotary components retained by compressed attention.
@@ -1657,6 +1901,27 @@ pub trait NeuralBackend: Sized + 'static {
             ));
         }
         Self::attention(queries, keys, values, scale, mask, context)
+    }
+    /// Runs causal attention with caller-projected learned relative profiles.
+    fn relative_attention(
+        input: RelativeAttentionInput<'_, Self::Tensor>,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        let _ = (input, context);
+        Err(Error::backend(
+            "relative-profile attention is not implemented by this backend",
+        ))
+    }
+    /// Selects routed experts and jointly normalizes them with always-on shared
+    /// experts without materializing indices or logits on the host.
+    fn joint_expert_routing(
+        input: JointExpertRoutingInput<'_, Self::Tensor>,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<JointExpertRoutingResult<Self::Tensor>, Error> {
+        let _ = (input, context);
+        Err(Error::backend(
+            "joint routed/shared expert weighting is not implemented by this backend",
+        ))
     }
     /// Applies RMS normalization without a learned scale.
     fn rms_norm_without_weight(
@@ -2105,6 +2370,17 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         shape: &[i32],
         context: &Self::Context,
     ) -> Result<Self, Error>;
+    /// Creates a signed 32-bit integer tensor from host initialization data.
+    fn from_i32_slice(
+        values: &[i32],
+        shape: &[i32],
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let _ = (values, shape, context);
+        Err(Error::backend(
+            "I32 tensor construction is not implemented by this backend",
+        ))
+    }
     /// Creates a floating-point tensor filled with one scalar.
     fn full_f32(value: f32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         let _ = (value, shape, context);
@@ -2131,8 +2407,22 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     fn divide(&self, rhs: &Self, context: &Self::Context) -> Result<Self, Error>;
     /// Elementwise square.
     fn square(&self, context: &Self::Context) -> Result<Self, Error>;
+    /// Elementwise hyperbolic tangent.
+    fn tanh(&self, context: &Self::Context) -> Result<Self, Error> {
+        let _ = context;
+        Err(Error::backend(
+            "tanh is not implemented by this tensor backend",
+        ))
+    }
     /// Elementwise maximum with a scalar.
     fn maximum_scalar(&self, rhs: f32, context: &Self::Context) -> Result<Self, Error>;
+    /// Elementwise clamp using backend tensor bounds that may be scalar or broadcastable.
+    fn clip(&self, minimum: &Self, maximum: &Self, context: &Self::Context) -> Result<Self, Error> {
+        let _ = (minimum, maximum, context);
+        Err(Error::backend(
+            "clip is not implemented by this tensor backend",
+        ))
+    }
 
     /// Softmax over one axis.
     fn softmax_axis(
@@ -2244,6 +2534,22 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         groups: i32,
         context: &Self::Context,
     ) -> Result<Self, Error>;
+    /// Two-dimensional convolution over canonical NHWC inputs and OHWI weights.
+    #[allow(clippy::too_many_arguments)]
+    fn conv2d(
+        input: &Self,
+        weight: &Self,
+        stride: (i32, i32),
+        padding: (i32, i32),
+        dilation: (i32, i32),
+        groups: i32,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let _ = (input, weight, stride, padding, dilation, groups, context);
+        Err(Error::backend(
+            "two-dimensional convolution is not implemented by this backend",
+        ))
+    }
     /// One-dimensional transposed convolution.
     #[allow(clippy::too_many_arguments)]
     fn conv_transpose1d(
@@ -2286,6 +2592,27 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         offset: i32,
         context: &Self::Context,
     ) -> Result<Self, Error>;
+    /// Builds cosine and sine tensors for explicit multi-axis positions.
+    fn multi_axis_rotary_embeddings(
+        position_ids: &Self,
+        spec: &multimodal::MultiAxisRotarySpec,
+        context: &Self::Context,
+    ) -> Result<(Self, Self), Error> {
+        let _ = (position_ids, spec, context);
+        Err(Error::backend(
+            "multi-axis rotary embeddings are not implemented by this backend",
+        ))
+    }
+    /// Projects selected output rows and scatters them into vocabulary order.
+    fn masked_output_projection(
+        input: multimodal::MaskedOutputProjectionInput<'_, Self>,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let _ = (input, context);
+        Err(Error::backend(
+            "masked output projection is not implemented by this backend",
+        ))
+    }
     /// Scaled dot-product attention. Backends retain control over fusion.
     fn scaled_dot_product_attention(
         queries: &Self,
@@ -2785,6 +3112,7 @@ mod routed_contract_tests {
             input_dimensions: 16,
             intermediate_dimensions: 8,
             output_dimensions: 16,
+            activation: GatedExpertActivation::Silu,
             limit: None,
             layout: SwiGluExpertLayout::Independent(vec![parameters("e0"), parameters("e1")]),
         };

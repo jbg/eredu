@@ -9,10 +9,7 @@ use safemlx::{
     module::{Module, Param},
     native_quantization::NativeQuantizedTensor,
     nn,
-    ops::{
-        dequantize_with_mode, matmul, quantized_matmul_with_mode, quantized_packed_dimension,
-        QuantizationMode,
-    },
+    ops::{matmul, quantized_matmul_with_mode, quantized_packed_dimension, QuantizationMode},
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
@@ -210,35 +207,6 @@ impl PhysicalLinear {
             output = output.add(bias, stream)?;
         }
         Ok(output)
-    }
-
-    /// Materializes the logical floating-point matrix for algorithms that
-    /// absorb a projection into another contraction during decode.
-    pub(crate) fn dequantized_weight(&self, stream: &Stream) -> Result<Array, Exception> {
-        if let Some(quantization) = self.gguf {
-            let (ggml_type, endian) = quantization.gguf_iquant().expect("GGUF format");
-            NativeQuantizedTensor::from_iq_array(
-                self.weight.value.clone(),
-                &[self.output_dimensions, self.input_dimensions],
-                ggml_type,
-                endian,
-            )?
-            .dequantize(stream)
-        } else if let Some(scales) = self.scales.as_ref() {
-            dequantize_with_mode(
-                self.weight.as_ref(),
-                scales,
-                self.biases.as_ref().as_ref(),
-                self.group_size,
-                self.bits,
-                self.mode,
-                stream,
-            )
-        } else if let Some(scale) = self.weight_scale_inv.as_ref() {
-            super::fp8::dequantize(self.weight.as_ref(), scale, stream)
-        } else {
-            Ok(self.weight.as_ref().clone())
-        }
     }
 
     /// Applies a row-sharded projection, reducing partials before adding its

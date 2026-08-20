@@ -4,11 +4,7 @@ use eredu_checkpoint::WeightQuantization;
 
 use std::path::Path;
 
-use crate::composition::mlx_architectures::{
-    gemma4::model as gemma4,
-    inkling::model as inkling,
-    qwen::{hybrid::qwen3_5, vl::model as qwen3_vl},
-};
+use crate::composition::mlx_architectures::qwen::{hybrid::qwen3_5, vl::model as qwen3_vl};
 use eredu_core::{GgufArchitecture, ModelArtifact, ModelKind, ModelPreparationPlan};
 use safemlx::{
     ops::{GgufCheckpoint, GgufMetadataValue},
@@ -16,7 +12,7 @@ use safemlx::{
 };
 
 #[cfg(feature = "mlx-media")]
-use crate::backend::mlx::runtime::media::{load_processor, ModelProcessor};
+use crate::composition::mlx::{load_processor, ModelProcessor};
 
 pub(crate) fn gguf_eos_token_ids(
     metadata: &std::collections::HashMap<String, eredu_gguf::MetadataValue>,
@@ -37,7 +33,7 @@ use crate::{
 struct MaterializedGgufModel {
     model: Model,
     #[cfg(feature = "mlx-media")]
-    processor: Option<crate::backend::mlx::runtime::media::ModelProcessor>,
+    processor: Option<ModelProcessor>,
 }
 
 fn materialize_gguf_model(
@@ -110,43 +106,53 @@ fn materialize_gguf_model(
             (Model::GptOss(loaded), eos_token_ids)
         }
         GgufArchitecture::Inkling => {
-            let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
             #[cfg(feature = "mlx-media")]
-            if mmproj.is_some() {
+            if crate::composition::mlx::artifact::find_sibling_mmproj(gguf_file, "inkling")?
+                .is_some()
+            {
                 processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
             }
-            let (loaded, eos_token_ids) =
-                    crate::composition::mlx_architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
-                        checkpoint,
-                        metadata,
-                        mmproj.as_ref(),
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
+            if options.quantization.is_some() {
+                return Err(Error::UnsupportedArchitecture(
+                    "load-time Inkling quantization is not bound on the neutral loader".into(),
+                ));
+            }
+            let loaded = crate::composition::inkling::load_gguf(
+                gguf_file,
+                checkpoint,
+                metadata,
+                options.weight_residency,
+                stream,
+                weights_stream,
+            )?;
+            let eos_token_ids = gguf_eos_token_ids(metadata)?;
             (Model::Inkling(loaded), eos_token_ids)
         }
         GgufArchitecture::Gemma4 => {
-            let mmproj = gemma4::open_sibling_mmproj(gguf_file)?;
             #[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
-            if let Some(mmproj) = &mmproj {
+            if let Some(mmproj_path) =
+                crate::composition::mlx::artifact::find_sibling_mmproj(gguf_file, "gemma4")?
+            {
+                let mmproj = GgufCheckpoint::open(mmproj_path)?;
                 processor = Some(ModelProcessor::load_gemma4_gguf(
                     metadata,
-                    &mmproj.metadata,
+                    &crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&mmproj),
                 )?);
             }
-            let (loaded, eos_token_ids) =
-                    crate::composition::mlx_architectures::gemma4::layerwise::load_gemma4_gguf_layerwise_model(
-                        checkpoint,
-                        metadata,
-                        mmproj.as_ref(),
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-            (Model::Gemma4(Box::new(loaded)), eos_token_ids)
+            if options.quantization.is_some() {
+                return Err(Error::UnsupportedArchitecture(
+                    "load-time Gemma 4 quantization is not bound on the neutral loader".into(),
+                ));
+            }
+            let loaded = crate::composition::gemma4::load_gguf(
+                gguf_file,
+                checkpoint,
+                metadata,
+                options.weight_residency,
+                stream,
+                weights_stream,
+            )?;
+            (Model::Gemma4(loaded), gguf_eos_token_ids(metadata)?)
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
             let (loaded, eos_token_ids) = crate::composition::llama::load_llama_gguf_model(
@@ -162,20 +168,27 @@ fn materialize_gguf_model(
         GgufArchitecture::MuseGlimmer => {
             #[cfg(feature = "mlx-image")]
             if let Some(mmproj) =
-                crate::composition::mlx_architectures::muse_glimmer::open_sibling_mmproj(gguf_file)?
+                crate::composition::mlx::artifact::find_sibling_mmproj(gguf_file, "muse-glimmer")?
             {
-                processor = Some(ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata)?);
+                let checkpoint = GgufCheckpoint::open(mmproj)?;
+                processor = Some(ModelProcessor::load_muse_glimmer_gguf(
+                    &crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint),
+                )?);
             }
-            let (loaded, eos_token_ids) =
-                crate::composition::mlx_architectures::muse_glimmer::layerwise::load_gguf_checkpoint(
-                    checkpoint,
-                    metadata,
-                    gguf_architecture.metadata_name(),
-                    options.weight_residency,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
+            if options.quantization.is_some() {
+                return Err(Error::UnsupportedArchitecture(
+                    "load-time Muse-Glimmer quantization is not bound on the neutral loader".into(),
+                ));
+            }
+            let loaded = crate::composition::muse_glimmer::load_gguf(
+                gguf_file,
+                checkpoint,
+                metadata,
+                options.weight_residency,
+                stream,
+                weights_stream,
+            )?;
+            let eos_token_ids = gguf_eos_token_ids(metadata)?;
             (Model::MuseGlimmer(loaded), eos_token_ids)
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
@@ -287,7 +300,17 @@ pub(crate) fn materialize_model_plan(
         let path = match &artifact {
             ModelArtifact::Gguf { path, .. } | ModelArtifact::SafeTensors { path, .. } => path,
         };
-        if topology.pipeline_parallel_size > 1 {
+        let kind = match &artifact {
+            ModelArtifact::Gguf { configuration, .. }
+            | ModelArtifact::SafeTensors { configuration, .. } => configuration.kind,
+        };
+        if topology.pipeline_parallel_size > 1
+            || (topology.expert_parallel_size > 1
+                && matches!(
+                    kind,
+                    ModelKind::Gemma4 | ModelKind::MuseGlimmer | ModelKind::Inkling
+                ))
+        {
             let model =
                 crate::composition::mlx_architectures::distributed::pipeline::load_pipeline_model_with_options(
                     path,
@@ -415,15 +438,15 @@ fn materialize_tensor_parallel(
                 weights_stream,
             )?,
         ))),
-        ModelKind::Gemma4 => Ok(Model::Gemma4(Box::new(
-            crate::composition::mlx_architectures::gemma4::layerwise::load_gemma4_tensor_parallel_layerwise_model(
+        ModelKind::Gemma4 => Ok(Model::Gemma4(
+            crate::composition::gemma4::load_safetensors_tensor_parallel(
                 path,
                 execution,
                 build,
                 stream,
                 weights_stream,
             )?,
-        ))),
+        )),
         ModelKind::GptOss => Ok(Model::GptOss(
             crate::composition::mlx_architectures::gpt_oss::layerwise::load_gpt_oss_tensor_parallel_model(
                 path,
@@ -434,7 +457,7 @@ fn materialize_tensor_parallel(
             )?,
         )),
         ModelKind::Inkling => Ok(Model::Inkling(
-            crate::composition::mlx_architectures::inkling::layerwise::load_inkling_tensor_parallel_layerwise_model(
+            crate::composition::inkling::load_safetensors_tensor_parallel(
                 path,
                 execution,
                 build,
@@ -461,7 +484,7 @@ fn materialize_tensor_parallel(
             )?,
         )),
         ModelKind::MuseGlimmer => Ok(Model::MuseGlimmer(
-            crate::composition::mlx_architectures::muse_glimmer::layerwise::load_tensor_parallel_model(
+            crate::composition::muse_glimmer::load_safetensors_tensor_parallel(
                 path,
                 execution,
                 build,
@@ -587,19 +610,41 @@ fn materialize_gguf_artifact(
         )?;
         #[cfg(feature = "mlx-media")]
         let processor = match architecture {
-            GgufArchitecture::Inkling if inkling::open_sibling_mmproj(&path)?.is_some() => {
+            GgufArchitecture::Inkling
+                if crate::composition::mlx::artifact::find_sibling_mmproj(&path, "inkling")?
+                    .is_some() =>
+            {
                 Some(ModelProcessor::load_inkling_gguf(&metadata)?)
             }
             #[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
-            GgufArchitecture::Gemma4 => gemma4::open_sibling_mmproj(&path)?
-                .as_ref()
-                .map(|mmproj| ModelProcessor::load_gemma4_gguf(&metadata, &mmproj.metadata))
-                .transpose()?,
+            GgufArchitecture::Gemma4 => {
+                crate::composition::mlx::artifact::find_sibling_mmproj(&path, "gemma4")?
+                    .map(GgufCheckpoint::open)
+                    .transpose()?
+                    .as_ref()
+                    .map(|checkpoint| {
+                        ModelProcessor::load_gemma4_gguf(
+                            &metadata,
+                            &crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
+                                checkpoint,
+                            ),
+                        )
+                    })
+                    .transpose()?
+            }
             #[cfg(feature = "mlx-image")]
             GgufArchitecture::MuseGlimmer => {
-                crate::composition::mlx_architectures::muse_glimmer::open_sibling_mmproj(&path)?
+                crate::composition::mlx::artifact::find_sibling_mmproj(&path, "muse-glimmer")?
+                    .map(GgufCheckpoint::open)
+                    .transpose()?
                     .as_ref()
-                    .map(|mmproj| ModelProcessor::load_muse_glimmer_gguf(&mmproj.metadata))
+                    .map(|checkpoint| {
+                        ModelProcessor::load_muse_glimmer_gguf(
+                            &crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
+                                checkpoint,
+                            ),
+                        )
+                    })
                     .transpose()?
             }
             #[cfg(feature = "mlx-image")]
@@ -687,32 +732,28 @@ fn materialize_gguf_tensor_parallel(
             Ok((Model::GptOss(model), eos))
         }
         GgufArchitecture::Inkling => {
-            let mmproj = inkling::open_sibling_mmproj(gguf_path)?;
-            let (model, eos) =
-                crate::composition::mlx_architectures::inkling::layerwise::load_inkling_gguf_tensor_parallel_model(
-                    checkpoint,
-                    metadata,
-                    mmproj.as_ref(),
-                    residency,
-                    build,
-                    stream,
-                    weights_stream,
-                )?;
+            let (model, eos) = crate::composition::inkling::load_gguf_tensor_parallel(
+                gguf_path,
+                checkpoint,
+                metadata,
+                residency,
+                build,
+                stream,
+                weights_stream,
+            )?;
             Ok((Model::Inkling(model), eos))
         }
         GgufArchitecture::Gemma4 => {
-            let mmproj = gemma4::open_sibling_mmproj(gguf_path)?;
-            let (model, eos) =
-                crate::composition::mlx_architectures::gemma4::layerwise::load_gemma4_gguf_tensor_parallel_model(
-                    checkpoint,
-                    metadata,
-                    mmproj.as_ref(),
-                    residency,
-                    build,
-                    stream,
-                    weights_stream,
-                )?;
-            Ok((Model::Gemma4(Box::new(model)), eos))
+            let (model, eos) = crate::composition::gemma4::load_gguf_tensor_parallel(
+                gguf_path,
+                checkpoint,
+                metadata,
+                residency,
+                build,
+                stream,
+                weights_stream,
+            )?;
+            Ok((Model::Gemma4(model), eos))
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
             let (model, eos) = crate::composition::llama::load_llama_gguf_tensor_parallel_model(
@@ -726,16 +767,15 @@ fn materialize_gguf_tensor_parallel(
             Ok((Model::Llama(model), eos))
         }
         GgufArchitecture::MuseGlimmer => {
-            let (model, eos) =
-                crate::composition::mlx_architectures::muse_glimmer::layerwise::load_gguf_tensor_parallel_model(
-                    checkpoint,
-                    metadata,
-                    architecture.metadata_name(),
-                    residency,
-                    build,
-                    stream,
-                    weights_stream,
-                )?;
+            let (model, eos) = crate::composition::muse_glimmer::load_gguf_tensor_parallel(
+                gguf_path,
+                checkpoint,
+                metadata,
+                residency,
+                build,
+                stream,
+                weights_stream,
+            )?;
             Ok((Model::MuseGlimmer(model), eos))
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
@@ -887,15 +927,46 @@ pub(super) fn materialize_safetensors(
                     model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
+            ModelKind::Gemma4 => Ok(Model::Gemma4(
+                crate::composition::gemma4::load_safetensors(
+                    model_dir,
+                    eredu_runtime::WeightResidency::with_expert_cache(
+                        non_expert,
+                        expert_cache,
+                    ),
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
             ModelKind::Inkling => Ok(Model::Inkling(
-                crate::composition::mlx_architectures::inkling::layerwise::load_inkling_expert_cache_model(
-                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
+                crate::composition::inkling::load_safetensors(
+                    model_dir,
+                    eredu_runtime::WeightResidency::with_expert_cache(
+                        non_expert,
+                        expert_cache,
+                    ),
+                    options.quantization,
+                    stream,
+                    weights_stream,
                 )?,
             )),
             ModelKind::Lfm2 => Ok(Model::Lfm2(
                 crate::composition::lfm2::load_lfm2_model(
                     model_dir,
                     eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::MuseGlimmer => Ok(Model::MuseGlimmer(
+                crate::composition::muse_glimmer::load_safetensors(
+                    model_dir,
+                    eredu_runtime::WeightResidency::with_expert_cache(
+                        non_expert,
+                        expert_cache,
+                    ),
                     options.quantization,
                     stream,
                     weights_stream,
@@ -959,24 +1030,24 @@ pub(super) fn materialize_safetensors(
                 )?,
             )))
         }
-        ModelKind::Gemma4 => Ok(Model::Gemma4(Box::new(
-            crate::composition::mlx_architectures::gemma4::layerwise::load_gemma4_layerwise_model(
+        ModelKind::Gemma4 => {
+            Ok(Model::Gemma4(crate::composition::gemma4::load_safetensors(
                 model_dir,
-                execution,
+                eredu_runtime::WeightResidency::with_layers(execution),
                 options.quantization,
                 stream,
                 weights_stream,
-            )?,
-        ))),
-        ModelKind::Inkling => Ok(Model::Inkling(
-            crate::composition::mlx_architectures::inkling::layerwise::load_inkling_layerwise_model(
+            )?))
+        }
+        ModelKind::Inkling => {
+            Ok(Model::Inkling(crate::composition::inkling::load_safetensors(
                 model_dir,
-                execution,
+                eredu_runtime::WeightResidency::with_layers(execution),
                 options.quantization,
                 stream,
                 weights_stream,
-            )?,
-        )),
+            )?))
+        }
         ModelKind::KimiLinear => Ok(Model::KimiLinear(
             crate::composition::kimi_linear::load_kimi_linear_model(
                 model_dir,
@@ -997,15 +1068,17 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )),
-        ModelKind::MuseGlimmer => Ok(Model::MuseGlimmer(
-            crate::composition::mlx_architectures::muse_glimmer::layerwise::load_safetensors(
-                model_dir,
-                execution,
-                options.quantization,
-                stream,
-                weights_stream,
-            )?,
-        )),
+        ModelKind::MuseGlimmer => {
+            Ok(Model::MuseGlimmer(
+                crate::composition::muse_glimmer::load_safetensors(
+                    model_dir,
+                    eredu_runtime::WeightResidency::with_layers(execution),
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?,
+            ))
+        }
         ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::Qwen(
             crate::composition::qwen::load_qwen_safetensors_mlx(
                 model_dir,

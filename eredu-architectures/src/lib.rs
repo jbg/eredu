@@ -11,8 +11,14 @@ pub mod decoder;
 /// Shared assembly for heterogeneous stateful text decoders.
 pub mod hybrid_decoder;
 
+/// Inkling multimodal routed decoder family.
+pub mod inkling;
+pub mod muse_glimmer;
+
 /// DeepSeek V3/R1 and V4 compressed-attention decoder family.
 pub mod deepseek;
+/// Neutral Gemma 4 family implementation.
+pub mod gemma4;
 
 /// Llama and Mistral-compatible decoder architecture.
 pub mod llama;

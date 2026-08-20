@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, num::NonZeroU8};
 
 use eredu_architectures::{
-    kimi_linear, lfm2,
+    gemma4, kimi_linear, lfm2,
     llama::ModelArgs as LlamaModelArgs,
     nemotron_h,
     qwen::{ModelArgs as QwenModelArgs, QwenVariant},
@@ -21,10 +21,7 @@ use super::{MlxBackend, MlxModelInput, MlxModelSession, Model};
 use crate::{
     backend::mlx::runtime::media::input::{self, InputPayload, Modality},
     composition::mlx_architectures::{
-        gemma4::model as gemma4,
         gpt_oss::model as gpt_oss,
-        inkling::model as inkling,
-        muse_glimmer,
         qwen::hybrid::qwen3_5::{self, LayerPolicy as QwenHybridLayerPolicy},
     },
     core::attention::AttentionPolicy,
@@ -192,14 +189,14 @@ impl Model {
             }
             Self::GptOss(model) => gpt_oss_spec(model.args())?,
             Self::Gemma4(model) => {
-                let (_, _, image, audio, video) = model.media_accounting();
+                let args = model.args();
                 gemma4_spec(
-                    model.args(),
+                    &args.text,
                     InputModalities {
                         text: true,
-                        image,
-                        audio,
-                        video,
+                        image: args.image_token_id.is_some(),
+                        audio: args.audio_token_id.is_some(),
+                        video: args.video_token_id.is_some(),
                     },
                 )?
             }
@@ -381,7 +378,9 @@ fn qwen_spec(args: &QwenModelArgs, multimodal: bool) -> Result<Spec, CapabilityE
     Ok(spec)
 }
 
-fn muse_glimmer_spec(args: &muse_glimmer::DecoderConfig) -> Result<Spec, CapabilityError> {
+fn muse_glimmer_spec(
+    args: &eredu_architectures::muse_glimmer::DecoderConfig,
+) -> Result<Spec, CapabilityError> {
     let context = plain_context(args.max_position_embeddings)?;
     let full_layers = args.attention_schedule.full_layer_count() as u64;
     let sliding = args
@@ -416,10 +415,10 @@ fn muse_glimmer_spec(args: &muse_glimmer::DecoderConfig) -> Result<Spec, Capabil
         state_strategy,
         InputModalities {
             text: true,
-            image: args.vision_config.is_some(),
+            image: true,
             audio: false,
-            video: args.vision_config.is_some()
-                && args.weight_convention == muse_glimmer::WeightConvention::HuggingFace,
+            video: args.weight_convention
+                == eredu_architectures::muse_glimmer::WeightConvention::HuggingFace,
         },
         StateLayout {
             fixed_scalars_per_batch: 0,
@@ -667,7 +666,7 @@ fn gemma4_spec(
     modalities: InputModalities,
 ) -> Result<Spec, CapabilityError> {
     let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
-    let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
+    let layers = args.num_hidden_layers() as u64;
     let shared = args
         .layer_schedule
         .iter()
@@ -742,7 +741,7 @@ fn gemma4_spec(
     ))
 }
 
-fn inkling_spec(args: &inkling::ModelArgs) -> Result<Spec, CapabilityError> {
+fn inkling_spec(args: &eredu_architectures::inkling::ModelArgs) -> Result<Spec, CapabilityError> {
     let text = &args.text_config;
     let context = match text.model_max_length {
         Some(maximum) => plain_context(maximum)?,
@@ -1177,7 +1176,7 @@ fn qwen_attention_chunk_squares(
         let width = nonzero_positive(*width, "Qwen grid width")?;
         if height % merge != 0 || width % merge != 0 {
             return Err(CapabilityError::InvalidConfiguration {
-                field: "qwen_grid_thw",
+                field: "patch_grid",
                 detail: format!(
                     "Qwen grid ({height}, {width}) is not divisible by spatial merge {merge}"
                 ),
@@ -1324,7 +1323,7 @@ fn qwen_vision_workspace(
     }
     let positions = patches / merge_area;
     let grid = metadata
-        .qwen_grid_thw
+        .patch_grid
         .ok_or_else(|| CapabilityError::UnsupportedInput {
             architecture: architecture.into(),
             reason: "prepared Qwen media has no grid_thw metadata".into(),
@@ -1466,7 +1465,7 @@ fn qwen_vision_workspace(
 }
 
 fn gemma_vision_workspace(
-    config: &crate::composition::mlx_architectures::gemma4::vision::Gemma4VisionConfig,
+    config: &eredu_architectures::gemma4::VisionConfig,
     text_hidden: u64,
     payload: &Array,
     metadata: input::InputMetadata<'_>,
@@ -1498,7 +1497,7 @@ fn gemma_vision_workspace(
     }
     let position_ids =
         metadata
-            .patch_position_ids
+            .patch_positions
             .ok_or_else(|| CapabilityError::UnsupportedInput {
                 architecture: architecture.into(),
                 reason: "prepared Gemma media has no patch positions".into(),
@@ -1577,7 +1576,7 @@ fn gemma_vision_workspace(
 }
 
 fn gemma_audio_workspace(
-    config: &crate::composition::mlx_architectures::gemma4::audio::Gemma4AudioConfig,
+    config: &eredu_architectures::gemma4::AudioConfig,
     text_hidden: u64,
     payload: &Array,
     metadata: input::InputMetadata<'_>,
@@ -1728,7 +1727,7 @@ fn gemma_audio_workspace(
 }
 
 fn inkling_workspace(
-    args: &inkling::ModelArgs,
+    args: &eredu_architectures::inkling::ModelArgs,
     modality: Modality,
     payload: &Array,
     metadata: input::InputMetadata<'_>,
@@ -1920,9 +1919,11 @@ impl Model {
                     )
                 }),
             Self::Gemma4(model) => {
-                let (vision, audio, _, _, _) = model.media_accounting();
+                let args = model.args();
                 match modality {
-                    Modality::Image | Modality::Video => vision
+                    Modality::Image | Modality::Video => args
+                        .vision
+                        .as_ref()
                         .ok_or_else(|| CapabilityError::UnsupportedInput {
                             architecture: self.model_type().into(),
                             reason: "loaded model has no vision tower".into(),
@@ -1930,13 +1931,15 @@ impl Model {
                         .and_then(|config| {
                             gemma_vision_workspace(
                                 config,
-                                positive(model.args().hidden_size, "Gemma text hidden size")?,
+                                positive(args.text.hidden_size, "Gemma text hidden size")?,
                                 payload,
                                 metadata,
                                 self.model_type(),
                             )
                         }),
-                    Modality::Audio => audio
+                    Modality::Audio => args
+                        .audio
+                        .as_ref()
                         .ok_or_else(|| CapabilityError::UnsupportedInput {
                             architecture: self.model_type().into(),
                             reason: "loaded model has no audio tower".into(),
@@ -1944,7 +1947,7 @@ impl Model {
                         .and_then(|config| {
                             gemma_audio_workspace(
                                 config,
-                                positive(model.args().hidden_size, "Gemma text hidden size")?,
+                                positive(args.text.hidden_size, "Gemma text hidden size")?,
                                 payload,
                                 metadata,
                                 self.model_type(),
@@ -1967,15 +1970,11 @@ impl Model {
                 reason: format!("{} media is not supported", modality.as_str()),
             }),
             Self::MuseGlimmer(model) => {
-                let config = model.args().vision_config.as_ref().ok_or_else(|| {
-                    CapabilityError::UnsupportedInput {
-                        architecture: self.model_type().into(),
-                        reason: "loaded Muse-Glimmer artifact has no vision projector".into(),
-                    }
-                })?;
+                let config = &model.args().vision_config;
                 if modality == Modality::Audio
                     || (modality == Modality::Video
-                        && model.args().weight_convention == muse_glimmer::WeightConvention::Gguf)
+                        && model.args().weight_convention
+                            == eredu_architectures::muse_glimmer::WeightConvention::Gguf)
                 {
                     return Err(CapabilityError::UnsupportedInput {
                         architecture: self.model_type().into(),
@@ -1987,16 +1986,16 @@ impl Model {
                 }
                 let grid =
                     metadata
-                        .vision_grid_thw
+                        .patch_grid
                         .ok_or_else(|| CapabilityError::UnsupportedInput {
                             architecture: self.model_type().into(),
-                            reason: "Muse-Glimmer media requires vision_grid_thw metadata".into(),
+                            reason: "Muse-Glimmer media requires patch_grid metadata".into(),
                         })?;
                 if grid.ndim() != 2 || grid.dim(1) != 3 {
                     return Err(CapabilityError::UnsupportedInput {
                         architecture: self.model_type().into(),
                         reason: format!(
-                            "Muse-Glimmer vision_grid_thw must be [items, 3], got {:?}",
+                            "Muse-Glimmer patch_grid must be [items, 3], got {:?}",
                             grid.shape()
                         ),
                     });
@@ -2010,7 +2009,7 @@ impl Model {
                 if values.len() % 3 != 0 {
                     return Err(CapabilityError::UnsupportedInput {
                         architecture: self.model_type().into(),
-                        reason: "Muse-Glimmer vision_grid_thw has an incomplete row".into(),
+                        reason: "Muse-Glimmer patch_grid has an incomplete row".into(),
                     });
                 }
                 let mut patches = 0u64;
@@ -2779,7 +2778,6 @@ mod tests {
         gemma4::ModelArgs {
             model_type: "gemma4_unified".into(),
             hidden_size: 8,
-            num_hidden_layers: 4,
             num_attention_heads: 2,
             rms_norm_eps: 1e-5,
             vocab_size: 32,
@@ -2788,12 +2786,9 @@ mod tests {
             rope_theta: 10_000.0,
             tie_word_embeddings: true,
             attention_bias: false,
-            quantized: false,
             weight_quantization: None,
             quantized_weights: None,
             quantized_weight_configs: None,
-            quantization_group_size: 64,
-            quantization_bits: 4,
             hidden_size_per_layer_input: 0,
             vocab_size_per_layer_input: None,
             layer_schedule: crate::core::attention::LayerSchedule::new(
@@ -2801,23 +2796,26 @@ mod tests {
                 vec![
                     layer(
                         AttentionPolicy::sliding(4).unwrap(),
-                        gemma4::KeyValuePolicy::Local {
-                            value: gemma4::ValuePolicy::Projected,
+                        eredu_nn::AttentionStateSource::Local {
+                            value: eredu_nn::AttentionValueSource::Projected,
                         },
                     ),
                     layer(
                         AttentionPolicy::Full,
-                        gemma4::KeyValuePolicy::Publish {
-                            value: gemma4::ValuePolicy::Projected,
+                        eredu_nn::AttentionStateSource::Publish {
+                            value: eredu_nn::AttentionValueSource::Projected,
                         },
                     ),
                     layer(
                         AttentionPolicy::sliding(4).unwrap(),
-                        gemma4::KeyValuePolicy::Local {
-                            value: gemma4::ValuePolicy::Projected,
+                        eredu_nn::AttentionStateSource::Local {
+                            value: eredu_nn::AttentionValueSource::Projected,
                         },
                     ),
-                    layer(AttentionPolicy::Full, gemma4::KeyValuePolicy::Shared),
+                    layer(
+                        AttentionPolicy::Full,
+                        eredu_nn::AttentionStateSource::Shared,
+                    ),
                 ],
             )
             .unwrap(),
@@ -3021,53 +3019,55 @@ mod tests {
 
     #[test]
     fn gemma4_prepared_media_bounds_vision_and_audio_workspaces() {
-        let vision_config =
-            crate::composition::mlx_architectures::gemma4::vision::Gemma4VisionConfig {
-                hidden_size: 8,
-                intermediate_size: 16,
-                num_hidden_layers: 2,
-                num_attention_heads: 2,
-                num_key_value_heads: 2,
-                head_dim: 4,
-                patch_size: 1,
-                pooling_kernel_size: 2,
-                position_embedding_size: 4,
-                rms_norm_eps: 1e-5,
-                hidden_activation: "gelu_pytorch_tanh".into(),
-                standardize: false,
-                rope_parameters: None,
-                weight_quantization: None,
-            };
+        let vision_config = eredu_architectures::gemma4::VisionConfig {
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 4,
+            patch_size: 1,
+            pooling_kernel_size: 2,
+            position_embedding_size: 4,
+            rms_norm_eps: 1e-5,
+            hidden_activation: "gelu_pytorch_tanh".into(),
+            standardize: false,
+            rope_parameters: None,
+            weight_quantization: None,
+            quantized_weights: None,
+            quantized_weight_configs: None,
+        };
         let vision = Array::from_slice(&[0.0f32; 15], &[1, 5, 3]);
         let patch_positions = Array::from_slice(&[0, 0, 1, 0, 0, 1, 1, 1, -1, -1], &[1, 5, 2]);
         let (vision_positions, vision_workspace) = gemma_vision_workspace(
             &vision_config,
             8,
             &vision,
-            super::input::InputMetadata::patch_position_ids(&patch_positions),
+            super::input::InputMetadata::patch_positions(&patch_positions),
             "gemma4",
         )
         .unwrap();
         assert_eq!(vision_positions, 1);
         assert!(vision_workspace > array_bytes(&vision, "test vision bytes").unwrap());
 
-        let audio_config =
-            crate::composition::mlx_architectures::gemma4::audio::Gemma4AudioConfig {
-                hidden_size: 8,
-                num_hidden_layers: 2,
-                num_attention_heads: 2,
-                output_proj_dims: 8,
-                conv_kernel_size: 3,
-                attention_chunk_size: 4,
-                attention_context_left: 3,
-                attention_context_right: 0,
-                attention_invalid_logits_value: -1e9,
-                attention_logit_cap: 50.0,
-                residual_weight: 1.0,
-                rms_norm_eps: 1e-5,
-                subsampling_conv_channels: vec![4, 8],
-                weight_quantization: None,
-            };
+        let audio_config = eredu_architectures::gemma4::AudioConfig {
+            hidden_size: 8,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            output_proj_dims: 8,
+            conv_kernel_size: 3,
+            attention_chunk_size: 4,
+            attention_context_left: 3,
+            attention_context_right: 0,
+            attention_invalid_logits_value: -1e9,
+            attention_logit_cap: 50.0,
+            residual_weight: 1.0,
+            rms_norm_eps: 1e-5,
+            subsampling_conv_channels: vec![4, 8],
+            weight_quantization: None,
+            quantized_weights: None,
+            quantized_weight_configs: None,
+        };
         let audio = Array::from_slice(&[0.0f32; 8 * 128], &[1, 8, 128]);
         let audio_mask =
             Array::from_slice(&[true, true, true, true, true, true, false, false], &[1, 8]);
@@ -3122,7 +3122,7 @@ mod tests {
             &config,
             Modality::Image,
             &payload,
-            super::input::InputMetadata::qwen_grid_thw(&grid),
+            super::input::InputMetadata::patch_grid(&grid),
             &stream,
             "qwen3_vl",
         )
@@ -3131,38 +3131,39 @@ mod tests {
         assert!(workspace > payload.nbytes() as u64);
     }
 
-    fn tiny_inkling() -> inkling::ModelArgs {
-        inkling::model_args_from_config_value(&json!({
-            "model_type":"inkling_mm_model",
-            "text_config":{
-                "hidden_size":32,"num_hidden_layers":3,"vocab_size":64,
-                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,
-                "swa_num_attention_heads":4,"swa_num_key_value_heads":2,"swa_head_dim":8,
-                "sliding_window_size":8,"local_layer_ids":[0,1],"dense_mlp_idx":1,
-                "sconv_kernel_size":4,"d_rel":4,"rel_extent":16,
-                "intermediate_size":24,"dense_intermediate_size":48,
-                "n_routed_experts":4,"num_experts_per_tok":2,"n_shared_experts":1,
-                "route_scale":8.0,"use_sconv":true,"use_embed_norm":true,
-                "shared_expert_sink":true,"use_gate_bias":true,"norm_after_topk":true,
-                "use_global_scale":true,"gate_activation":"sigmoid"
-            },
-            "audio_config":{
-                "decoder_dmodel":32,"n_mel_bins":80,"mel_vocab_size":16
-            },
-            "vision_config":{
-                "decoder_dmodel":32,"patch_size":40,"temporal_patch_size":2,
-                "n_channels":3,"n_layers":4
-            }
-        }))
+    fn tiny_inkling() -> eredu_architectures::inkling::ModelArgs {
+        eredu_architectures::inkling::ModelArgs::from_hf_json(
+            &serde_json::to_vec(&json!({
+                "model_type":"inkling_mm_model",
+                "text_config":{
+                    "hidden_size":32,"num_hidden_layers":3,"vocab_size":64,
+                    "num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,
+                    "swa_num_attention_heads":4,"swa_num_key_value_heads":2,"swa_head_dim":8,
+                    "sliding_window_size":8,"local_layer_ids":[0,1],"dense_mlp_idx":1,
+                    "sconv_kernel_size":4,"d_rel":4,"rel_extent":16,
+                    "intermediate_size":24,"dense_intermediate_size":48,
+                    "n_routed_experts":4,"num_experts_per_tok":2,"n_shared_experts":1,
+                    "route_scale":8.0,"use_sconv":true,"use_embed_norm":true,
+                    "shared_expert_sink":true,"use_gate_bias":true,"norm_after_topk":true,
+                    "use_global_scale":true,"gate_activation":"sigmoid"
+                },
+                "audio_config":{
+                    "decoder_dmodel":32,"n_mel_bins":80,"mel_vocab_size":16
+                },
+                "vision_config":{
+                    "decoder_dmodel":32,"patch_size":40,"temporal_patch_size":2,
+                    "n_channels":3,"n_layers":4
+                }
+            }))
+            .unwrap(),
+        )
         .unwrap()
     }
 
     #[test]
     fn inkling_runtime_state_groups_the_exact_ordered_schedule() {
-        use crate::composition::mlx_architectures::inkling::model::{
-            FeedForwardPolicy, LayerPolicy,
-        };
         use crate::core::attention::LayerSchedule;
+        use eredu_architectures::inkling::{FeedForwardPolicy, LayerPolicy};
 
         let mut args = tiny_inkling();
         args.text_config.num_key_value_heads = 1;

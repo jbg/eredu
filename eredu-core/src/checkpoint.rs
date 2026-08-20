@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TensorDtype {
+    /// Boolean.
+    Bool,
     /// IEEE f32.
     F32,
     /// IEEE f16.
@@ -17,10 +19,22 @@ pub enum TensorDtype {
     I8,
     /// Unsigned 8-bit integer.
     U8,
+    /// Unsigned 16-bit integer.
+    U16,
     /// Unsigned 32-bit integer.
     U32,
+    /// Unsigned 64-bit integer.
+    U64,
+    /// Signed 16-bit integer.
+    I16,
     /// Signed 32-bit integer.
     I32,
+    /// Signed 64-bit integer.
+    I64,
+    /// IEEE f64.
+    F64,
+    /// Complex number represented by two IEEE f32 values.
+    Complex64,
     /// Backend-independent encoded/quantized storage.
     Encoded(String),
 }
@@ -56,14 +70,15 @@ pub struct TensorCatalog {
 }
 
 impl TensorCatalog {
-    /// Validates unique names, non-empty shapes, and non-zero dimensions.
+    /// Validates unique names and non-zero dimensions. An empty shape is a
+    /// valid rank-zero scalar with one element.
     pub fn new(tensors: impl IntoIterator<Item = TensorDescriptor>) -> Result<Self, CatalogError> {
         let mut map = BTreeMap::new();
         for tensor in tensors {
             if tensor.name.trim().is_empty() {
                 return Err(CatalogError::EmptyName);
             }
-            if tensor.shape.is_empty() || tensor.shape.contains(&0) {
+            if tensor.shape.contains(&0) {
                 return Err(CatalogError::InvalidShape(tensor.name));
             }
             let name = tensor.name.clone();
@@ -96,7 +111,7 @@ pub enum CatalogError {
     /// Tensor name is duplicated.
     #[error("duplicate checkpoint tensor {0}")]
     Duplicate(String),
-    /// Shape is scalar/empty or contains zero.
+    /// Shape contains a zero dimension.
     #[error("checkpoint tensor {0} has an invalid shape")]
     InvalidShape(String),
 }

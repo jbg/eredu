@@ -1,6 +1,14 @@
 //! Shared Qwen vision-language encoder building blocks.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_nn::multimodal::{
+    multi_axis_rotary_embeddings, project_flattened_patches, FlattenedPatchSpec,
+    MultiAxisRotaryLayout, MultiAxisRotarySpec, RotaryAxisSpec,
+};
+use eredu_nn::sequence_layout::{
+    attention_chunk_lengths, bilinear_interpolation_samples, inverse_permutation, patch_positions,
+    validate_patch_grid, window_partition, InterpolationMode, PatchTraversal,
+};
 
 use std::collections::HashMap;
 
@@ -12,7 +20,6 @@ use safemlx::{
     ops::{
         concatenate_axis,
         indexing::{NewAxis, TryIndexOp},
-        matmul,
     },
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
@@ -508,13 +515,20 @@ impl QwenVisionPatchEmbed {
                 self.input_dim()
             )));
         }
-        let weight = self
-            .proj
-            .weight
-            .as_ref()
-            .reshape(&[self.embed_dim, self.input_dim()], stream)?;
-        let output = matmul(pixel_values, weight.transpose(stream)?, stream)?;
-        output.add(&*self.proj.bias, stream)
+        project_flattened_patches(
+            pixel_values,
+            &self.proj.weight,
+            Some(&self.proj.bias),
+            FlattenedPatchSpec {
+                channels: self.in_channels,
+                temporal: self.temporal_patch_size,
+                height: self.patch_size,
+                width: self.patch_size,
+                output: self.embed_dim,
+            },
+            stream,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))
     }
 
     pub(crate) fn training_mode(&mut self, mode: bool) {
@@ -1155,7 +1169,7 @@ impl QwenVisionLayerwiseStatic {
         let grid = grid_thw_from_array(grid_thw, stream)?;
         validate_vision_grid(&grid, self.config.spatial_merge_size, pixel_values)?;
         let seq_len = pixel_values.dim(0);
-        let full_chunk_lengths = vision_attention_chunk_lengths(&grid);
+        let full_chunk_lengths = vision_attention_chunk_lengths(&grid)?;
         let total: i32 = full_chunk_lengths.iter().sum();
         if total != seq_len {
             return Err(Exception::custom(format!(
@@ -1181,7 +1195,8 @@ impl QwenVisionLayerwiseStatic {
             &grid,
             self.config.spatial_merge_size,
             self.config.hidden_size / self.config.num_heads,
-        );
+            stream,
+        )?;
         let reorder = |array: Array| -> Result<Array, Exception> {
             array
                 .reshape(&[seq_len / merge_unit, merge_unit, -1], stream)?
@@ -1305,7 +1320,7 @@ impl QwenVisionLayerwiseStatic {
         stream: &Stream,
     ) -> Result<VisionOutput, Exception> {
         let hidden = self.merger.forward(hidden, stream)?;
-        let reverse_index = reverse_permutation(&state.window_index);
+        let reverse_index = reverse_permutation(&state.window_index)?;
         let reverse_index_array = Array::from_slice(&reverse_index, &[reverse_index.len() as i32]);
         let embeddings = hidden
             .try_index_device((&reverse_index_array, ..), stream)?
@@ -1324,7 +1339,7 @@ impl QwenVisionLayerwiseStatic {
         stream: &Stream,
     ) -> Result<VisionOutput, Exception> {
         let hidden = self.merger.forward_tensor_parallel(hidden, group, stream)?;
-        let reverse_index = reverse_permutation(&state.window_index);
+        let reverse_index = reverse_permutation(&state.window_index)?;
         let reverse_index_array = Array::from_slice(&reverse_index, &[reverse_index.len() as i32]);
         let embeddings = hidden
             .try_index_device((&reverse_index_array, ..), stream)?
@@ -1671,7 +1686,7 @@ impl QwenVisionTransformer {
             position_embeddings.as_dtype(hidden_states.dtype(), stream)?,
             stream,
         )?;
-        let full_chunk_lengths = vision_attention_chunk_lengths(&grid);
+        let full_chunk_lengths = vision_attention_chunk_lengths(&grid)?;
         let total: i32 = full_chunk_lengths.iter().sum();
         if total != seq_len {
             return Err(Exception::custom(format!(
@@ -1707,7 +1722,8 @@ impl QwenVisionTransformer {
             &grid,
             self.config.spatial_merge_size,
             self.config.hidden_size / self.config.num_heads,
-        );
+            stream,
+        )?;
         let cos = cos.reshape(
             &[
                 seq_len / (self.config.spatial_merge_size * self.config.spatial_merge_size),
@@ -1760,7 +1776,7 @@ impl QwenVisionTransformer {
             }
         }
         let hidden_states = self.merger.forward(&hidden_states, stream)?;
-        let reverse_index = reverse_permutation(&window_index);
+        let reverse_index = reverse_permutation(&window_index)?;
         let reverse_index_array = Array::from_slice(&reverse_index, &[reverse_index.len() as i32]);
         let embeddings = hidden_states
             .try_index_device((&reverse_index_array, ..), stream)?
@@ -1825,26 +1841,7 @@ pub(crate) fn grid_thw_from_array(
     grid_thw: &Array,
     stream: &Stream,
 ) -> Result<Vec<(i32, i32, i32)>, Exception> {
-    let shape = grid_thw.shape();
-    if shape.len() != 2 || shape[1] != 3 {
-        return Err(Exception::custom(format!(
-            "qwen3_5_moe qwen_grid_thw must be shaped [items, 3], got {shape:?}"
-        )));
-    }
-    let mut grid = Vec::with_capacity(shape[0] as usize);
-    for index in 0..shape[0] {
-        let t = grid_thw
-            .try_index_device((index, 0), stream)?
-            .item::<i32>(stream);
-        let h = grid_thw
-            .try_index_device((index, 1), stream)?
-            .item::<i32>(stream);
-        let w = grid_thw
-            .try_index_device((index, 2), stream)?
-            .item::<i32>(stream);
-        grid.push((t, h, w));
-    }
-    Ok(grid)
+    crate::backend::mlx::runtime::media::input::patch_grid_from_array(grid_thw, stream)
 }
 
 fn validate_vision_grid(
@@ -1852,28 +1849,9 @@ fn validate_vision_grid(
     spatial_merge_size: i32,
     pixel_values: &Array,
 ) -> Result<(), Exception> {
-    let patches: i32 = grid.iter().map(|(t, h, w)| t * h * w).sum();
-    if patches != pixel_values.dim(0) {
-        return Err(Exception::custom(format!(
-            "qwen3_5_moe qwen_grid_thw describes {patches} patches but image tensor has {}",
-            pixel_values.dim(0)
-        )));
-    }
-    for &(t, h, w) in grid {
-        if t <= 0 || h <= 0 || w <= 0 {
-            return Err(Exception::custom(format!(
-                "qwen3_5_moe qwen_grid_thw entries must be positive, got {:?}",
-                (t, h, w)
-            )));
-        }
-        if h % spatial_merge_size != 0 || w % spatial_merge_size != 0 {
-            return Err(Exception::custom(format!(
-                "qwen3_5_moe qwen_grid_thw spatial dimensions must be divisible by spatial_merge_size {spatial_merge_size}, got {:?}",
-                (t, h, w)
-            )));
-        }
-    }
-    Ok(())
+    validate_patch_grid(grid, spatial_merge_size, Some(pixel_values.dim(0)))
+        .map(|_| ())
+        .map_err(|error| Exception::custom(format!("invalid Qwen VL vision grid: {error}")))
 }
 
 fn vision_position_indices(
@@ -1890,7 +1868,7 @@ fn vision_position_indices(
     for &(t, h, w) in grid {
         if h > side || w > side {
             return Err(Exception::custom(format!(
-                "qwen3_5_moe qwen_grid_thw spatial dimensions {:?} exceed learned position table side {side}",
+                "qwen3_5_moe patch_grid spatial dimensions {:?} exceed learned position table side {side}",
                 (h, w)
             )));
         }
@@ -1918,45 +1896,31 @@ fn vision_interpolated_position_embeddings(
             "Qwen VL vision num_position_embeddings must be a square, got {num_position_embeddings}"
         )));
     }
-    let mut corner_indices = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    let mut corner_weights = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    for &(t, h, w) in grid {
-        let axis = |position: i32, length: i32| {
-            if length == 1 {
-                (0, 0, 0.0)
-            } else {
-                let value = position as f32 * (side - 1) as f32 / (length - 1) as f32;
-                let floor = value.floor() as i32;
-                (floor, (floor + 1).min(side - 1), value - floor as f32)
-            }
-        };
-        for _ in 0..t {
-            for h_block in 0..h / spatial_merge_size {
-                for w_block in 0..w / spatial_merge_size {
-                    for h_inner in 0..spatial_merge_size {
-                        for w_inner in 0..spatial_merge_size {
-                            let (h0, h1, hf) = axis(h_block * spatial_merge_size + h_inner, h);
-                            let (w0, w1, wf) = axis(w_block * spatial_merge_size + w_inner, w);
-                            for (corner, index, weight) in [
-                                (0, h0 * side + w0, (1.0 - hf) * (1.0 - wf)),
-                                (1, h0 * side + w1, (1.0 - hf) * wf),
-                                (2, h1 * side + w0, hf * (1.0 - wf)),
-                                (3, h1 * side + w1, hf * wf),
-                            ] {
-                                corner_indices[corner].push(index as u32);
-                                corner_weights[corner].push(weight);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let seq_len = corner_indices[0].len() as i32;
+    let samples = bilinear_interpolation_samples(
+        grid,
+        side,
+        side,
+        InterpolationMode::AlignCorners,
+        PatchTraversal::MergeMajor(spatial_merge_size),
+    )
+    .map_err(|error| Exception::custom(format!("invalid Qwen VL position grid: {error}")))?;
+    let seq_len = samples.len() as i32;
     let mut output: Option<Array> = None;
     for corner in 0..4 {
-        let indices = Array::from_slice(&corner_indices[corner], &[seq_len]);
-        let weights = Array::from_slice(&corner_weights[corner], &[seq_len, 1]);
+        let indices = Array::from_slice(
+            &samples
+                .iter()
+                .map(|sample| sample.indices[corner])
+                .collect::<Vec<_>>(),
+            &[seq_len],
+        );
+        let weights = Array::from_slice(
+            &samples
+                .iter()
+                .map(|sample| sample.weights[corner])
+                .collect::<Vec<_>>(),
+            &[seq_len, 1],
+        );
         let weighted = pos_embed
             .forward(&indices, stream)?
             .multiply(weights, stream)?;
@@ -1968,14 +1932,9 @@ fn vision_interpolated_position_embeddings(
     output.ok_or_else(|| Exception::custom("Qwen VL vision grid must not be empty"))
 }
 
-fn vision_attention_chunk_lengths(grid: &[(i32, i32, i32)]) -> Vec<i32> {
-    let mut lengths = Vec::new();
-    for &(t, h, w) in grid {
-        for _ in 0..t {
-            lengths.push(h * w);
-        }
-    }
-    lengths
+fn vision_attention_chunk_lengths(grid: &[(i32, i32, i32)]) -> Result<Vec<i32>, Exception> {
+    attention_chunk_lengths(grid)
+        .map_err(|error| Exception::custom(format!("invalid Qwen VL vision chunks: {error}")))
 }
 
 pub(crate) fn vision_window_index(
@@ -1984,109 +1943,50 @@ pub(crate) fn vision_window_index(
     window_size: i32,
     patch_size: i32,
 ) -> Result<(Vec<i32>, Vec<i32>), Exception> {
-    let vit_merger_window_size = window_size / spatial_merge_size / patch_size;
-    if vit_merger_window_size <= 0 {
-        return Err(Exception::custom(format!(
-            "Qwen VL vision window_size {window_size} is too small for spatial_merge_size {spatial_merge_size} and patch_size {patch_size}"
-        )));
-    }
-    let spatial_merge_unit = spatial_merge_size * spatial_merge_size;
-    let mut window_index = Vec::new();
-    let mut cumulative_seqlens = vec![0];
-    let mut window_index_id = 0;
-    for &(grid_t, grid_h, grid_w) in grid {
-        let llm_grid_h = grid_h / spatial_merge_size;
-        let llm_grid_w = grid_w / spatial_merge_size;
-        let pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size;
-        let pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size;
-        let num_windows_h = (llm_grid_h + pad_h) / vit_merger_window_size;
-        let num_windows_w = (llm_grid_w + pad_w) / vit_merger_window_size;
-        for t in 0..grid_t {
-            for window_h in 0..num_windows_h {
-                for window_w in 0..num_windows_w {
-                    let mut window_groups = 0;
-                    for inner_h in 0..vit_merger_window_size {
-                        for inner_w in 0..vit_merger_window_size {
-                            let h = window_h * vit_merger_window_size + inner_h;
-                            let w = window_w * vit_merger_window_size + inner_w;
-                            if h < llm_grid_h && w < llm_grid_w {
-                                let index = t * llm_grid_h * llm_grid_w + h * llm_grid_w + w;
-                                window_index.push(window_index_id + index);
-                                window_groups += 1;
-                            }
-                        }
-                    }
-                    let next = cumulative_seqlens.last().copied().unwrap_or(0)
-                        + window_groups * spatial_merge_unit;
-                    if cumulative_seqlens.last().copied() != Some(next) {
-                        cumulative_seqlens.push(next);
-                    }
-                }
-            }
-        }
-        window_index_id += grid_t * llm_grid_h * llm_grid_w;
-    }
-    let chunk_lengths = cumulative_seqlens
-        .windows(2)
-        .map(|window| window[1] - window[0])
-        .collect::<Vec<_>>();
-    Ok((window_index, chunk_lengths))
+    let layout = window_partition(grid, spatial_merge_size, window_size, patch_size)
+        .map_err(|error| Exception::custom(format!("invalid Qwen VL vision window: {error}")))?;
+    Ok((layout.permutation, layout.chunk_lengths))
 }
 
-pub(crate) fn reverse_permutation(indices: &[i32]) -> Vec<i32> {
-    let mut reverse = vec![0; indices.len()];
-    for (position, &index) in indices.iter().enumerate() {
-        reverse[index as usize] = position as i32;
-    }
-    reverse
+fn reverse_permutation(indices: &[i32]) -> Result<Vec<i32>, Exception> {
+    inverse_permutation(indices)
+        .map_err(|error| Exception::custom(format!("invalid Qwen VL permutation: {error}")))
 }
 
 fn vision_rotary_embeddings(
     grid: &[(i32, i32, i32)],
     spatial_merge_size: i32,
     head_dim: i32,
-) -> (Array, Array) {
+    stream: &Stream,
+) -> Result<(Array, Array), Exception> {
     let rotary_dim = head_dim / 2;
-    let inv_freq = (0..rotary_dim)
-        .step_by(2)
-        .map(|idx| 1.0f32 / 10000.0f32.powf(idx as f32 / rotary_dim as f32))
+    let positions = patch_positions(grid, PatchTraversal::MergeMajor(spatial_merge_size))
+        .map_err(|error| Exception::custom(format!("invalid Qwen VL rotary grid: {error}")))?;
+    let positions = positions
+        .into_iter()
+        .flat_map(|[_, height, width]| [height, width])
         .collect::<Vec<_>>();
-    let mut cos_values = Vec::new();
-    let mut sin_values = Vec::new();
-    for &(t, h, w) in grid {
-        for _ in 0..t {
-            for h_block in 0..(h / spatial_merge_size) {
-                for w_block in 0..(w / spatial_merge_size) {
-                    for h_inner in 0..spatial_merge_size {
-                        for w_inner in 0..spatial_merge_size {
-                            let h_pos = h_block * spatial_merge_size + h_inner;
-                            let w_pos = w_block * spatial_merge_size + w_inner;
-                            let mut angles = Vec::with_capacity(rotary_dim as usize);
-                            for position in [h_pos, w_pos] {
-                                for inv in &inv_freq {
-                                    angles.push(position as f32 * inv);
-                                }
-                            }
-                            let full_angles = angles
-                                .iter()
-                                .chain(angles.iter())
-                                .copied()
-                                .collect::<Vec<_>>();
-                            for angle in full_angles {
-                                cos_values.push(angle.cos());
-                                sin_values.push(angle.sin());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let seq_len = (cos_values.len() as i32) / head_dim;
-    (
-        Array::from_slice(&cos_values, &[seq_len, head_dim]),
-        Array::from_slice(&sin_values, &[seq_len, head_dim]),
+    let position_ids = Array::from_slice(&positions, &[positions.len() as i32 / 2, 2]);
+    multi_axis_rotary_embeddings(
+        &position_ids,
+        &MultiAxisRotarySpec {
+            axes: vec![
+                RotaryAxisSpec {
+                    dimensions: rotary_dim,
+                    position_offset: 0,
+                },
+                RotaryAxisSpec {
+                    dimensions: rotary_dim,
+                    position_offset: 0,
+                },
+            ],
+            base: 10_000.0,
+            minimum_position: 0,
+            layout: MultiAxisRotaryLayout::SplitHalves,
+        },
+        stream,
     )
+    .map_err(|error| Exception::custom(error.to_string()))
 }
 
 #[cfg(test)]

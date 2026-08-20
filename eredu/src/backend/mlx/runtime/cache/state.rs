@@ -560,6 +560,35 @@ impl MlxKeyValueLayerState {
             Self::Paged(cache) => cache.clear(),
         }
     }
+
+    fn deep_clone_state(&self) -> Result<Self, Exception> {
+        match self {
+            Self::Device(cache) => cache.deep_clone_state().map(Self::Device),
+            Self::Paged(cache) => cache.deep_clone_state().map(Self::Paged),
+        }
+    }
+
+    fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
+        match (self, checkpoint) {
+            (Self::Device(current), Self::Device(previous)) => {
+                match previous.snapshot_arrays(stream)? {
+                    Some((keys, values)) => {
+                        current.restore_resident(keys, values, KeyValueCache::offset(previous))
+                    }
+                    None => {
+                        current.clear();
+                        Ok(())
+                    }
+                }
+            }
+            (Self::Paged(current), Self::Paged(previous)) => {
+                current.restore_checkpoint(previous, stream)
+            }
+            _ => Err(Exception::custom(
+                "key/value checkpoint representation changed",
+            )),
+        }
+    }
 }
 
 impl KeyValueCache for MlxKeyValueLayerState {
@@ -695,6 +724,35 @@ impl MlxKeyValueState {
         Ok(())
     }
 
+    /// Creates an independently advanceable speculative fork.
+    pub(crate) fn deep_clone_state(&self) -> Result<Self, Exception> {
+        Ok(Self {
+            layout: self.layout.clone(),
+            layers: self
+                .layers
+                .iter()
+                .map(MlxKeyValueLayerState::deep_clone_state)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// Restores every append-only layer to an exact speculative checkpoint.
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        if self.layout != checkpoint.layout || self.layers.len() != checkpoint.layers.len() {
+            return Err(Exception::custom(
+                "key/value state checkpoint layout does not match canonical state",
+            ));
+        }
+        for (current, previous) in self.layers.iter_mut().zip(&checkpoint.layers) {
+            current.restore_checkpoint(previous, stream)?;
+        }
+        Ok(())
+    }
+
     /// Returns aggregate telemetry when this is paged state.
     pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
         self.layers
@@ -740,14 +798,15 @@ impl RuntimeState<MlxBackend> for MlxKeyValueState {
 
     fn retained_values(
         &self,
-        ordinal: usize,
-        _address: eredu_runtime::ExecutionUnitAddress,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
     ) -> Result<Self::RetainedValues<'_>, StateError> {
+        let layer = address.index();
         self.layers
-            .get(ordinal)
+            .get(layer)
             .map(RuntimeLayerState::retained_values)
             .ok_or(StateError::UnknownLayer {
-                layer: ordinal,
+                layer,
                 count: self.layers.len(),
             })
     }
@@ -947,11 +1006,19 @@ impl MlxHybridLayerState {
 
     fn device(layer: usize, policy: &LayerCachePolicy) -> Result<Self, Exception> {
         let attention = hybrid_attention_policy(layer, policy)?.map(|policy| match policy {
-            HybridAttentionPolicy::KeyValue(window) => {
-                MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(match window {
-                    Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
-                    None => ConcatKeyValueCache::new(),
-                }))
+            HybridAttentionPolicy::KeyValue { window, key_only } => {
+                MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(
+                    match (window, key_only) {
+                        (Some(window), true) => {
+                            ConcatKeyValueCache::new_key_only_for_sliding_attention(window)
+                        }
+                        (Some(window), false) => {
+                            ConcatKeyValueCache::new_for_sliding_attention(window)
+                        }
+                        (None, true) => ConcatKeyValueCache::new_key_only(),
+                        (None, false) => ConcatKeyValueCache::new(),
+                    },
+                ))
             }
             HybridAttentionPolicy::Compressed => {
                 MlxHybridAttentionState::Compressed(CompressedLatentCache::new())
@@ -976,11 +1043,19 @@ impl MlxHybridLayerState {
     ) -> Result<Self, Exception> {
         let attention = hybrid_attention_policy(layer, policy)?
             .map(|policy| match policy {
-                HybridAttentionPolicy::KeyValue(window) => {
+                HybridAttentionPolicy::KeyValue { window, key_only } => if key_only {
+                    PagedKeyValueCache::new_key_only_with_layout(
+                        manager.clone(),
+                        layer,
+                        window,
+                        0,
+                        rank,
+                    )
+                } else {
                     PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
-                        .map(MlxKeyValueLayerState::Paged)
-                        .map(MlxHybridAttentionState::KeyValue)
                 }
+                .map(MlxKeyValueLayerState::Paged)
+                .map(MlxHybridAttentionState::KeyValue),
                 HybridAttentionPolicy::Compressed => {
                     CompressedLatentCache::new_paged(manager.clone(), layer, rank)
                         .map(MlxHybridAttentionState::Compressed)
@@ -1212,19 +1287,32 @@ impl CompressedAttentionCache<Array> for MlxHybridLayerState {
 #[derive(Debug, Clone)]
 pub struct MlxHybridState {
     layout: StateLayout,
+    global_layer_start: usize,
     layers: Vec<MlxHybridLayerState>,
 }
 
 impl MlxHybridState {
     /// Creates device-resident attention and fixed state from a neutral layout.
     pub fn device(layout: StateLayout) -> Result<Self, Exception> {
+        Self::device_with_global_layer_start(layout, 0)
+    }
+
+    /// Creates device-resident state addressed from an architecture-global layer.
+    pub(crate) fn device_with_global_layer_start(
+        layout: StateLayout,
+        global_layer_start: usize,
+    ) -> Result<Self, Exception> {
         let layers = layout
             .layers()
             .iter()
             .enumerate()
             .map(|(layer, policy)| MlxHybridLayerState::device(layer, policy))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { layout, layers })
+        Ok(Self {
+            layout,
+            global_layer_start,
+            layers,
+        })
     }
 
     /// Creates paged attention with device-resident fixed components.
@@ -1233,13 +1321,45 @@ impl MlxHybridState {
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
+        Self::paged_with_global_layer_start(layout, manager, rank, 0)
+    }
+
+    /// Creates paged state addressed from an architecture-global layer.
+    pub(crate) fn paged_with_global_layer_start(
+        layout: StateLayout,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+        global_layer_start: usize,
+    ) -> Result<Self, Exception> {
         let layers = layout
             .layers()
             .iter()
             .enumerate()
-            .map(|(layer, policy)| MlxHybridLayerState::paged(layer, policy, &manager, rank))
+            .map(|(layer, policy)| {
+                let global_layer = global_layer_start.checked_add(layer).ok_or_else(|| {
+                    Exception::custom("hybrid state global layer index overflowed")
+                })?;
+                MlxHybridLayerState::paged(global_layer, policy, &manager, rank)
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { layout, layers })
+        Ok(Self {
+            layout,
+            global_layer_start,
+            layers,
+        })
+    }
+
+    /// Mutably borrows the ordinary per-layer states used by neutral units.
+    pub(crate) fn layers_mut(&mut self) -> &mut [MlxHybridLayerState] {
+        &mut self.layers
+    }
+
+    /// Borrows the paging manager shared by this state's attention components.
+    pub(crate) fn residency_manager(&self) -> Option<&CacheResidencyManager> {
+        self.layers
+            .iter()
+            .filter_map(|layer| layer.attention.as_ref())
+            .find_map(MlxHybridAttentionState::manager)
     }
 
     /// Returns the common absolute token frontier.
@@ -1264,6 +1384,7 @@ impl MlxHybridState {
     pub(crate) fn deep_clone_state(&self) -> Result<Self, Exception> {
         Ok(Self {
             layout: self.layout.clone(),
+            global_layer_start: self.global_layer_start,
             layers: self
                 .layers
                 .iter()
@@ -1278,7 +1399,10 @@ impl MlxHybridState {
         checkpoint: &Self,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        if self.layout != checkpoint.layout || self.layers.len() != checkpoint.layers.len() {
+        if self.layout != checkpoint.layout
+            || self.global_layer_start != checkpoint.global_layer_start
+            || self.layers.len() != checkpoint.layers.len()
+        {
             return Err(Exception::custom(
                 "hybrid state checkpoint layout does not match canonical state",
             ));
@@ -1307,7 +1431,10 @@ impl MlxHybridState {
         source: &Self,
         start: usize,
     ) -> Result<(), Exception> {
-        if self.layout != source.layout || start > self.layers.len() {
+        if self.layout != source.layout
+            || self.global_layer_start != source.global_layer_start
+            || start > self.layers.len()
+        {
             return Err(Exception::custom(
                 "hybrid draft state layout does not match canonical state",
             ));
@@ -1368,7 +1495,7 @@ impl MlxHybridState {
                 )));
             }
             for (role, slot) in &mut state.fixed {
-                let owner = StateTensorOwner::Layer(layer);
+                let owner = StateTensorOwner::Layer(self.global_layer_start + layer);
                 let restored = tensors.remove(&(owner, *role));
                 let state_policy = policy
                     .fixed_state()
@@ -1426,7 +1553,7 @@ impl MlxHybridState {
                 )));
             }
             for (role, slot) in &mut state.fixed {
-                let owner = StateTensorOwner::Layer(layer);
+                let owner = StateTensorOwner::Layer(self.global_layer_start + layer);
                 let restored = tensors.remove(&(owner, *role));
                 let state_policy = policy
                     .fixed_state()
@@ -1482,6 +1609,7 @@ impl MlxHybridState {
                 }
             }
         }
+        let global_layer_start = self.global_layer_start;
         Ok(range
             .flat_map(|layer| {
                 self.layers[layer]
@@ -1489,7 +1617,7 @@ impl MlxHybridState {
                     .iter()
                     .filter_map(move |(role, value)| {
                         value.as_ref().map(|array| PromptCacheStateArray {
-                            owner: StateTensorOwner::Layer(layer),
+                            owner: StateTensorOwner::Layer(global_layer_start + layer),
                             role: *role,
                             array,
                         })
@@ -1543,6 +1671,7 @@ impl MlxHybridState {
                 });
             }
         }
+        let global_layer_start = self.global_layer_start;
         let state_arrays = self
             .layers
             .iter()
@@ -1550,7 +1679,7 @@ impl MlxHybridState {
             .flat_map(|(layer, state)| {
                 state.fixed.iter().filter_map(move |(role, value)| {
                     value.as_ref().map(|array| PromptCacheStateArray {
-                        owner: StateTensorOwner::Layer(layer),
+                        owner: StateTensorOwner::Layer(global_layer_start + layer),
                         role: *role,
                         array,
                     })
@@ -1579,14 +1708,15 @@ impl RuntimeState<MlxBackend> for MlxHybridState {
 
     fn retained_values(
         &self,
-        ordinal: usize,
-        _address: eredu_runtime::ExecutionUnitAddress,
+        _ordinal: usize,
+        address: eredu_runtime::ExecutionUnitAddress,
     ) -> Result<Self::RetainedValues<'_>, StateError> {
+        let layer = address.index();
         self.layers
-            .get(ordinal)
+            .get(layer)
             .map(RuntimeLayerState::retained_values)
             .ok_or(StateError::UnknownLayer {
-                layer: ordinal,
+                layer,
                 count: self.layers.len(),
             })
     }
@@ -1605,12 +1735,12 @@ impl LayerRuntimeState<MlxBackend> for MlxHybridState {
 
 #[derive(Debug, Clone, Copy)]
 enum HybridAttentionPolicy {
-    KeyValue(Option<i32>),
+    KeyValue { window: Option<i32>, key_only: bool },
     Compressed,
 }
 
 fn hybrid_attention_policy(
-    layer: usize,
+    _layer: usize,
     policy: &LayerCachePolicy,
 ) -> Result<Option<HybridAttentionPolicy>, Exception> {
     match policy {
@@ -1618,14 +1748,23 @@ fn hybrid_attention_policy(
         LayerCachePolicy::KeyValue { attention, .. }
         | LayerCachePolicy::KeyValueWithFixedState { attention, .. } => attention
             .sliding_window_i32()
-            .map(HybridAttentionPolicy::KeyValue)
+            .map(|window| HybridAttentionPolicy::KeyValue {
+                window,
+                key_only: false,
+            })
+            .map(Some)
+            .map_err(|error| Exception::custom(error.to_string())),
+        LayerCachePolicy::KeyOnly { attention, .. }
+        | LayerCachePolicy::KeyOnlyWithFixedState { attention, .. } => attention
+            .sliding_window_i32()
+            .map(|window| HybridAttentionPolicy::KeyValue {
+                window,
+                key_only: true,
+            })
             .map(Some)
             .map_err(|error| Exception::custom(error.to_string())),
         LayerCachePolicy::CompressedLatentRotary { .. } => {
             Ok(Some(HybridAttentionPolicy::Compressed))
         }
-        other => Err(Exception::custom(format!(
-            "MLX hybrid state does not support cache policy at layer {layer}: {other:?}"
-        ))),
     }
 }

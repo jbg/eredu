@@ -91,6 +91,8 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
                     .as_deref()
                     .map(parameter)
                     .transpose()?,
+                input_transform: None,
+                route_scale: None,
                 quantization: None,
                 routing,
             },
@@ -102,6 +104,7 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
                 input_dimensions: policy.hidden,
                 intermediate_dimensions: policy.expert_width,
                 output_dimensions: policy.hidden,
+                activation: eredu_nn::GatedExpertActivation::Silu,
                 limit: policy.limit,
                 layout: SwiGluExpertLayout::Packed {
                     gate_up: SwiGluExpertProjection {

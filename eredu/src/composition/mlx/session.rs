@@ -14,8 +14,6 @@ use safemlx::{
 };
 use std::path::Path;
 
-#[cfg(feature = "mlx-media")]
-use crate::backend::mlx::runtime::media::{ModelProcessor, PreparedModelInput};
 use crate::core::generation::MtpConfig;
 use crate::{
     backend::mlx::error::Error,
@@ -27,6 +25,8 @@ use crate::{
     },
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
 };
+#[cfg(feature = "mlx-media")]
+use crate::{backend::mlx::runtime::media::PreparedModelInput, composition::mlx::ModelProcessor};
 use eredu_core::MtpStats;
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
@@ -156,10 +156,11 @@ enum MlxInputPayload {
 
 #[derive(Debug, Clone, Default)]
 struct MlxInputMetadata {
-    qwen_grid_thw: Option<Array>,
-    vision_grid_thw: Option<Array>,
-    patch_position_ids: Option<Array>,
+    patch_grid: Option<Array>,
+    patch_positions: Option<Array>,
     audio_mask: Option<Array>,
+    patch_extent: Option<[i32; 3]>,
+    audio_valid_frames: Option<i32>,
 }
 
 impl From<input::ModelInput<'_>> for MlxModelInput {
@@ -182,10 +183,11 @@ impl From<input::ModelInput<'_>> for MlxModelInput {
                         }
                     },
                     metadata: MlxInputMetadata {
-                        qwen_grid_thw: part.metadata.qwen_grid_thw.cloned(),
-                        vision_grid_thw: part.metadata.vision_grid_thw.cloned(),
-                        patch_position_ids: part.metadata.patch_position_ids.cloned(),
+                        patch_grid: part.metadata.patch_grid.cloned(),
+                        patch_positions: part.metadata.patch_positions.cloned(),
                         audio_mask: part.metadata.audio_mask.cloned(),
+                        patch_extent: part.metadata.patch_extent,
+                        audio_valid_frames: part.metadata.audio_valid_frames,
                     },
                 })
                 .collect(),
@@ -212,10 +214,11 @@ impl MlxModelInput {
                     MlxInputPayload::Embeddings(value) => input::InputPayload::Embeddings(value),
                 },
                 metadata: input::InputMetadata {
-                    qwen_grid_thw: part.metadata.qwen_grid_thw.as_ref(),
-                    vision_grid_thw: part.metadata.vision_grid_thw.as_ref(),
-                    patch_position_ids: part.metadata.patch_position_ids.as_ref(),
+                    patch_grid: part.metadata.patch_grid.as_ref(),
+                    patch_positions: part.metadata.patch_positions.as_ref(),
                     audio_mask: part.metadata.audio_mask.as_ref(),
+                    patch_extent: part.metadata.patch_extent,
+                    audio_valid_frames: part.metadata.audio_valid_frames,
                 },
             })
             .collect::<Vec<_>>();
@@ -710,11 +713,15 @@ impl<'a> MlxModelSession<'a> {
             (Model::Qwen(model), ModelCache::Qwen(cache)) => {
                 model.forward_with_observer(input_tokens, mask, cache, stream, observer)
             }
-            (Model::MuseGlimmer(model), ModelCache::KeyValue(cache)) => {
-                model.forward_with_observer(input_tokens, mask, cache, stream, observer)
-            }
-            (Model::MuseGlimmer(model), ModelCache::PagedKeyValue(cache)) => {
-                model.forward_paged_with_observer(input_tokens, mask, cache, stream, observer)
+            (Model::MuseGlimmer(model), ModelCache::MuseGlimmer(cache)) => {
+                if mask.is_some() {
+                    return Err(Error::UnsupportedArchitecture(
+                        "explicit Muse-Glimmer observer masks are not bound yet".into(),
+                    ));
+                }
+                let output = model.forward_tokens(input_tokens, cache, stream)?;
+                observer.observe("model.logits", &output)?;
+                Ok(output)
             }
             (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
             | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => {
@@ -725,13 +732,15 @@ impl<'a> MlxModelSession<'a> {
                 }
                 model.forward_with_observer(input_tokens, cache, stream, observer)
             }
-            (Model::Gemma4(model), ModelCache::Gemma4(cache)) => {
+            (Model::Gemma4(model), ModelCache::Hybrid(cache)) => {
                 if mask.is_some() {
                     return Err(Error::UnsupportedArchitecture(
                         "an explicit Gemma observer mask is unsupported; the adapter constructs its per-layer masks from cache state".into(),
                     ));
                 }
-                model.forward_with_observer(input_tokens, cache, stream, observer)
+                let output = model.forward_tokens(input_tokens, cache, stream)?;
+                observer.observe("model.logits", &output)?;
+                Ok(output)
             }
             (model, _) => {
                 return Err(Error::UnsupportedArchitecture(format!(
@@ -773,31 +782,20 @@ impl<'a> MlxModelSession<'a> {
         stream: &Stream,
         observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Submission<Array, MlxCompletion>, Error> {
-        let output = input.with_borrowed(|input| {
-            if let (Model::Gemma4(model), ModelCache::Gemma4(cache)) = (&mut *model, &mut *cache) {
-                return model
-                    .prefill_input_with_observer(input, cache, stream, observer)
-                    .map_err(|error| {
-                        Error::Exception(safemlx::error::Exception::custom(error.to_string()))
-                    })?
+        let output = input.with_borrowed(|input| match (&mut *model, &mut *cache) {
+            (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
+            | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => model
+                .prefill_input_with_observer(input, cache, stream, observer)
+                .map_err(|error| {
+                    Error::Exception(safemlx::error::Exception::custom(error.to_string()))
+                })?
+                .try_index_device((.., -1, ..), stream)
+                .map_err(Error::from),
+            _ => {
+                let tokens = input::text_token_ids(input, stream)?;
+                Self::forward_with_observer(model, &tokens, None, cache, stream, observer)?
                     .try_index_device((.., -1, ..), stream)
-                    .map_err(Error::from);
-            }
-            match (&mut *model, &mut *cache) {
-                (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
-                | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => model
-                    .prefill_input_with_observer(input, cache, stream, observer)
-                    .map_err(|error| {
-                        Error::Exception(safemlx::error::Exception::custom(error.to_string()))
-                    })?
-                    .try_index_device((.., -1, ..), stream)
-                    .map_err(Error::from),
-                _ => {
-                    let tokens = input::text_token_ids(input, stream)?;
-                    Self::forward_with_observer(model, &tokens, None, cache, stream, observer)?
-                        .try_index_device((.., -1, ..), stream)
-                        .map_err(Error::from)
-                }
+                    .map_err(Error::from)
             }
         })?;
         MlxCompletion::submission(output)
@@ -1078,8 +1076,8 @@ fn prefill_model(
         (Model::DeepSeek(model), ModelCache::DeepSeek(cache)) => {
             prefill_pair(model.as_mut(), cache, input, stream)
         }
-        (Model::Gemma4(model), ModelCache::Gemma4(cache)) => {
-            prefill_pair(model.as_mut(), cache, input, stream)
+        (Model::Gemma4(model), ModelCache::Hybrid(cache)) => {
+            prefill_pair(model, cache, input, stream)
         }
         (Model::GptOss(model), ModelCache::GptOss(cache)) => {
             prefill_pair(model, cache, input, stream)
@@ -1093,10 +1091,7 @@ fn prefill_model(
         (Model::Llama(model), ModelCache::Llama(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::MuseGlimmer(model), ModelCache::KeyValue(cache)) => {
-            prefill_pair(model, cache, input, stream)
-        }
-        (Model::MuseGlimmer(model), ModelCache::PagedKeyValue(cache)) => {
+        (Model::MuseGlimmer(model), ModelCache::MuseGlimmer(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
         (Model::Lfm2(model), ModelCache::Hybrid(cache)) => {
@@ -1133,8 +1128,8 @@ fn decode_model(
         (Model::DeepSeek(model), ModelCache::DeepSeek(cache)) => {
             decode_pair(model.as_mut(), cache, input, stream)
         }
-        (Model::Gemma4(model), ModelCache::Gemma4(cache)) => {
-            decode_pair(model.as_mut(), cache, input, stream)
+        (Model::Gemma4(model), ModelCache::Hybrid(cache)) => {
+            decode_pair(model, cache, input, stream)
         }
         (Model::GptOss(model), ModelCache::GptOss(cache)) => {
             decode_pair(model, cache, input, stream)
@@ -1146,10 +1141,7 @@ fn decode_model(
             decode_pair(model, cache, input, stream)
         }
         (Model::Llama(model), ModelCache::Llama(cache)) => decode_pair(model, cache, input, stream),
-        (Model::MuseGlimmer(model), ModelCache::KeyValue(cache)) => {
-            decode_pair(model, cache, input, stream)
-        }
-        (Model::MuseGlimmer(model), ModelCache::PagedKeyValue(cache)) => {
+        (Model::MuseGlimmer(model), ModelCache::MuseGlimmer(cache)) => {
             decode_pair(model, cache, input, stream)
         }
         (Model::Lfm2(model), ModelCache::Hybrid(cache)) => decode_pair(model, cache, input, stream),
@@ -1200,46 +1192,6 @@ fn last_token_logits(logits: Array, stream: &Stream) -> Result<Array, Error> {
         .map_err(Into::into)
 }
 
-fn with_muse_cache<T>(
-    cache: &mut ModelCache,
-    layout: eredu_runtime::StateLayout,
-    execute: impl FnOnce(
-        &mut crate::composition::mlx_architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache,
-    ) -> Result<T, Error>,
-) -> Result<T, Error> {
-    use crate::composition::mlx_architectures::muse_glimmer::layerwise::MuseGlimmerLayerwiseCache;
-    let mut owned = match cache {
-        ModelCache::KeyValue(values) => {
-            MuseGlimmerLayerwiseCache::concat(layout.clone(), std::mem::take(values))
-        }
-        ModelCache::PagedKeyValue(values) => {
-            MuseGlimmerLayerwiseCache::paged(layout, std::mem::take(values))
-        }
-        _ => {
-            return Err(Error::UnsupportedArchitecture(
-                "Muse-Glimmer cache does not match model".into(),
-            ))
-        }
-    };
-    let result = execute(&mut owned);
-    match (cache, owned) {
-        (
-            ModelCache::KeyValue(values),
-            MuseGlimmerLayerwiseCache::Concat {
-                caches: restored, ..
-            },
-        ) => *values = restored,
-        (
-            ModelCache::PagedKeyValue(values),
-            MuseGlimmerLayerwiseCache::Paged {
-                caches: restored, ..
-            },
-        ) => *values = restored,
-        _ => unreachable!("Muse-Glimmer tensor-parallel cache wrapper changed variants"),
-    }
-    result
-}
-
 fn prefill_model_tensor_parallel(
     model: &mut Model,
     cache: &mut ModelCache,
@@ -1251,7 +1203,7 @@ fn prefill_model_tensor_parallel(
         Error::Parallel("tensor-parallel model session has no tensor communicator".into())
     })?;
     let logits = match (model, cache) {
-        (Model::Gemma4(model), ModelCache::Gemma4(cache)) => {
+        (Model::Gemma4(model), ModelCache::Hybrid(cache)) => {
             model.prefill_tensor_parallel(input, cache, group, stream)?
         }
         (Model::Inkling(model), ModelCache::Inkling(cache)) => {
@@ -1267,12 +1219,9 @@ fn prefill_model_tensor_parallel(
         | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => {
             model.prefill_tensor_parallel(input, cache, group, stream)?
         }
-        (
-            Model::MuseGlimmer(model),
-            cache @ (ModelCache::KeyValue(_) | ModelCache::PagedKeyValue(_)),
-        ) => with_muse_cache(cache, model.state_layout()?, |cache| {
-            model.prefill_tensor_parallel(input, cache, group, stream)
-        })?,
+        (Model::MuseGlimmer(model), ModelCache::MuseGlimmer(cache)) => {
+            model.prefill_tensor_parallel(input, cache, group, stream)?
+        }
         (model, cache) => {
             let tokens = input::text_token_ids(input, stream)?;
             forward_model_tensor_parallel(model, cache, &tokens, group, stream)?
@@ -1307,7 +1256,7 @@ fn forward_model_tensor_parallel(
             model.forward_tensor_parallel(input, cache, group, stream)
         }
         (Model::Inkling(model), ModelCache::Inkling(cache)) => {
-            model.decode_tensor_parallel(input, cache, group, stream)
+            model.forward_tensor_parallel(input, cache, group, stream)
         }
         (Model::KimiLinear(model), ModelCache::Hybrid(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
@@ -1321,18 +1270,15 @@ fn forward_model_tensor_parallel(
         (Model::NemotronH(model), ModelCache::Hybrid(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
-        (Model::Gemma4(model), ModelCache::Gemma4(cache)) => {
-            model.decode_tensor_parallel(input, cache, group, stream)
+        (Model::Gemma4(model), ModelCache::Hybrid(cache)) => {
+            model.forward_tensor_parallel(input, cache, group, stream)
         }
         (Model::Qwen(model), ModelCache::Qwen(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
-        (
-            Model::MuseGlimmer(model),
-            cache @ (ModelCache::KeyValue(_) | ModelCache::PagedKeyValue(_)),
-        ) => with_muse_cache(cache, model.state_layout()?, |cache| {
-            model.forward_tensor_parallel(input, None, cache, group, stream)
-        }),
+        (Model::MuseGlimmer(model), ModelCache::MuseGlimmer(cache)) => {
+            model.forward_tensor_parallel(input, cache, group, stream)
+        }
         (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
         | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
@@ -1476,7 +1422,7 @@ mod tests {
         let grid = Array::from_slice(&[1_i32, 2, 2], &[1, 3]);
         let parts = [
             input::InputPart::text_token_ids(&tokens),
-            input::InputPart::image_tensor(&image, input::InputMetadata::qwen_grid_thw(&grid)),
+            input::InputPart::image_tensor(&image, input::InputMetadata::patch_grid(&grid)),
         ];
 
         let owned = MlxModelInput::from(input::ModelInput::new(&parts));
@@ -1487,7 +1433,7 @@ mod tests {
             assert_eq!(
                 borrowed.parts[1]
                     .metadata
-                    .qwen_grid_thw
+                    .patch_grid
                     .expect("grid metadata")
                     .shape(),
                 &[1, 3]

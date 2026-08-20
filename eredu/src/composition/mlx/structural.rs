@@ -15,11 +15,8 @@ use crate::backend::mlx::{error::Error, runtime::checkpoint::store::SafetensorsW
 use crate::composition::{
     llama_checkpoint,
     mlx_architectures::{
-        gemma4::{checkpoint as gemma4_checkpoint, model as gemma4},
         gpt_oss::checkpoint as gpt_oss_checkpoint,
-        inkling::{checkpoint as inkling_checkpoint, model as inkling},
         moshi::personaplex_checkpoint,
-        muse_glimmer::checkpoint as muse_glimmer_checkpoint,
         qwen::{
             hybrid::checkpoint as qwen_hybrid_checkpoint, vl::checkpoint as qwen_vl_checkpoint,
         },
@@ -167,18 +164,13 @@ pub(crate) fn validate_safetensors(
         StructuralValidationPolicy::Exact => match kind {
             ModelKind::DeepSeekV3 => validate_neutral_deepseek_v3_safetensors(config, store),
             ModelKind::DeepSeekV4 => validate_neutral_deepseek_v4_safetensors(config, store),
-            ModelKind::Gemma4 => gemma4_checkpoint::validate_safetensors(
-                config,
-                store,
-                !options.weight_residency.is_fully_resident(),
-                options.weight_residency.expert_cache().is_some(),
-            ),
+            ModelKind::Gemma4 => validate_neutral_gemma4_safetensors(config, store),
             ModelKind::GptOss => gpt_oss_checkpoint::validate_safetensors(config, store),
-            ModelKind::Inkling => inkling_checkpoint::validate_safetensors(config, store),
+            ModelKind::Inkling => validate_neutral_inkling_safetensors(config, store),
             ModelKind::KimiLinear => validate_neutral_kimi_safetensors(config, store),
             ModelKind::Lfm2 => validate_neutral_lfm2_safetensors(config, store),
             ModelKind::Llama => llama_checkpoint::validate_safetensors(config, store),
-            ModelKind::MuseGlimmer => muse_glimmer_checkpoint::validate_safetensors(config, store),
+            ModelKind::MuseGlimmer => validate_neutral_muse_glimmer_safetensors(config, store),
             ModelKind::NemotronH => validate_neutral_nemotron_safetensors(config, store),
             ModelKind::PersonaPlex => personaplex_checkpoint::validate_safetensors(config, store),
             ModelKind::Qwen2 | ModelKind::Qwen3 => validate_neutral_qwen_safetensors(config, store),
@@ -233,14 +225,14 @@ pub(crate) fn validate_gguf(
                 if let Err(error) = architecture.validate_load_policy(options) {
                     invalid_geometry(error.to_string())
                 } else {
-                    gemma4_checkpoint::validate_gguf(checkpoint, metadata)
+                    validate_neutral_gemma4_gguf(checkpoint, metadata)
                 }
             }
             GgufArchitecture::Inkling => {
                 if let Err(error) = architecture.validate_load_policy(options) {
                     invalid_geometry(error.to_string())
                 } else {
-                    inkling_checkpoint::validate_gguf(checkpoint, metadata)
+                    validate_neutral_inkling_gguf(checkpoint, metadata)
                 }
             }
             GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
@@ -250,7 +242,7 @@ pub(crate) fn validate_gguf(
                 llama_checkpoint::validate_gguf(checkpoint, metadata)
             }
             GgufArchitecture::MuseGlimmer => {
-                muse_glimmer_checkpoint::validate_gguf(checkpoint, metadata)
+                validate_neutral_muse_glimmer_gguf(checkpoint, metadata)
             }
             GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
                 if let Err(error) = architecture.validate_load_policy(options) {
@@ -295,6 +287,122 @@ pub(crate) fn validate_gguf(
         StructuralValidationPolicy::Unverified => unverified(architecture.metadata_name()),
     };
     validation.with_strict_catalog(options.weight_residency.strict_loading())
+}
+
+fn validate_neutral_gemma4_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let bytes = match serde_json::to_vec(config) {
+        Ok(bytes) => bytes,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let args = match eredu_architectures::gemma4::FamilyConfig::from_hf_json(&bytes) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::gemma4::safetensors_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+fn validate_neutral_inkling_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let bytes = match serde_json::to_vec(config) {
+        Ok(bytes) => bytes,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let args = match eredu_architectures::inkling::ModelArgs::from_hf_json(&bytes) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::inkling::safetensors_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+fn validate_neutral_muse_glimmer_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let bytes = match serde_json::to_vec(config) {
+        Ok(bytes) => bytes,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let args = match eredu_architectures::muse_glimmer::DecoderConfig::from_hf_json(&bytes) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::muse_glimmer::safetensors_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+fn validate_neutral_gemma4_gguf(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    let names = checkpoint
+        .catalog()
+        .tensors()
+        .flat_map(|tensor| tensor.outputs())
+        .map(|output| output.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let text = match eredu_architectures::gemma4::ModelArgs::from_gguf_metadata(&names, metadata) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let family = match eredu_architectures::gemma4::family_from_gguf_metadata(text, metadata, None)
+    {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::gemma4::gguf_plan(&family.text) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
+}
+
+fn validate_neutral_inkling_gguf(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    let args = match eredu_architectures::inkling::ModelArgs::from_gguf_metadata(metadata) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::inkling::gguf_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
+}
+
+fn validate_neutral_muse_glimmer_gguf(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    let args = match eredu_architectures::muse_glimmer::DecoderConfig::from_gguf_metadata(
+        metadata,
+        checkpoint.contains_gguf_tensor("output.weight"),
+    ) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::muse_glimmer::gguf_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
 }
 
 fn validate_neutral_qwen_safetensors(
@@ -592,18 +700,81 @@ fn unverified(architecture: &str) -> StructuralValidation {
 }
 
 pub(crate) fn validate_inkling_mmproj_gguf(
+    model_checkpoint: &GgufCheckpoint,
     model_metadata: &HashMap<String, GgufMetadataValue>,
-    mmproj: &inkling::InklingMmprojGguf,
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    inkling_checkpoint::validate_mmproj_gguf(model_metadata, mmproj)
+    let mut args = match eredu_architectures::inkling::ModelArgs::from_gguf_metadata(model_metadata)
+    {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let formats = match crate::backend::mlx::runtime::checkpoint::load::gguf_quantization_configs(
+        checkpoint,
+        eredu_architectures::inkling::translate_mmproj_weight_name,
+    ) {
+        Ok(formats) => formats,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let audio = formats
+        .iter()
+        .filter(|(name, _)| name.starts_with("audio."))
+        .map(|(name, value)| (name.clone(), *value))
+        .collect();
+    let vision = formats
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("visual."))
+        .collect();
+    args = match args.with_gguf_projector_metadata(model_metadata, metadata, audio, vision) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let primary = validate_neutral_inkling_gguf(model_checkpoint, model_metadata);
+    if !matches!(primary, StructuralValidation::Exact) {
+        return primary;
+    }
+    let plan = match eredu_architectures::inkling::mmproj_gguf_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
 }
 
 pub(crate) fn validate_gemma4_mmproj_gguf(
     model_checkpoint: &GgufCheckpoint,
     model_metadata: &HashMap<String, GgufMetadataValue>,
-    mmproj: &gemma4::Gemma4MmprojGguf,
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    gemma4_checkpoint::validate_mmproj_gguf(model_checkpoint, model_metadata, mmproj)
+    let names = model_checkpoint
+        .catalog()
+        .tensors()
+        .flat_map(|tensor| tensor.outputs())
+        .map(|output| output.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let text =
+        match eredu_architectures::gemma4::ModelArgs::from_gguf_metadata(&names, model_metadata) {
+            Ok(args) => args,
+            Err(error) => return invalid_geometry(error.to_string()),
+        };
+    let family = match eredu_architectures::gemma4::family_from_gguf_metadata(
+        text,
+        model_metadata,
+        Some(metadata),
+    ) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let primary = validate_neutral_gemma4_gguf(model_checkpoint, model_metadata);
+    if !matches!(primary, StructuralValidation::Exact) {
+        return primary;
+    }
+    let plan = match eredu_architectures::gemma4::mmproj_gguf_plan(&family) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
 }
 
 pub(crate) fn validate_muse_glimmer_projector_gguf(
@@ -612,12 +783,31 @@ pub(crate) fn validate_muse_glimmer_projector_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    muse_glimmer_checkpoint::validate_projector_gguf(
-        model_checkpoint,
-        model_metadata,
+    let formats = match crate::backend::mlx::runtime::checkpoint::load::gguf_quantization_configs(
         checkpoint,
-        metadata,
+        eredu_architectures::muse_glimmer::translate_projector_gguf_name,
+    ) {
+        Ok(formats) => formats,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let args = match eredu_architectures::muse_glimmer::DecoderConfig::from_gguf_metadata(
+        model_metadata,
+        model_checkpoint.contains_gguf_tensor("output.weight"),
     )
+    .and_then(|args| args.with_gguf_projector_metadata(metadata, formats))
+    {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let primary = validate_neutral_muse_glimmer_gguf(model_checkpoint, model_metadata);
+    if !matches!(primary, StructuralValidation::Exact) {
+        return primary;
+    }
+    let plan = match eredu_architectures::muse_glimmer::projector_gguf_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
 }
 
 pub(crate) fn validate_qwen3_vl_projector_gguf(

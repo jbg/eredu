@@ -27,10 +27,8 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{layers::silu, linear},
     backend::mlx::runtime::distributed::parallel::{
-        aligned_partition_units, partitioned_projection_members,
-        register_partitioned_projection_group, register_projection_module,
-        register_replicated_module, ParallelBuildContext, ParallelExecutionContext,
-        ParallelPlanBuilder, ProjectionSharding,
+        aligned_partition_units, partitioned_projection_members, register_replicated_module,
+        ParallelBuildContext, ParallelExecutionContext, ParallelPlanBuilder, ProjectionSharding,
     },
     core::balanced_contiguous_range,
 };
@@ -44,22 +42,6 @@ pub enum LinearParallelism {
     Column,
     /// Input features are rank-local and output partials are summed.
     Row,
-}
-
-/// Registers an architecture-native linear and all of its quantization
-/// companions with the shared typed placement rules.
-pub(crate) fn register_linear_parameter_group(
-    planner: &mut ParallelPlanBuilder,
-    projection: &MaybeQuantized<nn::Linear>,
-    prefix: &str,
-    parallelism: LinearParallelism,
-) -> Result<(), Error> {
-    let placement = match parallelism {
-        LinearParallelism::Replicated => ProjectionSharding::Replicated,
-        LinearParallelism::Column => ProjectionSharding::Column,
-        LinearParallelism::Row => ProjectionSharding::Row,
-    };
-    register_projection_module(planner, projection, prefix, placement)
 }
 
 /// Registers all parameters in an architecture-owned module as replicated.
@@ -88,50 +70,6 @@ pub(crate) struct GqaProjectionNames {
     pub key: &'static str,
     pub value: &'static str,
     pub output: &'static str,
-}
-
-/// Checkpoint-facing names for projections sharing one SwiGLU intermediate
-/// partition.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SwiGluProjectionNames {
-    pub gate: &'static str,
-    pub up: &'static str,
-    pub down: &'static str,
-}
-
-/// Registers separate GQA projections as one logical head domain. The output
-/// projection's packed-input alignment determines the smallest legal group of
-/// complete KV/query-head bundles.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn register_gqa_projection_group(
-    planner: &mut ParallelPlanBuilder,
-    prefix: &str,
-    names: GqaProjectionNames,
-    q_proj: &MaybeQuantized<nn::Linear>,
-    k_proj: &MaybeQuantized<nn::Linear>,
-    v_proj: &MaybeQuantized<nn::Linear>,
-    o_proj: &MaybeQuantized<nn::Linear>,
-    query_heads: i32,
-    kv_heads: i32,
-    head_dim: i32,
-) -> Result<(), Error> {
-    let (units, members) = gqa_projection_members(
-        prefix,
-        names,
-        q_proj,
-        k_proj,
-        v_proj,
-        o_proj,
-        query_heads,
-        kv_heads,
-        head_dim,
-    )?;
-    planner.register(ParameterGroupSpec::partitioned(
-        format!("{prefix}.projections"),
-        ParameterRole::AttentionHeads,
-        units,
-        members,
-    )?)
 }
 
 /// Builds the physical members for one GQA head domain. Architectures with
@@ -179,38 +117,6 @@ pub(crate) fn gqa_projection_members(
             (k_proj, k_prefix.as_str(), ProjectionSharding::Column),
             (v_proj, v_prefix.as_str(), ProjectionSharding::Column),
             (o_proj, o_prefix.as_str(), ProjectionSharding::Row),
-        ],
-        units,
-    )
-}
-
-/// Registers gate, up, and down projections as one logical dense
-/// feed-forward intermediate domain, including packed quantization companions.
-pub(crate) fn register_swiglu_projection_group(
-    planner: &mut ParallelPlanBuilder,
-    prefix: &str,
-    names: SwiGluProjectionNames,
-    gate_proj: &MaybeQuantized<nn::Linear>,
-    up_proj: &MaybeQuantized<nn::Linear>,
-    down_proj: &MaybeQuantized<nn::Linear>,
-    intermediate_size: i32,
-) -> Result<(), Error> {
-    let intermediate = usize::try_from(intermediate_size)
-        .map_err(|_| Error::Parallel("feed-forward width exceeds usize".into()))?;
-    let units =
-        aligned_partition_units(prefix, intermediate, 1, row_partition_alignment(down_proj)?)?;
-    let gate_prefix = format!("{prefix}.{}", names.gate);
-    let up_prefix = format!("{prefix}.{}", names.up);
-    let down_prefix = format!("{prefix}.{}", names.down);
-    let logical_name = format!("{prefix}.projections");
-    register_partitioned_projection_group(
-        planner,
-        &logical_name,
-        ParameterRole::FeedForwardIntermediate,
-        &[
-            (gate_proj, gate_prefix.as_str(), ProjectionSharding::Column),
-            (up_proj, up_prefix.as_str(), ProjectionSharding::Column),
-            (down_proj, down_prefix.as_str(), ProjectionSharding::Row),
         ],
         units,
     )
@@ -726,26 +632,6 @@ fn add_output_bias(
     };
     match bias {
         Some(bias) => Ok(output.add(bias, stream)?),
-        None => Ok(output),
-    }
-}
-
-/// Executes a row-sharded projection stored in an architecture-native module.
-/// Bias is applied once after the rank-local partials are reduced.
-pub(crate) fn forward_row_parallel(
-    projection: &mut MaybeQuantized<nn::Linear>,
-    input: &Array,
-    group: &safemlx::distributed::Group,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    let partial = forward_without_output_bias(projection, input, stream)?;
-    let output = safemlx::distributed::all_sum(&partial, group, stream)?;
-    let bias = match projection {
-        MaybeQuantized::Original(linear) => linear.bias.value.as_ref(),
-        MaybeQuantized::Quantized(linear) => linear.inner.bias.value.as_ref(),
-    };
-    match bias {
-        Some(bias) => output.add(bias, stream),
         None => Ok(output),
     }
 }

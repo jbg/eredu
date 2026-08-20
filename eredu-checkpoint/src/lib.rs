@@ -8,6 +8,8 @@
 use eredu_gguf::{Endian, GgmlType};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
+/// Composite model-artifact and component schemas.
+pub mod composite;
 /// Backend-neutral logical GGUF storage and portable encoded leases.
 pub mod expert;
 pub mod gguf_store;

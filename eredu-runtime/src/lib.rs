@@ -9,6 +9,8 @@
 pub mod backend;
 /// Backend-neutral mutable-cache ownership, storage, and admission algorithms.
 pub mod cache;
+/// Typed multimodal component graphs and residency accounting.
+pub mod component;
 /// Backend-neutral dense-stream residency telemetry.
 pub mod dense;
 /// Backend-neutral speculative-state fork, commit, and rollback ownership.
@@ -18,6 +20,8 @@ pub mod execution;
 pub mod expert;
 /// Backend-neutral causal-model and token-sampling contracts.
 pub mod generation;
+/// Backend-neutral ownership of prepared multimodal tensors.
+pub mod input;
 pub mod inspection;
 /// Statically dispatched layered architecture lifecycle and resident policy.
 pub mod layered;
@@ -51,6 +55,10 @@ pub use cache::{
     CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
     PROMPT_CACHE_CURRENT_FILE, PROMPT_CACHE_GENERATIONS_DIRECTORY,
 };
+pub use component::{
+    ComponentDomain, ComponentGraph, ComponentGraphError, ComponentKind, ComponentResidencyClass,
+    ComponentSpec,
+};
 pub use dense::{
     DenseCacheMetrics, DenseDiskStreamReport, DenseExecutionGroupReport, DensePassCounterSnapshot,
     DensePassReport, DenseStreamTelemetry, DenseStreamTelemetryError, DenseTierResidencyReport,
@@ -66,7 +74,11 @@ pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
     PenaltyConfig, Sampler, SamplingBackend, SamplingConfigurationError, SpeculativeSampler,
 };
-pub use inspection::{observe_and_intervene, ActivationObserver, NoopObserver, RoutingObservation};
+pub use input::{PreparedInputPart, PreparedInputPayload, PreparedModelInput};
+pub use inspection::{
+    observe_and_intervene, ActivationObserver, NoopObserver, RoutingObservation,
+    TargetStateCapture, TargetStateCaptureError, TargetStateTap,
+};
 pub use layered::{
     LayeredArchitecture, LayeredForwardState, LayerwisePolicy, LayerwiseRuntime,
     LayerwiseRuntimeError, ParallelLayeredArchitecture, ResidentRuntime, ResidentUnitWindow,

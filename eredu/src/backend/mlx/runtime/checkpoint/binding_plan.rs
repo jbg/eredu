@@ -177,7 +177,20 @@ impl BindingPlan {
 }
 
 fn recipe_dtype_matches(expected: &RecipeDtype, actual: &RecipeDtype) -> bool {
-    expected == actual || matches!((expected, actual), (RecipeDtype::U8, RecipeDtype::F8E4M3))
+    expected == actual
+        || matches!((expected, actual), (RecipeDtype::U8, RecipeDtype::F8E4M3))
+        // Unloaded dense module parameters use floating placeholders, then
+        // adopt the checkpoint-native floating dtype. Keep derived bindings
+        // consistent with direct bindings so aliases and layout recipes do
+        // not reject valid BF16/F16 checkpoints during the second plan check.
+        || (is_floating_recipe_dtype(expected) && is_floating_recipe_dtype(actual))
+}
+
+fn is_floating_recipe_dtype(dtype: &RecipeDtype) -> bool {
+    matches!(
+        dtype,
+        RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32 | RecipeDtype::F64
+    )
 }
 
 /// Invalid declarative bindings or inferred recipe outputs.
@@ -380,6 +393,19 @@ mod tests {
             "encoded",
             vec![4],
             RecipeDtype::U8,
+        )])
+        .unwrap();
+        assert!(plan.build_bindings(&store).is_ok());
+    }
+
+    #[test]
+    fn native_floating_source_can_replace_unloaded_f32_placeholder() {
+        let store = MetadataStore::new([("bf16", vec![4], StoredDtype::BF16)]);
+        let plan = BindingPlan::new(vec![PlannedBinding::direct(
+            "weight",
+            "bf16",
+            vec![4],
+            RecipeDtype::F32,
         )])
         .unwrap();
         assert!(plan.build_bindings(&store).is_ok());

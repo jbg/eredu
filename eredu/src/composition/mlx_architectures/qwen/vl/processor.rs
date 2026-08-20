@@ -209,7 +209,7 @@ impl QwenProcessor {
         Ok(PreparedInputPart::media_tensor(
             Modality::Image,
             patches,
-            OwnedInputMetadata::qwen_grid_thw(grid_thw),
+            OwnedInputMetadata::patch_grid(grid_thw),
         ))
     }
 
@@ -306,7 +306,7 @@ impl QwenProcessor {
             parts.push(PreparedInputPart::media_tensor(
                 Modality::Video,
                 patches,
-                OwnedInputMetadata::qwen_grid_thw(grid_thw),
+                OwnedInputMetadata::patch_grid(grid_thw),
             ));
             push_text_token_ids(&mut parts, &[self.vision_end_token_id()?]);
         }
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(
             parts[2]
                 .metadata
-                .qwen_grid_thw
+                .patch_grid
                 .unwrap()
                 .evaluated()
                 .unwrap()
@@ -734,7 +734,7 @@ mod tests {
         assert_eq!(
             parts[2]
                 .metadata
-                .qwen_grid_thw
+                .patch_grid
                 .unwrap()
                 .evaluated()
                 .unwrap()

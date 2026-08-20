@@ -4,11 +4,8 @@ use serde_json::Value;
 
 use crate::backend::mlx::error::Error;
 use crate::composition::mlx_architectures::{
-    gemma4::model as gemma4,
     gpt_oss::model as gpt_oss,
-    inkling::model as inkling,
     moshi::personaplex,
-    muse_glimmer,
     qwen::{
         hybrid::{qwen3_5, qwen3_next},
         vl::{model as qwen3_vl, moe as qwen3_vl_moe},
@@ -71,9 +68,21 @@ fn validate_model_config(kind: eredu_core::ModelKind, config: &Value) -> Result<
         ModelKind::DeepSeekV4 => eredu_architectures::deepseek::parse_v4_config(config)
             .map(|_| ())
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
-        ModelKind::Gemma4 => gemma4::validate_model_config_value(config),
+        ModelKind::Gemma4 => serde_json::to_vec(config)
+            .map_err(Error::from)
+            .and_then(|bytes| {
+                eredu_architectures::gemma4::FamilyConfig::from_hf_json(&bytes)
+                    .map(|_| ())
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            }),
         ModelKind::GptOss => gpt_oss::validate_model_config_value(config),
-        ModelKind::Inkling => inkling::validate_model_config_value(config),
+        ModelKind::Inkling => serde_json::to_vec(config)
+            .map_err(Error::from)
+            .and_then(|bytes| {
+                eredu_architectures::inkling::ModelArgs::from_hf_json(&bytes)
+                    .map(|_| ())
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            }),
         ModelKind::KimiLinear => {
             eredu_architectures::kimi_linear::model_args_from_config_value(config)
                 .map(|_| ())
@@ -82,7 +91,15 @@ fn validate_model_config(kind: eredu_core::ModelKind, config: &Value) -> Result<
         ModelKind::Llama => eredu_architectures::llama::model_args_from_config_value(config)
             .map(|_| ())
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
-        ModelKind::MuseGlimmer => muse_glimmer::validate_model_config_value(config),
+        ModelKind::MuseGlimmer => {
+            serde_json::to_vec(config)
+                .map_err(Error::from)
+                .and_then(|bytes| {
+                    eredu_architectures::muse_glimmer::DecoderConfig::from_hf_json(&bytes)
+                        .map(|_| ())
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                })
+        }
         ModelKind::Lfm2 => eredu_architectures::lfm2::model_args_from_config_value(config)
             .map(|_| ())
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),

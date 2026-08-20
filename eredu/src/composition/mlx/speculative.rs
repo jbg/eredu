@@ -2,6 +2,8 @@
 
 /// MLX executor for checkpoint-embedded prediction heads.
 pub(crate) mod embedded;
+/// External assistant adapters over neutral family equations and state.
+pub(crate) mod external;
 /// MLX scheduler and semantic-generation adapter over the portable core engine.
 pub(crate) mod scheduler;
 
@@ -25,12 +27,9 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::{ModelCache, ModelLoadOptions},
-    composition::mlx_architectures::gemma4::assistant::{
-        load_gemma4_assistant_gguf_with_options, load_gemma4_assistant_model_with_options,
-        Gemma4AssistantDraftModel,
-    },
-    composition::mlx_architectures::muse_glimmer::assistant::{
-        self as muse_dflash, MuseGlimmerDFlash,
+    composition::gemma4::{load_assistant_gguf, load_assistant_safetensors, Gemma4AssistantModel},
+    composition::muse_glimmer::{
+        load_dflash_gguf, load_dflash_safetensors, MuseGlimmerDFlashModel,
     },
 };
 
@@ -42,8 +41,8 @@ pub struct MlxDrafter {
 }
 
 enum MlxDrafterModel {
-    Gemma4(Box<Gemma4AssistantDraftModel>),
-    MuseGlimmerDFlash(Box<MuseGlimmerDFlash>),
+    Gemma4(Box<Gemma4AssistantModel>),
+    MuseGlimmerDFlash(Box<MuseGlimmerDFlashModel>),
 }
 
 /// Stable architecture identity for an independently loaded MLX draft model.
@@ -130,17 +129,15 @@ impl MlxDrafter {
                     )
                 })?;
             match architecture {
-                "dflash" => MlxDrafterModel::MuseGlimmerDFlash(Box::new(
-                    muse_dflash::load_with_options(source, options, stream, weights_stream)?,
+                "dflash" => MlxDrafterModel::MuseGlimmerDFlash(Box::new(load_dflash_gguf(
+                    source,
+                    options,
+                    stream,
+                    weights_stream,
+                )?)),
+                "gemma4_assistant" | "gemma4-assistant" => MlxDrafterModel::Gemma4(Box::new(
+                    load_assistant_gguf(source, options, stream, weights_stream)?,
                 )),
-                "gemma4_assistant" | "gemma4-assistant" => {
-                    MlxDrafterModel::Gemma4(Box::new(load_gemma4_assistant_gguf_with_options(
-                        source,
-                        options,
-                        stream,
-                        weights_stream,
-                    )?))
-                }
                 other => {
                     return Err(Error::UnsupportedArchitecture(format!(
                         "unsupported drafter GGUF architecture {other:?}"
@@ -156,16 +153,11 @@ impl MlxDrafter {
                 .unwrap_or_default()
             {
                 "muse_glimmer_assistant" => MlxDrafterModel::MuseGlimmerDFlash(Box::new(
-                    muse_dflash::load_with_options(source, options, stream, weights_stream)?,
+                    load_dflash_safetensors(source, options, stream, weights_stream)?,
                 )),
-                "gemma4_assistant" => {
-                    MlxDrafterModel::Gemma4(Box::new(load_gemma4_assistant_model_with_options(
-                        source,
-                        options,
-                        stream,
-                        weights_stream,
-                    )?))
-                }
+                "gemma4_assistant" => MlxDrafterModel::Gemma4(Box::new(
+                    load_assistant_safetensors(source, options, stream, weights_stream)?,
+                )),
                 other => {
                     return Err(Error::UnsupportedArchitecture(format!(
                         "unsupported safetensors drafter model_type {other:?}"
@@ -188,7 +180,7 @@ impl MlxDrafter {
         }
     }
 
-    pub(crate) fn gemma4(&self) -> &Gemma4AssistantDraftModel {
+    pub(crate) fn gemma4(&self) -> &Gemma4AssistantModel {
         match &self.model {
             MlxDrafterModel::Gemma4(model) => model,
             MlxDrafterModel::MuseGlimmerDFlash(_) => {
@@ -197,7 +189,7 @@ impl MlxDrafter {
         }
     }
 
-    pub(crate) fn gemma4_mut(&mut self) -> &mut Gemma4AssistantDraftModel {
+    pub(crate) fn gemma4_mut(&mut self) -> &mut Gemma4AssistantModel {
         match &mut self.model {
             MlxDrafterModel::Gemma4(model) => model,
             MlxDrafterModel::MuseGlimmerDFlash(_) => {
@@ -206,7 +198,7 @@ impl MlxDrafter {
         }
     }
 
-    pub(crate) fn muse_glimmer(&self) -> &MuseGlimmerDFlash {
+    pub(crate) fn muse_glimmer(&self) -> &MuseGlimmerDFlashModel {
         match &self.model {
             MlxDrafterModel::MuseGlimmerDFlash(model) => model,
             MlxDrafterModel::Gemma4(_) => {
@@ -215,7 +207,7 @@ impl MlxDrafter {
         }
     }
 
-    pub(crate) fn muse_glimmer_mut(&mut self) -> &mut MuseGlimmerDFlash {
+    pub(crate) fn muse_glimmer_mut(&mut self) -> &mut MuseGlimmerDFlashModel {
         match &mut self.model {
             MlxDrafterModel::MuseGlimmerDFlash(model) => model,
             MlxDrafterModel::Gemma4(_) => {

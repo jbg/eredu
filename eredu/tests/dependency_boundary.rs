@@ -71,6 +71,118 @@ fn shared_architectures_do_not_depend_on_accelerator_runtimes() {
 }
 
 #[test]
+fn multimodal_decoder_cutover_has_neutral_ownership_and_no_legacy_trees() {
+    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_root.parent().expect("workspace root");
+    let families = ["gemma4", "inkling", "muse_glimmer"];
+
+    for family in families {
+        let legacy = crate_root
+            .join("src/composition/mlx_architectures")
+            .join(family);
+        assert!(
+            !legacy.exists(),
+            "legacy multimodal architecture implementation remains at {legacy:?}"
+        );
+        let neutral = workspace.join("eredu-architectures/src").join(family);
+        assert!(
+            neutral.is_dir(),
+            "neutral multimodal family source is missing at {neutral:?}"
+        );
+        let mut sources = Vec::new();
+        rust_sources(&neutral, &mut sources);
+        for source in sources {
+            let text = std::fs::read_to_string(&source).expect("neutral source must be readable");
+            for forbidden in ["safemlx", "backend::mlx", "MlxBackend"] {
+                assert!(
+                    !text.contains(forbidden),
+                    "backend dependency {forbidden:?} leaked into {source:?}"
+                );
+            }
+            for other in families {
+                if other != family {
+                    assert!(
+                        !text.contains(&format!("{other}::")),
+                        "cross-family dependency {other:?} leaked into {source:?}"
+                    );
+                }
+            }
+            for qwen_dependency in ["qwen::", "qwen3_vl", "mlx_architectures::"] {
+                assert!(
+                    !text.contains(qwen_dependency),
+                    "architecture implementation dependency {qwen_dependency:?} leaked into {source:?}"
+                );
+            }
+        }
+    }
+
+    for general_root in [
+        crate_root.join("src/backend"),
+        workspace.join("eredu-nn/src"),
+        workspace.join("eredu-runtime/src"),
+        workspace.join("eredu-checkpoint/src"),
+    ] {
+        let mut sources = Vec::new();
+        rust_sources(&general_root, &mut sources);
+        for source in sources {
+            let text = std::fs::read_to_string(&source)
+                .expect("general implementation source must be readable")
+                .to_ascii_lowercase();
+            for forbidden in ["gemma", "inkling", "muse_glimmer", "muse-glimmer"] {
+                assert!(
+                    !text.contains(forbidden),
+                    "family identifier {forbidden:?} leaked into general layer {source:?}"
+                );
+            }
+        }
+    }
+
+    let pipeline = std::fs::read_to_string(
+        crate_root.join("src/composition/mlx_architectures/distributed/pipeline.rs"),
+    )
+    .expect("pipeline source must be readable");
+    for required in [
+        "struct NeutralGemma4Stage",
+        "struct NeutralInklingStage",
+        "struct MuseGlimmerStage",
+    ] {
+        assert!(
+            pipeline.contains(required),
+            "neutral pipeline stage is missing: {required}"
+        );
+    }
+    for legacy in [
+        "struct GemmaStage",
+        "Gemma4LayerwiseAdapter",
+        "InklingLayerwiseAdapter",
+        "MuseGlimmerLayerwiseAdapter",
+    ] {
+        assert!(
+            !pipeline.contains(legacy),
+            "legacy distributed implementation remains: {legacy}"
+        );
+    }
+
+    let expert = std::fs::read_to_string(
+        crate_root.join("src/composition/mlx_architectures/distributed/expert.rs"),
+    )
+    .expect("distributed expert source must be readable");
+    for legacy in [
+        "ExpertArchitecture::Gemma4",
+        "ExpertArchitecture::Inkling",
+        "ExpertArchitecture::MuseGlimmer",
+        "ExpertParallelCache::Gemma4",
+        "ExpertParallelCache::Inkling",
+        "ExpertParallelCache::MuseGlimmer",
+    ] {
+        assert!(
+            !expert.contains(legacy),
+            "legacy expert execution representation remains: {legacy}"
+        );
+    }
+}
+
+#[test]
 fn hybrid_decoder_cutover_has_neutral_ownership_and_no_legacy_trees() {
     let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace = crate_root.parent().expect("workspace root");

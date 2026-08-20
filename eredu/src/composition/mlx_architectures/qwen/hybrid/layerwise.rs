@@ -4351,9 +4351,9 @@ impl QwenHybridLayerwiseAdapter {
                     input::Modality::Image | input::Modality::Video,
                     input::InputPayload::Tensor(pixels),
                 ) => {
-                    let grid = part.metadata.qwen_grid_thw.ok_or_else(|| {
+                    let grid = part.metadata.patch_grid.ok_or_else(|| {
                         Error::UnsupportedArchitecture(format!(
-                            "Qwen3.5 {} input requires qwen_grid_thw metadata",
+                            "Qwen3.5 {} input requires patch_grid metadata",
                             part.modality.as_str()
                         ))
                     })?;
@@ -4437,9 +4437,10 @@ impl QwenHybridLayerwiseAdapter {
             let input::InputPayload::Tensor(pixels) = part.payload else {
                 continue;
             };
-            let grid = part.metadata.qwen_grid_thw.ok_or_else(|| {
-                Error::Parallel("Qwen3.5 continuation omitted qwen_grid_thw".into())
-            })?;
+            let grid = part
+                .metadata
+                .patch_grid
+                .ok_or_else(|| Error::Parallel("Qwen3.5 continuation omitted patch_grid".into()))?;
             vision_jobs.push(QwenHybridVisionJob {
                 hidden: pixels.clone(),
                 state: vision.continuation_state(pixels, grid, stream)?,
@@ -4874,9 +4875,9 @@ impl QwenHybridLayerwiseAdapter {
                             input::Modality::Image | input::Modality::Video,
                             input::InputPayload::Tensor(pixels),
                         ) => {
-                            let grid = part.metadata.qwen_grid_thw.ok_or_else(|| {
+                            let grid = part.metadata.patch_grid.ok_or_else(|| {
                                 Error::UnsupportedArchitecture(format!(
-                                    "Qwen3.5 {} input requires qwen_grid_thw metadata",
+                                    "Qwen3.5 {} input requires patch_grid metadata",
                                     part.modality.as_str()
                                 ))
                             })?;

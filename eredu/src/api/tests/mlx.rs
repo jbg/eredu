@@ -6,7 +6,6 @@ use eredu_checkpoint::WeightQuantization;
 use super::*;
 
 use crate::api::{LoadedModel, PreparedChatInput, PreparedChatMtpBatchRequest, SpeculativeDraft};
-use crate::composition::mlx_architectures::gemma4::model as gemma4;
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::quantization::CheckpointQuantizationOptions,
@@ -1279,6 +1278,341 @@ fn save_zero_qwen_checkpoint(
     .unwrap();
 }
 
+fn save_zero_gemma4_checkpoint(
+    args: &eredu_architectures::gemma4::FamilyConfig,
+    dir: &std::path::Path,
+    stream: &Stream,
+) {
+    struct ZeroCollector<'a> {
+        stream: &'a Stream,
+        arrays: Vec<(String, Array)>,
+    }
+    impl<'tensor> ParameterVisitor<'tensor, Array> for ZeroCollector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+            let mut name = metadata.id.to_string();
+            if name.contains(".experts.switch_glu.")
+                && (name.ends_with(".gate_up_proj") || name.ends_with(".down_proj"))
+            {
+                name.push_str(".weight");
+            }
+            self.arrays.push((
+                name,
+                zeros_dtype(parameter.shape(), parameter.dtype(), self.stream).unwrap(),
+            ));
+        }
+    }
+
+    type Architecture =
+        eredu_architectures::gemma4::LayeredModel<crate::backend::mlx::nn::shared::MlxBackend>;
+    type State = crate::backend::mlx::runtime::cache::state::MlxHybridState;
+    let architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut collector = ZeroCollector {
+        stream,
+        arrays: Vec::new(),
+    };
+    <Architecture as eredu_runtime::LayeredArchitecture<
+        crate::backend::mlx::nn::shared::MlxBackend,
+        State,
+    >>::static_modules(&architecture)
+    .visit_parameters(&mut collector);
+    for group in 0..3 {
+        let count = <Architecture as eredu_runtime::LayeredArchitecture<
+            crate::backend::mlx::nn::shared::MlxBackend,
+            State,
+        >>::group_unit_count(&architecture, group)
+        .unwrap();
+        for index in 0..count {
+            <Architecture as eredu_runtime::LayeredArchitecture<
+                crate::backend::mlx::nn::shared::MlxBackend,
+                State,
+            >>::build_unit(&architecture, group, index, stream)
+            .unwrap()
+            .visit_parameters(&mut collector);
+        }
+    }
+    Array::save_safetensors(
+        collector
+            .arrays
+            .iter()
+            .map(|(name, array)| (name.as_str(), array)),
+        None,
+        dir.join("model.safetensors"),
+    )
+    .unwrap();
+}
+
+fn save_zero_inkling_checkpoint(
+    args: &eredu_architectures::inkling::ModelArgs,
+    dir: &std::path::Path,
+    stream: &Stream,
+) {
+    struct ZeroCollector<'a> {
+        stream: &'a Stream,
+        arrays: Vec<(String, Array)>,
+    }
+    impl<'tensor> ParameterVisitor<'tensor, Array> for ZeroCollector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+            self.arrays.push((
+                metadata.id.to_string(),
+                zeros_dtype(parameter.shape(), parameter.dtype(), self.stream).unwrap(),
+            ));
+        }
+    }
+
+    type Architecture =
+        eredu_architectures::inkling::LayeredModel<crate::backend::mlx::nn::shared::MlxBackend>;
+    type State = crate::backend::mlx::runtime::cache::state::MlxHybridState;
+    let architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut collector = ZeroCollector {
+        stream,
+        arrays: Vec::new(),
+    };
+    <Architecture as eredu_runtime::LayeredArchitecture<
+        crate::backend::mlx::nn::shared::MlxBackend,
+        State,
+    >>::static_modules(&architecture)
+    .visit_parameters(&mut collector);
+    for group in 0..2 {
+        let count = <Architecture as eredu_runtime::LayeredArchitecture<
+            crate::backend::mlx::nn::shared::MlxBackend,
+            State,
+        >>::group_unit_count(&architecture, group)
+        .unwrap();
+        for index in 0..count {
+            <Architecture as eredu_runtime::LayeredArchitecture<
+                crate::backend::mlx::nn::shared::MlxBackend,
+                State,
+            >>::build_unit(&architecture, group, index, stream)
+            .unwrap()
+            .visit_parameters(&mut collector);
+        }
+    }
+    Array::save_safetensors(
+        collector
+            .arrays
+            .iter()
+            .map(|(name, array)| (name.as_str(), array)),
+        None,
+        dir.join("model.safetensors"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn tiny_gemma4_neutral_runtime_executes_independent_expert_cache() {
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let weights_stream = weights_context.stream();
+    let dir = temp_model_dir(
+        r#"{
+          "model_type":"gemma4","tie_word_embeddings":true,
+          "text_config":{"model_type":"gemma4_text","hidden_size":32,
+            "num_hidden_layers":1,"intermediate_size":64,"num_attention_heads":4,
+            "num_key_value_heads":2,"head_dim":8,"rms_norm_eps":0.00001,
+            "vocab_size":32,"max_position_embeddings":128,"tie_word_embeddings":true,
+            "attention_k_eq_v":false,"layer_types":["full_attention"],
+            "enable_moe_block":true,"num_experts":2,"top_k_experts":1,
+            "moe_intermediate_size":32}
+        }"#,
+    );
+    let args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
+        &std::fs::read(dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    save_zero_gemma4_checkpoint(&args, &dir, stream);
+    let mut model = crate::composition::gemma4::load_safetensors(
+        &dir,
+        eredu_runtime::WeightResidency::with_expert_cache(
+            eredu_runtime::NonExpertWeightResidency::FullyResident,
+            eredu_runtime::ExpertCacheLoadOptions::default(),
+        ),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let mut cache = model.new_cache();
+    let logits = model.forward_tokens(&tokens, &mut cache, stream).unwrap();
+    safemlx::transforms::eval([&logits]).unwrap();
+    assert_eq!(logits.shape(), &[1, 2, 32]);
+    assert!(model.expert_cache_report().unwrap().is_some());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn tiny_gemma4_external_assistant_uses_neutral_transaction_path() {
+    use eredu_core::{Completion, SpeculativeExecutor};
+
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let weights_stream = weights_context.stream();
+    let target_dir = temp_model_dir(
+        r#"{
+          "model_type":"gemma4","tie_word_embeddings":true,
+          "text_config":{"model_type":"gemma4_text","hidden_size":32,
+            "num_hidden_layers":2,"intermediate_size":64,"num_attention_heads":4,
+            "num_key_value_heads":2,"head_dim":8,"rms_norm_eps":0.00001,
+            "vocab_size":32,"max_position_embeddings":128,"tie_word_embeddings":true,
+            "attention_k_eq_v":false,"num_kv_shared_layers":1,
+            "layer_types":["full_attention","full_attention"]}
+        }"#,
+    );
+    let target_args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
+        &std::fs::read(target_dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    save_zero_gemma4_checkpoint(&target_args, &target_dir, stream);
+    let mut target = crate::composition::gemma4::load_safetensors(
+        &target_dir,
+        eredu_runtime::WeightResidency::fully_resident(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+
+    let assistant_dir = temp_model_dir(
+        r#"{
+          "model_type":"gemma4_assistant","backbone_hidden_size":32,
+          "use_ordered_embeddings":false,"tie_word_embeddings":true,"block_size":4,
+          "text_config":{"model_type":"gemma4_text","hidden_size":32,
+            "num_hidden_layers":1,"intermediate_size":64,"num_attention_heads":4,
+            "num_key_value_heads":2,"head_dim":8,"rms_norm_eps":0.00001,
+            "vocab_size":32,"max_position_embeddings":128,"tie_word_embeddings":true,
+            "attention_k_eq_v":false,"layer_types":["full_attention"]}
+        }"#,
+    );
+    let assistant_config = eredu_architectures::gemma4::AssistantConfig::from_json(
+        &std::fs::read(assistant_dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    let assistant_module = eredu_architectures::gemma4::Assistant::<
+        crate::backend::mlx::nn::shared::MlxBackend,
+    >::new(assistant_config, stream)
+    .unwrap();
+    save_zero_neutral_checkpoint(&assistant_module, &assistant_dir, stream);
+    let mut assistant = crate::composition::gemma4::load_assistant_safetensors(
+        &assistant_dir,
+        ModelLoadOptions::default(),
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+
+    let mut cache = target.new_cache();
+    let mut executor = crate::composition::mlx::speculative::external::Gemma4ExternalExecutor::new(
+        &mut target,
+        &mut assistant,
+    );
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let parts = [input::InputPart::text_token_ids(&tokens)];
+    let prepared = crate::backend::mlx::MlxModelInput::from(input::ModelInput::new(&parts));
+    let streams = crate::composition::mlx::speculative::MtpExecutionStreams::single(stream);
+    let prefill = executor.prefill(prepared, &mut cache, streams).unwrap();
+    let mut draft = executor
+        .begin_proposal(&prefill.state, 2, 2, streams)
+        .unwrap();
+    let draft_logits = executor.proposal_logits(&mut draft, 2, streams).unwrap();
+    assert_eq!(draft_logits.shape(), &[1, 1, 32]);
+
+    let checkpoint = <crate::composition::mlx::speculative::external::Gemma4ExternalExecutor<'_> as SpeculativeExecutor>::checkpoint(&cache);
+    let verification = executor
+        .submit_verification(&[3, 4], &mut cache, streams)
+        .unwrap();
+    verification.completion.wait().unwrap();
+    let commit = executor
+        .commit_verification(
+            verification.output,
+            draft,
+            &mut cache,
+            checkpoint,
+            1,
+            streams,
+        )
+        .unwrap();
+    assert_eq!(commit.replayed_tokens, 1);
+    assert_eq!(cache.offset(), 3);
+
+    fs::remove_dir_all(target_dir).unwrap();
+    fs::remove_dir_all(assistant_dir).unwrap();
+}
+
+#[test]
+fn tiny_inkling_embedded_mtp_uses_neutral_transaction_path() {
+    use eredu_core::{Completion, SpeculativeExecutor};
+
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let weights_stream = weights_context.stream();
+    let dir = temp_model_dir(
+        r#"{
+          "model_type":"inkling_mm_model","image_token_id":60,"audio_token_id":61,
+          "text_config":{"hidden_size":16,"num_hidden_layers":1,"vocab_size":64,
+            "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+            "layer_types":["full_attention"],"mlp_layer_types":["dense"],
+            "sconv_kernel_size":2,"d_rel":2,"rel_extent":16,
+            "intermediate_size":32,"dense_intermediate_size":32,
+            "n_routed_experts":2,"num_experts_per_tok":1,"n_shared_experts":1},
+          "mtp_config":{"num_nextn_predict_layers":2,"local_layer_ids":[]}
+        }"#,
+    );
+    let args = eredu_architectures::inkling::ModelArgs::from_hf_json(
+        &std::fs::read(dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    save_zero_inkling_checkpoint(&args, &dir, stream);
+    let mut target = crate::composition::inkling::load_safetensors(
+        &dir,
+        eredu_runtime::WeightResidency::fully_resident(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    assert_eq!(target.mtp_len(), 2);
+
+    let mut cache = target.new_cache();
+    let mut executor =
+        crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let parts = [input::InputPart::text_token_ids(&tokens)];
+    let prepared = crate::backend::mlx::MlxModelInput::from(input::ModelInput::new(&parts));
+    let streams = crate::composition::mlx::speculative::MtpExecutionStreams::single(stream);
+    let prefill = executor.prefill(prepared, &mut cache, streams).unwrap();
+    let mut draft = executor
+        .begin_proposal(&prefill.state, 2, 2, streams)
+        .unwrap();
+    let draft_logits = executor.proposal_logits(&mut draft, 2, streams).unwrap();
+    assert_eq!(draft_logits.shape(), &[1, 1, 64]);
+
+    let checkpoint = <crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor<
+        '_,
+        crate::composition::inkling::InklingModel,
+    > as SpeculativeExecutor>::checkpoint(&cache);
+    let verification = executor
+        .submit_verification(&[3, 4], &mut cache, streams)
+        .unwrap();
+    verification.completion.wait().unwrap();
+    let commit = executor
+        .commit_verification(
+            verification.output,
+            draft,
+            &mut cache,
+            checkpoint,
+            1,
+            streams,
+        )
+        .unwrap();
+    assert_eq!(commit.replayed_tokens, 1);
+    assert_eq!(cache.target().offset(), 3);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn tiny_text_families_quantize_through_high_level_dispatch() {
     let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
@@ -1377,8 +1711,11 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 );
             }
             "gemma4" => {
-                let args = gemma4::get_gemma4_model_args(&dir).unwrap();
-                save_zero_checkpoint(&gemma4::Model::new(args, stream).unwrap(), &dir, stream);
+                let args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
+                    &std::fs::read(dir.join("config.json")).unwrap(),
+                )
+                .unwrap();
+                save_zero_gemma4_checkpoint(&args, &dir, stream);
             }
             _ => unreachable!(),
         }
@@ -2385,7 +2722,7 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     let grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
     let parts = [
         input::InputPart::text_token_ids(&tokens),
-        input::InputPart::image_tensor(&pixels, input::InputMetadata::qwen_grid_thw(&grid)),
+        input::InputPart::image_tensor(&pixels, input::InputMetadata::patch_grid(&grid)),
     ];
     let mut cache = quantized.new_cache();
     let logits = quantized

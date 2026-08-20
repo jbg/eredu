@@ -1,6 +1,8 @@
 use std::{cell::Cell, collections::BTreeMap};
 
-use eredu_architectures::{deepseek, kimi_linear, lfm2, nemotron_h, qwen};
+use eredu_architectures::{
+    deepseek, gemma4, inkling, kimi_linear, lfm2, muse_glimmer, nemotron_h, qwen,
+};
 use eredu_core::cache::{LayerCachePolicy, StateTensorRole};
 use eredu_nn::{
     reference_gated_delta_scan, reference_selective_state_space_scan, AttentionCache,
@@ -11,10 +13,11 @@ use eredu_nn::{
     GatedDeltaScanOutput, GatedShortConvolution, GatedShortConvolutionSpec, HyperConnection,
     HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState, HyperHead,
     HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, Index, IndexedAttentionInput,
-    LinearOperator, LinearSpec, LowRankProjection, LowRankProjectionSpec, NeuralBackend,
-    NormalizationOperator, NormalizationSpec, PadMode, ParameterMetadata, ParameterSpec,
-    ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
-    PooledPositionInput, PoolingAttentionCache, PoolingOverlap, PoolingWindows,
+    JointExpertRoutingInput, JointExpertRoutingResult, LinearOperator, LinearSpec,
+    LowRankProjection, LowRankProjectionSpec, NeuralBackend, NormalizationOperator,
+    NormalizationSpec, PadMode, ParameterMetadata, ParameterSpec, ParameterVisitor,
+    ParameterVisitorMut, Parameterized, PooledAttentionInput, PooledPositionInput,
+    PoolingAttentionCache, PoolingOverlap, PoolingWindows, RelativeAttentionInput,
     Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
     RotarySubspace, RoutedNeuralBackend, RoutingOperator, RoutingResult,
     SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, SwiGluExpertBankOperator,
@@ -572,6 +575,13 @@ impl Tensor for NumericTensor {
         Ok(Self::new(shape.to_vec(), values.to_vec()))
     }
 
+    fn from_i32_slice(values: &[i32], shape: &[i32], _: &NumericContext) -> Result<Self, Error> {
+        Ok(Self::new(
+            shape.to_vec(),
+            values.iter().map(|value| *value as f32).collect(),
+        ))
+    }
+
     fn full_f32(value: f32, shape: &[i32], _: &NumericContext) -> Result<Self, Error> {
         Ok(Self::new(shape.to_vec(), vec![value; elements(shape)]))
     }
@@ -607,8 +617,24 @@ impl Tensor for NumericTensor {
         Ok(self.map(|value| value * value))
     }
 
+    fn tanh(&self, _: &NumericContext) -> Result<Self, Error> {
+        Ok(self.map(f32::tanh))
+    }
+
     fn maximum_scalar(&self, rhs: f32, _: &NumericContext) -> Result<Self, Error> {
         Ok(self.map(|value| value.max(rhs)))
+    }
+
+    fn clip(&self, minimum: &Self, maximum: &Self, _: &NumericContext) -> Result<Self, Error> {
+        let minimum = *minimum
+            .data
+            .first()
+            .ok_or_else(|| Error::backend("numeric clip minimum is empty"))?;
+        let maximum = *maximum
+            .data
+            .first()
+            .ok_or_else(|| Error::backend("numeric clip maximum is empty"))?;
+        Ok(self.map(|value| value.clamp(minimum, maximum)))
     }
 
     fn softmax_axis(&self, selected: i32, _: bool, _: &NumericContext) -> Result<Self, Error> {
@@ -908,24 +934,65 @@ impl Tensor for NumericTensor {
         Self::concatenate(&expanded, selected as i32, context)
     }
 
-    fn matmul(lhs: &Self, rhs: &Self, _: &NumericContext) -> Result<Self, Error> {
-        if lhs.shape.len() != 2 || rhs.shape.len() != 2 || lhs.shape[1] != rhs.shape[0] {
-            return Err(Error::backend(
-                "numeric matmul requires compatible matrices",
-            ));
+    fn matmul(lhs: &Self, rhs: &Self, context: &NumericContext) -> Result<Self, Error> {
+        if lhs.shape.len() < 2
+            || rhs.shape.len() < 2
+            || lhs.shape[lhs.shape.len() - 1] != rhs.shape[rhs.shape.len() - 2]
+        {
+            return Err(Error::backend(format!(
+                "numeric matmul requires compatible matrices, got {:?} and {:?}",
+                lhs.shape, rhs.shape
+            )));
         }
-        let rows = lhs.shape[0] as usize;
-        let inner_width = lhs.shape[1] as usize;
-        let columns = rhs.shape[1] as usize;
-        let mut output = Self::zeros(vec![rows as i32, columns as i32]);
-        for row in 0..rows {
-            for column in 0..columns {
-                output.data[row * columns + column] = (0..inner_width)
-                    .map(|inner_index| {
-                        lhs.data[row * inner_width + inner_index]
-                            * rhs.data[inner_index * columns + column]
-                    })
-                    .sum();
+        let rank = lhs.shape.len().max(rhs.shape.len());
+        let prefix_rank = rank - 2;
+        let mut prefix = Vec::with_capacity(prefix_rank);
+        for selected in 0..prefix_rank {
+            let left = selected
+                .checked_sub(rank - lhs.shape.len())
+                .map_or(1, |axis| lhs.shape[axis]);
+            let right = selected
+                .checked_sub(rank - rhs.shape.len())
+                .map_or(1, |axis| rhs.shape[axis]);
+            if left != right && left != 1 && right != 1 {
+                return Err(Error::backend(format!(
+                    "numeric matmul batch mismatch: {:?} versus {:?}",
+                    lhs.shape, rhs.shape
+                )));
+            }
+            prefix.push(left.max(right));
+        }
+        let rows = lhs.shape[lhs.shape.len() - 2];
+        let inner_width = lhs.shape[lhs.shape.len() - 1];
+        let columns = rhs.shape[rhs.shape.len() - 1];
+        let mut left_shape = prefix.clone();
+        left_shape.extend([rows, inner_width]);
+        let mut right_shape = prefix.clone();
+        right_shape.extend([inner_width, columns]);
+        let lhs = lhs.broadcast_to(&left_shape, context)?;
+        let rhs = rhs.broadcast_to(&right_shape, context)?;
+        let mut output_shape = prefix.clone();
+        output_shape.extend([rows, columns]);
+        let mut output = Self::zeros(output_shape);
+        for batch_index in 0..elements(&prefix) {
+            let batch = unravel(batch_index, &prefix);
+            for row in 0..rows as usize {
+                for column in 0..columns as usize {
+                    let value = (0..inner_width as usize)
+                        .map(|inner| {
+                            let mut left = batch.clone();
+                            left.extend([row, inner]);
+                            let mut right = batch.clone();
+                            right.extend([inner, column]);
+                            lhs.data[offset(&left, &left_shape)]
+                                * rhs.data[offset(&right, &right_shape)]
+                        })
+                        .sum();
+                    let mut coordinate = batch.clone();
+                    coordinate.extend([row, column]);
+                    let output_shape = output.shape.clone();
+                    output.data[offset(&coordinate, &output_shape)] = value;
+                }
             }
         }
         Ok(output)
@@ -2179,6 +2246,146 @@ impl NeuralBackend for NumericBackend {
         attention(&queries, &keys, &values, scale, mask, None, 0)
     }
 
+    fn relative_attention(
+        input: RelativeAttentionInput<'_, NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        input.validate()?;
+        let [batch, heads, queries, dimensions] = input.queries.shape.as_slice() else {
+            unreachable!()
+        };
+        let key_heads = input.keys.shape[1];
+        let keys = input.keys.shape[2];
+        let extent = input.profiles.shape[3];
+        let mut output = NumericTensor::zeros(input.queries.shape.clone());
+        for b in 0..*batch as usize {
+            for head in 0..*heads as usize {
+                let key_head = head % key_heads as usize;
+                for query in 0..*queries as usize {
+                    let query_position = input.query_offset + query as i32;
+                    let tau = if input.window.is_none() {
+                        input.log_scaling_floor.map_or(1.0, |floor| {
+                            1.0 + input.log_scaling_alpha
+                                * (((query_position + 1) as f32 / floor as f32).max(1.0).ln())
+                        })
+                    } else {
+                        1.0
+                    };
+                    let mut scores = vec![f32::NEG_INFINITY; keys as usize];
+                    for key in 0..keys as usize {
+                        let distance = query_position - (input.key_offset + key as i32);
+                        if distance < 0 || input.window.is_some_and(|window| distance >= window) {
+                            continue;
+                        }
+                        let query_base = ((b * *heads as usize + head) * *queries as usize + query)
+                            * *dimensions as usize;
+                        let key_base = ((b * key_heads as usize + key_head) * keys as usize + key)
+                            * *dimensions as usize;
+                        let dot = (0..*dimensions as usize)
+                            .map(|dimension| {
+                                input.queries.data[query_base + dimension]
+                                    * input.keys.data[key_base + dimension]
+                            })
+                            .sum::<f32>()
+                            / *dimensions as f32;
+                        let bias = if distance < extent {
+                            let base = ((b * *heads as usize + head) * *queries as usize + query)
+                                * extent as usize;
+                            input.profiles.data[base + distance as usize]
+                        } else {
+                            0.0
+                        };
+                        scores[key] = (dot + bias) * tau;
+                    }
+                    let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let denominator = scores
+                        .iter()
+                        .map(|score| (*score - maximum).exp())
+                        .sum::<f32>();
+                    let output_base = ((b * *heads as usize + head) * *queries as usize + query)
+                        * *dimensions as usize;
+                    for key in 0..keys as usize {
+                        let probability = (scores[key] - maximum).exp() / denominator;
+                        let value_base = ((b * key_heads as usize + key_head) * keys as usize
+                            + key)
+                            * *dimensions as usize;
+                        for dimension in 0..*dimensions as usize {
+                            output.data[output_base + dimension] +=
+                                probability * input.values.data[value_base + dimension];
+                        }
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    fn joint_expert_routing(
+        input: JointExpertRoutingInput<'_, NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<JointExpertRoutingResult<NumericTensor>, Error> {
+        input.validate()?;
+        let hidden = input.hidden.shape.last().copied().unwrap() as usize;
+        let tokens = input.hidden.data.len() / hidden;
+        let experts = input.weight.shape[0] as usize;
+        let routed = input.routed_experts as usize;
+        let shared = experts - routed;
+        let top_k = input.top_k as usize;
+        let global_scale = *input
+            .global_scale
+            .data
+            .first()
+            .ok_or_else(|| Error::backend("numeric global route scale is empty"))?;
+        let mut routed_ids = NumericTensor::zeros(vec![tokens as i32, input.top_k]);
+        let mut routed_weights = NumericTensor::zeros(vec![tokens as i32, input.top_k]);
+        let mut shared_weights = NumericTensor::zeros(vec![tokens as i32, shared as i32]);
+        for token in 0..tokens {
+            let logits = (0..experts)
+                .map(|expert| {
+                    (0..hidden)
+                        .map(|column| {
+                            input.hidden.data[token * hidden + column]
+                                * input.weight.data[expert * hidden + column]
+                        })
+                        .sum::<f32>()
+                })
+                .collect::<Vec<_>>();
+            let mut order = (0..routed).collect::<Vec<_>>();
+            order.sort_by(|left, right| {
+                let score = |expert: usize| {
+                    1.0 / (1.0 + (-logits[expert]).exp()) + input.correction_bias.data[expert]
+                };
+                score(*right)
+                    .total_cmp(&score(*left))
+                    .then_with(|| left.cmp(right))
+            });
+            order.truncate(top_k);
+            let mut selected = order
+                .iter()
+                .map(|expert| 1.0 / (1.0 + (-logits[*expert]).exp()))
+                .collect::<Vec<_>>();
+            selected.extend(
+                logits[routed..]
+                    .iter()
+                    .map(|logit| 1.0 / (1.0 + (-logit).exp())),
+            );
+            let denominator = selected.iter().sum::<f32>();
+            let scale = input.route_scale * global_scale / denominator;
+            for (slot, expert) in order.into_iter().enumerate() {
+                routed_ids.data[token * top_k + slot] = expert as f32;
+                routed_weights.data[token * top_k + slot] = selected[slot] * scale;
+            }
+            for expert in 0..shared {
+                shared_weights.data[token * shared + expert] = selected[top_k + expert] * scale;
+            }
+        }
+        Ok(JointExpertRoutingResult {
+            routed_ids,
+            routed_weights,
+            shared_weights,
+        })
+    }
+
     fn indexed_attention(
         input: IndexedAttentionInput<'_, NumericTensor>,
         _: &NumericContext,
@@ -2768,6 +2975,8 @@ struct NumericRouter {
     linear: NumericLinear,
     routing: TopKRoutingSpec,
     correction_bias: Option<(NumericTensor, ParameterMetadata)>,
+    input_transform: Option<(f32, NumericTensor, ParameterMetadata, bool)>,
+    route_scale: Option<(NumericTensor, ParameterMetadata)>,
 }
 
 impl Parameterized<NumericTensor> for NumericRouter {
@@ -2777,6 +2986,12 @@ impl Parameterized<NumericTensor> for NumericRouter {
     {
         self.linear.visit_parameters(visitor);
         if let Some((value, metadata)) = &self.correction_bias {
+            visit(metadata, value, visitor);
+        }
+        if let Some((_, value, metadata, _)) = &self.input_transform {
+            visit(metadata, value, visitor);
+        }
+        if let Some((value, metadata)) = &self.route_scale {
             visit(metadata, value, visitor);
         }
     }
@@ -2789,6 +3004,12 @@ impl Parameterized<NumericTensor> for NumericRouter {
         if let Some((value, metadata)) = &mut self.correction_bias {
             visit_mut(metadata, value, visitor);
         }
+        if let Some((_, value, metadata, _)) = &mut self.input_transform {
+            visit_mut(metadata, value, visitor);
+        }
+        if let Some((value, metadata)) = &mut self.route_scale {
+            visit_mut(metadata, value, visitor);
+        }
     }
 
     fn set_trainable(&mut self, trainable: bool) {
@@ -2796,6 +3017,36 @@ impl Parameterized<NumericTensor> for NumericRouter {
         if let Some((_, metadata)) = &mut self.correction_bias {
             metadata.trainable = trainable;
         }
+        if let Some((_, _, metadata, _)) = &mut self.input_transform {
+            metadata.trainable = trainable;
+        }
+        if let Some((_, metadata)) = &mut self.route_scale {
+            metadata.trainable = trainable;
+        }
+    }
+}
+
+impl NumericRouter {
+    fn transformed_input(&self, input: &NumericTensor) -> NumericTensor {
+        let Some((epsilon, scale, _, inverse_sqrt_dimensions)) = &self.input_transform else {
+            return input.clone();
+        };
+        let width = input.shape.last().copied().unwrap() as usize;
+        let width_scale = if *inverse_sqrt_dimensions {
+            (width as f32).sqrt().recip()
+        } else {
+            1.0
+        };
+        let mut output = input.clone();
+        for row in output.data.chunks_mut(width) {
+            let rms = (row.iter().map(|value| value * value).sum::<f32>() / width as f32 + epsilon)
+                .sqrt()
+                .recip();
+            for (dimension, value) in row.iter_mut().enumerate() {
+                *value *= rms * scale.data[dimension] * width_scale;
+            }
+        }
+        output
     }
 }
 
@@ -2805,7 +3056,8 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
         input: &NumericTensor,
         context: &NumericContext,
     ) -> Result<RoutingResult<NumericTensor>, Error> {
-        let logits = self.linear.forward(input, context)?;
+        let input = self.transformed_input(input);
+        let logits = self.linear.forward(&input, context)?;
         let experts = self.routing.expert_count() as usize;
         let top_k = self.routing.top_k() as usize;
         let tokens = logits.data.len() / experts;
@@ -2825,6 +3077,7 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
                     let sum = exponentials.iter().sum::<f32>();
                     exponentials.iter().map(|value| *value / sum).collect()
                 }
+                eredu_nn::RoutingScoring::SelectedSoftmax => row.to_vec(),
                 eredu_nn::RoutingScoring::Sigmoid => row
                     .iter()
                     .map(|value| 1.0 / (1.0 + (-value).exp()))
@@ -2864,12 +3117,24 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
                 .filter(|expert| eligible.contains(&(expert / experts_per_group)))
                 .collect::<Vec<_>>();
             order.sort_by(|left, right| selection[*right].total_cmp(&selection[*left]));
-            let selected_sum = order[..top_k]
+            let selected = order[..top_k]
                 .iter()
                 .map(|expert| scores[*expert])
-                .sum::<f32>();
+                .collect::<Vec<_>>();
+            let selected = if self.routing.scoring() == eredu_nn::RoutingScoring::SelectedSoftmax {
+                let maximum = selected.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let exponentials = selected
+                    .iter()
+                    .map(|value| (*value - maximum).exp())
+                    .collect::<Vec<_>>();
+                let sum = exponentials.iter().sum::<f32>();
+                exponentials.into_iter().map(|value| value / sum).collect()
+            } else {
+                selected
+            };
+            let selected_sum = selected.iter().sum::<f32>();
             for (route, expert) in order.iter().copied().take(top_k).enumerate() {
-                let selected = scores[expert];
+                let selected = selected[route];
                 let index = token * top_k + route;
                 expert_ids.data[index] = expert as f32;
                 selected_scores.data[index] = selected;
@@ -2877,7 +3142,11 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
                     selected / (selected_sum + self.routing.normalization_epsilon())
                 } else {
                     selected
-                } * self.routing.routed_scaling();
+                } * self.routing.routed_scaling()
+                    * self
+                        .route_scale
+                        .as_ref()
+                        .map_or(1.0, |(scale, _)| scale.data[expert]);
             }
         }
         Ok(RoutingResult {
@@ -2893,7 +3162,8 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
         expert_ids: &NumericTensor,
         context: &NumericContext,
     ) -> Result<RoutingResult<NumericTensor>, Error> {
-        let logits = self.linear.forward(input, context)?;
+        let input = self.transformed_input(input);
+        let logits = self.linear.forward(&input, context)?;
         let experts = self.routing.expert_count() as usize;
         let top_k = self.routing.top_k() as usize;
         let tokens = logits.data.len() / experts;
@@ -2917,6 +3187,7 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
                         .map(|value| value / sum)
                         .collect::<Vec<_>>()
                 }
+                eredu_nn::RoutingScoring::SelectedSoftmax => row.to_vec(),
                 eredu_nn::RoutingScoring::Sigmoid => row
                     .iter()
                     .map(|value| 1.0 / (1.0 + (-value).exp()))
@@ -2936,13 +3207,34 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
                 selected_scores.data[index] = scores[expert];
                 sum += scores[expert];
             }
+            if self.routing.scoring() == eredu_nn::RoutingScoring::SelectedSoftmax {
+                let start = token * top_k;
+                let maximum = selected_scores.data[start..start + top_k]
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let mut denominator = 0.0;
+                for value in &mut selected_scores.data[start..start + top_k] {
+                    *value = (*value - maximum).exp();
+                    denominator += *value;
+                }
+                for value in &mut selected_scores.data[start..start + top_k] {
+                    *value /= denominator;
+                }
+                sum = 1.0;
+            }
             for route in 0..top_k {
                 let index = token * top_k + route;
+                let expert = expert_ids.data[index] as usize;
                 route_weights.data[index] = if self.routing.normalize_selected() {
                     selected_scores.data[index] / (sum + self.routing.normalization_epsilon())
                 } else {
                     selected_scores.data[index]
-                } * self.routing.routed_scaling();
+                } * self.routing.routed_scaling()
+                    * self
+                        .route_scale
+                        .as_ref()
+                        .map_or(1.0, |(scale, _)| scale.data[expert]);
             }
         }
         Ok(RoutingResult {
@@ -2965,6 +3257,7 @@ struct NumericExpertBank {
     experts: Vec<NumericExpert>,
     parameters: Vec<(NumericTensor, ParameterMetadata)>,
     limit: Option<eredu_nn::SwiGluLimit>,
+    activation: eredu_nn::GatedExpertActivation,
 }
 
 #[derive(Debug, Clone)]
@@ -3106,7 +3399,13 @@ impl SwiGluExpertBankOperator<NumericTensor> for NumericExpertBank {
                     .ok_or_else(|| Error::backend("numeric expert id is out of range"))?;
                 let gate = linear(&token_input, &expert.gate, None)?
                     .map(|value| self.limit.map_or(value, |bound| value.min(bound.get())));
-                let gate = gate.map(|value| value / (1.0 + (-value).exp()));
+                let gate = gate.map(|value| match self.activation {
+                    eredu_nn::GatedExpertActivation::Silu => value / (1.0 + (-value).exp()),
+                    eredu_nn::GatedExpertActivation::GeluApproximate => {
+                        0.5 * value
+                            * (1.0 + (0.797_884_6 * (value + 0.044_715 * value.powi(3))).tanh())
+                    }
+                });
                 let up = linear(&token_input, &expert.up, None)?.map(|value| {
                     self.limit
                         .map_or(value, |bound| value.clamp(-bound.get(), bound.get()))
@@ -3212,10 +3511,28 @@ impl RoutedNeuralBackend for NumericBackend {
             let metadata = ParameterMetadata::from_spec(&parameter_spec, parameter_spec.trainable);
             (value, metadata)
         });
+        let input_transform = spec.input_transform.map(|transform| {
+            let value = parameter(&transform.scale, vec![spec.input_dimensions], true);
+            let metadata =
+                ParameterMetadata::from_spec(&transform.scale, transform.scale.trainable);
+            (
+                transform.epsilon,
+                value,
+                metadata,
+                transform.inverse_sqrt_dimensions,
+            )
+        });
+        let route_scale = spec.route_scale.map(|parameter_spec| {
+            let value = parameter(&parameter_spec, vec![routing.expert_count()], true);
+            let metadata = ParameterMetadata::from_spec(&parameter_spec, parameter_spec.trainable);
+            (value, metadata)
+        });
         Ok(NumericRouter {
             linear,
             routing,
             correction_bias,
+            input_transform,
+            route_scale,
         })
     }
 
@@ -3320,6 +3637,7 @@ impl RoutedNeuralBackend for NumericBackend {
             experts,
             parameters,
             limit: spec.limit,
+            activation: spec.activation,
         })
     }
 
@@ -3460,7 +3778,9 @@ impl NumericHybridLayerState {
         Self {
             attention: match policy {
                 LayerCachePolicy::KeyValue { attention, .. }
-                | LayerCachePolicy::KeyValueWithFixedState { attention, .. } => {
+                | LayerCachePolicy::KeyValueWithFixedState { attention, .. }
+                | LayerCachePolicy::KeyOnly { attention, .. }
+                | LayerCachePolicy::KeyOnlyWithFixedState { attention, .. } => {
                     Some(NumericCache::new(attention.sliding_window_i32().unwrap()))
                 }
                 _ => None,
@@ -3641,6 +3961,13 @@ impl AttentionCache<NumericTensor> for NumericHybridLayerState {
     }
 }
 
+impl eredu_nn::AuxiliaryConvolutionState<NumericTensor> for NumericHybridLayerState {
+    fn convolution_state(&mut self, slot: u32) -> Result<&mut Option<NumericTensor>, Error> {
+        self.fixed_component(StateTensorRole::Convolution { slot })
+            .map_err(Error::backend)
+    }
+}
+
 fn config(model_type: &str, tied: bool) -> serde_json::Value {
     let mut config = serde_json::json!({
         "model_type": model_type,
@@ -3788,6 +4115,291 @@ fn numerical_qwen2_qwen3_and_moe_prefill_decode_goldens() {
         );
         assert_eq!(result.sliding_calls, usize::from(model_type == "qwen2"));
     }
+}
+
+#[test]
+fn gemma4_sparse_shared_kv_prefill_decode_is_chunk_invariant() {
+    let args = gemma4::ModelArgs::from_hf_json(
+        br#"{
+            "model_type":"gemma4_unified",
+            "hidden_size":8,
+            "num_hidden_layers":4,
+            "intermediate_size":12,
+            "num_attention_heads":2,
+            "rms_norm_eps":0.00001,
+            "vocab_size":19,
+            "num_key_value_heads":1,
+            "max_position_embeddings":64,
+            "head_dim":4,
+            "attention_k_eq_v":true,
+            "num_kv_shared_layers":1,
+            "layer_types":["sliding_attention","full_attention","full_attention","full_attention"],
+            "sliding_window":4,
+            "enable_moe_block":true,
+            "num_experts":3,
+            "top_k_experts":2,
+            "moe_intermediate_size":5,
+            "final_logit_softcapping":7.0
+        }"#,
+    )
+    .unwrap();
+    let layout = gemma4::state_layout(&args).unwrap();
+    let family = gemma4::FamilyConfig {
+        model_type: args.model_type.clone(),
+        text: args,
+        vision: None,
+        image_token_id: None,
+        video_token_id: None,
+        audio: None,
+        audio_token_id: None,
+    };
+    let context = NumericContext::default();
+    let mut whole_state = DeviceState::<NumericBackend, _>::create(layout.clone(), |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let mut chunked_state = DeviceState::<NumericBackend, _>::create(layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let mut whole = ResidentRuntime::new(
+        gemma4::LayeredModel::<NumericBackend>::new(family.clone(), &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let mut chunked = ResidentRuntime::new(
+        gemma4::LayeredModel::<NumericBackend>::new(family, &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let whole_tokens = NumericTensor::token_ids(&[1, 2, 3]);
+    let whole_parts = [gemma4::DecoderInputPart::Text(&whole_tokens)];
+    let expected = whole
+        .forward(
+            gemma4::ModelInput {
+                parts: &whole_parts,
+                vision: None,
+                audio: None,
+                per_layer_tokens: None,
+                mask: None,
+            },
+            &mut whole_state,
+            &context,
+        )
+        .unwrap();
+    let prefix_tokens = NumericTensor::token_ids(&[1, 2]);
+    let prefix_parts = [gemma4::DecoderInputPart::Text(&prefix_tokens)];
+    let prefix = chunked
+        .forward(
+            gemma4::ModelInput {
+                parts: &prefix_parts,
+                vision: None,
+                audio: None,
+                per_layer_tokens: None,
+                mask: None,
+            },
+            &mut chunked_state,
+            &context,
+        )
+        .unwrap();
+    let decode_tokens = NumericTensor::token_ids(&[3]);
+    let decode_parts = [gemma4::DecoderInputPart::Text(&decode_tokens)];
+    let decode = chunked
+        .forward(
+            gemma4::ModelInput {
+                parts: &decode_parts,
+                vision: None,
+                audio: None,
+                per_layer_tokens: None,
+                mask: None,
+            },
+            &mut chunked_state,
+            &context,
+        )
+        .unwrap();
+    let actual = NumericTensor::concatenate(&[prefix, decode], 1, &context).unwrap();
+    assert_tensor_close(&actual, &expected, "Gemma 4 sparse shared-KV logits");
+    assert_eq!(actual.shape, [1, 3, 19]);
+    assert_eq!(chunked_state.layer(0).unwrap().position(), 3);
+    assert_eq!(chunked_state.layer(1).unwrap().position(), 3);
+    assert_eq!(chunked_state.layer(2).unwrap().position(), 3);
+    assert_eq!(chunked_state.layer(3).unwrap().position(), 0);
+}
+
+#[test]
+fn inkling_fixed_state_and_sparse_decode_are_chunk_invariant() {
+    let args = inkling::ModelArgs::from_hf_json(
+        br#"{
+          "model_type":"inkling_mm_model",
+          "text_config":{
+            "hidden_size":8,"num_hidden_layers":2,"vocab_size":19,
+            "num_attention_heads":2,"num_key_value_heads":1,"head_dim":4,
+            "sliding_window_size":4,
+            "layer_types":["sliding_attention","full_attention"],
+            "mlp_layer_types":["dense","moe"],"sconv_kernel_size":3,
+            "d_rel":2,"rel_extent":8,"intermediate_size":12,
+            "dense_intermediate_size":12,"moe_intermediate_size":6,
+            "n_routed_experts":3,"num_experts_per_tok":2,"n_shared_experts":1,
+            "unpadded_vocab_size":19
+          }
+        }"#,
+    )
+    .unwrap();
+    let layout = inkling::state_layout(&args).unwrap();
+    let context = NumericContext::default();
+    let make_state = || {
+        DeviceState::<NumericBackend, _>::create(layout.clone(), |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .unwrap()
+    };
+    let mut whole_state = make_state();
+    let mut chunked_state = make_state();
+    let mut whole = ResidentRuntime::new(
+        inkling::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let mut chunked = ResidentRuntime::new(
+        inkling::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let whole_tokens = NumericTensor::token_ids(&[1, 2, 3]);
+    let whole_parts = [inkling::DecoderInputPart::Text(&whole_tokens)];
+    let expected = whole
+        .forward(
+            inkling::ModelInput {
+                parts: &whole_parts,
+                vision_patches: None,
+                audio: None,
+            },
+            &mut whole_state,
+            &context,
+        )
+        .unwrap();
+    let prefix_tokens = NumericTensor::token_ids(&[1, 2]);
+    let prefix_parts = [inkling::DecoderInputPart::Text(&prefix_tokens)];
+    let prefix = chunked
+        .forward(
+            inkling::ModelInput {
+                parts: &prefix_parts,
+                vision_patches: None,
+                audio: None,
+            },
+            &mut chunked_state,
+            &context,
+        )
+        .unwrap();
+    let decode_tokens = NumericTensor::token_ids(&[3]);
+    let decode_parts = [inkling::DecoderInputPart::Text(&decode_tokens)];
+    let decode = chunked
+        .forward(
+            inkling::ModelInput {
+                parts: &decode_parts,
+                vision_patches: None,
+                audio: None,
+            },
+            &mut chunked_state,
+            &context,
+        )
+        .unwrap();
+    let actual = NumericTensor::concatenate(&[prefix, decode], 1, &context).unwrap();
+    assert_tensor_close(&actual, &expected, "Inkling fixed-state sparse logits");
+    assert_eq!(actual.shape, [1, 3, 19]);
+    for layer in 0..2 {
+        let state = chunked_state.layer(layer).unwrap();
+        assert_eq!(state.position(), 3);
+        assert_eq!(
+            state.fixed.values().filter(|value| value.is_some()).count(),
+            4
+        );
+    }
+}
+
+#[test]
+fn muse_text_decode_skips_vision_and_is_chunk_invariant() {
+    let value = serde_json::json!({
+        "architectures":["MuseGlimmerForConditionalGeneration"],"model_type":"muse_glimmer",
+        "image_token_id":22,"video_token_id":23,"out_hidden_size":32,"projector_hidden_size":8,
+        "text_config":{"model_type":"muse_glimmer_text","hidden_size":8,"num_hidden_layers":2,
+          "intermediate_size":12,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":4,
+          "rms_norm_eps":0.00001,"post_norm_eps":0.00001,"vocab_size":24,
+          "max_position_embeddings":64,"rope_theta":10000.0,
+          "layer_types":["sliding_attention","full_attention"],
+          "layer_rope_theta":[10000.0,0.0],"sliding_window":4,"tie_word_embeddings":false,
+          "hidden_act":"silu","attention_dropout":0.0,"qk_scale_factor":1.0,
+          "output_multiplier":1.0,"final_logit_softcapping":7.0},
+        "vision_config":{"model_type":"muse_glimmer_vision","hidden_size":8,
+          "intermediate_size":12,"num_attention_heads":2,"num_hidden_layers":1,
+          "patch_size":2,"patch_temporal":1,"merge_size":1,"pos_emb_height":2,
+          "pos_emb_width":2,"max_position_embeddings":4,"layer_norm_eps":0.00001,
+          "hidden_act":"gelu","layer_types":["full_attention"],
+          "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}}
+    });
+    let args = muse_glimmer::DecoderConfig::from_hf_value(&value).unwrap();
+    let layout = muse_glimmer::state_layout(&args).unwrap();
+    let context = NumericContext::default();
+    let make_state = || {
+        DeviceState::<NumericBackend, _>::create(layout.clone(), |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .unwrap()
+    };
+    let mut whole_state = make_state();
+    let mut chunked_state = make_state();
+    let mut whole = ResidentRuntime::new(
+        muse_glimmer::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let mut chunked = ResidentRuntime::new(
+        muse_glimmer::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let whole_tokens = NumericTensor::token_ids(&[1, 2, 3]);
+    let whole_parts = [muse_glimmer::DecoderInputPart::Text(&whole_tokens)];
+    let expected = whole
+        .forward(
+            muse_glimmer::ModelInput {
+                parts: &whole_parts,
+                vision: None,
+                mask: None,
+            },
+            &mut whole_state,
+            &context,
+        )
+        .unwrap();
+    let prefix_tokens = NumericTensor::token_ids(&[1, 2]);
+    let prefix_parts = [muse_glimmer::DecoderInputPart::Text(&prefix_tokens)];
+    let prefix = chunked
+        .forward(
+            muse_glimmer::ModelInput {
+                parts: &prefix_parts,
+                vision: None,
+                mask: None,
+            },
+            &mut chunked_state,
+            &context,
+        )
+        .unwrap();
+    let decode_tokens = NumericTensor::token_ids(&[3]);
+    let decode_parts = [muse_glimmer::DecoderInputPart::Text(&decode_tokens)];
+    let decode = chunked
+        .forward(
+            muse_glimmer::ModelInput {
+                parts: &decode_parts,
+                vision: None,
+                mask: None,
+            },
+            &mut chunked_state,
+            &context,
+        )
+        .unwrap();
+    let actual = NumericTensor::concatenate(&[prefix, decode], 1, &context).unwrap();
+    assert_tensor_close(&actual, &expected, "Muse-Glimmer text logits");
+    assert_eq!(actual.shape, [1, 3, 24]);
 }
 
 #[test]
@@ -4033,6 +4645,8 @@ fn reference_router_and_packed_experts_match_analytical_values() {
         },
         routing: TopKRoutingSpec::new(3, 2, eredu_nn::RoutingScoring::Softmax, true).unwrap(),
         correction_bias: None,
+        input_transform: None,
+        route_scale: None,
     };
     let input = NumericTensor::new(vec![1, 2], vec![1.0, 0.0]);
     let routes = router.route(&input, &context).unwrap();
@@ -4057,6 +4671,7 @@ fn reference_router_and_packed_experts_match_analytical_values() {
         ],
         parameters: Vec::new(),
         limit: None,
+        activation: eredu_nn::GatedExpertActivation::Silu,
     };
     let routes = RoutingResult {
         expert_ids: NumericTensor::new(vec![1, 2], vec![0.0, 1.0]),
@@ -4072,6 +4687,73 @@ fn reference_router_and_packed_experts_match_analytical_values() {
         .unwrap();
     assert_close(output.data[0], 2.633_574_2);
     assert_close(output.data[1], -0.215_790_8);
+}
+
+#[test]
+fn selected_softmax_router_applies_rms_input_and_per_expert_scales() {
+    let weight = ParameterSpec::trainable("router.selected.weight").unwrap();
+    let input_scale = ParameterSpec::trainable("router.selected.input_scale").unwrap();
+    let route_scale = ParameterSpec::trainable("router.selected.route_scale").unwrap();
+    let mut router = NumericRouter {
+        linear: NumericLinear {
+            weight: NumericTensor::new(vec![3, 2], vec![1.0, 0.0, 0.0, 1.0, -1.0, 0.0]),
+            weight_metadata: ParameterMetadata::from_spec(&weight, true),
+            bias: None,
+        },
+        routing: TopKRoutingSpec::new(3, 2, eredu_nn::RoutingScoring::SelectedSoftmax, false)
+            .unwrap(),
+        correction_bias: None,
+        input_transform: Some((
+            0.0,
+            NumericTensor::new(vec![2], vec![2.0, 1.0]),
+            ParameterMetadata::from_spec(&input_scale, true),
+            true,
+        )),
+        route_scale: Some((
+            NumericTensor::new(vec![3], vec![2.0, 3.0, 5.0]),
+            ParameterMetadata::from_spec(&route_scale, true),
+        )),
+    };
+    let routes = router
+        .route(
+            &NumericTensor::new(vec![1, 2], vec![3.0, 4.0]),
+            &NumericContext::default(),
+        )
+        .unwrap();
+    let first = 0.4_f32.exp() / (0.4_f32.exp() + 1.0);
+    assert_eq!(routes.expert_ids.data, [0.0, 1.0]);
+    assert_close(routes.selected_scores.data[0], first);
+    assert_close(routes.selected_scores.data[1], 1.0 - first);
+    assert_close(routes.route_weights.data[0], 2.0 * first);
+    assert_close(routes.route_weights.data[1], 3.0 * (1.0 - first));
+}
+
+#[test]
+fn routed_gated_experts_support_approximate_gelu() {
+    let mut experts = NumericExpertBank {
+        experts: vec![NumericExpert {
+            gate: NumericTensor::new(vec![1, 1], vec![1.0]),
+            up: NumericTensor::new(vec![1, 1], vec![2.0]),
+            down: NumericTensor::new(vec![1, 1], vec![3.0]),
+        }],
+        parameters: Vec::new(),
+        limit: None,
+        activation: eredu_nn::GatedExpertActivation::GeluApproximate,
+    };
+    let routes = RoutingResult {
+        expert_ids: NumericTensor::new(vec![1, 1], vec![0.0]),
+        selected_scores: NumericTensor::new(vec![1, 1], vec![1.0]),
+        route_weights: NumericTensor::new(vec![1, 1], vec![1.0]),
+    };
+    let output = experts
+        .forward_routed(
+            &NumericTensor::new(vec![1, 1], vec![1.0]),
+            &routes,
+            &NumericContext::default(),
+        )
+        .unwrap();
+    let gelu = 0.5 * (1.0 + (0.797_884_6_f32 * 1.044_715).tanh());
+    assert_close(output.data[0], gelu * 2.0 * 3.0);
 }
 
 #[test]
@@ -4646,6 +5328,8 @@ fn grouped_sigmoid_and_caller_selected_routes_preserve_unbiased_scores() {
             NumericTensor::new(vec![4], vec![0.0, 0.0, 2.0, 0.0]),
             ParameterMetadata::from_spec(&correction, true),
         )),
+        input_transform: None,
+        route_scale: None,
     };
     let input = NumericTensor::new(vec![1, 1], vec![1.0]);
     let learned = router.route(&input, &NumericContext::default()).unwrap();

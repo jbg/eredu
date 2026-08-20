@@ -667,9 +667,9 @@ impl Model {
             stream,
             |tokens, stream| embed_tokens.forward(tokens, stream),
             |part, stream| {
-                let grid = part.metadata.qwen_grid_thw.ok_or_else(|| {
+                let grid = part.metadata.patch_grid.ok_or_else(|| {
                     Exception::custom(format!(
-                        "qwen3_vl {} input requires qwen_grid_thw metadata",
+                        "qwen3_vl {} input requires patch_grid metadata",
                         part.modality.as_str()
                     ))
                 })?;
@@ -857,8 +857,8 @@ pub(crate) fn multimodal_position_ids(
                 current += tokens.dim(1);
             }
             (runtime_input::Modality::Image | runtime_input::Modality::Video, _) => {
-                let grid = part.metadata.qwen_grid_thw.ok_or_else(|| {
-                    Exception::custom("qwen3_vl visual input requires qwen_grid_thw metadata")
+                let grid = part.metadata.patch_grid.ok_or_else(|| {
+                    Exception::custom("qwen3_vl visual input requires patch_grid metadata")
                 })?;
                 for (t, h, w) in grid_thw_from_array(grid, stream)? {
                     let h = h / spatial_merge_size;
@@ -1351,13 +1351,12 @@ pub(crate) fn translate_qwen3_vl_mmproj_name(name: &str, deepstack_layers: &[i32
 /// Loads one shared Qwen vision projector into an architecture-selected root.
 /// Finds the dense sibling mmproj used by the single-path dense or MoE loader.
 pub(crate) fn find_qwen3_vl_mmproj(gguf_file: &Path) -> Result<PathBuf, Error> {
-    crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "qwen3vl")?
-        .ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
-                "qwen3vl GGUF requires a nearby mmproj file relative to {}",
-                gguf_file.display()
-            ))
-        })
+    crate::composition::mlx::artifact::find_sibling_mmproj(gguf_file, "qwen3vl")?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!(
+            "qwen3vl GGUF requires a nearby mmproj file relative to {}",
+            gguf_file.display()
+        ))
+    })
 }
 
 impl CausalModel<Cache> for Model {

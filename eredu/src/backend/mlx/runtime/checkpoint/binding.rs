@@ -45,20 +45,14 @@ const MODEL_LOAD_MATERIALIZATION_BUFFERS: usize = 2;
 /// implementation detail while retaining companion `.scales` and `.biases`
 /// tensors unchanged.
 pub fn canonical_checkpoint_name(parameter_name: &str) -> String {
-    parameter_name
+    let canonical = parameter_name
         .replace(".inner.weight", ".weight")
-        .replace(".inner.bias", ".bias")
-}
-
-/// Maps custom packed-bank companion fields onto the canonical overlay name.
-pub(crate) fn packed_companion_checkpoint_name(parameter_name: &str) -> Option<String> {
-    [("_scales", "scales"), ("_biases", "biases")]
-        .into_iter()
-        .find_map(|(runtime_suffix, checkpoint_component)| {
-            parameter_name
-                .strip_suffix(runtime_suffix)
-                .map(|prefix| format!("{prefix}.{checkpoint_component}"))
-        })
+        .replace(".inner.bias", ".bias");
+    match canonical.as_str() {
+        "inner.weight" => "weight".into(),
+        "inner.bias" => "bias".into(),
+        _ => canonical,
+    }
 }
 
 /// Whether a flattened module parameter has checkpoint-backed storage.
@@ -308,9 +302,37 @@ where
             .map(|(name, _)| name.to_string())
             .collect::<BTreeSet<_>>()
     };
-    let actual = arrays.keys().cloned().collect::<BTreeSet<_>>();
-    let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
-    let unexpected = actual.difference(&expected).cloned().collect::<Vec<_>>();
+    let mut canonical_expected = BTreeMap::<String, Vec<String>>::new();
+    for name in &expected {
+        canonical_expected
+            .entry(canonical_checkpoint_name(name))
+            .or_default()
+            .push(name.clone());
+    }
+    let mut resolved = BTreeMap::<String, &Array>::new();
+    let mut unexpected = Vec::new();
+    for (name, value) in arrays {
+        let target = if expected.contains(name) {
+            Some(name.clone())
+        } else {
+            canonical_expected
+                .get(&canonical_checkpoint_name(name))
+                .and_then(|candidates| (candidates.len() == 1).then(|| candidates[0].clone()))
+        };
+        match target {
+            Some(target) => {
+                if resolved.insert(target, value).is_some() {
+                    unexpected.push(name.clone());
+                }
+            }
+            None => unexpected.push(name.clone()),
+        }
+    }
+    let missing = expected
+        .iter()
+        .filter(|name| !resolved.contains_key(*name))
+        .cloned()
+        .collect::<Vec<_>>();
     if !missing.is_empty() || !unexpected.is_empty() {
         return Err(ModuleBindingError::LeaseContents {
             unit: "materialized checkpoint bindings".into(),
@@ -323,7 +345,7 @@ where
         if !expected.contains(name.as_ref()) {
             continue;
         }
-        let value = arrays
+        let value = *resolved
             .get(name.as_ref())
             .expect("validated materialized binding must exist");
         if parameter.shape() != value.shape() {

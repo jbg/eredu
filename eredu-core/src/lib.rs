@@ -27,6 +27,8 @@ pub mod consensus;
 pub mod execution;
 /// Backend-independent generation lifecycle and output events.
 pub mod generation;
+/// Portable identity for ordered, prepared model input.
+pub mod input;
 /// Portable model-artifact inspection results.
 pub mod inspection;
 /// Portable decoded-media requests and backend preparation inputs.
@@ -91,6 +93,10 @@ pub use generation::{
     MtpRequestPhase, MtpSchedulerOptions, OptimisticReuseDecision, ResolvedGenerationConfig,
     SemanticEvent, SpeculativeCommitPlan, SpeculativeRound, SpeculativeTail, TokenCommit,
     TokenTerminalSignals,
+};
+pub use input::{
+    InputExtent, InputMetadataKey, InputModality, InputPartDescriptor, InputPayloadKind,
+    InputTensorIdentity, PreparedInputError, PreparedInputIdentity,
 };
 pub use inspection::{
     ArtifactModality, ArtifactTensorEncoding, InspectionIssue, InspectionIssueCode,

@@ -3032,6 +3032,9 @@ impl SparseMoeBlock {
                     n_group: 1,
                     topk_group: 1,
                     score_correction_bias: false,
+                    input_rms_epsilon: None,
+                    input_inverse_sqrt_dimensions: false,
+                    route_scale: false,
                 },
                 args.quantization_for(&format!("{prefix}.gate.weight")),
                 stream,
@@ -5569,8 +5572,7 @@ pub(crate) struct Qwen35MmprojGguf {
 
 /// Opens and validates the optional sibling Qwen3.5 vision projector.
 pub(crate) fn open_sibling_mmproj(gguf_file: &Path) -> Result<Option<Qwen35MmprojGguf>, Error> {
-    let Some(path) =
-        crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "qwen35")?
+    let Some(path) = crate::composition::mlx::artifact::find_sibling_mmproj(gguf_file, "qwen35")?
     else {
         return Ok(None);
     };
@@ -7035,9 +7037,9 @@ fn visual_embeddings_from_payload(
     part: &runtime_input::InputPart<'_>,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    let grid_thw = part.metadata.qwen_grid_thw.ok_or_else(|| {
+    let grid_thw = part.metadata.patch_grid.ok_or_else(|| {
         Exception::custom(format!(
-            "qwen3_5_moe {} input requires qwen_grid_thw metadata",
+            "qwen3_5_moe {} input requires patch_grid metadata",
             part.modality.as_str()
         ))
     })?;
@@ -7063,9 +7065,10 @@ fn video_embedding_chunks(
     embeddings: &Array,
     stream: &Stream,
 ) -> Result<Vec<Array>, Exception> {
-    let grid_thw = part.metadata.qwen_grid_thw.ok_or_else(|| {
-        Exception::custom("qwen3_5_moe video input requires qwen_grid_thw metadata")
-    })?;
+    let grid_thw = part
+        .metadata
+        .patch_grid
+        .ok_or_else(|| Exception::custom("qwen3_5_moe video input requires patch_grid metadata"))?;
     let grid = grid_thw_from_array(grid_thw, stream)?;
     if grid.len() != 1 {
         return Err(Exception::custom(format!(

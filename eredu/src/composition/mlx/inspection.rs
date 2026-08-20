@@ -19,10 +19,7 @@ use serde_json::Value;
 use super::*;
 use crate::{
     backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
-    composition::mlx_architectures::{
-        gemma4::model as gemma4, inkling::model as inkling, muse_glimmer,
-        qwen::vl::model as qwen3_vl,
-    },
+    composition::mlx_architectures::qwen::vl::model as qwen3_vl,
 };
 
 /// Options applied while inspecting a model artifact.
@@ -67,6 +64,18 @@ fn is_gguf_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+}
+
+fn open_stage5_projector(
+    model: &Path,
+    family: &str,
+) -> Result<Option<(PathBuf, GgufCheckpoint, HashMap<String, GgufMetadataValue>)>, Error> {
+    let Some(path) = crate::composition::mlx::artifact::find_sibling_mmproj(model, family)? else {
+        return Ok(None);
+    };
+    let checkpoint = GgufCheckpoint::open(&path)?;
+    let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+    Ok(Some((path, checkpoint, metadata)))
 }
 
 fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspectionReport {
@@ -578,12 +587,10 @@ fn inspect_gguf_projector(
             ) {
                 Ok(Some(mmproj)) => {
                     let projector_path =
-                        crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(
-                            path, "qwen35",
-                        )
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| path.to_path_buf());
+                        crate::composition::mlx::artifact::find_sibling_mmproj(path, "qwen35")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| path.to_path_buf());
                     let validation = structural::validate_qwen35_projector_gguf(
                         model_checkpoint,
                         model_metadata,
@@ -632,16 +639,14 @@ fn inspect_gguf_projector(
                 Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
             }
         }
-        GgufArchitecture::Inkling => match inkling::open_sibling_mmproj(path) {
-            Ok(Some(mmproj)) => {
-                let projector_path =
-                    crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(
-                        path, "inkling",
-                    )
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| path.to_path_buf());
-                let validation = structural::validate_inkling_mmproj_gguf(model_metadata, &mmproj);
+        GgufArchitecture::Inkling => match open_stage5_projector(path, "inkling") {
+            Ok(Some((projector_path, checkpoint, metadata))) => {
+                let validation = structural::validate_inkling_mmproj_gguf(
+                    model_checkpoint,
+                    model_metadata,
+                    &checkpoint,
+                    &metadata,
+                );
                 let exact = matches!(validation, structural::StructuralValidation::Exact);
                 apply_structural_validation(report, validation, &projector_path);
                 report.multimodal = if !exact {
@@ -669,19 +674,13 @@ fn inspect_gguf_projector(
             }
             Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
         },
-        GgufArchitecture::Gemma4 => match gemma4::open_sibling_mmproj(path) {
-            Ok(Some(mmproj)) => {
-                let projector_path =
-                    crate::backend::mlx::runtime::checkpoint::gguf::find_sibling_mmproj(
-                        path, "gemma4",
-                    )
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| path.to_path_buf());
+        GgufArchitecture::Gemma4 => match open_stage5_projector(path, "gemma4") {
+            Ok(Some((projector_path, checkpoint, metadata))) => {
                 let validation = structural::validate_gemma4_mmproj_gguf(
                     model_checkpoint,
                     model_metadata,
-                    &mmproj,
+                    &checkpoint,
+                    &metadata,
                 );
                 let exact = matches!(validation, structural::StructuralValidation::Exact);
                 apply_structural_validation(report, validation, &projector_path);
@@ -724,16 +723,16 @@ fn inspect_gguf_projector(
             }
             Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
         },
-        GgufArchitecture::MuseGlimmer => match muse_glimmer::open_sibling_mmproj(path) {
-            Ok(Some(mmproj)) => {
+        GgufArchitecture::MuseGlimmer => match open_stage5_projector(path, "muse-glimmer") {
+            Ok(Some((projector_path, checkpoint, metadata))) => {
                 let validation = structural::validate_muse_glimmer_projector_gguf(
                     model_checkpoint,
                     model_metadata,
-                    &mmproj.checkpoint,
-                    &mmproj.metadata,
+                    &checkpoint,
+                    &metadata,
                 );
                 let exact = matches!(validation, structural::StructuralValidation::Exact);
-                apply_structural_validation(report, validation, &mmproj.path);
+                apply_structural_validation(report, validation, &projector_path);
                 report.multimodal = if !exact {
                     InspectionReadiness::Invalid
                 } else if cfg!(feature = "mlx-image") {
@@ -753,7 +752,7 @@ fn inspect_gguf_projector(
                     } else {
                         "Muse-Glimmer projector is structurally incompatible".into()
                     },
-                    path: Some(mmproj.path),
+                    path: Some(projector_path),
                 });
             }
             Ok(None) => {

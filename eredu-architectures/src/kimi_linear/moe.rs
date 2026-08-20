@@ -112,6 +112,8 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
                     ParameterSpec::trainable(format!("{prefix}.gate.e_score_correction_bias"))
                         .map_err(Error::backend)?,
                 ),
+                input_transform: None,
+                route_scale: None,
                 quantization: args.weight_quantization_for(&gate_name),
                 routing,
             },
@@ -126,6 +128,7 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
                 input_dimensions: args.hidden_size,
                 intermediate_dimensions: routed_intermediate,
                 output_dimensions: args.hidden_size,
+                activation: eredu_nn::GatedExpertActivation::Silu,
                 limit: None,
                 layout: SwiGluExpertLayout::Packed {
                     gate_up: SwiGluExpertProjection {

@@ -62,6 +62,8 @@ impl<B: RoutedNeuralBackend> RoutedSwiGlu<B> {
                 input_dimensions: args.hidden_size,
                 weight: ParameterSpec::trainable(&router_name).map_err(Error::backend)?,
                 correction_bias: None,
+                input_transform: None,
+                route_scale: None,
                 quantization: args.weight_quantization_for(&router_name),
                 routing,
             },
@@ -76,6 +78,7 @@ impl<B: RoutedNeuralBackend> RoutedSwiGlu<B> {
                 input_dimensions: args.hidden_size,
                 intermediate_dimensions: args.moe_intermediate_size,
                 output_dimensions: args.hidden_size,
+                activation: eredu_nn::GatedExpertActivation::Silu,
                 limit: None,
                 layout: SwiGluExpertLayout::Packed {
                     gate_up: SwiGluExpertProjection {

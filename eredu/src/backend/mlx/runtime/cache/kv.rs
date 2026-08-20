@@ -1651,83 +1651,6 @@ impl PagedKeyValueCache {
         self.manager.report().map_err(cache_residency_exception)
     }
 
-    /// Visits immutable blocks and the live tail intersecting an attention range.
-    ///
-    /// The callback runs while each sealed block is leased, so callers can
-    /// implement architecture-specific blockwise attention without retaining
-    /// the entire key/value history on the device.
-    pub(crate) fn visit_attention_blocks(
-        &self,
-        start: i64,
-        end: i64,
-        stream: &Stream,
-        mut visit: impl FnMut(&KeyValueAttentionBlock) -> Result<(), Exception>,
-    ) -> Result<(u64, u64), Exception> {
-        let ids = self
-            .manager
-            .layer_block_ids(
-                self.global_layer,
-                CacheRepresentation::KeyValue,
-                start,
-                end,
-                self.prefix_tokens as i64,
-            )
-            .map_err(cache_residency_exception)?;
-        let mut scanned_blocks = 0;
-        let mut scanned_bytes = 0;
-        let mut blocks = self
-            .manager
-            .prefetch_blocks(ids, stream)
-            .map_err(cache_residency_exception)?;
-        while let Some(lease) = blocks.next_block().map_err(cache_residency_exception)? {
-            let id = lease.id();
-            let (keys, values) = match lease.arrays() {
-                CacheBlockArrays::KeyValue { keys, values } => (keys.clone(), values.clone()),
-                _ => {
-                    return Err(Exception::custom(
-                        "paged key/value cache found an incompatible block representation",
-                    ))
-                }
-            };
-            let block = KeyValueAttentionBlock::unleased(id.start, id.end, keys, values);
-            visit(&block)?;
-            scanned_blocks += 1;
-            scanned_bytes += lease.bytes();
-        }
-        if self.tail_start < end {
-            if let (Some(keys), Some(values)) = (&self.tail_keys, &self.tail_values) {
-                let block = KeyValueAttentionBlock::unleased(
-                    self.tail_start,
-                    self.offset,
-                    keys.clone(),
-                    values.clone(),
-                );
-                visit(&block)?;
-                scanned_blocks += 1;
-                scanned_bytes += block.bytes;
-            }
-        }
-        Ok((scanned_blocks, scanned_bytes))
-    }
-
-    pub(crate) fn record_architecture_attention_scan(
-        &self,
-        prefill: bool,
-        scanned_blocks: u64,
-        scanned_bytes: u64,
-        scratch_bytes: u64,
-    ) -> Result<(), Exception> {
-        self.manager
-            .record_attention_scan(
-                self.global_layer,
-                prefill,
-                scanned_blocks,
-                scanned_bytes,
-                scratch_bytes,
-            )
-            .map_err(cache_residency_exception)
-    }
-
     pub(crate) fn reset_local_after_manager_clear(&mut self) {
         self.tail_keys = None;
         self.tail_values = None;
@@ -2684,6 +2607,7 @@ fn cache_residency_exception(error: impl std::fmt::Display) -> Exception {
 pub struct ConcatKeyValueCache {
     keys: Option<Array>,
     values: Option<Array>,
+    key_only: bool,
     offset: i32,
     length: i32,
     capacity: i32,
@@ -2790,6 +2714,14 @@ impl ConcatKeyValueCache {
         Self::default()
     }
 
+    /// Creates an empty cache that persists keys and reuses them as values.
+    pub fn new_key_only() -> Self {
+        Self {
+            key_only: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn deep_clone_state(&self) -> Result<Self, Exception> {
         let mut cache = self.clone();
         cache.keys = self
@@ -2826,7 +2758,18 @@ impl ConcatKeyValueCache {
         }
     }
 
+    /// Creates an exact sliding-window cache that persists keys only.
+    pub fn new_key_only_for_sliding_attention(window: i32) -> Self {
+        assert!(window > 0, "sliding attention window must be positive");
+        Self {
+            key_only: true,
+            attention_window: Some(window),
+            ..Self::default()
+        }
+    }
+
     /// Creates an unbounded cache whose backing arrays grow in `step`-token chunks.
+    #[cfg(test)]
     pub(crate) fn new_with_step(step: i32) -> Self {
         Self {
             step: step.max(1),
@@ -2943,11 +2886,14 @@ impl ConcatKeyValueCache {
             .as_ref()
             .expect("Keys cannot be None")
             .try_index_device((.., .., ..self.length, ..), stream)?;
-        let values = self
-            .values
-            .as_ref()
-            .expect("Values cannot be None")
-            .try_index_device((.., .., ..self.length, ..), stream)?;
+        let values = if self.key_only {
+            keys.clone()
+        } else {
+            self.values
+                .as_ref()
+                .expect("Values cannot be None")
+                .try_index_device((.., .., ..self.length, ..), stream)?
+        };
         Ok((keys, values))
     }
 
@@ -2990,7 +2936,7 @@ impl ConcatKeyValueCache {
             }
         }
         self.keys = Some(keys);
-        self.values = Some(values);
+        self.values = (!self.key_only).then_some(values);
         self.offset = end;
         self.length = length;
         self.capacity = length;
@@ -3025,9 +2971,13 @@ impl KeyValueCache for ConcatKeyValueCache {
                 Some(previous) => concatenate_axis(&[previous, keys], -2, stream)?,
                 None => keys,
             };
-            let combined_values = match self.values.take() {
-                Some(previous) => concatenate_axis(&[previous, values], -2, stream)?,
-                None => values,
+            let combined_values = if self.key_only {
+                combined_keys.clone()
+            } else {
+                match self.values.take() {
+                    Some(previous) => concatenate_axis(&[previous, values], -2, stream)?,
+                    None => values,
+                }
             };
             let retained = (window - 1).min(combined_keys.dim(-2));
             if retained == 0 {
@@ -3036,8 +2986,11 @@ impl KeyValueCache for ConcatKeyValueCache {
             } else {
                 let start = combined_keys.dim(-2) - retained;
                 self.keys = Some(combined_keys.try_index_device((.., .., start.., ..), stream)?);
-                self.values =
-                    Some(combined_values.try_index_device((.., .., start.., ..), stream)?);
+                self.values = if self.key_only {
+                    None
+                } else {
+                    Some(combined_values.try_index_device((.., .., start.., ..), stream)?)
+                };
             }
             self.length = retained;
             self.capacity = retained;
@@ -3045,14 +2998,21 @@ impl KeyValueCache for ConcatKeyValueCache {
         }
 
         if self.step <= 1 {
-            match (self.keys.take(), self.values.take()) {
-                (Some(k), Some(v)) => {
-                    self.keys = Some(concatenate_axis(&[k, keys], -2, stream)?);
-                    self.values = Some(concatenate_axis(&[v, values], -2, stream)?);
-                }
-                _ => {
-                    self.keys = Some(keys);
-                    self.values = Some(values);
+            if self.key_only {
+                self.keys = Some(match self.keys.take() {
+                    Some(previous) => concatenate_axis(&[previous, keys], -2, stream)?,
+                    None => keys,
+                });
+            } else {
+                match (self.keys.take(), self.values.take()) {
+                    (Some(k), Some(v)) => {
+                        self.keys = Some(concatenate_axis(&[k, keys], -2, stream)?);
+                        self.values = Some(concatenate_axis(&[v, values], -2, stream)?);
+                    }
+                    _ => {
+                        self.keys = Some(keys);
+                        self.values = Some(values);
+                    }
                 }
             }
             if let Some(max_size) = self.max_size {
@@ -3065,19 +3025,25 @@ impl KeyValueCache for ConcatKeyValueCache {
                             .expect("Keys cannot be None")
                             .try_index_device((.., .., start.., ..), stream)?,
                     );
-                    self.values = Some(
-                        self.values
-                            .take()
-                            .expect("Values cannot be None")
-                            .try_index_device((.., .., start.., ..), stream)?,
-                    );
+                    if !self.key_only {
+                        self.values = Some(
+                            self.values
+                                .take()
+                                .expect("Values cannot be None")
+                                .try_index_device((.., .., start.., ..), stream)?,
+                        );
+                    }
                 }
             }
             self.length = self.keys.as_ref().expect("Keys cannot be None").dim(-2);
             self.capacity = self.length;
             return Ok((
                 self.keys.clone().expect("Keys cannot be None"),
-                self.values.clone().expect("Values cannot be None"),
+                if self.key_only {
+                    self.keys.clone().expect("Keys cannot be None")
+                } else {
+                    self.values.clone().expect("Values cannot be None")
+                },
             ));
         }
 
@@ -3088,7 +3054,9 @@ impl KeyValueCache for ConcatKeyValueCache {
                 if self.keys.is_none() {
                     let start = new_tokens - max_size;
                     self.keys = Some(keys.try_index_device((.., .., start.., ..), stream)?);
-                    self.values = Some(values.try_index_device((.., .., start.., ..), stream)?);
+                    if !self.key_only {
+                        self.values = Some(values.try_index_device((.., .., start.., ..), stream)?);
+                    }
                     self.length = max_size;
                     self.capacity = max_size;
                     return self.logical_arrays(stream);
@@ -3098,8 +3066,10 @@ impl KeyValueCache for ConcatKeyValueCache {
                 let combined_values = concatenate_axis(&[old_values, values], -2, stream)?;
                 let start = required - max_size;
                 self.keys = Some(combined_keys.try_index_device((.., .., start.., ..), stream)?);
-                self.values =
-                    Some(combined_values.try_index_device((.., .., start.., ..), stream)?);
+                if !self.key_only {
+                    self.values =
+                        Some(combined_values.try_index_device((.., .., start.., ..), stream)?);
+                }
                 self.length = max_size;
                 self.capacity = max_size;
                 return self.logical_arrays(stream);
@@ -3110,30 +3080,38 @@ impl KeyValueCache for ConcatKeyValueCache {
             self.capacity = self.grown_capacity(required);
             if self.capacity == required {
                 self.keys = Some(keys);
-                self.values = Some(values);
+                if !self.key_only {
+                    self.values = Some(values);
+                }
                 self.length = required;
                 return self.logical_arrays(stream);
             }
             self.keys = Some(Self::padded(&keys, self.capacity, stream)?);
-            self.values = Some(Self::padded(&values, self.capacity, stream)?);
+            if !self.key_only {
+                self.values = Some(Self::padded(&values, self.capacity, stream)?);
+            }
         } else if required > self.capacity {
             let new_capacity = self.grown_capacity(required);
             let padding = new_capacity - self.capacity;
             let key_padding = Self::padded(&keys, padding, stream)?;
-            let value_padding = Self::padded(&values, padding, stream)?;
+            let value_padding = (!self.key_only)
+                .then(|| Self::padded(&values, padding, stream))
+                .transpose()?;
             self.keys = Some(concatenate_axis(
                 &[self.keys.take().expect("Keys cannot be None"), key_padding],
                 -2,
                 stream,
             )?);
-            self.values = Some(concatenate_axis(
-                &[
-                    self.values.take().expect("Values cannot be None"),
-                    value_padding,
-                ],
-                -2,
-                stream,
-            )?);
+            if let Some(value_padding) = value_padding {
+                self.values = Some(concatenate_axis(
+                    &[
+                        self.values.take().expect("Values cannot be None"),
+                        value_padding,
+                    ],
+                    -2,
+                    stream,
+                )?);
+            }
             self.capacity = new_capacity;
         }
 
@@ -3141,10 +3119,12 @@ impl KeyValueCache for ConcatKeyValueCache {
             .as_mut()
             .expect("Keys cannot be None")
             .try_index_mut_device((.., .., self.length..required, ..), &keys, stream)?;
-        self.values
-            .as_mut()
-            .expect("Values cannot be None")
-            .try_index_mut_device((.., .., self.length..required, ..), &values, stream)?;
+        if !self.key_only {
+            self.values
+                .as_mut()
+                .expect("Values cannot be None")
+                .try_index_mut_device((.., .., self.length..required, ..), &values, stream)?;
+        }
         self.length = required;
         self.logical_arrays(stream)
     }

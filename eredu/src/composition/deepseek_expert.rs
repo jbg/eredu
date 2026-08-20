@@ -264,6 +264,7 @@ pub(crate) fn v3_spec(args: &V3Args, layer: usize) -> CachedSwiGluBankSpec {
         down_quantization: args
             .linear_format_for(&format!("{root}.down_proj"))
             .weight_quantization(),
+        activation: eredu_nn::GatedExpertActivation::Silu,
         limit: None,
     }
 }
@@ -286,6 +287,7 @@ pub(crate) fn v4_spec(args: &V4Args, layer: usize) -> CachedSwiGluBankSpec {
         down_quantization: args
             .linear_format_for(&format!("{root}.down_proj"))
             .weight_quantization(),
+        activation: eredu_nn::GatedExpertActivation::Silu,
         limit: args.swiglu_limit.map(|limit| limit.get()),
     }
 }

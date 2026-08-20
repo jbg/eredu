@@ -1,6 +1,7 @@
 //! Mixture-of-experts routing and packed expert implementations.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_nn::GatedExpertActivation;
 
 use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use safemlx::{
@@ -12,8 +13,9 @@ use safemlx::{
         arange, argpartition_axis, concatenate_axis, gather_grouped_rows, gather_qmm_with_mode,
         gather_route_values, grouped_matmul,
         indexing::{scatter_single, take_along_axis, topk_axis, NewAxis, TryIndexOp},
-        matmul, quantized_matmul_with_mode, quantized_packed_dimension, r#where, sigmoid,
-        softmax_axis, sum_axis, topk_route_plan, zeros_dtype, GroupedRoutePlan, QuantizationMode,
+        matmul, mean_axis, quantized_matmul_with_mode, quantized_packed_dimension, r#where, rsqrt,
+        sigmoid, softmax_axis, sum_axis, topk_route_plan, zeros_dtype, GroupedRoutePlan,
+        QuantizationMode,
     },
     Array, Dtype, Stream,
 };
@@ -190,6 +192,8 @@ pub fn quantize_expert_bank(
 pub enum TopKRouterScoreFunction {
     /// Softmax scores before top-k selection.
     Softmax,
+    /// Select raw logits first, then softmax only the selected routes.
+    SelectedSoftmax,
     /// Sigmoid router scores.
     Sigmoid,
     /// Square-root softplus router scores.
@@ -204,6 +208,7 @@ impl TopKRouterScoreFunction {
     fn apply(self, logits: Array, stream: &Stream) -> Result<Array, Exception> {
         match self {
             Self::Softmax => softmax_axis(logits, -1, true, stream),
+            Self::SelectedSoftmax => Ok(logits),
             Self::Sigmoid => sigmoid(logits, stream),
             Self::SqrtSoftplus => safemlx::nn::softplus(logits, stream)?.sqrt(stream),
         }
@@ -233,6 +238,12 @@ pub struct TopKRouterConfig {
     pub topk_group: i32,
     /// Whether to allocate a selection-only expert score correction bias.
     pub score_correction_bias: bool,
+    /// Optional epsilon for weightless RMS normalization before projection.
+    pub input_rms_epsilon: Option<f32>,
+    /// Whether normalized inputs receive an additional inverse-sqrt-width scale.
+    pub input_inverse_sqrt_dimensions: bool,
+    /// Whether to allocate learned per-expert route multipliers.
+    pub route_scale: bool,
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -268,6 +279,16 @@ pub struct TopKRouter {
     #[param]
     /// Optional score correction bias used only when choosing experts.
     pub e_score_correction_bias: Param<Option<Array>>,
+    #[param]
+    /// Optional learned feature scale applied to RMS-normalized inputs.
+    pub input_scale: Param<Option<Array>>,
+    #[param]
+    /// Optional learned multiplier gathered for each selected expert.
+    pub route_scale: Param<Option<Array>>,
+    /// Optional router-input RMS epsilon.
+    pub input_rms_epsilon: Option<f32>,
+    /// Whether normalized router inputs are divided by the square root of width.
+    pub input_inverse_sqrt_dimensions: bool,
     /// Affine group size, or zero for a dense router.
     pub group_size: i32,
     /// Affine bit width, or zero for a dense router.
@@ -408,6 +429,18 @@ impl TopKRouter {
             } else {
                 Param::new(None)
             },
+            input_scale: if config.input_rms_epsilon.is_some() {
+                Param::<Option<Array>>::unloaded_some(&[config.hidden_size], dense_dtype, stream)?
+            } else {
+                Param::new(None)
+            },
+            route_scale: if config.route_scale {
+                Param::<Option<Array>>::unloaded_some(&[config.num_experts], dense_dtype, stream)?
+            } else {
+                Param::new(None)
+            },
+            input_rms_epsilon: config.input_rms_epsilon,
+            input_inverse_sqrt_dimensions: config.input_inverse_sqrt_dimensions,
             group_size: affine.map_or(0, WeightQuantization::group_size),
             bits: affine.map_or(0, WeightQuantization::bits),
             mode: affine.map_or(
@@ -448,7 +481,7 @@ impl TopKRouter {
         selection_bias: Option<&Array>,
         stream: &Stream,
     ) -> Result<TopKRouterOutput, Exception> {
-        let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
+        let flat = self.transform_input(hidden_states, stream)?;
         let logits = if let Some(iquant) = self.iquant {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ router format");
             NativeQuantizedTensor::from_iq_array(
@@ -499,6 +532,9 @@ impl TopKRouter {
 
         let top_k_index = self.topk_indices(&scores_for_choice, stream)?;
         let mut top_k_weights = take_along_axis(&scores, &top_k_index, -1, stream)?;
+        if self.score_function == TopKRouterScoreFunction::SelectedSoftmax {
+            top_k_weights = softmax_axis(&top_k_weights, -1, true, stream)?;
+        }
         let selected_scores = top_k_weights.clone();
         if self.norm_topk_prob {
             let mut denominator = sum_axis(&top_k_weights, -1, true, stream)?;
@@ -511,6 +547,10 @@ impl TopKRouter {
         if self.routed_scaling_factor != 1.0 {
             top_k_weights =
                 top_k_weights.multiply(Array::from_f32(self.routed_scaling_factor), stream)?;
+        }
+        if let Some(scale) = self.route_scale.as_ref() {
+            top_k_weights =
+                top_k_weights.multiply(scale.take_axis(&top_k_index, 0, stream)?, stream)?;
         }
         Ok(TopKRouterOutput {
             indices: top_k_index,
@@ -543,7 +583,7 @@ impl TopKRouter {
         expert_indices: &Array,
         stream: &Stream,
     ) -> Result<TopKRouterOutput, Exception> {
-        let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
+        let flat = self.transform_input(hidden_states, stream)?;
         let logits = if let Some(iquant) = self.iquant {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ router format");
             NativeQuantizedTensor::from_iq_array(
@@ -586,6 +626,9 @@ impl TopKRouter {
         let scores = self.score_function.apply(logits, stream)?;
         let expert_indices = expert_indices.reshape(&[-1, self.top_k], stream)?;
         let mut weights = take_along_axis(scores, &expert_indices, -1, stream)?;
+        if self.score_function == TopKRouterScoreFunction::SelectedSoftmax {
+            weights = softmax_axis(&weights, -1, true, stream)?;
+        }
         let selected_scores = weights.clone();
         if self.norm_topk_prob {
             let denominator = weights
@@ -596,11 +639,38 @@ impl TopKRouter {
         if self.routed_scaling_factor != 1.0 {
             weights = weights.multiply(Array::from_f32(self.routed_scaling_factor), stream)?;
         }
+        if let Some(scale) = self.route_scale.as_ref() {
+            weights = weights.multiply(scale.take_axis(&expert_indices, 0, stream)?, stream)?;
+        }
         Ok(TopKRouterOutput {
             indices: expert_indices,
             scores: selected_scores,
             weights,
         })
+    }
+
+    fn transform_input(&self, hidden_states: &Array, stream: &Stream) -> Result<Array, Exception> {
+        let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
+        let Some(scale) = self.input_scale.as_ref() else {
+            return Ok(flat);
+        };
+        let epsilon = self
+            .input_rms_epsilon
+            .expect("router input scale requires an RMS epsilon");
+        let variance = mean_axis(&flat.square(stream)?, -1, true, stream)?;
+        let normalized = flat.multiply(
+            rsqrt(variance.add(Array::from_f32(epsilon), stream)?, stream)?,
+            stream,
+        )?;
+        let scaled = normalized.multiply(scale, stream)?;
+        if self.input_inverse_sqrt_dimensions {
+            scaled.multiply(
+                Array::from_f32((self.input_dims as f32).sqrt().recip()),
+                stream,
+            )
+        } else {
+            Ok(scaled)
+        }
     }
 
     /// Returns selected expert ids and weights while reporting router internals.
@@ -611,7 +681,7 @@ impl TopKRouter {
         prefix: &str,
         observer: &mut dyn RuntimeActivationObserver<Array, Exception>,
     ) -> Result<TopKRouterOutput, Exception> {
-        let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
+        let flat = self.transform_input(hidden_states, stream)?;
         let logits = if let Some(scales) = self.scales.as_ref() {
             let input = if self.score_function.requires_fp32() {
                 flat.as_dtype(Dtype::Float32, stream)?
@@ -658,6 +728,9 @@ impl TopKRouter {
         let top_k_index = self.topk_indices(&scores_for_choice, stream)?;
         observer.observe(&format!("{prefix}.top_k_experts"), &top_k_index)?;
         let mut top_k_weights = take_along_axis(&scores, &top_k_index, -1, stream)?;
+        if self.score_function == TopKRouterScoreFunction::SelectedSoftmax {
+            top_k_weights = softmax_axis(&top_k_weights, -1, true, stream)?;
+        }
         let top_k_scores = top_k_weights.clone();
         observer.observe(&format!("{prefix}.top_k_scores"), &top_k_weights)?;
         if self.norm_topk_prob {
@@ -676,6 +749,14 @@ impl TopKRouter {
             top_k_weights =
                 top_k_weights.multiply(Array::from_f32(self.routed_scaling_factor), stream)?;
             observer.observe(&format!("{prefix}.top_k_weights_scaled"), &top_k_weights)?;
+        }
+        if let Some(scale) = self.route_scale.as_ref() {
+            top_k_weights =
+                top_k_weights.multiply(scale.take_axis(&top_k_index, 0, stream)?, stream)?;
+            observer.observe(
+                &format!("{prefix}.top_k_weights_expert_scaled"),
+                &top_k_weights,
+            )?;
         }
         Ok(TopKRouterOutput {
             indices: top_k_index,
@@ -1037,6 +1118,8 @@ pub struct PackedSwiGluExperts {
     pub hidden_dim: i32,
     /// Per-expert intermediate dimension.
     pub intermediate_dim: i32,
+    /// Gate activation selected by the architecture.
+    pub activation: GatedExpertActivation,
     /// Optional finite bound applied before the SwiGLU product.
     pub swiglu_limit: Option<f32>,
     /// Optional encoding for the concatenated gate/up projection.
@@ -1195,6 +1278,7 @@ impl PackedSwiGluExperts {
             num_experts,
             hidden_dim,
             intermediate_dim,
+            activation: GatedExpertActivation::Silu,
             swiglu_limit: None,
             gate_up_affine,
             down_affine,
@@ -1221,6 +1305,12 @@ impl PackedSwiGluExperts {
         }
         self.swiglu_limit = (limit > 0.0).then_some(limit);
         Ok(self)
+    }
+
+    /// Selects the gated-product activation.
+    pub fn with_activation(mut self, activation: GatedExpertActivation) -> Self {
+        self.activation = activation;
+        self
     }
 
     /// Rebuilds projection storage for native block-FP8 expert tensors.
@@ -1316,7 +1406,11 @@ impl PackedSwiGluExperts {
             gate = safemlx::ops::clip(gate, ((), limit), stream)?;
             up = safemlx::ops::clip(up, (-limit, limit), stream)?;
         }
-        let activated = silu(gate, stream)?.multiply(up, stream)?;
+        let gate = match self.activation {
+            GatedExpertActivation::Silu => silu(gate, stream)?,
+            GatedExpertActivation::GeluApproximate => safemlx::nn::gelu_approximate(gate, stream)?,
+        };
+        let activated = gate.multiply(up, stream)?;
         let output = if self.native_fp8_e8m0 {
             crate::backend::mlx::nn::fp8::grouped_linear(
                 &activated,
@@ -1391,4 +1485,78 @@ impl PackedSwiGluExperts {
 
     /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use safemlx::{module::Param, transforms::eval, Device, DeviceType, ExecutionContext};
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn mlx_selected_softmax_router_applies_input_and_expert_scales() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let mut router = TopKRouter::new(
+            TopKRouterConfig {
+                top_k: 2,
+                num_experts: 3,
+                hidden_size: 2,
+                score_function: TopKRouterScoreFunction::SelectedSoftmax,
+                norm_topk_prob: false,
+                normalization_epsilon: 0.0,
+                routed_scaling_factor: 1.0,
+                n_group: 1,
+                topk_group: 1,
+                score_correction_bias: false,
+                input_rms_epsilon: Some(0.0),
+                input_inverse_sqrt_dimensions: true,
+                route_scale: true,
+            },
+            stream,
+        )
+        .unwrap();
+        router.weight = Param::new(Array::from_slice(
+            &[1.0_f32, 0.0, 0.0, 1.0, -1.0, 0.0],
+            &[3, 2],
+        ));
+        router.input_scale = Param::new(Some(Array::from_slice(&[2.0_f32, 1.0], &[2])));
+        router.route_scale = Param::new(Some(Array::from_slice(&[2.0_f32, 3.0, 5.0], &[3])));
+        let output = router
+            .forward_routes_with_selection_bias(
+                &Array::from_slice(&[3.0_f32, 4.0], &[1, 2]),
+                None,
+                stream,
+            )
+            .unwrap();
+        eval([&output.indices, &output.scores, &output.weights]).unwrap();
+        let first = 0.4_f32.exp() / (0.4_f32.exp() + 1.0);
+        let mut seen = [false; 2];
+        for route in 0..2 {
+            let expert = output
+                .indices
+                .try_index_device((0, route), stream)
+                .unwrap()
+                .item::<i32>(stream);
+            let score = output
+                .scores
+                .try_index_device((0, route), stream)
+                .unwrap()
+                .item::<f32>(stream);
+            let weight = output
+                .weights
+                .try_index_device((0, route), stream)
+                .unwrap()
+                .item::<f32>(stream);
+            let (expected_score, expected_weight) = match expert {
+                0 => (first, 2.0 * first),
+                1 => (1.0 - first, 3.0 * (1.0 - first)),
+                other => panic!("unexpected selected expert {other}"),
+            };
+            seen[expert as usize] = true;
+            assert!((score - expected_score).abs() < 1e-5);
+            assert!((weight - expected_weight).abs() < 1e-5);
+        }
+        assert_eq!(seen, [true, true]);
+    }
 }

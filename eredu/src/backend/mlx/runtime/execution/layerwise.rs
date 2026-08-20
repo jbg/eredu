@@ -547,6 +547,29 @@ where
     Ok((transformed, report))
 }
 
+/// Builds a bounded packed overlay for one fully resident neutral module tree.
+pub(crate) fn quantize_parameterized_module_store<M>(
+    store: SharedCheckpointSource,
+    source: &M,
+    target: &M,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
+where
+    M: Clone + eredu_nn::Parameterized<Array>,
+{
+    quantize_parameterized_store(
+        store,
+        source,
+        target,
+        |_index, _stream| Ok(source.clone()),
+        |_index, _stream| Ok(target.clone()),
+        0,
+        quantization,
+        stream,
+    )
+}
+
 /// Builds a bounded packed overlay from native module trees and caller-owned
 /// semantic checkpoint bindings.
 ///

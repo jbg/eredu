@@ -15,7 +15,7 @@ use eredu_core::{
     SpeculativeSampling, SpeculativeSemanticConstraint, SpeculativeSemanticState,
     SpeculativeTelemetry,
 };
-use safemlx::{error::Exception, Array, TimedEvaluation};
+use safemlx::{error::Exception, Array};
 #[cfg(test)]
 use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event, Stream};
 
@@ -93,43 +93,6 @@ impl MtpComponentTimings {
 impl SpeculativeTelemetry for MtpComponentTimings {
     fn record(self, stats: &mut MtpStats) {
         self.add_to(stats);
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct MtpComponentTimingEvaluations {
-    draft_context: Vec<TimedEvaluation>,
-    draft_assistant: Vec<TimedEvaluation>,
-    draft_head: Vec<TimedEvaluation>,
-}
-
-impl MtpComponentTimingEvaluations {
-    pub(crate) fn push_draft_context(&mut self, timing: Option<TimedEvaluation>) {
-        self.draft_context.extend(timing);
-    }
-
-    pub(crate) fn push_draft_assistant(&mut self, timing: Option<TimedEvaluation>) {
-        self.draft_assistant.extend(timing);
-    }
-
-    pub(crate) fn push_draft_head(&mut self, timing: Option<TimedEvaluation>) {
-        self.draft_head.extend(timing);
-    }
-
-    pub(crate) fn resolve(&mut self) -> Result<MtpComponentTimings, Exception> {
-        fn sum(timings: &mut Vec<TimedEvaluation>) -> Result<Duration, Exception> {
-            timings.drain(..).try_fold(
-                Duration::ZERO,
-                |total, timing| Ok(total + timing.elapsed()?),
-            )
-        }
-
-        Ok(MtpComponentTimings {
-            draft_context: sum(&mut self.draft_context)?,
-            draft_assistant: sum(&mut self.draft_assistant)?,
-            draft_head: sum(&mut self.draft_head)?,
-            target_verification: Duration::ZERO,
-        })
     }
 }
 
