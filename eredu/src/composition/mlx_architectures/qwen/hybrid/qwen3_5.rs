@@ -4,6 +4,7 @@
 use eredu_checkpoint::AffineQuantization;
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
+use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::{CausalModel, RuntimeLayerState, RuntimeState, StateError, StateLayout};
 
 use safemlx::{
@@ -71,7 +72,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, GgufTensorNames,
     },
-    backend::mlx::runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    backend::mlx::runtime::execution::inspection::MoeRoutingObservation,
     backend::mlx::runtime::media::input as runtime_input,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
@@ -1744,7 +1745,7 @@ impl FullAttention {
         input: FullAttentionInput<'_>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let FullAttentionInput { x, mask, mut cache } = input;
         let shape = x.shape();
@@ -2196,7 +2197,7 @@ impl LinearAttention {
         input: LinearAttentionInput<'_>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let LinearAttentionInput { x, mut cache } = input;
         let shape = x.shape();
@@ -2338,7 +2339,7 @@ impl Mlp {
         input: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(input, stream)?;
         observer.observe(&format!("{prefix}.gate_proj"), &gate)?;
@@ -2664,7 +2665,7 @@ impl Experts {
         top_k_weights: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.shape()[0];
         if num_tokens <= ROUTED_EXPERT_CHUNK_THRESHOLD {
@@ -2715,7 +2716,7 @@ impl Experts {
         top_k_weights: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         observer.observe(&format!("{prefix}.input"), hidden_states)?;
         observer.observe(&format!("{prefix}.top_k_experts"), top_k_index)?;
@@ -2882,7 +2883,7 @@ impl Experts {
         top_k_weights: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.shape()[0];
         let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
@@ -3218,7 +3219,7 @@ impl SparseMoeBlock {
         hidden_states: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let shape = hidden_states.shape();
         let b = shape[0];
@@ -3260,17 +3261,17 @@ impl SparseMoeBlock {
 
         let combined = routed.add(&shared, stream)?;
         observer.observe(&format!("{prefix}.combined_flat"), &combined)?;
-        observer.observe_moe_routing(MoeRoutingObservation {
-            prefix,
+        observer.observe_routing(MoeRoutingObservation {
+            path: prefix,
             selected_experts: &selected_experts,
             selected_scores: &selected_scores,
-            routing_weights: &routing_weights,
+            route_weights: &routing_weights,
             routed_output: &routed,
             local_routed_output: None,
             reduced_routed_output: Some(&routed),
             shared_output: Some(&shared),
             combined_output: Some(&combined),
-            num_experts: self.gate.num_experts,
+            expert_count: self.gate.num_experts,
         })?;
         let output = combined.reshape(&[b, l, h], stream)?;
         observer.observe(&format!("{prefix}.output"), &output)?;
@@ -3388,7 +3389,7 @@ impl FeedForward {
         input: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         match self {
             Self::Dense(mlp) => mlp.forward_with_observer(input, stream, prefix, observer),
@@ -4503,7 +4504,7 @@ impl TransformerBlock {
         input: BlockInput<'_>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let BlockInput { x, mask, cache } = input;
         observer.observe(&format!("{prefix}.input"), x)?;
@@ -4891,7 +4892,7 @@ impl Qwen35TextModel {
         &mut self,
         input: ModelInput<'_>,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let ModelInput {
             inputs,
@@ -5534,7 +5535,7 @@ impl Model {
         &mut self,
         input: ModelInput<'_>,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         self.reject_multimodal_tokens(input.inputs, input.inputs_embeds.is_some(), stream)?;
         let hidden_states = self.model.forward_with_observer(input, stream, observer)?;
@@ -7044,7 +7045,7 @@ impl Model {
         input: runtime_input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let prepared = self.prepare_typed_prefill(input, stream)?;
         let logits =

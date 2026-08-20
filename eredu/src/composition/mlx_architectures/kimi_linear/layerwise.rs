@@ -1261,7 +1261,7 @@ impl KimiLinearLayerwiseModel {
         inputs: &Array,
         cache: &mut Cache,
         stream: &Stream,
-        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     ) -> Result<Array, Error> {
         let hook = |_architecture: &mut KimiLinearArchitecture,
                     _group: usize,

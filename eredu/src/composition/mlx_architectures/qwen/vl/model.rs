@@ -1,5 +1,6 @@
 //! Qwen3-VL conditional-generation model support.
 
+use eredu_nn::RotaryPosition;
 use eredu_runtime::{CausalModel, RuntimeState, StateError, StateLayout};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -35,7 +36,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{
         self as common,
-        attention::AttentionInput,
+        shared::{MlxBackend, MlxModule},
         tensor::{create_attention_mask, AttentionMask},
     },
     backend::mlx::runtime::cache::{
@@ -45,9 +46,11 @@ use crate::{
         },
         ConcatKeyValueCache, KeyValueCache,
     },
-    backend::mlx::runtime::checkpoint::load::gguf_quantization_configs,
+    backend::mlx::runtime::checkpoint::load::{
+        gguf_i32_catalog, gguf_quantization_configs, gguf_string,
+    },
     backend::mlx::runtime::media::input as runtime_input,
-    composition::mlx_architectures::qwen::{dense as dense_qwen, vl::vision::grid_thw_from_array},
+    composition::mlx_architectures::qwen::vl::vision::grid_thw_from_array,
     core::attention::LayerSchedule,
     core::cache::{
         LayerCachePolicy, StateTensorDimension, StateTensorDtype, StateTensorOwner,
@@ -59,7 +62,7 @@ use crate::{
 /// Parsed Qwen3-VL configuration.
 pub struct ModelArgs {
     /// Text decoder configuration shared with Qwen3.
-    pub text_config: dense_qwen::DecoderConfig,
+    pub text_config: eredu_architectures::qwen::ModelArgs,
     /// Vision encoder configuration shared across Qwen VL models.
     pub vision_config: VisionConfig,
     /// Placeholder token used for image embeddings.
@@ -135,17 +138,24 @@ fn parse_model_args_value(mut value: Value) -> Result<ModelArgs, Error> {
                 .collect::<Option<Vec<_>>>()
         })
         .unwrap_or_else(|| vec![24, 20, 20]);
-    if let Some(rope) = rope {
+    let empty_rope_scaling = if let Some(rope) = rope {
         rope.remove("mrope_section");
         rope.remove("mrope_interleaved");
-    }
-    let normalized_text_model_type = if model_type == "qwen3_vl_moe" {
-        "qwen3_vl_moe_text"
+        rope.is_empty()
     } else {
-        "qwen3_vl_text"
+        false
+    };
+    if empty_rope_scaling {
+        text_object.remove("rope_scaling");
+    }
+    let text_context = if model_type == "qwen3_vl_moe" {
+        eredu_architectures::qwen::TextConfigContext::Qwen3VlMoe
+    } else {
+        eredu_architectures::qwen::TextConfigContext::Qwen3Vl
     };
     let text_config =
-        dense_qwen::qwen3_text_config_from_hf_value(&text_value, normalized_text_model_type)?;
+        eredu_architectures::qwen::model_args_from_text_config_value(&text_value, text_context)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     if model_type == "qwen3_vl_moe" && text_config.num_experts <= 0 {
         return Err(Error::UnsupportedArchitecture(
             "qwen3_vl_moe text_config must define routed experts".into(),
@@ -183,7 +193,7 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
         [
             (
                 "text",
-                dense_qwen::prompt_cache_architecture_fingerprint(&args.text_config),
+                eredu_architectures::qwen::prompt_cache_architecture_fingerprint(&args.text_config),
             ),
             ("image_token", args.image_token_id.to_string()),
             ("video_token", args.video_token_id.to_string()),
@@ -318,7 +328,7 @@ pub struct Qwen3VLModel {
     pub visual: QwenVisionTransformer,
     #[param]
     /// Qwen3-compatible language model body.
-    pub language_model: dense_qwen::Decoder,
+    pub language_model: MlxModule<eredu_architectures::qwen::Decoder<MlxBackend>>,
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -434,7 +444,10 @@ impl Model {
     /// Creates an unloaded Qwen3-VL model.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let visual = QwenVisionTransformer::new_deepstack(args.vision_config.clone(), stream)?;
-        let language_model = dense_qwen::Decoder::new(&args.text_config, stream)?;
+        let language_model = MlxModule::new(
+            eredu_architectures::qwen::new_decoder::<MlxBackend>(&args.text_config, stream)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        );
         let lm_head = if args.text_config.tie_word_embeddings {
             None
         } else {
@@ -442,9 +455,7 @@ impl Model {
                 common::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
                     args.text_config.hidden_size,
                     args.text_config.vocab_size,
-                    args.text_config
-                        .quantization
-                        .or(args.text_config.quantization_config),
+                    args.text_config.weight_quantization_for("lm_head.weight"),
                     stream,
                 )?,
             )
@@ -461,7 +472,7 @@ impl Model {
 
     /// Returns the effective model type.
     pub fn model_type(&self) -> &str {
-        if self.args.text_config.model_type == "qwen3_vl_moe_text" {
+        if self.args.text_config.is_moe() {
             "qwen3_vl_moe"
         } else {
             "qwen3_vl"
@@ -533,7 +544,7 @@ impl Model {
         let layer_count = args.text_config.num_hidden_layers as usize;
         let identity = PromptCacheModelIdentity {
             model_family: "qwen3_vl".into(),
-            effective_model_type: if args.text_config.model_type == "qwen3_vl_moe_text" {
+            effective_model_type: if args.text_config.is_moe() {
                 "qwen3_vl_moe".into()
             } else {
                 "qwen3_vl".into()
@@ -646,7 +657,7 @@ impl Model {
         let mut collected = (0..deepstack_count)
             .map(|_| Vec::new())
             .collect::<Vec<Vec<Array>>>();
-        let embed_tokens = &mut self.model.language_model.embed_tokens;
+        let embed_tokens = &mut self.model.language_model.embeddings;
         let visual = &mut self.model.visual;
         let prepared = runtime_input::prepare_decoder_prefill(
             input,
@@ -695,7 +706,7 @@ impl Model {
             None => self
                 .model
                 .language_model
-                .embed_tokens
+                .embeddings
                 .forward(&tokens, stream)?,
         };
         let (position_ids, rope_delta) = multimodal_position_ids(
@@ -790,16 +801,21 @@ impl Model {
             .zip(cache.kv.iter_mut())
             .enumerate()
         {
-            hidden = layer.forward_with_rotary_embeddings(
-                AttentionInput {
-                    x: &hidden,
-                    mask: mask.as_ref(),
-                    cache: layer_cache.as_mut(),
-                },
-                &cos,
-                &sin,
-                stream,
-            )?;
+            hidden = layer
+                .forward(
+                    eredu_architectures::qwen::AttentionInput {
+                        hidden: &hidden,
+                        mask: mask.as_ref(),
+                        cache: layer_cache.as_mut(),
+                        allow_sliding_prefill: true,
+                        rotary_position: Some(RotaryPosition::Embeddings {
+                            cosine: &cos,
+                            sine: &sin,
+                        }),
+                    },
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))?;
             if let Some(features) = deepstack_features.get(layer_index) {
                 let base = zeros_dtype(hidden.shape(), hidden.dtype(), stream)?;
                 let features = features.try_index_device((0, .., ..), stream)?;
@@ -815,7 +831,7 @@ impl Model {
         let hidden = self.model.language_model.norm.forward(&hidden, stream)?;
         common::linear::project_logits_maybe_quantized(
             &mut self.lm_head,
-            &mut self.model.language_model.embed_tokens,
+            &mut self.model.language_model.embeddings,
             &hidden,
             stream,
         )
@@ -939,13 +955,23 @@ pub(crate) struct PreparedQwen3VlGguf {
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
+struct Qwen3VlGgufCatalog<'a>(&'a GgufCheckpoint);
+
+impl eredu_architectures::qwen::GgufTensorCatalog for Qwen3VlGgufCatalog<'_> {
+    fn contains(&self, name: &str) -> bool {
+        crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames::contains_gguf_tensor(
+            self.0, name,
+        )
+    }
+}
+
 pub(crate) fn prepare_qwen3_vl_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     vision_checkpoint: &GgufCheckpoint,
     vision_metadata: &HashMap<String, GgufMetadataValue>,
 ) -> Result<PreparedQwen3VlGguf, Error> {
-    let architecture = dense_qwen::gguf_string(metadata, "general.architecture")?;
+    let architecture = gguf_string(metadata, "general.architecture")?;
     let is_moe = match architecture.as_str() {
         "qwen3vl" => false,
         "qwen3vlmoe" => true,
@@ -962,25 +988,52 @@ pub(crate) fn prepare_qwen3_vl_gguf_checkpoint(
         vision_metadata,
     )
     .into_loader_result()?;
-    let (mut text_config, eos_token_ids) =
-        dense_qwen::prepare_gguf_checkpoint(checkpoint, metadata, &architecture, is_moe)?;
-    text_config.model_type = if is_moe {
-        "qwen3_vl_moe_text"
+    let context = if is_moe {
+        eredu_architectures::qwen::TextConfigContext::Qwen3VlMoe
     } else {
-        "qwen3_vl_text"
+        eredu_architectures::qwen::TextConfigContext::Qwen3Vl
+    };
+    let mut text_config = eredu_architectures::qwen::model_args_from_gguf_catalog_with_context(
+        &Qwen3VlGgufCatalog(checkpoint),
+        metadata,
+        context,
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let translate = |name: &str| {
+        let standalone = eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe);
+        standalone
+            .strip_prefix("model.")
+            .map_or(standalone.clone(), |name| {
+                format!("model.language_model.{name}")
+            })
+    };
+    checkpoint
+        .catalog()
+        .translated_outputs(translate)
+        .map_err(safemlx::error::IoError::from)?;
+    let mut configs = gguf_quantization_configs(checkpoint, translate)?;
+    if is_moe {
+        for layer in 0..text_config.num_hidden_layers {
+            let prefix = format!("model.language_model.layers.{layer}.mlp.experts");
+            if let Some(config) = configs.remove(&format!("{prefix}.gate_proj.weight")) {
+                configs.remove(&format!("{prefix}.up_proj.weight"));
+                configs.insert(format!("{prefix}.gate_up_proj"), config);
+            }
+        }
     }
-    .into();
+    text_config.quantized_weights = Some(configs.keys().cloned().collect());
+    text_config.quantized_weight_configs = Some(configs);
     let args =
         qwen3_vl_args_from_gguf_catalog(text_config, metadata, vision_checkpoint, vision_metadata)?;
     Ok(PreparedQwen3VlGguf {
         args,
-        eos_token_ids,
+        eos_token_ids: crate::backend::mlx::gguf_eos_token_ids(metadata)?,
     })
 }
 
 /// Builds the complete Qwen3-VL geometry from GGUF catalogs without reading payload bytes.
 pub(crate) fn qwen3_vl_args_from_gguf_catalog(
-    text_config: dense_qwen::DecoderConfig,
+    text_config: eredu_architectures::qwen::ModelArgs,
     metadata: &HashMap<String, GgufMetadataValue>,
     vision_checkpoint: &GgufCheckpoint,
     vision_metadata: &HashMap<String, GgufMetadataValue>,
@@ -1009,7 +1062,7 @@ pub(crate) fn qwen_vision_config_from_gguf_catalog(
 ) -> Result<VisionConfig, Error> {
     validate_qwen3_vl_mmproj(metadata)?;
     let deepstack_visual_indexes = gguf_deepstack_layers(metadata)?;
-    let hidden_size = dense_qwen::gguf_i32_catalog(metadata, "clip.vision.embedding_length")?;
+    let hidden_size = gguf_i32_catalog(metadata, "clip.vision.embedding_length")?;
     let position_layout = checkpoint
         .catalog()
         .tensors()
@@ -1026,7 +1079,7 @@ pub(crate) fn qwen_vision_config_from_gguf_catalog(
             position_layout.shape
         )));
     }
-    let depth = dense_qwen::gguf_i32_catalog(metadata, "clip.vision.block_count")?;
+    let depth = gguf_i32_catalog(metadata, "clip.vision.block_count")?;
     let depth = usize::try_from(depth)
         .ok()
         .filter(|depth| *depth > 0)
@@ -1082,29 +1135,23 @@ pub(crate) fn qwen_vision_config_from_gguf_catalog(
         })?,
         hidden_size,
         hidden_act: "gelu_pytorch_tanh".into(),
-        intermediate_size: dense_qwen::gguf_i32_catalog(
-            metadata,
-            "clip.vision.feed_forward_length",
-        )?,
-        num_heads: dense_qwen::gguf_i32_catalog(metadata, "clip.vision.attention.head_count")?,
+        intermediate_size: gguf_i32_catalog(metadata, "clip.vision.feed_forward_length")?,
+        num_heads: gguf_i32_catalog(metadata, "clip.vision.attention.head_count")?,
         num_position_embeddings: i32::try_from(position_layout.shape[0]).map_err(|_| {
             Error::UnsupportedArchitecture(format!("{family} position count exceeds i32"))
         })?,
         in_channels: 3,
-        patch_size: dense_qwen::gguf_i32_catalog(metadata, "clip.vision.patch_size")?,
-        spatial_merge_size: dense_qwen::gguf_i32_catalog(
-            metadata,
-            "clip.vision.spatial_merge_size",
-        )?,
+        patch_size: gguf_i32_catalog(metadata, "clip.vision.patch_size")?,
+        spatial_merge_size: gguf_i32_catalog(metadata, "clip.vision.spatial_merge_size")?,
         temporal_patch_size: 2,
         window_size: 112,
-        out_hidden_size: dense_qwen::gguf_i32_catalog(metadata, "clip.vision.projection_dim")?,
+        out_hidden_size: gguf_i32_catalog(metadata, "clip.vision.projection_dim")?,
         quantized_weight_configs,
     })
 }
 
 pub(crate) fn validate_qwen3_vl_text_gguf_catalog(
-    text_config: &dense_qwen::DecoderConfig,
+    text_config: &eredu_architectures::qwen::ModelArgs,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> Result<(Vec<i32>, u32, u32), Error> {
     if !text_config.tie_word_embeddings {
@@ -1112,7 +1159,7 @@ pub(crate) fn validate_qwen3_vl_text_gguf_catalog(
             "qwen3vl GGUF with an untied output head is not supported".into(),
         ));
     }
-    let architecture = dense_qwen::gguf_string(metadata, "general.architecture")?;
+    let architecture = gguf_string(metadata, "general.architecture")?;
     if !matches!(architecture.as_str(), "qwen3vl" | "qwen3vlmoe") {
         return Err(Error::UnsupportedArchitecture(format!(
             "Qwen3-VL text validation requires qwen3vl or qwen3vlmoe, got {architecture:?}"
@@ -1139,7 +1186,7 @@ pub(crate) fn validate_qwen3_vl_text_gguf_catalog(
 }
 
 pub(crate) fn validate_qwen3_vl_vision_geometry(
-    text_config: &dense_qwen::DecoderConfig,
+    text_config: &eredu_architectures::qwen::ModelArgs,
     metadata: &HashMap<String, GgufMetadataValue>,
     vision_config: &VisionConfig,
 ) -> Result<(), Error> {
@@ -1153,7 +1200,7 @@ pub(crate) fn validate_qwen3_vl_vision_geometry(
             "qwen3vl GGUF vision geometry must be positive".into(),
         ));
     }
-    let architecture = dense_qwen::gguf_string(metadata, "general.architecture")?;
+    let architecture = gguf_string(metadata, "general.architecture")?;
     let deepstack_key = format!("{architecture}.n_deepstack_layers");
     if let Some(value) = metadata.get(&deepstack_key) {
         let expected = value.as_i64().ok_or_else(|| {
@@ -1180,8 +1227,8 @@ pub(crate) fn validate_qwen3_vl_vision_geometry(
 pub(crate) fn validate_qwen3_vl_mmproj(
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> Result<(), Error> {
-    let architecture = dense_qwen::gguf_string(metadata, "general.architecture")?;
-    let projector = dense_qwen::gguf_string(metadata, "clip.projector_type")?;
+    let architecture = gguf_string(metadata, "general.architecture")?;
+    let projector = gguf_string(metadata, "clip.projector_type")?;
     if architecture != "clip" || projector != "qwen3vl_merger" {
         return Err(Error::UnsupportedArchitecture(format!(
             "expected a qwen3vl GGUF vision projector, got architecture {architecture:?} and projector {projector:?}"
@@ -1338,7 +1385,7 @@ impl CausalModel<Cache> for Model {
         let embeddings = self
             .model
             .language_model
-            .embed_tokens
+            .embeddings
             .forward(input_tokens, stream)?;
         let start = cache
             .kv

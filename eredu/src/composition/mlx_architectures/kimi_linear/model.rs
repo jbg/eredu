@@ -1,6 +1,7 @@
 //! Kimi Linear hybrid KDA/MLA causal language model.
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::{CausalModel, RuntimeLayerState, RuntimeState, StateError, StateLayout};
 
 use std::{
@@ -51,7 +52,7 @@ use crate::{
             CompressedLatentCache,
         },
         checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
-        execution::inspection::{ActivationObserver, MoeRoutingObservation},
+        execution::inspection::MoeRoutingObservation,
         media::input as runtime_input,
     },
     composition::mlx_architectures::deepseek_v3::model::{
@@ -1195,7 +1196,7 @@ impl KimiDeltaAttention {
         mut cache: Option<&mut KdaCache>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut Option<&mut dyn ActivationObserver>,
+        observer: &mut Option<&mut dyn RuntimeActivationObserver<Array, Exception>>,
     ) -> Result<Array, Exception> {
         let batch = x.dim(0);
         let sequence = x.dim(1);
@@ -1423,7 +1424,7 @@ impl SparseMoe {
         input: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut Option<&mut dyn ActivationObserver>,
+        observer: &mut Option<&mut dyn RuntimeActivationObserver<Array, Exception>>,
     ) -> Result<Array, Exception> {
         let shape = input.shape().to_vec();
         let flat = input.reshape(&[-1, input.dim(-1)], stream)?;
@@ -1441,17 +1442,17 @@ impl SparseMoe {
             let combined = routed.add(&shared, stream)?;
             observer.observe(&format!("{prefix}.routed_experts"), &routed)?;
             observer.observe(&format!("{prefix}.shared_experts"), &shared)?;
-            observer.observe_moe_routing(MoeRoutingObservation {
-                prefix,
+            observer.observe_routing(MoeRoutingObservation {
+                path: prefix,
                 selected_experts: &routing.indices,
                 selected_scores: &routing.scores,
-                routing_weights: &routing.weights,
+                route_weights: &routing.weights,
                 routed_output: &routed,
                 local_routed_output: None,
                 reduced_routed_output: Some(&routed),
                 shared_output: Some(&shared),
                 combined_output: Some(&combined),
-                num_experts: self.gate.num_experts,
+                expert_count: self.gate.num_experts,
             })?;
             combined.reshape(&shape, stream)
         } else {
@@ -1489,7 +1490,7 @@ impl SparseMoe {
         group: &safemlx::distributed::Group,
         statistics: &mut crate::composition::mlx_architectures::distributed::expert::RoutingStatistics,
         stream: &Stream,
-        observer: &mut Option<&mut dyn ActivationObserver>,
+        observer: &mut Option<&mut dyn RuntimeActivationObserver<Array, Exception>>,
         prefix: &str,
     ) -> Result<Array, Exception> {
         let shape = input.shape().to_vec();
@@ -1535,17 +1536,17 @@ impl SparseMoe {
         let combined = returned.reduced_output.add(&shared, stream)?;
         if let (Some(observer), Some(scores)) = (observer.as_deref_mut(), selected_scores.as_ref())
         {
-            observer.observe_moe_routing(MoeRoutingObservation {
-                prefix,
+            observer.observe_routing(MoeRoutingObservation {
+                path: prefix,
                 selected_experts: &indices,
                 selected_scores: scores,
-                routing_weights: &weights,
+                route_weights: &weights,
                 routed_output: &returned.reduced_output,
                 local_routed_output: Some(&returned.local_output),
                 reduced_routed_output: Some(&returned.reduced_output),
                 shared_output: Some(&shared),
                 combined_output: Some(&combined),
-                num_experts: self.gate.num_experts,
+                expert_count: self.gate.num_experts,
             })?;
         }
         combined.reshape(&shape, stream)
@@ -1758,7 +1759,7 @@ impl DecoderLayer {
         cache: Option<&mut LayerCache>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut Option<&mut dyn ActivationObserver>,
+        observer: &mut Option<&mut dyn RuntimeActivationObserver<Array, Exception>>,
     ) -> Result<Array, Exception> {
         if let Some(observer) = observer.as_deref_mut() {
             observer.observe(&format!("{prefix}.input"), input)?;
@@ -1831,7 +1832,7 @@ impl DecoderLayer {
         cache: Option<&mut LayerCache>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut dyn ActivationObserver,
+        observer: &mut dyn RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let mut observer = Some(observer);
         self.forward_impl(input, mask, cache, stream, prefix, &mut observer)
@@ -2538,7 +2539,7 @@ impl Model {
         input: ModelInput<'_>,
         last_token_only: bool,
         stream: &Stream,
-        mut observer: Option<&mut dyn ActivationObserver>,
+        mut observer: Option<&mut dyn RuntimeActivationObserver<Array, Exception>>,
     ) -> Result<Array, Exception> {
         let mut hidden = self.model.embed_tokens.forward(input.inputs, stream)?;
         if let Some(observer) = observer.as_deref_mut() {
@@ -2620,7 +2621,7 @@ impl Model {
         &mut self,
         input: ModelInput<'_>,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         self.forward_logits_impl(input, false, stream, Some(observer))
     }

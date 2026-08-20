@@ -15,7 +15,6 @@ use crate::composition::mlx_architectures::{
     muse_glimmer,
     nemotron_h::model as nemotron_h,
     qwen::{
-        dense as dense_qwen,
         hybrid::{qwen3_5, qwen3_next},
         vl::{model as qwen3_vl, moe as qwen3_vl_moe},
     },
@@ -84,7 +83,11 @@ fn validate_model_config(kind: eredu_core::ModelKind, config: &Value) -> Result<
         ModelKind::Lfm2 => lfm2::validate_model_config_value(config),
         ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),
         ModelKind::PersonaPlex => personaplex::validate_model_config_value(config),
-        ModelKind::Qwen2 | ModelKind::Qwen3 => dense_qwen::config_from_hf_value(config).map(|_| ()),
+        ModelKind::Qwen2 | ModelKind::Qwen3 => {
+            eredu_architectures::qwen::model_args_from_config_value(config)
+                .map(|_| ())
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        }
         ModelKind::Qwen3Next => qwen3_next::validate_model_config_value(config),
         ModelKind::Qwen3Vl => qwen3_vl::validate_model_config_value(config),
         ModelKind::Qwen3VlMoe => qwen3_vl_moe::validate_model_config_value(config),

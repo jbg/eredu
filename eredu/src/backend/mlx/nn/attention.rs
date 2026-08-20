@@ -252,27 +252,18 @@ where
     Ok((queries, keys, values))
 }
 
-/// Applies caller-provided rotary embeddings and updates a key/value cache.
-///
-/// This is shared by multimodal decoders whose positions are not representable
-/// by a single monotonically increasing RoPE offset.
-pub(crate) fn apply_rotary_embeddings_and_update_cache<C>(
-    queries: Array,
-    keys: Array,
-    mut values: Array,
+/// Applies caller-provided rotary cosine and sine tensors to one head view.
+pub(crate) fn apply_rotary_embeddings(
+    value: &Array,
     cos: &Array,
     sin: &Array,
-    cache: &mut Option<&mut C>,
     stream: &Stream,
-) -> Result<(Array, Array, Array), Exception>
-where
-    C: KeyValueCache + ?Sized,
-{
+) -> Result<Array, Exception> {
     let cos = cos
-        .as_dtype(queries.dtype(), stream)?
+        .as_dtype(value.dtype(), stream)?
         .try_index_device((.., NewAxis, .., ..), stream)?;
     let sin = sin
-        .as_dtype(queries.dtype(), stream)?
+        .as_dtype(value.dtype(), stream)?
         .try_index_device((.., NewAxis, .., ..), stream)?;
     let rotate_half = |x: &Array| -> Result<Array, Exception> {
         let half = x.dim(-1) / 2;
@@ -284,16 +275,9 @@ where
             stream,
         )
     };
-    let queries = queries
+    value
         .multiply(&cos, stream)?
-        .add(rotate_half(&queries)?.multiply(&sin, stream)?, stream)?;
-    let mut keys = keys
-        .multiply(&cos, stream)?
-        .add(rotate_half(&keys)?.multiply(&sin, stream)?, stream)?;
-    if let Some(cache) = cache.as_mut() {
-        (keys, values) = cache.update_for_attention(keys, values, stream)?;
-    }
-    Ok((queries, keys, values))
+        .add(rotate_half(value)?.multiply(&sin, stream)?, stream)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -13,6 +13,7 @@ pub(crate) mod vision;
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
+use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::CausalModel;
 
 use std::{
@@ -67,7 +68,7 @@ use crate::{
     backend::mlx::runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, GgufTensorNames,
     },
-    backend::mlx::runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    backend::mlx::runtime::execution::inspection::MoeRoutingObservation,
     backend::mlx::runtime::media::input,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::CacheRankIdentity,
@@ -786,7 +787,7 @@ impl Attention {
         input: AttentionInput<'_, C>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache,
@@ -990,7 +991,7 @@ impl SparseMoeBlock {
         hidden_states: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let shape = hidden_states.shape();
         let flat = hidden_states.reshape(&[-1, shape[2]], stream)?;
@@ -1001,17 +1002,17 @@ impl SparseMoeBlock {
             .experts
             .forward(&flat, &routing.indices, &routing.weights, stream)?;
         observer.observe(&format!("{prefix}.experts.output"), &output)?;
-        observer.observe_moe_routing(MoeRoutingObservation {
-            prefix,
+        observer.observe_routing(MoeRoutingObservation {
+            path: prefix,
             selected_experts: &routing.indices,
             selected_scores: &routing.scores,
-            routing_weights: &routing.weights,
+            route_weights: &routing.weights,
             routed_output: &output,
             local_routed_output: None,
             reduced_routed_output: Some(&output),
             shared_output: None,
             combined_output: Some(&output),
-            num_experts: self.gate.num_experts,
+            expert_count: self.gate.num_experts,
         })?;
         output.reshape(shape, stream)
     }
@@ -1086,7 +1087,7 @@ impl FeedForward {
         input: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         match self {
             Self::Dense(mlp) => mlp.forward_with_observer(input, stream, prefix, observer),
@@ -1330,7 +1331,7 @@ impl TransformerBlock {
         input: AttentionInput<'_, C>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache,
@@ -1621,7 +1622,7 @@ impl Decoder {
         &mut self,
         input: ModelInput<'_, C>,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache + Default,
@@ -1806,7 +1807,7 @@ impl Model {
         &mut self,
         input: ModelInput<'_, C>,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache + Default,

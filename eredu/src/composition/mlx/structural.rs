@@ -10,6 +10,7 @@ use serde_json::Value;
 use eredu_core::{GgufArchitecture, ModelKind};
 
 use super::ModelLoadOptions;
+use crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames;
 use crate::backend::mlx::{error::Error, runtime::checkpoint::store::SafetensorsWeightStore};
 use crate::composition::{
     llama_checkpoint,
@@ -25,7 +26,6 @@ use crate::composition::{
         muse_glimmer::checkpoint as muse_glimmer_checkpoint,
         nemotron_h::checkpoint as nemotron_h_checkpoint,
         qwen::{
-            dense::checkpoint as dense_qwen_checkpoint,
             hybrid::checkpoint as qwen_hybrid_checkpoint, vl::checkpoint as qwen_vl_checkpoint,
         },
     },
@@ -194,9 +194,7 @@ pub(crate) fn validate_safetensors(
             ModelKind::MuseGlimmer => muse_glimmer_checkpoint::validate_safetensors(config, store),
             ModelKind::NemotronH => nemotron_h_checkpoint::validate_safetensors(config, store),
             ModelKind::PersonaPlex => personaplex_checkpoint::validate_safetensors(config, store),
-            ModelKind::Qwen2 | ModelKind::Qwen3 => {
-                dense_qwen_checkpoint::validate_safetensors(config, store)
-            }
+            ModelKind::Qwen2 | ModelKind::Qwen3 => validate_neutral_qwen_safetensors(config, store),
             ModelKind::Qwen3Next => qwen_hybrid_checkpoint::validate_qwen3_next_safetensors(
                 config,
                 store,
@@ -289,13 +287,7 @@ pub(crate) fn validate_gguf(
                 }
             }
             GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-                let variant = match architecture {
-                    GgufArchitecture::Qwen2 => dense_qwen_checkpoint::GgufVariant::Qwen2,
-                    GgufArchitecture::Qwen3 => dense_qwen_checkpoint::GgufVariant::Qwen3,
-                    GgufArchitecture::Qwen3Moe => dense_qwen_checkpoint::GgufVariant::Qwen3Moe,
-                    _ => unreachable!("covered by the outer architecture match"),
-                };
-                dense_qwen_checkpoint::validate_gguf(variant, checkpoint, metadata)
+                validate_neutral_qwen_gguf(checkpoint, metadata)
             }
             architecture @ (GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe) => {
                 if let Err(error) = architecture.validate_load_policy(options) {
@@ -332,6 +324,52 @@ pub(crate) fn validate_gguf(
         StructuralValidationPolicy::Unverified => unverified(architecture.metadata_name()),
     };
     validation.with_strict_catalog(options.weight_residency.strict_loading())
+}
+
+fn validate_neutral_qwen_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let args = match eredu_architectures::qwen::model_args_from_config_value(config) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::qwen::safetensors_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+struct NeutralQwenGgufCatalog<'a>(&'a GgufCheckpoint);
+
+impl eredu_architectures::qwen::GgufTensorCatalog for NeutralQwenGgufCatalog<'_> {
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains_gguf_tensor(name)
+    }
+}
+
+fn validate_neutral_qwen_gguf(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    let args = match eredu_architectures::qwen::model_args_from_gguf_catalog(
+        &NeutralQwenGgufCatalog(checkpoint),
+        metadata,
+    ) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    if let Err(error) = checkpoint.catalog().translated_outputs(|name| {
+        eredu_architectures::qwen::translate_gguf_weight_name(name, args.is_moe())
+    }) {
+        return invalid_geometry(error.to_string());
+    }
+    let plan = match eredu_architectures::qwen::gguf_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
 }
 
 fn unverified(architecture: &str) -> StructuralValidation {
@@ -445,14 +483,11 @@ mod admission_policy_tests {
 }
 
 #[cfg(test)]
-mod dense_qwen_tests {
+mod neutral_qwen_tests {
     use std::collections::BTreeSet;
 
-    use super::*;
-    use crate::composition::mlx_architectures::qwen::dense;
-
-    fn qwen2_args(tied: bool) -> dense::DecoderConfig {
-        dense::config_from_hf_value(&serde_json::json!({
+    fn qwen2_args(tied: bool) -> eredu_architectures::qwen::ModelArgs {
+        eredu_architectures::qwen::model_args_from_config_value(&serde_json::json!({
             "model_type": "qwen2", "hidden_size": 8, "num_hidden_layers": 2,
             "intermediate_size": 16, "num_attention_heads": 4,
             "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 32,
@@ -464,7 +499,7 @@ mod dense_qwen_tests {
 
     #[test]
     fn qwen2_plan_is_exactly_biased_and_has_no_qk_norms() {
-        let tied = dense_qwen_checkpoint::safetensors_plan(&qwen2_args(true)).unwrap();
+        let tied = eredu_architectures::qwen::safetensors_plan(&qwen2_args(true)).unwrap();
         let names = tied
             .common_tensors
             .iter()
@@ -483,16 +518,7 @@ mod dense_qwen_tests {
             .expect("optional redundant tied head layout");
         assert!(!redundant_head.required);
         assert_eq!(redundant_head.variants[0].tensors[0].key, "lm_head.weight");
-        assert!(dense_qwen_checkpoint::is_redundant_tied_output_head_key(
-            &qwen2_args(true),
-            "lm_head.weight"
-        ));
-        assert!(!dense_qwen_checkpoint::is_redundant_tied_output_head_key(
-            &qwen2_args(false),
-            "lm_head.weight"
-        ));
-
-        let untied = dense_qwen_checkpoint::safetensors_plan(&qwen2_args(false)).unwrap();
+        let untied = eredu_architectures::qwen::safetensors_plan(&qwen2_args(false)).unwrap();
         assert!(untied
             .common_tensors
             .iter()

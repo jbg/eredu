@@ -52,9 +52,10 @@ use crate::{
     backend::mlx::runtime::cache::{
         BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
-    backend::mlx::runtime::checkpoint::load::{gguf_metadata, gguf_quantization_configs},
+    backend::mlx::runtime::checkpoint::load::{
+        gguf_i32_catalog, gguf_metadata, gguf_quantization_configs, gguf_string,
+    },
     backend::mlx::runtime::media::input,
-    composition::mlx_architectures::qwen::dense::{gguf_i32_catalog, gguf_string},
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
         CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,

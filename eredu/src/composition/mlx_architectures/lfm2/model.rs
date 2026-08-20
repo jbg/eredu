@@ -53,9 +53,10 @@ use crate::{
         },
         ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
     },
-    backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
+    backend::mlx::runtime::checkpoint::load::{
+        gguf_quantization_configs, gguf_string, GgufTensorNames,
+    },
     backend::mlx::runtime::media::input,
-    composition::mlx_architectures::qwen::dense::gguf_string,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
         CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,

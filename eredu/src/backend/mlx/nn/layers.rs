@@ -13,7 +13,7 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use crate::backend::mlx::runtime::execution::inspection::ActivationObserver;
+use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 
 use super::linear::unloaded_maybe_quantized_linear;
 
@@ -103,7 +103,7 @@ impl SwiGluMlp {
         input: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut (impl ActivationObserver + ?Sized),
+        observer: &mut (impl RuntimeActivationObserver<Array, Exception> + ?Sized),
     ) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(input, stream)?;
         observer.observe(&format!("{prefix}.gate_proj"), &gate)?;

@@ -1140,7 +1140,7 @@ impl Gemma4Execution {
         input: Gemma4Input<'_>,
         cache: &mut Cache,
         stream: &Stream,
-        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     ) -> Result<Array, Error> {
         let mut observer =
             crate::backend::mlx::runtime::execution::inspection::ActivationObserverProxy(observer);
@@ -1387,7 +1387,7 @@ impl Gemma4LayerwiseModel {
         inputs: &Array,
         cache: &mut Cache,
         stream: &Stream,
-        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     ) -> Result<Array, Error> {
         self.execution
             .forward_with_observer(Gemma4Input::Decode(inputs), cache, stream, observer)
@@ -1399,7 +1399,7 @@ impl Gemma4LayerwiseModel {
         input: input::ModelInput<'_>,
         cache: &mut Cache,
         stream: &Stream,
-        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     ) -> Result<Array, Error> {
         self.execution
             .forward_with_observer(Gemma4Input::Prefill(input), cache, stream, observer)
@@ -5215,7 +5215,7 @@ impl Gemma4LayerwiseAdapter {
     }
 
     pub(crate) fn forward_layer_with_observer<
-        O: crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+        O: eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     >(
         &mut self,
         group: usize,

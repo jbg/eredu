@@ -22,7 +22,6 @@ use crate::{
         gpt_oss::model as gpt_oss,
         kimi_linear::model as kimi_linear,
         lfm2::model as lfm2,
-        qwen::dense as dense_qwen,
         qwen::{hybrid::qwen3_5, vl::model as qwen3_vl},
     },
     core::generation::MtpSchedulerOptions,
@@ -1227,6 +1226,53 @@ fn save_zero_neutral_checkpoint<M: Parameterized<Array>>(
     .unwrap();
 }
 
+fn save_zero_qwen_checkpoint(
+    args: &eredu_architectures::qwen::ModelArgs,
+    dir: &std::path::Path,
+    stream: &Stream,
+) {
+    struct ZeroCollector<'a> {
+        stream: &'a Stream,
+        arrays: Vec<(String, Array)>,
+    }
+    impl<'tensor> ParameterVisitor<'tensor, Array> for ZeroCollector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+            self.arrays.push((
+                metadata.id.to_string(),
+                zeros_dtype(parameter.shape(), parameter.dtype(), self.stream).unwrap(),
+            ));
+        }
+    }
+
+    let architecture = eredu_architectures::qwen::LayeredModel::<
+        crate::backend::mlx::nn::shared::MlxBackend,
+    >::new(args.clone(), stream)
+    .unwrap();
+    let mut collector = ZeroCollector {
+        stream,
+        arrays: Vec::new(),
+    };
+    architecture
+        .static_modules()
+        .visit_parameters(&mut collector);
+    for layer in 0..args.num_hidden_layers as usize {
+        eredu_architectures::qwen::new_block::<crate::backend::mlx::nn::shared::MlxBackend>(
+            args, layer, stream,
+        )
+        .unwrap()
+        .visit_parameters(&mut collector);
+    }
+    Array::save_safetensors(
+        collector
+            .arrays
+            .iter()
+            .map(|(name, array)| (name.as_str(), array)),
+        None,
+        dir.join("model.safetensors"),
+    )
+    .unwrap();
+}
+
 #[test]
 fn tiny_text_families_quantize_through_high_level_dispatch() {
     let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
@@ -1305,8 +1351,8 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 save_zero_neutral_checkpoint(&model, &dir, stream);
             }
             "qwen3" => {
-                let args = dense_qwen::load_config(&dir).unwrap();
-                save_zero_checkpoint(&dense_qwen::Model::new(args, stream).unwrap(), &dir, stream);
+                let args = crate::composition::qwen::load_model_args(&dir).unwrap();
+                save_zero_qwen_checkpoint(&args, &dir, stream);
             }
             "qwen3_5" => {
                 let (args, image_token_id, video_token_id, vision_config) =
@@ -1625,7 +1671,7 @@ fn tiny_lfm2_neutral_runtime_executes_convolution_and_attention_layers() {
 }
 
 #[test]
-fn tiny_dense_qwen_neutral_runtime_executes_resident_and_bounded_layers() {
+fn tiny_qwen_neutral_runtime_executes_resident_and_bounded_layers() {
     let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
@@ -1639,42 +1685,77 @@ fn tiny_dense_qwen_neutral_runtime_executes_resident_and_bounded_layers() {
               "tie_word_embeddings":false,"rope_scaling":null
             }"#,
     );
-    let args = dense_qwen::load_config(&dir).unwrap();
-    save_zero_checkpoint(&dense_qwen::Model::new(args, stream).unwrap(), &dir, stream);
+    let args = crate::composition::qwen::load_model_args(&dir).unwrap();
+    save_zero_qwen_checkpoint(&args, &dir, stream);
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
 
-    let mut resident =
-        crate::composition::mlx_architectures::qwen::dense::layerwise::load_safetensors(
-            &dir,
-            eredu_runtime::LayerWeightResidency::FullyResident,
-            None,
-            stream,
-            weights_stream,
-        )
-        .unwrap();
+    let mut resident = crate::composition::qwen::load_qwen_safetensors_mlx(
+        &dir,
+        eredu_runtime::WeightResidency::fully_resident(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
     let mut resident_cache = resident.new_cache();
     let resident_logits = resident
-        .forward(&tokens, None, &mut resident_cache, stream)
+        .forward(&tokens, &mut resident_cache, stream)
         .unwrap();
     safemlx::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 24]);
 
-    let mut bounded =
-        crate::composition::mlx_architectures::qwen::dense::layerwise::load_safetensors(
-            &dir,
+    let mut bounded = crate::composition::qwen::load_qwen_safetensors_mlx(
+        &dir,
+        eredu_runtime::WeightResidency::layerwise_host(
             eredu_runtime::LayerwiseLoadOptions::default(),
-            None,
-            stream,
-            weights_stream,
-        )
-        .unwrap();
+        ),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
     let mut bounded_cache = bounded.new_cache();
     let bounded_logits = bounded
-        .forward(&tokens, None, &mut bounded_cache, stream)
+        .forward(&tokens, &mut bounded_cache, stream)
         .unwrap();
     safemlx::transforms::eval([&bounded_logits]).unwrap();
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
-    assert!(bounded.residency_report().unwrap().initialized());
+    assert!(bounded.residency_report().unwrap().unwrap().initialized());
+
+    let paged = eredu_runtime::PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
+        .unwrap()
+        .with_full_attention(true);
+    let mut paged_cache = resident
+        .new_cache_with_options(eredu_runtime::CacheResidencyPolicy::Paged(paged))
+        .unwrap();
+    let paged_logits = resident.forward(&tokens, &mut paged_cache, stream).unwrap();
+    safemlx::transforms::eval([&paged_logits]).unwrap();
+    assert_eq!(paged_logits.shape(), resident_logits.shape());
+
+    let mut streamed = crate::composition::qwen::load_qwen_safetensors_mlx(
+        &dir,
+        eredu_runtime::WeightResidency::dense_disk_stream(
+            eredu_runtime::DenseDiskStreamLoadOptions::new(1 << 20, 1 << 20, 1, 1).unwrap(),
+        ),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    let mut streamed_cache = streamed.new_cache();
+    let streamed_logits = streamed
+        .forward(&tokens, &mut streamed_cache, stream)
+        .unwrap();
+    safemlx::transforms::eval([&streamed_logits]).unwrap();
+    assert_eq!(streamed_logits.shape(), resident_logits.shape());
+    assert!(
+        streamed
+            .dense_stream_report()
+            .unwrap()
+            .unwrap()
+            .prefill_forwards()
+            >= 1
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -2406,8 +2487,7 @@ fn resolve_model_config_validates_qwen2_sliding_window() {
         invalid["sliding_window"] = invalid_window;
         assert_eq!(
             resolve_model_config(&invalid).is_ok(),
-            crate::composition::mlx_architectures::qwen::dense::config_from_hf_value(&invalid)
-                .is_ok(),
+            eredu_architectures::qwen::model_args_from_config_value(&invalid).is_ok(),
             "inspection and load normalization diverged for {invalid}"
         );
     }

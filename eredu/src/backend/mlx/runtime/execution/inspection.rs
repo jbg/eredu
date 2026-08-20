@@ -1,63 +1,15 @@
-//! Lightweight activation inspection hooks.
+//! MLX recorders and adapters for the backend-neutral inspection contract.
 
 use safemlx::{error::Exception, Array};
 
-/// Normalized routing data emitted by MoE implementations during observed passes.
-///
-/// The arrays are intentionally limited to routing decisions and compact
-/// contribution tensors so observers can build per-token summaries without
-/// depending on model-family-specific activation names.
-pub struct MoeRoutingObservation<'a> {
-    /// Stable path-like name of the MoE block.
-    pub prefix: &'a str,
-    /// Selected expert ids with shape `[tokens, top_k]`.
-    pub selected_experts: &'a Array,
-    /// Router probabilities or scores for the selected experts.
-    pub selected_scores: &'a Array,
-    /// Final route weights applied to selected expert outputs.
-    pub routing_weights: &'a Array,
-    /// Summed routed expert contribution with shape `[tokens, hidden]`.
-    pub routed_output: &'a Array,
-    /// Rank-local routed contribution before an EP reduction, when applicable.
-    pub local_routed_output: Option<&'a Array>,
-    /// Globally reduced routed contribution, when applicable.
-    pub reduced_routed_output: Option<&'a Array>,
-    /// Shared expert contribution with shape `[tokens, hidden]`, when present.
-    pub shared_output: Option<&'a Array>,
-    /// Combined MoE output with shape `[tokens, hidden]`, when present.
-    pub combined_output: Option<&'a Array>,
-    /// Total number of routed experts.
-    pub num_experts: i32,
-}
+pub use eredu_runtime::{NoopObserver, RoutingObservation as MoeRoutingObservation};
 
-/// Receives named tensors from instrumented model forward passes.
-///
-/// Implementations should be selective about evaluating tensors: activations
-/// can be large, and observing them does not force evaluation by itself.
-pub trait ActivationObserver {
-    /// Observe a named tensor.
-    fn observe(&mut self, name: &str, value: &Array) -> Result<(), Exception>;
+/// Adapts a dynamically selected MLX observer to generic instrumented code.
+pub(crate) struct ActivationObserverProxy<'a>(
+    pub &'a mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+);
 
-    /// Optionally replace a named activation before downstream computation uses it.
-    ///
-    /// Instrumented model paths call this at causal intervention points such as
-    /// transformer block outputs. Returning `None` preserves the original value.
-    fn intervene(&mut self, _name: &str, _value: &Array) -> Result<Option<Array>, Exception> {
-        Ok(None)
-    }
-
-    /// Observe compact, model-normalized MoE routing metadata.
-    fn observe_moe_routing(
-        &mut self,
-        _routing: MoeRoutingObservation<'_>,
-    ) -> Result<(), Exception> {
-        Ok(())
-    }
-}
-
-pub(crate) struct ActivationObserverProxy<'a>(pub &'a mut dyn ActivationObserver);
-
-impl ActivationObserver for ActivationObserverProxy<'_> {
+impl eredu_runtime::ActivationObserver<Array, Exception> for ActivationObserverProxy<'_> {
     fn observe(&mut self, name: &str, value: &Array) -> Result<(), Exception> {
         self.0.observe(name, value)
     }
@@ -66,27 +18,11 @@ impl ActivationObserver for ActivationObserverProxy<'_> {
         self.0.intervene(name, value)
     }
 
-    fn observe_moe_routing(&mut self, routing: MoeRoutingObservation<'_>) -> Result<(), Exception> {
-        self.0.observe_moe_routing(routing)
-    }
-}
-
-impl<F> ActivationObserver for F
-where
-    F: FnMut(&str, &Array) -> Result<(), Exception>,
-{
-    fn observe(&mut self, name: &str, value: &Array) -> Result<(), Exception> {
-        self(name, value)
-    }
-}
-
-/// Observer that ignores every tensor.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoopObserver;
-
-impl ActivationObserver for NoopObserver {
-    fn observe(&mut self, _name: &str, _value: &Array) -> Result<(), Exception> {
-        Ok(())
+    fn observe_routing(
+        &mut self,
+        routing: MoeRoutingObservation<'_, Array>,
+    ) -> Result<(), Exception> {
+        self.0.observe_routing(routing)
     }
 }
 
@@ -127,7 +63,7 @@ impl ActivationRecorder {
     }
 }
 
-impl ActivationObserver for ActivationRecorder {
+impl eredu_runtime::ActivationObserver<Array, Exception> for ActivationRecorder {
     fn observe(&mut self, name: &str, value: &Array) -> Result<(), Exception> {
         self.activations.push(RecordedActivation {
             name: name.to_string(),
@@ -139,14 +75,15 @@ impl ActivationObserver for ActivationRecorder {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivationObserver, ActivationRecorder, NoopObserver};
+    use super::{ActivationRecorder, NoopObserver};
+    use eredu_runtime::ActivationObserver;
     use safemlx::{error::Exception, Array};
 
     struct ReplacingObserver {
         intervention_name: Option<String>,
     }
 
-    impl ActivationObserver for ReplacingObserver {
+    impl ActivationObserver<Array, Exception> for ReplacingObserver {
         fn observe(&mut self, _name: &str, _value: &Array) -> Result<(), Exception> {
             Ok(())
         }
@@ -175,10 +112,15 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn intervention_defaults_to_passthrough_and_can_replace_an_activation() {
         let array = Array::from_slice(&[1.0f32, 2.0], &[2]);
-        assert!(NoopObserver
-            .intervene("model.layers.0.output", &array)
+        assert!(
+            <NoopObserver as ActivationObserver<Array, Exception>>::intervene(
+                &mut NoopObserver,
+                "model.layers.0.output",
+                &array,
+            )
             .unwrap()
-            .is_none());
+            .is_none()
+        );
 
         let mut observer = ReplacingObserver {
             intervention_name: None,

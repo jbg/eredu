@@ -467,7 +467,7 @@ impl LlamaModel {
         mask: Option<&Array>,
         cache: &mut MlxKeyValueState,
         stream: &Stream,
-        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
         match &mut self.execution {
@@ -720,6 +720,7 @@ fn load_neutral_llama_parallel(
         &static_modules.embeddings,
         &static_modules.norm,
         static_modules.lm_head.as_ref(),
+        "model",
     )? {
         planner.register(group)?;
     }
@@ -976,6 +977,7 @@ impl LlamaParallelComposition {
             &static_modules.embeddings,
             &static_modules.norm,
             static_modules.lm_head.as_ref(),
+            "model",
         )? {
             planner.register(group)?;
         }

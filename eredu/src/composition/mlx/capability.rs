@@ -2,7 +2,10 @@
 
 use std::{collections::BTreeMap, num::NonZeroU8};
 
-use eredu_architectures::llama::ModelArgs as LlamaModelArgs;
+use eredu_architectures::{
+    llama::ModelArgs as LlamaModelArgs,
+    qwen::{ModelArgs as QwenModelArgs, QwenVariant},
+};
 use eredu_core::{
     estimate_runtime_state, AvailableMemory, CacheStateStrategy, CapabilityError,
     EstimationCompleteness, GrowingState, InputModalities, InputTokenCount, ModelCapabilities,
@@ -25,7 +28,6 @@ use crate::{
         lfm2::model as lfm2,
         muse_glimmer,
         nemotron_h::model as nemotron_h,
-        qwen::dense as dense_qwen,
         qwen::hybrid::qwen3_5::{self, LayerPolicy as QwenHybridLayerPolicy},
     },
     core::attention::AttentionPolicy,
@@ -179,10 +181,10 @@ impl Model {
         let model_type = self.model_type().to_string();
         let result = match self {
             Self::Llama(model) => llama_spec(model.args(), false)?,
-            Self::DenseQwen(model) => dense_qwen_spec(model.args(), false)?,
+            Self::Qwen(model) => qwen_spec(model.args(), false)?,
             Self::MuseGlimmer(model) => muse_glimmer_spec(model.args())?,
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
-                dense_qwen_spec(&model.args().text_config, true)?
+                qwen_spec(&model.args().text_config, true)?
             }
             Self::DeepSeekV3(model) => deepseek_spec(model.args())?,
             Self::DeepSeekV4(model) => deepseek_v4_spec(&model.args)?,
@@ -313,10 +315,7 @@ fn llama_spec(args: &LlamaModelArgs, multimodal: bool) -> Result<Spec, Capabilit
     ))
 }
 
-fn dense_qwen_spec(
-    args: &dense_qwen::DecoderConfig,
-    multimodal: bool,
-) -> Result<Spec, CapabilityError> {
+fn qwen_spec(args: &QwenModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
     let mut spec = llama_spec(
         &LlamaModelArgs {
             model_type: args.model_type.clone(),
@@ -332,7 +331,7 @@ fn dense_qwen_spec(
             rope_traditional: false,
             head_dim: args.head_dim,
             tie_word_embeddings: args.tie_word_embeddings,
-            attention_bias: args.qkv_bias(),
+            attention_bias: args.variant == QwenVariant::Qwen2,
             mlp_bias: false,
             rope_scaling: args.rope_scaling.clone(),
             attention_schedule: args.attention_schedule.clone(),
@@ -1959,7 +1958,7 @@ impl Model {
             | Self::Llama(_)
             | Self::Lfm2(_)
             | Self::NemotronH(_)
-            | Self::DenseQwen(_) => Err(CapabilityError::UnsupportedInput {
+            | Self::Qwen(_) => Err(CapabilityError::UnsupportedInput {
                 architecture: self.model_type().into(),
                 reason: format!("{} media is not supported", modality.as_str()),
             }),
@@ -2492,17 +2491,16 @@ mod tests {
 
     #[test]
     fn qwen2_runtime_state_splits_full_and_sliding_gqa_layers() {
-        let args =
-            crate::composition::mlx_architectures::qwen::dense::config_from_hf_value(&json!({
+        let args = eredu_architectures::qwen::model_args_from_config_value(&json!({
                 "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 6,
                 "intermediate_size": 32, "num_attention_heads": 4,
                 "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 64,
                 "max_position_embeddings": 128, "rope_theta": 10000.0,
                 "tie_word_embeddings": false, "use_sliding_window": true,
                 "sliding_window": 8, "max_window_layers": 4
-            }))
-            .unwrap();
-        let (_, _, strategy, _, estimate) = dense_qwen_spec(&args, false).unwrap();
+        }))
+        .unwrap();
+        let (_, _, strategy, _, estimate) = qwen_spec(&args, false).unwrap();
         assert_eq!(
             strategy,
             CacheStateStrategy::MixedKv {
@@ -2524,15 +2522,14 @@ mod tests {
 
     #[test]
     fn qwen2_runtime_state_groups_arbitrary_distinct_windows_exactly() {
-        let mut args =
-            crate::composition::mlx_architectures::qwen::dense::config_from_hf_value(&json!({
+        let mut args = eredu_architectures::qwen::model_args_from_config_value(&json!({
                 "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 4,
                 "intermediate_size": 32, "num_attention_heads": 4,
                 "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 64,
                 "max_position_embeddings": 128, "rope_theta": 10000.0,
                 "tie_word_embeddings": false
-            }))
-            .unwrap();
+        }))
+        .unwrap();
         args.attention_schedule = crate::core::attention::LayerSchedule::new(
             4,
             vec![
@@ -2543,7 +2540,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let (_, _, strategy, _, layout) = dense_qwen_spec(&args, false).unwrap();
+        let (_, _, strategy, _, layout) = qwen_spec(&args, false).unwrap();
         assert_eq!(
             strategy,
             CacheStateStrategy::MixedKv {

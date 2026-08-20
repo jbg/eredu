@@ -14,13 +14,12 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
     sync::Arc,
-    time::Instant,
 };
 
 use safemlx::{
     error::Exception,
     macros::ModuleParameters,
-    module::{Module, ModuleParameters, Param},
+    module::{Module, ModuleParameters},
     nn,
     ops::{
         concatenate_axis,
@@ -40,17 +39,17 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{
         self as common,
-        attention::AttentionInput,
         parallel::{
             planned_kv_head_layout, vocab_embedding_parameter_group, vocab_lm_head_parameter_group,
             VocabParallelEmbedding, VocabParallelLmHead,
         },
-        shared::{MlxBackend, MlxParameterTree},
+        shared::{MlxBackend, MlxEmbedding, MlxLinear, MlxModule, MlxParameterTree, MlxRmsNorm},
         tensor::{create_attention_mask, AttentionMask},
     },
     backend::mlx::runtime::cache::KeyValueCache,
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes,
+        build_module_binding_plan_with_recipes_excluding,
     },
     backend::mlx::runtime::checkpoint::store::{TensorSelection, WeightStoreBackend},
     backend::mlx::runtime::checkpoint::{
@@ -64,13 +63,7 @@ use crate::{
         open_safetensors_weight_store, quantize_module_store_with_bindings, shard_layer_bindings,
     },
     backend::mlx::runtime::media::input,
-    backend::mlx::runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheReport, ExpertRouteBatch,
-    },
-    composition::mlx_architectures::qwen::dense::{
-        layerwise::{qwen_text_layer_bindings, register_qwen_layer_parallel_plan},
-        Decoder, Experts as QwenExperts, FeedForward, TransformerBlock,
-    },
+    backend::mlx::runtime::residency::expert_cache::{ExpertCache, ExpertCacheReport},
     composition::mlx_architectures::qwen::{
         vl::model::{self as resident, Cache, ModelArgs},
         vl::vision::{
@@ -80,6 +73,11 @@ use crate::{
         },
     },
 };
+use eredu_architectures::qwen::{self as neutral_qwen, FeedForward as NeutralFeedForward};
+use eredu_nn::{
+    EmbeddingOperator, LinearOperator, ParameterSpec, RoutedNeuralBackend, SwiGluExpertBankSpec,
+    SwiGluExpertLayout, SwiGluExpertProjection,
+};
 use eredu_runtime::PagedCacheOptions;
 
 use eredu_runtime::ResidencyReport;
@@ -88,6 +86,65 @@ const VISION_STATIC_UNIT: &str = "qwen3_vl.static.vision";
 const EMBEDDING_UNIT: &str = "qwen3_vl.static.embedding";
 const NORM_UNIT: &str = "qwen3_vl.static.norm";
 const HEAD_UNIT: &str = "qwen3_vl.static.output";
+
+type NeutralTextBlock = MlxModule<neutral_qwen::TransformerBlock<MlxBackend>>;
+
+fn qwen_vl_text_layer_bindings(
+    layer: &NeutralTextBlock,
+    args: &eredu_architectures::qwen::ModelArgs,
+    index: usize,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    external_experts: bool,
+) -> Result<Vec<WeightBinding>, Error> {
+    let mut recipes = BTreeMap::new();
+    if args.is_moe() && !external_experts {
+        let resolved =
+            eredu_architectures::qwen::expert_recipes(store, args, &args.parameter_root, index)
+                .map_err(Error::UnsupportedArchitecture)?;
+        recipes.insert(resolved.target_gate_up, resolved.gate_up);
+        recipes.insert(resolved.target_down, resolved.down);
+    }
+    Ok(
+        build_module_binding_plan_with_recipes_excluding(layer, "", store, recipes, |name| {
+            external_experts && name.contains(".mlp.experts.")
+        })?
+        .build_bindings(store)?,
+    )
+}
+
+fn unloaded_expert_bank(
+    args: &eredu_architectures::qwen::ModelArgs,
+    layer: usize,
+    expert_count: i32,
+    intermediate: i32,
+    stream: &Stream,
+) -> Result<<MlxBackend as RoutedNeuralBackend>::SwiGluExpertBank, Error> {
+    let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
+    let gate_up = format!("{prefix}.gate_up_proj");
+    let down = format!("{prefix}.down_proj");
+    <MlxBackend as RoutedNeuralBackend>::swiglu_expert_bank(
+        SwiGluExpertBankSpec {
+            expert_count,
+            input_dimensions: args.hidden_size,
+            intermediate_dimensions: intermediate,
+            output_dimensions: args.hidden_size,
+            layout: SwiGluExpertLayout::Packed {
+                gate_up: SwiGluExpertProjection {
+                    weight: ParameterSpec::trainable(&gate_up)
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                    quantization: args.weight_quantization_for(&gate_up),
+                },
+                down: SwiGluExpertProjection {
+                    weight: ParameterSpec::trainable(&down)
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                    quantization: args.weight_quantization_for(&down),
+                },
+            },
+        },
+        stream,
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
 
 type Qwen3VlUnit = MlxParameterTree<Qwen3VlLayer>;
 type Qwen3VlStatic = MlxParameterTree<Qwen3VlStaticModules>;
@@ -101,8 +158,8 @@ type Qwen3VlBoundedRuntime = LayerwiseRuntime<
 >;
 
 enum Qwen3VlRuntime {
-    Resident(Qwen3VlResidentRuntime),
-    Layerwise(Qwen3VlBoundedRuntime),
+    Resident(Box<Qwen3VlResidentRuntime>),
+    Layerwise(Box<Qwen3VlBoundedRuntime>),
 }
 
 struct Qwen3VlExecution {
@@ -195,11 +252,11 @@ struct Qwen3VlReplicatedStatic {
     #[param]
     vision: QwenVisionLayerwiseStatic,
     #[param]
-    embedding: MaybeQuantized<nn::Embedding>,
+    embedding: MlxEmbedding,
     #[param]
-    norm: nn::RmsNorm,
+    norm: MlxRmsNorm,
     #[param]
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
+    lm_head: Option<MlxLinear>,
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -209,7 +266,7 @@ struct Qwen3VlParallelStatic {
     #[param]
     embedding: VocabParallelEmbedding,
     #[param]
-    norm: nn::RmsNorm,
+    norm: MlxRmsNorm,
     #[param]
     lm_head: Option<VocabParallelLmHead>,
 }
@@ -259,26 +316,13 @@ impl ModuleParameters for Qwen3VlStaticModules {
 impl Qwen3VlStaticModules {
     fn replicated(args: &ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let visual = QwenVisionTransformer::new_deepstack(args.vision_config.clone(), stream)?;
-        let text = Decoder::new(&args.text_config, stream)?;
-        let lm_head = if args.text_config.tie_word_embeddings {
-            None
-        } else {
-            Some(
-                common::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
-                    args.text_config.hidden_size,
-                    args.text_config.vocab_size,
-                    args.text_config
-                        .quantization
-                        .or(args.text_config.quantization_config),
-                    stream,
-                )?,
-            )
-        };
+        let text = neutral_qwen::StaticModules::<MlxBackend>::new(&args.text_config, stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         Ok(Self::Replicated(Qwen3VlReplicatedStatic {
             vision: QwenVisionLayerwiseStatic::from_transformer(visual),
-            embedding: text.embed_tokens,
-            norm: text.norm,
-            lm_head,
+            embedding: text.embeddings.clone(),
+            norm: text.norm.clone(),
+            lm_head: text.lm_head,
         }))
     }
 }
@@ -414,11 +458,10 @@ fn build_qwen3_vl_unit(
                         .map_err(|_| Error::Parallel("Qwen local MLP width exceeds i32".into()))?;
                 }
             }
-            Qwen3VlLayer::Text(Box::new(TransformerBlock::new_for_layer(
-                &config,
-                index as i32,
-                stream,
-            )?))
+            Qwen3VlLayer::Text(Box::new(MlxModule::new(
+                neutral_qwen::new_block::<MlxBackend>(&config, index, stream)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            )))
         }
         _ => {
             return Err(Error::UnsupportedArchitecture(format!(
@@ -574,6 +617,7 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn begin_qwen3_vl_text_group(
     args: &ModelArgs,
     vision: &mut QwenVisionLayerwiseStatic,
@@ -657,75 +701,78 @@ fn add_qwen3_vl_deepstack(
     Ok(output)
 }
 
-fn execute_cached_qwen3_vl_experts(
-    expert_cache: &ExpertCache,
-    args: &ModelArgs,
-    index: usize,
-    pass: ExpertPass,
-    flat: &Array,
-    indices: &Array,
-    weights: &Array,
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_qwen3_vl_text<C>(
+    block: &mut NeutralTextBlock,
+    hidden: &Array,
+    mask: Option<&Array>,
+    cache: Option<&mut C>,
+    cosine: &Array,
+    sine: &Array,
+    parallel: Option<&safemlx::distributed::Group>,
     stream: &Stream,
-) -> Result<Array, Exception> {
-    expert_cache
-        .execute_routes_bounded(
-            ExpertRouteBatch::new(index, flat, indices, weights, pass),
-            stream,
-            |flat, acquired, weights, stream| {
-                let started = Instant::now();
-                let prefix = format!("model.language_model.layers.{index}.mlp.experts");
-                let config = &args.text_config;
-                let load_time = expert_cache.weight_quantization();
-                let mut bank = QwenExperts::new(
-                    acquired.identities().len() as i32,
-                    config.hidden_size,
-                    config.moe_intermediate_size,
-                    load_time.or_else(|| {
-                        config.weight_quantization_for(&format!("{prefix}.gate_up_proj"))
-                    }),
-                    load_time
-                        .or_else(|| config.weight_quantization_for(&format!("{prefix}.down_proj"))),
-                    stream,
-                )?;
-                bank.gate_up_proj = Param::new(
-                    acquired
-                        .compact_binding("gate_up_proj", stream)
-                        .map_err(|error| Exception::custom(error.to_string()))?,
-                );
-                bank.gate_up_proj_scales = Param::new(
-                    acquired
-                        .optional_compact_binding("gate_up_proj_scales", stream)
-                        .map_err(|error| Exception::custom(error.to_string()))?,
-                );
-                bank.gate_up_proj_biases = Param::new(
-                    acquired
-                        .optional_compact_binding("gate_up_proj_biases", stream)
-                        .map_err(|error| Exception::custom(error.to_string()))?,
-                );
-                bank.down_proj = Param::new(
-                    acquired
-                        .compact_binding("down_proj", stream)
-                        .map_err(|error| Exception::custom(error.to_string()))?,
-                );
-                bank.down_proj_scales = Param::new(
-                    acquired
-                        .optional_compact_binding("down_proj_scales", stream)
-                        .map_err(|error| Exception::custom(error.to_string()))?,
-                );
-                bank.down_proj_biases = Param::new(
-                    acquired
-                        .optional_compact_binding("down_proj_biases", stream)
-                        .map_err(|error| Exception::custom(error.to_string()))?,
-                );
-                expert_cache.record_compact_bank(
-                    pass,
-                    acquired.scratch_bytes(),
-                    started.elapsed(),
-                )?;
-                Ok(bank.forward(flat, acquired.compact_routes(), weights, stream)?)
-            },
-        )
-        .map_err(|error| Exception::custom(error.to_string()))
+) -> Result<Array, Error>
+where
+    C: KeyValueCache + eredu_nn::AttentionCache<Array>,
+{
+    let input = neutral_qwen::AttentionInput {
+        hidden,
+        mask,
+        cache,
+        allow_sliding_prefill: false,
+        rotary_position: Some(eredu_nn::RotaryPosition::Embeddings { cosine, sine }),
+    };
+    match parallel {
+        Some(group) => block.forward_tensor_parallel(input, group, stream),
+        None => block.forward(input, stream),
+    }
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_qwen3_vl_text_external_experts<C, P>(
+    block: &mut NeutralTextBlock,
+    hidden: &Array,
+    mask: Option<&Array>,
+    cache: Option<&mut C>,
+    cosine: &Array,
+    sine: &Array,
+    layer: usize,
+    pass: ExpertPass,
+    parallel: Option<&safemlx::distributed::Group>,
+    stream: &Stream,
+    provider: &mut P,
+) -> Result<Array, Error>
+where
+    C: KeyValueCache + eredu_nn::AttentionCache<Array>,
+    P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+    P::Error: std::fmt::Display,
+{
+    let input = neutral_qwen::AttentionInput {
+        hidden,
+        mask,
+        cache,
+        allow_sliding_prefill: false,
+        rotary_position: Some(eredu_nn::RotaryPosition::Embeddings { cosine, sine }),
+    };
+    let feed_forward =
+        |policy: &mut NeutralFeedForward<MlxBackend>, normalized: &Array, context: &Stream| {
+            let shape = normalized.shape().to_vec();
+            let flat = normalized
+                .reshape(&[-1, normalized.dim(-1)], context)
+                .map_err(eredu_nn::Error::backend)?;
+            policy
+                .forward_with_provider(layer, pass, &flat, context, provider)?
+                .reshape(&shape, context)
+                .map_err(eredu_nn::Error::backend)
+        };
+    match parallel {
+        Some(group) => {
+            block.forward_tensor_parallel_with_feed_forward(input, group, stream, feed_forward)
+        }
+        None => block.forward_with_feed_forward(input, stream, feed_forward),
+    }
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 impl LayeredArchitecture<MlxBackend, Cache> for Qwen3VlArchitecture {
@@ -737,7 +784,7 @@ impl LayeredArchitecture<MlxBackend, Cache> for Qwen3VlArchitecture {
     type Error = Error;
 
     fn model_identity(&self) -> &str {
-        if self.args.text_config.model_type == "qwen3_vl_moe_text" {
+        if self.args.text_config.is_moe() {
             "qwen3_vl_moe"
         } else {
             "qwen3_vl"
@@ -889,37 +936,32 @@ impl LayeredArchitecture<MlxBackend, Cache> for Qwen3VlArchitecture {
                     } else {
                         ExpertPass::Decode
                     };
-                    block.forward_sparse_experts_with_rotary(
-                        AttentionInput {
-                            x: hidden,
-                            mask: forward.mask.as_ref(),
-                            cache: cache.kv[index].as_mut(),
-                        },
+                    let mut provider = crate::composition::qwen_expert::cached_provider(
+                        expert_cache,
+                        &self.args.text_config,
+                    );
+                    forward_qwen3_vl_text_external_experts(
+                        block,
+                        hidden,
+                        forward.mask.as_ref(),
+                        cache.kv[index].as_mut(),
                         &forward.cos,
                         &forward.sin,
+                        index,
+                        pass,
+                        None,
                         stream,
-                        |flat, ids, weights, stream| {
-                            execute_cached_qwen3_vl_experts(
-                                expert_cache,
-                                &self.args,
-                                index,
-                                pass,
-                                flat,
-                                ids,
-                                weights,
-                                stream,
-                            )
-                        },
+                        &mut provider,
                     )?
                 } else {
-                    block.forward_with_rotary_embeddings(
-                        AttentionInput {
-                            x: hidden,
-                            mask: forward.mask.as_ref(),
-                            cache: cache.kv[index].as_mut(),
-                        },
+                    forward_qwen3_vl_text(
+                        block,
+                        hidden,
+                        forward.mask.as_ref(),
+                        cache.kv[index].as_mut(),
                         &forward.cos,
                         &forward.sin,
+                        None,
                         stream,
                     )?
                 };
@@ -941,12 +983,15 @@ impl LayeredArchitecture<MlxBackend, Cache> for Qwen3VlArchitecture {
     ) -> Result<Array, Error> {
         let modules = self.replicated_static_mut()?;
         let hidden = modules.norm.forward(hidden, stream)?;
-        Ok(common::linear::project_logits_maybe_quantized(
-            &mut modules.lm_head,
-            &mut modules.embedding,
-            &hidden,
-            stream,
-        )?)
+        match &mut modules.lm_head {
+            Some(head) => head
+                .forward(&hidden, stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+            None => modules
+                .embedding
+                .as_linear(&hidden, stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+        }
     }
 
     fn retained_context_values<'a>(
@@ -990,19 +1035,13 @@ impl ParallelLayeredArchitecture<MlxBackend, Cache> for Qwen3VlArchitecture {
                 stream,
                 |tokens| {
                     let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
-                    modules
-                        .embedding
-                        .forward(tokens, &execution)
-                        .map_err(Into::into)
+                    modules.embedding.forward(tokens, &execution)
                 },
             ),
             Qwen3VlInput::Decode(tokens) => {
                 prepare_qwen3_vl_decode(&args, tokens, cache, stream, |tokens| {
                     let execution = crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(topology, group, stream)?;
-                    modules
-                        .embedding
-                        .forward(tokens, &execution)
-                        .map_err(Into::into)
+                    modules.embedding.forward(tokens, &execution)
                 })
             }
         }
@@ -1039,15 +1078,14 @@ impl ParallelLayeredArchitecture<MlxBackend, Cache> for Qwen3VlArchitecture {
                 Ok(output)
             }
             (1, Qwen3VlLayer::Text(block)) => {
-                let output = block.forward_with_rotary_embeddings_tensor_parallel(
-                    AttentionInput {
-                        x: hidden,
-                        mask: forward.mask.as_ref(),
-                        cache: cache.kv[index].as_mut(),
-                    },
+                let output = forward_qwen3_vl_text(
+                    block,
+                    hidden,
+                    forward.mask.as_ref(),
+                    cache.kv[index].as_mut(),
                     &forward.cos,
                     &forward.sin,
-                    group,
+                    Some(group),
                     stream,
                 )?;
                 add_qwen3_vl_deepstack(output, index, forward, stream)
@@ -1109,7 +1147,7 @@ impl ParallelLayeredArchitecture<MlxBackend, Cache> for Qwen3VlArchitecture {
         } else {
             modules.embedding.project_logits(&hidden, &execution)?
         };
-        Ok(logits.all_gather(&execution)?)
+        logits.all_gather(&execution)
     }
 }
 
@@ -1145,7 +1183,7 @@ impl Qwen3VlLayerwiseModel {
 
     /// Returns the public architecture type.
     pub fn model_type(&self) -> &'static str {
-        if self.args().text_config.model_type == "qwen3_vl_moe_text" {
+        if self.args().text_config.is_moe() {
             "qwen3_vl_moe"
         } else {
             "qwen3_vl"
@@ -1346,6 +1384,10 @@ impl Qwen3VlLayerwiseModel {
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
+        let mut provider =
+            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
+                &mut execute,
+            );
         let hook = |architecture: &mut Qwen3VlArchitecture,
                     group,
                     index,
@@ -1369,16 +1411,18 @@ impl Qwen3VlLayerwiseModel {
                 Ok(output)
             }
             (1, Qwen3VlLayer::Text(block)) => {
-                let mut output = block.forward_sparse_experts_with_rotary(
-                    AttentionInput {
-                        x: hidden,
-                        mask: context.mask.as_ref(),
-                        cache: cache.kv[index].as_mut(),
-                    },
+                let mut output = forward_qwen3_vl_text_external_experts(
+                    block,
+                    hidden,
+                    context.mask.as_ref(),
+                    cache.kv[index].as_mut(),
                     &context.cos,
                     &context.sin,
+                    index,
+                    ExpertPass::Decode,
+                    None,
                     stream,
-                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                    &mut provider,
                 )?;
                 if let Some(features) = context.deepstack_features.get(index) {
                     let base = zeros_dtype(output.shape(), output.dtype(), stream)?;
@@ -1420,6 +1464,10 @@ impl Qwen3VlLayerwiseModel {
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
+        let mut provider =
+            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
+                &mut execute,
+            );
         let hook = |_architecture: &mut Qwen3VlArchitecture,
                     group: usize,
                     index: usize,
@@ -1439,17 +1487,18 @@ impl Qwen3VlLayerwiseModel {
                     "Qwen3-VL TP+EP decoder received a vision unit at text layer {index}"
                 )));
             };
-            let mut output = block.forward_sparse_experts_with_rotary_tensor_parallel(
-                AttentionInput {
-                    x: hidden,
-                    mask: context.mask.as_ref(),
-                    cache: cache.kv[index].as_mut(),
-                },
+            let mut output = forward_qwen3_vl_text_external_experts(
+                block,
+                hidden,
+                context.mask.as_ref(),
+                cache.kv[index].as_mut(),
                 &context.cos,
                 &context.sin,
-                tp_group,
+                index,
+                ExpertPass::Decode,
+                Some(tp_group),
                 stream,
-                |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                &mut provider,
             )?;
             if let Some(features) = context.deepstack_features.get(index) {
                 let base = zeros_dtype(output.shape(), output.dtype(), stream)?;
@@ -1554,7 +1603,7 @@ fn qwen3_vl_prompt_cache_identity(
     };
     Ok(PromptCacheModelIdentity {
         model_family: "qwen3_vl".into(),
-        effective_model_type: if args.text_config.model_type == "qwen3_vl_moe_text" {
+        effective_model_type: if args.text_config.is_moe() {
             "qwen3_vl_moe".into()
         } else {
             "qwen3_vl".into()
@@ -1673,13 +1722,7 @@ fn qwen3_vl_unit_bindings(
                 "Qwen3-VL text group contains a vision unit".into(),
             ));
         };
-        qwen_text_layer_bindings(
-            layer,
-            &args.text_config,
-            &format!("model.language_model.layers.{index}"),
-            store,
-            sparse_experts,
-        )
+        qwen_vl_text_layer_bindings(layer, &args.text_config, index, store, sparse_experts)
     } else {
         Ok(build_module_binding_plan_with_recipes(
             layer,
@@ -1811,7 +1854,7 @@ fn load_qwen3_vl_with_store(
         stream,
         weights_stream,
         move |key| sparse_experts && key.contains(".mlp.experts."),
-        |modules, store| qwen3_vl_static_bindings(&**modules, store),
+        |modules, store| qwen3_vl_static_bindings(modules, store),
         move |ordinal, unit, store, _| {
             let (group, index) = qwen3_vl_ordinal(&binding_args, ordinal);
             qwen3_vl_unit_bindings(&binding_args, group, index, &unit, store, sparse_experts)
@@ -1825,12 +1868,12 @@ fn load_qwen3_vl_with_store(
     metadata.set_quantization(args.text_config.weight_quantization());
     metadata.set_materialization(materialization);
     let runtime = if options.is_fully_resident() {
-        Qwen3VlRuntime::Resident(LayerwiseRuntime::new(
+        Qwen3VlRuntime::Resident(Box::new(LayerwiseRuntime::new(
             architecture,
             policy.into_resident(stream)?,
-        ))
+        )))
     } else {
-        Qwen3VlRuntime::Layerwise(LayerwiseRuntime::new(architecture, policy))
+        Qwen3VlRuntime::Layerwise(Box::new(LayerwiseRuntime::new(architecture, policy)))
     };
     Ok(Qwen3VlExecution {
         runtime,
@@ -1869,13 +1912,15 @@ fn register_qwen3_vl_parallel_parameters(
         planner.register(group)?;
     }
     for index in 0..args.text_config.num_hidden_layers as usize {
-        let layer = TransformerBlock::new_for_layer(&args.text_config, index as i32, stream)?;
-        register_qwen_layer_parallel_plan(
-            planner,
+        let layer = neutral_qwen::new_block::<MlxBackend>(&args.text_config, index, stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        for group in neutral_qwen::layer_parallel_parameter_groups::<MlxBackend>(
             &layer,
             &args.text_config,
-            &format!("model.language_model.layers.{index}"),
-        )?;
+            index,
+        )? {
+            planner.register(group)?;
+        }
     }
     Ok(())
 }
@@ -2042,12 +2087,12 @@ fn load_qwen3_vl_parallel_with_store(
         maximum_device_parameter_bytes,
     );
     let runtime = if options.is_fully_resident() {
-        Qwen3VlRuntime::Resident(LayerwiseRuntime::new(
+        Qwen3VlRuntime::Resident(Box::new(LayerwiseRuntime::new(
             architecture,
             policy.into_resident(stream)?,
-        ))
+        )))
     } else {
-        Qwen3VlRuntime::Layerwise(LayerwiseRuntime::new(architecture, policy))
+        Qwen3VlRuntime::Layerwise(Box::new(LayerwiseRuntime::new(architecture, policy)))
     };
     Ok(Qwen3VlExecution {
         runtime,
@@ -2248,11 +2293,7 @@ fn load_qwen3_vl_gguf_sparse_execution(
     )?;
     let store = execution.checkpoint_store_arc();
     let entries =
-        crate::composition::mlx_architectures::qwen::dense::layerwise::qwen3_expert_catalog_at(
-            &args.text_config,
-            store.as_ref(),
-            "model.language_model.layers",
-        )?;
+        crate::composition::qwen_expert::expert_catalog(&args.text_config, store.as_ref())?;
     execution.architecture_mut().expert_cache = Some(match quantization {
         Some(quantization) => ExpertCache::new_quantized_shared(
             store,
@@ -2281,16 +2322,8 @@ pub(crate) fn qwen3_vl_gguf_store(
 ) -> Result<Arc<dyn eredu_checkpoint::store::CheckpointSource>, Error> {
     let deepstack = args.vision_config.deepstack_layers();
     let is_moe = args.text_config.is_moe();
-    let text_variant = if is_moe {
-        crate::composition::mlx_architectures::qwen::dense::checkpoint::GgufVariant::Qwen3Moe
-    } else {
-        crate::composition::mlx_architectures::qwen::dense::checkpoint::GgufVariant::Qwen3
-    };
-    let text_plan = crate::composition::mlx_architectures::qwen::dense::checkpoint::gguf_plan(
-        &args.text_config,
-        text_variant,
-    )
-    .map_err(Error::UnsupportedArchitecture)?;
+    let text_plan = eredu_architectures::qwen::gguf_plan(&args.text_config)
+        .map_err(Error::UnsupportedArchitecture)?;
     let vision_plan =
         super::checkpoint::projector_gguf_plan(&args.vision_config, args.text_config.hidden_size)
             .map_err(Error::UnsupportedArchitecture)?;
@@ -2298,10 +2331,7 @@ pub(crate) fn qwen3_vl_gguf_store(
         eredu_checkpoint::gguf_store::GgufWeightStore::builder()
             .max_cached_readers(max_mapped_shards)?
             .add_checkpoint(checkpoint.catalog().clone(), &text_plan, move |name| {
-                let name =
-                    crate::composition::mlx_architectures::qwen::dense::translate_gguf_weight_name(
-                        name, is_moe,
-                    );
+                let name = eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe);
                 name.strip_prefix("model.")
                     .map(|name| format!("model.language_model.{name}"))
                     .unwrap_or(name)
@@ -2354,11 +2384,7 @@ pub fn load_qwen3_vl_expert_cache_model(
     )?;
     let store = execution.checkpoint_store_arc();
     let entries =
-        crate::composition::mlx_architectures::qwen::dense::layerwise::qwen3_expert_catalog_at(
-            &args.text_config,
-            store.as_ref(),
-            "model.language_model.layers",
-        )?;
+        crate::composition::qwen_expert::expert_catalog(&args.text_config, store.as_ref())?;
     execution.architecture_mut().expert_cache = Some(match quantize_on_load {
         Some(quantization) => ExpertCache::new_quantized_shared(
             store,
@@ -2480,7 +2506,7 @@ pub enum Qwen3VlLayer {
     /// Vision transformer block.
     Vision(Box<QwenVisionBlock>),
     /// Dense or sparse-MoE Qwen3 decoder block.
-    Text(Box<TransformerBlock>),
+    Text(Box<NeutralTextBlock>),
 }
 
 impl ModuleParameters for Qwen3VlLayer {
@@ -2773,7 +2799,21 @@ impl Qwen3VlLayerwiseAdapter {
 
     pub(crate) fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let visual = QwenVisionTransformer::new_deepstack(args.vision_config.clone(), stream)?;
-        let text = Decoder::new(&args.text_config, stream)?;
+        let embedding = common::linear::unloaded_maybe_quantized_embedding(
+            args.text_config.vocab_size,
+            args.text_config.hidden_size,
+            args.text_config.weight_quantization_for(&format!(
+                "{}.embed_tokens.weight",
+                args.text_config.parameter_root
+            )),
+            stream,
+        )?;
+        let norm = nn::RmsNorm::unloaded(
+            args.text_config.hidden_size,
+            args.text_config.rms_norm_eps,
+            safemlx::Dtype::Float32,
+            stream,
+        )?;
         let lm_head = if args.text_config.tie_word_embeddings {
             None
         } else {
@@ -2791,9 +2831,9 @@ impl Qwen3VlLayerwiseAdapter {
         Ok(Self {
             args,
             vision: QwenVisionLayerwiseStatic::from_transformer(visual),
-            embedding: text.embed_tokens,
+            embedding,
             parallel_embedding: None,
-            norm: text.norm,
+            norm,
             lm_head,
             parallel_lm_head: None,
             parallel_kv_heads: None,
@@ -3080,7 +3120,7 @@ impl Qwen3VlLayerwiseAdapter {}
 
 impl Qwen3VlLayerwiseAdapter {
     pub(crate) fn model_type(&self) -> &str {
-        if self.args.text_config.model_type == "qwen3_vl_moe_text" {
+        if self.args.text_config.is_moe() {
             "qwen3_vl_moe"
         } else {
             "qwen3_vl"
@@ -3211,9 +3251,10 @@ impl Qwen3VlLayerwiseAdapter {
                 index,
                 stream,
             )?))),
-            1 => Ok(Qwen3VlLayer::Text(Box::new(
-                TransformerBlock::new_for_layer(&self.args.text_config, index as i32, stream)?,
-            ))),
+            1 => Ok(Qwen3VlLayer::Text(Box::new(MlxModule::new(
+                neutral_qwen::new_block::<MlxBackend>(&self.args.text_config, index, stream)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            )))),
             _ => Err(Error::UnsupportedArchitecture(format!(
                 "Qwen3-VL has no execution group {group}"
             ))),
@@ -3292,13 +3333,15 @@ impl Qwen3VlLayerwiseAdapter {
         }
         for index in 0..self.args.text_config.num_hidden_layers as usize {
             let layer =
-                TransformerBlock::new_for_layer(&self.args.text_config, index as i32, stream)?;
-            register_qwen_layer_parallel_plan(
-                planner,
+                neutral_qwen::new_block::<MlxBackend>(&self.args.text_config, index, stream)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            for group in neutral_qwen::layer_parallel_parameter_groups::<MlxBackend>(
                 &layer,
                 &self.args.text_config,
-                &format!("model.language_model.layers.{index}"),
-            )?;
+                index,
+            )? {
+                planner.register(group)?;
+            }
         }
         Ok(())
     }
@@ -3340,9 +3383,10 @@ impl Qwen3VlLayerwiseAdapter {
                 config.intermediate_size = i32::try_from(gate.local_shape()[0])
                     .map_err(|_| Error::Parallel("Qwen local MLP width exceeds i32".into()))?;
             }
-            return Ok(Qwen3VlLayer::Text(Box::new(
-                TransformerBlock::new_for_layer(&config, index as i32, stream)?,
-            )));
+            return Ok(Qwen3VlLayer::Text(Box::new(MlxModule::new(
+                neutral_qwen::new_block::<MlxBackend>(&config, index, stream)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            ))));
         }
         let config = &self.args.vision_config;
         Ok(Qwen3VlLayer::Vision(Box::new(new_parallel_vision_block(
@@ -3370,7 +3414,7 @@ impl Qwen3VlLayerwiseAdapter {
         let Qwen3VlLayer::Text(block) = &mut layer else {
             unreachable!("validated text group")
         };
-        let FeedForward::Moe(moe) = &mut block.mlp else {
+        let NeutralFeedForward::Routed(moe) = &mut block.mlp else {
             return Err(Error::Parallel(format!(
                 "Qwen3-VL text layer {index} is not an MoE layer"
             )));
@@ -3381,19 +3425,15 @@ impl Qwen3VlLayerwiseAdapter {
             i32::try_from(assignment.local_global_expert_ids().len())
                 .map_err(|_| Error::Parallel("local Qwen3-VL expert count exceeds i32".into()))?
         };
-        let prefix = format!("model.language_model.layers.{index}.mlp.experts");
-        moe.experts = QwenExperts::new(
-            local_experts,
-            self.args.text_config.hidden_size,
-            self.args.text_config.moe_intermediate_size,
-            self.args
-                .text_config
-                .weight_quantization_for(&format!("{prefix}.gate_up_proj")),
-            self.args
-                .text_config
-                .weight_quantization_for(&format!("{prefix}.down_proj")),
-            stream,
-        )?;
+        if local_experts > 0 {
+            moe.experts = unloaded_expert_bank(
+                &self.args.text_config,
+                index,
+                local_experts,
+                self.args.text_config.moe_intermediate_size,
+                stream,
+            )?;
+        }
         Ok(layer)
     }
 
@@ -3414,7 +3454,7 @@ impl Qwen3VlLayerwiseAdapter {
         let Qwen3VlLayer::Text(block) = &mut layer else {
             unreachable!("validated text group")
         };
-        let FeedForward::Moe(moe) = &mut block.mlp else {
+        let NeutralFeedForward::Routed(moe) = &mut block.mlp else {
             return Err(Error::Parallel(format!(
                 "Qwen3-VL text layer {index} is not an MoE layer"
             )));
@@ -3425,20 +3465,16 @@ impl Qwen3VlLayerwiseAdapter {
             i32::try_from(assignment.local_global_expert_ids().len())
                 .map_err(|_| Error::Parallel("local Qwen3-VL expert count exceeds i32".into()))?
         };
-        let local_intermediate = moe.experts.intermediate_dim;
-        let prefix = format!("model.language_model.layers.{index}.mlp.experts");
-        moe.experts = QwenExperts::new(
-            local_experts,
-            self.args.text_config.hidden_size,
-            local_intermediate,
-            self.args
-                .text_config
-                .weight_quantization_for(&format!("{prefix}.gate_up_proj")),
-            self.args
-                .text_config
-                .weight_quantization_for(&format!("{prefix}.down_proj")),
-            stream,
-        )?;
+        if local_experts > 0 {
+            let local = neutral_qwen::local_block_args(&self.args.text_config, index, layout)?;
+            moe.experts = unloaded_expert_bank(
+                &self.args.text_config,
+                index,
+                local_experts,
+                local.moe_intermediate_size,
+                stream,
+            )?;
+        }
         Ok(layer)
     }
 
@@ -3486,10 +3522,10 @@ impl Qwen3VlLayerwiseAdapter {
                     "Qwen3-VL text execution group contains a vision layer at {index}"
                 )));
             };
-            qwen_text_layer_bindings(
+            qwen_vl_text_layer_bindings(
                 layer,
                 &self.args.text_config,
-                &prefix,
+                index,
                 store,
                 self.sparse_expert_cache,
             )
@@ -3556,6 +3592,7 @@ impl Qwen3VlLayerwiseAdapter {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_layer(
         &mut self,
         group: usize,
@@ -3590,120 +3627,32 @@ impl Qwen3VlLayerwiseAdapter {
                     } else {
                         ExpertPass::Decode
                     };
-                    block.forward_sparse_experts_with_rotary(
-                        AttentionInput {
-                            x: hidden,
-                            mask: context.mask.as_ref(),
-                            cache: cache.kv[index].as_mut(),
-                        },
+                    let mut provider = crate::composition::qwen_expert::cached_provider(
+                        expert_cache,
+                        &self.args.text_config,
+                    );
+                    forward_qwen3_vl_text_external_experts(
+                        block,
+                        hidden,
+                        context.mask.as_ref(),
+                        cache.kv[index].as_mut(),
                         &context.cos,
                         &context.sin,
+                        index,
+                        pass,
+                        None,
                         stream,
-                        |flat, indices, weights, stream| {
-                            expert_cache
-                                .execute_routes_bounded(
-                                    ExpertRouteBatch::new(index, flat, indices, weights, pass),
-                                    stream,
-                                    |flat, acquired, weights, stream| {
-                                        let started = Instant::now();
-                                        let prefix = format!(
-                                            "model.language_model.layers.{index}.mlp.experts"
-                                        );
-                                        let args = &self.args.text_config;
-                                        let load_time = expert_cache.weight_quantization();
-                                        let mut bank = QwenExperts::new(
-                                            acquired.identities().len() as i32,
-                                            args.hidden_size,
-                                            args.moe_intermediate_size,
-                                            load_time.or_else(|| {
-                                                args.weight_quantization_for(&format!(
-                                                    "{prefix}.gate_up_proj"
-                                                ))
-                                            }),
-                                            load_time.or_else(|| {
-                                                args.weight_quantization_for(&format!(
-                                                    "{prefix}.down_proj"
-                                                ))
-                                            }),
-                                            stream,
-                                        )?;
-                                        bank.gate_up_proj = Param::new(
-                                            acquired
-                                                .compact_binding("gate_up_proj", stream)
-                                                .map_err(|error| {
-                                                    Exception::custom(error.to_string())
-                                                })?,
-                                        );
-                                        bank.gate_up_proj_scales = Param::new(
-                                            acquired
-                                                .optional_compact_binding(
-                                                    "gate_up_proj_scales",
-                                                    stream,
-                                                )
-                                                .map_err(|error| {
-                                                    Exception::custom(error.to_string())
-                                                })?,
-                                        );
-                                        bank.gate_up_proj_biases = Param::new(
-                                            acquired
-                                                .optional_compact_binding(
-                                                    "gate_up_proj_biases",
-                                                    stream,
-                                                )
-                                                .map_err(|error| {
-                                                    Exception::custom(error.to_string())
-                                                })?,
-                                        );
-                                        bank.down_proj = Param::new(
-                                            acquired.compact_binding("down_proj", stream).map_err(
-                                                |error| Exception::custom(error.to_string()),
-                                            )?,
-                                        );
-                                        bank.down_proj_scales = Param::new(
-                                            acquired
-                                                .optional_compact_binding(
-                                                    "down_proj_scales",
-                                                    stream,
-                                                )
-                                                .map_err(|error| {
-                                                    Exception::custom(error.to_string())
-                                                })?,
-                                        );
-                                        bank.down_proj_biases = Param::new(
-                                            acquired
-                                                .optional_compact_binding(
-                                                    "down_proj_biases",
-                                                    stream,
-                                                )
-                                                .map_err(|error| {
-                                                    Exception::custom(error.to_string())
-                                                })?,
-                                        );
-                                        expert_cache.record_compact_bank(
-                                            pass,
-                                            acquired.scratch_bytes(),
-                                            started.elapsed(),
-                                        )?;
-                                        Ok(bank.forward(
-                                            flat,
-                                            acquired.compact_routes(),
-                                            weights,
-                                            stream,
-                                        )?)
-                                    },
-                                )
-                                .map_err(|error| Exception::custom(error.to_string()))
-                        },
+                        &mut provider,
                     )?
                 } else {
-                    block.forward_with_rotary_embeddings(
-                        AttentionInput {
-                            x: hidden,
-                            mask: context.mask.as_ref(),
-                            cache: cache.kv[index].as_mut(),
-                        },
+                    forward_qwen3_vl_text(
+                        block,
+                        hidden,
+                        context.mask.as_ref(),
+                        cache.kv[index].as_mut(),
                         &context.cos,
                         &context.sin,
+                        None,
                         stream,
                     )?
                 };
@@ -3726,6 +3675,7 @@ impl Qwen3VlLayerwiseAdapter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_layer_with_execution(
         &mut self,
         group: usize,
@@ -3772,17 +3722,16 @@ impl Qwen3VlLayerwiseAdapter {
                 return Ok(output);
             }
         } else if let Qwen3VlLayer::Text(block) = layer {
-            return Ok(block.forward_with_rotary_embeddings_tensor_parallel(
-                AttentionInput {
-                    x: hidden,
-                    mask: context.mask.as_ref(),
-                    cache: cache.kv[index].as_mut(),
-                },
+            return forward_qwen3_vl_text(
+                block,
+                hidden,
+                context.mask.as_ref(),
+                cache.kv[index].as_mut(),
                 &context.cos,
                 &context.sin,
-                tp_group,
+                Some(tp_group),
                 execution.stream(),
-            )?);
+            );
         }
         self.forward_layer(
             group,
@@ -3975,6 +3924,7 @@ impl Qwen3VlLayerwiseAdapter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn tensor_expert_parallel_layer_bindings(
         &self,
         group: usize,
@@ -3995,6 +3945,7 @@ impl Qwen3VlLayerwiseAdapter {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn cartesian_layer_bindings(
         &self,
         group: usize,

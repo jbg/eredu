@@ -3,6 +3,7 @@
 //! Tests never download data. Set the named environment variable to a local
 //! model directory or GGUF and run the exact ignored test on a Metal host.
 
+use eredu::backend::mlx::ModelLoadOptions;
 use eredu::{
     api::{
         LoadedModel, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
@@ -24,13 +25,21 @@ fn profile_requires_structural_tool_tokens(identity: &str) -> bool {
 }
 
 fn smoke(environment: &str, expected_profile_prefix: &str) {
+    smoke_with_options(
+        environment,
+        expected_profile_prefix,
+        ModelLoadOptions::default(),
+    );
+}
+
+fn smoke_with_options(environment: &str, expected_profile_prefix: &str, options: ModelLoadOptions) {
     let path = std::env::var(environment)
         .unwrap_or_else(|_| panic!("{environment} must name a local checkpoint"));
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let mut model = LoadedModel::load(
         eredu::backend::mlx::MlxBackend::new(execution.stream(), execution.stream()),
         &path,
-        Default::default(),
+        options,
     )
     .unwrap_or_else(|error| panic!("failed to load {environment}={path:?}: {error}"));
     let prepared = model
@@ -200,6 +209,24 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
     }
 }
 
+fn qwen_residency_smoke(environment: &str) {
+    smoke_with_options(
+        environment,
+        "qwen.",
+        ModelLoadOptions::default()
+            .with_weight_residency(eredu_runtime::WeightResidency::fully_resident()),
+    );
+    smoke_with_options(
+        environment,
+        "qwen.",
+        ModelLoadOptions::default().with_weight_residency(
+            eredu_runtime::WeightResidency::layerwise_host(
+                eredu_runtime::LayerwiseLoadOptions::default(),
+            ),
+        ),
+    );
+}
+
 #[test]
 #[ignore = "requires SAFEMLX_GEMMA4_TOOL_CHECKPOINT and an MLX Metal device"]
 fn gemma4_real_checkpoint_native_tool_smoke() {
@@ -216,6 +243,24 @@ fn gpt_oss_real_checkpoint_native_tool_smoke() {
 #[ignore = "requires SAFEMLX_QWEN_TOOL_CHECKPOINT and an MLX Metal device"]
 fn qwen_real_checkpoint_native_tool_smoke() {
     smoke("SAFEMLX_QWEN_TOOL_CHECKPOINT", "qwen.");
+}
+
+#[test]
+#[ignore = "requires SAFEMLX_QWEN2_CHECKPOINT and an MLX Metal device"]
+fn qwen2_real_checkpoint_resident_and_bounded_smoke() {
+    qwen_residency_smoke("SAFEMLX_QWEN2_CHECKPOINT");
+}
+
+#[test]
+#[ignore = "requires SAFEMLX_QWEN3_CHECKPOINT and an MLX Metal device"]
+fn qwen3_real_checkpoint_resident_and_bounded_smoke() {
+    qwen_residency_smoke("SAFEMLX_QWEN3_CHECKPOINT");
+}
+
+#[test]
+#[ignore = "requires SAFEMLX_QWEN3_MOE_CHECKPOINT and an MLX Metal device"]
+fn qwen3_moe_real_checkpoint_resident_and_bounded_smoke() {
+    qwen_residency_smoke("SAFEMLX_QWEN3_MOE_CHECKPOINT");
 }
 
 #[test]

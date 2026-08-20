@@ -1617,7 +1617,7 @@ impl DeepSeekV3LayerwiseModel {
         inputs: &Array,
         cache: &mut Cache,
         stream: &Stream,
-        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     ) -> Result<Array, Error> {
         let execute = |architecture: &mut DeepSeekV3Architecture,
                        _group: usize,

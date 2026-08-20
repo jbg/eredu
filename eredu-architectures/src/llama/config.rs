@@ -123,9 +123,7 @@ impl ModelArgs {
         {
             return Some(*config);
         }
-        let Some(encoding) = self.weight_quantization() else {
-            return None;
-        };
+        let encoding = self.weight_quantization()?;
         match &self.quantized_weights {
             Some(names) if !names.contains(weight_name) => None,
             _ => Some(encoding),
@@ -134,6 +132,12 @@ impl ModelArgs {
 }
 
 impl Config for ModelArgs {
+    fn model_identity(&self) -> &str {
+        &self.model_type
+    }
+    fn validate_config(&self) -> Result<(), eredu_nn::Error> {
+        self.validate().map_err(eredu_nn::Error::backend)
+    }
     fn hidden_size(&self) -> i32 {
         self.hidden_size
     }
@@ -158,7 +162,7 @@ impl Config for ModelArgs {
     fn vocabulary_size(&self) -> i32 {
         self.vocab_size
     }
-    fn attention_bias(&self) -> bool {
+    fn attention_bias(&self, _projection: super::AttentionProjection) -> bool {
         self.attention_bias
     }
     fn mlp_bias(&self) -> bool {

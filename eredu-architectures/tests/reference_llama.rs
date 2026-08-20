@@ -1,15 +1,19 @@
-use eredu_architectures::llama::{self, LayeredInput, ModelArgs};
+use eredu_architectures::{
+    llama::{self, LayeredInput, ModelArgs},
+    qwen,
+};
 use eredu_core::{AttentionPolicy, Completion, LayerSchedule};
 use eredu_nn::{
     AttentionCache, AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator,
     LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode,
     ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized, RotaryOperator,
-    RotarySpec, Tensor,
+    RotaryPosition, RotarySpec, RoutedNeuralBackend, RoutingOperator, RoutingResult,
+    SwiGluExpertBankOperator, SwiGluExpertBankSpec, Tensor, TopKRouterSpec,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_bindings, DeviceState, LayerRuntimeState, LayerwiseRuntime,
-    ParameterBackend, ResidentRuntime, ResidentUnitWindow, RuntimeLayerState, SubmissionBackend,
-    WeightBinding,
+    bind_materialized_unit, materialize_bindings, DeviceState, ExpertPass, LayerRuntimeState,
+    LayerwiseRuntime, ParameterBackend, ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider,
+    RoutedExpertRequest, RuntimeLayerState, SubmissionBackend, WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -234,6 +238,35 @@ impl LinearOperator<ReferenceTensor> for ReferenceLinear {
     }
 }
 
+impl RoutingOperator<ReferenceTensor> for ReferenceLinear {
+    fn route(
+        &mut self,
+        input: &ReferenceTensor,
+        _: &(),
+    ) -> Result<RoutingResult<ReferenceTensor>, Error> {
+        let tokens = input.shape()[..input.shape().len() - 1]
+            .iter()
+            .product::<i32>();
+        let routes = ReferenceTensor(vec![tokens, self.output]);
+        Ok(RoutingResult {
+            expert_ids: routes.clone(),
+            selected_scores: routes.clone(),
+            route_weights: routes,
+        })
+    }
+}
+
+impl SwiGluExpertBankOperator<ReferenceTensor> for ReferenceLinear {
+    fn forward_routed(
+        &mut self,
+        input: &ReferenceTensor,
+        _: &RoutingResult<ReferenceTensor>,
+        _: &(),
+    ) -> Result<ReferenceTensor, Error> {
+        Ok(input.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ReferenceEmbedding {
     vocabulary: i32,
@@ -322,7 +355,7 @@ impl RotaryOperator<ReferenceTensor> for ReferenceRotary {
     fn forward(
         &mut self,
         input: &ReferenceTensor,
-        _: i32,
+        _: RotaryPosition<'_, ReferenceTensor>,
         _: &(),
     ) -> Result<ReferenceTensor, Error> {
         Ok(input.clone())
@@ -397,6 +430,38 @@ impl NeuralBackend for ReferenceBackend {
         context: &(),
     ) -> Result<Self::Tensor, Error> {
         linear.forward(input, context)
+    }
+}
+
+impl RoutedNeuralBackend for ReferenceBackend {
+    type Router = ReferenceLinear;
+    type SwiGluExpertBank = ReferenceLinear;
+
+    fn top_k_router(spec: TopKRouterSpec, _: &()) -> Result<Self::Router, Error> {
+        Ok(ReferenceLinear {
+            output: spec.routing.top_k(),
+            weight: ReferenceTensor(vec![spec.routing.expert_count(), spec.input_dimensions]),
+            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+        })
+    }
+
+    fn swiglu_expert_bank(
+        spec: SwiGluExpertBankSpec,
+        _: &(),
+    ) -> Result<Self::SwiGluExpertBank, Error> {
+        let weight = match spec.layout {
+            eredu_nn::SwiGluExpertLayout::Packed { gate_up, .. } => gate_up.weight,
+            eredu_nn::SwiGluExpertLayout::Independent(mut experts) => experts.remove(0).gate.weight,
+        };
+        Ok(ReferenceLinear {
+            output: spec.output_dimensions,
+            weight: ReferenceTensor(vec![
+                spec.expert_count,
+                2 * spec.intermediate_dimensions,
+                spec.input_dimensions,
+            ]),
+            metadata: ParameterMetadata::from_spec(&weight, weight.trainable),
+        })
     }
 }
 
@@ -712,4 +777,199 @@ fn shared_llama_runs_prefill_and_decode_without_mlx() {
     assert_eq!(logits.shape(), &[1, 1, 32]);
     assert_eq!(state.layer(0).unwrap().offset(), 5);
     assert_eq!(state.layer(1).unwrap().offset(), 5);
+}
+
+#[test]
+fn shared_decoder_runs_qwen2_and_qwen3_without_mlx() {
+    for model_type in ["qwen2", "qwen3", "qwen3_moe"] {
+        let mut config = serde_json::json!({
+            "model_type": model_type,
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 32,
+            "max_position_embeddings": 128,
+            "tie_word_embeddings": false
+        });
+        if model_type == "qwen3_moe" {
+            config["intermediate_size"] = 0.into();
+            config["moe_intermediate_size"] = 8.into();
+            config["num_experts"] = 4.into();
+            config["num_experts_per_tok"] = 2.into();
+            config["norm_topk_prob"] = true.into();
+        } else if model_type == "qwen2" {
+            config["use_sliding_window"] = true.into();
+            config["sliding_window"] = 4.into();
+            config["max_window_layers"] = 1.into();
+        }
+        let args = qwen::model_args_from_config_value(&config).unwrap();
+        let layout = qwen::state_layout(&args).unwrap();
+        let mut state =
+            DeviceState::<ReferenceBackend, ReferenceCache>::create(layout, |_, policy| {
+                Ok::<_, std::convert::Infallible>(ReferenceCache {
+                    offset: 0,
+                    window: policy
+                        .attention()
+                        .and_then(|attention| attention.window())
+                        .map(|window| window.get() as i32),
+                })
+            })
+            .unwrap();
+        let architecture = qwen::LayeredModel::<ReferenceBackend>::new(args, &()).unwrap();
+        let mut runtime = ResidentRuntime::new(architecture, &()).unwrap();
+        let parameters = runtime
+            .units()
+            .iter()
+            .flat_map(topology)
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        if model_type == "qwen2" {
+            assert!(!parameters
+                .iter()
+                .any(|name| name.ends_with("q_norm.weight")));
+        } else {
+            assert!(parameters
+                .iter()
+                .any(|name| name.ends_with("q_norm.weight")));
+        }
+        if model_type == "qwen3_moe" {
+            assert!(parameters
+                .iter()
+                .any(|name| name.ends_with("mlp.gate.weight")));
+            assert!(parameters
+                .iter()
+                .any(|name| name.ends_with("mlp.experts.gate_up_proj")));
+        }
+        let logits = runtime
+            .forward(
+                LayeredInput {
+                    tokens: &ReferenceTensor(vec![1, 3]),
+                    mask: None,
+                },
+                &mut state,
+                &(),
+            )
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 3, 32]);
+        assert_eq!(state.layer(0).unwrap().offset(), 3);
+        assert_eq!(state.layer(1).unwrap().offset(), 3);
+        if model_type == "qwen2" {
+            assert_eq!(state.layer(0).unwrap().max_size(), None);
+            assert_eq!(state.layer(1).unwrap().max_size(), Some(4));
+        }
+        let logits = runtime
+            .forward(
+                LayeredInput {
+                    tokens: &ReferenceTensor(vec![1, 1]),
+                    mask: None,
+                },
+                &mut state,
+                &(),
+            )
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 1, 32]);
+        assert_eq!(state.layer(0).unwrap().offset(), 4);
+        assert_eq!(state.layer(1).unwrap().offset(), 4);
+    }
+}
+
+#[derive(Default)]
+struct ProbeExpertProvider {
+    calls: Vec<(usize, ExpertPass, Vec<i32>, Vec<i32>)>,
+}
+
+impl RoutedExpertProvider<ReferenceBackend> for ProbeExpertProvider {
+    type Error = std::convert::Infallible;
+
+    fn forward_routed(
+        &mut self,
+        _resident_bank: &mut ReferenceLinear,
+        request: RoutedExpertRequest<'_, ReferenceTensor>,
+        _: &(),
+    ) -> Result<ReferenceTensor, Self::Error> {
+        self.calls.push((
+            request.layer,
+            request.pass,
+            request.input.shape().to_vec(),
+            request.routes.expert_ids.shape().to_vec(),
+        ));
+        Ok(request.input.clone())
+    }
+}
+
+#[derive(Default)]
+struct ProbeObserver {
+    route_shapes: Vec<(Vec<i32>, Vec<i32>, i32)>,
+}
+
+impl eredu_runtime::ActivationObserver<ReferenceTensor, Error> for ProbeObserver {
+    fn observe(&mut self, _: &str, _: &ReferenceTensor) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn observe_routing(
+        &mut self,
+        routing: eredu_runtime::RoutingObservation<'_, ReferenceTensor>,
+    ) -> Result<(), Error> {
+        self.route_shapes.push((
+            routing.selected_experts.shape().to_vec(),
+            routing.route_weights.shape().to_vec(),
+            routing.expert_count,
+        ));
+        Ok(())
+    }
+}
+
+#[test]
+fn qwen_routed_execution_uses_the_runtime_provider_and_observer_contract() {
+    let config = serde_json::json!({
+        "model_type": "qwen3_moe",
+        "hidden_size": 8,
+        "num_hidden_layers": 1,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 8,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "norm_topk_prob": true,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "rms_norm_eps": 0.00001,
+        "vocab_size": 32,
+        "max_position_embeddings": 128,
+        "tie_word_embeddings": false
+    });
+    let args = qwen::model_args_from_config_value(&config).unwrap();
+    let mut policy = qwen::FeedForward::<ReferenceBackend>::new(&args, 0, &()).unwrap();
+    let input = ReferenceTensor(vec![3, 8]);
+    let mut provider = ProbeExpertProvider::default();
+    let output = policy
+        .forward_with_provider(0, ExpertPass::Prefill, &input, &(), &mut provider)
+        .unwrap();
+    assert_eq!(output.shape(), input.shape());
+    assert_eq!(
+        provider.calls,
+        vec![(0, ExpertPass::Prefill, vec![3, 8], vec![3, 2])]
+    );
+
+    let mut observer = ProbeObserver::default();
+    let output = policy
+        .forward_observed_with_provider(
+            "model.layers.0.mlp",
+            0,
+            ExpertPass::Decode,
+            args.num_experts,
+            &input,
+            &(),
+            &mut observer,
+            &mut provider,
+        )
+        .unwrap();
+    assert_eq!(output.shape(), input.shape());
+    assert_eq!(observer.route_shapes, vec![(vec![3, 2], vec![3, 2], 4)]);
+    assert_eq!(provider.calls[1].1, ExpertPass::Decode);
 }

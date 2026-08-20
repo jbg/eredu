@@ -4,7 +4,7 @@ use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, Completion, LayerSche
 use eredu_nn::{
     AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator, LinearSpec,
     NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode, ParameterVisitor,
-    ParameterVisitorMut, Parameterized, RotaryOperator, RotarySpec, Tensor,
+    ParameterVisitorMut, Parameterized, RotaryOperator, RotaryPosition, RotarySpec, Tensor,
 };
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, CollectiveBackend, DeviceState, ExecutionGraph,
@@ -222,7 +222,12 @@ impl NormalizationOperator<FakeTensor> for FakeOperator {
     }
 }
 impl RotaryOperator<FakeTensor> for FakeOperator {
-    fn forward(&mut self, input: &FakeTensor, _: i32, _: &()) -> Result<FakeTensor, Error> {
+    fn forward(
+        &mut self,
+        input: &FakeTensor,
+        _: RotaryPosition<'_, FakeTensor>,
+        _: &(),
+    ) -> Result<FakeTensor, Error> {
         Ok(input.clone())
     }
 }

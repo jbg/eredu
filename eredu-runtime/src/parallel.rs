@@ -365,6 +365,70 @@ where
     ParameterGroupSpec::new(logical_name, role, collector.members)
 }
 
+/// Describes every parameter in a neutral module as one shared logical partition.
+pub fn partitioned_module_parameter_group<T, M>(
+    logical_name: impl Into<String>,
+    role: ParameterRole,
+    preferred_units: usize,
+    module: &M,
+    mut sharding: impl FnMut(&ParameterMetadata, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
+) -> Result<ParameterGroupSpec, ParallelPlanError>
+where
+    T: Tensor,
+    M: Parameterized<T>,
+{
+    if preferred_units == 0 {
+        return Err(ParallelPlanError::InvalidGroup(
+            "partitioned module group has zero preferred units".into(),
+        ));
+    }
+    struct Collector<'a, F> {
+        members: Vec<ParameterMemberSpec>,
+        sharding: &'a mut F,
+        error: Option<ParallelPlanError>,
+    }
+    impl<'a, 'tensor, T, F> ParameterVisitor<'tensor, T> for Collector<'a, F>
+    where
+        T: Tensor,
+        F: FnMut(&ParameterMetadata, &[usize]) -> Result<MemberSharding, ParallelPlanError>,
+    {
+        fn visit(&mut self, metadata: ParameterMetadata, value: &'tensor T) {
+            if self.error.is_some() {
+                return;
+            }
+            let shape = value
+                .shape()
+                .iter()
+                .map(|dimension| {
+                    usize::try_from(*dimension).map_err(|_| {
+                        ParallelPlanError::InvalidTensor(format!(
+                            "parameter {} has negative dimension {dimension}",
+                            metadata.id.as_str()
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>();
+            match shape.and_then(|shape| {
+                (self.sharding)(&metadata, &shape)
+                    .map(|sharding| ParameterMemberSpec::new(metadata.id.as_str(), shape, sharding))
+            }) {
+                Ok(member) => self.members.push(member),
+                Err(error) => self.error = Some(error),
+            }
+        }
+    }
+    let mut collector = Collector {
+        members: Vec::new(),
+        sharding: &mut sharding,
+        error: None,
+    };
+    module.visit_parameters(&mut collector);
+    if let Some(error) = collector.error {
+        return Err(error);
+    }
+    ParameterGroupSpec::partitioned(logical_name, role, preferred_units, collector.members)
+}
+
 /// Describes one affine projection and all encoding companions.
 pub fn projection_parameter_group<T, M>(
     logical_name: impl Into<String>,

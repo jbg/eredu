@@ -329,8 +329,249 @@ pub trait NormalizationOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
 
 /// Backend-native rotary-position operator.
 pub trait RotaryOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
-    /// Applies rotary positions at the supplied sequence offset.
-    fn forward(&mut self, input: &T, offset: i32, context: &T::Context) -> Result<T, Error>;
+    /// Applies the architecture-selected rotary position source.
+    fn forward(
+        &mut self,
+        input: &T,
+        position: RotaryPosition<'_, T>,
+        context: &T::Context,
+    ) -> Result<T, Error>;
+}
+
+/// Position data supplied to a backend-native rotary operator.
+#[derive(Debug)]
+pub enum RotaryPosition<'a, T> {
+    /// Ordinary contiguous sequence positions beginning at this offset.
+    Offset(i32),
+    /// Caller-provided cosine and sine tensors for explicit positions.
+    Embeddings {
+        /// Cosine values shaped for the input sequence and rotary dimensions.
+        cosine: &'a T,
+        /// Sine values shaped for the input sequence and rotary dimensions.
+        sine: &'a T,
+    },
+}
+
+impl<T> Copy for RotaryPosition<'_, T> {}
+
+impl<T> Clone for RotaryPosition<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+/// Architecture-selected scoring policy for routed experts.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RoutingScoring {
+    /// Apply softmax across all expert logits before selecting routes.
+    Softmax,
+}
+
+/// Backend-neutral top-k routing semantics.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TopKRoutingSpec {
+    expert_count: i32,
+    top_k: i32,
+    scoring: RoutingScoring,
+    normalize_selected: bool,
+}
+
+/// Construction specification for a learned top-k router projection.
+#[derive(Debug, Clone)]
+pub struct TopKRouterSpec {
+    /// Hidden width consumed by the router projection.
+    pub input_dimensions: i32,
+    /// Stable router projection parameter identity.
+    pub weight: ParameterSpec,
+    /// Optional physical encoding of the router projection.
+    pub quantization: Option<WeightQuantization>,
+    /// Architecture-selected scoring and selection semantics.
+    pub routing: TopKRoutingSpec,
+}
+
+impl TopKRouterSpec {
+    /// Validates positive input geometry.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.input_dimensions <= 0 {
+            return Err(Error::backend(format!(
+                "router input dimensions must be positive, got {}",
+                self.input_dimensions
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl TopKRoutingSpec {
+    /// Creates a validated routed-expert selection policy.
+    pub fn new(
+        expert_count: i32,
+        top_k: i32,
+        scoring: RoutingScoring,
+        normalize_selected: bool,
+    ) -> Result<Self, Error> {
+        if expert_count <= 0 {
+            return Err(Error::backend(format!(
+                "expert count must be positive, got {expert_count}"
+            )));
+        }
+        if top_k <= 0 || top_k > expert_count {
+            return Err(Error::backend(format!(
+                "top-k route count must be in 1..={expert_count}, got {top_k}"
+            )));
+        }
+        Ok(Self {
+            expert_count,
+            top_k,
+            scoring,
+            normalize_selected,
+        })
+    }
+
+    /// Returns the total number of routed experts.
+    pub const fn expert_count(self) -> i32 {
+        self.expert_count
+    }
+
+    /// Returns the number of selected experts per token.
+    pub const fn top_k(self) -> i32 {
+        self.top_k
+    }
+
+    /// Returns the score transformation applied before selection.
+    pub const fn scoring(self) -> RoutingScoring {
+        self.scoring
+    }
+
+    /// Returns whether selected scores are renormalized to sum to one.
+    pub const fn normalize_selected(self) -> bool {
+        self.normalize_selected
+    }
+}
+
+/// Backend-native result of one top-k route selection.
+#[derive(Debug, Clone)]
+pub struct RoutingResult<T> {
+    /// Selected expert IDs shaped `[..., top_k]`.
+    pub expert_ids: T,
+    /// Selected scores before optional top-k renormalization.
+    pub selected_scores: T,
+    /// Final normalized or unnormalized route weights.
+    pub route_weights: T,
+}
+
+/// Statically dispatched top-k router.
+pub trait RoutingOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
+    /// Selects expert IDs and route weights without host materialization.
+    fn route(&mut self, logits: &T, context: &T::Context) -> Result<RoutingResult<T>, Error>;
+}
+
+/// Parameter identities for one SwiGLU expert or one packed expert axis.
+#[derive(Debug, Clone)]
+pub struct SwiGluExpertParameters {
+    /// Gating projection weight.
+    pub gate: SwiGluExpertProjection,
+    /// Up projection weight.
+    pub up: SwiGluExpertProjection,
+    /// Down projection weight.
+    pub down: SwiGluExpertProjection,
+}
+
+/// One expert projection identity and optional physical encoding.
+#[derive(Debug, Clone)]
+pub struct SwiGluExpertProjection {
+    /// Stable logical parameter identity.
+    pub weight: ParameterSpec,
+    /// Optional physical checkpoint encoding.
+    pub quantization: Option<WeightQuantization>,
+}
+
+/// Logical parameter layout for a SwiGLU expert bank.
+#[derive(Debug, Clone)]
+pub enum SwiGluExpertLayout {
+    /// Fused gate/up and down tensors whose leading axis indexes experts.
+    Packed {
+        /// Concatenated gate/up projection.
+        gate_up: SwiGluExpertProjection,
+        /// Down projection.
+        down: SwiGluExpertProjection,
+    },
+    /// Independently materialized expert parameter triples in expert-ID order.
+    Independent(Vec<SwiGluExpertParameters>),
+}
+
+/// Complete architecture-owned construction specification for routed SwiGLU experts.
+#[derive(Debug, Clone)]
+pub struct SwiGluExpertBankSpec {
+    /// Number of routed experts.
+    pub expert_count: i32,
+    /// Input hidden width.
+    pub input_dimensions: i32,
+    /// Per-expert intermediate width.
+    pub intermediate_dimensions: i32,
+    /// Output hidden width.
+    pub output_dimensions: i32,
+    /// Stable logical parameter identities and storage organization.
+    pub layout: SwiGluExpertLayout,
+}
+
+impl SwiGluExpertBankSpec {
+    /// Validates positive geometry and exact independent-expert cardinality.
+    pub fn validate(&self) -> Result<(), Error> {
+        for (name, value) in [
+            ("expert_count", self.expert_count),
+            ("input_dimensions", self.input_dimensions),
+            ("intermediate_dimensions", self.intermediate_dimensions),
+            ("output_dimensions", self.output_dimensions),
+        ] {
+            if value <= 0 {
+                return Err(Error::backend(format!(
+                    "SwiGLU expert-bank {name} must be positive, got {value}"
+                )));
+            }
+        }
+        if let SwiGluExpertLayout::Independent(experts) = &self.layout {
+            let expected = usize::try_from(self.expert_count).map_err(Error::backend)?;
+            if experts.len() != expected {
+                return Err(Error::backend(format!(
+                    "independent SwiGLU bank has {} experts, expected {expected}",
+                    experts.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Statically dispatched routed SwiGLU expert bank.
+pub trait SwiGluExpertBankOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
+    /// Executes selected experts and combines their outputs by route weight.
+    fn forward_routed(
+        &mut self,
+        input: &T,
+        routes: &RoutingResult<T>,
+        context: &T::Context,
+    ) -> Result<T, Error>;
+}
+
+/// Neural backend extension for routed expert architectures.
+pub trait RoutedNeuralBackend: NeuralBackend {
+    /// Concrete top-k router.
+    type Router: RoutingOperator<Self::Tensor>;
+    /// Concrete packed or independently materialized expert bank.
+    type SwiGluExpertBank: SwiGluExpertBankOperator<Self::Tensor>;
+
+    /// Builds a router with architecture-selected top-k semantics.
+    fn top_k_router(
+        spec: TopKRouterSpec,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Router, Error>;
+
+    /// Builds a routed SwiGLU expert bank.
+    fn swiglu_expert_bank(
+        spec: SwiGluExpertBankSpec,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::SwiGluExpertBank, Error>;
 }
 
 /// Backend-native key/value cache operations required by attention.
@@ -704,6 +945,52 @@ impl<T: 'static, M: Parameterized<T>> Parameterized<T> for Option<M> {
         if let Some(module) = self {
             module.set_trainable(trainable);
         }
+    }
+}
+
+#[cfg(test)]
+mod routed_contract_tests {
+    use super::*;
+
+    fn parameters(prefix: &str) -> SwiGluExpertParameters {
+        SwiGluExpertParameters {
+            gate: SwiGluExpertProjection {
+                weight: ParameterSpec::trainable(format!("{prefix}.gate.weight")).unwrap(),
+                quantization: None,
+            },
+            up: SwiGluExpertProjection {
+                weight: ParameterSpec::trainable(format!("{prefix}.up.weight")).unwrap(),
+                quantization: None,
+            },
+            down: SwiGluExpertProjection {
+                weight: ParameterSpec::trainable(format!("{prefix}.down.weight")).unwrap(),
+                quantization: None,
+            },
+        }
+    }
+
+    #[test]
+    fn top_k_routing_policy_rejects_invalid_selection_counts() {
+        assert!(TopKRoutingSpec::new(8, 2, RoutingScoring::Softmax, true).is_ok());
+        assert!(TopKRoutingSpec::new(0, 1, RoutingScoring::Softmax, false).is_err());
+        assert!(TopKRoutingSpec::new(8, 9, RoutingScoring::Softmax, false).is_err());
+    }
+
+    #[test]
+    fn independent_expert_layout_requires_exact_cardinality() {
+        let valid = SwiGluExpertBankSpec {
+            expert_count: 2,
+            input_dimensions: 16,
+            intermediate_dimensions: 8,
+            output_dimensions: 16,
+            layout: SwiGluExpertLayout::Independent(vec![parameters("e0"), parameters("e1")]),
+        };
+        assert!(valid.validate().is_ok());
+        let invalid = SwiGluExpertBankSpec {
+            layout: SwiGluExpertLayout::Independent(vec![parameters("e0")]),
+            ..valid
+        };
+        assert!(invalid.validate().is_err());
     }
 }
 

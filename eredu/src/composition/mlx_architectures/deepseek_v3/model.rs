@@ -7,6 +7,7 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_nn::RopeValue;
+use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::{CausalModel, RuntimeLayerState, RuntimeState, StateError, StateLayout};
 
 use std::{collections::HashMap, path::Path};
@@ -52,7 +53,7 @@ use crate::{
         BlockwiseAttentionAccumulator, CompressedLatentCache, KeyValueAttentionBlock,
     },
     backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
-    backend::mlx::runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    backend::mlx::runtime::execution::inspection::MoeRoutingObservation,
     core::attention::LayerSchedule,
     core::cache::CacheRankIdentity,
 };
@@ -67,7 +68,7 @@ use crate::{
     },
 };
 use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
-type ObserverOption<'a> = Option<&'a mut dyn ActivationObserver>;
+type ObserverOption<'a> = Option<&'a mut dyn RuntimeActivationObserver<Array, Exception>>;
 
 fn activation_name(prefix: &str, suffix: &str) -> String {
     if suffix.is_empty() {
@@ -1740,7 +1741,7 @@ impl MultiHeadLatentAttention {
         cache: Option<&mut CompressedLatentCache>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut Option<&mut dyn ActivationObserver>,
+        observer: &mut Option<&mut dyn RuntimeActivationObserver<Array, Exception>>,
     ) -> Result<Array, Exception> {
         self.forward_impl(x, mask, cache, stream, prefix, observer)
     }
@@ -2328,19 +2329,19 @@ impl Moe {
         let combined = routed.add(&shared, stream)?;
         observe_activation(observer, prefix, "combined_flat", &combined)?;
         if let Some(observer) = observer.as_deref_mut() {
-            observer.observe_moe_routing(MoeRoutingObservation {
-                prefix,
+            observer.observe_routing(MoeRoutingObservation {
+                path: prefix,
                 selected_experts: &indices,
                 selected_scores: selected_scores
                     .as_ref()
                     .expect("observed routing scores initialized"),
-                routing_weights: &weights,
+                route_weights: &weights,
                 routed_output: &routed,
                 local_routed_output: None,
                 reduced_routed_output: Some(&routed),
                 shared_output: Some(&shared),
                 combined_output: Some(&combined),
-                num_experts: self.gate.num_experts,
+                expert_count: self.gate.num_experts,
             })?;
         }
         let output = combined.reshape(shape, stream)?;
@@ -2429,19 +2430,19 @@ impl Moe {
         let combined = returned.reduced_output.add(&shared, stream)?;
         observe_activation(&mut observer, prefix, "combined_flat", &combined)?;
         if let Some(observer) = observer {
-            observer.observe_moe_routing(MoeRoutingObservation {
-                prefix,
+            observer.observe_routing(MoeRoutingObservation {
+                path: prefix,
                 selected_experts: &indices,
                 selected_scores: selected_scores
                     .as_ref()
                     .expect("observed EP routing scores initialized"),
-                routing_weights: &weights,
+                route_weights: &weights,
                 routed_output: &returned.reduced_output,
                 local_routed_output: Some(&returned.local_output),
                 reduced_routed_output: Some(&returned.reduced_output),
                 shared_output: Some(&shared),
                 combined_output: Some(&combined),
-                num_experts: self.gate.num_experts,
+                expert_count: self.gate.num_experts,
             })?;
         }
         let output = combined.reshape(shape, stream)?;
@@ -2785,7 +2786,7 @@ impl DecoderLayer {
         cache: Option<&mut CompressedLatentCache>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut dyn ActivationObserver,
+        observer: &mut dyn RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let mut observer = Some(observer);
         self.forward_impl(x, mask, cache, stream, prefix, &mut observer)
@@ -3198,7 +3199,7 @@ impl Model {
         &mut self,
         input: ModelInput<'_>,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let mut observer: ObserverOption<'_> = Some(observer);
         self.forward_logits_impl(input, false, stream, &mut observer)

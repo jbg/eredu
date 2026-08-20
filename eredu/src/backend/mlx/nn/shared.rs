@@ -13,7 +13,9 @@ use eredu_nn::{
     validate_parameter_topology, AttentionCache, EmbeddingOperator, EmbeddingSpec,
     Error as ComputeError, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
     NormalizationSpec, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
-    Parameterized, RopeValue, RotaryOperator, RotarySpec,
+    Parameterized, RopeValue, RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend,
+    RoutingOperator, RoutingResult, RoutingScoring, SwiGluExpertBankOperator, SwiGluExpertBankSpec,
+    SwiGluExpertLayout, TopKRouterSpec,
 };
 use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
 use safemlx::{
@@ -651,14 +653,21 @@ impl RotaryOperator<Array> for MlxRotary {
     fn forward(
         &mut self,
         input: &Array,
-        offset: i32,
+        position: RotaryPosition<'_, Array>,
         context: &Stream,
     ) -> Result<Array, ComputeError> {
-        let rope_input = nn::RopeInputBuilder::new(input)
-            .offset(offset)
-            .build()
-            .map_err(ComputeError::backend)?;
-        compute(self.0.forward(rope_input, context))
+        match position {
+            RotaryPosition::Offset(offset) => {
+                let rope_input = nn::RopeInputBuilder::new(input)
+                    .offset(offset)
+                    .build()
+                    .map_err(ComputeError::backend)?;
+                compute(self.0.forward(rope_input, context))
+            }
+            RotaryPosition::Embeddings { cosine, sine } => compute(
+                common::attention::apply_rotary_embeddings(input, cosine, sine, context),
+            ),
+        }
     }
 }
 
@@ -674,6 +683,107 @@ impl Parameterized<Array> for MlxRotary {
     {
     }
     fn set_trainable(&mut self, _trainable: bool) {}
+}
+
+/// MLX implementation of the backend-neutral learned top-k router.
+#[derive(Debug, Clone)]
+pub struct MlxTopKRouter {
+    module: MlxNamedModule<common::moe::TopKRouter>,
+}
+
+impl Parameterized<Array> for MlxTopKRouter {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, Array>,
+    {
+        self.module.visit_parameters(visitor);
+    }
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, Array>,
+    {
+        self.module.visit_parameters_mut(visitor);
+    }
+    fn set_trainable(&mut self, trainable: bool) {
+        self.module.set_trainable(trainable);
+    }
+}
+
+impl RoutingOperator<Array> for MlxTopKRouter {
+    fn route(
+        &mut self,
+        input: &Array,
+        context: &Stream,
+    ) -> Result<RoutingResult<Array>, ComputeError> {
+        let output = compute(
+            self.module
+                .forward_routes_with_selection_bias(input, None, context),
+        )?;
+        Ok(RoutingResult {
+            expert_ids: output.indices,
+            selected_scores: output.scores,
+            route_weights: output.weights,
+        })
+    }
+}
+
+/// MLX packed execution bank for backend-neutral routed SwiGLU experts.
+#[derive(Debug, Clone)]
+pub struct MlxSwiGluExpertBank {
+    module: MlxParameterTree<common::moe::PackedSwiGluExperts>,
+}
+
+impl Parameterized<Array> for MlxSwiGluExpertBank {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, Array>,
+    {
+        self.module.visit_parameters(visitor);
+    }
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, Array>,
+    {
+        self.module.visit_parameters_mut(visitor);
+    }
+    fn set_trainable(&mut self, trainable: bool) {
+        self.module.set_trainable(trainable);
+    }
+}
+
+impl SwiGluExpertBankOperator<Array> for MlxSwiGluExpertBank {
+    fn forward_routed(
+        &mut self,
+        input: &Array,
+        routes: &RoutingResult<Array>,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
+        let output = compute(self.module.forward(
+            &flattened,
+            &routes.expert_ids,
+            &routes.route_weights,
+            context,
+        ))?;
+        compute(output.reshape(input.shape(), context))
+    }
+}
+
+impl crate::backend::mlx::runtime::distributed::expert::LocalExpertBank for MlxSwiGluExpertBank {
+    fn execute_local_routes(
+        &mut self,
+        hidden: &Array,
+        local_expert_ids: &Array,
+        stream: &Stream,
+    ) -> Result<Array, crate::backend::mlx::error::Error> {
+        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
+        let weights = crate::backend::mlx::runtime::distributed::expert::unit_route_weights(
+            hidden.dim(0),
+            hidden.dtype(),
+            stream,
+        )?;
+        Ok(self.module.forward(hidden, &ids, &weights, stream)?)
+    }
 }
 
 /// Zero-sized MLX backend selector. All calls are statically dispatched.
@@ -1023,6 +1133,80 @@ impl NeuralBackend for MlxBackend {
             parallel,
             context,
         ))
+    }
+}
+
+impl RoutedNeuralBackend for MlxBackend {
+    type Router = MlxTopKRouter;
+    type SwiGluExpertBank = MlxSwiGluExpertBank;
+
+    fn top_k_router(spec: TopKRouterSpec, context: &Stream) -> Result<Self::Router, ComputeError> {
+        spec.validate()?;
+        let score_function = match spec.routing.scoring() {
+            RoutingScoring::Softmax => common::moe::TopKRouterScoreFunction::Softmax,
+        };
+        let module = compute(common::moe::TopKRouter::new_with_quantization(
+            common::moe::TopKRouterConfig {
+                top_k: spec.routing.top_k(),
+                num_experts: spec.routing.expert_count(),
+                hidden_size: spec.input_dimensions,
+                score_function,
+                norm_topk_prob: spec.routing.normalize_selected(),
+                normalization_epsilon: 0.0,
+                routed_scaling_factor: 1.0,
+                n_group: 1,
+                topk_group: 1,
+                score_correction_bias: false,
+            },
+            spec.quantization,
+            context,
+        ))?;
+        Ok(MlxTopKRouter {
+            module: MlxNamedModule::new(module, spec.weight, None)?,
+        })
+    }
+
+    fn swiglu_expert_bank(
+        spec: SwiGluExpertBankSpec,
+        context: &Stream,
+    ) -> Result<Self::SwiGluExpertBank, ComputeError> {
+        spec.validate()?;
+        if spec.input_dimensions != spec.output_dimensions {
+            return Err(ComputeError::backend(
+                "MLX packed SwiGLU experts require equal input and output dimensions",
+            ));
+        }
+        let SwiGluExpertLayout::Packed { gate_up, down } = spec.layout else {
+            return Err(ComputeError::backend(
+                "independent expert units must be acquired through a runtime expert provider",
+            ));
+        };
+        let prefix = gate_up
+            .weight
+            .id
+            .as_str()
+            .strip_suffix(".gate_up_proj")
+            .ok_or_else(|| {
+                ComputeError::backend("packed gate/up identity must end in .gate_up_proj")
+            })?;
+        let expected_down = format!("{prefix}.down_proj");
+        if down.weight.id.as_str() != expected_down {
+            return Err(ComputeError::backend(format!(
+                "packed down identity {:?} does not match {expected_down:?}",
+                down.weight.id.as_str()
+            )));
+        }
+        let module = compute(common::moe::PackedSwiGluExperts::new(
+            spec.expert_count,
+            spec.input_dimensions,
+            spec.intermediate_dimensions,
+            gate_up.quantization,
+            down.quantization,
+            context,
+        ))?;
+        Ok(MlxSwiGluExpertBank {
+            module: MlxParameterTree::new(module, prefix)?,
+        })
     }
 }
 

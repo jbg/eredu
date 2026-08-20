@@ -3,7 +3,7 @@
 //! Checkpoints store E4M3 bytes together with one inverse scale per 128x128
 //! weight block. Conventional dense and routed-expert projections dynamically
 //! quantize each 128-value activation block to E4M3 using the checkpoint's
-//! declared DeepSeek/Qwen FP8 execution scheme. GPU operations consume both
+//! declared block-scaled FP8 execution scheme. GPU operations consume both
 //! packed representations directly, including rank-3 expert banks, without
 //! expanding a complete weight bank. CPU execution uses a deliberately slow
 //! dequantized reference path for correctness tests and functional fallback.
@@ -68,7 +68,7 @@ fn ceil_div(lhs: i32, rhs: i32) -> i32 {
 }
 
 /// Decodes native unsigned E8M0 scale bytes without expanding FP8 weights.
-/// Float scale tensors are returned unchanged, allowing Qwen-style F16, BF16,
+/// Float scale tensors are returned unchanged, allowing F16, BF16,
 /// or F32 inverse scales and DeepSeek-V4 native scales to share every execution
 /// kernel.
 pub fn decode_scale(scale: &Array, stream: &Stream) -> Result<Array, Exception> {
@@ -1695,7 +1695,7 @@ mod tests {
             8.0
         );
 
-        // Official Qwen3.8 FP8 checkpoints store inverse block scales as
+        // Some block-FP8 checkpoints store inverse block scales as
         // BF16. Keep them in their checkpoint dtype through the custom kernel
         // instead of requiring a separate conversion at every projection.
         let bf16_scale = scale.as_dtype(Dtype::Bfloat16, stream).unwrap();

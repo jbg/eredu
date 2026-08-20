@@ -6,10 +6,7 @@ use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
 use serde_json::Value;
 
 use super::{model, vision::VisionConfig};
-use crate::{
-    backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
-    composition::mlx_architectures::qwen::dense::{self, checkpoint as dense_checkpoint},
-};
+use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
 use eredu_checkpoint::schema::{
     CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
     SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
@@ -24,14 +21,17 @@ pub(crate) enum GgufVariant {
     Moe,
 }
 
-impl GgufVariant {
-    const fn metadata_name(self) -> &'static str {
-        match self {
-            Self::Dense => "qwen3vl",
-            Self::Moe => "qwen3vlmoe",
-        }
-    }
+struct Qwen3VlGgufCatalog<'a>(&'a GgufCheckpoint);
 
+impl eredu_architectures::qwen::GgufTensorCatalog for Qwen3VlGgufCatalog<'_> {
+    fn contains(&self, name: &str) -> bool {
+        crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames::contains_gguf_tensor(
+            self.0, name,
+        )
+    }
+}
+
+impl GgufVariant {
     const fn is_moe(self) -> bool {
         matches!(self, Self::Moe)
     }
@@ -76,7 +76,7 @@ pub(crate) fn safetensors_plan(
     args: &model::ModelArgs,
     allow_derived_expert_layouts: bool,
 ) -> Result<SafetensorsCheckpointPlan, String> {
-    let text = dense_checkpoint::safetensors_plan_with_root(
+    let text = eredu_architectures::qwen::safetensors_plan_with_root(
         &args.text_config,
         "model.language_model",
         allow_derived_expert_layouts,
@@ -190,17 +190,20 @@ pub(crate) fn validate_gguf(
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> CheckpointValidation {
     let is_moe = variant.is_moe();
-    if let Err(error) = checkpoint
-        .catalog()
-        .translated_outputs(|name| dense::translate_gguf_weight_name(name, is_moe))
-    {
+    if let Err(error) = checkpoint.catalog().translated_outputs(|name| {
+        eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe)
+    }) {
         return conflict(error.to_string());
     }
-    let args = match dense::config_from_gguf_catalog(
-        checkpoint,
+    let context = if is_moe {
+        eredu_architectures::qwen::TextConfigContext::Qwen3VlMoe
+    } else {
+        eredu_architectures::qwen::TextConfigContext::Qwen3Vl
+    };
+    let args = match eredu_architectures::qwen::model_args_from_gguf_catalog_with_context(
+        &Qwen3VlGgufCatalog(checkpoint),
         metadata,
-        variant.metadata_name(),
-        is_moe,
+        context,
     ) {
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
@@ -208,19 +211,14 @@ pub(crate) fn validate_gguf(
     if let Err(error) = model::validate_qwen3_vl_text_gguf_catalog(&args, metadata) {
         return invalid_geometry(error.to_string());
     }
-    let dense_variant = if is_moe {
-        dense_checkpoint::GgufVariant::Qwen3Moe
-    } else {
-        dense_checkpoint::GgufVariant::Qwen3
-    };
-    let dense_plan = match dense_checkpoint::gguf_plan(&args, dense_variant) {
+    let text_plan = match eredu_architectures::qwen::gguf_plan(&args) {
         Ok(plan) => plan,
         Err(error) => return invalid_geometry(error),
     };
     let plan = match GgufCheckpointPlan::new(
         "Qwen3-VL text GGUF",
-        dense_plan.common_tensors,
-        dense_plan.layout_groups,
+        text_plan.common_tensors,
+        text_plan.layout_groups,
         CatalogPolicy::strict(),
     ) {
         Ok(plan) => plan,
@@ -248,9 +246,9 @@ pub(crate) fn validate_projector_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> CheckpointValidation {
-    let architecture = match dense::gguf_string(model_metadata, "general.architecture") {
-        Ok(architecture) => architecture,
-        Err(error) => return invalid_geometry(error.to_string()),
+    let architecture = match model_metadata.get("general.architecture") {
+        Some(GgufMetadataValue::String(architecture)) => architecture.clone(),
+        _ => return invalid_geometry("GGUF general.architecture must be a string".into()),
     };
     let is_moe = architecture == "qwen3vlmoe";
     if architecture != "qwen3vl" && !is_moe {
@@ -258,11 +256,15 @@ pub(crate) fn validate_projector_gguf(
             "Qwen3-VL projector requires qwen3vl or qwen3vlmoe text, got {architecture:?}"
         ));
     }
-    let text_args = match dense::config_from_gguf_catalog(
-        model_checkpoint,
+    let context = if is_moe {
+        eredu_architectures::qwen::TextConfigContext::Qwen3VlMoe
+    } else {
+        eredu_architectures::qwen::TextConfigContext::Qwen3Vl
+    };
+    let text_args = match eredu_architectures::qwen::model_args_from_gguf_catalog_with_context(
+        &Qwen3VlGgufCatalog(model_checkpoint),
         model_metadata,
-        &architecture,
-        is_moe,
+        context,
     ) {
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),

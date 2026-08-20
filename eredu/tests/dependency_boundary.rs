@@ -101,6 +101,104 @@ fn mlx_backend_contains_no_llama_knowledge() {
 }
 
 #[test]
+fn qwen_neutral_cutover_has_no_legacy_or_backend_model_knowledge() {
+    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_root.parent().expect("workspace root");
+    for deleted in [
+        "eredu/src/composition/mlx_architectures/qwen/dense.rs",
+        "eredu/src/composition/mlx_architectures/qwen/dense",
+    ] {
+        assert!(
+            !workspace.join(deleted).exists(),
+            "legacy Qwen implementation still exists at {deleted}"
+        );
+    }
+
+    let mut sources = Vec::new();
+    rust_sources(&workspace.join("eredu/src"), &mut sources);
+    for source in sources {
+        let text = std::fs::read_to_string(&source).expect("Rust source must be readable");
+        for forbidden in [
+            concat!("mlx_architectures::qwen", "::dense"),
+            concat!("qwen", "::dense"),
+            concat!("Dense", "Qwen", "Layerwise", "Adapter"),
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "legacy Qwen dependency {forbidden:?} remains in {source:?}"
+            );
+        }
+    }
+
+    for relative in [
+        "src/backend/mlx/nn",
+        "src/backend/mlx/runtime/checkpoint",
+        "src/backend/mlx/runtime/execution",
+        "src/backend/mlx/runtime/distributed",
+        "src/backend/mlx/runtime/residency",
+    ] {
+        let mut backend_sources = Vec::new();
+        rust_sources(&crate_root.join(relative), &mut backend_sources);
+        for source in backend_sources {
+            let text = std::fs::read_to_string(&source).expect("MLX source must be readable");
+            assert!(
+                !text.to_ascii_lowercase().contains("qwen"),
+                "Qwen model semantics leaked into backend implementation {source:?}"
+            );
+        }
+    }
+
+    let pipeline = std::fs::read_to_string(
+        crate_root.join("src/composition/mlx_architectures/distributed/pipeline.rs"),
+    )
+    .expect("distributed pipeline source must be readable");
+    assert!(!pipeline.contains("struct QwenStage"));
+    assert!(pipeline.contains("type QwenStage = NeutralDecoderStage"));
+
+    for relative in [
+        "src/composition/qwen.rs",
+        "src/composition/mlx_architectures/qwen/vl/layerwise.rs",
+        "src/composition/mlx_architectures/distributed/pipeline.rs",
+    ] {
+        let source = std::fs::read_to_string(crate_root.join(relative))
+            .expect("Qwen composition source must be readable");
+        assert!(
+            !source.contains(".router.route("),
+            "Qwen composition bypassed the routed-expert provider in {relative}"
+        );
+    }
+
+    let expert_composition =
+        std::fs::read_to_string(crate_root.join("src/composition/qwen_expert.rs"))
+            .expect("Qwen expert composition source must be readable");
+    for removed_provider in [
+        "struct CachedQwenExpertProvider",
+        "struct QwenExpertExecutorProvider",
+        "struct QwenResidentExpertExecutorProvider",
+    ] {
+        assert!(
+            !expert_composition.contains(removed_provider),
+            "Qwen composition still owns backend provider {removed_provider:?}"
+        );
+    }
+    assert!(expert_composition.contains("CachedSwiGluExpertProvider"));
+
+    let inspection =
+        std::fs::read_to_string(crate_root.join("src/backend/mlx/runtime/execution/inspection.rs"))
+            .expect("MLX inspection utilities must be readable");
+    for duplicate in [
+        "pub trait ActivationObserver",
+        "pub struct MoeRoutingObservation",
+    ] {
+        assert!(
+            !inspection.contains(duplicate),
+            "MLX redefined neutral inspection contract {duplicate:?}"
+        );
+    }
+    assert!(inspection.contains("pub use eredu_runtime::{NoopObserver, RoutingObservation"));
+}
+
+#[test]
 fn moshi_composition_uses_the_neutral_layered_runtime() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let source =

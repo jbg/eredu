@@ -146,7 +146,7 @@ fn main() -> anyhow::Result<()> {
     let model_family = if model_type.contains("deepseek") {
         "deepseek_v3"
     } else if model_type.contains("qwen") {
-        "dense_qwen"
+        "qwen"
     } else if model_type.contains("gpt_oss") {
         "gpt_oss"
     } else {

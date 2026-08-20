@@ -120,7 +120,7 @@ fn all_included_field_types(data: &Data) -> syn::Result<Vec<&Type>> {
             .collect(),
         Data::Union(data) => {
             return Err(syn::Error::new_spanned(
-                &data.union_token,
+                data.union_token,
                 "Parameterized cannot be derived for unions",
             ))
         }
@@ -173,7 +173,7 @@ fn traversal(data: &Data, traversal: Traversal) -> syn::Result<proc_macro2::Toke
             Ok(quote! { match self { #(#arms),* } })
         }
         Data::Union(data) => Err(syn::Error::new_spanned(
-            &data.union_token,
+            data.union_token,
             "Parameterized cannot be derived for unions",
         )),
     }

@@ -798,7 +798,7 @@ impl MuseGlimmerExecution {
         input: MuseGlimmerAdapterInput<'_>,
         cache: &mut MuseGlimmerLayerwiseCache,
         stream: &Stream,
-        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     ) -> Result<Array, Error> {
         let mut observer =
             crate::backend::mlx::runtime::execution::inspection::ActivationObserverProxy(observer);
@@ -1191,7 +1191,7 @@ impl LayerwiseDecoder {
         mask: Option<&Array>,
         cache: &mut Vec<Option<ConcatKeyValueCache>>,
         stream: &Stream,
-        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     ) -> Result<Array, Error> {
         let mut owned =
             MuseGlimmerLayerwiseCache::concat(self.state_layout()?, std::mem::take(cache));
@@ -1215,7 +1215,7 @@ impl LayerwiseDecoder {
         mask: Option<&Array>,
         cache: &mut Vec<Option<PagedKeyValueCache>>,
         stream: &Stream,
-        observer: &mut dyn crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+        observer: &mut dyn eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     ) -> Result<Array, Error> {
         let mut owned =
             MuseGlimmerLayerwiseCache::paged(self.state_layout()?, std::mem::take(cache));
@@ -3504,7 +3504,7 @@ impl MuseGlimmerLayerwiseAdapter {
     }
 
     pub(crate) fn forward_layer_with_observer<
-        O: crate::backend::mlx::runtime::execution::inspection::ActivationObserver,
+        O: eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>,
     >(
         &mut self,
         group: usize,

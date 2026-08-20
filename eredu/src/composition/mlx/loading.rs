@@ -194,17 +194,15 @@ fn materialize_gguf_model(
             (Model::NemotronH(loaded), eos_token_ids)
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-            let (loaded, eos_token_ids) =
-                crate::composition::mlx_architectures::qwen::dense::layerwise::load_gguf_checkpoint(
-                    &checkpoint,
-                    &metadata,
-                    gguf_architecture.metadata_name(),
-                    options.weight_residency,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
-            (Model::DenseQwen(loaded), eos_token_ids)
+            let (loaded, eos_token_ids) = crate::composition::qwen::load_qwen_gguf_model(
+                &checkpoint,
+                &metadata,
+                options.weight_residency,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
+            (Model::Qwen(loaded), eos_token_ids)
         }
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
@@ -491,8 +489,8 @@ fn materialize_tensor_parallel(
                 weights_stream,
             )?,
         )),
-        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwen(
-            crate::composition::mlx_architectures::qwen::dense::layerwise::load_tensor_parallel_model(
+        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::Qwen(
+            crate::composition::qwen::load_qwen_tensor_parallel_model(
                 path,
                 execution,
                 build,
@@ -748,17 +746,15 @@ fn materialize_gguf_tensor_parallel(
             Ok((Model::NemotronH(model), eos))
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-            let (model, eos) =
-                crate::composition::mlx_architectures::qwen::dense::layerwise::load_gguf_tensor_parallel_model(
-                    checkpoint,
-                    metadata,
-                    architecture.metadata_name(),
-                    residency,
-                    build,
-                    stream,
-                    weights_stream,
-                )?;
-            Ok((Model::DenseQwen(model), eos))
+            let (model, eos) = crate::composition::qwen::load_qwen_gguf_tensor_parallel_model(
+                checkpoint,
+                metadata,
+                residency,
+                build,
+                stream,
+                weights_stream,
+            )?;
+            Ok((Model::Qwen(model), eos))
         }
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             let vision_path = qwen3_vl::find_qwen3_vl_mmproj(gguf_path)?;
@@ -890,9 +886,13 @@ pub(super) fn materialize_safetensors(
             ModelKind::Qwen2 => Err(Error::UnsupportedArchitecture(
                 "Qwen2 is dense and does not support sparse expert-cache residency".into(),
             )),
-            ModelKind::Qwen3 => Ok(Model::DenseQwen(
-                crate::composition::mlx_architectures::qwen::dense::layerwise::load_qwen3_expert_cache_model(
-                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
+            ModelKind::Qwen3 => Ok(Model::Qwen(
+                crate::composition::qwen::load_qwen_safetensors_mlx(
+                    model_dir,
+                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    options.quantization,
+                    stream,
+                    weights_stream,
                 )?,
             )),
             ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
@@ -986,10 +986,10 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )),
-        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwen(
-            crate::composition::mlx_architectures::qwen::dense::layerwise::load_safetensors(
+        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::Qwen(
+            crate::composition::qwen::load_qwen_safetensors_mlx(
                 model_dir,
-                execution,
+                eredu_runtime::WeightResidency::with_layers(execution),
                 options.quantization,
                 stream,
                 weights_stream,

@@ -10,3 +10,7 @@ pub(crate) mod llama_mlx;
 pub mod mlx;
 #[cfg(feature = "mlx")]
 pub mod mlx_architectures;
+#[cfg(feature = "mlx")]
+pub(crate) mod qwen;
+#[cfg(feature = "mlx")]
+pub(crate) mod qwen_expert;

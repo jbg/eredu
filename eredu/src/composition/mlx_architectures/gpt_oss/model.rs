@@ -39,9 +39,10 @@ use crate::{
     },
     backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
     backend::mlx::runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
-    backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames},
+    backend::mlx::runtime::checkpoint::load::{
+        gguf_quantization_configs, gguf_string, GgufTensorNames,
+    },
     backend::mlx::runtime::media::input,
-    composition::mlx_architectures::qwen::dense::gguf_string,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::CacheRankIdentity,
 };

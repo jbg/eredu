@@ -2,6 +2,7 @@
 
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_nn::RopeValue;
+use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::{CausalModel, RuntimeState, StateError, StateLayout};
 
 use std::{
@@ -74,7 +75,6 @@ use crate::{
     backend::mlx::runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, GgufTensorNames,
     },
-    backend::mlx::runtime::execution::inspection::ActivationObserver,
     backend::mlx::runtime::media::input,
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
@@ -1662,7 +1662,7 @@ impl Attention {
         input: AttentionInput<'_, C>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache,
@@ -1916,7 +1916,7 @@ impl Mlp {
         input: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(input, stream)?;
         observer.observe(&format!("{prefix}.gate_proj"), &gate)?;
@@ -3198,7 +3198,7 @@ impl TransformerBlock {
         input: AttentionInput<'_, C>,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache,
@@ -3642,7 +3642,7 @@ impl Gemma4TextModel {
         input_ids: &Array,
         inputs_embeds: &Array,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Option<Array>, Exception> {
         let Some(embed_tokens_per_layer) = self.embed_tokens_per_layer.as_mut() else {
             return Ok(None);
@@ -3805,7 +3805,7 @@ impl Gemma4TextModel {
         &mut self,
         input: ModelInput<'_, C>,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache + Default,
@@ -4297,7 +4297,7 @@ impl Model {
         &mut self,
         input: ModelInput<'_, C>,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache + Default,

@@ -6,7 +6,124 @@ use std::collections::BTreeSet;
 
 use eredu_gguf::GgmlType as GgufType;
 
-use crate::StoredDtype;
+use crate::{StoredDtype, WeightQuantization};
+
+/// Invalid matrix-plus-quantization-companion geometry.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum MatrixConstraintError {
+    /// Matrix shape has no input dimension.
+    #[error("quantized matrix {name:?} has scalar shape")]
+    Scalar { name: String },
+    /// Packing or companion geometry is incompatible.
+    #[error("{detail}")]
+    Invalid { detail: String },
+}
+
+/// Builds a floating matrix constraint or its affine packed weight companions.
+///
+/// This helper is family-neutral: callers provide canonical names, aliases,
+/// logical shape, and the selected physical encoding.
+pub fn matrix_with_optional_quantization(
+    name: impl Into<String>,
+    aliases: impl IntoIterator<Item = impl Into<String>>,
+    shape: Vec<usize>,
+    quantization: Option<WeightQuantization>,
+) -> Result<Vec<SafetensorsTensorConstraint>, MatrixConstraintError> {
+    let name = name.into();
+    let aliases = aliases.into_iter().map(Into::into).collect::<Vec<String>>();
+    let Some(quantization) = quantization else {
+        return Ok(vec![SafetensorsTensorConstraint::required(
+            name,
+            shape,
+            StoredDtypeConstraint::Floating,
+        )
+        .with_aliases(aliases)]);
+    };
+    let input = *shape
+        .last()
+        .ok_or_else(|| MatrixConstraintError::Scalar { name: name.clone() })?;
+    let bits =
+        usize::try_from(quantization.bits()).map_err(|_| MatrixConstraintError::Invalid {
+            detail: format!("quantization bit width for {name:?} exceeds usize"),
+        })?;
+    let group =
+        usize::try_from(quantization.group_size()).map_err(|_| MatrixConstraintError::Invalid {
+            detail: format!("quantization group size for {name:?} exceeds usize"),
+        })?;
+    let packed_bits = input
+        .checked_mul(bits)
+        .ok_or_else(|| MatrixConstraintError::Invalid {
+            detail: format!("quantized matrix {name:?} packing geometry overflows"),
+        })?;
+    if group == 0
+        || !input.is_multiple_of(group)
+        || !input.is_multiple_of(32)
+        || !packed_bits.is_multiple_of(32)
+    {
+        return Err(MatrixConstraintError::Invalid {
+            detail: format!(
+                "quantized matrix {name:?} input dimension {input} is incompatible with group size {group} and {bits}-bit packing"
+            ),
+        });
+    }
+    let mut packed = shape.clone();
+    *packed.last_mut().expect("matrix shape") = packed_bits / 32;
+    let mut companion = shape;
+    *companion.last_mut().expect("matrix shape") = input / group;
+    let prefix = name.strip_suffix(".weight").unwrap_or(&name).to_string();
+    let weight_aliases = aliases
+        .iter()
+        .cloned()
+        .chain(
+            name.strip_suffix(".weight")
+                .map(|prefix| format!("{prefix}.inner.weight")),
+        )
+        .collect::<Vec<_>>();
+    let companion_dtype = || {
+        StoredDtypeConstraint::OneOf(vec![
+            StoredDtype::F16,
+            StoredDtype::BF16,
+            StoredDtype::F32,
+            StoredDtype::U8,
+        ])
+    };
+    let companion_alias = |component: &str| {
+        aliases
+            .iter()
+            .map(|alias| {
+                let prefix = alias.strip_suffix(".weight").unwrap_or(alias);
+                format!("{prefix}.{component}")
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut constraints = vec![SafetensorsTensorConstraint::required(
+        name,
+        packed,
+        StoredDtypeConstraint::Exact(StoredDtype::U32),
+    )
+    .with_aliases(weight_aliases)];
+    constraints.push(
+        SafetensorsTensorConstraint::required(
+            format!("{prefix}.scales"),
+            companion.clone(),
+            companion_dtype(),
+        )
+        .with_aliases(companion_alias("scales"))
+        .companion(),
+    );
+    if quantization.has_biases() {
+        constraints.push(
+            SafetensorsTensorConstraint::required(
+                format!("{prefix}.biases"),
+                companion,
+                companion_dtype(),
+            )
+            .with_aliases(companion_alias("biases"))
+            .companion(),
+        );
+    }
+    Ok(constraints)
+}
 
 /// Whether a physical tensor must be present in the selected layout.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -379,8 +496,8 @@ impl PhysicalConstraint for GgufTensorConstraint {
 
 fn normalize_plan<T: PhysicalConstraint>(
     identity: &str,
-    common: &mut Vec<T>,
-    groups: &mut Vec<AlternativeLayoutGroup<T>>,
+    common: &mut [T],
+    groups: &mut [AlternativeLayoutGroup<T>],
     policy: &mut CatalogPolicy,
 ) -> Result<(), CheckpointPlanError> {
     if identity.trim().is_empty() {

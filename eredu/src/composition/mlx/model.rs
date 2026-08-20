@@ -14,7 +14,6 @@ use safemlx::{error::Exception, Array, Stream};
 
 use crate::backend::mlx::error::Error;
 use crate::backend::mlx::runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache};
-use crate::backend::mlx::runtime::execution::inspection::ActivationObserver;
 use crate::backend::mlx::runtime::generation::sampler::SpeculativeSampler;
 use crate::backend::mlx::runtime::media::input;
 use crate::composition::mlx::speculative::{MlxDrafter, MtpExecutionStreams};
@@ -30,12 +29,12 @@ use crate::composition::mlx_architectures::{
     muse_glimmer,
     nemotron_h::model as nemotron_h,
     qwen::{
-        dense as dense_qwen,
         hybrid::{qwen3_5, qwen3_next},
         vl::{model as qwen3_vl, moe as qwen3_vl_moe},
     },
 };
 use crate::{LayerCachePolicy, LayerSchedule};
+use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::CacheResidencyReport;
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
@@ -73,8 +72,8 @@ pub enum Model {
     NemotronH(
         crate::composition::mlx_architectures::nemotron_h::layerwise::NemotronHLayerwiseModel,
     ),
-    /// Dense Qwen2/Qwen2.5/Qwen3 model.
-    DenseQwen(crate::composition::mlx_architectures::qwen::dense::layerwise::LayerwiseDecoder),
+    /// Neutral Qwen2/Qwen2.5/Qwen3/Qwen3-MoE model.
+    Qwen(crate::composition::qwen::QwenModel),
     /// Qwen3-Next model.
     Qwen3Next(
         crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel,
@@ -101,7 +100,7 @@ impl Model {
             Self::DeepSeekV3(model) => model.parallel_info(),
             Self::DeepSeekV4(_) | Self::DeepSeekV4Layerwise(_) => None,
             Self::GptOss(model) => model.parallel_info(),
-            Self::DenseQwen(model) => model.parallel_info(),
+            Self::Qwen(model) => model.parallel_info(),
             Self::KimiLinear(model) => model.parallel_info(),
             Self::Lfm2(model) => model.parallel_info(),
             Self::NemotronH(model) => model.parallel_info(),
@@ -667,7 +666,7 @@ impl Model {
             Self::Lfm2(model) => Ok(Some(model.residency_report()?)),
             Self::NemotronH(model) => Ok(Some(model.residency_report()?)),
             Self::Qwen3Next(model) | Self::Qwen35(model) => Ok(Some(model.residency_report()?)),
-            Self::DenseQwen(model) => Ok(Some(model.residency_report()?)),
+            Self::Qwen(model) => model.residency_report(),
             Self::MuseGlimmer(model) => Ok(Some(model.residency_report()?)),
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => Ok(Some(model.residency_report()?)),
         }
@@ -689,7 +688,7 @@ impl Model {
             Self::Lfm2(model) => model.dense_stream_report(),
             Self::NemotronH(model) => model.dense_stream_report(),
             Self::Qwen3Next(model) | Self::Qwen35(model) => model.dense_stream_report(),
-            Self::DenseQwen(model) => model.dense_stream_report(),
+            Self::Qwen(model) => model.dense_stream_report(),
             Self::MuseGlimmer(model) => model.dense_stream_report(),
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => model.dense_stream_report(),
         }
@@ -711,7 +710,7 @@ impl Model {
             Self::Inkling(model) => model.expert_cache_report(),
             Self::Lfm2(model) => model.expert_cache_report(),
             Self::NemotronH(model) => model.expert_cache_report(),
-            Self::DenseQwen(model) => model.expert_cache_report(),
+            Self::Qwen(model) => model.expert_cache_report(),
             Self::Qwen3Next(model) | Self::Qwen35(model) => model.expert_cache_report(),
             Self::Qwen3VlMoe(model) => model.expert_cache_report(),
             _ => Ok(None),
@@ -731,7 +730,7 @@ impl Model {
             Self::Llama(model) => &model.args().model_type,
             Self::Lfm2(model) => &model.args().model_type,
             Self::NemotronH(model) => &model.args().model_type,
-            Self::DenseQwen(model) => &model.args().model_type,
+            Self::Qwen(model) => &model.args().model_type,
             Self::MuseGlimmer(model) => &model.args().model_type,
             Self::Qwen3Next(model) => &model.args().model_type,
             Self::Qwen3Vl(model) => model.model_type(),
@@ -771,9 +770,7 @@ impl Model {
                 model.args(),
             )),
             Self::Lfm2(model) => Ok(lfm2::prompt_cache_architecture_fingerprint(model.args())),
-            Self::DenseQwen(model) => Ok(dense_qwen::prompt_cache_architecture_fingerprint(
-                model.args(),
-            )),
+            Self::Qwen(model) => Ok(model.prompt_cache_architecture_fingerprint()),
             Self::MuseGlimmer(model) => Ok(muse_glimmer::prompt_cache_architecture_fingerprint(
                 model.args(),
             )),
@@ -797,7 +794,7 @@ impl Model {
             Self::DeepSeekV4(model) => model.prompt_cache_layer_layout(),
             Self::DeepSeekV4Layerwise(model) => model.prompt_cache_layer_layout(),
             Self::GptOss(model) => model.prompt_cache_layer_layout(),
-            Self::DenseQwen(model) => model.prompt_cache_layer_layout(),
+            Self::Qwen(model) => model.prompt_cache_layer_layout(),
             Self::MuseGlimmer(model) => model.prompt_cache_layer_layout(),
             Self::KimiLinear(model) => model.prompt_cache_layer_layout(),
             Self::Lfm2(model) => model.prompt_cache_layer_layout(),
@@ -836,7 +833,7 @@ impl Model {
         mask: Option<&Array>,
         cache: &mut ModelCache,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
         crate::backend::mlx::MlxModelSession::forward_with_observer(
             self,
@@ -855,7 +852,7 @@ impl Model {
         input: input::ModelInput<'_>,
         cache: &mut ModelCache,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<eredu_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
         crate::backend::mlx::MlxModelSession::submit_complete_prefill_with_observer(
             self,
@@ -886,7 +883,7 @@ impl Model {
             Self::KimiLinear(model) => ModelCache::KimiLinear(model.new_cache()),
             Self::Llama(model) => ModelCache::Llama(model.new_cache()),
             Self::Lfm2(model) => ModelCache::Lfm2(model.new_cache()),
-            Self::DenseQwen(model) => ModelCache::KeyValue(model.new_cache()),
+            Self::Qwen(model) => ModelCache::Qwen(model.new_cache()),
             Self::MuseGlimmer(model) => ModelCache::KeyValue(model.new_cache()),
             Self::Qwen3Next(model) => ModelCache::Qwen3Next(model.new_cache()),
             Self::Qwen3Vl(model) => ModelCache::Qwen3Vl(model.new_cache()),
@@ -928,14 +925,9 @@ impl Model {
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ModelCache::GptOss)
                     .map_err(|error| Exception::custom(error.to_string())),
-                Self::DenseQwen(model) => model
+                Self::Qwen(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .and_then(|cache| match cache {
-                        crate::composition::mlx_architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache::Paged { caches, .. } => Ok(ModelCache::PagedKeyValue(caches)),
-                        _ => Err(Error::UnsupportedArchitecture(
-                            "dense-Qwen paged cache construction returned device state".into(),
-                        )),
-                    })
+                    .map(ModelCache::Qwen)
                     .map_err(|error| Exception::custom(error.to_string())),
                 Self::MuseGlimmer(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
@@ -997,7 +989,7 @@ impl Model {
             Self::DeepSeekV4(model) => load!(model, ModelCache::DeepSeekV4),
             Self::DeepSeekV4Layerwise(model) => load!(model, ModelCache::DeepSeekV4),
             Self::GptOss(model) => load!(model, ModelCache::GptOss),
-            Self::DenseQwen(model) => load!(model, ModelCache::KeyValue),
+            Self::Qwen(model) => load!(model, ModelCache::Qwen),
             Self::MuseGlimmer(model) => load!(model, ModelCache::KeyValue),
             Self::KimiLinear(model) => load!(model, ModelCache::KimiLinear),
             Self::Qwen3Next(model) => load!(model, ModelCache::Qwen3Next),
@@ -1082,7 +1074,7 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
+            (Self::Qwen(model), ModelCache::Qwen(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1200,7 +1192,7 @@ impl Model {
             Self::DeepSeekV3(_) => "deepseek_v3",
             Self::DeepSeekV4(_) | Self::DeepSeekV4Layerwise(_) => "deepseek_v4",
             Self::GptOss(_) => "gpt_oss",
-            Self::DenseQwen(_) => "dense_qwen",
+            Self::Qwen(_) => "qwen",
             Self::MuseGlimmer(_) => "muse_glimmer",
             Self::KimiLinear(_) => "kimi_linear",
             Self::Lfm2(_) => "lfm2",
@@ -1226,19 +1218,6 @@ impl Model {
         validate_prompt_cache_model_identity(&descriptor, &identity)
             .map_err(|error| Exception::custom(error.to_string()))?;
         match (self, cache) {
-            (Self::DenseQwen(_), ModelCache::PagedKeyValue(caches)) => {
-                for cache in caches.iter_mut().flatten() {
-                    cache.finalize()?;
-                }
-                caches
-                    .iter()
-                    .flatten()
-                    .next()
-                    .ok_or_else(|| Exception::custom("cannot persist an empty paged cache"))?
-                    .manager()
-                    .save_prompt_cache(destination, descriptor, prefix_token_ids, &[], options)
-                    .map_err(|error| Exception::custom(error.to_string()))
-            }
             (Self::MuseGlimmer(_), ModelCache::PagedKeyValue(caches)) => {
                 for cache in caches.iter_mut().flatten() {
                     cache.finalize()?;
@@ -1296,6 +1275,8 @@ pub enum ModelCache {
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
     /// Runtime-policy-selected MLX key/value state.
     Llama(crate::backend::mlx::runtime::cache::state::MlxKeyValueState),
+    /// Runtime-policy-selected Qwen key/value state.
+    Qwen(crate::backend::mlx::runtime::cache::state::MlxKeyValueState),
     /// Qwen3-VL key/value cache and multimodal position state.
     Qwen3Vl(qwen3_vl::Cache),
     /// Qwen3-VL-MoE key/value cache and multimodal position state.

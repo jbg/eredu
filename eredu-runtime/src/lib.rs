@@ -13,8 +13,10 @@ pub mod cache;
 pub mod dense;
 /// Portable execution-group topology and scheduling state.
 pub mod execution;
+pub mod expert;
 /// Backend-neutral causal-model and token-sampling contracts.
 pub mod generation;
+pub mod inspection;
 /// Statically dispatched layered architecture lifecycle and resident policy.
 pub mod layered;
 /// Architecture-declared parallel parameter semantics and local layouts.
@@ -56,20 +58,22 @@ pub use execution::{
     ExecutionGroupSchedule, ExecutionGroupSpec, ExecutionScheduleError, ExecutionUnitAddress,
     ExecutionUnitLayout, ExecutionUnitLayoutError, ReadyGroupState,
 };
+pub use expert::{ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest};
 pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
     PenaltyConfig, Sampler, SamplingBackend, SamplingConfigurationError, SpeculativeSampler,
 };
+pub use inspection::{observe_and_intervene, ActivationObserver, NoopObserver, RoutingObservation};
 pub use layered::{
     LayeredArchitecture, LayeredForwardState, LayerwisePolicy, LayerwiseRuntime,
     LayerwiseRuntimeError, ParallelLayeredArchitecture, ResidentRuntime, ResidentUnitWindow,
     ResidentUnitWindowError,
 };
 pub use parallel::{
-    aligned_partition_units, module_parameter_group, partitioned_projection_group,
-    projection_parameter_group, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-    ProjectionSharding, ShardingPolicy, TensorPlacement,
+    aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
+    partitioned_projection_group, projection_parameter_group, LocalModelLayout, LocalTensorLayout,
+    MemberSharding, ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, ProjectionSharding, ShardingPolicy, TensorPlacement,
 };
 pub use parameter::{
     bind_materialized_unit, materialize_bindings, MaterializedUnit, ParameterOrchestrationError,

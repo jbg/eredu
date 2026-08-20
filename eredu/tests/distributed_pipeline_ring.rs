@@ -22,14 +22,9 @@ use eredu::{
         load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
     },
     composition::mlx_architectures::{
-        deepseek_v3::model as deepseek_v3,
-        gemma4,
-        gpt_oss::model as gpt_oss,
-        inkling::model as inkling,
-        kimi_linear::model as kimi_model,
-        lfm2::model as lfm2,
-        nemotron_h::model as nemotron_model,
-        qwen::{dense as dense_qwen, hybrid::qwen3_5 as qwen_hybrid},
+        deepseek_v3::model as deepseek_v3, gemma4, gpt_oss::model as gpt_oss,
+        inkling::model as inkling, kimi_linear::model as kimi_model, lfm2::model as lfm2,
+        nemotron_h::model as nemotron_model, qwen::hybrid::qwen3_5 as qwen_hybrid,
     },
     core::{residency::OffloadConfig, BackendProvider as _, BackendSession as _},
     load_model, DenseDiskStreamLoadOptions, ExpertCacheLoadOptions, LayerwiseLoadOptions,
@@ -39,6 +34,7 @@ use eredu::{
 use eredu::{CacheResidencyPolicy, PagedCacheOptions};
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_gguf::{GgmlType, TensorInput, Writer};
+use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized};
 use safemlx::{
     distributed::{self, Backend},
     module::ModuleParameters,
@@ -218,9 +214,9 @@ impl FixtureFamily {
             Self::Llama => ("llama", "llama"),
             Self::DeepSeek | Self::DeepSeekGguf => ("deepseek_v3", "deepseek_v3"),
             Self::Gemma => ("gemma4", "gemma4"),
-            Self::Qwen2 => ("dense_qwen", "qwen2"),
-            Self::Qwen3 => ("dense_qwen", "qwen3"),
-            Self::Qwen3Moe | Self::Qwen3MoeTied | Self::Qwen3MoeGguf => ("dense_qwen", "qwen3_moe"),
+            Self::Qwen2 => ("qwen", "qwen2"),
+            Self::Qwen3 => ("qwen", "qwen3"),
+            Self::Qwen3Moe | Self::Qwen3MoeTied | Self::Qwen3MoeGguf => ("qwen", "qwen3_moe"),
             Self::GptOss | Self::GptOssGguf => ("gpt_oss", "gpt_oss"),
             Self::Lfm2 => ("lfm2", "lfm2"),
             Self::Lfm2Moe | Self::Lfm2MoeGguf => ("lfm2", "lfm2_moe"),
@@ -1455,7 +1451,7 @@ fn qwen_config(model_type: &str) -> serde_json::Value {
             "qwen2" => "Qwen2ForCausalLM",
             "qwen3" => "Qwen3ForCausalLM",
             "qwen3_moe" => "Qwen3MoeForCausalLM",
-            _ => panic!("unsupported dense-Qwen pipeline fixture model type {model_type}"),
+            _ => panic!("unsupported Qwen pipeline fixture model type {model_type}"),
         }],
         "model_type": model_type,
         "hidden_size": 32,
@@ -1504,6 +1500,54 @@ fn write_qwen_requantized_tp_fixture(directory: &Path) {
     write_qwen_config_fixture(directory, config);
 }
 
+fn qwen_fixture_arrays(
+    args: &eredu_architectures::qwen::ModelArgs,
+    stream: &Stream,
+) -> Vec<(String, Array)> {
+    struct Collector<'a> {
+        stream: &'a Stream,
+        arrays: Vec<(String, Array)>,
+    }
+    impl<'tensor> ParameterVisitor<'tensor, Array> for Collector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+            let name = metadata.id.to_string();
+            let shape = parameter.shape().to_vec();
+            let value = if name.ends_with("norm.weight") {
+                Array::ones::<f32>(&shape, self.stream).unwrap()
+            } else {
+                let ordinal = name.bytes().fold(0u32, |sum, byte| sum + u32::from(byte)) % 17;
+                Array::full::<f32>(
+                    &shape,
+                    Array::from_f32(0.002 + ordinal as f32 * 0.0003),
+                    self.stream,
+                )
+                .unwrap()
+            };
+            self.arrays.push((name, value));
+        }
+    }
+
+    let architecture = eredu_architectures::qwen::LayeredModel::<
+        eredu::backend::mlx::nn::shared::MlxBackend,
+    >::new(args.clone(), stream)
+    .unwrap();
+    let mut collector = Collector {
+        stream,
+        arrays: Vec::new(),
+    };
+    architecture
+        .static_modules()
+        .visit_parameters(&mut collector);
+    for layer in 0..args.num_hidden_layers as usize {
+        eredu_architectures::qwen::new_block::<eredu::backend::mlx::nn::shared::MlxBackend>(
+            args, layer, stream,
+        )
+        .unwrap()
+        .visit_parameters(&mut collector);
+    }
+    collector.arrays
+}
+
 fn write_qwen_config_fixture(directory: &Path, config: serde_json::Value) {
     std::fs::write(
         directory.join("config.json"),
@@ -1512,28 +1556,8 @@ fn write_qwen_config_fixture(directory: &Path, config: serde_json::Value) {
     .unwrap();
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = dense_qwen::load_config(directory).unwrap();
-    let mut model = dense_qwen::Model::new(args, stream).unwrap();
-    for (name, parameter) in model.parameters_mut().flatten() {
-        let shape = parameter.shape().to_vec();
-        *parameter = if name.ends_with("norm.weight") {
-            Array::ones::<f32>(&shape, stream).unwrap()
-        } else {
-            let ordinal = name.bytes().fold(0u32, |sum, byte| sum + u32::from(byte)) % 17;
-            Array::full::<f32>(
-                &shape,
-                Array::from_f32(0.002 + ordinal as f32 * 0.0003),
-                stream,
-            )
-            .unwrap()
-        };
-    }
-    let arrays = model
-        .parameters()
-        .flatten()
-        .into_iter()
-        .map(|(name, value)| (canonical_checkpoint_name(&name), value.clone()))
-        .collect::<Vec<_>>();
+    let args = eredu_architectures::qwen::model_args_from_config_value(&config).unwrap();
+    let arrays = qwen_fixture_arrays(&args, stream);
     Array::save_safetensors(
         arrays.iter().map(|(name, value)| (name.as_str(), value)),
         None,
@@ -1551,12 +1575,11 @@ fn write_qwen3_moe_gguf_fixture(path: &Path) {
     .unwrap();
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = dense_qwen::load_config(path.parent().unwrap()).unwrap();
-    let mut model = dense_qwen::Model::new(args.clone(), stream).unwrap();
-    initialize_fixture(&mut model, stream);
+    let args = eredu_architectures::qwen::model_args_from_config_value(&config).unwrap();
+    let arrays = qwen_fixture_arrays(&args, stream);
     let mut specs = Vec::new();
-    for (runtime_name, value) in model.parameters().flatten() {
-        let runtime_name = canonical_checkpoint_name(&runtime_name);
+    for (runtime_name, value) in &arrays {
+        let runtime_name = canonical_checkpoint_name(runtime_name);
         if let Some(prefix) = runtime_name.strip_suffix(".mlp.experts.gate_up_proj") {
             let gate = value
                 .try_index_device((.., ..args.moe_intermediate_size, ..), stream)
@@ -3645,14 +3668,14 @@ fn ring_two_process_gemma_pipeline() {
 }
 
 /// Verifies biased GQA, mixed full/sliding cache persistence, and two-stage
-/// execution for a dense Qwen2 decoder.
+/// execution for a Qwen2 decoder.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_qwen2_pipeline() {
     run_ring_pipeline(false, FixtureFamily::Qwen2);
 }
 
-/// Verifies Q/K-normalized dense Qwen3 execution through streamed local layers.
+/// Verifies Q/K-normalized Qwen3 execution through streamed local layers.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_qwen3_dense_stream_pipeline() {
@@ -3660,7 +3683,7 @@ fn ring_two_process_qwen3_dense_stream_pipeline() {
 }
 
 /// Verifies Qwen3 routed-expert ownership, paged cache persistence, and
-/// rank-synchronized two-stage execution through the shared dense-Qwen stage.
+/// rank-synchronized two-stage execution through the shared Qwen stage.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_qwen3_moe_pipeline() {

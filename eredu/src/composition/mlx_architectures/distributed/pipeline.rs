@@ -79,7 +79,8 @@ use crate::{
     },
     backend::mlx::runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
     backend::mlx::runtime::distributed::expert::{
-        dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
+        dispatch_local_with, dispatch_replicated, dispatch_replicated_with, ExpertAssignment,
+        RoutingStatistics,
     },
     backend::mlx::runtime::distributed::parallel::{
         ParallelBuildContext, ParallelExecutionContext,
@@ -120,7 +121,6 @@ use crate::{
         nemotron_h::layerwise::NemotronHLayerwiseAdapter,
         nemotron_h::model as nemotron_h,
         qwen::{
-            dense as dense_qwen,
             hybrid::{
                 layerwise::{QwenHybridLayer, QwenHybridLayerwiseAdapter},
                 qwen3_5 as qwen_hybrid,
@@ -154,6 +154,14 @@ use eredu_runtime::ResidentLayerGroup;
 use safemlx::ops::indexing::TryIndexOp;
 
 type LlamaBlock = MlxModule<eredu_architectures::llama::TransformerBlock<MlxBackend>>;
+
+fn qwen_model_kind(args: &eredu_architectures::qwen::ModelArgs) -> ModelKind {
+    match args.variant {
+        eredu_architectures::qwen::QwenVariant::Qwen2 => ModelKind::Qwen2,
+        eredu_architectures::qwen::QwenVariant::Qwen3
+        | eredu_architectures::qwen::QwenVariant::Qwen3Moe => ModelKind::Qwen3,
+    }
+}
 
 fn new_llama_block(
     args: &LlamaModelArgs,
@@ -253,8 +261,8 @@ impl_pipeline_quantization_adapter!(DeepSeekV4LayerwiseAdapter, deepseek_v4::Dec
 impl_pipeline_quantization_adapter!(QwenHybridLayerwiseAdapter, QwenHybridLayer);
 impl_pipeline_quantization_adapter!(Qwen3VlLayerwiseAdapter, Qwen3VlLayer);
 impl_pipeline_quantization_adapter!(
-    dense_qwen::layerwise::DenseQwenLayerwiseAdapter,
-    dense_qwen::TransformerBlock
+    crate::composition::qwen::QwenParallelComposition,
+    MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>
 );
 impl_pipeline_quantization_adapter!(Lfm2LayerwiseAdapter, lfm2::DecoderLayer);
 impl_pipeline_quantization_adapter!(Gemma4LayerwiseAdapter, Gemma4Layer);
@@ -701,6 +709,7 @@ fn recv_prepared_input(
     PreparedModelInput::from_identity_wire_arrays(&identity, arrays)
 }
 
+/// Submitted completion for one rank-local pipeline stage.
 pub struct PipelineStageCompletion {
     inner: DistributedCompletion<Option<Array>>,
 }
@@ -736,7 +745,7 @@ impl PipelineStageCompletion {
 
 #[cfg(test)]
 impl PipelineStageCompletion {
-    pub fn into_logits(self) -> Result<Option<Array>, Error> {
+    pub(crate) fn into_logits(self) -> Result<Option<Array>, Error> {
         self.synchronize()?;
         Ok(self.logits().cloned())
     }
@@ -1076,13 +1085,18 @@ impl PipelineLayerCache {
     }
 }
 
-struct LlamaStage {
-    args: LlamaModelArgs,
-    layer_adapter: crate::composition::llama::LlamaParallelComposition,
+/// Pipeline placement over one backend-neutral layered decoder architecture.
+///
+/// Family selection happens when the concrete architecture, block, and
+/// validated arguments are chosen at the composition boundary. Placement and
+/// static-module ownership are shared mechanics rather than a second model.
+struct NeutralDecoderStage<A, C, L> {
+    args: A,
+    layer_adapter: C,
     range: Range<usize>,
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
-    layers: Vec<LlamaBlock>,
+    layers: Vec<L>,
     dense_layers: Option<PipelineLayerStorage>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
@@ -1091,7 +1105,22 @@ struct LlamaStage {
     parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
     parallel_layout: Option<eredu_runtime::LocalModelLayout>,
     parallel_kv_heads: Option<Vec<i32>>,
+    expert_assignment: Option<ExpertAssignment>,
+    expert_cache: Option<ExpertCache>,
+    routing_statistics: RoutingStatistics,
 }
+
+type LlamaStage = NeutralDecoderStage<
+    LlamaModelArgs,
+    crate::composition::llama::LlamaParallelComposition,
+    LlamaBlock,
+>;
+
+type QwenStage = NeutralDecoderStage<
+    eredu_architectures::qwen::ModelArgs,
+    crate::composition::qwen::QwenParallelComposition,
+    MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>,
+>;
 
 struct DeepSeekStage {
     args: deepseek_v3::ModelArgs,
@@ -1158,25 +1187,6 @@ struct GemmaStage {
 struct PipelineMediaUnit {
     group: usize,
     index: usize,
-}
-
-struct DenseQwenStage {
-    args: dense_qwen::DecoderConfig,
-    layer_adapter: dense_qwen::layerwise::DenseQwenLayerwiseAdapter,
-    range: Range<usize>,
-    embedding: Option<MaybeQuantized<nn::Embedding>>,
-    output_embedding: Option<MaybeQuantized<nn::Embedding>>,
-    layers: Vec<dense_qwen::TransformerBlock>,
-    dense_layers: Option<PipelineLayerStorage>,
-    norm: Option<nn::RmsNorm>,
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
-    parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
-    parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
-    parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
-    expert_assignment: Option<ExpertAssignment>,
-    expert_cache: Option<ExpertCache>,
-    routing_statistics: RoutingStatistics,
 }
 
 struct MuseGlimmerStage {
@@ -2161,7 +2171,7 @@ where
                 crate::backend::mlx::runtime::checkpoint::binding::populate_module_from_lease_excluding(
                     &mut layer,
                     transfer.lease(),
-                    |name| name.starts_with(prefix),
+                    |name| name.contains(prefix),
                 )?;
             } else {
                 populate_module_from_lease(&mut layer, transfer.lease())?;
@@ -2183,7 +2193,7 @@ where
                 crate::backend::mlx::runtime::checkpoint::binding::populate_module_from_lease_excluding(
                     &mut layer,
                     &lease,
-                    |name| name.starts_with(prefix),
+                    |name| name.contains(prefix),
                 )?;
             } else {
                 populate_module_from_lease(&mut layer, &lease)?;
@@ -3173,9 +3183,9 @@ impl PipelineStageSemantics for GemmaStage {
     }
 }
 
-impl PipelineStageSemantics for DenseQwenStage {
+impl PipelineStageSemantics for QwenStage {
     fn model_kind(&self) -> ModelKind {
-        self.args.model_kind()
+        qwen_model_kind(&self.args)
     }
 
     fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
@@ -3228,11 +3238,11 @@ impl PipelineStageSemantics for DenseQwenStage {
         .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok(pipeline_prompt_cache_identity(
             topology,
-            "dense_qwen",
+            "qwen",
             &self.args.model_type,
-            dense_qwen::prompt_cache_architecture_fingerprint(&self.args),
+            eredu_architectures::qwen::prompt_cache_architecture_fingerprint(&self.args),
             usize::try_from(self.args.num_hidden_layers)
-                .map_err(|_| Error::Parallel("invalid dense-Qwen layer count".into()))?,
+                .map_err(|_| Error::Parallel("invalid Qwen layer count".into()))?,
             self.range.clone(),
             layout,
         ))
@@ -3249,7 +3259,7 @@ impl PipelineStageSemantics for DenseQwenStage {
         if self.expert_cache.is_some() {
             self.forward_external_experts(input, step, mask, cache, None, stream)
         } else {
-            DenseQwenStage::forward(self, input, step, mask, cache, stream)
+            QwenStage::forward(self, input, step, mask, cache, stream)
         }
     }
 
@@ -4029,9 +4039,177 @@ impl Qwen3VlStage {
     }
 }
 
+fn forward_qwen_pipeline_block<C>(
+    block: &mut MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>,
+    hidden: &Array,
+    mask: Option<&Array>,
+    cache: &mut C,
+    tensor_group: Option<&Group>,
+    stream: &Stream,
+) -> Result<Array, Error>
+where
+    C: KeyValueCache + eredu_nn::AttentionCache<Array>,
+{
+    let input = eredu_architectures::qwen::AttentionInput {
+        hidden,
+        mask,
+        cache: Some(cache),
+        allow_sliding_prefill: false,
+        rotary_position: None,
+    };
+    match tensor_group {
+        Some(group) => block.forward_tensor_parallel(input, group, stream),
+        None => block.forward(input, stream),
+    }
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
 #[allow(clippy::too_many_arguments)]
-fn qwen3_vl_forward_pipeline_block<C: KeyValueCache>(
-    block: &mut dense_qwen::TransformerBlock,
+fn forward_qwen_pipeline_external_experts<C, P>(
+    block: &mut MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>,
+    hidden: &Array,
+    mask: Option<&Array>,
+    cache: &mut C,
+    layer: usize,
+    pass: ExpertPass,
+    tensor_group: Option<&Group>,
+    stream: &Stream,
+    provider: &mut P,
+) -> Result<Array, Error>
+where
+    C: KeyValueCache + eredu_nn::AttentionCache<Array>,
+    P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+    P::Error: std::fmt::Display,
+{
+    let input = eredu_architectures::qwen::AttentionInput {
+        hidden,
+        mask,
+        cache: Some(cache),
+        allow_sliding_prefill: false,
+        rotary_position: None,
+    };
+    let feed_forward = |policy: &mut eredu_architectures::qwen::FeedForward<MlxBackend>,
+                        normalized: &Array,
+                        context: &Stream| {
+        let shape = normalized.shape().to_vec();
+        let flat = normalized
+            .reshape(&[-1, normalized.dim(-1)], context)
+            .map_err(eredu_nn::Error::backend)?;
+        policy
+            .forward_with_provider(layer, pass, &flat, context, provider)?
+            .reshape(&shape, context)
+            .map_err(eredu_nn::Error::backend)
+    };
+    match tensor_group {
+        Some(group) => {
+            block.forward_tensor_parallel_with_feed_forward(input, group, stream, feed_forward)
+        }
+        None => block.forward_with_feed_forward(input, stream, feed_forward),
+    }
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_qwen_pipeline_layer<C>(
+    block: &mut MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>,
+    hidden: &Array,
+    mask: Option<&Array>,
+    cache: &mut C,
+    args: &eredu_architectures::qwen::ModelArgs,
+    layout: Option<&eredu_runtime::LocalModelLayout>,
+    tensor_group: Option<&Group>,
+    expert_group: Option<&Group>,
+    assignment: Option<&ExpertAssignment>,
+    expert_cache: Option<&ExpertCache>,
+    pass: ExpertPass,
+    statistics: &mut RoutingStatistics,
+    global_layer: usize,
+    stream: &Stream,
+) -> Result<Array, Error>
+where
+    C: KeyValueCache + eredu_nn::AttentionCache<Array>,
+{
+    let Some(assignment) = assignment else {
+        return forward_qwen_pipeline_block(block, hidden, mask, cache, tensor_group, stream);
+    };
+    if let Some(expert_cache) = expert_cache {
+        let expert_args = qwen_pipeline_local_expert_args(args, layout, global_layer)?;
+        let mut execute = |_layer: usize,
+                           routed_hidden: &Array,
+                           ids: &Array,
+                           weights: &Array,
+                           route_stream: &Stream| {
+            execute_pipeline_cached_qwen3(
+                &expert_args,
+                global_layer,
+                routed_hidden,
+                ids,
+                weights,
+                pass,
+                expert_cache,
+                assignment,
+                expert_group,
+                tensor_group,
+                statistics,
+                route_stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))
+        };
+        let mut provider =
+            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
+                &mut execute,
+            );
+        return forward_qwen_pipeline_external_experts(
+            block,
+            hidden,
+            mask,
+            cache,
+            global_layer,
+            pass,
+            tensor_group,
+            stream,
+            &mut provider,
+        );
+    }
+    let group = expert_group.ok_or_else(|| {
+        Error::Parallel("resident Qwen expert execution requires an EP communicator".into())
+    })?;
+    let mut execute = |bank: &mut _,
+                       routed_hidden: &Array,
+                       ids: &Array,
+                       weights: &Array,
+                       route_stream: &Stream| {
+        let returned = dispatch_replicated(
+            routed_hidden,
+            ids,
+            weights,
+            assignment,
+            bank,
+            group,
+            route_stream,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        statistics.accumulate(&returned.statistics);
+        Ok(returned.reduced_output)
+    };
+    let mut provider =
+        crate::backend::mlx::runtime::residency::expert_provider::ResidentExpertExecutorProvider::new(&mut execute);
+    forward_qwen_pipeline_external_experts(
+        block,
+        hidden,
+        mask,
+        cache,
+        global_layer,
+        pass,
+        tensor_group,
+        stream,
+        &mut provider,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen3_vl_forward_pipeline_block<C>(
+    block: &mut MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>,
     hidden: &Array,
     mask: Option<&Array>,
     cache: &mut C,
@@ -4041,13 +4219,16 @@ fn qwen3_vl_forward_pipeline_block<C: KeyValueCache>(
     expert_group: Option<&Group>,
     assignment: Option<&ExpertAssignment>,
     expert_cache: Option<&ExpertCache>,
-    args: &dense_qwen::DecoderConfig,
+    args: &eredu_architectures::qwen::ModelArgs,
     layout: Option<&eredu_runtime::LocalModelLayout>,
     pass: ExpertPass,
     statistics: &mut RoutingStatistics,
     global_layer: usize,
     stream: &Stream,
-) -> Result<Array, Error> {
+) -> Result<Array, Error>
+where
+    C: KeyValueCache + eredu_nn::AttentionCache<Array>,
+{
     let tensor_group = execution
         .filter(|execution| execution.is_tensor_parallel())
         .map(|execution| {
@@ -4060,114 +4241,95 @@ fn qwen3_vl_forward_pipeline_block<C: KeyValueCache>(
         let assignment = assignment.ok_or_else(|| {
             Error::Parallel("cached Qwen3-VL experts have no ownership assignment".into())
         })?;
-        let expert_args = qwen_pipeline_local_expert_args(
-            args,
-            layout,
-            global_layer,
-            "model.language_model.layers",
-        )?;
-        let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-            execute_pipeline_cached_qwen3(
-                &expert_args,
-                global_layer,
-                "model.language_model.layers",
-                hidden,
-                ids,
-                weights,
-                pass,
-                expert_cache,
-                assignment,
-                expert_group,
-                tensor_group,
-                statistics,
-                stream,
-            )
-            .map_err(|error| Exception::custom(error.to_string()))
-        };
-        return match tensor_group {
-            Some(group) => Ok(block.forward_sparse_experts_with_rotary_tensor_parallel(
-                AttentionInput {
-                    x: hidden,
-                    mask,
-                    cache: Some(cache),
-                },
-                cos,
-                sin,
-                group,
-                stream,
-                execute,
-            )?),
-            None => Ok(block.forward_sparse_experts_with_rotary(
-                AttentionInput {
-                    x: hidden,
-                    mask,
-                    cache: Some(cache),
-                },
-                cos,
-                sin,
-                stream,
-                execute,
-            )?),
-        };
+        let expert_args = qwen_pipeline_local_expert_args(args, layout, global_layer)?;
+        let mut execute =
+            |_layer: usize, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                execute_pipeline_cached_qwen3(
+                    &expert_args,
+                    global_layer,
+                    hidden,
+                    ids,
+                    weights,
+                    pass,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    tensor_group,
+                    statistics,
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+        let mut provider =
+            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
+                &mut execute,
+            );
+        return crate::composition::mlx_architectures::qwen::vl::layerwise::forward_qwen3_vl_text_external_experts(
+            block, hidden, mask, Some(cache), cos, sin, global_layer, pass, tensor_group, stream, &mut provider,
+        );
     }
     if let (Some(tensor_group), Some(assignment), Some(expert_group)) =
         (tensor_group, assignment, expert_group)
     {
-        return Ok(block.forward_tensor_expert_parallel_with_rotary(
-            hidden,
-            mask,
-            Some(cache),
-            cos,
-            sin,
-            assignment,
-            tensor_group,
-            expert_group,
-            statistics,
-            stream,
-        )?);
+        let mut execute = |bank: &mut _,
+                           routed_hidden: &Array,
+                           ids: &Array,
+                           weights: &Array,
+                           route_stream: &Stream| {
+            let returned = dispatch_replicated(
+                routed_hidden,
+                ids,
+                weights,
+                assignment,
+                bank,
+                expert_group,
+                route_stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+            statistics.accumulate(&returned.statistics);
+            Ok(returned.reduced_output)
+        };
+        let mut provider =
+            crate::backend::mlx::runtime::residency::expert_provider::ResidentExpertExecutorProvider::new(&mut execute);
+        return crate::composition::mlx_architectures::qwen::vl::layerwise::forward_qwen3_vl_text_external_experts(
+            block, hidden, mask, Some(cache), cos, sin, global_layer, pass, Some(tensor_group), stream, &mut provider,
+        );
     }
-    if let Some(group) = expert_group {
-        return Ok(block.forward_expert_parallel_with_rotary(
-            AttentionInput {
-                x: hidden,
-                mask,
-                cache: Some(cache),
-            },
-            cos,
-            sin,
-            assignment.ok_or_else(|| {
-                Error::Parallel("Qwen3-VL PP+EP stage has no expert assignment".into())
-            })?,
-            group,
-            statistics,
-            &format!("model.language_model.layers.{global_layer}"),
-            None,
-            stream,
-        )?);
+    if let (Some(assignment), Some(expert_group)) = (assignment, expert_group) {
+        let mut execute = |bank: &mut _,
+                           routed_hidden: &Array,
+                           ids: &Array,
+                           weights: &Array,
+                           route_stream: &Stream| {
+            let returned = dispatch_replicated(
+                routed_hidden,
+                ids,
+                weights,
+                assignment,
+                bank,
+                expert_group,
+                route_stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+            statistics.accumulate(&returned.statistics);
+            Ok(returned.reduced_output)
+        };
+        let mut provider =
+            crate::backend::mlx::runtime::residency::expert_provider::ResidentExpertExecutorProvider::new(&mut execute);
+        return crate::composition::mlx_architectures::qwen::vl::layerwise::forward_qwen3_vl_text_external_experts(
+            block, hidden, mask, Some(cache), cos, sin, global_layer, pass, None, stream, &mut provider,
+        );
     }
-    if let Some(group) = tensor_group {
-        return Ok(block.forward_with_rotary_embeddings_tensor_parallel(
-            AttentionInput {
-                x: hidden,
-                mask,
-                cache: Some(cache),
-            },
-            cos,
-            sin,
-            group,
-            stream,
-        )?);
-    }
-    Ok(block.forward_with_rotary_embeddings(
-        AttentionInput {
-            x: hidden,
-            mask,
-            cache: Some(cache),
-        },
+    crate::composition::mlx_architectures::qwen::vl::layerwise::forward_qwen3_vl_text(
+        block,
+        hidden,
+        mask,
+        Some(cache),
         cos,
         sin,
+        tensor_group,
         stream,
-    )?)
+    )
 }
 
 fn qwen3_vl_pipeline_rope_delta(
@@ -6674,11 +6836,11 @@ impl PipelineModel {
 
 #[cfg(test)]
 impl PipelineModel {
-    pub const fn placed_ingress_schedule_report(&self) -> &PlacedIngressScheduleReport {
+    pub(crate) const fn placed_ingress_schedule_report(&self) -> &PlacedIngressScheduleReport {
         &self.last_placed_ingress_schedule
     }
 
-    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
+    pub(crate) fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
         Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
     }
 
@@ -6689,7 +6851,9 @@ impl PipelineModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn sample_and_synchronize<S: crate::backend::mlx::runtime::generation::sampler::Sampler>(
+    pub(crate) fn sample_and_synchronize<
+        S: crate::backend::mlx::runtime::generation::sampler::Sampler,
+    >(
         &self,
         logits: Option<&Array>,
         step: PipelineStep,
@@ -8409,35 +8573,19 @@ pub(crate) fn load_pipeline_model_with_options(
             architecture @ (crate::core::GgufArchitecture::Qwen2
             | crate::core::GgufArchitecture::Qwen3
             | crate::core::GgufArchitecture::Qwen3Moe) => {
-                let architecture_name = architecture.metadata_name();
                 let is_moe = architecture == crate::core::GgufArchitecture::Qwen3Moe;
-                let (args, _) = dense_qwen::prepare_gguf_checkpoint(
-                    &checkpoint,
-                    &metadata,
-                    architecture_name,
-                    is_moe,
-                )?;
-                let variant = match architecture {
-                    crate::core::GgufArchitecture::Qwen2 => {
-                        crate::composition::mlx_architectures::qwen::dense::checkpoint::GgufVariant::Qwen2
-                    }
-                    crate::core::GgufArchitecture::Qwen3Moe => {
-                        crate::composition::mlx_architectures::qwen::dense::checkpoint::GgufVariant::Qwen3Moe
-                    }
-                    _ => crate::composition::mlx_architectures::qwen::dense::checkpoint::GgufVariant::Qwen3,
-                };
-                let gguf_plan =
-                    crate::composition::mlx_architectures::qwen::dense::checkpoint::gguf_plan(
-                        &args, variant,
-                    )
+                let prepared =
+                    crate::composition::qwen::prepare_qwen_gguf_checkpoint(&checkpoint, &metadata)?;
+                let args = prepared.args;
+                let gguf_plan = eredu_architectures::qwen::gguf_plan(&args)
                     .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
-                    move |name| dense_qwen::translate_gguf_weight_name(name, is_moe),
+                    move |name| eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe),
                     max_mapped_shards,
                 )?);
-                load_dense_qwen_pipeline(
+                load_qwen_pipeline(
                     args,
                     store,
                     topology,
@@ -8853,8 +9001,8 @@ pub(crate) fn load_pipeline_model_with_options(
             )
         }
         Some("qwen2" | "qwen3" | "qwen3_moe") => {
-            let args = dense_qwen::load_config(model_dir)?;
-            load_dense_qwen_pipeline(
+            let args = crate::composition::qwen::load_model_args(model_dir)?;
+            load_qwen_pipeline(
                 args,
                 store,
                 topology,
@@ -9345,6 +9493,9 @@ impl LlamaStage {
             parallel_lm_head: None,
             parallel_layout: None,
             parallel_kv_heads: None,
+            expert_assignment: None,
+            expert_cache: None,
+            routing_statistics: RoutingStatistics::default(),
         })
     }
 
@@ -9451,6 +9602,7 @@ impl LlamaStage {
                         mask,
                         cache: Some(cache),
                         allow_sliding_prefill,
+                        rotary_position: None,
                     },
                     stream,
                 )?),
@@ -9464,6 +9616,7 @@ impl LlamaStage {
                         mask,
                         cache: Some(cache),
                         allow_sliding_prefill,
+                        rotary_position: None,
                     },
                     stream,
                 )?),
@@ -10276,6 +10429,7 @@ impl LlamaStage {
                                 mask,
                                 cache: Some(cache),
                                 allow_sliding_prefill,
+                                rotary_position: None,
                             },
                             group,
                             stream,
@@ -10293,6 +10447,7 @@ impl LlamaStage {
                                 mask,
                                 cache: Some(cache),
                                 allow_sliding_prefill,
+                                rotary_position: None,
                             },
                             group,
                             stream,
@@ -10334,8 +10489,8 @@ impl LlamaStage {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_dense_qwen_pipeline(
-    source_args: dense_qwen::DecoderConfig,
+fn load_qwen_pipeline(
+    source_args: eredu_architectures::qwen::ModelArgs,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -10350,12 +10505,12 @@ fn load_dense_qwen_pipeline(
         ));
     }
     let binding_adapter = if expert_cache_options.is_some() {
-        dense_qwen::layerwise::DenseQwenLayerwiseAdapter::new_external_experts(
+        crate::composition::qwen::QwenParallelComposition::new_external_experts(
             source_args.clone(),
             stream,
         )?
     } else {
-        dense_qwen::layerwise::DenseQwenLayerwiseAdapter::new(source_args.clone(), stream)?
+        crate::composition::qwen::QwenParallelComposition::new(source_args.clone(), stream)?
     };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
@@ -10367,7 +10522,7 @@ fn load_dense_qwen_pipeline(
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
-                "dense-Qwen pipeline",
+                "Qwen pipeline",
                 source_args.weight_quantization(),
                 requested,
             )
@@ -10387,10 +10542,10 @@ fn load_dense_qwen_pipeline(
         topology,
         range.clone(),
         source_args.attention_schedule.len(),
-        source_args.model_kind(),
+        qwen_model_kind(&source_args),
         source_args.hidden_size,
     );
-    let mut stage = DenseQwenStage::new(
+    let mut stage = QwenStage::new(
         target_args.clone(),
         range,
         &info,
@@ -10405,7 +10560,7 @@ fn load_dense_qwen_pipeline(
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
         let mut planner = build.planner();
-        binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
+        binding_adapter.register_parallel_parameters(&mut planner, stream)?;
         let (_, layout) = planner.finish()?;
         stage.parallel_embedding = info
             .is_first
@@ -10502,7 +10657,7 @@ fn load_dense_qwen_pipeline(
     };
     info.materialization = materialization;
     let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
-    let mut loaded = PipelineLoadAccumulator::new("dense-Qwen");
+    let mut loaded = PipelineLoadAccumulator::new("Qwen");
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
             pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
@@ -10661,18 +10816,16 @@ fn load_dense_qwen_pipeline(
             dense_layers
         });
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
-        info.planned_owned_parameter_bytes =
-            static_bytes.checked_add(layer_bytes).ok_or_else(|| {
-                Error::Parallel("dense-Qwen pipeline planned bytes overflowed".into())
-            })?;
+        info.planned_owned_parameter_bytes = static_bytes
+            .checked_add(layer_bytes)
+            .ok_or_else(|| Error::Parallel("Qwen pipeline planned bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if let Some(options) = expert_cache_options {
-        let entries = dense_qwen::layerwise::qwen3_expert_catalog_cartesian(
+        let entries = crate::composition::qwen_expert::expert_catalog_cartesian(
             &source_args,
             store.as_ref(),
-            "model.layers",
             parallel_layout.as_ref(),
         )?
         .into_iter()
@@ -10695,9 +10848,7 @@ fn load_dense_qwen_pipeline(
         info.planned_owned_parameter_bytes = info
             .planned_owned_parameter_bytes
             .checked_add(owned_expert_bytes)
-            .ok_or_else(|| {
-                Error::Parallel("dense-Qwen pipeline expert byte total overflowed".into())
-            })?;
+            .ok_or_else(|| Error::Parallel("Qwen pipeline expert byte total overflowed".into()))?;
         stage.expert_cache = Some(cache);
     }
     let checkpoint_diagnostics = store.source_diagnostics()?;
@@ -11506,10 +11657,9 @@ fn load_qwen3_vl_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if let Some(options) = expert_cache_options {
-        let entries = dense_qwen::layerwise::qwen3_expert_catalog_cartesian(
+        let entries = crate::composition::qwen_expert::expert_catalog_cartesian(
             &source_args.text_config,
             store.as_ref(),
-            "model.language_model.layers",
             parallel_layout.as_ref(),
         )?
         .into_iter()
@@ -11592,21 +11742,21 @@ impl Qwen3VlStage {
     }
 }
 
-impl DenseQwenStage {
+impl QwenStage {
     fn new(
-        args: dense_qwen::DecoderConfig,
+        args: eredu_architectures::qwen::ModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
         external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
         let layer_adapter = if external_experts {
-            dense_qwen::layerwise::DenseQwenLayerwiseAdapter::new_external_experts(
+            crate::composition::qwen::QwenParallelComposition::new_external_experts(
                 args.clone(),
                 stream,
             )?
         } else {
-            dense_qwen::layerwise::DenseQwenLayerwiseAdapter::new(args.clone(), stream)?
+            crate::composition::qwen::QwenParallelComposition::new(args.clone(), stream)?
         };
         let make_embedding = || {
             linear::unloaded_maybe_quantized_embedding(
@@ -11622,7 +11772,11 @@ impl DenseQwenStage {
             .transpose()?;
         let layers = range
             .clone()
-            .map(|layer| dense_qwen::TransformerBlock::new_for_layer(&args, layer as i32, stream))
+            .map(|layer| {
+                eredu_architectures::qwen::new_block::<MlxBackend>(&args, layer, stream)
+                    .map(MlxModule::new)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let norm = info
             .is_last
@@ -11654,6 +11808,7 @@ impl DenseQwenStage {
             parallel_output_embedding: None,
             parallel_lm_head: None,
             parallel_layout: None,
+            parallel_kv_heads: None,
             expert_assignment: None,
             expert_cache: None,
             routing_statistics: RoutingStatistics::default(),
@@ -11669,7 +11824,7 @@ impl DenseQwenStage {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         validate_scheduled_pipeline_kv_cache(
-            "dense-Qwen",
+            "Qwen",
             self.range.clone(),
             &self.args.attention_schedule,
             caches,
@@ -11678,7 +11833,7 @@ impl DenseQwenStage {
             PipelineStageInput::Tokens(tokens) => (
                 self.embedding
                     .as_mut()
-                    .expect("first dense-Qwen stage embedding")
+                    .expect("first Qwen stage embedding")
                     .forward(tokens, stream)?,
                 PipelineAuxiliaryState::default(),
             ),
@@ -11703,17 +11858,15 @@ impl DenseQwenStage {
                 stream,
             },
             |global_layer, stream| {
-                Ok(dense_qwen::TransformerBlock::new_for_layer(
-                    args,
-                    global_layer as i32,
-                    stream,
-                )?)
+                eredu_architectures::qwen::new_block::<MlxBackend>(args, global_layer, stream)
+                    .map(MlxModule::new)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
             },
             |global_layer, layer, hidden, cache, stream| {
                 let policy = *args
                     .attention_schedule
                     .get(global_layer)
-                    .expect("validated dense-Qwen pipeline range");
+                    .expect("validated Qwen pipeline range");
                 let mask = match explicit_mask {
                     Some(mask) => Some(mask),
                     None if policy.window().is_none() => full_mask,
@@ -11724,28 +11877,36 @@ impl DenseQwenStage {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Standard(cache),
                         ..
-                    } if *cached == global_layer => Ok(layer.forward(
-                        AttentionInput {
-                            x: hidden,
-                            mask,
-                            cache: Some(cache),
-                        },
-                        stream,
-                    )?),
+                    } if *cached == global_layer => layer
+                        .forward(
+                            eredu_architectures::qwen::AttentionInput {
+                                hidden,
+                                mask,
+                                cache: Some(cache),
+                                allow_sliding_prefill: false,
+                                rotary_position: None,
+                            },
+                            stream,
+                        )
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Paged(cache),
                         ..
-                    } if *cached == global_layer => Ok(layer.forward(
-                        AttentionInput {
-                            x: hidden,
-                            mask,
-                            cache: Some(cache),
-                        },
-                        stream,
-                    )?),
+                    } if *cached == global_layer => layer
+                        .forward(
+                            eredu_architectures::qwen::AttentionInput {
+                                hidden,
+                                mask,
+                                cache: Some(cache),
+                                allow_sliding_prefill: false,
+                                rotary_position: None,
+                            },
+                            stream,
+                        )
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
                     _ => Err(Error::Parallel(format!(
-                        "dense-Qwen stage cache does not match global layer {global_layer}"
+                        "Qwen stage cache does not match global layer {global_layer}"
                     ))),
                 }
             },
@@ -11760,7 +11921,7 @@ impl DenseQwenStage {
                     self.output_embedding
                         .as_mut()
                         .or(self.embedding.as_mut())
-                        .expect("last tied dense-Qwen stage output embedding"),
+                        .expect("last tied Qwen stage output embedding"),
                     &hidden,
                     stream,
                 )?
@@ -12003,7 +12164,7 @@ impl MuseGlimmerStage {
     }
 }
 
-impl DenseQwenStage {
+impl QwenStage {
     fn forward_tensor_parallel(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -12017,7 +12178,7 @@ impl DenseQwenStage {
             Error::Parallel("tensor-sharded pipeline stage has no TP communicator".into())
         })?;
         validate_scheduled_pipeline_kv_cache(
-            "dense-Qwen TP+PP",
+            "Qwen TP+PP",
             self.range.clone(),
             &self.args.attention_schedule,
             caches,
@@ -12065,7 +12226,7 @@ impl DenseQwenStage {
             }
             None if expert_group.is_some() || expert_cache.is_some() => {
                 return Err(Error::Parallel(
-                    "dense-Qwen Cartesian stage has an expert communicator or cache without an ownership assignment"
+                    "Qwen Cartesian stage has an expert communicator or cache without an ownership assignment"
                         .into(),
                 ));
             }
@@ -12095,7 +12256,7 @@ impl DenseQwenStage {
                 let policy = *args
                     .attention_schedule
                     .get(global_layer)
-                    .expect("validated dense-Qwen TP+PP range");
+                    .expect("validated Qwen TP+PP range");
                 let mask = match explicit_mask {
                     Some(mask) => Some(mask),
                     None if policy.window().is_none() => full_mask,
@@ -12106,131 +12267,45 @@ impl DenseQwenStage {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Standard(cache),
                         ..
-                    } if *cached == global_layer => match expert_assignment.as_ref() {
-                        Some(assignment) => match expert_cache {
-                            Some(expert_cache) => {
-                                let expert_args = qwen_pipeline_local_expert_args(
-                                    &args,
-                                    parallel_layout.as_ref(),
-                                    global_layer,
-                                    "model.layers",
-                                )?;
-                                layer.forward_sparse_experts_tensor_parallel(
-                                    AttentionInput {
-                                        x: hidden,
-                                        mask,
-                                        cache: Some(cache),
-                                    },
-                                    group,
-                                    stream,
-                                    |hidden, ids, weights, stream| {
-                                        execute_pipeline_cached_qwen3(
-                                            &expert_args,
-                                            global_layer,
-                                            "model.layers",
-                                            hidden,
-                                            ids,
-                                            weights,
-                                            pass,
-                                            expert_cache,
-                                            assignment,
-                                            expert_group,
-                                            Some(group),
-                                            &mut self.routing_statistics,
-                                            stream,
-                                        )
-                                        .map_err(|error| Exception::custom(error.to_string()))
-                                    },
-                                )?
-                            }
-                            None => {
-                                let expert_group = expert_group.expect("validated EP group");
-                                layer.forward_tensor_expert_parallel(
-                                    hidden,
-                                    mask,
-                                    Some(cache),
-                                    assignment,
-                                    group,
-                                    expert_group,
-                                    &mut self.routing_statistics,
-                                    stream,
-                                )?
-                            }
-                        },
-                        None => layer.forward_tensor_parallel(
-                            hidden,
-                            mask,
-                            Some(cache),
-                            group,
-                            stream,
-                        )?,
-                    },
+                    } if *cached == global_layer => execute_qwen_pipeline_layer(
+                        layer,
+                        hidden,
+                        mask,
+                        cache,
+                        &args,
+                        parallel_layout.as_ref(),
+                        Some(group),
+                        expert_group,
+                        expert_assignment.as_ref(),
+                        expert_cache,
+                        pass,
+                        &mut self.routing_statistics,
+                        global_layer,
+                        stream,
+                    )?,
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Paged(cache),
                         ..
-                    } if *cached == global_layer => match expert_assignment.as_ref() {
-                        Some(assignment) => match expert_cache {
-                            Some(expert_cache) => {
-                                let expert_args = qwen_pipeline_local_expert_args(
-                                    &args,
-                                    parallel_layout.as_ref(),
-                                    global_layer,
-                                    "model.layers",
-                                )?;
-                                layer.forward_sparse_experts_tensor_parallel(
-                                    AttentionInput {
-                                        x: hidden,
-                                        mask,
-                                        cache: Some(cache),
-                                    },
-                                    group,
-                                    stream,
-                                    |hidden, ids, weights, stream| {
-                                        execute_pipeline_cached_qwen3(
-                                            &expert_args,
-                                            global_layer,
-                                            "model.layers",
-                                            hidden,
-                                            ids,
-                                            weights,
-                                            pass,
-                                            expert_cache,
-                                            assignment,
-                                            expert_group,
-                                            Some(group),
-                                            &mut self.routing_statistics,
-                                            stream,
-                                        )
-                                        .map_err(|error| Exception::custom(error.to_string()))
-                                    },
-                                )?
-                            }
-                            None => {
-                                let expert_group = expert_group.expect("validated EP group");
-                                layer.forward_tensor_expert_parallel(
-                                    hidden,
-                                    mask,
-                                    Some(cache),
-                                    assignment,
-                                    group,
-                                    expert_group,
-                                    &mut self.routing_statistics,
-                                    stream,
-                                )?
-                            }
-                        },
-                        None => layer.forward_tensor_parallel(
-                            hidden,
-                            mask,
-                            Some(cache),
-                            group,
-                            stream,
-                        )?,
-                    },
+                    } if *cached == global_layer => execute_qwen_pipeline_layer(
+                        layer,
+                        hidden,
+                        mask,
+                        cache,
+                        &args,
+                        parallel_layout.as_ref(),
+                        Some(group),
+                        expert_group,
+                        expert_assignment.as_ref(),
+                        expert_cache,
+                        pass,
+                        &mut self.routing_statistics,
+                        global_layer,
+                        stream,
+                    )?,
                     _ => {
                         return Err(Error::Parallel(format!(
-                            "dense-Qwen TP+PP cache does not match global layer {global_layer}"
+                            "Qwen TP+PP cache does not match global layer {global_layer}"
                         )))
                     }
                 };
@@ -12275,17 +12350,8 @@ impl DenseQwenStage {
             Error::Parallel("cached/EP pipeline stage has no rank-local expert assignment".into())
         })?;
         validate_pipeline_expert_dispatch(assignment, group, self.expert_cache.is_some())?;
-        let resident_group = if self.expert_cache.is_none() {
-            Some(group.ok_or_else(|| {
-                Error::Parallel(
-                    "resident expert-local pipeline execution requires an EP communicator".into(),
-                )
-            })?)
-        } else {
-            None
-        };
         validate_scheduled_pipeline_kv_cache(
-            "dense-Qwen PP+EP",
+            "Qwen PP+EP",
             self.range.clone(),
             &self.args.attention_schedule,
             caches,
@@ -12341,7 +12407,7 @@ impl DenseQwenStage {
                 let policy = *args
                     .attention_schedule
                     .get(global_layer)
-                    .expect("validated dense-Qwen PP+EP range");
+                    .expect("validated Qwen PP+EP range");
                 let mask = match explicit_mask {
                     Some(mask) => Some(mask),
                     None if policy.window().is_none() => full_mask,
@@ -12352,95 +12418,45 @@ impl DenseQwenStage {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Standard(cache),
                         ..
-                    } if *cached == global_layer => match expert_cache {
-                        Some(expert_cache) => layer.forward_sparse_experts(
-                            AttentionInput {
-                                x: hidden,
-                                mask,
-                                cache: Some(cache),
-                            },
-                            stream,
-                            |hidden, ids, weights, stream| {
-                                execute_pipeline_cached_qwen3(
-                                    &args,
-                                    global_layer,
-                                    "model.layers",
-                                    hidden,
-                                    ids,
-                                    weights,
-                                    pass,
-                                    expert_cache,
-                                    &expert_assignment,
-                                    group,
-                                    None,
-                                    &mut self.routing_statistics,
-                                    stream,
-                                )
-                                .map_err(|error| Exception::custom(error.to_string()))
-                            },
-                        )?,
-                        None => layer.forward_expert_parallel(
-                            AttentionInput {
-                                x: hidden,
-                                mask,
-                                cache: Some(cache),
-                            },
-                            &expert_assignment,
-                            resident_group.expect("validated resident EP group"),
-                            &mut self.routing_statistics,
-                            &format!("model.layers.{global_layer}"),
-                            None,
-                            stream,
-                        )?,
-                    },
+                    } if *cached == global_layer => execute_qwen_pipeline_layer(
+                        layer,
+                        hidden,
+                        mask,
+                        cache,
+                        &args,
+                        parallel_layout.as_ref(),
+                        None,
+                        group,
+                        Some(&expert_assignment),
+                        expert_cache,
+                        pass,
+                        &mut self.routing_statistics,
+                        global_layer,
+                        stream,
+                    )?,
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Paged(cache),
                         ..
-                    } if *cached == global_layer => match expert_cache {
-                        Some(expert_cache) => layer.forward_sparse_experts(
-                            AttentionInput {
-                                x: hidden,
-                                mask,
-                                cache: Some(cache),
-                            },
-                            stream,
-                            |hidden, ids, weights, stream| {
-                                execute_pipeline_cached_qwen3(
-                                    &args,
-                                    global_layer,
-                                    "model.layers",
-                                    hidden,
-                                    ids,
-                                    weights,
-                                    pass,
-                                    expert_cache,
-                                    &expert_assignment,
-                                    group,
-                                    None,
-                                    &mut self.routing_statistics,
-                                    stream,
-                                )
-                                .map_err(|error| Exception::custom(error.to_string()))
-                            },
-                        )?,
-                        None => layer.forward_expert_parallel(
-                            AttentionInput {
-                                x: hidden,
-                                mask,
-                                cache: Some(cache),
-                            },
-                            &expert_assignment,
-                            resident_group.expect("validated resident EP group"),
-                            &mut self.routing_statistics,
-                            &format!("model.layers.{global_layer}"),
-                            None,
-                            stream,
-                        )?,
-                    },
+                    } if *cached == global_layer => execute_qwen_pipeline_layer(
+                        layer,
+                        hidden,
+                        mask,
+                        cache,
+                        &args,
+                        parallel_layout.as_ref(),
+                        None,
+                        group,
+                        Some(&expert_assignment),
+                        expert_cache,
+                        pass,
+                        &mut self.routing_statistics,
+                        global_layer,
+                        stream,
+                    )?,
                     _ => {
                         return Err(Error::Parallel(format!(
-                            "dense-Qwen PP+EP cache does not match global layer {global_layer}"
+                            "Qwen PP+EP cache does not match global layer {global_layer}"
                         )))
                     }
                 };
@@ -12475,23 +12491,15 @@ impl DenseQwenStage {
 
 #[allow(clippy::too_many_arguments)]
 fn qwen_pipeline_local_expert_args(
-    args: &dense_qwen::DecoderConfig,
+    args: &eredu_architectures::qwen::ModelArgs,
     layout: Option<&eredu_runtime::LocalModelLayout>,
     global_layer: usize,
-    layer_root: &str,
-) -> Result<dense_qwen::DecoderConfig, Error> {
-    let mut local = args.clone();
-    if let Some(layout) = layout {
-        let name = format!("{layer_root}.{global_layer}.mlp.experts.gate_up_proj");
-        let tensor = layout.tensor(&name).ok_or_else(|| {
-            Error::Parallel(format!(
-                "missing TP semantic layout for cached pipeline experts at {name}"
-            ))
-        })?;
-        local.moe_intermediate_size = i32::try_from(tensor.local_shape()[1] / 2)
-            .map_err(|_| Error::Parallel("local Qwen expert width exceeds i32".into()))?;
+) -> Result<eredu_architectures::qwen::ModelArgs, Error> {
+    match layout {
+        Some(layout) => eredu_architectures::qwen::local_block_args(args, global_layer, layout)
+            .map_err(Into::into),
+        None => Ok(args.clone()),
     }
-    Ok(local)
 }
 
 fn validate_pipeline_expert_dispatch(
@@ -12528,9 +12536,8 @@ fn validate_pipeline_expert_dispatch(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_qwen3(
-    args: &dense_qwen::DecoderConfig,
+    args: &eredu_architectures::qwen::ModelArgs,
     global_layer: usize,
-    layer_root: &str,
     hidden: &Array,
     expert_ids: &Array,
     weights: &Array,
@@ -12545,15 +12552,7 @@ fn execute_pipeline_cached_qwen3(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        super::expert::execute_cached_qwen3_at(
-            args,
-            global_layer,
-            layer_root,
-            routes,
-            pass,
-            cache,
-            stream,
-        )
+        super::expert::execute_cached_neutral_qwen3(args, global_layer, routes, pass, cache, stream)
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(

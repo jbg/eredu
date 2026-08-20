@@ -6,5 +6,11 @@
 
 #![warn(missing_docs)]
 
+/// Shared decoder mechanics used by backend-neutral text architectures.
+pub mod decoder;
+
 /// Llama and Mistral-compatible decoder architecture.
 pub mod llama;
+
+/// Qwen2, Qwen3, and Qwen3-MoE text decoder architecture.
+pub mod qwen;

@@ -2,6 +2,7 @@
 
 use eredu_checkpoint::WeightQuantization;
 
+use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use safemlx::{
     error::Exception,
     macros::ModuleParameters,
@@ -20,7 +21,6 @@ use safemlx::{
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::quantization::{quantize_tensor, QuantizedTensor},
-    backend::mlx::runtime::execution::inspection::ActivationObserver,
 };
 
 use super::layers::{relu2, silu};
@@ -188,7 +188,7 @@ pub fn quantize_expert_bank(
 /// Router score transform used before top-k expert selection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TopKRouterScoreFunction {
-    /// Softmax scores, as used by Qwen MoE routers.
+    /// Softmax scores before top-k selection.
     Softmax,
     /// Sigmoid scores, as used by Nemotron/DeepSeek-style routers.
     Sigmoid,
@@ -436,6 +436,18 @@ impl TopKRouter {
         selection_bias: Option<&Array>,
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
+        let output =
+            self.forward_routes_with_selection_bias(hidden_states, selection_bias, stream)?;
+        Ok((output.indices, output.weights))
+    }
+
+    /// Returns selected ids, pre-normalization selected scores, and final route weights.
+    pub fn forward_routes_with_selection_bias(
+        &mut self,
+        hidden_states: &Array,
+        selection_bias: Option<&Array>,
+        stream: &Stream,
+    ) -> Result<TopKRouterOutput, Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
         let logits = if let Some(iquant) = self.iquant {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ router format");
@@ -487,6 +499,7 @@ impl TopKRouter {
 
         let top_k_index = self.topk_indices(&scores_for_choice, stream)?;
         let mut top_k_weights = take_along_axis(&scores, &top_k_index, -1, stream)?;
+        let selected_scores = top_k_weights.clone();
         if self.norm_topk_prob {
             let mut denominator = sum_axis(&top_k_weights, -1, true, stream)?;
             if self.normalization_epsilon != 0.0 {
@@ -499,7 +512,11 @@ impl TopKRouter {
             top_k_weights =
                 top_k_weights.multiply(Array::from_f32(self.routed_scaling_factor), stream)?;
         }
-        Ok((top_k_index, top_k_weights))
+        Ok(TopKRouterOutput {
+            indices: top_k_index,
+            scores: selected_scores,
+            weights: top_k_weights,
+        })
     }
 
     /// Computes routing weights for caller-provided global expert ids.
@@ -574,7 +591,7 @@ impl TopKRouter {
         hidden_states: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut dyn ActivationObserver,
+        observer: &mut dyn RuntimeActivationObserver<Array, Exception>,
     ) -> Result<TopKRouterOutput, Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
         let logits = if let Some(scales) = self.scales.as_ref() {

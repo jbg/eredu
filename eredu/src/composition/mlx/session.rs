@@ -4,6 +4,7 @@ use eredu_core::{
     BackendSession, Completion, ModelRuntime, Submission, TextGenerationBackend,
     TextGenerationConfig, TokenFilter, TokenOutput,
 };
+use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::CausalModel;
 use safemlx::{
     error::Exception,
@@ -18,7 +19,6 @@ use crate::backend::mlx::runtime::media::{ModelProcessor, PreparedModelInput};
 use crate::core::generation::MtpConfig;
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::runtime::execution::inspection::ActivationObserver,
     backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
     backend::mlx::runtime::media::input,
     composition::mlx_architectures::distributed::{
@@ -680,7 +680,7 @@ impl<'a> MlxModelSession<'a> {
         mask: Option<&Array>,
         cache: &mut ModelCache,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
         let result = match (model, cache) {
             (Model::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
@@ -702,11 +702,8 @@ impl<'a> MlxModelSession<'a> {
             (Model::Llama(model), ModelCache::Llama(cache)) => {
                 model.forward_with_observer(input_tokens, mask, cache, stream, observer)
             }
-            (Model::DenseQwen(model), ModelCache::KeyValue(cache)) => {
+            (Model::Qwen(model), ModelCache::Qwen(cache)) => {
                 model.forward_with_observer(input_tokens, mask, cache, stream, observer)
-            }
-            (Model::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
-                model.forward_paged_with_observer(input_tokens, mask, cache, stream, observer)
             }
             (Model::MuseGlimmer(model), ModelCache::KeyValue(cache)) => {
                 model.forward_with_observer(input_tokens, mask, cache, stream, observer)
@@ -746,7 +743,7 @@ impl<'a> MlxModelSession<'a> {
         &mut self,
         backend: &MlxBackend<'a>,
         input: MlxModelInput,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Submission<Array, MlxCompletion>, Error> {
         match &mut self.inner {
             MlxSessionKind::Complete(model, cache) => Self::submit_complete_prefill_with_observer(
@@ -769,7 +766,7 @@ impl<'a> MlxModelSession<'a> {
         input: MlxModelInput,
         cache: &mut ModelCache,
         stream: &Stream,
-        observer: &mut impl ActivationObserver,
+        observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Submission<Array, MlxCompletion>, Error> {
         let output = input.with_borrowed(|input| {
             if let (Model::Gemma4(model), ModelCache::Gemma4(cache)) = (&mut *model, &mut *cache) {
@@ -1107,12 +1104,7 @@ fn prefill_model(
         (Model::NemotronH(model), ModelCache::NemotronH(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::DenseQwen(model), ModelCache::KeyValue(cache)) => {
-            prefill_pair(model, cache, input, stream)
-        }
-        (Model::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
-            prefill_pair(model, cache, input, stream)
-        }
+        (Model::Qwen(model), ModelCache::Qwen(cache)) => prefill_pair(model, cache, input, stream),
         (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
         | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => {
             prefill_pair(model, cache, input, stream)
@@ -1169,12 +1161,7 @@ fn decode_model(
         (Model::NemotronH(model), ModelCache::NemotronH(cache)) => {
             decode_pair(model, cache, input, stream)
         }
-        (Model::DenseQwen(model), ModelCache::KeyValue(cache)) => {
-            decode_pair(model, cache, input, stream)
-        }
-        (Model::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
-            decode_pair(model, cache, input, stream)
-        }
+        (Model::Qwen(model), ModelCache::Qwen(cache)) => decode_pair(model, cache, input, stream),
         (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
         | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => {
             decode_pair(model, cache, input, stream)
@@ -1216,46 +1203,6 @@ fn last_token_logits(logits: Array, stream: &Stream) -> Result<Array, Error> {
     logits
         .try_index_device((.., -1, ..), stream)
         .map_err(Into::into)
-}
-
-fn with_dense_qwen_cache<T>(
-    cache: &mut ModelCache,
-    layout: eredu_runtime::StateLayout,
-    execute: impl FnOnce(
-        &mut crate::composition::mlx_architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache,
-    ) -> Result<T, Error>,
-) -> Result<T, Error> {
-    use crate::composition::mlx_architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache;
-    let mut owned = match cache {
-        ModelCache::KeyValue(values) => {
-            DenseQwenLayerwiseCache::concat(layout.clone(), std::mem::take(values))
-        }
-        ModelCache::PagedKeyValue(values) => {
-            DenseQwenLayerwiseCache::paged(layout, std::mem::take(values))
-        }
-        _ => {
-            return Err(Error::UnsupportedArchitecture(
-                "dense Qwen cache does not match model".into(),
-            ))
-        }
-    };
-    let result = execute(&mut owned);
-    match (cache, owned) {
-        (
-            ModelCache::KeyValue(values),
-            DenseQwenLayerwiseCache::Concat {
-                caches: restored, ..
-            },
-        ) => *values = restored,
-        (
-            ModelCache::PagedKeyValue(values),
-            DenseQwenLayerwiseCache::Paged {
-                caches: restored, ..
-            },
-        ) => *values = restored,
-        _ => unreachable!("dense Qwen tensor-parallel cache wrapper changed variants"),
-    }
-    result
 }
 
 fn with_muse_cache<T>(
@@ -1388,12 +1335,9 @@ fn forward_model_tensor_parallel(
         (Model::Gemma4(model), ModelCache::Gemma4(cache)) => {
             model.decode_tensor_parallel(input, cache, group, stream)
         }
-        (
-            Model::DenseQwen(model),
-            cache @ (ModelCache::KeyValue(_) | ModelCache::PagedKeyValue(_)),
-        ) => with_dense_qwen_cache(cache, model.cache_layout()?, |cache| {
-            model.forward_tensor_parallel(input, None, cache, group, stream)
-        }),
+        (Model::Qwen(model), ModelCache::Qwen(cache)) => {
+            model.forward_tensor_parallel(input, cache, group, stream)
+        }
         (
             Model::MuseGlimmer(model),
             cache @ (ModelCache::KeyValue(_) | ModelCache::PagedKeyValue(_)),
