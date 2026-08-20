@@ -254,6 +254,19 @@ impl RoutingOperator<ReferenceTensor> for ReferenceLinear {
             route_weights: routes,
         })
     }
+
+    fn route_selected(
+        &mut self,
+        _input: &ReferenceTensor,
+        expert_ids: &ReferenceTensor,
+        _: &(),
+    ) -> Result<RoutingResult<ReferenceTensor>, Error> {
+        Ok(RoutingResult {
+            expert_ids: expert_ids.clone(),
+            selected_scores: expert_ids.clone(),
+            route_weights: expert_ids.clone(),
+        })
+    }
 }
 
 impl SwiGluExpertBankOperator<ReferenceTensor> for ReferenceLinear {
@@ -398,6 +411,15 @@ impl NeuralBackend for ReferenceBackend {
     }
     fn silu(input: Self::Tensor, _: &()) -> Result<Self::Tensor, Error> {
         Ok(input)
+    }
+
+    fn swiglu(
+        gate: Self::Tensor,
+        _up: Self::Tensor,
+        _limit: Option<eredu_nn::SwiGluLimit>,
+        _: &(),
+    ) -> Result<Self::Tensor, Error> {
+        Ok(gate)
     }
     fn attention(
         queries: Self::Tensor,

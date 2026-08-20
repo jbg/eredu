@@ -18,8 +18,6 @@ use crate::backend::mlx::runtime::generation::sampler::SpeculativeSampler;
 use crate::backend::mlx::runtime::media::input;
 use crate::composition::mlx::speculative::{MlxDrafter, MtpExecutionStreams};
 use crate::composition::mlx_architectures::{
-    deepseek_v3::model as deepseek_v3,
-    deepseek_v4::model as deepseek_v4,
     gemma4::assistant as gemma4_assistant,
     gemma4::model as gemma4,
     gpt_oss::model as gpt_oss,
@@ -40,18 +38,8 @@ use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 /// Loaded model value for any architecture supported by this crate.
 pub enum Model {
-    /// DeepSeek-V3/R1 model.
-    DeepSeekV3(
-        crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseModel,
-    ),
-    /// DeepSeek-V4 target model.
-    DeepSeekV4(Box<crate::composition::mlx_architectures::deepseek_v4::model::Model>),
-    /// DeepSeek-V4 model using generalized bounded residency.
-    DeepSeekV4Layerwise(
-        Box<
-            crate::composition::mlx_architectures::deepseek_v4::layerwise::DeepSeekV4LayerwiseModel,
-        >,
-    ),
+    /// Neutral DeepSeek-V3/V4 architecture with policy-selected residency.
+    DeepSeek(Box<crate::composition::deepseek::DeepSeekModel>),
     /// Gemma 4 text and multimodal model.
     Gemma4(Box<crate::composition::mlx_architectures::gemma4::layerwise::Gemma4LayerwiseModel>),
     /// OpenAI GPT-OSS model.
@@ -95,10 +83,9 @@ impl Model {
         &self,
     ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
         match self {
+            Self::DeepSeek(_) => None,
             Self::Llama(model) => model.parallel_info(),
             Self::MuseGlimmer(model) => model.parallel_info(),
-            Self::DeepSeekV3(model) => model.parallel_info(),
-            Self::DeepSeekV4(_) | Self::DeepSeekV4Layerwise(_) => None,
             Self::GptOss(model) => model.parallel_info(),
             Self::Qwen(model) => model.parallel_info(),
             Self::KimiLinear(model) => model.parallel_info(),
@@ -114,17 +101,11 @@ impl Model {
     /// Reports how this model architecture exposes MTP weights.
     pub fn mtp_capability(&self) -> MtpCapability {
         match self {
+            Self::DeepSeek(model) if model.mtp_len() > 0 => MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded,
+            },
             Self::Gemma4(_) | Self::MuseGlimmer(_) => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Separate,
-            },
-            Self::DeepSeekV3(model) if model.mtp_len() > 0 => MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
-            },
-            Self::DeepSeekV4(model) if model.mtp_len() > 0 => MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
-            },
-            Self::DeepSeekV4Layerwise(model) if model.mtp_len() > 0 => MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
             },
             Self::Inkling(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
@@ -262,28 +243,6 @@ impl Model {
             )
             .map_err(|error| Exception::custom(error.to_string()))?;
         let result = match (self, cache) {
-            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
-                let mut target =
-                    crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekTensorMtpTarget::new(
-                        model,
-                        tensor_group,
-                    );
-                let mut executor =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        &mut target,
-                    );
-                crate::composition::mlx::speculative::scheduler::generate_tokens(
-                    &mut executor,
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    &mut synchronized,
-                    MtpExecutionStreams::single(stream),
-                    MtpSchedulerOptions::default(),
-                    |_| Ok(()),
-                )
-            }
             (Self::Inkling(model), ModelCache::Inkling(cache)) => {
                 let mut target =
                     crate::composition::mlx_architectures::inkling::layerwise::InklingTensorMtpTarget::new(
@@ -399,41 +358,7 @@ impl Model {
         F: FnMut(u32) -> Result<(), Exception>,
     {
         match (self, cache) {
-            (Self::DeepSeekV3(target), ModelCache::DeepSeekV3(cache)) => {
-                let mut executor =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        target,
-                    );
-                crate::composition::mlx::speculative::scheduler::generate_tokens(
-                    &mut executor,
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    sampler,
-                    MtpExecutionStreams::single(stream),
-                    MtpSchedulerOptions::default(),
-                    on_token,
-                )
-            }
-            (Self::DeepSeekV4(target), ModelCache::DeepSeekV4(cache)) => {
-                let mut executor =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        target.as_mut(),
-                    );
-                crate::composition::mlx::speculative::scheduler::generate_tokens(
-                    &mut executor,
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    sampler,
-                    MtpExecutionStreams::single(stream),
-                    MtpSchedulerOptions::default(),
-                    on_token,
-                )
-            }
-            (Self::DeepSeekV4Layerwise(target), ModelCache::DeepSeekV4(cache)) => {
+            (Self::DeepSeek(target), ModelCache::DeepSeek(cache)) => {
                 let mut executor =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target.as_mut(),
@@ -529,45 +454,7 @@ impl Model {
         F: FnMut(SemanticEvent),
     {
         match (self, cache) {
-            (Self::DeepSeekV3(target), ModelCache::DeepSeekV3(cache)) => {
-                let mut executor =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        target,
-                    );
-                crate::composition::mlx::speculative::scheduler::generate_semantic(
-                    &mut executor,
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    sampler,
-                    semantic,
-                    cancellation,
-                    MtpExecutionStreams::single(stream),
-                    scheduler_options,
-                    on_event,
-                )
-            }
-            (Self::DeepSeekV4(target), ModelCache::DeepSeekV4(cache)) => {
-                let mut executor =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        target.as_mut(),
-                    );
-                crate::composition::mlx::speculative::scheduler::generate_semantic(
-                    &mut executor,
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    sampler,
-                    semantic,
-                    cancellation,
-                    MtpExecutionStreams::single(stream),
-                    scheduler_options,
-                    on_event,
-                )
-            }
-            (Self::DeepSeekV4Layerwise(target), ModelCache::DeepSeekV4(cache)) => {
+            (Self::DeepSeek(target), ModelCache::DeepSeek(cache)) => {
                 let mut executor =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target.as_mut(),
@@ -655,9 +542,7 @@ impl Model {
     /// Returns residency telemetry when this model uses bounded layer execution.
     pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
         match self {
-            Self::DeepSeekV3(model) => Ok(Some(model.residency_report()?)),
-            Self::DeepSeekV4(_) => Ok(None),
-            Self::DeepSeekV4Layerwise(model) => Ok(Some(model.residency_report()?)),
+            Self::DeepSeek(model) => Ok(Some(model.residency_report()?)),
             Self::Gemma4(model) => Ok(Some(model.residency_report()?)),
             Self::Inkling(model) => Ok(Some(model.residency_report()?)),
             Self::KimiLinear(model) => Ok(Some(model.residency_report()?)),
@@ -677,9 +562,7 @@ impl Model {
         &self,
     ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
         match self {
-            Self::DeepSeekV3(model) => model.dense_stream_report(),
-            Self::DeepSeekV4(_) => Ok(None),
-            Self::DeepSeekV4Layerwise(model) => model.dense_stream_report(),
+            Self::DeepSeek(model) => model.dense_stream_report(),
             Self::Gemma4(model) => model.dense_stream_report(),
             Self::Inkling(model) => model.dense_stream_report(),
             Self::KimiLinear(model) => model.dense_stream_report(),
@@ -702,8 +585,7 @@ impl Model {
         Error,
     > {
         match self {
-            Self::DeepSeekV3(model) => model.expert_cache_report(),
-            Self::DeepSeekV4Layerwise(model) => model.expert_cache_report(),
+            Self::DeepSeek(model) => model.expert_cache_report(),
             Self::Gemma4(model) => model.expert_cache_report(),
             Self::KimiLinear(model) => model.expert_cache_report(),
             Self::GptOss(model) => model.expert_cache_report(),
@@ -720,9 +602,7 @@ impl Model {
     /// Returns the effective model type used for dispatch.
     pub fn model_type(&self) -> &str {
         match self {
-            Self::DeepSeekV3(model) => &model.args().model_type,
-            Self::DeepSeekV4(model) => &model.args.model_type,
-            Self::DeepSeekV4Layerwise(model) => &model.args().model_type,
+            Self::DeepSeek(model) => model.model_type(),
             Self::Gemma4(model) => &model.args().model_type,
             Self::GptOss(model) => &model.args().model_type,
             Self::Inkling(model) => &model.args().model_type,
@@ -749,19 +629,11 @@ impl Model {
     /// Returns the canonical cache-relevant architecture identity derived from the loaded model.
     pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Exception> {
         match self {
+            Self::DeepSeek(model) => Ok(model.architecture_fingerprint()),
             Self::Gemma4(model) => Ok(gemma4::prompt_cache_architecture_fingerprint(model.args())),
             Self::Llama(model) => {
                 Ok(eredu_architectures::llama::prompt_cache_architecture_fingerprint(model.args()))
             }
-            Self::DeepSeekV3(model) => Ok(deepseek_v3::prompt_cache_architecture_fingerprint(
-                model.args(),
-            )),
-            Self::DeepSeekV4(model) => Ok(deepseek_v4::prompt_cache_architecture_fingerprint(
-                &model.args,
-            )),
-            Self::DeepSeekV4Layerwise(model) => Ok(
-                deepseek_v4::prompt_cache_architecture_fingerprint(model.args()),
-            ),
             Self::GptOss(model) => Ok(gpt_oss::prompt_cache_architecture_fingerprint(model.args())),
             Self::Inkling(model) => {
                 Ok(inkling::prompt_cache_architecture_fingerprint(model.args()))
@@ -789,10 +661,8 @@ impl Model {
     /// Returns the exact ordered prompt-cache state and attention layout.
     pub fn prompt_cache_layer_layout(&self) -> Result<LayerSchedule<LayerCachePolicy>, Exception> {
         match self {
+            Self::DeepSeek(model) => model.state_layout().map(|layout| layout.layers().clone()),
             Self::Llama(model) => model.prompt_cache_layer_layout(),
-            Self::DeepSeekV3(model) => model.prompt_cache_layer_layout(),
-            Self::DeepSeekV4(model) => model.prompt_cache_layer_layout(),
-            Self::DeepSeekV4Layerwise(model) => model.prompt_cache_layer_layout(),
             Self::GptOss(model) => model.prompt_cache_layer_layout(),
             Self::Qwen(model) => model.prompt_cache_layer_layout(),
             Self::MuseGlimmer(model) => model.prompt_cache_layer_layout(),
@@ -812,15 +682,8 @@ impl Model {
     /// may trail the target frontier.
     pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Exception> {
         match self {
-            Self::DeepSeekV4(model) => deepseek_v4::prompt_cache_model_identity(
-                &model.args,
-                crate::PromptCacheTopology::default(),
-            )
-            .map(|identity| identity.layer_prefix_offsets)
-            .map_err(|error| Exception::custom(error.to_string())),
-            Self::DeepSeekV4Layerwise(model) => model
-                .prompt_cache_model_identity()
-                .map(|identity| identity.layer_prefix_offsets)
+            Self::DeepSeek(model) => model
+                .prompt_cache_layer_prefix_offsets()
                 .map_err(|error| Exception::custom(error.to_string())),
             _ => Ok(vec![0; self.prompt_cache_layer_layout()?.len()]),
         }
@@ -866,16 +729,10 @@ impl Model {
     /// Creates an empty cache value appropriate for this model.
     pub fn new_cache(&self) -> ModelCache {
         match self {
-            Self::DeepSeekV3(model) => ModelCache::DeepSeekV3(model.new_cache()),
-            Self::DeepSeekV4(model) => ModelCache::DeepSeekV4(
+            Self::DeepSeek(model) => ModelCache::DeepSeek(
                 model
-                    .new_cache()
-                    .expect("validated DeepSeek-V4 cache geometry"),
-            ),
-            Self::DeepSeekV4Layerwise(model) => ModelCache::DeepSeekV4(
-                model
-                    .new_cache()
-                    .expect("validated layerwise DeepSeek-V4 cache geometry"),
+                    .new_state()
+                    .expect("validated DeepSeek state geometry"),
             ),
             Self::Gemma4(model) => ModelCache::Gemma4(model.new_cache()),
             Self::GptOss(model) => ModelCache::GptOss(model.new_cache()),
@@ -901,21 +758,13 @@ impl Model {
         match policy {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
             CacheResidencyPolicy::Paged(options) => match self {
+                Self::DeepSeek(model) => model
+                    .new_state_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::DeepSeek)
+                    .map_err(|error| Exception::custom(error.to_string())),
                 Self::Llama(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ModelCache::Llama)
-                    .map_err(|error| Exception::custom(error.to_string())),
-                Self::DeepSeekV3(model) => model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ModelCache::DeepSeekV3)
-                    .map_err(|error| Exception::custom(error.to_string())),
-                Self::DeepSeekV4(model) => model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ModelCache::DeepSeekV4)
-                    .map_err(|error| Exception::custom(error.to_string())),
-                Self::DeepSeekV4Layerwise(model) => model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ModelCache::DeepSeekV4)
                     .map_err(|error| Exception::custom(error.to_string())),
                 Self::KimiLinear(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
@@ -984,10 +833,11 @@ impl Model {
             };
         }
         match self {
+            Self::DeepSeek(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                .map(|(state, manifest)| (ModelCache::DeepSeek(state), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::Llama(model) => load!(model, ModelCache::Llama),
-            Self::DeepSeekV3(model) => load!(model, ModelCache::DeepSeekV3),
-            Self::DeepSeekV4(model) => load!(model, ModelCache::DeepSeekV4),
-            Self::DeepSeekV4Layerwise(model) => load!(model, ModelCache::DeepSeekV4),
             Self::GptOss(model) => load!(model, ModelCache::GptOss),
             Self::Qwen(model) => load!(model, ModelCache::Qwen),
             Self::MuseGlimmer(model) => load!(model, ModelCache::KeyValue),
@@ -1014,43 +864,12 @@ impl Model {
         stream: &Stream,
     ) -> Result<PromptCacheManifest, Exception> {
         match (self, &mut *cache) {
+            (Self::DeepSeek(model), ModelCache::DeepSeek(state)) => {
+                return model
+                    .save_prompt_cache(state, &destination, descriptor, prefix_token_ids, options)
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
             (Self::Llama(model), ModelCache::Llama(cache)) => {
-                return model
-                    .save_prompt_cache(
-                        cache,
-                        &destination,
-                        descriptor,
-                        prefix_token_ids,
-                        options,
-                        stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()));
-            }
-            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
-                return model
-                    .save_prompt_cache(
-                        cache,
-                        &destination,
-                        descriptor,
-                        prefix_token_ids,
-                        options,
-                        stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()));
-            }
-            (Self::DeepSeekV4(model), ModelCache::DeepSeekV4(cache)) => {
-                return model
-                    .save_prompt_cache(
-                        cache,
-                        &destination,
-                        descriptor,
-                        prefix_token_ids,
-                        options,
-                        stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()));
-            }
-            (Self::DeepSeekV4Layerwise(model), ModelCache::DeepSeekV4(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1188,9 +1007,8 @@ impl Model {
         }
         let layer_layout = self.prompt_cache_layer_layout()?;
         let model_family = match self {
+            Self::DeepSeek(model) => model.model_type(),
             Self::Llama(_) => "llama",
-            Self::DeepSeekV3(_) => "deepseek_v3",
-            Self::DeepSeekV4(_) | Self::DeepSeekV4Layerwise(_) => "deepseek_v4",
             Self::GptOss(_) => "gpt_oss",
             Self::Qwen(_) => "qwen",
             Self::MuseGlimmer(_) => "muse_glimmer",
@@ -1261,10 +1079,8 @@ impl Model {
 /// Cache value matching a [`Model`] variant.
 #[derive(Clone)]
 pub enum ModelCache {
-    /// Compressed latent MLA cache for DeepSeek-V3/R1.
-    DeepSeekV3(deepseek_v3::Cache),
-    /// Local and compressed attention caches for DeepSeek-V4.
-    DeepSeekV4(crate::composition::mlx_architectures::deepseek_v4::model::Cache),
+    /// Architecture-declared DeepSeek state.
+    DeepSeek(crate::composition::deepseek::DeepSeekState),
     /// Gemma 4 generation cache.
     Gemma4(gemma4::Cache),
     /// GPT-OSS cache following its canonical per-layer attention schedule.
@@ -1365,6 +1181,7 @@ impl ModelCache {
     /// Returns aggregate cache-residency telemetry when paging is active.
     pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
         match self {
+            Self::DeepSeek(cache) => cache.residency_report(),
             Self::PagedKeyValue(caches) => caches
                 .iter()
                 .flatten()
@@ -1374,8 +1191,6 @@ impl ModelCache {
             Self::Llama(cache) => cache
                 .residency_report()
                 .map_err(|error| Exception::custom(error.to_string())),
-            Self::DeepSeekV3(cache) => cache.residency_report(),
-            Self::DeepSeekV4(cache) => cache.residency_report(),
             Self::GptOss(cache) => cache.residency_report(),
             Self::Inkling(cache) => cache.residency_report(),
             Self::KimiLinear(cache) => cache.residency_report(),

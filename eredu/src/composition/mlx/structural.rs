@@ -15,8 +15,6 @@ use crate::backend::mlx::{error::Error, runtime::checkpoint::store::SafetensorsW
 use crate::composition::{
     llama_checkpoint,
     mlx_architectures::{
-        deepseek_v3::checkpoint as deepseek_v3_checkpoint,
-        deepseek_v4::checkpoint as deepseek_v4_checkpoint,
         gemma4::{checkpoint as gemma4_checkpoint, model as gemma4},
         gpt_oss::checkpoint as gpt_oss_checkpoint,
         inkling::{checkpoint as inkling_checkpoint, model as inkling},
@@ -170,12 +168,8 @@ pub(crate) fn validate_safetensors(
 ) -> StructuralValidation {
     let validation = match safetensors_policy(kind) {
         StructuralValidationPolicy::Exact => match kind {
-            ModelKind::DeepSeekV3 => deepseek_v3_checkpoint::validate_safetensors(
-                config,
-                store,
-                !options.weight_residency.is_fully_resident(),
-            ),
-            ModelKind::DeepSeekV4 => deepseek_v4_checkpoint::validate_safetensors(config, store),
+            ModelKind::DeepSeekV3 => validate_neutral_deepseek_v3_safetensors(config, store),
+            ModelKind::DeepSeekV4 => validate_neutral_deepseek_v4_safetensors(config, store),
             ModelKind::Gemma4 => gemma4_checkpoint::validate_safetensors(
                 config,
                 store,
@@ -239,12 +233,8 @@ pub(crate) fn validate_gguf(
 ) -> StructuralValidation {
     let validation = match gguf_policy(architecture) {
         StructuralValidationPolicy::Exact => match architecture {
-            GgufArchitecture::DeepSeek2 => {
-                deepseek_v3_checkpoint::validate_gguf(checkpoint, metadata)
-            }
-            GgufArchitecture::DeepSeek4 => {
-                deepseek_v4_checkpoint::validate_gguf(checkpoint, metadata)
-            }
+            GgufArchitecture::DeepSeek2 => validate_neutral_deepseek_v3_gguf(checkpoint, metadata),
+            GgufArchitecture::DeepSeek4 => validate_neutral_deepseek_v4_gguf(checkpoint, metadata),
             GgufArchitecture::GptOss => gpt_oss_checkpoint::validate_gguf(checkpoint, metadata),
             GgufArchitecture::Gemma4 => {
                 if let Err(error) = architecture.validate_load_policy(options) {
@@ -339,6 +329,89 @@ fn validate_neutral_qwen_safetensors(
         Err(error) => return invalid_geometry(error),
     };
     eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+fn validate_neutral_deepseek_v3_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let args = match eredu_architectures::deepseek::parse_v3_config(config) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::deepseek::v3_safetensors_plan(&args, true) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+fn validate_neutral_deepseek_v4_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let args = match eredu_architectures::deepseek::parse_v4_config(config) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::deepseek::v4_safetensors_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+struct NeutralDeepSeekGgufCatalog<'a>(&'a GgufCheckpoint);
+
+impl eredu_architectures::deepseek::GgufTensorCatalog for NeutralDeepSeekGgufCatalog<'_> {
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains_gguf_tensor(name)
+    }
+}
+
+fn validate_neutral_deepseek_v3_gguf(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    let args = match eredu_architectures::deepseek::parse_v3_gguf(
+        &NeutralDeepSeekGgufCatalog(checkpoint),
+        metadata,
+    ) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    if let Err(error) = checkpoint
+        .catalog()
+        .translated_outputs(eredu_architectures::deepseek::translate_v3_gguf_weight_name)
+    {
+        return invalid_geometry(error.to_string());
+    }
+    let plan = match eredu_architectures::deepseek::v3_gguf_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
+}
+
+fn validate_neutral_deepseek_v4_gguf(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    let args = match eredu_architectures::deepseek::parse_v4_gguf(metadata) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    if let Err(error) = checkpoint
+        .catalog()
+        .translated_outputs(eredu_architectures::deepseek::translate_v4_gguf_weight_name)
+    {
+        return invalid_geometry(error.to_string());
+    }
+    let plan = match eredu_architectures::deepseek::v4_gguf_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
 }
 
 struct NeutralQwenGgufCatalog<'a>(&'a GgufCheckpoint);

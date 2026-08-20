@@ -15,6 +15,10 @@ mod storage;
 mod telemetry;
 mod worker;
 
+pub use executor::{
+    CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
+    CacheIoExecutionStateError, CacheIoPreparation, CacheIoStartDisposition,
+};
 pub use lifecycle::{CacheBlockLifecycle, CacheLifecycleError, MutableCacheTail};
 pub use persistence::{
     finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
@@ -678,7 +682,3 @@ mod tests {
         ));
     }
 }
-pub use executor::{
-    CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
-    CacheIoExecutionStateError, CacheIoPreparation, CacheIoStartDisposition,
-};

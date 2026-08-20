@@ -245,7 +245,7 @@ pub struct StateTensorPolicy {
     /// Accepted dtype family.
     pub dtype: StateTensorDtype,
     /// Authoritative live-state residency behavior.
-    pub residency: MutableStateResidency,
+    pub residency: StateResidencyClass,
     /// Condition under which persisted caches materialize this tensor.
     pub presence: StateTensorPresence,
 }
@@ -256,6 +256,65 @@ pub struct StateTensorPolicy {
 pub enum StateTensorOwner {
     /// Architecture-global decoder layer index.
     Layer(usize),
+}
+
+/// Stable semantic identity for one independently managed runtime component.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateComponentRole {
+    /// Ordinary attention keys.
+    AttentionKeys,
+    /// Ordinary attention values.
+    AttentionValues,
+    /// Head-independent compressed latent key/value state.
+    CompressedLatent,
+    /// Rotary keys paired with compressed latent state.
+    RotaryKeys,
+    /// One fixed-size or pooling tensor.
+    Fixed(StateTensorRole),
+}
+
+impl StateComponentRole {
+    /// Returns a stable checkpoint/runtime component name.
+    pub fn stable_name(self) -> String {
+        match self {
+            Self::AttentionKeys => "attention.keys".into(),
+            Self::AttentionValues => "attention.values".into(),
+            Self::CompressedLatent => "attention.compressed_latent".into(),
+            Self::RotaryKeys => "attention.rotary_keys".into(),
+            Self::Fixed(StateTensorRole::Convolution { slot }) => {
+                format!("state.convolution.{slot}")
+            }
+            Self::Fixed(StateTensorRole::Recurrent) => "state.recurrent".into(),
+            Self::Fixed(StateTensorRole::PrefixEmbedding) => "state.prefix_embedding".into(),
+            Self::Fixed(StateTensorRole::PositionDelta) => "state.position_delta".into(),
+            Self::Fixed(StateTensorRole::Pooling { stream, component }) => {
+                let component = match component {
+                    PoolingStateComponent::PendingValues => "pending_values",
+                    PoolingStateComponent::PendingGates => "pending_gates",
+                    PoolingStateComponent::Pooled => "pooled",
+                    PoolingStateComponent::OverlapValues => "overlap_values",
+                    PoolingStateComponent::OverlapGates => "overlap_gates",
+                };
+                format!("state.pooling.{stream}.{component}")
+            }
+        }
+    }
+}
+
+/// Symbolic geometry and persistence behavior of one named state component.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct StateComponentPolicy {
+    /// Stable semantic role.
+    pub role: StateComponentRole,
+    /// Symbolic shape resolved from batch and prefix geometry.
+    pub shape: Vec<StateTensorDimension>,
+    /// Accepted persisted dtype family.
+    pub dtype: StateTensorDtype,
+    /// Runtime residency behavior.
+    pub residency: StateResidencyClass,
+    /// Condition under which persisted state materializes this component.
+    pub presence: StateTensorPresence,
 }
 
 impl LayerCachePolicy {
@@ -379,6 +438,101 @@ impl LayerCachePolicy {
         }
     }
 
+    /// Expands this layer policy into ordered, stably named semantic
+    /// components shared by runtime residency and prompt persistence.
+    pub fn components(&self) -> Vec<StateComponentPolicy> {
+        let mut components = Vec::new();
+        let floating = StateTensorDtype::Floating;
+        let required = StateTensorPresence::Required;
+        match self {
+            Self::NoState | Self::FixedState { .. } => {}
+            Self::KeyValue {
+                num_key_value_heads,
+                head_dim,
+                ..
+            }
+            | Self::KeyValueWithFixedState {
+                num_key_value_heads,
+                head_dim,
+                ..
+            } => {
+                let shape = vec![
+                    StateTensorDimension::Batch,
+                    StateTensorDimension::Fixed(*num_key_value_heads),
+                    StateTensorDimension::PrefixTokens,
+                    StateTensorDimension::Fixed(*head_dim),
+                ];
+                for role in [
+                    StateComponentRole::AttentionKeys,
+                    StateComponentRole::AttentionValues,
+                ] {
+                    components.push(StateComponentPolicy {
+                        role,
+                        shape: shape.clone(),
+                        dtype: floating,
+                        residency: StateResidencyClass::SealablePaged,
+                        presence: required,
+                    });
+                }
+            }
+            Self::KeyOnly {
+                num_key_heads,
+                head_dim,
+                ..
+            }
+            | Self::KeyOnlyWithFixedState {
+                num_key_heads,
+                head_dim,
+                ..
+            } => components.push(StateComponentPolicy {
+                role: StateComponentRole::AttentionKeys,
+                shape: vec![
+                    StateTensorDimension::Batch,
+                    StateTensorDimension::Fixed(*num_key_heads),
+                    StateTensorDimension::PrefixTokens,
+                    StateTensorDimension::Fixed(*head_dim),
+                ],
+                dtype: floating,
+                residency: StateResidencyClass::SealablePaged,
+                presence: required,
+            }),
+            Self::CompressedLatentRotary {
+                latent_dim,
+                rotary_dim,
+                ..
+            } => {
+                for (role, dimension) in [
+                    (StateComponentRole::CompressedLatent, *latent_dim),
+                    (StateComponentRole::RotaryKeys, *rotary_dim),
+                ] {
+                    components.push(StateComponentPolicy {
+                        role,
+                        shape: vec![
+                            StateTensorDimension::Batch,
+                            StateTensorDimension::PrefixTokens,
+                            StateTensorDimension::Fixed(dimension),
+                        ],
+                        dtype: floating,
+                        residency: StateResidencyClass::SealablePaged,
+                        presence: required,
+                    });
+                }
+            }
+        }
+        components.extend(
+            self.fixed_state()
+                .iter()
+                .map(|tensor| StateComponentPolicy {
+                    role: StateComponentRole::Fixed(tensor.role),
+                    shape: tensor.shape.clone(),
+                    dtype: tensor.dtype,
+                    residency: tensor.residency_class(),
+                    presence: tensor.presence,
+                }),
+        );
+        components
+    }
+
     /// Validates dimensions and fixed-state invariants after deserialization.
     pub fn validate(&self) -> Result<(), CachePolicyError> {
         if let Some(attention) = self.attention() {
@@ -464,6 +618,16 @@ impl StateTensorPolicy {
         dtype: StateTensorDtype,
         residency: MutableStateResidency,
     ) -> Result<Self, CachePolicyError> {
+        Self::new_with_residency(role, shape, dtype, residency.into())
+    }
+
+    /// Constructs state with an explicit pageable or mutable residency class.
+    pub fn new_with_residency(
+        role: StateTensorRole,
+        shape: Vec<StateTensorDimension>,
+        dtype: StateTensorDtype,
+        residency: StateResidencyClass,
+    ) -> Result<Self, CachePolicyError> {
         let policy = Self {
             role,
             shape,
@@ -507,7 +671,7 @@ impl StateTensorPolicy {
 
     /// Returns the unified residency classification.
     pub fn residency_class(&self) -> StateResidencyClass {
-        self.residency.into()
+        self.residency
     }
 
     /// Resolves symbolic dimensions for an exact batch and prefix length.
@@ -581,11 +745,15 @@ fn validate_state_tensor_policies(tensors: &[StateTensorPolicy]) -> Result<(), C
             )));
         }
         let expected = match tensor.role {
-            StateTensorRole::Recurrent => MutableStateResidency::LayerScopedOffloadable,
+            StateTensorRole::Recurrent => StateResidencyClass::LayerScopedOffloadable,
             StateTensorRole::Convolution { .. }
             | StateTensorRole::PrefixEmbedding
-            | StateTensorRole::PositionDelta
-            | StateTensorRole::Pooling { .. } => MutableStateResidency::AlwaysDeviceMutable,
+            | StateTensorRole::PositionDelta => StateResidencyClass::AlwaysDeviceMutable,
+            StateTensorRole::Pooling {
+                component: PoolingStateComponent::Pooled,
+                ..
+            } => StateResidencyClass::SealablePaged,
+            StateTensorRole::Pooling { .. } => StateResidencyClass::AlwaysDeviceMutable,
         };
         if tensor.residency != expected {
             return Err(CachePolicyError::Invalid(format!(

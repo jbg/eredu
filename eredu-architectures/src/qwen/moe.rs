@@ -61,6 +61,7 @@ impl<B: RoutedNeuralBackend> RoutedSwiGlu<B> {
             TopKRouterSpec {
                 input_dimensions: args.hidden_size,
                 weight: ParameterSpec::trainable(&router_name).map_err(Error::backend)?,
+                correction_bias: None,
                 quantization: args.weight_quantization_for(&router_name),
                 routing,
             },
@@ -75,14 +76,15 @@ impl<B: RoutedNeuralBackend> RoutedSwiGlu<B> {
                 input_dimensions: args.hidden_size,
                 intermediate_dimensions: args.moe_intermediate_size,
                 output_dimensions: args.hidden_size,
+                limit: None,
                 layout: SwiGluExpertLayout::Packed {
                     gate_up: SwiGluExpertProjection {
                         weight: ParameterSpec::trainable(&gate_up_name).map_err(Error::backend)?,
-                        quantization: args.weight_quantization_for(&gate_up_name),
+                        format: args.weight_quantization_for(&gate_up_name).into(),
                     },
                     down: SwiGluExpertProjection {
                         weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
-                        quantization: args.weight_quantization_for(&down_name),
+                        format: args.weight_quantization_for(&down_name).into(),
                     },
                 },
             },

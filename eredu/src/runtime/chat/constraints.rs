@@ -521,6 +521,7 @@ impl ConstraintCompiler {
             .expect("synthetic tokenizer must support llguidance")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn compile_generation_plan(
         &self,
         dialect: &'static dyn FormatDialect,

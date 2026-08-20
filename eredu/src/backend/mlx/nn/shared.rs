@@ -10,14 +10,18 @@ use std::{
 
 use eredu_core::Completion;
 use eredu_nn::{
-    validate_parameter_topology, AttentionCache, EmbeddingOperator, EmbeddingSpec,
-    Error as ComputeError, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
-    NormalizationSpec, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
-    Parameterized, RopeValue, RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend,
-    RoutingOperator, RoutingResult, RoutingScoring, SwiGluExpertBankOperator, SwiGluExpertBankSpec,
-    SwiGluExpertLayout, TopKRouterSpec,
+    validate_parameter_topology, AttentionCache, BlockwiseAttentionBackend, BlockwiseAttentionSpec,
+    EmbeddingOperator, EmbeddingSpec, Error as ComputeError, HyperConnectionOperator,
+    HyperConnectionSpec, HyperConnectionState, HyperHeadOperator, HyperHeadSpec,
+    HyperNeuralBackend, IndexedAttentionInput, LinearFormat, LinearOperator, LinearSpec,
+    NeuralBackend, NormalizationOperator, NormalizationSpec, ParameterMetadata, ParameterSpec,
+    ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
+    PooledPositionInput, RopeValue, RotaryOperator, RotaryPosition, RotarySpec,
+    RoutedNeuralBackend, RoutingOperator, RoutingResult, RoutingScoring, SwiGluExpertBankOperator,
+    SwiGluExpertBankSpec, SwiGluExpertLayout, SwiGluLimit, Tensor, TopKRouterSpec,
 };
 use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
+use safemlx::ops::{argpartition_axis, broadcast_to, einsum, indexing::take_along_axis, maximum};
 use safemlx::{
     builder::Builder,
     distributed::Group,
@@ -33,7 +37,8 @@ use safemlx::{
 use crate::backend::mlx::{
     nn::{self as common, tensor::rope::RopeVariant},
     runtime::cache::{
-        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
+        BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueAttentionBlock, KeyValueCache,
+        PagedKeyValueCache, SlidingKeyValueCache,
     },
 };
 
@@ -56,6 +61,49 @@ fn companion_spec(weight: &ParameterSpec, component: &str) -> ParameterSpec {
     }
 }
 
+impl BlockwiseAttentionBackend for MlxBackend {
+    type BlockwiseAccumulator = BlockwiseAttentionAccumulator;
+
+    fn begin_blockwise_attention(
+        spec: BlockwiseAttentionSpec<'_, Array>,
+        context: &Stream,
+    ) -> Result<Self::BlockwiseAccumulator, ComputeError> {
+        compute(BlockwiseAttentionAccumulator::new(
+            spec.queries,
+            spec.scale,
+            spec.mask,
+            spec.query_start,
+            spec.sliding_window,
+            spec.prefix_tokens,
+            spec.sinks,
+            spec.context_end,
+            context,
+        ))
+    }
+
+    fn accumulate_blockwise_attention(
+        accumulator: &mut Self::BlockwiseAccumulator,
+        start: i64,
+        end: i64,
+        keys: Array,
+        values: Array,
+        context: &Stream,
+    ) -> Result<u64, ComputeError> {
+        let scratch = keys.nbytes() as u64 + values.nbytes() as u64;
+        let block = KeyValueAttentionBlock::unleased(start, end, keys, values);
+        compute(accumulator.accumulate(&block, context))?;
+        compute(accumulator.submit())?;
+        Ok(scratch)
+    }
+
+    fn finish_blockwise_attention(
+        accumulator: Self::BlockwiseAccumulator,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        compute(accumulator.finish(context))
+    }
+}
+
 fn parameter_topology(
     module: &impl ModuleParameters,
     weight: ParameterSpec,
@@ -75,6 +123,12 @@ fn parameter_topology(
                 })?,
                 "scales" => companion_spec(&weight, "scales"),
                 "biases" => companion_spec(&weight, "biases"),
+                "weight_scale_inv" => companion_spec(&weight, "weight_scale_inv"),
+                "e_score_correction_bias" => bias.clone().ok_or_else(|| {
+                    ComputeError::backend(format!(
+                        "backend operator exposed unexpected correction-bias parameter {local:?}"
+                    ))
+                })?,
                 name => {
                     return Err(ComputeError::backend(format!(
                         "backend operator exposed unknown parameter slot {name:?}"
@@ -84,6 +138,29 @@ fn parameter_topology(
             Ok((local.to_string(), spec))
         })
         .collect()
+}
+
+fn exact_parameter_topology(
+    module: &impl ModuleParameters,
+    specs: impl IntoIterator<Item = (&'static str, ParameterSpec)>,
+) -> Result<BTreeMap<String, ParameterSpec>, ComputeError> {
+    let expected = specs
+        .into_iter()
+        .map(|(local, spec)| (local.to_owned(), spec))
+        .collect::<BTreeMap<_, _>>();
+    let actual = module
+        .parameters()
+        .flatten()
+        .into_keys()
+        .map(|local| local.to_string())
+        .collect::<BTreeSet<_>>();
+    let wanted = expected.keys().cloned().collect::<BTreeSet<_>>();
+    if actual != wanted {
+        return Err(ComputeError::backend(format!(
+            "backend operator parameter slots differ: expected {wanted:?}, got {actual:?}"
+        )));
+    }
+    Ok(expected)
 }
 
 fn visit_module_parameters<'a, M, V>(
@@ -238,6 +315,12 @@ impl<M> std::ops::Deref for MlxModule<M> {
 
 impl<M> std::ops::DerefMut for MlxModule<M> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<M> AsMut<M> for MlxModule<M> {
+    fn as_mut(&mut self) -> &mut M {
         &mut self.inner
     }
 }
@@ -496,21 +579,10 @@ macro_rules! delegate_parameters {
 /// MLX dense-or-quantized affine projection.
 #[derive(Debug, Clone)]
 pub struct MlxLinear {
-    module: MaybeQuantized<nn::Linear>,
+    module: common::linear::PhysicalLinear,
     topology: BTreeMap<String, ParameterSpec>,
 }
 
-impl Deref for MlxLinear {
-    type Target = MaybeQuantized<nn::Linear>;
-    fn deref(&self) -> &Self::Target {
-        &self.module
-    }
-}
-impl DerefMut for MlxLinear {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.module
-    }
-}
 delegate_parameters!(MlxLinear, module);
 
 impl LinearOperator<Array> for MlxLinear {
@@ -685,6 +757,104 @@ impl Parameterized<Array> for MlxRotary {
     fn set_trainable(&mut self, _trainable: bool) {}
 }
 
+/// MLX implementation of neutral multi-stream residual mixing.
+#[derive(Debug, Clone)]
+pub struct MlxHyperConnection {
+    module: common::hyper_connections::HyperConnection,
+    topology: BTreeMap<String, ParameterSpec>,
+}
+
+delegate_parameters!(MlxHyperConnection, module);
+
+impl HyperConnectionOperator<Array> for MlxHyperConnection {
+    fn collapse(
+        &mut self,
+        residual: &Array,
+        norm_epsilon: f32,
+        context: &Stream,
+    ) -> Result<HyperConnectionState<Array>, ComputeError> {
+        let (collapsed, split) =
+            compute(self.module.collapse_split(residual, norm_epsilon, context))?;
+        Ok(HyperConnectionState {
+            collapsed,
+            pre: split.pre,
+            post: split.post,
+            combination: split.combination,
+        })
+    }
+
+    fn expand(
+        &mut self,
+        sublayer: &Array,
+        residual: &Array,
+        state: &HyperConnectionState<Array>,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        compute(common::hyper_connections::expand(
+            sublayer,
+            residual,
+            &state.post,
+            &state.combination,
+            context,
+        ))
+    }
+}
+
+impl Parameterized<Array> for MlxHyperConnection {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, Array>,
+    {
+        visit_module_parameters(&self.module, &self.topology, visitor);
+    }
+
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, Array>,
+    {
+        visit_module_parameters_mut(&mut self.module, &self.topology, visitor);
+    }
+
+    fn set_trainable(&mut self, trainable: bool) {
+        set_module_trainable(&mut self.module, trainable);
+    }
+}
+
+/// MLX implementation of the neutral final hyper-head collapse.
+#[derive(Debug, Clone)]
+pub struct MlxHyperHead {
+    module: common::hyper_connections::HyperHead,
+    topology: BTreeMap<String, ParameterSpec>,
+}
+
+delegate_parameters!(MlxHyperHead, module);
+
+impl HyperHeadOperator<Array> for MlxHyperHead {
+    fn forward(&mut self, residual: &Array, context: &Stream) -> Result<Array, ComputeError> {
+        compute(self.module.forward(residual, context))
+    }
+}
+
+impl Parameterized<Array> for MlxHyperHead {
+    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
+    where
+        V: ParameterVisitor<'a, Array>,
+    {
+        visit_module_parameters(&self.module, &self.topology, visitor);
+    }
+
+    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
+    where
+        V: ParameterVisitorMut<'a, Array>,
+    {
+        visit_module_parameters_mut(&mut self.module, &self.topology, visitor);
+    }
+
+    fn set_trainable(&mut self, trainable: bool) {
+        set_module_trainable(&mut self.module, trainable);
+    }
+}
+
 /// MLX implementation of the backend-neutral learned top-k router.
 #[derive(Debug, Clone)]
 pub struct MlxTopKRouter {
@@ -718,6 +888,23 @@ impl RoutingOperator<Array> for MlxTopKRouter {
         let output = compute(
             self.module
                 .forward_routes_with_selection_bias(input, None, context),
+        )?;
+        Ok(RoutingResult {
+            expert_ids: output.indices,
+            selected_scores: output.scores,
+            route_weights: output.weights,
+        })
+    }
+
+    fn route_selected(
+        &mut self,
+        input: &Array,
+        expert_ids: &Array,
+        context: &Stream,
+    ) -> Result<RoutingResult<Array>, ComputeError> {
+        let output = compute(
+            self.module
+                .forward_routes_with_routing_indices(input, expert_ids, context),
         )?;
         Ok(RoutingResult {
             expert_ids: output.indices,
@@ -1001,11 +1188,11 @@ impl NeuralBackend for MlxBackend {
     type ParallelContext = Group;
 
     fn linear(spec: LinearSpec, context: &Stream) -> Result<MlxLinear, ComputeError> {
-        let module = compute(common::linear::unloaded_maybe_quantized_linear(
+        let module = compute(common::linear::PhysicalLinear::unloaded(
             spec.input,
             spec.output,
             spec.bias.is_some(),
-            spec.quantization,
+            spec.format,
             context,
         ))?;
         let topology = parameter_topology(&module, spec.weight, spec.bias)?;
@@ -1063,6 +1250,24 @@ impl NeuralBackend for MlxBackend {
         compute(common::layers::silu(input, context))
     }
 
+    fn swiglu(
+        mut gate: Array,
+        mut up: Array,
+        limit: Option<SwiGluLimit>,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        if let Some(limit) = limit {
+            gate = compute(safemlx::ops::minimum(
+                gate,
+                Array::from_f32(limit.get()),
+                context,
+            ))?;
+            up = compute(safemlx::ops::clip(up, (-limit.get(), limit.get()), context))?;
+        }
+        let gate = compute(common::layers::silu(gate, context))?;
+        compute(gate.multiply(up, context))
+    }
+
     fn attention(
         queries: Array,
         keys: Array,
@@ -1080,6 +1285,223 @@ impl NeuralBackend for MlxBackend {
             None,
             context,
         ))
+    }
+
+    fn indexed_attention(
+        input: IndexedAttentionInput<'_, Array>,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        input.validate()?;
+        compute(common::attention::indexed_sparse_attention(
+            input.queries,
+            input.local_keys,
+            input.local_values,
+            input.pooled_keys,
+            input.pooled_values,
+            input.selected_positions,
+            input.scale,
+            input.local_mask,
+            input.pooled_mask,
+            input.sinks,
+            context,
+        ))
+    }
+
+    fn pooled_attention(
+        input: PooledAttentionInput<'_, Array>,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        let query_tokens = input.queries.dim(2);
+        let local_tokens = input.local.dim(1);
+        let pooled_tokens = input.pooled.dim(1);
+        let local = compute(input.local.expand_dims(1, context))?;
+        let pooled = compute(input.pooled.expand_dims(1, context))?;
+        let keys = compute(safemlx::ops::concatenate_axis(&[local, pooled], 2, context))?;
+        let mask = if input.local_mask.is_none() && input.pooled_mask.is_none() {
+            None
+        } else {
+            let local = match input.local_mask {
+                Some(mask) => mask.clone(),
+                None => compute(Array::ones::<bool>(&[query_tokens, local_tokens], context))?,
+            };
+            let pooled = match input.pooled_mask {
+                Some(mask) => mask.clone(),
+                None => compute(Array::ones::<bool>(&[query_tokens, pooled_tokens], context))?,
+            };
+            Some(compute(safemlx::ops::concatenate_axis(
+                &[local, pooled],
+                -1,
+                context,
+            ))?)
+        };
+        compute(safemlx::fast::scaled_dot_product_attention(
+            input.queries,
+            &keys,
+            &keys,
+            input.scale,
+            mask.as_ref().map(ScaledDotProductAttentionMask::Array),
+            input.sinks,
+            context,
+        ))
+    }
+
+    fn select_pooled_positions(
+        input: PooledPositionInput<'_, Array>,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        let query_shape = input.queries.shape();
+        let pooled_shape = input.pooled_keys.shape();
+        let weight_shape = input.head_weights.shape();
+        if query_shape.len() != 4
+            || pooled_shape.len() != 3
+            || weight_shape.len() != 3
+            || query_shape[0] != pooled_shape[0]
+            || query_shape[0] != weight_shape[0]
+            || query_shape[1] != weight_shape[2]
+            || query_shape[2] != weight_shape[1]
+            || query_shape[3] != pooled_shape[2]
+            || input.top_k <= 0
+            || !input.scale.is_finite()
+            || input.scale <= 0.0
+            || !input.head_scale.is_finite()
+            || input.head_scale <= 0.0
+        {
+            return Err(ComputeError::backend(format!(
+                "invalid pooled-position geometry: queries={query_shape:?} pooled={pooled_shape:?} weights={weight_shape:?} top_k={}",
+                input.top_k
+            )));
+        }
+        let scores = compute(einsum(
+            "bhld,bpd->bhlp",
+            [
+                &compute(input.queries.as_dtype(Dtype::Float32, context))?,
+                &compute(input.pooled_keys.as_dtype(Dtype::Float32, context))?,
+            ],
+            context,
+        ))?;
+        let scores = compute(maximum(scores, Array::from_f32(0.0), context))?;
+        let scores = compute(scores.multiply(Array::from_f32(input.scale), context))?;
+        let weights = compute(input.head_weights.as_dtype(Dtype::Float32, context))?;
+        let weights = compute(weights.multiply(Array::from_f32(input.head_scale), context))?;
+        let weights = compute(weights.transpose_axes(&[0, 2, 1], context))?;
+        let weights = compute(weights.expand_dims(-1, context))?;
+        let mut scores = compute(scores.multiply(weights, context))?;
+        scores = compute(scores.sum_axis(1, false, context))?;
+        if let Some(mask) = input.mask {
+            scores = compute(safemlx::ops::r#where(
+                mask,
+                scores,
+                Array::from_f32(f32::NEG_INFINITY),
+                context,
+            ))?;
+        }
+        let top_k = input.top_k.min(pooled_shape[1]);
+        let indices = compute(argpartition_axis(&scores, -top_k, -1, context))?;
+        let mut indexes = vec![eredu_nn::Index::Full; indices.ndim()];
+        let last = indexes.len() - 1;
+        indexes[last] = eredu_nn::Index::Range(indices.dim(-1) - top_k, indices.dim(-1));
+        indices.index(&indexes, context)
+    }
+
+    fn gather_pooled_mask(
+        mask: &Array,
+        selected_positions: &Array,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        if mask.ndim() != 2 || selected_positions.ndim() != 3 {
+            return Err(ComputeError::backend(format!(
+                "pooled mask gathering expects [query, pool] and [batch, query, selected], got {:?} and {:?}",
+                mask.shape(),
+                selected_positions.shape()
+            )));
+        }
+        let expanded = compute(mask.expand_dims(0, context))?;
+        let expanded = compute(broadcast_to(
+            &expanded,
+            &[
+                selected_positions.dim(0),
+                selected_positions.dim(1),
+                mask.dim(1),
+            ],
+            context,
+        ))?;
+        let selected = compute(take_along_axis(&expanded, selected_positions, 2, context))?;
+        compute(selected.expand_dims(1, context))
+    }
+
+    fn attention_with_sinks(
+        queries: Array,
+        keys: Array,
+        values: Array,
+        scale: f32,
+        mask: Option<&Array>,
+        sinks: Option<&Array>,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        compute(safemlx::fast::scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale,
+            mask.map(ScaledDotProductAttentionMask::Array),
+            sinks,
+            context,
+        ))
+    }
+
+    fn rms_norm_without_weight(
+        input: &Array,
+        epsilon: f32,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        let dtype = input.dtype();
+        let variance = compute(input.square(context))?;
+        let variance = compute(variance.mean_axis(-1, true, context))?;
+        let denominator = compute(variance.add(Array::from_f32(epsilon), context))?;
+        let denominator = compute(denominator.rsqrt(context))?;
+        compute(input.multiply(denominator, context))?
+            .as_dtype(dtype, context)
+            .map_err(ComputeError::backend)
+    }
+
+    fn grouped_linear(
+        linear: &mut MlxLinear,
+        input: &Array,
+        groups: i32,
+        output_per_group: i32,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        if input.ndim() != 4 || input.dim(1) != groups || groups <= 0 || output_per_group <= 0 {
+            return Err(ComputeError::backend(format!(
+                "grouped linear expects [batch, {groups}, tokens, input] and positive output width, got {:?}",
+                input.shape()
+            )));
+        }
+        let projected = compute(linear.module.forward(input, context))?;
+        if projected.dim(-1) != groups * output_per_group {
+            return Err(ComputeError::backend(format!(
+                "grouped linear produced width {}, expected {}",
+                projected.dim(-1),
+                groups * output_per_group
+            )));
+        }
+        let mut pieces = Vec::with_capacity(groups as usize);
+        for group in 0..groups {
+            let selected = projected.index(
+                &[
+                    eredu_nn::Index::Full,
+                    eredu_nn::Index::At(group),
+                    eredu_nn::Index::Full,
+                    eredu_nn::Index::Range(
+                        group * output_per_group,
+                        (group + 1) * output_per_group,
+                    ),
+                ],
+                context,
+            )?;
+            pieces.push(compute(selected.expand_dims(1, context))?);
+        }
+        Array::concatenate(&pieces, 1, context)
     }
 
     fn sliding_window_attention(
@@ -1127,12 +1549,55 @@ impl NeuralBackend for MlxBackend {
         parallel: &Group,
         context: &Stream,
     ) -> Result<Array, ComputeError> {
-        compute(crate::backend::mlx::nn::parallel::forward_row_parallel(
-            &mut linear.module,
-            input,
-            parallel,
+        compute(linear.module.forward_row_parallel(input, parallel, context))
+    }
+}
+
+impl HyperNeuralBackend for MlxBackend {
+    type HyperConnection = MlxHyperConnection;
+    type HyperHead = MlxHyperHead;
+
+    fn hyper_connection(
+        spec: HyperConnectionSpec,
+        context: &Stream,
+    ) -> Result<Self::HyperConnection, ComputeError> {
+        spec.validate()?;
+        let module = compute(common::hyper_connections::HyperConnection::unloaded(
+            spec.streams,
+            spec.hidden_size,
+            spec.sinkhorn_iterations,
+            spec.epsilon,
             context,
-        ))
+        ))?;
+        let topology = exact_parameter_topology(
+            &module,
+            [
+                ("function", spec.function),
+                ("base", spec.base),
+                ("scale", spec.scale),
+            ],
+        )?;
+        Ok(MlxHyperConnection { module, topology })
+    }
+
+    fn hyper_head(spec: HyperHeadSpec, context: &Stream) -> Result<Self::HyperHead, ComputeError> {
+        spec.validate()?;
+        let module = compute(common::hyper_connections::HyperHead::unloaded(
+            spec.streams,
+            spec.hidden_size,
+            spec.norm_epsilon,
+            spec.epsilon,
+            context,
+        ))?;
+        let topology = exact_parameter_topology(
+            &module,
+            [
+                ("function", spec.function),
+                ("base", spec.base),
+                ("scale", spec.scale),
+            ],
+        )?;
+        Ok(MlxHyperHead { module, topology })
     }
 }
 
@@ -1144,6 +1609,8 @@ impl RoutedNeuralBackend for MlxBackend {
         spec.validate()?;
         let score_function = match spec.routing.scoring() {
             RoutingScoring::Softmax => common::moe::TopKRouterScoreFunction::Softmax,
+            RoutingScoring::Sigmoid => common::moe::TopKRouterScoreFunction::Sigmoid,
+            RoutingScoring::SqrtSoftplus => common::moe::TopKRouterScoreFunction::SqrtSoftplus,
         };
         let module = compute(common::moe::TopKRouter::new_with_quantization(
             common::moe::TopKRouterConfig {
@@ -1152,17 +1619,17 @@ impl RoutedNeuralBackend for MlxBackend {
                 hidden_size: spec.input_dimensions,
                 score_function,
                 norm_topk_prob: spec.routing.normalize_selected(),
-                normalization_epsilon: 0.0,
-                routed_scaling_factor: 1.0,
-                n_group: 1,
-                topk_group: 1,
-                score_correction_bias: false,
+                normalization_epsilon: spec.routing.normalization_epsilon(),
+                routed_scaling_factor: spec.routing.routed_scaling(),
+                n_group: spec.routing.expert_groups(),
+                topk_group: spec.routing.selected_groups(),
+                score_correction_bias: spec.correction_bias.is_some(),
             },
             spec.quantization,
             context,
         ))?;
         Ok(MlxTopKRouter {
-            module: MlxNamedModule::new(module, spec.weight, None)?,
+            module: MlxNamedModule::new(module, spec.weight, spec.correction_bias)?,
         })
     }
 
@@ -1196,14 +1663,39 @@ impl RoutedNeuralBackend for MlxBackend {
                 down.weight.id.as_str()
             )));
         }
-        let module = compute(common::moe::PackedSwiGluExperts::new(
+        let native_fp8 = match (gate_up.format, down.format) {
+            (LinearFormat::E4M3BlockFp8(gate), LinearFormat::E4M3BlockFp8(down))
+                if gate == down
+                    && gate.scale_encoding == eredu_checkpoint::BlockFp8ScaleEncoding::Ue8m0 =>
+            {
+                true
+            }
+            (LinearFormat::E4M3BlockFp8(_), LinearFormat::E4M3BlockFp8(_)) => {
+                return Err(ComputeError::backend(
+                    "MLX packed block-FP8 experts require matching UE8M0 formats",
+                ));
+            }
+            (LinearFormat::E4M3BlockFp8(_), _) | (_, LinearFormat::E4M3BlockFp8(_)) => {
+                return Err(ComputeError::backend(
+                    "packed expert projections must use one physical format",
+                ));
+            }
+            _ => false,
+        };
+        let mut module = compute(common::moe::PackedSwiGluExperts::new(
             spec.expert_count,
             spec.input_dimensions,
             spec.intermediate_dimensions,
-            gate_up.quantization,
-            down.quantization,
+            gate_up.format.weight_quantization(),
+            down.format.weight_quantization(),
             context,
         ))?;
+        if native_fp8 {
+            module = compute(module.with_native_fp8_e8m0(context))?;
+        }
+        if let Some(limit) = spec.limit {
+            module = compute(module.with_swiglu_limit(limit.get()))?;
+        }
         Ok(MlxSwiGluExpertBank {
             module: MlxParameterTree::new(module, prefix)?,
         })

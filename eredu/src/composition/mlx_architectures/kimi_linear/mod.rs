@@ -2,6 +2,7 @@
 
 pub(crate) mod checkpoint;
 pub mod layerwise;
+mod mla;
 pub mod model;
 
 pub use layerwise::{

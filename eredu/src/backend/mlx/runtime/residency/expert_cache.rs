@@ -309,7 +309,7 @@ fn packed_binding(
         local_name,
         checkpoint_key,
         TensorSelection::Full,
-        metadata.encoded_byte_len as u64,
+        metadata.encoded_byte_len,
     )?)
 }
 

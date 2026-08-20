@@ -7,7 +7,6 @@ use eredu_core::{
 };
 use safemlx::{
     distributed::{self, Group},
-    ops::{ones, zeros},
     Array, Dtype, Stream,
 };
 
@@ -92,6 +91,50 @@ impl<'a> MlxDistributedSession<'a> {
         self.communicators.pipeline_group()
     }
 
+    fn world_control_consensus(&self, local: [i32; 2]) -> Result<[i32; 2], Error> {
+        let world = self.world();
+        if world.size() == 1 {
+            return Ok(local);
+        }
+        let rank = world.rank();
+        let last = world.size() - 1;
+        let mut result = local;
+        if rank < last {
+            let received = distributed::recv(&[2], Dtype::Int32, rank + 1, world, &self.stream)?;
+            let evaluated = received.evaluated()?;
+            let values = evaluated
+                .try_as_slice::<i32>()
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            result[0] |= i32::from(values[0] != 0);
+            result[1] |= i32::from(values[1] != 0);
+        }
+        if rank > 0 {
+            let result_array = Array::from_slice(&result, &[2]);
+            distributed::send(&result_array, rank - 1, world, &self.stream)?.evaluated()?;
+        }
+
+        // Broadcast around the same descending ring direction. Rank zero and
+        // the final rank are direct neighbors, so this never requires the
+        // unsupported non-neighbor Ring sends used by a star gather.
+        if rank == 0 {
+            let result_array = Array::from_slice(&result, &[2]);
+            distributed::send(&result_array, last, world, &self.stream)?.evaluated()?;
+        } else {
+            let successor = if rank == last { 0 } else { rank + 1 };
+            let received = distributed::recv(&[2], Dtype::Int32, successor, world, &self.stream)?;
+            let evaluated = received.evaluated()?;
+            let values = evaluated
+                .try_as_slice::<i32>()
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            result = [values[0], values[1]];
+            if rank > 1 {
+                let result_array = Array::from_slice(&result, &[2]);
+                distributed::send(&result_array, rank - 1, world, &self.stream)?.evaluated()?;
+            }
+        }
+        Ok(result)
+    }
+
     /// Submits hidden activations to the succeeding pipeline coordinate.
     pub fn send_pipeline(&self, hidden: &Array) -> Result<DistributedCompletion<Array>, Error> {
         let topology = self.topology();
@@ -137,7 +180,7 @@ impl<'a> MlxDistributedSession<'a> {
         match scope {
             CollectiveScope::World => Ok(self.world()),
             CollectiveScope::Axis(ParallelAxis::Data) => {
-                return Err(Error::Backend(BackendError::Unsupported {
+                Err(Error::Backend(BackendError::Unsupported {
                     backend: "mlx".into(),
                     capability: "data-parallel subgroup".into(),
                 }))
@@ -216,25 +259,9 @@ impl<'a> MlxDistributedSession<'a> {
         local_failed: bool,
         local_cancelled: bool,
     ) -> Result<(bool, bool), Error> {
-        let failed = if local_failed {
-            ones::<i32>(&[], &self.stream)?
-        } else {
-            zeros::<i32>(&[], &self.stream)?
-        };
-        let cancelled = if local_cancelled {
-            ones::<i32>(&[], &self.stream)?
-        } else {
-            zeros::<i32>(&[], &self.stream)?
-        };
-        let failed = DistributedSession::all_reduce_sum(self, CollectiveScope::World, &failed)?;
-        let cancelled =
-            DistributedSession::all_reduce_sum(self, CollectiveScope::World, &cancelled)?;
-        let failed = failed.wait()?;
-        let cancelled = cancelled.wait()?;
-        Ok((
-            failed.try_item::<i32>(&self.stream)? != 0,
-            cancelled.try_item::<i32>(&self.stream)? != 0,
-        ))
+        let consensus =
+            self.world_control_consensus([i32::from(local_failed), i32::from(local_cancelled)])?;
+        Ok((consensus[0] != 0, consensus[1] != 0))
     }
 
     fn value_dtype(value: &ValueDescriptor) -> Result<Dtype, Error> {

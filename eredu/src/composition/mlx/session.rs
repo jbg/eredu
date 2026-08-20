@@ -656,21 +656,29 @@ impl<'a> MlxModelSession<'a> {
         prng_state: Option<&mut RandomState>,
         finished: bool,
     ) -> Result<crate::backend::mlx::runtime::distributed::parallel::SynchronizedToken, Error> {
-        self.distributed
-            .as_ref()
-            .ok_or_else(|| {
-                Error::Parallel(
-                    "sampling synchronization requires a distributed model session".into(),
-                )
-            })?
-            .sample_and_synchronize(
+        let distributed = self.distributed.as_ref().ok_or_else(|| {
+            Error::Parallel("sampling synchronization requires a distributed model session".into())
+        })?;
+        match &self.inner {
+            MlxSessionKind::Pipeline(model, _) => model.sample_and_synchronize_token(
                 logits,
                 batch_size,
                 sampler,
                 temperature,
                 prng_state,
                 finished,
-            )
+                distributed,
+            ),
+            MlxSessionKind::Complete(_, _) | MlxSessionKind::Expert(_, _) => distributed
+                .sample_and_synchronize(
+                    logits,
+                    batch_size,
+                    sampler,
+                    temperature,
+                    prng_state,
+                    finished,
+                ),
+        }
     }
 
     /// Runs one MLX instrumented pass through the architecture-erased adapter.
@@ -683,14 +691,8 @@ impl<'a> MlxModelSession<'a> {
         observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
         let result = match (model, cache) {
-            (Model::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
-                if mask.is_some() {
-                    return Err(Error::UnsupportedArchitecture(
-                        "an explicit DeepSeek observer mask is unsupported; the adapter constructs the causal mask from cache state".into(),
-                    ));
-                }
-                model.forward_with_observer(input_tokens, cache, stream, observer)
-            }
+            (Model::DeepSeek(model), ModelCache::DeepSeek(cache)) => model
+                .forward_with_observer(input_tokens, mask, cache, stream, observer),
             (Model::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
                 if mask.is_some() {
                     return Err(Error::UnsupportedArchitecture(
@@ -1070,13 +1072,7 @@ fn prefill_model(
     stream: &Stream,
 ) -> Result<Array, Error> {
     match (model, cache) {
-        (Model::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
-            prefill_pair(model, cache, input, stream)
-        }
-        (Model::DeepSeekV4(model), ModelCache::DeepSeekV4(cache)) => {
-            prefill_pair(model.as_mut(), cache, input, stream)
-        }
-        (Model::DeepSeekV4Layerwise(model), ModelCache::DeepSeekV4(cache)) => {
+        (Model::DeepSeek(model), ModelCache::DeepSeek(cache)) => {
             prefill_pair(model.as_mut(), cache, input, stream)
         }
         (Model::Gemma4(model), ModelCache::Gemma4(cache)) => {
@@ -1129,13 +1125,7 @@ fn decode_model(
     stream: &Stream,
 ) -> Result<Array, Error> {
     match (model, cache) {
-        (Model::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
-            decode_pair(model, cache, input, stream)
-        }
-        (Model::DeepSeekV4(model), ModelCache::DeepSeekV4(cache)) => {
-            decode_pair(model.as_mut(), cache, input, stream)
-        }
-        (Model::DeepSeekV4Layerwise(model), ModelCache::DeepSeekV4(cache)) => {
+        (Model::DeepSeek(model), ModelCache::DeepSeek(cache)) => {
             decode_pair(model.as_mut(), cache, input, stream)
         }
         (Model::Gemma4(model), ModelCache::Gemma4(cache)) => {
@@ -1308,12 +1298,6 @@ fn forward_model_tensor_parallel(
     stream: &Stream,
 ) -> Result<Array, Error> {
     match (model, cache) {
-        (Model::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
-            model.forward_tensor_parallel(input, cache, group, stream)
-        }
-        (Model::DeepSeekV4Layerwise(model), ModelCache::DeepSeekV4(cache)) => {
-            model.forward_tensor_parallel(input, cache, group, stream)
-        }
         (Model::GptOss(model), ModelCache::GptOss(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }

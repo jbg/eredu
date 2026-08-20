@@ -1,5 +1,7 @@
 //! Statically dispatched layered-architecture lifecycle and resident execution.
 
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use eredu_nn::{NeuralBackend, Parameterized};
 
 use crate::{
@@ -253,6 +255,21 @@ where
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, A::Error> {
+        self.forward_with_context(input, state, context)
+            .map(|(output, _)| output)
+    }
+
+    /// Runs one complete pass and returns its architecture-owned context.
+    ///
+    /// This is the resident counterpart of the bounded runtime's context
+    /// result and lets callers retain target captures without storing
+    /// request-local tensors on the model object.
+    pub fn forward_with_context<'a>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(B::Tensor, A::ForwardContext), A::Error> {
         let forward = self.architecture.begin_forward(input, state, context)?;
         let initial = forward.hidden;
         let mut forward_context = forward.context;
@@ -316,8 +333,10 @@ where
         let hidden = outputs[self.graph.output()]
             .take()
             .expect("validated graph output completed");
-        self.architecture
-            .finish_forward(&hidden, state, &forward_context, context)
+        let output = self
+            .architecture
+            .finish_forward(&hidden, state, &forward_context, context)?;
+        Ok((output, forward_context))
     }
 
     /// Borrows the architecture and its pinned parameter topology.

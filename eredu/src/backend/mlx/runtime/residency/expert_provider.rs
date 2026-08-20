@@ -18,6 +18,7 @@ pub(crate) struct CachedSwiGluBankSpec {
     pub(crate) intermediate_dimensions: i32,
     pub(crate) gate_up_quantization: Option<WeightQuantization>,
     pub(crate) down_quantization: Option<WeightQuantization>,
+    pub(crate) limit: Option<f32>,
 }
 
 /// Executes independently cached SwiGLU experts through a layer-spec factory.
@@ -144,10 +145,16 @@ pub(crate) fn execute_cached_swiglu(
     pass: ExpertPass,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    Ok(cache.execute_routes_bounded(
-        ExpertRouteBatch::new(layer, hidden, expert_ids, route_weights, pass),
+    // The neutral router reports one row per token while decoder hidden state
+    // retains its leading batch/sequence dimensions. Resident expert banks
+    // flatten and restore those dimensions as part of their operator contract;
+    // cached banks must do the same before entering the row-oriented cache.
+    let original_shape = hidden.shape().to_vec();
+    let flattened = hidden.reshape(&[-1, hidden.dim(-1)], stream)?;
+    let output = cache.execute_routes_bounded(
+        ExpertRouteBatch::new(layer, &flattened, expert_ids, route_weights, pass),
         stream,
-        |hidden, acquired, _weights, stream| {
+        |hidden, acquired, weights, stream| {
             let started = Instant::now();
             let load_time = cache.weight_quantization();
             let mut bank = PackedSwiGluExperts::new(
@@ -158,6 +165,9 @@ pub(crate) fn execute_cached_swiglu(
                 load_time.or(spec.down_quantization),
                 stream,
             )?;
+            if let Some(limit) = spec.limit {
+                bank = bank.with_swiglu_limit(limit)?;
+            }
             bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
             bank.gate_up_proj_scales =
                 Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
@@ -173,8 +183,36 @@ pub(crate) fn execute_cached_swiglu(
                 acquired.scratch_bytes(),
                 started.elapsed(),
             )?;
-            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
-            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
+            Ok(bank.forward(hidden, acquired.compact_routes(), weights, stream)?)
         },
-    )?)
+    )?;
+    Ok(output.reshape(&original_shape, stream)?)
+}
+
+/// Executes route rows already compacted by distributed ownership dispatch.
+///
+/// Each input row represents exactly one selected route. The outer dispatcher
+/// applies the original route weight while recombining rows, so this compact
+/// bank must use a unit weight and return one unweighted output row per input.
+pub(crate) fn execute_cached_swiglu_dispatched(
+    cache: &ExpertCache,
+    spec: CachedSwiGluBankSpec,
+    layer: usize,
+    hidden: &Array,
+    global_expert_ids: &Array,
+    pass: ExpertPass,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let expert_ids = global_expert_ids.reshape(&[-1, 1], stream)?;
+    let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+    execute_cached_swiglu(
+        cache,
+        spec,
+        layer,
+        hidden,
+        &expert_ids,
+        &weights,
+        pass,
+        stream,
+    )
 }

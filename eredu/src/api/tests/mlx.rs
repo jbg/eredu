@@ -17,8 +17,6 @@ use crate::{
         ResolvedModelConfig,
     },
     composition::mlx_architectures::{
-        deepseek_v3::model as deepseek_v3,
-        deepseek_v4::model as deepseek_v4,
         gpt_oss::model as gpt_oss,
         kimi_linear::model as kimi_linear,
         lfm2::model as lfm2,
@@ -1174,12 +1172,21 @@ fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
 }
 
 fn save_zero_checkpoint<M: ModuleParameters>(model: &M, dir: &std::path::Path, stream: &Stream) {
+    save_zero_checkpoint_with_names(model, dir, stream, str::to_owned)
+}
+
+fn save_zero_checkpoint_with_names<M: ModuleParameters>(
+    model: &M,
+    dir: &std::path::Path,
+    stream: &Stream,
+    canonical_name: impl Fn(&str) -> String,
+) {
     let parameters = model.parameters().flatten();
     let arrays = parameters
         .iter()
         .map(|(name, parameter)| {
             (
-                name.to_string(),
+                canonical_name(name),
                 zeros_dtype(parameter.shape(), parameter.dtype(), stream).unwrap(),
             )
         })
@@ -1992,11 +1999,10 @@ fn tiny_deepseek_v3_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
               "num_nextn_predict_layers":1,"tie_word_embeddings":false
             }"#,
     );
-    let args = deepseek_v3::get_model_args(&dir).unwrap();
-    let plan = crate::composition::mlx_architectures::deepseek_v3::checkpoint::safetensors_plan(
-        &args, true,
-    )
-    .unwrap();
+    let config: serde_json::Value =
+        serde_json::from_reader(fs::File::open(dir.join("config.json")).unwrap()).unwrap();
+    let args = eredu_architectures::deepseek::parse_v3_config(&config).unwrap();
+    let plan = eredu_architectures::deepseek::v3_safetensors_plan(&args, true).unwrap();
     let mut tensors = plan.common_tensors;
     for group in plan.layout_groups {
         let packed = group
@@ -2038,15 +2044,15 @@ fn tiny_deepseek_v3_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     .unwrap();
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
 
-    let mut resident = crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
+    let mut resident = crate::composition::deepseek::load_safetensors(
         &dir,
-        eredu_runtime::LayerWeightResidency::FullyResident,
+        eredu_runtime::WeightResidency::fully_resident(),
         None,
         stream,
         weights_stream,
     )
     .unwrap();
-    let mut resident_cache = resident.new_cache();
+    let mut resident_cache = resident.new_state().unwrap();
     let resident_logits = resident
         .forward(&tokens, &mut resident_cache, stream)
         .unwrap();
@@ -2054,15 +2060,17 @@ fn tiny_deepseek_v3_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     assert_eq!(resident_logits.shape(), &[1, 2, 16]);
     assert_eq!(resident.mtp_len(), 1);
 
-    let mut bounded = crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
+    let mut bounded = crate::composition::deepseek::load_safetensors(
         &dir,
-        eredu_runtime::LayerwiseLoadOptions::default(),
+        eredu_runtime::WeightResidency::layerwise_host(
+            eredu_runtime::LayerwiseLoadOptions::default(),
+        ),
         None,
         stream,
         weights_stream,
     )
     .unwrap();
-    let mut bounded_cache = bounded.new_cache();
+    let mut bounded_cache = bounded.new_state().unwrap();
     let bounded_logits = bounded
         .forward(&tokens, &mut bounded_cache, stream)
         .unwrap();
@@ -2070,16 +2078,18 @@ fn tiny_deepseek_v3_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
     assert!(bounded.residency_report().unwrap().initialized());
 
-    let mut sparse = crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_expert_cache_model(
+    let mut sparse = crate::composition::deepseek::load_safetensors(
         &dir,
-        eredu_runtime::NonExpertWeightResidency::FullyResident,
-        eredu_runtime::ExpertCacheLoadOptions::default(),
+        eredu_runtime::WeightResidency::with_expert_cache(
+            eredu_runtime::NonExpertWeightResidency::FullyResident,
+            eredu_runtime::ExpertCacheLoadOptions::default(),
+        ),
         None,
         stream,
         weights_stream,
     )
     .unwrap();
-    let mut sparse_cache = sparse.new_cache();
+    let mut sparse_cache = sparse.new_state().unwrap();
     let sparse_logits = sparse.forward(&tokens, &mut sparse_cache, stream).unwrap();
     safemlx::transforms::eval([&sparse_logits]).unwrap();
     assert_eq!(sparse_logits.shape(), resident_logits.shape());
@@ -2108,10 +2118,10 @@ fn tiny_deepseek_v4_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
               "routed_scaling_factor":1.0,"num_nextn_predict_layers":1
             }"#,
     );
-    let args = deepseek_v4::get_model_args(&dir).unwrap();
-    let plan =
-        crate::composition::mlx_architectures::deepseek_v4::checkpoint::safetensors_plan(&args)
-            .unwrap();
+    let config: serde_json::Value =
+        serde_json::from_reader(fs::File::open(dir.join("config.json")).unwrap()).unwrap();
+    let args = eredu_architectures::deepseek::parse_v4_config(&config).unwrap();
+    let plan = eredu_architectures::deepseek::v4_safetensors_plan(&args).unwrap();
     let arrays = plan
         .common_tensors
         .iter()
@@ -2145,15 +2155,15 @@ fn tiny_deepseek_v4_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     .unwrap();
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
 
-    let mut resident = crate::composition::mlx_architectures::deepseek_v4::layerwise::load_deepseek_v4_layerwise_model(
+    let mut resident = crate::composition::deepseek::load_safetensors(
         &dir,
-        eredu_runtime::LayerWeightResidency::FullyResident,
+        eredu_runtime::WeightResidency::fully_resident(),
         None,
         stream,
         weights_stream,
     )
     .unwrap();
-    let mut resident_cache = resident.new_cache().unwrap();
+    let mut resident_cache = resident.new_state().unwrap();
     let resident_logits = resident
         .forward(&tokens, &mut resident_cache, stream)
         .unwrap();
@@ -2161,15 +2171,17 @@ fn tiny_deepseek_v4_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     assert_eq!(resident_logits.shape(), &[1, 2, 16]);
     assert_eq!(resident.mtp_len(), 1);
 
-    let mut bounded = crate::composition::mlx_architectures::deepseek_v4::layerwise::load_deepseek_v4_layerwise_model(
+    let mut bounded = crate::composition::deepseek::load_safetensors(
         &dir,
-        eredu_runtime::LayerwiseLoadOptions::default(),
+        eredu_runtime::WeightResidency::layerwise_host(
+            eredu_runtime::LayerwiseLoadOptions::default(),
+        ),
         None,
         stream,
         weights_stream,
     )
     .unwrap();
-    let mut bounded_cache = bounded.new_cache().unwrap();
+    let mut bounded_cache = bounded.new_state().unwrap();
     let bounded_logits = bounded
         .forward(&tokens, &mut bounded_cache, stream)
         .unwrap();
@@ -2177,20 +2189,117 @@ fn tiny_deepseek_v4_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
     assert!(bounded.residency_report().unwrap().initialized());
 
-    let mut sparse = crate::composition::mlx_architectures::deepseek_v4::layerwise::load_deepseek_v4_expert_cache_model(
+    let mut sparse = crate::composition::deepseek::load_safetensors(
         &dir,
-        eredu_runtime::NonExpertWeightResidency::FullyResident,
-        eredu_runtime::ExpertCacheLoadOptions::default(),
+        eredu_runtime::WeightResidency::with_expert_cache(
+            eredu_runtime::NonExpertWeightResidency::FullyResident,
+            eredu_runtime::ExpertCacheLoadOptions::default(),
+        ),
         None,
         stream,
         weights_stream,
     )
     .unwrap();
-    let mut sparse_cache = sparse.new_cache().unwrap();
+    let mut sparse_cache = sparse.new_state().unwrap();
     let sparse_logits = sparse.forward(&tokens, &mut sparse_cache, stream).unwrap();
     safemlx::transforms::eval([&sparse_logits]).unwrap();
     assert_eq!(sparse_logits.shape(), resident_logits.shape());
     assert!(sparse.expert_cache_report().unwrap().is_some());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn tiny_deepseek_v4_dspark_executes_through_shared_draft_boundary() {
+    use crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget;
+
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let weights_stream = weights_context.stream();
+    let dir = temp_model_dir(
+        r#"{
+              "model_type":"deepseek_v4","hidden_size":4,"moe_intermediate_size":4,
+              "num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,
+              "head_dim":4,"qk_rope_head_dim":2,"q_lora_rank":2,
+              "o_lora_rank":2,"o_groups":2,"vocab_size":16,
+              "rms_norm_eps":0.000001,"max_position_embeddings":64,
+              "sliding_window":8,"compress_ratios":[0,0,0,0],
+              "index_n_heads":2,"index_head_dim":4,"index_topk":1,
+              "hc_mult":2,"hc_sinkhorn_iters":2,"hc_eps":0.000001,
+              "n_routed_experts":2,"n_shared_experts":1,"num_experts_per_tok":1,
+              "num_hash_layers":0,"scoring_func":"sqrtsoftplus",
+              "topk_method":"noaux_tc","norm_topk_prob":true,
+              "routed_scaling_factor":1.0,"swiglu_limit":4.0,
+              "num_nextn_predict_layers":2,"dspark_block_size":2,
+              "dspark_noise_token_id":0,"dspark_target_layer_ids":[0,1],
+              "dspark_markov_rank":2
+            }"#,
+    );
+    let config: serde_json::Value =
+        serde_json::from_reader(fs::File::open(dir.join("config.json")).unwrap()).unwrap();
+    let args = eredu_architectures::deepseek::parse_v4_config(&config).unwrap();
+    let plan = eredu_architectures::deepseek::v4_safetensors_plan(&args).unwrap();
+    let arrays = plan
+        .common_tensors
+        .iter()
+        .map(|tensor| {
+            let shape = tensor
+                .shape
+                .iter()
+                .map(|dimension| i32::try_from(*dimension).unwrap())
+                .collect::<Vec<_>>();
+            let dtype = if matches!(
+                tensor.dtype,
+                eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                    eredu_checkpoint::StoredDtype::I32
+                )
+            ) {
+                Dtype::Int32
+            } else {
+                Dtype::Float32
+            };
+            (
+                tensor.key.clone(),
+                zeros_dtype(&shape, dtype, stream).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Array::save_safetensors(
+        arrays.iter().map(|(name, array)| (name.as_str(), array)),
+        None,
+        dir.join("model.safetensors"),
+    )
+    .unwrap();
+
+    let mut model = crate::composition::deepseek::load_safetensors(
+        &dir,
+        eredu_runtime::WeightResidency::fully_resident(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    let mut state = model.new_state().unwrap();
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let parts = [input::InputPart::text_token_ids(&tokens)];
+    let output = EmbeddedMtpTarget::prefill_target(
+        &mut model,
+        input::ModelInput::new(&parts),
+        &mut state,
+        stream,
+    )
+    .unwrap();
+    EmbeddedMtpTarget::prefill_draft_cache(&mut model, &output, &tokens, &mut state, stream)
+        .unwrap();
+    let mut draft =
+        <crate::composition::deepseek::DeepSeekModel as EmbeddedMtpTarget>::draft_cache(&state);
+    let proposal =
+        EmbeddedMtpTarget::fused_draft_logits(&mut model, &output.hidden, 2, 2, &mut draft, stream)
+            .unwrap()
+            .expect("DSpark must provide fused proposal logits");
+    safemlx::transforms::eval([&proposal]).unwrap();
+    assert_eq!(output.logits.shape(), &[1, 2, 16]);
+    assert_eq!(proposal.shape(), &[1, 2, 16]);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -2221,7 +2330,18 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
             }"#,
     );
     let args = qwen3_vl::get_qwen3_vl_model_args(&dir).unwrap();
-    save_zero_checkpoint(&qwen3_vl::Model::new(args, stream).unwrap(), &dir, stream);
+    save_zero_checkpoint_with_names(
+        &qwen3_vl::Model::new(args, stream).unwrap(),
+        &dir,
+        stream,
+        |name| {
+            name.strip_prefix("model.language_model.model.language_model.")
+                .map_or_else(
+                    || name.to_owned(),
+                    |suffix| format!("model.language_model.{suffix}"),
+                )
+        },
+    );
 
     let quantization = WeightQuantization::MxFp4;
     let mut quantized = load_test_model(

@@ -117,6 +117,21 @@ impl<U> std::ops::DerefMut for MlxResidentUnit<U> {
 /// Statically dispatched unloaded-unit construction used by the MLX policy.
 pub(crate) trait MlxUnitFactory<U> {
     fn build(&mut self, index: usize, stream: &Stream) -> Result<U, Error>;
+
+    /// Populates the parameters owned by the execution-unit residency policy.
+    ///
+    /// Most units own every materialized parameter. Architectures with an
+    /// independently managed parameter class (for example, an expert cache)
+    /// override this method with the same exclusion used while binding the
+    /// unit. Keeping the ownership decision on the factory makes resident,
+    /// bounded, and dense-stream execution follow one contract.
+    fn populate(&mut self, unit: &mut MlxModule<U>, lease: &ResidentUnitLease) -> Result<(), Error>
+    where
+        U: Parameterized<Array>,
+    {
+        populate_module_from_lease(unit, lease)?;
+        Ok(())
+    }
 }
 
 impl<U, F> MlxUnitFactory<U> for F
@@ -314,7 +329,7 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
         let mut units = Vec::with_capacity(self.unit_ids.len());
         for (index, lease) in transfer.leases().iter().enumerate() {
             let mut unit = MlxModule::new(self.build.build(index, stream)?);
-            populate_module_from_lease(&mut unit, lease)?;
+            self.build.populate(&mut unit, lease)?;
             units.push(Some(unit));
         }
         Ok(MlxResidentPolicy {
@@ -453,6 +468,7 @@ fn populate_parameterized<M: Parameterized<Array>>(
 ) -> Result<(), Error> {
     struct Binder<'a> {
         lease: &'a ResidentUnitLease,
+        resident: &'a BTreeSet<String>,
         visited: BTreeSet<String>,
         error: Option<String>,
     }
@@ -462,6 +478,9 @@ fn populate_parameterized<M: Parameterized<Array>>(
                 return;
             }
             let name = metadata.id.to_string();
+            if !self.resident.contains(&name) {
+                return;
+            }
             let value = match self.lease.device_value(&name) {
                 Ok(value) => value,
                 Err(error) => {
@@ -481,8 +500,13 @@ fn populate_parameterized<M: Parameterized<Array>>(
             self.visited.insert(name);
         }
     }
+    let resident = lease
+        .binding_names()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
     let mut binder = Binder {
         lease,
+        resident: &resident,
         visited: BTreeSet::new(),
         error: None,
     };
@@ -490,10 +514,6 @@ fn populate_parameterized<M: Parameterized<Array>>(
     if let Some(error) = binder.error {
         return Err(Error::Parallel(error));
     }
-    let resident = lease
-        .binding_names()
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
     if binder.visited != resident {
         return Err(Error::Parallel(format!(
             "static resident bindings {:?} do not match parameter topology {:?}",
@@ -853,7 +873,7 @@ where
                 )));
             }
             let mut unit = MlxModule::new(self.build.build(index, stream)?);
-            populate_module_from_lease(&mut unit, transfer.lease())?;
+            self.build.populate(&mut unit, transfer.lease())?;
             return Ok(MlxUnitLease {
                 unit,
                 _transfer: MlxUnitTransfer::Dense {
@@ -890,7 +910,7 @@ where
         };
         transfer.order_after(stream)?;
         let mut unit = MlxModule::new(self.build.build(index, stream)?);
-        populate_module_from_lease(&mut unit, &transfer.leases()[0])?;
+        self.build.populate(&mut unit, &transfer.leases()[0])?;
         Ok(MlxUnitLease {
             unit,
             _transfer: MlxUnitTransfer::Ordinary {

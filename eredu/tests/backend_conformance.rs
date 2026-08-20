@@ -307,7 +307,7 @@ impl DistributedSession for MockDistributedSession {
 impl DistributedBackend for MockBackend {
     type DistributedSession = MockDistributedSession;
 
-    fn distributed_session<'a>(session: &'a Self::Session) -> Option<&'a Self::DistributedSession> {
+    fn distributed_session(session: &Self::Session) -> Option<&Self::DistributedSession> {
         Some(&session.distributed)
     }
 }
@@ -958,7 +958,7 @@ fn realize_residency_copy<R, E>(
         .unwrap();
     assert!(resources.insert((id.clone(), tier), resource).is_none());
     assert!(ledger
-        .resolve_transfer(&[id.clone()], tier, generation, true)
+        .resolve_transfer(std::slice::from_ref(id), tier, generation, true)
         .unwrap()
         .is_empty());
     Ok(())

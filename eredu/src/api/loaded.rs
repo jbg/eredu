@@ -325,6 +325,7 @@ impl<B: eredu_core::TextGenerationBackend> LoadedModel<B> {
         .map_err(PreparedChatMtpError::Backend)
     }
 
+    #[allow(clippy::type_complexity)]
     fn prepare_speculative_chat(
         &self,
         input: PreparedChatInput<'_, B>,
@@ -577,6 +578,7 @@ where
     ///
     /// The returned report is the exact portable plan used to realize the
     /// backend and remains suitable for persistence and execution telemetry.
+    #[allow(clippy::type_complexity)]
     pub fn plan_and_load<F>(
         factory: &F,
         planner: &eredu_core::AutomaticPlanner,

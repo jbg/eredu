@@ -128,16 +128,17 @@ fn unloaded_expert_bank(
             input_dimensions: args.hidden_size,
             intermediate_dimensions: intermediate,
             output_dimensions: args.hidden_size,
+            limit: None,
             layout: SwiGluExpertLayout::Packed {
                 gate_up: SwiGluExpertProjection {
                     weight: ParameterSpec::trainable(&gate_up)
                         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-                    quantization: args.weight_quantization_for(&gate_up),
+                    format: args.weight_quantization_for(&gate_up).into(),
                 },
                 down: SwiGluExpertProjection {
                     weight: ParameterSpec::trainable(&down)
                         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-                    quantization: args.weight_quantization_for(&down),
+                    format: args.weight_quantization_for(&down).into(),
                 },
             },
         },
@@ -1892,21 +1893,13 @@ fn register_qwen3_vl_parallel_parameters(
     else {
         unreachable!()
     };
-    planner.register(vocab_embedding_parameter_group(
+    for group in neutral_qwen::static_parallel_parameter_groups::<MlxBackend>(
         &modules.embedding,
-        "model.language_model.embed_tokens",
-        args.text_config.vocab_size as usize,
-        args.text_config.hidden_size,
-        false,
-    )?)?;
-    if let Some(head) = &modules.lm_head {
-        planner.register(vocab_lm_head_parameter_group(
-            head,
-            "lm_head",
-            args.text_config.hidden_size,
-            args.text_config.vocab_size as usize,
-            false,
-        )?)?;
+        &modules.norm,
+        modules.lm_head.as_ref(),
+        "model.language_model",
+    )? {
+        planner.register(group)?;
     }
     for group in vision_parallel_parameter_groups(&args.vision_config, "model.visual", stream)? {
         planner.register(group)?;

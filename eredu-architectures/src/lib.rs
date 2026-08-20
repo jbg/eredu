@@ -9,6 +9,9 @@
 /// Shared decoder mechanics used by backend-neutral text architectures.
 pub mod decoder;
 
+/// DeepSeek V3/R1 and V4 compressed-attention decoder family.
+pub mod deepseek;
+
 /// Llama and Mistral-compatible decoder architecture.
 pub mod llama;
 

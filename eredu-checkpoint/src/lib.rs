@@ -159,6 +159,124 @@ pub enum WeightQuantization {
     },
 }
 
+/// Physical encoding of the scale companion for an E4M3 block-FP8 matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockFp8ScaleEncoding {
+    /// Floating-point inverse scales (F16, BF16, or F32 in an artifact).
+    FloatingPoint,
+    /// Unsigned exponent-only E8M0 inverse scales.
+    Ue8m0,
+}
+
+/// Geometry and companion encoding for an E4M3 block-FP8 matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockFp8Format {
+    /// Number of output rows represented by one scale.
+    pub block_rows: i32,
+    /// Number of input columns represented by one scale.
+    pub block_columns: i32,
+    /// Physical encoding of each inverse scale.
+    pub scale_encoding: BlockFp8ScaleEncoding,
+}
+
+impl BlockFp8Format {
+    /// Creates a validated block-FP8 format.
+    pub fn new(
+        block_rows: i32,
+        block_columns: i32,
+        scale_encoding: BlockFp8ScaleEncoding,
+    ) -> Result<Self, Error> {
+        let format = Self {
+            block_rows,
+            block_columns,
+            scale_encoding,
+        };
+        format.validate()?;
+        Ok(format)
+    }
+
+    /// Validates positive two-dimensional block geometry.
+    pub fn validate(self) -> Result<(), Error> {
+        if self.block_rows <= 0 || self.block_columns <= 0 {
+            return Err(Error::invalid(format!(
+                "block-FP8 geometry must be positive, got [{}, {}]",
+                self.block_rows, self.block_columns
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Complete physical encoding selected for one linear matrix.
+///
+/// Unlike [`WeightQuantization`], this type includes dense and block-FP8
+/// storage, so a neural-layer specification never needs an architecture-owned
+/// format enum or an out-of-band quantization flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearFormat {
+    /// Ordinary floating-point matrix storage.
+    Dense,
+    /// Per-group affine integer storage.
+    Affine(AffineQuantization),
+    /// Microscaling FP4 with E2M1 values and E8M0 scales.
+    MxFp4,
+    /// Checkpoint-native GGML blocks.
+    GgufIQuant {
+        /// Native GGML tensor encoding.
+        ggml_type: GgmlType,
+        /// Byte order declared by the GGUF container.
+        endian: Endian,
+    },
+    /// E4M3 values with one inverse scale per two-dimensional block.
+    E4M3BlockFp8(BlockFp8Format),
+}
+
+impl LinearFormat {
+    /// Validates the selected physical encoding and its geometry.
+    pub fn validate(self) -> Result<(), Error> {
+        match self {
+            Self::Dense => Ok(()),
+            Self::Affine(config) => config.validate(),
+            Self::MxFp4 => WeightQuantization::MxFp4.validate(),
+            Self::GgufIQuant { ggml_type, endian } => {
+                WeightQuantization::GgufIQuant { ggml_type, endian }.validate()
+            }
+            Self::E4M3BlockFp8(format) => format.validate(),
+        }
+    }
+
+    /// Returns the packed-quantization descriptor when this format is
+    /// represented by the standard affine/GGUF materializer.
+    pub const fn weight_quantization(self) -> Option<WeightQuantization> {
+        match self {
+            Self::Dense | Self::E4M3BlockFp8(_) => None,
+            Self::Affine(config) => Some(WeightQuantization::Affine(config)),
+            Self::MxFp4 => Some(WeightQuantization::MxFp4),
+            Self::GgufIQuant { ggml_type, endian } => {
+                Some(WeightQuantization::GgufIQuant { ggml_type, endian })
+            }
+        }
+    }
+}
+
+impl From<WeightQuantization> for LinearFormat {
+    fn from(value: WeightQuantization) -> Self {
+        match value {
+            WeightQuantization::Affine(config) => Self::Affine(config),
+            WeightQuantization::MxFp4 => Self::MxFp4,
+            WeightQuantization::GgufIQuant { ggml_type, endian } => {
+                Self::GgufIQuant { ggml_type, endian }
+            }
+        }
+    }
+}
+
+impl From<Option<WeightQuantization>> for LinearFormat {
+    fn from(value: Option<WeightQuantization>) -> Self {
+        value.map_or(Self::Dense, Into::into)
+    }
+}
+
 impl WeightQuantization {
     /// MXFP4 group size fixed by the format.
     pub const MXFP4_GROUP_SIZE: i32 = 32;

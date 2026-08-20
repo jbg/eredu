@@ -13,7 +13,7 @@ use safemlx::{
     distributed::{self, Group},
     module::ModuleParameters,
     ops::{indexing::TryIndexOp, ones, zeros},
-    Array, Stream,
+    Array, Dtype, Stream,
 };
 
 use crate::{
@@ -84,20 +84,31 @@ pub(crate) fn sample_and_synchronize<S: Sampler>(
         sampler
             .sample(&logits, temperature, prng_state, stream)?
             .reshape(&[batch_size, 1], stream)?
+            .as_dtype(Dtype::Uint32, stream)?
     } else {
         zeros::<u32>(&[batch_size, 1], stream)?
     };
-    let token = distributed::all_sum(&local_token, group, stream)?;
+    // MLX Ring reductions operate on floating payloads. Reducing an integer
+    // token array can preserve the integer dtype while interpreting its bytes
+    // as floats. Token ids are exactly representable in f32 throughout the
+    // supported vocabulary range, so cross the collective boundary as f32 and
+    // restore the public u32 contract afterward.
+    let token = distributed::all_sum(
+        &local_token.as_dtype(Dtype::Float32, stream)?,
+        group,
+        stream,
+    )?
+    .as_dtype(Dtype::Uint32, stream)?;
     let local_finished = if group.rank() == sampling_rank && finished {
-        ones::<i32>(&[], stream)?
+        ones::<f32>(&[], stream)?
     } else {
-        zeros::<i32>(&[], stream)?
+        zeros::<f32>(&[], stream)?
     };
     let finished = distributed::all_sum(&local_finished, group, stream)?;
     synchronize_outputs([&token, &finished])?;
     Ok(SynchronizedToken {
         token,
-        finished: finished.try_item::<i32>(stream)? != 0,
+        finished: finished.try_item::<f32>(stream)? != 0.0,
     })
 }
 

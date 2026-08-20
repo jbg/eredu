@@ -19,8 +19,6 @@ use super::{MlxBackend, MlxModelInput, MlxModelSession, Model};
 use crate::{
     backend::mlx::runtime::media::input::{self, InputPayload, Modality},
     composition::mlx_architectures::{
-        deepseek_v3::model as deepseek_v3,
-        deepseek_v4,
         gemma4::model as gemma4,
         gpt_oss::model as gpt_oss,
         inkling::model as inkling,
@@ -180,15 +178,19 @@ impl Model {
     ) -> Result<(ModelCapabilities, StateLayout), CapabilityError> {
         let model_type = self.model_type().to_string();
         let result = match self {
+            Self::DeepSeek(model) => {
+                if let Some(args) = model.v3_args() {
+                    neutral_deepseek_v3_spec(args)?
+                } else {
+                    neutral_deepseek_v4_spec(model.v4_args().expect("DeepSeek family"))?
+                }
+            }
             Self::Llama(model) => llama_spec(model.args(), false)?,
             Self::Qwen(model) => qwen_spec(model.args(), false)?,
             Self::MuseGlimmer(model) => muse_glimmer_spec(model.args())?,
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
                 qwen_spec(&model.args().text_config, true)?
             }
-            Self::DeepSeekV3(model) => deepseek_spec(model.args())?,
-            Self::DeepSeekV4(model) => deepseek_v4_spec(&model.args)?,
-            Self::DeepSeekV4Layerwise(model) => deepseek_v4_spec(model.args())?,
             Self::GptOss(model) => gpt_oss_spec(model.args())?,
             Self::Gemma4(model) => {
                 let (_, _, image, audio, video) = model.media_accounting();
@@ -430,7 +432,9 @@ fn muse_glimmer_spec(args: &muse_glimmer::DecoderConfig) -> Result<Spec, Capabil
     ))
 }
 
-fn deepseek_spec(args: &deepseek_v3::ModelArgs) -> Result<Spec, CapabilityError> {
+fn neutral_deepseek_v3_spec(
+    args: &eredu_architectures::deepseek::V3Args,
+) -> Result<Spec, CapabilityError> {
     let effective = positive(args.max_position_embeddings, "max_position_embeddings")?;
     let native = args
         .rope_scaling
@@ -451,17 +455,16 @@ fn deepseek_spec(args: &deepseek_v3::ModelArgs) -> Result<Spec, CapabilityError>
     })?;
     let latent = positive(args.kv_lora_rank, "kv_lora_rank")?;
     let rotary = positive(args.qk_rope_head_dim, "qk_rope_head_dim")?;
-    let width = checked_add(latent, rotary, "MLA latent plus rotary width")?;
     Ok((
         Observed::Available {
             value: native,
             kind: ObservationKind::Exact,
-            source: "validated DeepSeek YaRN configuration".into(),
+            source: "validated neutral DeepSeek YaRN configuration".into(),
         },
         Observed::Available {
             value: effective,
             kind: ObservationKind::Exact,
-            source: "validated DeepSeek configuration".into(),
+            source: "validated neutral DeepSeek configuration".into(),
         },
         CacheStateStrategy::CompressedMla {
             latent_width: latent,
@@ -472,7 +475,7 @@ fn deepseek_spec(args: &deepseek_v3::ModelArgs) -> Result<Spec, CapabilityError>
             fixed_scalars_per_batch: 0,
             growing: vec![GrowingState {
                 layers,
-                scalars_per_position: width,
+                scalars_per_position: checked_add(latent, rotary, "MLA latent plus rotary width")?,
                 window: None,
             }],
             hidden_size: positive(args.hidden_size, "hidden_size")?,
@@ -482,7 +485,9 @@ fn deepseek_spec(args: &deepseek_v3::ModelArgs) -> Result<Spec, CapabilityError>
     ))
 }
 
-fn deepseek_v4_spec(args: &deepseek_v4::ModelArgs) -> Result<Spec, CapabilityError> {
+fn neutral_deepseek_v4_spec(
+    args: &eredu_architectures::deepseek::V4Args,
+) -> Result<Spec, CapabilityError> {
     let effective = positive(args.max_position_embeddings, "max_position_embeddings")?;
     let native = args
         .rope_scaling
@@ -497,21 +502,26 @@ fn deepseek_v4_spec(args: &deepseek_v4::ModelArgs) -> Result<Spec, CapabilityErr
         .unwrap_or(effective);
     let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
     let compressed = args
-        .compress_ratios
+        .attention_schedule
         .iter()
-        .filter(|ratio| **ratio != 0)
+        .filter(|policy| {
+            matches!(
+                policy,
+                eredu_architectures::deepseek::V4AttentionPolicy::Compressed { .. }
+            )
+        })
         .count() as u64;
     let head_dim = positive(args.head_dim, "head_dim")?;
     Ok((
         Observed::Available {
             value: native,
             kind: ObservationKind::Exact,
-            source: "validated DeepSeek-V4 YaRN configuration".into(),
+            source: "validated neutral DeepSeek-V4 YaRN configuration".into(),
         },
         Observed::Available {
             value: effective,
             kind: ObservationKind::Exact,
-            source: "validated DeepSeek-V4 configuration".into(),
+            source: "validated neutral DeepSeek-V4 configuration".into(),
         },
         CacheStateStrategy::MixedKv {
             full_layers: compressed,
@@ -523,9 +533,6 @@ fn deepseek_v4_spec(args: &deepseek_v4::ModelArgs) -> Result<Spec, CapabilityErr
         text_modalities(),
         StateLayout {
             fixed_scalars_per_batch: 0,
-            // Pooled state grows more slowly than one vector per source token;
-            // charging a full vector is a complete safe upper bound across the
-            // heterogeneous 4/128 compression schedule.
             growing: vec![
                 GrowingState {
                     layers,
@@ -1950,9 +1957,7 @@ impl Model {
             Self::Inkling(model) => {
                 inkling_workspace(model.args(), modality, payload, metadata, self.model_type())
             }
-            Self::DeepSeekV3(_)
-            | Self::DeepSeekV4(_)
-            | Self::DeepSeekV4Layerwise(_)
+            Self::DeepSeek(_)
             | Self::GptOss(_)
             | Self::KimiLinear(_)
             | Self::Llama(_)

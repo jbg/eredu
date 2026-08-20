@@ -1,19 +1,10 @@
 //! MLX executor adapter for checkpoint-embedded prediction heads.
 
-use eredu_checkpoint::WeightQuantization;
-
 use eredu_core::{SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission};
-use safemlx::{
-    distributed::{self, Group},
-    error::Exception,
-    module::{Module, ModuleParamMut, ModuleParamRef, ModuleParameters},
-    nn,
-    ops::indexing::TryIndexOp,
-    quantization::MaybeQuantized,
-    Array, Stream,
-};
+use safemlx::{distributed::Group, error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::{
+    backend::mlx::error::Error,
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::input::ModelInput,
     composition::mlx::{
@@ -29,8 +20,8 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct DistributedEmbeddedMtpSampler<'a, S> {
     sampler: S,
-    sampling_rank: usize,
-    group: &'a Group,
+    _sampling_rank: usize,
+    _group: &'a Group,
 }
 
 impl<'a, S> DistributedEmbeddedMtpSampler<'a, S> {
@@ -43,8 +34,8 @@ impl<'a, S> DistributedEmbeddedMtpSampler<'a, S> {
         }
         Ok(Self {
             sampler,
-            sampling_rank,
-            group,
+            _sampling_rank: sampling_rank,
+            _group: group,
         })
     }
 
@@ -87,12 +78,13 @@ impl<S: SpeculativeSampler> SpeculativeSampler for DistributedEmbeddedMtpSampler
         let sampled = self
             .sampler
             .sample_processed(logits, temperature, prng_state, stream)?;
-        let selected = if self.group.rank() == self.sampling_rank {
-            sampled
-        } else {
-            safemlx::ops::zeros_dtype(sampled.shape(), sampled.dtype(), stream)?
-        };
-        distributed::all_sum(&selected, self.group, stream)
+        // Pipeline MTP publishes identical complete logits to every rank before
+        // sampling. The speculative scheduler also advances the same sampler
+        // and PRNG state on every rank, so sampling locally is the exact
+        // synchronized operation. A world collective here is unsafe after
+        // point-to-point pipeline traffic on MLX Ring because it can consume a
+        // prior activation payload from the transport queue.
+        Ok(sampled)
     }
 
     fn commit_token(
@@ -102,156 +94,6 @@ impl<S: SpeculativeSampler> SpeculativeSampler for DistributedEmbeddedMtpSampler
         stream: &Stream,
     ) -> Result<(), Exception> {
         self.sampler.commit_token(processed_logits, token, stream)
-    }
-}
-
-use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::nn::parallel::VocabParallelLmHead,
-    backend::mlx::runtime::distributed::parallel::{
-        ParallelBuildContext, ParallelExecutionContext,
-    },
-};
-
-/// One vocabulary projection whose parameter tree stays stable when TP turns
-/// the physical storage into rank-local rows.
-///
-/// Keeping the active representation behind one module boundary means static
-/// residency, bounded conversion, and pipeline loading continue to address the
-/// same semantic parameter names in replicated and distributed execution.
-#[derive(Debug, Clone)]
-pub(crate) struct EmbeddedMtpVocabHead {
-    ordinary: MaybeQuantized<nn::Linear>,
-    parallel: Option<VocabParallelLmHead>,
-    input_dims: i32,
-    vocabulary: usize,
-    quantization: Option<WeightQuantization>,
-}
-
-impl EmbeddedMtpVocabHead {
-    pub(crate) fn new(
-        input_dims: i32,
-        vocabulary: usize,
-        quantization: Option<WeightQuantization>,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            ordinary: crate::backend::mlx::nn::linear::unloaded_maybe_quantized_linear(
-                input_dims,
-                i32::try_from(vocabulary)
-                    .map_err(|_| Error::Parallel("MTP vocabulary exceeds i32".into()))?,
-                false,
-                quantization,
-                stream,
-            )?,
-            parallel: None,
-            input_dims,
-            vocabulary,
-            quantization,
-        })
-    }
-
-    pub(crate) fn configure_parallel(
-        &mut self,
-        context: ParallelBuildContext,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        self.parallel = Some(VocabParallelLmHead::unloaded(
-            self.input_dims,
-            self.vocabulary,
-            self.quantization,
-            context,
-            stream,
-        )?);
-        Ok(())
-    }
-
-    pub(crate) fn register(
-        &self,
-        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
-        prefix: &str,
-    ) -> Result<(), Error> {
-        planner.register(
-            crate::backend::mlx::nn::parallel::vocab_lm_head_parameter_group(
-                &self.ordinary,
-                prefix,
-                self.input_dims,
-                self.vocabulary,
-                false,
-            )?,
-        )
-    }
-
-    pub(crate) fn forward(
-        &mut self,
-        hidden: &Array,
-        execution: Option<&ParallelExecutionContext<'_>>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        match (self.parallel.as_mut(), execution) {
-            (Some(head), Some(execution)) if execution.is_tensor_parallel() => head
-                .forward(hidden, execution)
-                .and_then(|output| output.all_gather(execution))
-                .map_err(|error| Exception::custom(error.to_string())),
-            (None, None) => self.ordinary.forward(hidden, stream),
-            (Some(_), None) => Err(Exception::custom(
-                "TP-sharded embedded MTP head requires a tensor execution context",
-            )),
-            (None, Some(execution)) if execution.is_tensor_parallel() => Err(Exception::custom(
-                "embedded MTP head was not configured for tensor parallelism",
-            )),
-            (None, Some(_)) => self.ordinary.forward(hidden, stream),
-            (Some(head), Some(execution)) => head
-                .forward(hidden, execution)
-                .and_then(|output| output.all_gather(execution))
-                .map_err(|error| Exception::custom(error.to_string())),
-        }
-    }
-
-    fn active(&self) -> &dyn ModuleParameters {
-        self.parallel
-            .as_ref()
-            .map_or(&self.ordinary as &dyn ModuleParameters, |head| head)
-    }
-
-    fn active_mut(&mut self) -> &mut dyn ModuleParameters {
-        self.parallel
-            .as_mut()
-            .map_or(&mut self.ordinary as &mut dyn ModuleParameters, |head| head)
-    }
-}
-
-impl ModuleParameters for EmbeddedMtpVocabHead {
-    fn num_parameters(&self) -> usize {
-        self.active().num_parameters()
-    }
-
-    fn parameters(&self) -> ModuleParamRef<'_> {
-        self.active().parameters()
-    }
-
-    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-        self.active_mut().parameters_mut()
-    }
-
-    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
-        self.active().trainable_parameters()
-    }
-
-    fn freeze_parameters(&mut self, recursive: bool) {
-        self.active_mut().freeze_parameters(recursive);
-    }
-
-    fn unfreeze_parameters(&mut self, recursive: bool) {
-        self.active_mut().unfreeze_parameters(recursive);
-    }
-
-    fn all_frozen(&self) -> Option<bool> {
-        self.active().all_frozen()
-    }
-
-    fn any_frozen(&self) -> Option<bool> {
-        self.active().any_frozen()
     }
 }
 

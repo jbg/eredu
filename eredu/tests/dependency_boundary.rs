@@ -71,6 +71,95 @@ fn shared_architectures_do_not_depend_on_accelerator_runtimes() {
 }
 
 #[test]
+fn deepseek_cutover_has_one_neutral_source_of_model_semantics() {
+    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_root.parent().expect("workspace root");
+
+    for deleted in [
+        "eredu/src/composition/mlx_architectures/deepseek_v3",
+        "eredu/src/composition/mlx_architectures/deepseek_v4",
+    ] {
+        assert!(
+            !workspace.join(deleted).exists(),
+            "legacy DeepSeek implementation still exists at {deleted}"
+        );
+    }
+
+    let mut neutral_sources = Vec::new();
+    rust_sources(
+        &workspace.join("eredu-architectures/src/deepseek"),
+        &mut neutral_sources,
+    );
+    for source in neutral_sources {
+        let text = std::fs::read_to_string(&source).expect("DeepSeek source must be readable");
+        for forbidden in [
+            "safemlx",
+            "backend::mlx",
+            "MlxBackend",
+            "CompressedLatentCache",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "backend dependency {forbidden:?} leaked into {source:?}"
+            );
+        }
+    }
+
+    let mut backend_sources = Vec::new();
+    rust_sources(&crate_root.join("src/backend/mlx"), &mut backend_sources);
+    for source in backend_sources {
+        let text = std::fs::read_to_string(&source).expect("MLX source must be readable");
+        assert!(
+            !text.to_ascii_lowercase().contains("deepseek"),
+            "DeepSeek policy leaked into backend implementation {source:?}"
+        );
+    }
+
+    let mut facade_sources = Vec::new();
+    rust_sources(&crate_root.join("src"), &mut facade_sources);
+    for source in facade_sources {
+        let text = std::fs::read_to_string(&source).expect("facade source must be readable");
+        for forbidden in [
+            concat!("DeepSeekV3", "LayerwiseAdapter"),
+            concat!("DeepSeekV4", "LayerwiseAdapter"),
+            concat!("mlx_architectures::", "deepseek_v3"),
+            concat!("mlx_architectures::", "deepseek_v4"),
+            concat!("load_deepseek_", "pipeline"),
+            concat!("load_deepseek_v4_", "pipeline"),
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "legacy DeepSeek dependency {forbidden:?} remains in {source:?}"
+            );
+        }
+    }
+
+    let architecture_root = crate_root.join("src/composition/mlx_architectures");
+    let mut architecture_sources = Vec::new();
+    rust_sources(&architecture_root, &mut architecture_sources);
+    for source in architecture_sources {
+        if source
+            .strip_prefix(&architecture_root)
+            .is_ok_and(|relative| {
+                relative
+                    .components()
+                    .next()
+                    .is_some_and(|component| component.as_os_str() == "qwen")
+            })
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(&source).expect("architecture source must be readable");
+        for forbidden in ["QwenLinear", "QwenWeightFormat", "qwen::hybrid::qwen3_5"] {
+            assert!(
+                !text.contains(forbidden),
+                "Qwen-hybrid linear dependency {forbidden:?} leaked into {source:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn mlx_neural_operator_binding_is_architecture_agnostic() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let source = std::fs::read_to_string(root.join("src/backend/mlx/nn/shared.rs"))

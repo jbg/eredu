@@ -748,6 +748,7 @@ impl ResidencyController {
     }
 
     /// Publishes one realized copy and records its backend transfer observation.
+    #[allow(clippy::too_many_arguments)]
     pub fn publish_acquisition_copy(
         &mut self,
         id: &OffloadUnitId,
@@ -1370,8 +1371,10 @@ mod tests {
 
     struct TestTransferResources(Arc<Mutex<Vec<bool>>>);
 
+    type TransferCompletionRecord = (Vec<OffloadUnitId>, MemoryTier, u64, bool);
+
     #[derive(Default)]
-    struct TestTransferOwner(Mutex<Vec<(Vec<OffloadUnitId>, MemoryTier, u64, bool)>>);
+    struct TestTransferOwner(Mutex<Vec<TransferCompletionRecord>>);
 
     impl ResidencyTransferOwner<TestTransferCompletion, TestTransferResources> for TestTransferOwner {
         type Executor = Mutex<usize>;

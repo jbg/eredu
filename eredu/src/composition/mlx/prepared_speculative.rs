@@ -20,8 +20,8 @@ use crate::backend::mlx::{
     runtime::generation::sampler::{ConstrainedSampler, GenerationSampler},
 };
 use crate::composition::mlx_architectures::{
-    deepseek_v3::model as deepseek_v3, gemma4::model as gemma4, inkling::model as inkling,
-    nemotron_h::model as nemotron_h, qwen::hybrid::qwen3_5,
+    gemma4::model as gemma4, inkling::model as inkling, nemotron_h::model as nemotron_h,
+    qwen::hybrid::qwen3_5,
 };
 
 impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
@@ -209,9 +209,11 @@ fn qwen35_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5::Cache> {
     }
 }
 
-fn deepseek_mtp_cache(cache: &mut ModelCache) -> Option<&mut deepseek_v3::Cache> {
+fn neutral_deepseek_mtp_cache(
+    cache: &mut ModelCache,
+) -> Option<&mut crate::composition::deepseek::DeepSeekState> {
     match cache {
-        ModelCache::DeepSeekV3(cache) => Some(cache),
+        ModelCache::DeepSeek(cache) => Some(cache),
         _ => None,
     }
 }
@@ -408,15 +410,15 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         let prepared_lanes = self.prepare_speculative_batch_lanes(lanes, &mut cache)?;
         let streams = MtpExecutionStreams::single(&stream);
         match self.model_and_cache().0 {
-            Model::DeepSeekV3(target) => {
+            Model::DeepSeek(target) => {
                 let mut backend =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        target,
+                        target.as_mut(),
                     );
                 run_speculative_batch(
                     &mut backend,
                     prepared_lanes,
-                    deepseek_mtp_cache,
+                    neutral_deepseek_mtp_cache,
                     "DeepSeek embedded",
                     streams,
                     scheduler,

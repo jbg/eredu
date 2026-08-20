@@ -190,9 +190,9 @@ pub fn quantize_expert_bank(
 pub enum TopKRouterScoreFunction {
     /// Softmax scores before top-k selection.
     Softmax,
-    /// Sigmoid scores, as used by Nemotron/DeepSeek-style routers.
+    /// Sigmoid router scores.
     Sigmoid,
-    /// Square-root softplus scores used by DeepSeek V4.
+    /// Square-root softplus router scores.
     SqrtSoftplus,
 }
 
@@ -521,7 +521,7 @@ impl TopKRouter {
 
     /// Computes routing weights for caller-provided global expert ids.
     ///
-    /// This is the hash-router form used by DeepSeek V4: the checkpoint's
+    /// In hash-router form, the checkpoint's
     /// token-id table chooses experts, while the ordinary router projection
     /// still supplies their normalized contribution weights.
     pub fn forward_with_routing_indices(
@@ -530,6 +530,19 @@ impl TopKRouter {
         expert_indices: &Array,
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
+        let output =
+            self.forward_routes_with_routing_indices(hidden_states, expert_indices, stream)?;
+        Ok((output.indices, output.weights))
+    }
+
+    /// Returns caller-selected ids, their raw transformed scores, and final
+    /// normalized/scaled route weights.
+    pub fn forward_routes_with_routing_indices(
+        &mut self,
+        hidden_states: &Array,
+        expert_indices: &Array,
+        stream: &Stream,
+    ) -> Result<TopKRouterOutput, Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
         let logits = if let Some(iquant) = self.iquant {
             let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ router format");
@@ -573,6 +586,7 @@ impl TopKRouter {
         let scores = self.score_function.apply(logits, stream)?;
         let expert_indices = expert_indices.reshape(&[-1, self.top_k], stream)?;
         let mut weights = take_along_axis(scores, &expert_indices, -1, stream)?;
+        let selected_scores = weights.clone();
         if self.norm_topk_prob {
             let denominator = weights
                 .sum_axis(-1, true, stream)?
@@ -582,7 +596,11 @@ impl TopKRouter {
         if self.routed_scaling_factor != 1.0 {
             weights = weights.multiply(Array::from_f32(self.routed_scaling_factor), stream)?;
         }
-        Ok((expert_indices, weights))
+        Ok(TopKRouterOutput {
+            indices: expert_indices,
+            scores: selected_scores,
+            weights,
+        })
     }
 
     /// Returns selected expert ids and weights while reporting router internals.
@@ -854,7 +872,7 @@ pub struct PackedSwiGluExperts {
     pub hidden_dim: i32,
     /// Per-expert intermediate dimension.
     pub intermediate_dim: i32,
-    /// Optional DeepSeek-style bound applied before the SwiGLU product.
+    /// Optional finite bound applied before the SwiGLU product.
     pub swiglu_limit: Option<f32>,
     /// Optional encoding for the concatenated gate/up projection.
     pub gate_up_affine: Option<WeightQuantization>,
@@ -1030,7 +1048,7 @@ impl PackedSwiGluExperts {
     /// Applies a finite activation bound to gate and up projections.
     ///
     /// The gate is upper-bounded while the up projection is bounded on both
-    /// sides, matching the limited SwiGLU used by DeepSeek V4. A non-positive
+    /// sides. A non-positive
     /// value disables the bound.
     pub fn with_swiglu_limit(mut self, limit: f32) -> Result<Self, Exception> {
         if !limit.is_finite() {

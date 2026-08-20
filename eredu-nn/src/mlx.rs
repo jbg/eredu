@@ -6,7 +6,7 @@ use safemlx::{
     ops::{
         addmm, concatenate_axis, conv1d, conv_transpose1d,
         indexing::{ArrayIndex, ArrayIndexOp, TryIndexOp},
-        matmul, pad, stack_axis, sum_axis, PadMode as MlxPadMode,
+        matmul, pad, softmax_axis, stack_axis, sum_axis, PadMode as MlxPadMode,
     },
     Array, Stream,
 };
@@ -27,12 +27,24 @@ impl Tensor for Array {
         backend(Array::zeros::<f32>(shape, context))
     }
 
+    fn unloaded_i32(shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
+        backend(Array::zeros::<i32>(shape, context))
+    }
+
     fn from_f32_slice(
         values: &[f32],
         shape: &[i32],
         context: &Self::Context,
     ) -> Result<Self, Error> {
         backend(Array::from_slice(values, shape).copy(context))
+    }
+
+    fn full_f32(value: f32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
+        backend(Array::full::<f32>(shape, Array::from_f32(value), context))
+    }
+
+    fn full_i32(value: i32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
+        backend(Array::full::<i32>(shape, Array::from_int(value), context))
     }
 
     fn add(&self, rhs: &Self, context: &Self::Context) -> Result<Self, Error> {
@@ -63,8 +75,21 @@ impl Tensor for Array {
         backend(safemlx::ops::maximum(self, Array::from_f32(rhs), context))
     }
 
+    fn softmax_axis(
+        &self,
+        axis: i32,
+        precise: bool,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        backend(softmax_axis(self, axis, precise, context))
+    }
+
     fn reshape(&self, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         backend(Array::reshape(self, shape, context))
+    }
+
+    fn broadcast_to(&self, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
+        backend(safemlx::ops::broadcast_to(self, shape, context))
     }
 
     fn transpose_axes(&self, axes: &[i32], context: &Self::Context) -> Result<Self, Error> {
@@ -103,6 +128,26 @@ impl Tensor for Array {
         backend(Array::take_axis(self, indexes, axis, context))
     }
 
+    fn rope_with_frequencies(
+        &self,
+        dimensions: i32,
+        traditional: bool,
+        offset: i32,
+        frequencies: &Self,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        backend(safemlx::fast::rope(
+            self,
+            dimensions,
+            traditional,
+            None::<f32>,
+            1.0,
+            offset,
+            frequencies,
+            context,
+        ))
+    }
+
     fn concatenate(values: &[Self], axis: i32, context: &Self::Context) -> Result<Self, Error> {
         backend(concatenate_axis(values, axis, context))
     }
@@ -122,6 +167,15 @@ impl Tensor for Array {
         context: &Self::Context,
     ) -> Result<Self, Error> {
         backend(sum_axis(value, axis, keep_dims, context))
+    }
+
+    fn mean_axis(
+        value: &Self,
+        axis: i32,
+        keep_dims: bool,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        backend(safemlx::ops::mean_axis(value, axis, keep_dims, context))
     }
 
     fn argmin_axis(

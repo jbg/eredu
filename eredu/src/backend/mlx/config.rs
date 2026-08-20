@@ -122,14 +122,14 @@ mod tests {
     use eredu_runtime::WeightResidency;
 
     #[test]
-    fn deepseek_v4_quantization_composes_with_nonresident_layers() {
+    fn quantization_composes_with_nonresident_layers() {
         let options = ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
             .with_weight_residency(WeightResidency::layerwise_host(
                 LayerwiseLoadOptions::default(),
             ));
         options
             .validate_preparation(
-                eredu_core::ModelKind::DeepSeekV4,
+                eredu_core::ModelKind::Qwen3,
                 None,
                 eredu_core::ArtifactFormat::SafeTensors,
             )

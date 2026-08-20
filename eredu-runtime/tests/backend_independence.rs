@@ -4,7 +4,8 @@ use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, Completion, LayerSche
 use eredu_nn::{
     AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator, LinearSpec,
     NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode, ParameterVisitor,
-    ParameterVisitorMut, Parameterized, RotaryOperator, RotaryPosition, RotarySpec, Tensor,
+    ParameterVisitorMut, Parameterized, RotaryOperator, RotaryPosition, RotarySpec, SwiGluLimit,
+    Tensor,
 };
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, CollectiveBackend, DeviceState, ExecutionGraph,
@@ -256,6 +257,14 @@ impl NeuralBackend for FakeBackend {
     }
     fn silu(input: Self::Tensor, _: &()) -> Result<Self::Tensor, Error> {
         Ok(input)
+    }
+    fn swiglu(
+        gate: Self::Tensor,
+        _: Self::Tensor,
+        _: Option<SwiGluLimit>,
+        _: &(),
+    ) -> Result<Self::Tensor, Error> {
+        Ok(gate)
     }
     fn attention(
         queries: Self::Tensor,

@@ -6,7 +6,16 @@ use std::collections::BTreeSet;
 
 use eredu_gguf::GgmlType as GgufType;
 
-use crate::{StoredDtype, WeightQuantization};
+use crate::{BlockFp8ScaleEncoding, LinearFormat, StoredDtype};
+
+/// Architecture-supplied physical names for a block-FP8 scale companion.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MatrixScaleNames {
+    /// Canonical physical scale tensor name.
+    pub key: String,
+    /// Accepted alternative physical scale tensor names.
+    pub aliases: Vec<String>,
+}
 
 /// Invalid matrix-plus-quantization-companion geometry.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -17,28 +26,81 @@ pub enum MatrixConstraintError {
     /// Packing or companion geometry is incompatible.
     #[error("{detail}")]
     Invalid { detail: String },
+    /// A block-FP8 matrix did not declare its architecture-owned scale name.
+    #[error("block-FP8 matrix {name:?} requires an explicit scale companion name")]
+    MissingBlockScaleName { name: String },
 }
 
-/// Builds a floating matrix constraint or its affine packed weight companions.
+/// Builds a matrix constraint and every companion required by its complete
+/// physical format.
 ///
 /// This helper is family-neutral: callers provide canonical names, aliases,
 /// logical shape, and the selected physical encoding.
-pub fn matrix_with_optional_quantization(
+pub fn matrix_for_linear_format(
     name: impl Into<String>,
     aliases: impl IntoIterator<Item = impl Into<String>>,
     shape: Vec<usize>,
-    quantization: Option<WeightQuantization>,
+    format: LinearFormat,
+    scale_companion: Option<MatrixScaleNames>,
 ) -> Result<Vec<SafetensorsTensorConstraint>, MatrixConstraintError> {
     let name = name.into();
     let aliases = aliases.into_iter().map(Into::into).collect::<Vec<String>>();
-    let Some(quantization) = quantization else {
+    if format == LinearFormat::Dense {
         return Ok(vec![SafetensorsTensorConstraint::required(
             name,
             shape,
             StoredDtypeConstraint::Floating,
         )
         .with_aliases(aliases)]);
-    };
+    }
+    if let LinearFormat::E4M3BlockFp8(fp8) = format {
+        fp8.validate()
+            .map_err(|error| MatrixConstraintError::Invalid {
+                detail: error.to_string(),
+            })?;
+        let scale = scale_companion
+            .ok_or_else(|| MatrixConstraintError::MissingBlockScaleName { name: name.clone() })?;
+        let row_axis = shape
+            .len()
+            .checked_sub(2)
+            .ok_or_else(|| MatrixConstraintError::Scalar { name: name.clone() })?;
+        let column_axis = shape.len() - 1;
+        let rows = *shape
+            .get(row_axis)
+            .ok_or_else(|| MatrixConstraintError::Scalar { name: name.clone() })?;
+        let columns = *shape
+            .get(column_axis)
+            .ok_or_else(|| MatrixConstraintError::Scalar { name: name.clone() })?;
+        let block_rows =
+            usize::try_from(fp8.block_rows).map_err(|_| MatrixConstraintError::Invalid {
+                detail: format!("block-FP8 row geometry for {name:?} exceeds usize"),
+            })?;
+        let block_columns =
+            usize::try_from(fp8.block_columns).map_err(|_| MatrixConstraintError::Invalid {
+                detail: format!("block-FP8 column geometry for {name:?} exceeds usize"),
+            })?;
+        let mut scale_shape = shape.clone();
+        scale_shape[row_axis] = rows.div_ceil(block_rows);
+        scale_shape[column_axis] = columns.div_ceil(block_columns);
+        let scale_dtype = match fp8.scale_encoding {
+            BlockFp8ScaleEncoding::FloatingPoint => StoredDtypeConstraint::Floating,
+            BlockFp8ScaleEncoding::Ue8m0 => StoredDtypeConstraint::Exact(StoredDtype::F8E8M0),
+        };
+        return Ok(vec![
+            SafetensorsTensorConstraint::required(
+                name,
+                shape,
+                StoredDtypeConstraint::Exact(StoredDtype::F8E4M3),
+            )
+            .with_aliases(aliases),
+            SafetensorsTensorConstraint::required(scale.key, scale_shape, scale_dtype)
+                .with_aliases(scale.aliases)
+                .companion(),
+        ]);
+    }
+    let quantization = format
+        .weight_quantization()
+        .expect("non-dense, non-FP8 linear formats use packed quantization");
     let input = *shape
         .last()
         .ok_or_else(|| MatrixConstraintError::Scalar { name: name.clone() })?;
@@ -102,14 +164,14 @@ pub fn matrix_with_optional_quantization(
         StoredDtypeConstraint::Exact(StoredDtype::U32),
     )
     .with_aliases(weight_aliases)];
+    let scale = scale_companion.unwrap_or_else(|| MatrixScaleNames {
+        key: format!("{prefix}.scales"),
+        aliases: companion_alias("scales"),
+    });
     constraints.push(
-        SafetensorsTensorConstraint::required(
-            format!("{prefix}.scales"),
-            companion.clone(),
-            companion_dtype(),
-        )
-        .with_aliases(companion_alias("scales"))
-        .companion(),
+        SafetensorsTensorConstraint::required(scale.key, companion.clone(), companion_dtype())
+            .with_aliases(scale.aliases)
+            .companion(),
     );
     if quantization.has_biases() {
         constraints.push(
@@ -716,6 +778,52 @@ checkpoint_plan!(GgufCheckpointPlan, GgufTensorConstraint);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BlockFp8Format, BlockFp8ScaleEncoding};
+
+    #[test]
+    fn block_fp8_matrix_declares_exact_weight_scale_geometry_and_dtype() {
+        let constraints = matrix_for_linear_format(
+            "projection.weight",
+            ["projection.alias.weight"],
+            vec![8, 257, 129],
+            LinearFormat::E4M3BlockFp8(
+                BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::Ue8m0).unwrap(),
+            ),
+            Some(MatrixScaleNames {
+                key: "projection.weight_scale_inv".into(),
+                aliases: vec!["projection.alias.weight_scale_inv".into()],
+            }),
+        )
+        .unwrap();
+        assert_eq!(constraints.len(), 2);
+        assert_eq!(constraints[0].shape, vec![8, 257, 129]);
+        assert_eq!(
+            constraints[0].dtype,
+            StoredDtypeConstraint::Exact(StoredDtype::F8E4M3)
+        );
+        assert_eq!(constraints[1].shape, vec![8, 3, 2]);
+        assert_eq!(
+            constraints[1].dtype,
+            StoredDtypeConstraint::Exact(StoredDtype::F8E8M0)
+        );
+        assert_eq!(constraints[1].role, TensorRole::Companion);
+    }
+
+    #[test]
+    fn block_fp8_matrix_requires_architecture_supplied_scale_identity() {
+        assert!(matches!(
+            matrix_for_linear_format(
+                "projection.weight",
+                Vec::<String>::new(),
+                vec![128, 128],
+                LinearFormat::E4M3BlockFp8(
+                    BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::FloatingPoint,).unwrap(),
+                ),
+                None,
+            ),
+            Err(MatrixConstraintError::MissingBlockScaleName { .. })
+        ));
+    }
 
     #[test]
     fn construction_sorts_and_rejects_duplicate_or_invalid_shapes() {

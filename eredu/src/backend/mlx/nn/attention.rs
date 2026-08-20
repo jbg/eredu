@@ -99,16 +99,19 @@ pub fn attention_probabilities(
 
 /// Sparse attention over a bounded local window and indexed compressed tokens.
 ///
-/// Queries are `[batch, heads, query, dim]`, local and pooled values are
-/// `[batch, tokens, dim]`, and `pooled_indices` is `[batch, query, selected]`.
+/// Queries are `[batch, heads, query, key_dim]`, local and pooled keys/values
+/// are `[batch, tokens, key_or_value_dim]`, and `pooled_indices` is
+/// `[batch, query, selected]`.
 /// A learned sink contributes to the shared softmax denominator with a zero
 /// value. The implementation materializes scores only for the local window and
 /// selected compressed positions, never for the complete source context.
 #[allow(clippy::too_many_arguments)]
 pub fn indexed_sparse_attention(
     queries: &Array,
-    local: &Array,
-    pooled: &Array,
+    local_keys: &Array,
+    local_values: &Array,
+    pooled_keys: &Array,
+    pooled_values: &Array,
     pooled_indices: &Array,
     scale: f32,
     local_mask: Option<&Array>,
@@ -117,53 +120,76 @@ pub fn indexed_sparse_attention(
     stream: &Stream,
 ) -> Result<Array, Exception> {
     if queries.ndim() != 4
-        || local.ndim() != 3
-        || pooled.ndim() != 3
+        || local_keys.ndim() != 3
+        || local_values.ndim() != 3
+        || pooled_keys.ndim() != 3
+        || pooled_values.ndim() != 3
         || pooled_indices.ndim() != 3
-        || queries.dim(0) != local.dim(0)
-        || queries.dim(0) != pooled.dim(0)
+        || queries.dim(0) != local_keys.dim(0)
+        || queries.dim(0) != local_values.dim(0)
+        || queries.dim(0) != pooled_keys.dim(0)
+        || queries.dim(0) != pooled_values.dim(0)
         || queries.dim(0) != pooled_indices.dim(0)
         || queries.dim(2) != pooled_indices.dim(1)
-        || queries.dim(3) != local.dim(2)
-        || queries.dim(3) != pooled.dim(2)
+        || queries.dim(3) != local_keys.dim(2)
+        || queries.dim(3) != pooled_keys.dim(2)
+        || local_keys.dim(1) != local_values.dim(1)
+        || pooled_keys.dim(1) != pooled_values.dim(1)
+        || local_values.dim(2) != pooled_values.dim(2)
     {
         return Err(Exception::custom(format!(
-            "indexed sparse attention received incompatible shapes q={:?}, local={:?}, pooled={:?}, indices={:?}",
+            "indexed sparse attention received incompatible shapes q={:?}, local_keys={:?}, local_values={:?}, pooled_keys={:?}, pooled_values={:?}, indices={:?}",
             queries.shape(),
-            local.shape(),
-            pooled.shape(),
+            local_keys.shape(),
+            local_values.shape(),
+            pooled_keys.shape(),
+            pooled_values.shape(),
             pooled_indices.shape()
         )));
     }
     let batch = queries.dim(0);
     let heads = queries.dim(1);
     let query_tokens = queries.dim(2);
-    let head_dim = queries.dim(3);
+    let key_dim = queries.dim(3);
+    let value_dim = local_values.dim(2);
     let selected = pooled_indices.dim(2);
-    let pooled_tokens = pooled.dim(1);
+    let pooled_tokens = pooled_keys.dim(1);
     if selected <= 0 || pooled_tokens <= 0 {
         return Err(Exception::custom(
             "indexed sparse attention requires at least one pooled token and selected index",
         ));
     }
 
-    let expanded_pooled = broadcast_to(
-        &pooled.try_index_device((.., NewAxis, .., ..), stream)?,
-        &[batch, query_tokens, pooled_tokens, head_dim],
+    let expanded_pooled_keys = broadcast_to(
+        &pooled_keys.try_index_device((.., NewAxis, .., ..), stream)?,
+        &[batch, query_tokens, pooled_tokens, key_dim],
         stream,
     )?;
-    let expanded_indices = broadcast_to(
+    let expanded_key_indices = broadcast_to(
         &pooled_indices.try_index_device((.., .., .., NewAxis), stream)?,
-        &[batch, query_tokens, selected, head_dim],
+        &[batch, query_tokens, selected, key_dim],
         stream,
     )?;
-    let selected_pooled = take_along_axis(expanded_pooled, &expanded_indices, 2, stream)?;
+    let selected_pooled_keys =
+        take_along_axis(expanded_pooled_keys, &expanded_key_indices, 2, stream)?;
+    let expanded_pooled_values = broadcast_to(
+        &pooled_values.try_index_device((.., NewAxis, .., ..), stream)?,
+        &[batch, query_tokens, pooled_tokens, value_dim],
+        stream,
+    )?;
+    let expanded_value_indices = broadcast_to(
+        &pooled_indices.try_index_device((.., .., .., NewAxis), stream)?,
+        &[batch, query_tokens, selected, value_dim],
+        stream,
+    )?;
+    let selected_pooled_values =
+        take_along_axis(expanded_pooled_values, &expanded_value_indices, 2, stream)?;
 
     let scaled_queries = queries.multiply(Array::from_f32(scale), stream)?;
-    let mut local_scores = einsum("bhld,btd->bhlt", [&scaled_queries, local], stream)?;
+    let mut local_scores = einsum("bhld,btd->bhlt", [&scaled_queries, local_keys], stream)?;
     let mut pooled_scores = einsum(
         "bhld,blkd->bhlk",
-        [&scaled_queries, &selected_pooled],
+        [&scaled_queries, &selected_pooled_keys],
         stream,
     )?;
     apply_score_mask(&mut local_scores, local_mask, stream)?;
@@ -187,14 +213,14 @@ pub fn indexed_sparse_attention(
     }
     let scores = concatenate_axis(&score_parts, -1, stream)?;
     let weights = softmax_axis(scores, -1, true, stream)?;
-    let local_tokens = local.dim(1);
+    let local_tokens = local_keys.dim(1);
     let local_weights = weights.try_index_device((.., .., .., ..local_tokens), stream)?;
     let pooled_weights =
         weights.try_index_device((.., .., .., local_tokens..local_tokens + selected), stream)?;
-    let local_context = einsum("bhlt,btd->bhld", [&local_weights, local], stream)?;
+    let local_context = einsum("bhlt,btv->bhlv", [&local_weights, local_values], stream)?;
     let pooled_context = einsum(
-        "bhlk,blkd->bhld",
-        [&pooled_weights, &selected_pooled],
+        "bhlk,blkv->bhlv",
+        [&pooled_weights, &selected_pooled_values],
         stream,
     )?;
     local_context.add(pooled_context, stream)
@@ -556,6 +582,8 @@ mod tests {
         let output = indexed_sparse_attention(
             &queries,
             &local,
+            &local,
+            &pooled,
             &pooled,
             &indices,
             1.0,

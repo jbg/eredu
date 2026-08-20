@@ -3,13 +3,13 @@
 //! Architecture families retain configuration, checkpoint naming, identity, and
 //! policy while reusing these statically dispatched decoder operations.
 
-use eredu_checkpoint::WeightQuantization;
+use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::cache::LayerCachePolicy;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
     AttentionCache, EmbeddingOperator, EmbeddingSpec, Error, LinearOperator, LinearSpec,
     NeuralBackend, NormalizationOperator, NormalizationSpec, ParameterSpec, RotaryOperator,
-    RotaryPosition, RotarySpec, Tensor,
+    RotaryPosition, RotarySpec, RotarySubspace, SwiGluLimit, Tensor,
 };
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_projection_group,
@@ -51,6 +51,10 @@ pub trait Config: 'static {
     }
     /// Whether projections own MLP biases.
     fn mlp_bias(&self) -> bool;
+    /// Optional bound applied before each dense SwiGLU product.
+    fn swiglu_limit(&self) -> Option<SwiGluLimit> {
+        None
+    }
     /// Whether the language-model head is tied to input embeddings.
     fn tie_word_embeddings(&self) -> bool;
     /// Exact per-layer attention policy.
@@ -267,7 +271,7 @@ impl<B: NeuralBackend> Attention<B> {
                     output,
                     weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
                     bias,
-                    quantization: config.weight_quantization(&weight_name),
+                    format: config.weight_quantization(&weight_name).into(),
                 },
                 context,
             )
@@ -390,8 +394,12 @@ impl<B: NeuralBackend> Attention<B> {
         } = self.projections(hidden, context)?;
         let offset = cache.as_ref().map_or(0, |cache| cache.offset());
         let position = rotary_position.unwrap_or(RotaryPosition::Offset(offset));
-        let queries = self.rotary.forward(&queries, position, context)?;
-        let keys = self.rotary.forward(&keys, position, context)?;
+        let queries =
+            self.rotary
+                .forward_subspace(&queries, RotarySubspace::Full, position, context)?;
+        let keys = self
+            .rotary
+            .forward_subspace(&keys, RotarySubspace::Full, position, context)?;
         let (keys, values) = match cache.as_mut() {
             Some(cache) => cache.update_for_attention(keys, values, context)?,
             None => (keys, values),
@@ -458,6 +466,9 @@ pub struct Mlp<B: NeuralBackend> {
     pub up: B::Linear,
     /// Down projection.
     pub down: B::Linear,
+    /// Optional shared pre-activation bound.
+    #[parameter(skip)]
+    pub limit: Option<SwiGluLimit>,
 }
 
 impl<B: NeuralBackend> Mlp<B> {
@@ -481,7 +492,7 @@ impl<B: NeuralBackend> Mlp<B> {
                     output,
                     weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
                     bias,
-                    quantization: config.weight_quantization(&weight_name),
+                    format: config.weight_quantization(&weight_name).into(),
                 },
                 context,
             )
@@ -498,6 +509,7 @@ impl<B: NeuralBackend> Mlp<B> {
                 config.intermediate_size(),
                 config.hidden_size(),
             )?,
+            limit: config.swiglu_limit(),
         })
     }
 
@@ -506,9 +518,9 @@ impl<B: NeuralBackend> Mlp<B> {
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let gate = B::silu(self.gate.forward(input, context)?, context)?;
+        let gate = self.gate.forward(input, context)?;
         let up = self.up.forward(input, context)?;
-        gate.multiply(&up, context)
+        B::swiglu(gate, up, self.limit, context)
     }
 
     fn forward(
@@ -1101,7 +1113,7 @@ impl<B: NeuralBackend> Model<B> {
                     output: config.vocabulary_size(),
                     weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
                     bias: None,
-                    quantization: config.weight_quantization("lm_head.weight"),
+                    format: config.weight_quantization("lm_head.weight").into(),
                 },
                 context,
             )?)
@@ -1174,41 +1186,65 @@ pub struct StaticModules<B: NeuralBackend> {
     pub lm_head: Option<B::Linear>,
 }
 
+/// Architecture-supplied identities and geometry for the shared pinned text
+/// modules.
+#[derive(Debug, Clone)]
+pub struct StaticModuleSpec {
+    /// Token embedding parameter identity.
+    pub embedding_weight: String,
+    /// Final normalization parameter identity.
+    pub normalization_weight: String,
+    /// Untied output-head parameter identity.
+    pub head_weight: String,
+    /// Vocabulary row count.
+    pub vocabulary: i32,
+    /// Hidden width.
+    pub hidden_size: i32,
+    /// Final RMS normalization epsilon.
+    pub normalization_epsilon: f32,
+    /// Packed embedding format, when supported by the general embedding operator.
+    pub embedding_quantization: Option<WeightQuantization>,
+    /// Complete output-head physical encoding.
+    pub head_format: LinearFormat,
+    /// Whether output logits reuse the embedding table.
+    pub tied_head: bool,
+}
+
 impl<B: NeuralBackend> StaticModules<B> {
-    /// Builds unloaded pinned modules for a decoder family.
-    pub fn new<C: Config>(
-        config: &C,
+    /// Builds unloaded pinned modules from architecture-owned parameter
+    /// identities and physical formats.
+    pub fn from_spec(
+        spec: StaticModuleSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
-        let norm_name = format!("{}.norm.weight", config.parameter_root());
         let embeddings = B::embedding(
             EmbeddingSpec {
-                vocabulary: config.vocabulary_size(),
-                dimensions: config.hidden_size(),
-                weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
-                quantization: config.weight_quantization(&embedding_name),
+                vocabulary: spec.vocabulary,
+                dimensions: spec.hidden_size,
+                weight: ParameterSpec::trainable(&spec.embedding_weight).map_err(Error::backend)?,
+                quantization: spec.embedding_quantization,
             },
             context,
         )?;
         let norm = B::rms_norm(
             NormalizationSpec {
-                dimensions: config.hidden_size(),
-                epsilon: config.rms_norm_epsilon(),
-                weight: ParameterSpec::trainable(&norm_name).map_err(Error::backend)?,
+                dimensions: spec.hidden_size,
+                epsilon: spec.normalization_epsilon,
+                weight: ParameterSpec::trainable(&spec.normalization_weight)
+                    .map_err(Error::backend)?,
             },
             context,
         )?;
-        let lm_head = if config.tie_word_embeddings() {
+        let lm_head = if spec.tied_head {
             None
         } else {
             Some(B::linear(
                 LinearSpec {
-                    input: config.hidden_size(),
-                    output: config.vocabulary_size(),
-                    weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
+                    input: spec.hidden_size,
+                    output: spec.vocabulary,
+                    weight: ParameterSpec::trainable(&spec.head_weight).map_err(Error::backend)?,
                     bias: None,
-                    quantization: config.weight_quantization("lm_head.weight"),
+                    format: spec.head_format,
                 },
                 context,
             )?)
@@ -1219,6 +1255,29 @@ impl<B: NeuralBackend> StaticModules<B> {
             lm_head,
         })
     }
+
+    /// Builds unloaded pinned modules for a decoder family.
+    pub fn new<C: Config>(
+        config: &C,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
+        let norm_name = format!("{}.norm.weight", config.parameter_root());
+        Self::from_spec(
+            StaticModuleSpec {
+                embedding_weight: embedding_name.clone(),
+                normalization_weight: norm_name,
+                head_weight: "lm_head.weight".into(),
+                vocabulary: config.vocabulary_size(),
+                hidden_size: config.hidden_size(),
+                normalization_epsilon: config.rms_norm_epsilon(),
+                embedding_quantization: config.weight_quantization(&embedding_name),
+                head_format: config.weight_quantization("lm_head.weight").into(),
+                tied_head: config.tie_word_embeddings(),
+            },
+            context,
+        )
+    }
 }
 
 /// Borrowed token input for the shared layered lifecycle.
@@ -1227,6 +1286,164 @@ pub struct LayeredInput<'a, T> {
     pub tokens: &'a T,
     /// Optional caller-provided attention mask.
     pub mask: Option<&'a T>,
+}
+
+/// Shared declaration and validation for one ordered decoder execution group.
+#[derive(Debug, Clone)]
+pub struct SequentialGroup {
+    name: &'static str,
+    parameter_root: &'static str,
+    units: usize,
+}
+
+/// Shared declaration for a target group followed by zero or more ordered
+/// single-unit prediction groups.
+#[derive(Debug, Clone)]
+pub struct SequentialPredictionGroups {
+    target: SequentialGroup,
+    prediction_roots: Vec<String>,
+}
+
+impl SequentialPredictionGroups {
+    /// Creates the target group and `mtp.{depth}` prediction groups.
+    pub fn new(
+        target_parameter_root: &'static str,
+        target_units: usize,
+        prediction_roots: impl IntoIterator<Item = String>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            target: SequentialGroup::new("target", target_parameter_root, target_units)?,
+            prediction_roots: prediction_roots.into_iter().collect(),
+        })
+    }
+
+    /// Builds one dependency chain from target through every prediction depth.
+    pub fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
+        eredu_runtime::ExecutionGraph::chain(
+            std::iter::once("target".to_owned())
+                .chain((0..self.prediction_roots.len()).map(|depth| format!("mtp.{depth}"))),
+        )
+        .map_err(Error::backend)
+    }
+
+    /// Returns the number of units in one group.
+    pub fn unit_count(&self, group: usize) -> Result<usize, Error> {
+        if group == 0 {
+            self.target.unit_count(0)
+        } else if group <= self.prediction_roots.len() {
+            Ok(1)
+        } else {
+            Err(Error::backend(format!(
+                "execution group {group} is outside target plus {} prediction groups",
+                self.prediction_roots.len()
+            )))
+        }
+    }
+
+    /// Returns one stable target or prediction unit path.
+    pub fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
+        if group == 0 {
+            return self.target.unit_path(0, index);
+        }
+        self.unit_count(group)?;
+        if index != 0 {
+            return Err(Error::backend(format!(
+                "prediction group {group} contains one unit, received index {index}"
+            )));
+        }
+        Ok(self.prediction_roots[group - 1].clone())
+    }
+
+    /// Selects the activation carried into a ready chain group.
+    pub fn begin<T: Clone>(
+        &self,
+        group: usize,
+        initial: &T,
+        dependencies: &[&T],
+    ) -> Result<T, Error> {
+        self.unit_count(group)?;
+        if group == 0 {
+            return self.target.begin(0, initial, dependencies);
+        }
+        match dependencies {
+            [dependency] => Ok((*dependency).clone()),
+            _ => Err(Error::backend(format!(
+                "prediction group {group} expected one dependency, received {}",
+                dependencies.len()
+            ))),
+        }
+    }
+
+    /// Returns the number of appended prediction groups.
+    pub fn prediction_count(&self) -> usize {
+        self.prediction_roots.len()
+    }
+}
+
+impl SequentialGroup {
+    /// Creates one non-empty ordered group.
+    pub fn new(
+        name: &'static str,
+        parameter_root: &'static str,
+        units: usize,
+    ) -> Result<Self, Error> {
+        if name.is_empty() || parameter_root.is_empty() || units == 0 {
+            return Err(Error::backend(
+                "sequential decoder group requires non-empty names and units",
+            ));
+        }
+        Ok(Self {
+            name,
+            parameter_root,
+            units,
+        })
+    }
+
+    /// Builds the corresponding one-group dependency graph.
+    pub fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
+        eredu_runtime::ExecutionGraph::chain([self.name]).map_err(Error::backend)
+    }
+
+    /// Validates the group ordinal and returns its unit count.
+    pub fn unit_count(&self, group: usize) -> Result<usize, Error> {
+        if group != 0 {
+            return Err(Error::backend(format!(
+                "execution group {group} is outside {}",
+                self.name
+            )));
+        }
+        Ok(self.units)
+    }
+
+    /// Returns one validated stable unit path.
+    pub fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
+        let count = self.unit_count(group)?;
+        if index >= count {
+            return Err(Error::backend(format!(
+                "unit {index} is outside {count} {} units",
+                self.name
+            )));
+        }
+        Ok(format!("{}.{index}", self.parameter_root))
+    }
+
+    /// Starts the sole group from the initial activation.
+    pub fn begin<T: Clone>(
+        &self,
+        group: usize,
+        initial: &T,
+        dependencies: &[&T],
+    ) -> Result<T, Error> {
+        self.unit_count(group)?;
+        if !dependencies.is_empty() {
+            return Err(Error::backend(format!(
+                "{} received {} unexpected dependencies",
+                self.name,
+                dependencies.len()
+            )));
+        }
+        Ok(initial.clone())
+    }
 }
 
 /// Architecture-owned values retained across one layered forward pass.

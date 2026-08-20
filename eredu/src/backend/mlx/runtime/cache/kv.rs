@@ -8,6 +8,11 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use eredu_nn::{
+    CompressedAttentionBlock, CompressedAttentionCache, CompressedAttentionScan,
+    CompressedAttentionState, CompressedAttentionView, Error as ComputeError,
+};
+
 use crate::{
     backend::mlx::nn::shared::MlxBackend,
     backend::mlx::runtime::cache::residency::{CacheBlockArrays, CacheResidencyManager},
@@ -148,6 +153,24 @@ impl PoolingCache {
             overlap_values: None,
             overlap_gates: None,
             processed_tokens: 0,
+        })
+    }
+
+    pub(crate) fn deep_clone_state(&self) -> Result<Self, Exception> {
+        let clone = |array: &Option<Array>| {
+            array
+                .as_ref()
+                .map(|array| array.clone().deep_clone())
+                .transpose()
+        };
+        Ok(Self {
+            ratio: self.ratio,
+            pending_values: clone(&self.pending_values)?,
+            pending_gates: clone(&self.pending_gates)?,
+            pooled: clone(&self.pooled)?,
+            overlap_values: clone(&self.overlap_values)?,
+            overlap_gates: clone(&self.overlap_gates)?,
+            processed_tokens: self.processed_tokens,
         })
     }
 
@@ -434,21 +457,16 @@ impl CompressedLatentCache {
         self.paged.as_deref().map(|paged| &paged.manager)
     }
 
-    /// Returns the global layer identity for a paged compressed cache.
-    pub(crate) fn paged_global_layer(&self) -> Option<usize> {
-        self.paged.as_deref().map(|paged| paged.global_layer)
-    }
-
-    /// Returns ordered identities for sealed compressed blocks.
-    pub(crate) fn paged_block_ids(&self) -> Result<Option<Vec<CacheBlockId>>, Exception> {
+    #[cfg(test)]
+    fn paged_block_ids(&self) -> Result<Option<Vec<CacheBlockId>>, Exception> {
         self.paged
             .as_deref()
             .map(PagedCompressedLatentCache::block_ids)
             .transpose()
     }
 
-    /// Returns the current mutable compressed tail, if nonempty.
-    pub(crate) fn paged_tail_block(&self) -> Option<PagedLatentAttentionBlock> {
+    #[cfg(test)]
+    fn paged_tail_block(&self) -> Option<PagedLatentAttentionBlock> {
         self.paged
             .as_deref()
             .and_then(PagedCompressedLatentCache::tail_block)
@@ -705,6 +723,130 @@ impl eredu_runtime::RuntimeLayerState<MlxBackend> for CompressedLatentCache {
 
     fn retained_values(&self) -> Self::RetainedValues<'_> {
         self.retained_arrays().into_iter()
+    }
+}
+
+impl CompressedAttentionCache<Array> for CompressedLatentCache {
+    type Checkpoint = Self;
+
+    fn offset(&self) -> i32 {
+        CompressedLatentCache::offset(self)
+    }
+
+    fn is_paged(&self) -> bool {
+        CompressedLatentCache::is_paged(self)
+    }
+
+    fn append(
+        &mut self,
+        state: CompressedAttentionState<Array>,
+        context: &Stream,
+    ) -> Result<CompressedAttentionView<Array>, ComputeError> {
+        let appended = state.clone();
+        let (latent, rotary) = self
+            .update_and_fetch(state.latent, state.rotary, context)
+            .map_err(ComputeError::backend)?;
+        if self.is_paged() {
+            Ok(CompressedAttentionView::Paged { appended })
+        } else {
+            Ok(CompressedAttentionView::Resident(
+                CompressedAttentionState { latent, rotary },
+            ))
+        }
+    }
+
+    fn visit_blocks<F>(
+        &mut self,
+        query_tokens: i32,
+        context: &Stream,
+        mut visitor: F,
+    ) -> Result<CompressedAttentionScan, ComputeError>
+    where
+        F: FnMut(CompressedAttentionBlock<Array>) -> Result<u64, ComputeError>,
+    {
+        let paged = self
+            .paged
+            .as_deref_mut()
+            .ok_or_else(|| ComputeError::backend("compressed block scan requires paged state"))?;
+        let block_ids = paged.block_ids().map_err(ComputeError::backend)?;
+        let manager = paged.manager.clone();
+        let global_layer = paged.global_layer;
+        let tail = paged.tail_block();
+        let mut scan = CompressedAttentionScan::default();
+        let mut blocks = manager
+            .prefetch_blocks(block_ids, context)
+            .map_err(ComputeError::backend)?;
+        while let Some(lease) = blocks.next_block().map_err(ComputeError::backend)? {
+            let id = lease.id();
+            let state = match lease.arrays() {
+                CacheBlockArrays::CompressedLatentRotary { latent, rotary_key } => {
+                    CompressedAttentionState {
+                        latent: latent.clone(),
+                        rotary: rotary_key.clone(),
+                    }
+                }
+                _ => {
+                    return Err(ComputeError::backend(
+                        "paged compressed cache found an incompatible block representation",
+                    ));
+                }
+            };
+            scan.reconstruction_scratch_bytes =
+                scan.reconstruction_scratch_bytes
+                    .max(visitor(CompressedAttentionBlock {
+                        start: id.start,
+                        end: id.end,
+                        state,
+                    })?);
+            scan.blocks += 1;
+            scan.bytes += lease.bytes();
+            drop(lease);
+        }
+        if let Some(tail) = tail {
+            scan.reconstruction_scratch_bytes =
+                scan.reconstruction_scratch_bytes
+                    .max(visitor(CompressedAttentionBlock {
+                        start: tail.start,
+                        end: tail.end,
+                        state: CompressedAttentionState {
+                            latent: tail.latent,
+                            rotary: tail.rotary_key,
+                        },
+                    })?);
+            scan.blocks += 1;
+            scan.bytes += tail.bytes;
+        }
+        manager
+            .record_attention_scan(
+                global_layer,
+                query_tokens > 1,
+                scan.blocks,
+                scan.bytes,
+                scan.reconstruction_scratch_bytes,
+            )
+            .map_err(ComputeError::backend)?;
+        Ok(scan)
+    }
+
+    fn checkpoint(&self) -> Self::Checkpoint {
+        self.clone()
+    }
+
+    fn restore(
+        &mut self,
+        checkpoint: &Self::Checkpoint,
+        context: &Stream,
+    ) -> Result<(), ComputeError> {
+        self.restore_checkpoint(checkpoint, context)
+            .map_err(ComputeError::backend)
+    }
+
+    fn finalize(&mut self) -> Result<(), ComputeError> {
+        CompressedLatentCache::finalize(self).map_err(ComputeError::backend)
+    }
+
+    fn clear(&mut self) -> Result<(), ComputeError> {
+        CompressedLatentCache::clear(self).map_err(ComputeError::backend)
     }
 }
 
@@ -1168,6 +1310,13 @@ impl LiveKeyValueCache {
     /// Wraps an architecture-selected resident cache growth policy.
     pub const fn resident(cache: ConcatKeyValueCache) -> Self {
         Self::Resident(cache)
+    }
+
+    pub(crate) fn deep_clone_state(&self) -> Result<Self, Exception> {
+        match self {
+            Self::Resident(cache) => cache.deep_clone_state().map(Self::Resident),
+            Self::Paged(cache) => Ok(Self::Paged(cache.clone())),
+        }
     }
 
     /// Creates a block-addressable cache with exact global-layer and rank
@@ -2201,7 +2350,9 @@ impl KeyValueAttentionBlock {
     }
 }
 
-pub(crate) struct BlockwiseAttentionAccumulator {
+/// MLX online-softmax recurrence used behind the neutral blockwise-attention
+/// backend contract.
+pub struct BlockwiseAttentionAccumulator {
     queries: Array,
     output_dtype: Dtype,
     scale: f32,
@@ -2599,6 +2750,21 @@ impl ConcatKeyValueCache {
     /// Creates an empty concatenating key/value cache.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn deep_clone_state(&self) -> Result<Self, Exception> {
+        let mut cache = self.clone();
+        cache.keys = self
+            .keys
+            .as_ref()
+            .map(|array| array.clone().deep_clone())
+            .transpose()?;
+        cache.values = self
+            .values
+            .as_ref()
+            .map(|array| array.clone().deep_clone())
+            .transpose()?;
+        Ok(cache)
     }
 
     /// Creates an empty concatenating cache that retains at most `max_size` tokens.

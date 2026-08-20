@@ -50,8 +50,6 @@ use crate::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
     composition::mlx_architectures::{
-        deepseek_v3::model as deepseek_v3,
-        deepseek_v4::model as deepseek_v4,
         gemma4::model as gemma4,
         gpt_oss::model as gpt_oss,
         inkling::model as inkling,
@@ -75,25 +73,9 @@ use eredu_runtime::{
     LayerWeightResidency, PagedCacheOptions, WeightResidency,
 };
 
-use crate::{
-    backend::mlx::nn::moe::PackedSwiGluExperts,
-    composition::mlx_architectures::deepseek_v3::model::RoutedExperts,
-};
+use crate::backend::mlx::nn::moe::PackedSwiGluExperts;
 
 pub use crate::backend::mlx::runtime::distributed::expert::*;
-
-impl LocalExpertBank for RoutedExperts {
-    fn execute_local_routes(
-        &mut self,
-        hidden: &Array,
-        local_expert_ids: &Array,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
-        let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
-        Ok(self.forward_local(hidden, &ids, &weights, stream)?)
-    }
-}
 
 impl LocalExpertBank for gpt_oss::Experts {
     fn execute_local_routes(
@@ -191,10 +173,8 @@ pub struct ExpertParallelInfo {
 /// Architecture-checked replicated attention cache used by an EP model.
 #[derive(Debug, Clone)]
 pub enum ExpertParallelCache {
-    /// DeepSeek compressed-latent attention cache.
-    DeepSeek(deepseek_v3::Cache),
-    /// DeepSeek V4 compressed/sparse attention cache.
-    DeepSeekV4(deepseek_v4::Cache),
+    /// Neutral DeepSeek V3/V4 architecture state.
+    DeepSeek(crate::composition::deepseek::DeepSeekState),
     /// Kimi Linear heterogeneous KDA/MLA cache.
     KimiLinear(kimi_linear::Cache),
     /// Neutral Qwen key/value state, device-resident or paged.
@@ -219,12 +199,7 @@ impl ExpertParallelCache {
     /// Clears all cached attention state.
     pub fn reset(&mut self) -> Result<(), Error> {
         match self {
-            Self::DeepSeek(cache) => {
-                for cache in &mut cache.layers {
-                    cache.clear()?;
-                }
-            }
-            Self::DeepSeekV4(cache) => cache.reset()?,
+            Self::DeepSeek(cache) => cache.clear()?,
             Self::KimiLinear(cache) => cache.reset()?,
             Self::Qwen(cache) => cache.clear()?,
             Self::GptOss(cache) => cache.reset()?,
@@ -244,7 +219,6 @@ impl ExpertParallelCache {
     pub(crate) fn offset(&self) -> i32 {
         match self {
             Self::DeepSeek(cache) => cache.offset(),
-            Self::DeepSeekV4(cache) => cache.offset(),
             Self::KimiLinear(cache) => cache.offset(),
             Self::Qwen(cache) => cache.offset(),
             Self::GptOss(cache) => cache.offset(),
@@ -262,12 +236,7 @@ impl ExpertParallelCache {
 }
 
 enum ExpertArchitecture {
-    DeepSeekLayerwise(
-        Box<crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseModel>,
-    ),
-    DeepSeekV4Layerwise(
-        Box<crate::composition::mlx_architectures::deepseek_v4::layerwise::DeepSeekV4LayerwiseModel>,
-    ),
+    DeepSeek(Box<crate::composition::deepseek::DeepSeekModel>),
     KimiLinearLayerwise(
         Box<crate::composition::mlx_architectures::kimi_linear::layerwise::KimiLinearLayerwiseModel>,
     ),
@@ -296,8 +265,7 @@ enum ExpertArchitecture {
 impl ExpertArchitecture {
     fn bind_parallel_topology(&mut self, topology: MlxParallelContext) {
         match self {
-            Self::DeepSeekLayerwise(model) => model.bind_parallel_topology(topology),
-            Self::DeepSeekV4Layerwise(model) => model.bind_parallel_topology(topology),
+            Self::DeepSeek(_) => {}
             Self::KimiLinearLayerwise(model) => model.bind_parallel_topology(topology),
             Self::Qwen(_) => {}
             Self::GptOssLayerwise(model) => model.bind_parallel_topology(topology),
@@ -329,8 +297,7 @@ struct ExpertParallelQwenMtpTarget<'a> {
 
 #[derive(Clone)]
 enum ExpertParallelMtpDraftCache {
-    DeepSeek(Vec<crate::backend::mlx::runtime::cache::CompressedLatentCache>),
-    DeepSeekV4(deepseek_v4::DraftCache),
+    DeepSeek(crate::composition::deepseek::DeepSeekState),
     Inkling(Vec<inkling::LayerCache>),
     NemotronH(Vec<nemotron_h::LayerCache>),
 }
@@ -485,15 +452,6 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        if let (
-            ExpertArchitecture::DeepSeekV4Layerwise(model),
-            ExpertParallelCache::DeepSeekV4(cache),
-        ) = (&mut self.model.architecture, &mut *cache)
-        {
-            return <crate::composition::mlx_architectures::deepseek_v4::layerwise::DeepSeekV4LayerwiseModel as EmbeddedMtpTarget>::prefill_draft_cache(
-                model, output, tokens, cache, stream,
-            );
-        }
         let sequence = tokens.dim(1);
         if sequence <= 1 {
             return Ok(());
@@ -521,10 +479,7 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
     fn draft_cache(cache: &Self::Cache) -> Self::DraftCache {
         match cache {
             ExpertParallelCache::DeepSeek(cache) => {
-                ExpertParallelMtpDraftCache::DeepSeek(cache.mtp_layers.clone())
-            }
-            ExpertParallelCache::DeepSeekV4(cache) => {
-                ExpertParallelMtpDraftCache::DeepSeekV4(cache.mtp_layers.clone())
+                ExpertParallelMtpDraftCache::DeepSeek(cache.clone())
             }
             ExpertParallelCache::Inkling(cache) => {
                 ExpertParallelMtpDraftCache::Inkling(cache.mtp_layers.clone())
@@ -541,11 +496,7 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
             (
                 ExpertParallelCache::DeepSeek(cache),
                 ExpertParallelMtpDraftCache::DeepSeek(draft),
-            ) => cache.mtp_layers.clone_from(draft),
-            (
-                ExpertParallelCache::DeepSeekV4(cache),
-                ExpertParallelMtpDraftCache::DeepSeekV4(draft),
-            ) => cache.mtp_layers.clone_from(draft),
+            ) => *cache = draft.clone(),
             (ExpertParallelCache::Inkling(cache), ExpertParallelMtpDraftCache::Inkling(draft)) => {
                 cache.mtp_layers.clone_from(draft)
             }
@@ -585,15 +536,6 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
         cache: &mut Self::DraftCache,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        if let (
-            ExpertArchitecture::DeepSeekV4Layerwise(model),
-            ExpertParallelMtpDraftCache::DeepSeekV4(cache),
-        ) = (&mut self.model.architecture, &mut *cache)
-        {
-            return <crate::composition::mlx_architectures::deepseek_v4::layerwise::DeepSeekV4LayerwiseModel as EmbeddedMtpTarget>::advance_draft_cache(
-                model, hidden, tokens, cache, stream,
-            );
-        }
         for depth in 0..self.max_draft_tokens() {
             let _ = self.model.forward_embedded_mtp_draft(
                 hidden,
@@ -616,15 +558,8 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
         cache: &mut Self::DraftCache,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
-        match (&mut self.model.architecture, cache) {
-            (
-                ExpertArchitecture::DeepSeekV4Layerwise(model),
-                ExpertParallelMtpDraftCache::DeepSeekV4(cache),
-            ) => <crate::composition::mlx_architectures::deepseek_v4::layerwise::DeepSeekV4LayerwiseModel as EmbeddedMtpTarget>::fused_draft_logits(
-                model, hidden, last_token, proposal_capacity, cache, stream,
-            ),
-            _ => Ok(None),
-        }
+        let _ = (hidden, last_token, proposal_capacity, cache, stream);
+        Ok(None)
     }
 
     fn adjust_fused_draft_logits(
@@ -633,20 +568,13 @@ impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
         last_token: u32,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        match &mut self.model.architecture {
-            ExpertArchitecture::DeepSeekV4Layerwise(model) => {
-                <crate::composition::mlx_architectures::deepseek_v4::layerwise::DeepSeekV4LayerwiseModel as EmbeddedMtpTarget>::adjust_fused_draft_logits(
-                    model, logits, last_token, stream,
-                )
-            }
-            _ => Ok(logits),
-        }
+        let _ = (last_token, stream);
+        Ok(logits)
     }
 
     fn max_draft_tokens(&self) -> usize {
         match &self.model.architecture {
-            ExpertArchitecture::DeepSeekLayerwise(model) => model.mtp_len(),
-            ExpertArchitecture::DeepSeekV4Layerwise(model) => model.mtp_len(),
+            ExpertArchitecture::DeepSeek(model) => model.mtp_len(),
             ExpertArchitecture::InklingLayerwise(model) => model.mtp_len(),
             ExpertArchitecture::NemotronHLayerwise(model) => model.mtp_len(),
             _ => 0,
@@ -663,16 +591,9 @@ impl ExpertParallelModel {
     /// Reports whether this EP target can perform embedded MTP generation.
     pub fn mtp_capability(&self) -> MtpCapability {
         match &self.architecture {
-            ExpertArchitecture::DeepSeekLayerwise(model) if model.mtp_len() > 0 => {
-                MtpCapability::Ready {
-                    checkpoint: MtpCheckpointKind::Embedded,
-                }
-            }
-            ExpertArchitecture::DeepSeekV4Layerwise(model) if model.mtp_len() > 0 => {
-                MtpCapability::Ready {
-                    checkpoint: MtpCheckpointKind::Embedded,
-                }
-            }
+            ExpertArchitecture::DeepSeek(model) if model.mtp_len() > 0 => MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded,
+            },
             ExpertArchitecture::InklingLayerwise(model) if model.mtp_len() > 0 => {
                 MtpCapability::Ready {
                     checkpoint: MtpCheckpointKind::Embedded,
@@ -704,8 +625,7 @@ impl ExpertParallelModel {
         &self,
     ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
         match &self.architecture {
-            ExpertArchitecture::DeepSeekLayerwise(model) => model.dense_stream_report(),
-            ExpertArchitecture::DeepSeekV4Layerwise(model) => model.dense_stream_report(),
+            ExpertArchitecture::DeepSeek(model) => model.dense_stream_report(),
             ExpertArchitecture::KimiLinearLayerwise(model) => model.dense_stream_report(),
             ExpertArchitecture::Qwen(model) => model.dense_stream_report(),
             ExpertArchitecture::GptOssLayerwise(model) => model.dense_stream_report(),
@@ -721,13 +641,10 @@ impl ExpertParallelModel {
     /// Allocates an empty architecture-appropriate replicated cache.
     pub fn new_cache(&self) -> ExpertParallelCache {
         match &self.architecture {
-            ExpertArchitecture::DeepSeekLayerwise(model) => {
-                ExpertParallelCache::DeepSeek(model.new_cache())
-            }
-            ExpertArchitecture::DeepSeekV4Layerwise(model) => ExpertParallelCache::DeepSeekV4(
+            ExpertArchitecture::DeepSeek(model) => ExpertParallelCache::DeepSeek(
                 model
-                    .new_cache()
-                    .expect("validated DeepSeek V4 distributed cache geometry"),
+                    .new_state()
+                    .expect("validated DeepSeek distributed state geometry"),
             ),
             ExpertArchitecture::KimiLinearLayerwise(model) => {
                 ExpertParallelCache::KimiLinear(model.new_cache())
@@ -770,12 +687,9 @@ impl ExpertParallelModel {
         match policy {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
             CacheResidencyPolicy::Paged(options) => match &self.architecture {
-                ExpertArchitecture::DeepSeekLayerwise(model) => model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                ExpertArchitecture::DeepSeek(model) => model
+                    .new_state_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::DeepSeek),
-                ExpertArchitecture::DeepSeekV4Layerwise(model) => model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ExpertParallelCache::DeepSeekV4),
                 ExpertArchitecture::KimiLinearLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::KimiLinear),
@@ -812,7 +726,6 @@ impl ExpertParallelModel {
     ) -> Result<Option<CacheResidencyReport>, Error> {
         match cache {
             ExpertParallelCache::DeepSeek(cache) => cache.residency_report().map_err(Into::into),
-            ExpertParallelCache::DeepSeekV4(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::GptOss(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::KimiLinear(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::Qwen(cache) => cache.residency_report().map_err(Into::into),
@@ -845,25 +758,12 @@ impl ExpertParallelModel {
             expert_parallel_rank: Some(self.topology.expert_parallel_rank),
         });
         match (&self.architecture, cache) {
-            (ExpertArchitecture::DeepSeekLayerwise(_), ExpertParallelCache::DeepSeek(cache)) => {
-                cache
-                    .save_prompt_cache(directory, descriptor, prefix_token_ids, options)
-                    .map_err(Into::into)
+            (ExpertArchitecture::DeepSeek(model), ExpertParallelCache::DeepSeek(cache)) => {
+                model.save_prompt_cache(cache, directory, descriptor, prefix_token_ids, options)
             }
             (ExpertArchitecture::GptOssLayerwise(_), ExpertParallelCache::GptOss(cache)) => cache
                 .save_prompt_cache(directory, descriptor, prefix_token_ids, options)
                 .map_err(Into::into),
-            (
-                ExpertArchitecture::DeepSeekV4Layerwise(model),
-                ExpertParallelCache::DeepSeekV4(cache),
-            ) => model.save_prompt_cache(
-                cache,
-                directory,
-                descriptor,
-                prefix_token_ids,
-                options,
-                stream,
-            ),
             (
                 ExpertArchitecture::KimiLinearLayerwise(_),
                 ExpertParallelCache::KimiLinear(cache),
@@ -960,12 +860,9 @@ impl ExpertParallelModel {
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let directory = self.prompt_cache_rank_directory(root.as_ref());
         match &self.architecture {
-            ExpertArchitecture::DeepSeekLayerwise(model) => model
+            ExpertArchitecture::DeepSeek(model) => model
                 .load_prompt_cache(&directory, expected, prefix_token_ids, options, stream)
                 .map(|(cache, manifest)| (ExpertParallelCache::DeepSeek(cache), manifest)),
-            ExpertArchitecture::DeepSeekV4Layerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ExpertParallelCache::DeepSeekV4(cache), manifest)),
             ExpertArchitecture::KimiLinearLayerwise(model) => {
                 kimi_linear::Model::load_paged_prompt_cache_with_identity(
                     model.args(),
@@ -1067,10 +964,7 @@ impl ExpertParallelModel {
 
     pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         let mut identity = match &self.architecture {
-            ExpertArchitecture::DeepSeekLayerwise(model) => model.prompt_cache_model_identity()?,
-            ExpertArchitecture::DeepSeekV4Layerwise(model) => {
-                model.prompt_cache_model_identity()?
-            }
+            ExpertArchitecture::DeepSeek(model) => model.prompt_cache_identity()?,
             ExpertArchitecture::KimiLinearLayerwise(model) => {
                 model.prompt_cache_model_identity()?
             }
@@ -1156,11 +1050,23 @@ impl ExpertParallelModel {
             };
             let assignment = &self.info.assignment;
             match (&mut self.architecture, cache) {
-                (
-                    ExpertArchitecture::DeepSeekLayerwise(model),
-                    ExpertParallelCache::DeepSeek(cache),
-                ) => {
-                    let args = model.args().clone();
+                (ExpertArchitecture::DeepSeek(model), ExpertParallelCache::DeepSeek(cache)) => {
+                    if mask.is_some() {
+                        return Err(Error::Parallel(
+                            "explicit masks are unsupported by neutral DeepSeek EP execution"
+                                .into(),
+                        ));
+                    }
+                    if tensor_group.is_some() {
+                        return Err(Error::Parallel(
+                            "neutral DeepSeek TP+EP execution is not configured".into(),
+                        ));
+                    }
+                    let args = match (model.v3_args(), model.v4_args()) {
+                        (Some(args), None) => NeutralDeepSeekArgs::V3(args.clone()),
+                        (None, Some(args)) => NeutralDeepSeekArgs::V4(args.clone()),
+                        _ => unreachable!("DeepSeek model has exactly one family policy"),
+                    };
                     let mut execute =
                         |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
                             let returned = dispatch_replicated_with(
@@ -1171,7 +1077,7 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    execute_cached_deepseek(
+                                    execute_cached_neutral_deepseek(
                                         &args,
                                         layer,
                                         routes,
@@ -1185,70 +1091,7 @@ impl ExpertParallelModel {
                             statistics.accumulate(&returned.statistics);
                             Ok(returned.reduced_output)
                         };
-                    match tensor_group {
-                        Some(tensor_group) => model.forward_tensor_expert_parallel(
-                            tokens,
-                            mask,
-                            cache,
-                            tensor_group,
-                            &mut execute,
-                            stream,
-                        )?,
-                        None => model.forward_with_expert_executor(
-                            tokens,
-                            mask,
-                            cache,
-                            &mut execute,
-                            stream,
-                        )?,
-                    }
-                }
-                (
-                    ExpertArchitecture::DeepSeekV4Layerwise(model),
-                    ExpertParallelCache::DeepSeekV4(cache),
-                ) => {
-                    let args = model.args().clone();
-                    let mut execute =
-                        |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_deepseek_v4(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        };
-                    match tensor_group {
-                        Some(tensor_group) => model.forward_tensor_expert_parallel(
-                            tokens,
-                            mask,
-                            cache,
-                            tensor_group,
-                            &mut execute,
-                            stream,
-                        )?,
-                        None => model.forward_with_expert_executor(
-                            tokens,
-                            mask,
-                            cache,
-                            &mut execute,
-                            stream,
-                        )?,
-                    }
+                    model.forward_with_expert_executor(tokens, cache, &mut execute, stream)?
                 }
                 (
                     ExpertArchitecture::KimiLinearLayerwise(model),
@@ -1699,16 +1542,19 @@ impl ExpertParallelModel {
         let assignment = &self.info.assignment;
         let mut statistics = RoutingStatistics::default();
         let output = match (&mut self.architecture, cache) {
-            (
-                ExpertArchitecture::DeepSeekLayerwise(model),
-                ExpertParallelCache::DeepSeek(cache),
-            ) => {
-                let args = model.args().clone();
-                model.forward_mtp_target_with_expert_executor(
-                    tokens,
-                    cache,
-                    tensor_group,
-                    |layer, hidden, ids, weights, stream| {
+            (ExpertArchitecture::DeepSeek(model), ExpertParallelCache::DeepSeek(cache)) => {
+                if tensor_group.is_some() {
+                    return Err(Exception::custom(
+                        "neutral DeepSeek TP+EP MTP execution is not configured",
+                    ));
+                }
+                let args = match (model.v3_args(), model.v4_args()) {
+                    (Some(args), None) => NeutralDeepSeekArgs::V3(args.clone()),
+                    (None, Some(args)) => NeutralDeepSeekArgs::V4(args.clone()),
+                    _ => unreachable!("DeepSeek model has exactly one family policy"),
+                };
+                let mut execute =
+                    |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
                         let returned = dispatch_replicated_with(
                             hidden,
                             ids,
@@ -1717,7 +1563,7 @@ impl ExpertParallelModel {
                             expert_group,
                             stream,
                             |routes, stream| {
-                                execute_cached_deepseek(
+                                execute_cached_neutral_deepseek(
                                     &args,
                                     layer,
                                     routes,
@@ -1730,44 +1576,18 @@ impl ExpertParallelModel {
                         .map_err(|error| Exception::custom(error.to_string()))?;
                         statistics.accumulate(&returned.statistics);
                         Ok(returned.reduced_output)
-                    },
-                    stream,
-                )?
-            }
-            (
-                ExpertArchitecture::DeepSeekV4Layerwise(model),
-                ExpertParallelCache::DeepSeekV4(cache),
-            ) => {
-                let args = model.args().clone();
-                model.forward_mtp_target_with_expert_executor(
-                    tokens,
+                    };
+                let (logits, hidden) = model.forward_embedded_with_expert_executor(
+                    eredu_architectures::deepseek::mtp::EmbeddedInput::target(tokens, None),
                     cache,
-                    tensor_group,
-                    |layer, hidden, ids, weights, stream| {
-                        let returned = dispatch_replicated_with(
-                            hidden,
-                            ids,
-                            weights,
-                            assignment,
-                            expert_group,
-                            stream,
-                            |routes, stream| {
-                                execute_cached_deepseek_v4(
-                                    &args,
-                                    layer,
-                                    routes,
-                                    pass,
-                                    expert_cache,
-                                    stream,
-                                )
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                        statistics.accumulate(&returned.statistics);
-                        Ok(returned.reduced_output)
-                    },
+                    &mut execute,
                     stream,
-                )?
+                )?;
+                EmbeddedMtpOutput {
+                    logits,
+                    hidden,
+                    tokens: tokens.clone(),
+                }
             }
             (ExpertArchitecture::InklingLayerwise(model), ExpertParallelCache::Inkling(cache)) => {
                 let args = model.args().clone();
@@ -1866,18 +1686,19 @@ impl ExpertParallelModel {
         let pass = ExpertPass::Decode;
         let mut statistics = RoutingStatistics::default();
         let output = match (&mut self.architecture, cache) {
-            (
-                ExpertArchitecture::DeepSeekLayerwise(model),
-                ExpertParallelMtpDraftCache::DeepSeek(cache),
-            ) => {
-                let args = model.args().clone();
-                model.forward_mtp_draft_with_expert_executor(
-                    hidden,
-                    tokens,
-                    depth,
-                    cache,
-                    tensor_group,
-                    |layer, hidden, ids, weights, stream| {
+            (ExpertArchitecture::DeepSeek(model), ExpertParallelMtpDraftCache::DeepSeek(cache)) => {
+                if tensor_group.is_some() {
+                    return Err(Exception::custom(
+                        "neutral DeepSeek TP+EP MTP execution is not configured",
+                    ));
+                }
+                let args = match (model.v3_args(), model.v4_args()) {
+                    (Some(args), None) => NeutralDeepSeekArgs::V3(args.clone()),
+                    (None, Some(args)) => NeutralDeepSeekArgs::V4(args.clone()),
+                    _ => unreachable!("DeepSeek model has exactly one family policy"),
+                };
+                let mut execute =
+                    |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
                         let returned = dispatch_replicated_with(
                             hidden,
                             ids,
@@ -1886,7 +1707,7 @@ impl ExpertParallelModel {
                             expert_group,
                             stream,
                             |routes, stream| {
-                                execute_cached_deepseek(
+                                execute_cached_neutral_deepseek(
                                     &args,
                                     layer,
                                     routes,
@@ -1899,21 +1720,16 @@ impl ExpertParallelModel {
                         .map_err(|error| Exception::custom(error.to_string()))?;
                         statistics.accumulate(&returned.statistics);
                         Ok(returned.reduced_output)
-                    },
+                    };
+                let (logits, next_hidden) = model.forward_embedded_with_expert_executor(
+                    eredu_architectures::deepseek::mtp::EmbeddedInput::draft(tokens, hidden, depth),
+                    cache,
+                    &mut execute,
                     stream,
-                )?
-            }
-            (
-                ExpertArchitecture::DeepSeekV4Layerwise(model),
-                ExpertParallelMtpDraftCache::DeepSeekV4(cache),
-            ) => {
-                let last_token = tokens.clone().item::<u32>(stream);
-                let (logits, hidden) = <crate::composition::mlx_architectures::deepseek_v4::layerwise::DeepSeekV4LayerwiseModel as EmbeddedMtpTarget>::draft_logits(
-                    model, hidden, last_token, depth, cache, stream,
                 )?;
                 EmbeddedMtpOutput {
                     logits,
-                    hidden,
+                    hidden: next_hidden,
                     tokens: tokens.clone(),
                 }
             }
@@ -2507,118 +2323,32 @@ fn parameter_bytes(module: &impl ModuleParameters) -> usize {
         .sum()
 }
 
-pub(crate) fn execute_cached_deepseek(
-    args: &deepseek_v3::ModelArgs,
-    layer: usize,
-    routes: &DispatchedRoutes,
-    pass: ExpertPass,
-    cache: &ExpertCache,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    Ok(cache.execute_routes_bounded(
-        ExpertRouteBatch::new(
-            layer,
-            &routes.hidden,
-            &routes.global_expert_ids,
-            &routes.weights,
-            pass,
-        ),
-        stream,
-        |hidden, acquired, _weights, stream| {
-            let started = Instant::now();
-            let mut bank = RoutedExperts::new_compact(
-                args,
-                layer as i32,
-                acquired.identities().len() as i32,
-                stream,
-            )?;
-            macro_rules! required {
-                ($field:ident, $name:literal) => {
-                    bank.$field = Param::new(Some(acquired.compact_binding($name, stream)?));
-                };
-            }
-            macro_rules! optional {
-                ($field:ident, $name:literal) => {
-                    bank.$field = Param::new(acquired.optional_compact_binding($name, stream)?);
-                };
-            }
-            required!(gate_proj, "gate_proj");
-            optional!(gate_proj_scale_inv, "gate_proj_scale_inv");
-            optional!(gate_proj_scales, "gate_proj_scales");
-            optional!(gate_proj_biases, "gate_proj_biases");
-            required!(up_proj, "up_proj");
-            optional!(up_proj_scale_inv, "up_proj_scale_inv");
-            optional!(up_proj_scales, "up_proj_scales");
-            optional!(up_proj_biases, "up_proj_biases");
-            required!(down_proj, "down_proj");
-            optional!(down_proj_scale_inv, "down_proj_scale_inv");
-            optional!(down_proj_scales, "down_proj_scales");
-            optional!(down_proj_biases, "down_proj_biases");
-            cache.record_compact_bank(
-                acquired.pass(),
-                acquired.scratch_bytes(),
-                started.elapsed(),
-            )?;
-            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
-            Ok(bank.forward_local(hidden, acquired.compact_routes(), &weights, stream)?)
-        },
-    )?)
+enum NeutralDeepSeekArgs {
+    V3(eredu_architectures::deepseek::V3Args),
+    V4(eredu_architectures::deepseek::V4Args),
 }
 
-pub(crate) fn execute_cached_deepseek_v4(
-    args: &deepseek_v4::ModelArgs,
+fn execute_cached_neutral_deepseek(
+    args: &NeutralDeepSeekArgs,
     layer: usize,
     routes: &DispatchedRoutes,
     pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    Ok(cache.execute_routes_bounded(
-        ExpertRouteBatch::new(
-            layer,
-            &routes.hidden,
-            &routes.global_expert_ids,
-            &routes.weights,
-            pass,
-        ),
+    let spec = match args {
+        NeutralDeepSeekArgs::V3(args) => crate::composition::deepseek_expert::v3_spec(args, layer),
+        NeutralDeepSeekArgs::V4(args) => crate::composition::deepseek_expert::v4_spec(args, layer),
+    };
+    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_swiglu_dispatched(
+        cache,
+        spec,
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        pass,
         stream,
-        |hidden, acquired, _weights, stream| {
-            let started = Instant::now();
-            let quantization = match args.expert_dtype.as_deref() {
-                Some("fp4") => Some(WeightQuantization::MxFp4),
-                Some("fp8") => None,
-                None => args.quantization,
-                Some(_) => unreachable!("validated expert dtype"),
-            };
-            let bank = PackedSwiGluExperts::new(
-                acquired.identities().len() as i32,
-                args.hidden_size,
-                args.moe_intermediate_size,
-                quantization,
-                quantization,
-                stream,
-            )?;
-            let mut bank = if args.expert_dtype.as_deref() == Some("fp8") {
-                bank.with_native_fp8_e8m0(stream)?
-            } else {
-                bank
-            }
-            .with_swiglu_limit(args.swiglu_limit)?;
-            bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
-            bank.gate_up_proj_scales =
-                Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
-            bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
-            bank.down_proj_scales =
-                Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
-            cache.record_compact_bank(
-                acquired.pass(),
-                acquired.scratch_bytes(),
-                started.elapsed(),
-            )?;
-            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
-            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
-        },
-    )?)
+    )
 }
 
 pub(crate) fn execute_cached_gemma4(
@@ -3270,56 +3000,37 @@ fn load_external_gguf_ep(
             )
         }
         "deepseek4" => {
-            let prepared = deepseek_v4::prepare_gguf_checkpoint(checkpoint, metadata)?;
-            let args = prepared.args;
+            if topology.tensor_parallel_size > 1 {
+                return Err(Error::Parallel(
+                    "neutral DeepSeek GGUF TP+EP loading is not configured".into(),
+                ));
+            }
+            let (model, _) = crate::composition::deepseek::load_gguf_external_experts(
+                checkpoint,
+                metadata,
+                true,
+                non_expert,
+                stream,
+                weights_stream,
+            )?;
+            let args = model
+                .v4_args()
+                .cloned()
+                .ok_or_else(|| Error::Parallel("expected DeepSeek V4 GGUF".into()))?;
             let assignment = resolve_model_assignment(
                 assignment,
                 args.n_routed_experts as usize,
                 topology,
             )?;
-            let gguf_plan = crate::composition::mlx_architectures::deepseek_v4::checkpoint::gguf_plan(&args)
-                .map_err(Error::UnsupportedArchitecture)?;
-            let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-                std::sync::Arc::new(open_gguf_checkpoint_source(
-                    checkpoint.clone(),
-                    &gguf_plan,
-                    deepseek_v4::translate_gguf_weight_name,
-                    max_mapped_shards,
-                )?);
-            let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::deepseek_v4::layerwise::
-                    load_deepseek_v4_sparse_tp_ep_base_with_store(
-                        store.clone(),
-                        args.clone(),
-                        non_expert,
-                        expert_residency.quantization(),
-                        ParallelBuildContext::new(topology, ShardingPolicy::Require),
-                        stream,
-                        weights_stream,
-                    )?
-            } else {
-                crate::composition::mlx_architectures::deepseek_v4::layerwise::
-                    load_deepseek_v4_sparse_ep_base_with_store(
-                        store.clone(),
-                        args.clone(),
-                        non_expert,
-                        expert_residency.quantization(),
-                        stream,
-                        weights_stream,
-                    )?
-            };
             let store = model.checkpoint_store_arc();
-            let entries = crate::composition::mlx_architectures::deepseek_v4::layerwise::expert_catalog(
-                &args,
-                store.as_ref(),
-            )?;
+            let entries = crate::composition::deepseek_expert::v4_catalog(&args, store.as_ref())?;
             let replicated_parameter_bytes =
                 planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::DeepSeekV4,
                 assignment,
-                ExpertArchitecture::DeepSeekV4Layerwise(Box::new(model)),
+                ExpertArchitecture::DeepSeek(Box::new(model)),
                 store,
                 entries,
                 expert_residency,
@@ -3329,60 +3040,37 @@ fn load_external_gguf_ep(
             )
         }
         "deepseek2" => {
-            let prepared = deepseek_v3::prepare_gguf_checkpoint(
+            if topology.tensor_parallel_size > 1 {
+                return Err(Error::Parallel(
+                    "neutral DeepSeek GGUF TP+EP loading is not configured".into(),
+                ));
+            }
+            let (model, _) = crate::composition::deepseek::load_gguf_external_experts(
                 checkpoint,
                 metadata,
-                None,
+                false,
+                non_expert,
+                stream,
                 weights_stream,
             )?;
-            let args = prepared.args;
+            let args = model
+                .v3_args()
+                .cloned()
+                .ok_or_else(|| Error::Parallel("expected DeepSeek V3 GGUF".into()))?;
             let assignment = resolve_model_assignment(
                 assignment,
                 args.n_routed_experts as usize,
                 topology,
             )?;
-            let gguf_plan = crate::composition::mlx_architectures::deepseek_v3::checkpoint::gguf_plan(&args)
-                .map_err(Error::UnsupportedArchitecture)?;
-            let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
-                std::sync::Arc::new(open_gguf_checkpoint_source(
-                    checkpoint.clone(),
-                    &gguf_plan,
-                    deepseek_v3::translate_gguf_weight_name,
-                    max_mapped_shards,
-                )?);
-            let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::deepseek_v3::layerwise::
-                    load_deepseek_v3_sparse_tp_ep_base_with_store(
-                        store.clone(),
-                        args.clone(),
-                        non_expert,
-                        ParallelBuildContext::new(topology, ShardingPolicy::Require),
-                        stream,
-                        weights_stream,
-                    )?
-            } else {
-                crate::composition::mlx_architectures::deepseek_v3::layerwise::
-                    load_deepseek_v3_sparse_ep_base_with_store(
-                        store.clone(),
-                        args.clone(),
-                        non_expert,
-                        stream,
-                        weights_stream,
-                    )?
-            };
             let store = model.checkpoint_store_arc();
-            let entries =
-                crate::composition::mlx_architectures::deepseek_v3::layerwise::deepseek_expert_catalog(
-                    &args,
-                    store.as_ref(),
-                )?;
+            let entries = crate::composition::deepseek_expert::v3_catalog(&args, store.as_ref())?;
             let replicated_parameter_bytes =
                 planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::DeepSeekV3,
                 assignment,
-                ExpertArchitecture::DeepSeekLayerwise(Box::new(model)),
+                ExpertArchitecture::DeepSeek(Box::new(model)),
                 store,
                 entries,
                 expert_residency,
@@ -3947,12 +3635,6 @@ impl ExternalExpertResidency {
             Self::SparseCache(_, _) => RoutedExpertResidency::SparseCache,
         }
     }
-
-    const fn quantization(self) -> Option<WeightQuantization> {
-        match self {
-            Self::FullyResident(quantization) | Self::SparseCache(_, quantization) => quantization,
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4016,51 +3698,40 @@ fn load_kimi_linear_external_ep(
 fn load_deepseek_external_ep(
     model_dir: &Path,
     topology: MlxParallelContext,
-    _options: ModelLoadOptions,
+    options: ModelLoadOptions,
     non_expert: LayerWeightResidency,
     expert_residency: ExternalExpertResidency,
-    max_mapped_shards: usize,
+    _max_mapped_shards: usize,
     assignment: Option<ExpertAssignment>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
-    let args = deepseek_v3::get_model_args(model_dir)?;
-    args.validate()?;
+    if topology.tensor_parallel_size > 1 {
+        return Err(Error::Parallel(
+            "neutral DeepSeek TP+EP loading is not configured".into(),
+        ));
+    }
+    let model = crate::composition::deepseek::load_safetensors_external_experts(
+        model_dir,
+        non_expert,
+        options.quantization,
+        stream,
+        weights_stream,
+    )?;
+    let args = model
+        .v3_args()
+        .cloned()
+        .ok_or_else(|| Error::Parallel("expected a DeepSeek V3 checkpoint".into()))?;
     let assignment =
         resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
-    let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> = std::sync::Arc::new(
-        SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
-    );
-    let model = if topology.tensor_parallel_size > 1 {
-        crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_sparse_tp_ep_base_with_store(
-            store.clone(),
-            args.clone(),
-            non_expert,
-            ParallelBuildContext::new(topology, ShardingPolicy::Require),
-            stream,
-            weights_stream,
-        )?
-    } else {
-        crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_sparse_ep_base_with_store(
-            store.clone(),
-            args.clone(),
-            non_expert,
-            stream,
-            weights_stream,
-        )?
-    };
     let store = model.checkpoint_store_arc();
-    let entries =
-        crate::composition::mlx_architectures::deepseek_v3::layerwise::deepseek_expert_catalog(
-            &args,
-            store.as_ref(),
-        )?;
+    let entries = crate::composition::deepseek_expert::v3_catalog(&args, store.as_ref())?;
     let replicated_parameter_bytes = planned_replicated_bytes(&model.residency_report()?)?;
     finish_external_ep(
         topology,
         ModelKind::DeepSeekV3,
         assignment,
-        ExpertArchitecture::DeepSeekLayerwise(Box::new(model)),
+        ExpertArchitecture::DeepSeek(Box::new(model)),
         store,
         entries,
         expert_residency,
@@ -4077,48 +3748,37 @@ fn load_deepseek_v4_external_ep(
     options: ModelLoadOptions,
     non_expert: LayerWeightResidency,
     expert_residency: ExternalExpertResidency,
-    max_mapped_shards: usize,
+    _max_mapped_shards: usize,
     assignment: Option<ExpertAssignment>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
-    let args = deepseek_v4::get_model_args(model_dir)?;
+    if topology.tensor_parallel_size > 1 {
+        return Err(Error::Parallel(
+            "neutral DeepSeek TP+EP loading is not configured".into(),
+        ));
+    }
+    let model = crate::composition::deepseek::load_safetensors_external_experts(
+        model_dir,
+        non_expert,
+        options.quantization,
+        stream,
+        weights_stream,
+    )?;
+    let args = model
+        .v4_args()
+        .cloned()
+        .ok_or_else(|| Error::Parallel("expected a DeepSeek V4 checkpoint".into()))?;
     let assignment =
         resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
-    let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> = std::sync::Arc::new(
-        SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
-    );
-    let model = if topology.tensor_parallel_size > 1 {
-        crate::composition::mlx_architectures::deepseek_v4::layerwise::load_deepseek_v4_sparse_tp_ep_base_with_store(
-            store.clone(),
-            args.clone(),
-            non_expert,
-            options.quantization,
-            ParallelBuildContext::new(topology, ShardingPolicy::Require),
-            stream,
-            weights_stream,
-        )?
-    } else {
-        crate::composition::mlx_architectures::deepseek_v4::layerwise::load_deepseek_v4_sparse_ep_base_with_store(
-            store.clone(),
-            args.clone(),
-            non_expert,
-            options.quantization,
-            stream,
-            weights_stream,
-        )?
-    };
     let store = model.checkpoint_store_arc();
-    let entries = crate::composition::mlx_architectures::deepseek_v4::layerwise::expert_catalog(
-        &args,
-        store.as_ref(),
-    )?;
+    let entries = crate::composition::deepseek_expert::v4_catalog(&args, store.as_ref())?;
     let replicated_parameter_bytes = planned_replicated_bytes(&model.residency_report()?)?;
     finish_external_ep(
         topology,
         ModelKind::DeepSeekV4,
         assignment,
-        ExpertArchitecture::DeepSeekV4Layerwise(Box::new(model)),
+        ExpertArchitecture::DeepSeek(Box::new(model)),
         store,
         entries,
         expert_residency,

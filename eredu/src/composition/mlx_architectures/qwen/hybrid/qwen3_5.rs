@@ -1163,33 +1163,6 @@ impl QwenLinear {
     }
 
     fn training_mode(&mut self, _mode: bool) {}
-
-    pub(crate) fn dequantized_weight(&self, stream: &Stream) -> Result<Array, Exception> {
-        if let Some(iquant) = self.iquant {
-            let (ggml_type, endian) = iquant.gguf_iquant().expect("IQ format");
-            safemlx::native_quantization::NativeQuantizedTensor::from_iq_array(
-                self.weight.value.clone(),
-                &[self.output_dims, self.input_dims],
-                ggml_type,
-                endian,
-            )?
-            .dequantize(stream)
-        } else if let Some(scales) = self.scales.as_ref() {
-            safemlx::ops::dequantize_with_mode(
-                self.weight.as_ref(),
-                scales,
-                self.biases.as_ref().as_ref(),
-                self.group_size,
-                self.bits,
-                self.mode,
-                stream,
-            )
-        } else if let Some(scale) = self.weight_scale_inv.as_ref() {
-            common::fp8::dequantize(self.weight.as_ref(), scale, stream)
-        } else {
-            Ok(self.weight.as_ref().clone())
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

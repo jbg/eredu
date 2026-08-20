@@ -1,11 +1,10 @@
 //! Pure checkpoint schemas and name translation for Qwen text models.
 
 use eredu_checkpoint::schema::{
-    matrix_with_optional_quantization, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
+    matrix_for_linear_format, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
     GgufTensorConstraint, GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
     SafetensorsTensorConstraint, TensorOperation,
 };
-use eredu_checkpoint::WeightQuantization;
 use eredu_checkpoint::{
     expert::{
         resolve_swiglu_expert_recipes, IndependentSwiGluExpertNames, SwiGluExpertLayoutNames,
@@ -13,6 +12,7 @@ use eredu_checkpoint::{
     },
     recipe::RecipeCatalog,
 };
+use eredu_checkpoint::{LinearFormat, WeightQuantization};
 
 use super::{ModelArgs, QwenVariant};
 
@@ -384,7 +384,7 @@ fn matrix_constraints(
     quantization: Option<WeightQuantization>,
     aliases: Vec<String>,
 ) -> Result<Vec<SafetensorsTensorConstraint>, String> {
-    matrix_with_optional_quantization(name, aliases, shape, quantization)
+    matrix_for_linear_format(name, aliases, shape, LinearFormat::from(quantization), None)
         .map_err(|error| error.to_string())
 }
 

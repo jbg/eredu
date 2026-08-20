@@ -83,11 +83,12 @@ impl CacheIoExecutionState {
 
     /// Registers an exact key or joins its existing completion owner.
     pub fn prepare(&mut self, key: CacheIoOperationKey) -> CacheIoPreparation {
-        if self.operations.contains_key(&key) {
-            CacheIoPreparation::Joined
-        } else {
-            self.operations.insert(key, OperationPhase::Prepared);
-            CacheIoPreparation::New
+        match self.operations.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(OperationPhase::Prepared);
+                CacheIoPreparation::New
+            }
+            std::collections::hash_map::Entry::Occupied(_) => CacheIoPreparation::Joined,
         }
     }
 

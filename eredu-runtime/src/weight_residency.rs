@@ -807,7 +807,7 @@ mod tests {
         let unit = StaticUnitBindings::new("static.embedding", vec![binding.clone()]).unwrap();
 
         assert_eq!(unit.id().as_str(), "static.embedding");
-        assert_eq!(unit.bindings(), &[binding.clone()]);
+        assert_eq!(unit.bindings(), std::slice::from_ref(&binding));
         let (id, bindings) = unit.into_parts();
         assert_eq!(id.as_str(), "static.embedding");
         assert_eq!(bindings, vec![binding]);

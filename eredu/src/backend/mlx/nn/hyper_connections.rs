@@ -1,6 +1,6 @@
 //! Architecture-neutral hyper-connection residual mixing.
 //!
-//! DeepSeek V4 uses a small doubly-stochastic matrix to mix multiple residual
+//! Multi-stream residual blocks use a small doubly-stochastic matrix to mix
 //! streams.  Keeping the numerical definition here avoids embedding a second
 //! implementation in target and speculative-decoder code.
 
@@ -23,7 +23,7 @@ pub struct HyperConnectionSplit {
     pub combination: Array,
 }
 
-/// Trainable DeepSeek-style multi-stream hyper-connection.
+/// Trainable multi-stream hyper-connection.
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct HyperConnection {
     /// Number of residual streams.
@@ -78,6 +78,17 @@ impl HyperConnection {
         norm_epsilon: f32,
         stream: &Stream,
     ) -> Result<(Array, Array, Array), Exception> {
+        let (collapsed, split) = self.collapse_split(residual, norm_epsilon, stream)?;
+        Ok((collapsed, split.post, split.combination))
+    }
+
+    /// Collapses residual streams while retaining all typed mixing coefficients.
+    pub fn collapse_split(
+        &mut self,
+        residual: &Array,
+        norm_epsilon: f32,
+        stream: &Stream,
+    ) -> Result<(Array, HyperConnectionSplit), Exception> {
         if residual.ndim() != 4
             || residual.dim(2) != self.streams
             || residual.dim(3) != self.hidden_size
@@ -115,7 +126,7 @@ impl HyperConnection {
         )?;
         let collapsed = einsum("blh,blhd->bld", [&split.pre, &residual_fp32], stream)?
             .as_dtype(residual.dtype(), stream)?;
-        Ok((collapsed, split.post, split.combination))
+        Ok((collapsed, split))
     }
 }
 
@@ -211,7 +222,10 @@ impl HyperHead {
             stream,
         )?
         .add(Array::from_f32(self.epsilon), stream)?;
-        einsum("blh,blhd->bld", [&pre, &fp32], stream)?.as_dtype(dtype, stream)
+        pre.try_index_device((.., .., .., safemlx::ops::indexing::NewAxis), stream)?
+            .multiply(&fp32, stream)?
+            .sum_axis(2, false, stream)?
+            .as_dtype(dtype, stream)
     }
 }
 
@@ -223,7 +237,7 @@ fn weightless_rms_norm(value: &Array, epsilon: f32, stream: &Stream) -> Result<A
     )
 }
 
-/// Applies DeepSeek's FP32 hyper-connection split and Sinkhorn normalization.
+/// Applies FP32 hyper-connection splitting and Sinkhorn normalization.
 ///
 /// `mixes` has shape `[..., (2 + streams) * streams]`, `scale` has shape
 /// `[3]`, and `base` has the same final dimension as `mixes`.  The returned
@@ -361,9 +375,9 @@ mod tests {
     fn preserves_arbitrary_leading_dimensions_and_normalizes_columns() {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
-        let mixes = Array::from_slice(&[0.0f32; 96], &[2, 3, 16]);
+        let mixes = Array::from_slice(&[0.0f32; 48], &[2, 3, 8]);
         let scale = Array::from_slice(&[1.0f32, 1.0, 1.0], &[3]);
-        let base = Array::from_slice(&[0.0f32; 16], &[16]);
+        let base = Array::from_slice(&[0.0f32; 8], &[8]);
         let split = split_sinkhorn(&mixes, &scale, &base, 2, 20, 1e-6, stream).unwrap();
 
         assert_eq!(split.pre.shape(), [2, 3, 2]);
@@ -372,7 +386,7 @@ mod tests {
         let columns = split.combination.sum_axis(-2, false, stream).unwrap();
         assert!(columns
             .all_close(
-                &Array::ones::<f32>(&[2, 3, 2], stream).unwrap(),
+                Array::ones::<f32>(&[2, 3, 2], stream).unwrap(),
                 1e-4,
                 1e-4,
                 None,

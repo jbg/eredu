@@ -4,8 +4,6 @@ use serde_json::Value;
 
 use crate::backend::mlx::error::Error;
 use crate::composition::mlx_architectures::{
-    deepseek_v3::model as deepseek_v3,
-    deepseek_v4::model as deepseek_v4,
     gemma4::model as gemma4,
     gpt_oss::model as gpt_oss,
     inkling::model as inkling,
@@ -70,8 +68,12 @@ fn validate_model_config(kind: eredu_core::ModelKind, config: &Value) -> Result<
     use eredu_core::ModelKind;
 
     match kind {
-        ModelKind::DeepSeekV3 => deepseek_v3::validate_model_config_value(config),
-        ModelKind::DeepSeekV4 => deepseek_v4::validate_model_config_value(config),
+        ModelKind::DeepSeekV3 => eredu_architectures::deepseek::parse_v3_config(config)
+            .map(|_| ())
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+        ModelKind::DeepSeekV4 => eredu_architectures::deepseek::parse_v4_config(config)
+            .map(|_| ())
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
         ModelKind::Gemma4 => gemma4::validate_model_config_value(config),
         ModelKind::GptOss => gpt_oss::validate_model_config_value(config),
         ModelKind::Inkling => inkling::validate_model_config_value(config),

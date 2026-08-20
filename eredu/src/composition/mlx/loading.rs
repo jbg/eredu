@@ -56,8 +56,8 @@ fn materialize_gguf_model(
         GgufArchitecture::KimiLinear => {
             let (loaded, eos_token_ids) =
                         crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_gguf_layerwise_model(
-                            &checkpoint,
-                            &metadata,
+                            checkpoint,
+                            metadata,
                             options.weight_residency,
                             options.quantization,
                             stream,
@@ -66,33 +66,42 @@ fn materialize_gguf_model(
             (Model::KimiLinear(loaded), eos_token_ids)
         }
         GgufArchitecture::DeepSeek2 => {
-            let (loaded, eos_token_ids) =
-                        crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_gguf_layerwise_model(
-                            &checkpoint,
-                            &metadata,
-                            options.weight_residency,
-                            options.quantization,
-                            stream,
-                            weights_stream,
-                        )?;
-            (Model::DeepSeekV3(loaded), eos_token_ids)
+            if options.quantization.is_some() {
+                return Err(Error::UnsupportedArchitecture(
+                    "load-time quantization is not yet supported by neutral DeepSeek GGUF composition".into(),
+                ));
+            }
+            let (loaded, eos_token_ids) = crate::composition::deepseek::load_gguf(
+                checkpoint,
+                metadata,
+                false,
+                options.weight_residency,
+                stream,
+                weights_stream,
+            )?;
+            (Model::DeepSeek(Box::new(loaded)), eos_token_ids)
         }
         GgufArchitecture::DeepSeek4 => {
-            let (loaded, eos_token_ids) = crate::composition::mlx_architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-            (Model::DeepSeekV4Layerwise(Box::new(loaded)), eos_token_ids)
+            if options.quantization.is_some() {
+                return Err(Error::UnsupportedArchitecture(
+                    "load-time quantization is not yet supported by neutral DeepSeek GGUF composition".into(),
+                ));
+            }
+            let (loaded, eos_token_ids) = crate::composition::deepseek::load_gguf(
+                checkpoint,
+                metadata,
+                true,
+                options.weight_residency,
+                stream,
+                weights_stream,
+            )?;
+            (Model::DeepSeek(Box::new(loaded)), eos_token_ids)
         }
         GgufArchitecture::GptOss => {
             let (loaded, eos_token_ids) =
                     crate::composition::mlx_architectures::gpt_oss::layerwise::load_gpt_oss_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
+                        checkpoint,
+                        metadata,
                         options.weight_residency,
                         options.quantization,
                         stream,
@@ -108,8 +117,8 @@ fn materialize_gguf_model(
             }
             let (loaded, eos_token_ids) =
                     crate::composition::mlx_architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
+                        checkpoint,
+                        metadata,
                         mmproj.as_ref(),
                         options.weight_residency,
                         options.quantization,
@@ -123,14 +132,14 @@ fn materialize_gguf_model(
             #[cfg(any(feature = "mlx-image", feature = "mlx-audio"))]
             if let Some(mmproj) = &mmproj {
                 processor = Some(ModelProcessor::load_gemma4_gguf(
-                    &metadata,
+                    metadata,
                     &mmproj.metadata,
                 )?);
             }
             let (loaded, eos_token_ids) =
                     crate::composition::mlx_architectures::gemma4::layerwise::load_gemma4_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
+                        checkpoint,
+                        metadata,
                         mmproj.as_ref(),
                         options.weight_residency,
                         options.quantization,
@@ -141,8 +150,8 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
             let (loaded, eos_token_ids) = crate::composition::llama::load_llama_gguf_model(
-                &checkpoint,
-                &metadata,
+                checkpoint,
+                metadata,
                 options.weight_residency,
                 options.quantization,
                 stream,
@@ -159,8 +168,8 @@ fn materialize_gguf_model(
             }
             let (loaded, eos_token_ids) =
                 crate::composition::mlx_architectures::muse_glimmer::layerwise::load_gguf_checkpoint(
-                    &checkpoint,
-                    &metadata,
+                    checkpoint,
+                    metadata,
                     gguf_architecture.metadata_name(),
                     options.weight_residency,
                     options.quantization,
@@ -172,8 +181,8 @@ fn materialize_gguf_model(
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
             let (loaded, eos_token_ids) =
                     crate::composition::mlx_architectures::lfm2::layerwise::load_lfm2_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
+                        checkpoint,
+                        metadata,
                         options.weight_residency,
                         options.quantization,
                         stream,
@@ -184,8 +193,8 @@ fn materialize_gguf_model(
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
             let (loaded, eos_token_ids) =
                     crate::composition::mlx_architectures::nemotron_h::layerwise::load_nemotron_h_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
+                        checkpoint,
+                        metadata,
                         options.weight_residency,
                         options.quantization,
                         stream,
@@ -195,8 +204,8 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
             let (loaded, eos_token_ids) = crate::composition::qwen::load_qwen_gguf_model(
-                &checkpoint,
-                &metadata,
+                checkpoint,
+                metadata,
                 options.weight_residency,
                 options.quantization,
                 stream,
@@ -211,8 +220,8 @@ fn materialize_gguf_model(
                 crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
             let (loaded, eos_token_ids) =
                     crate::composition::mlx_architectures::qwen::vl::layerwise::load_qwen3_vl_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
+                        checkpoint,
+                        metadata,
                         &vision_checkpoint,
                         &vision_metadata,
                         options.weight_residency,
@@ -241,8 +250,8 @@ fn materialize_gguf_model(
             }
             let (loaded, eos_token_ids, is_next) =
                         crate::composition::mlx_architectures::qwen::hybrid::layerwise::load_qwen_hybrid_gguf_layerwise_model(
-                            &checkpoint,
-                            &metadata,
+                            checkpoint,
+                            metadata,
                             mmproj.as_ref(),
                             options.weight_residency,
                             options.quantization,
@@ -398,21 +407,11 @@ fn materialize_tensor_parallel(
         eredu_runtime::ShardingPolicy::Require,
     );
     match kind {
-        ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
-            crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_tensor_parallel_model(
+        ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => Ok(Model::DeepSeek(Box::new(
+            crate::composition::deepseek::load_safetensors(
                 path,
-                execution,
-                build,
-                stream,
-                weights_stream,
-            )?,
-        )),
-        ModelKind::DeepSeekV4 => Ok(Model::DeepSeekV4Layerwise(Box::new(
-            crate::composition::mlx_architectures::deepseek_v4::layerwise::load_deepseek_v4_tensor_parallel_model(
-                path,
-                execution,
+                options.weight_residency,
                 options.quantization,
-                build,
                 stream,
                 weights_stream,
             )?,
@@ -657,13 +656,16 @@ fn materialize_gguf_tensor_parallel(
             let (model, eos) = crate::composition::mlx_architectures::kimi_linear::layerwise::load_kimi_linear_gguf_tensor_parallel_model(checkpoint, metadata, residency, build, stream, weights_stream)?;
             Ok((Model::KimiLinear(model), eos))
         }
-        GgufArchitecture::DeepSeek2 => {
-            let (model, eos) = crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_gguf_tensor_parallel_model(checkpoint, metadata, residency, build, stream, weights_stream)?;
-            Ok((Model::DeepSeekV3(model), eos))
-        }
-        GgufArchitecture::DeepSeek4 => {
-            let (model, eos) = crate::composition::mlx_architectures::deepseek_v4::layerwise::load_deepseek_v4_gguf_tensor_parallel_model(checkpoint, metadata, residency, options.quantization, build, stream, weights_stream)?;
-            Ok((Model::DeepSeekV4Layerwise(Box::new(model)), eos))
+        GgufArchitecture::DeepSeek2 | GgufArchitecture::DeepSeek4 => {
+            let (model, eos) = crate::composition::deepseek::load_gguf(
+                checkpoint,
+                metadata,
+                architecture == GgufArchitecture::DeepSeek4,
+                options.weight_residency,
+                stream,
+                weights_stream,
+            )?;
+            Ok((Model::DeepSeek(Box::new(model)), eos))
         }
         GgufArchitecture::GptOss => {
             let (model, eos) =
@@ -848,21 +850,20 @@ pub(super) fn materialize_safetensors(
                     model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
-            ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
-                crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_expert_cache_model(
-                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
-                )?,
-            )),
-            ModelKind::DeepSeekV4 => Ok(Model::DeepSeekV4Layerwise(Box::new(
-                crate::composition::mlx_architectures::deepseek_v4::layerwise::load_deepseek_v4_expert_cache_model(
-                    model_dir,
-                    non_expert,
-                    expert_cache,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?,
-            ))),
+            ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => {
+                Ok(Model::DeepSeek(Box::new(
+                    crate::composition::deepseek::load_safetensors(
+                        model_dir,
+                        eredu_runtime::WeightResidency::with_expert_cache(
+                            non_expert,
+                            expert_cache,
+                        ),
+                        options.quantization,
+                        stream,
+                        weights_stream,
+                    )?,
+                )))
+            }
             ModelKind::GptOss => Ok(Model::GptOss(
                 crate::composition::mlx_architectures::gpt_oss::layerwise::load_gpt_oss_expert_cache_model(
                     model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
@@ -921,24 +922,17 @@ pub(super) fn materialize_safetensors(
         quantization.validate()?;
     }
     match kind {
-        ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
-            crate::composition::mlx_architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
-                model_dir,
-                execution,
-                options.quantization,
-                stream,
-                weights_stream,
-            )?,
-        )),
-        ModelKind::DeepSeekV4 => Ok(Model::DeepSeekV4Layerwise(Box::new(
-            crate::composition::mlx_architectures::deepseek_v4::layerwise::load_deepseek_v4_layerwise_model(
-                model_dir,
-                execution,
-                options.quantization,
-                stream,
-                weights_stream,
-            )?,
-        ))),
+        ModelKind::DeepSeekV3 | ModelKind::DeepSeekV4 => {
+            Ok(Model::DeepSeek(Box::new(
+                crate::composition::deepseek::load_safetensors(
+                    model_dir,
+                    options.weight_residency,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?,
+            )))
+        }
         ModelKind::Gemma4 => Ok(Model::Gemma4(Box::new(
             crate::composition::mlx_architectures::gemma4::layerwise::load_gemma4_layerwise_model(
                 model_dir,

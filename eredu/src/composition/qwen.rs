@@ -1737,16 +1737,17 @@ impl QwenParallelComposition {
                         input_dimensions: args.hidden_size,
                         intermediate_dimensions: args.moe_intermediate_size,
                         output_dimensions: args.hidden_size,
+                        limit: None,
                         layout: SwiGluExpertLayout::Packed {
                             gate_up: SwiGluExpertProjection {
                                 weight: ParameterSpec::trainable(&gate_up)
                                     .map_err(|error| Error::Parallel(error.to_string()))?,
-                                quantization: args.weight_quantization_for(&gate_up),
+                                format: args.weight_quantization_for(&gate_up).into(),
                             },
                             down: SwiGluExpertProjection {
                                 weight: ParameterSpec::trainable(&down)
                                     .map_err(|error| Error::Parallel(error.to_string()))?,
-                                quantization: args.weight_quantization_for(&down),
+                                format: args.weight_quantization_for(&down).into(),
                             },
                         },
                     },

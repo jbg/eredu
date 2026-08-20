@@ -8,9 +8,9 @@ mod prompt;
 
 pub use policy::{
     CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier,
-    LayerCachePolicy, MutableStateResidency, PoolingStateComponent, StateResidencyClass,
-    StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
-    StateTensorPresence, StateTensorRole,
+    LayerCachePolicy, MutableStateResidency, PoolingStateComponent, StateComponentPolicy,
+    StateComponentRole, StateResidencyClass, StateTensorDimension, StateTensorDtype,
+    StateTensorOwner, StateTensorPolicy, StateTensorPresence, StateTensorRole,
 };
 pub use prompt::{
     derive_prompt_cache_architecture_fingerprint, prompt_cache_token_fingerprint,

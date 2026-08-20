@@ -56,7 +56,7 @@ fn unloaded_linear<T: Tensor>(
             output,
             weight: parameter_spec("weight"),
             bias: bias.then(|| parameter_spec("bias")),
-            quantization: None,
+            format: eredu_nn::LinearFormat::Dense,
         },
         context,
     )

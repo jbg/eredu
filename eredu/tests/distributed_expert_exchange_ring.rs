@@ -15,10 +15,9 @@ use eredu::{
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCatalogEntry, ExpertRouteBatch,
     },
-    composition::mlx_architectures::deepseek_v3::model::RoutedExperts,
     composition::mlx_architectures::distributed::expert::{
         dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
-        DispatchedRoutes, ExpertAssignment, RoutedTransport, ShardedRouteBlocks,
+        DispatchedRoutes, ExpertAssignment, LocalExpertBank, RoutedTransport, ShardedRouteBlocks,
     },
     core::residency::OffloadConfig,
 };
@@ -42,10 +41,6 @@ fn f32_array(values: &[f32], shape: &[i32], stream: &Stream) -> Array {
 }
 
 fn i32_array(values: &[i32], shape: &[i32], stream: &Stream) -> Array {
-    Array::from_slice(values, shape).copy(stream).unwrap()
-}
-
-fn u8_array(values: &[u8], shape: &[i32], stream: &Stream) -> Array {
     Array::from_slice(values, shape).copy(stream).unwrap()
 }
 
@@ -109,35 +104,36 @@ fn relu2_bank(stream: &Stream) -> PackedRelu2Experts {
     }
 }
 
-fn fp8_bank(stream: &Stream) -> RoutedExperts {
-    let weights = u8_array(&[0x38, 0x38], &[2, 1, 1], stream);
-    let scales = f32_array(&[1.0, 2.0], &[2, 1, 1], stream);
-    RoutedExperts {
-        num_experts: 2,
-        intermediate_size: 1,
-        use_fp8: true,
-        gate_affine: None,
-        up_affine: None,
-        down_affine: None,
-        gate_iquant: None,
-        up_iquant: None,
-        down_iquant: None,
-        gate_proj: Param::new(Some(weights.clone())),
-        gate_proj_scale_inv: Param::new(Some(scales.clone())),
-        gate_proj_scales: Param::new(None),
-        gate_proj_biases: Param::new(None),
-        up_proj: Param::new(Some(weights.clone())),
-        up_proj_scale_inv: Param::new(Some(scales.clone())),
-        up_proj_scales: Param::new(None),
-        up_proj_biases: Param::new(None),
-        down_proj: Param::new(Some(weights)),
-        down_proj_scale_inv: Param::new(Some(scales)),
-        down_proj_scales: Param::new(None),
-        down_proj_biases: Param::new(None),
+struct ScaledSwiGluExperts;
+
+impl LocalExpertBank for ScaledSwiGluExperts {
+    fn execute_local_routes(
+        &mut self,
+        hidden: &Array,
+        local_expert_ids: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let shape = hidden.shape().to_vec();
+        eval([hidden, local_expert_ids])?;
+        let hidden = hidden.evaluated()?;
+        let ids = local_expert_ids.evaluated()?;
+        let values = hidden.as_slice::<f32>();
+        let ids = ids.as_slice::<i32>();
+        let output = values
+            .iter()
+            .zip(ids)
+            .map(|(hidden, expert)| {
+                let scale = if *expert == 0 { 1.0 } else { 2.0 };
+                let gate = scale * hidden;
+                let silu = gate / (1.0 + (-gate).exp());
+                silu * (scale * hidden) * scale
+            })
+            .collect::<Vec<_>>();
+        Ok(Array::from_slice(&output, &shape).copy(stream)?)
     }
 }
 
-fn fp8_route_output(hidden: f32, local_expert: usize, weight: f32) -> f32 {
+fn scaled_route_output(hidden: f32, local_expert: usize, weight: f32) -> f32 {
     let scale = if local_expert == 0 { 1.0 } else { 2.0 };
     let gate = scale * hidden;
     let silu = gate / (1.0 + (-gate).exp());
@@ -297,32 +293,32 @@ fn expert_exchange_ring_worker() {
     assert_eq!(empty_dispatched.statistics.count_consensus_count, 1);
     assert_eq!(empty_dispatched.statistics.padding_routes, 0);
 
-    let mut fp8 = fp8_bank(&stream);
-    let fp8_dispatched = dispatch_sharded(
+    let mut scaled = ScaledSwiGluExperts;
+    let scaled_dispatched = dispatch_sharded(
         full_dispatch_blocks(expected_rank, &stream),
         &assignment,
-        &mut fp8,
+        &mut scaled,
         &group,
         &stream,
     )
     .unwrap();
     let expected = if expected_rank == 0 {
         [
-            fp8_route_output(1.0, 1, 0.5) + fp8_route_output(1.0, 0, 0.25),
-            fp8_route_output(2.0, 0, 0.1) + fp8_route_output(2.0, 1, 0.2),
+            scaled_route_output(1.0, 1, 0.5) + scaled_route_output(1.0, 0, 0.25),
+            scaled_route_output(2.0, 0, 0.1) + scaled_route_output(2.0, 1, 0.2),
         ]
     } else {
         [
-            fp8_route_output(3.0, 1, 0.2) + fp8_route_output(3.0, 0, 0.5),
-            fp8_route_output(4.0, 0, 0.25) + fp8_route_output(4.0, 1, 0.1),
+            scaled_route_output(3.0, 1, 0.2) + scaled_route_output(3.0, 0, 0.5),
+            scaled_route_output(4.0, 0, 0.25) + scaled_route_output(4.0, 1, 0.1),
         ]
     };
-    assert_f32_close(&fp8_dispatched.output, &expected);
-    assert_eq!(fp8_dispatched.statistics.total_routes, 4);
-    assert_eq!(fp8_dispatched.statistics.sent_routes, 4);
-    assert_eq!(fp8_dispatched.statistics.received_routes, 4);
-    assert_eq!(fp8_dispatched.statistics.count_consensus_count, 1);
-    assert_eq!(fp8_dispatched.statistics.padding_bytes, 0);
+    assert_f32_close(&scaled_dispatched.output, &expected);
+    assert_eq!(scaled_dispatched.statistics.total_routes, 4);
+    assert_eq!(scaled_dispatched.statistics.sent_routes, 4);
+    assert_eq!(scaled_dispatched.statistics.received_routes, 4);
+    assert_eq!(scaled_dispatched.statistics.count_consensus_count, 1);
+    assert_eq!(scaled_dispatched.statistics.padding_bytes, 0);
 
     let qwen_gate_up = [1.0f32, 1.0, 2.0, 1.0, 1.0, 2.0, 0.5, 3.0];
     let qwen_down = [1.0f32, 1.5, 2.0, 0.5];

@@ -69,7 +69,7 @@ fn ceil_div(lhs: i32, rhs: i32) -> i32 {
 
 /// Decodes native unsigned E8M0 scale bytes without expanding FP8 weights.
 /// Float scale tensors are returned unchanged, allowing F16, BF16,
-/// or F32 inverse scales and DeepSeek-V4 native scales to share every execution
+/// or F32 inverse scales and native unsigned scales to share every execution
 /// kernel.
 pub fn decode_scale(scale: &Array, stream: &Stream) -> Result<Array, Exception> {
     match scale.dtype() {
@@ -1340,7 +1340,7 @@ fn grouped_linear_scalar_kernel() -> Result<MetalKernel, Exception> {
 /// the checkpoint output dimension.
 ///
 /// This absorbed-MLA operation deliberately keeps floating-point activations:
-/// DeepSeek's released absorb path dequantizes this weight and applies an
+/// The absorb path dequantizes this weight and applies an
 /// einsum rather than invoking its dynamically activation-quantized linear.
 #[allow(clippy::too_many_arguments)]
 pub fn segmented_linear(

@@ -11,6 +11,8 @@ pub mod backend;
 pub mod cache;
 /// Backend-neutral dense-stream residency telemetry.
 pub mod dense;
+/// Backend-neutral speculative-state fork, commit, and rollback ownership.
+pub mod draft;
 /// Portable execution-group topology and scheduling state.
 pub mod execution;
 pub mod expert;
@@ -53,6 +55,7 @@ pub use dense::{
     DenseCacheMetrics, DenseDiskStreamReport, DenseExecutionGroupReport, DensePassCounterSnapshot,
     DensePassReport, DenseStreamTelemetry, DenseStreamTelemetryError, DenseTierResidencyReport,
 };
+pub use draft::DraftStateTransaction;
 pub use execution::{
     ExecutionGraph, ExecutionGraphError, ExecutionGroupId, ExecutionGroupReadySet,
     ExecutionGroupSchedule, ExecutionGroupSpec, ExecutionScheduleError, ExecutionUnitAddress,

@@ -24,5 +24,8 @@ pub mod parallel;
 pub mod rope;
 /// Backend-neutral architecture operators specialized to MLX.
 pub(crate) mod shared;
+/// MLX operator implementation used to specialize backend-neutral
+/// architecture crates.
+pub use shared::MlxBackend as MlxNeuralBackend;
 /// Shared tensor and attention-mask helpers.
 pub mod tensor;

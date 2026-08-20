@@ -1000,6 +1000,7 @@ pub(crate) enum CommittedGenerationError<S, D> {
 
 /// Drives the production committed-token boundary without owning a second
 /// model loop. The source remains the architecture-dispatched iterator.
+#[allow(clippy::type_complexity)]
 pub(crate) fn drive_committed_generation<D, T>(
     source: &mut T,
     pipeline: &mut CommittedTokenPipeline<D>,
@@ -1022,6 +1023,7 @@ where
 }
 
 /// Cancellation-aware committed-token driver used by high-level prepared chat.
+#[allow(clippy::type_complexity)]
 pub(crate) fn drive_committed_generation_cancellable<D, T>(
     source: &mut T,
     pipeline: &mut CommittedTokenPipeline<D>,

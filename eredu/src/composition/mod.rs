@@ -1,6 +1,10 @@
 //! Cold-path architecture/backend composition selected by public loaders.
 
 #[cfg(feature = "mlx")]
+pub(crate) mod deepseek;
+#[cfg(feature = "mlx")]
+pub(crate) mod deepseek_expert;
+#[cfg(feature = "mlx")]
 pub(crate) mod llama;
 #[cfg(feature = "mlx")]
 pub(crate) mod llama_checkpoint;

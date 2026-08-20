@@ -1,6 +1,6 @@
 //! Kimi Linear hybrid KDA/MLA causal language model.
 
-use eredu_checkpoint::WeightQuantization;
+use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::{CausalModel, RuntimeLayerState, RuntimeState, StateError, StateLayout};
 
@@ -37,7 +37,7 @@ use crate::{
         layers::{silu, SwiGluMlp},
         linear::{
             project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
-            unloaded_maybe_quantized_linear,
+            unloaded_maybe_quantized_linear, PhysicalLinear,
         },
         moe::{PackedSwiGluExperts, TopKRouter, TopKRouterConfig, TopKRouterScoreFunction},
         tensor::create_causal_mask,
@@ -55,11 +55,6 @@ use crate::{
         execution::inspection::MoeRoutingObservation,
         media::input as runtime_input,
     },
-    composition::mlx_architectures::deepseek_v3::model::{
-        DeepSeekQuantizationConfig, LayerPolicy as DeepSeekLayerPolicy, ModelArgs as DeepSeekArgs,
-        MultiHeadLatentAttention,
-    },
-    composition::mlx_architectures::qwen::hybrid::qwen3_5::{QwenLinear, QwenWeightFormat},
     core::attention::{AttentionPolicy, LayerSchedule},
     core::cache::{
         CacheRankIdentity, LayerCachePolicy, StateTensorDimension, StateTensorDtype,
@@ -67,6 +62,8 @@ use crate::{
     },
 };
 use eredu_runtime::{CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions};
+
+use super::mla::KimiLatentAttention;
 
 #[cfg(test)]
 use crate::backend::mlx::runtime::cache::residency::open_prompt_cache_snapshot;
@@ -482,11 +479,10 @@ impl ModelArgs {
             .or(self.quantization)
     }
 
-    fn weight_format_for(&self, name: &str) -> QwenWeightFormat {
+    pub(super) fn weight_format_for(&self, name: &str) -> LinearFormat {
         match self.weight_quantization_for(name) {
-            Some(iq @ WeightQuantization::GgufIQuant { .. }) => QwenWeightFormat::IQuant(iq),
-            Some(quantization) => QwenWeightFormat::Affine(quantization),
-            None => QwenWeightFormat::Dense,
+            Some(quantization) => quantization.into(),
+            None => LinearFormat::Dense,
         }
     }
 
@@ -600,53 +596,6 @@ impl ModelArgs {
             quantization.validate()?;
         }
         Ok(())
-    }
-
-    fn deepseek_mla_args(&self) -> DeepSeekArgs {
-        DeepSeekArgs {
-            model_type: "deepseek_v3".into(),
-            hidden_size: self.hidden_size,
-            intermediate_size: self.intermediate_size,
-            moe_intermediate_size: self.moe_intermediate_size,
-            num_hidden_layers: self.num_hidden_layers,
-            num_attention_heads: self.num_attention_heads,
-            vocab_size: self.vocab_size,
-            rms_norm_eps: self.rms_norm_eps,
-            max_position_embeddings: self.model_max_length,
-            rope_theta: self.rope_theta,
-            rope_scaling: None,
-            q_lora_rank: self.q_lora_rank,
-            kv_lora_rank: self.kv_lora_rank,
-            qk_nope_head_dim: self.qk_nope_head_dim,
-            qk_rope_head_dim: self.qk_rope_head_dim,
-            v_head_dim: self.v_head_dim,
-            layer_schedule: LayerSchedule::new(
-                self.layer_schedule.len(),
-                self.layer_schedule
-                    .iter()
-                    .map(|policy| match policy.feed_forward {
-                        FeedForwardPolicy::Dense => DeepSeekLayerPolicy::DenseMlp,
-                        FeedForwardPolicy::SparseMoe => DeepSeekLayerPolicy::SparseMoe,
-                    })
-                    .collect(),
-            )
-            .expect("validated Kimi layer schedule"),
-            n_routed_experts: self.num_experts,
-            n_shared_experts: self.num_shared_experts,
-            num_experts_per_tok: self.num_experts_per_token,
-            n_group: self.num_expert_group,
-            topk_group: self.topk_group,
-            topk_method: "noaux_tc".into(),
-            scoring_func: "sigmoid".into(),
-            norm_topk_prob: self.moe_renormalize,
-            routed_scaling_factor: self.routed_scaling_factor,
-            num_nextn_predict_layers: 0,
-            quantization_config: Option::<DeepSeekQuantizationConfig>::None,
-            quantization: self.quantization,
-            quantized_weight_configs: self.quantized_weight_configs.clone(),
-            split_kv_b: self.split_kv_b,
-            tie_word_embeddings: self.tie_word_embeddings,
-        }
     }
 }
 
@@ -1080,13 +1029,13 @@ pub struct KimiDeltaAttention {
     pub head_dim: i32,
     #[param]
     /// Query projection.
-    pub q_proj: QwenLinear,
+    pub(crate) q_proj: PhysicalLinear,
     #[param]
     /// Key projection.
-    pub k_proj: QwenLinear,
+    pub(crate) k_proj: PhysicalLinear,
     #[param]
     /// Value projection.
-    pub v_proj: QwenLinear,
+    pub(crate) v_proj: PhysicalLinear,
     #[param]
     /// Query causal convolution.
     pub q_conv1d: DepthwiseConv1d,
@@ -1098,19 +1047,19 @@ pub struct KimiDeltaAttention {
     pub v_conv1d: DepthwiseConv1d,
     #[param]
     /// Decay down projection.
-    pub f_a_proj: QwenLinear,
+    pub(crate) f_a_proj: PhysicalLinear,
     #[param]
     /// Decay up projection.
-    pub f_b_proj: QwenLinear,
+    pub(crate) f_b_proj: PhysicalLinear,
     #[param]
     /// Delta update-strength projection.
-    pub b_proj: QwenLinear,
+    pub(crate) b_proj: PhysicalLinear,
     #[param]
     /// Output-gate down projection.
-    pub g_a_proj: QwenLinear,
+    pub(crate) g_a_proj: PhysicalLinear,
     #[param]
     /// Output-gate up projection.
-    pub g_b_proj: QwenLinear,
+    pub(crate) g_b_proj: PhysicalLinear,
     #[param]
     /// Log transition rate.
     pub A_log: Param<Array>,
@@ -1122,7 +1071,7 @@ pub struct KimiDeltaAttention {
     pub o_norm: nn::RmsNorm,
     #[param]
     /// Output projection.
-    pub o_proj: QwenLinear,
+    pub(crate) o_proj: PhysicalLinear,
 }
 
 impl KimiDeltaAttention {
@@ -1132,7 +1081,7 @@ impl KimiDeltaAttention {
         let projection = heads * head_dim;
         let prefix = format!("model.layers.{layer}.self_attn");
         let linear = |name: &str, input, output| {
-            QwenLinear::new(
+            PhysicalLinear::unloaded(
                 input,
                 output,
                 false,
@@ -1308,7 +1257,7 @@ impl KimiDeltaAttention {
 #[derive(Debug, Clone)]
 pub(crate) enum Attention {
     Kda(Box<KimiDeltaAttention>),
-    Mla(Box<MultiHeadLatentAttention>),
+    Mla(Box<KimiLatentAttention>),
 }
 
 impl ModuleParameters for Attention {
@@ -1652,14 +1601,12 @@ impl DecoderLayer {
             AttentionKind::Kda => {
                 Attention::Kda(Box::new(KimiDeltaAttention::new(args, layer, stream)?))
             }
-            AttentionKind::Mla => {
-                Attention::Mla(Box::new(MultiHeadLatentAttention::new_with_nope(
-                    &args.deepseek_mla_args(),
-                    layer as i32,
-                    true,
-                    stream,
-                )?))
-            }
+            AttentionKind::Mla => Attention::Mla(Box::new(KimiLatentAttention::new_with_nope(
+                args,
+                layer as i32,
+                true,
+                stream,
+            )?)),
         };
         let mlp = match policy.feed_forward {
             FeedForwardPolicy::SparseMoe => FeedForward::Moe(Box::new(SparseMoe::new_with_widths(

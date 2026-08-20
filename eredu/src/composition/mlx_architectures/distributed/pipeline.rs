@@ -67,10 +67,12 @@ use crate::{
         PromptCacheStateArray,
     },
     backend::mlx::runtime::cache::{
-        CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+        state::MlxPoolingAttentionCache, CompressedLatentCache, ConcatKeyValueCache, KeyValueCache,
+        PagedKeyValueCache,
     },
     backend::mlx::runtime::checkpoint::binding::{
-        binding_bytes, materialize_module_bindings, populate_module_from_arrays_excluding,
+        binding_bytes, build_module_bindings, materialize_module_bindings,
+        populate_module_from_arrays_excluding,
         populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
     },
     backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load,
@@ -104,9 +106,6 @@ use crate::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
     composition::mlx_architectures::{
-        deepseek_v3::model as deepseek_v3,
-        deepseek_v4::layerwise::DeepSeekV4LayerwiseAdapter,
-        deepseek_v4::model as deepseek_v4,
         gemma4::layerwise::{Gemma4Layer, Gemma4LayerwiseAdapter},
         gemma4::model as gemma4,
         gpt_oss::model as gpt_oss,
@@ -139,17 +138,14 @@ use crate::{
     core::{MtpCapability, MtpCheckpointKind},
 };
 use eredu_checkpoint::store::SharedCheckpointSource;
+use eredu_core::MtpStats;
 use eredu_runtime::DenseDiskStreamReport;
+use eredu_runtime::ExecutionGroupReadySet;
+use eredu_runtime::ResidentLayerGroup;
 use eredu_runtime::{
     CacheResidencyPolicy, CacheResidencyReport, ExpertCacheLoadOptions, ExpertPass,
     PagedCacheOptions, WeightResidency,
 };
-#[cfg(test)]
-use safemlx::ops::{quantized_packed_dimension, stack_axis};
-
-use eredu_core::MtpStats;
-use eredu_runtime::ExecutionGroupReadySet;
-use eredu_runtime::ResidentLayerGroup;
 
 use safemlx::ops::indexing::TryIndexOp;
 
@@ -252,12 +248,7 @@ macro_rules! impl_pipeline_quantization_adapter {
 }
 
 impl_pipeline_quantization_adapter!(MuseGlimmerLayerwiseAdapter, MuseGlimmerLayer);
-impl_pipeline_quantization_adapter!(
-    crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter,
-    deepseek_v3::DecoderLayer
-);
 impl_pipeline_quantization_adapter!(KimiLinearLayerwiseAdapter, kimi_linear::DecoderLayer);
-impl_pipeline_quantization_adapter!(DeepSeekV4LayerwiseAdapter, deepseek_v4::DecoderLayer);
 impl_pipeline_quantization_adapter!(QwenHybridLayerwiseAdapter, QwenHybridLayer);
 impl_pipeline_quantization_adapter!(Qwen3VlLayerwiseAdapter, Qwen3VlLayer);
 impl_pipeline_quantization_adapter!(
@@ -469,6 +460,10 @@ impl PipelineStep {
 }
 
 const PLACED_PAYLOAD_WIRE_MAGIC: i32 = 0x534d_4c58;
+const PIPELINE_MTP_OUTPUT_ROUTE: usize = 0x004d_5450;
+const PIPELINE_MTP_CONTROL_ROUTE: usize = 0x004d_5451;
+const PIPELINE_MTP_FUSED_ROUTE: usize = 0x004d_5452;
+const PIPELINE_SAMPLE_ROUTE: usize = 0x004d_5453;
 
 #[derive(Debug, Clone)]
 struct PlacedGroupPayload {
@@ -926,13 +921,12 @@ pub enum PipelineLayerCache {
         /// Additional ordered fixed-state tensors.
         slots: Vec<PipelineStateSlot>,
     },
-    /// Architecture-owned attention state whose geometry cannot be reduced to
-    /// ordinary KV or compressed-latent storage.
-    DeepSeekV4 {
+    /// Neutral pooling/compressed/indexed attention state.
+    PoolingAttention {
         /// Global decoder-layer index.
         global_layer: usize,
-        /// Local, compressed, or sparse-pooling V4 attention state.
-        cache: crate::composition::mlx_architectures::deepseek_v4::attention::AttentionCache,
+        /// Backend realization of the neutral pooling-attention state contract.
+        cache: MlxPoolingAttentionCache,
     },
 }
 
@@ -950,7 +944,7 @@ enum PipelineMtpCache {
     #[default]
     None,
     DeepSeek(Vec<CompressedLatentCache>),
-    DeepSeekV4(deepseek_v4::DraftCache),
+    NeutralDeepSeekV4(Vec<MlxPoolingAttentionCache>),
     Inkling(Vec<inkling::LayerCache>),
     NemotronH(Vec<nemotron_h::LayerCache>),
     QwenHybrid(Vec<qwen_hybrid::LayerCache>),
@@ -1021,7 +1015,7 @@ impl PipelineCache {
                     }
                     slots.iter_mut().for_each(PipelineStateSlot::clear);
                 }
-                PipelineLayerCache::DeepSeekV4 { cache, .. } => {
+                PipelineLayerCache::PoolingAttention { cache, .. } => {
                     if shared_manager_cleared {
                         cache.reset_local_after_manager_clear();
                     } else {
@@ -1047,8 +1041,8 @@ impl PipelineCache {
             .map(|layer| match layer {
                 PipelineLayerCache::StateSlots { global_layer, .. }
                 | PipelineLayerCache::KeyValue { global_layer, .. }
-                | PipelineLayerCache::CompressedLatent { global_layer, .. }
-                | PipelineLayerCache::DeepSeekV4 { global_layer, .. } => *global_layer,
+                | PipelineLayerCache::CompressedLatent { global_layer, .. } => *global_layer,
+                PipelineLayerCache::PoolingAttention { global_layer, .. } => *global_layer,
             })
             .collect()
     }
@@ -1080,7 +1074,7 @@ impl PipelineLayerCache {
                 .flat_map(|(latent, rotary)| [latent, rotary])
                 .chain(slots.iter().filter_map(PipelineStateSlot::value))
                 .collect(),
-            Self::DeepSeekV4 { cache, .. } => cache.retained_arrays(),
+            Self::PoolingAttention { cache, .. } => cache.retained_arrays(),
         }
     }
 }
@@ -1122,31 +1116,37 @@ type QwenStage = NeutralDecoderStage<
     MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>,
 >;
 
-struct DeepSeekStage {
-    args: deepseek_v3::ModelArgs,
-    layer_adapter:
-        crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter,
+type NeutralV3Architecture = eredu_architectures::deepseek::v3::Model<MlxBackend>;
+type NeutralV3Unit = MlxModule<eredu_architectures::deepseek::v3::Unit<MlxBackend>>;
+type NeutralV4Architecture = eredu_architectures::deepseek::v4::Model<MlxBackend>;
+type NeutralV4Unit = MlxModule<eredu_architectures::deepseek::v4::Unit<MlxBackend>>;
+
+struct NeutralDeepSeekV3Stage {
+    args: eredu_architectures::deepseek::V3Args,
+    architecture: NeutralV3Architecture,
     range: Range<usize>,
-    embedding: Option<MaybeQuantized<nn::Embedding>>,
-    layers: Vec<deepseek_v3::DecoderLayer>,
-    dense_layers: Option<PipelineLayerStorage>,
-    norm: Option<nn::RmsNorm>,
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
+    layers: Vec<NeutralV3Unit>,
+    mtp_layers: Vec<NeutralV3Unit>,
     parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
     parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
+    local_args: Option<eredu_architectures::deepseek::V3Args>,
+    dense_layers: Option<PipelineLayerStorage>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
 }
 
-struct DeepSeekV4Stage {
-    args: deepseek_v4::ModelArgs,
-    layer_adapter: DeepSeekV4LayerwiseAdapter,
+struct NeutralDeepSeekV4Stage {
+    args: eredu_architectures::deepseek::V4Args,
+    architecture: NeutralV4Architecture,
     range: Range<usize>,
-    layers: Vec<deepseek_v4::DecoderLayer>,
-    dense_layers: Option<PipelineLayerStorage>,
+    layers: Vec<NeutralV4Unit>,
+    mtp_layers: Vec<NeutralV4Unit>,
+    parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
+    parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
     parallel_layout: Option<eredu_runtime::LocalModelLayout>,
+    local_args: Option<eredu_architectures::deepseek::V4Args>,
+    dense_layers: Option<PipelineLayerStorage>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
@@ -1448,6 +1448,8 @@ trait PipelineStageAdapter {
         last_token: u32,
         proposal_capacity: usize,
         cache: &mut PipelineMtpCache,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<Option<Array>, Error>;
     fn adjust_fused_embedded_mtp_logits(
@@ -1617,6 +1619,8 @@ trait PipelineStageSemantics {
         _last_token: u32,
         _proposal_capacity: usize,
         _cache: &mut PipelineMtpCache,
+        _execution: Option<&ParallelExecutionContext<'_>>,
+        _expert_group: Option<&Group>,
         _stream: &Stream,
     ) -> Result<Option<Array>, Error> {
         Ok(None)
@@ -1852,10 +1856,19 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
         last_token: u32,
         proposal_capacity: usize,
         cache: &mut PipelineMtpCache,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<Option<Array>, Error> {
-        self.0
-            .fused_embedded_mtp_logits(hidden, last_token, proposal_capacity, cache, stream)
+        self.0.fused_embedded_mtp_logits(
+            hidden,
+            last_token,
+            proposal_capacity,
+            cache,
+            execution,
+            expert_group,
+            stream,
+        )
     }
 
     fn adjust_fused_embedded_mtp_logits(
@@ -2434,7 +2447,7 @@ fn pipeline_kv_offset(caches: &[PipelineLayerCache]) -> i32 {
             cache: PipelineKeyValueCache::Paged(cache),
             ..
         } => cache.offset(),
-        PipelineLayerCache::DeepSeekV4 { cache, .. } => cache.offset(),
+        PipelineLayerCache::PoolingAttention { cache, .. } => cache.offset(),
         PipelineLayerCache::StateSlots { .. } | PipelineLayerCache::CompressedLatent { .. } => 0,
     })
 }
@@ -2462,7 +2475,7 @@ fn pipeline_state_offset(family: &str, caches: &[PipelineLayerCache]) -> Result<
                 cache,
                 slots,
             } => (*global_layer, Some(cache.offset()), slots.as_slice()),
-            PipelineLayerCache::DeepSeekV4 {
+            PipelineLayerCache::PoolingAttention {
                 global_layer,
                 cache,
             } => (*global_layer, Some(cache.offset()), &[][..]),
@@ -2580,36 +2593,270 @@ impl PipelineStageSemantics for LlamaStage {
     }
 }
 
-impl PipelineStageSemantics for DeepSeekStage {
+impl NeutralDeepSeekV3Stage {
+    fn forward_stage(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        explicit_mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if caches.len() != self.layers.len() {
+            return Err(Error::Parallel(format!(
+                "neutral DeepSeek V3 stage cache has {} entries, expected {}",
+                caches.len(),
+                self.layers.len()
+            )));
+        }
+        let tensor_group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .map(|execution| {
+                execution.group().ok_or_else(|| {
+                    Error::Parallel(
+                        "neutral DeepSeek V3 tensor stage has no TP communicator".into(),
+                    )
+                })
+            })
+            .transpose()?;
+        let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => {
+                let hidden = match execution.filter(|execution| execution.is_tensor_parallel()) {
+                    Some(execution) => self
+                        .parallel_embedding
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::Parallel(
+                                "first neutral DeepSeek V3 tensor stage has no embedding shard"
+                                    .into(),
+                            )
+                        })?
+                        .forward(tokens, execution)?,
+                    None => self
+                        .architecture
+                        .pipeline_embed(tokens, stream)
+                        .map_err(|error| Error::Parallel(error.to_string()))?,
+                };
+                (hidden, PipelineAuxiliaryState::default())
+            }
+            PipelineStageInput::Hidden(payload) => {
+                (payload.hidden.clone(), payload.auxiliary.clone())
+            }
+        };
+        let offset = caches.first().map_or(0, |cache| match cache {
+            PipelineLayerCache::CompressedLatent { cache, .. } => cache.offset(),
+            _ => 0,
+        });
+        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
+            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
+            .transpose()?;
+        let mask = explicit_mask.or(generated_mask.as_ref());
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        self.routing_statistics = RoutingStatistics::default();
+        let args = self.local_args.as_ref().unwrap_or(&self.args);
+        let architecture = &mut self.architecture;
+        let expert_cache = self.expert_storage.cache();
+        let assignment = self.expert_assignment.as_ref();
+        let statistics = &mut self.routing_statistics;
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| {
+                crate::composition::deepseek::new_v3_unit(
+                    args,
+                    global_layer,
+                    expert_cache.is_some(),
+                    stream,
+                )
+            },
+            |global_layer, unit, hidden, cache, stream| {
+                let PipelineLayerCache::CompressedLatent {
+                    global_layer: cached_layer,
+                    cache,
+                    slots,
+                } = cache
+                else {
+                    return Err(Error::Parallel(format!(
+                        "neutral DeepSeek V3 cache is not compressed state at layer {global_layer}"
+                    )));
+                };
+                if *cached_layer != global_layer || !slots.is_empty() {
+                    return Err(Error::Parallel(format!(
+                        "neutral DeepSeek V3 cache identity mismatch at layer {global_layer}"
+                    )));
+                }
+                if let Some(expert_cache) = expert_cache {
+                    let assignment = assignment.ok_or_else(|| {
+                        Error::Parallel(
+                            "neutral DeepSeek V3 external experts have no assignment".into(),
+                        )
+                    })?;
+                    let mut execute = |layer,
+                                       routed_hidden: &Array,
+                                       ids: &Array,
+                                       weights: &Array,
+                                       context: &Stream| {
+                        let original_shape = routed_hidden.shape().to_vec();
+                        let flattened =
+                            routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
+                        execute_pipeline_cached_neutral_deepseek_v3(
+                            args,
+                            layer,
+                            &flattened,
+                            ids,
+                            weights,
+                            pass,
+                            expert_cache,
+                            assignment,
+                            expert_group,
+                            statistics,
+                            context,
+                        )
+                        .and_then(|output| {
+                            output.reshape(&original_shape, context).map_err(Into::into)
+                        })
+                        .map_err(|error: Error| Exception::custom(error.to_string()))
+                    };
+                    let mut provider = crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(&mut execute);
+                    match tensor_group {
+                        Some(group) => architecture.pipeline_forward_target_parallel_with_provider(
+                            &mut unit.inner,
+                            hidden,
+                            mask,
+                            cache,
+                            pass,
+                            &mut provider,
+                            stream,
+                            |value, context| {
+                                safemlx::distributed::all_sum(&value, group, context)
+                                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                            },
+                        ),
+                        None => architecture.pipeline_forward_target_with_provider(
+                            &mut unit.inner,
+                            hidden,
+                            mask,
+                            cache,
+                            pass,
+                            &mut provider,
+                            stream,
+                        ),
+                    }
+                    .map_err(|error| Error::Parallel(error.to_string()))
+                } else {
+                    if expert_group.is_some()
+                        && args.layer_schedule.get(global_layer)
+                            == Some(&eredu_architectures::deepseek::LayerPolicy::SparseMoe)
+                    {
+                        return Err(Error::Parallel(
+                            "neutral DeepSeek V3 received an EP group without external experts"
+                                .into(),
+                        ));
+                    }
+                    match tensor_group {
+                        Some(group) => architecture.pipeline_forward_target_parallel(
+                            &mut unit.inner,
+                            hidden,
+                            mask,
+                            cache,
+                            stream,
+                            |value, context| {
+                                safemlx::distributed::all_sum(&value, group, context)
+                                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                            },
+                        ),
+                        None => architecture.pipeline_forward_target(
+                            &mut unit.inner,
+                            hidden,
+                            mask,
+                            cache,
+                            stream,
+                        ),
+                    }
+                    .map_err(|error| Error::Parallel(error.to_string()))
+                }
+            },
+        )?;
+        if self.range.end == self.args.num_hidden_layers as usize {
+            let capture = hidden.clone();
+            let logits = match execution.filter(|execution| execution.is_tensor_parallel()) {
+                Some(execution) => {
+                    let hidden = self
+                        .architecture
+                        .pipeline_finish_hidden(&hidden, stream)
+                        .map_err(|error| Error::Parallel(error.to_string()))?;
+                    self.parallel_lm_head
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::Parallel(
+                                "last neutral DeepSeek V3 tensor stage has no head shard".into(),
+                            )
+                        })?
+                        .forward(&hidden, execution)?
+                        .all_gather(execution)?
+                }
+                None => self
+                    .architecture
+                    .pipeline_finish(&hidden, stream)
+                    .map_err(|error| Error::Parallel(error.to_string()))?,
+            };
+            Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                logits,
+                hidden: capture,
+            })
+        } else {
+            Ok(PipelineStageOutput::Hidden(PipelinePayload {
+                hidden,
+                auxiliary,
+            }))
+        }
+    }
+}
+
+impl PipelineStageSemantics for NeutralDeepSeekV3Stage {
     fn model_kind(&self) -> ModelKind {
         ModelKind::DeepSeekV3
     }
-
     fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
         Vec::new()
     }
-
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
-
     fn expert_cache(&self) -> Option<&ExpertCache> {
         self.expert_storage.cache()
     }
-
     fn embedded_mtp_len(&self) -> usize {
-        self.layer_adapter.embedded_mtp_len()
+        self.args.num_nextn_predict_layers as usize
     }
-
     fn new_embedded_mtp_cache(
         &self,
-        _paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
-        Ok(PipelineMtpCache::DeepSeek(
-            self.layer_adapter.embedded_mtp_cache(),
-        ))
+        let target = self.args.num_hidden_layers as usize;
+        let caches = (0..self.mtp_layers.len())
+            .map(|depth| match &paged {
+                Some((manager, rank)) => {
+                    CompressedLatentCache::new_paged(manager.clone(), target + depth, *rank)
+                }
+                None => Ok(CompressedLatentCache::new()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(PipelineMtpCache::DeepSeek(caches))
     }
-
     fn forward_embedded_mtp_draft(
         &mut self,
         hidden: &Array,
@@ -2619,83 +2866,161 @@ impl PipelineStageSemantics for DeepSeekStage {
         execution: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let PipelineMtpCache::DeepSeek(cache) = cache else {
+    ) -> Result<EmbeddedMtpOutput, Error> {
+        let tensor_execution = execution.filter(|execution| execution.is_tensor_parallel());
+        let tensor_group = tensor_execution
+            .map(|execution| {
+                execution.group().ok_or_else(|| {
+                    Error::Parallel("neutral DeepSeek V3 MTP has no TP communicator".into())
+                })
+            })
+            .transpose()?;
+        let PipelineMtpCache::DeepSeek(caches) = cache else {
             return Err(Error::Parallel(
-                "DeepSeek pipeline MTP cache mismatch".into(),
+                "neutral DeepSeek V3 MTP cache mismatch".into(),
             ));
         };
-        if let Some(expert_cache) = self.expert_storage.cache() {
+        let unit = self.mtp_layers.get_mut(depth).ok_or_else(|| {
+            Error::Parallel(format!(
+                "neutral DeepSeek V3 MTP depth {depth} is unavailable"
+            ))
+        })?;
+        let layer = self.args.num_hidden_layers as usize + depth;
+        let layer_cache = caches.get_mut(depth).ok_or_else(|| {
+            Error::Parallel(format!(
+                "neutral DeepSeek V3 MTP cache depth {depth} is unavailable"
+            ))
+        })?;
+        let embedded = tensor_execution
+            .map(|execution| {
+                self.parallel_embedding
+                    .as_mut()
+                    .ok_or_else(|| {
+                        Error::Parallel("neutral DeepSeek V3 MTP has no embedding shard".into())
+                    })?
+                    .forward(tokens, execution)
+            })
+            .transpose()?;
+        let output = if let Some(expert_cache) = self.expert_storage.cache() {
             let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
-                Error::Parallel("DeepSeek pipeline MTP expert cache has no assignment".into())
+                Error::Parallel("neutral DeepSeek V3 MTP experts have no assignment".into())
             })?;
-            let args = self.args.clone();
-            let mut execute =
-                |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                    execute_pipeline_cached_deepseek(
-                        &args,
-                        layer,
+            let args = self.local_args.as_ref().unwrap_or(&self.args);
+            let mut execute = |requested_layer,
+                               routed_hidden: &Array,
+                               ids: &Array,
+                               weights: &Array,
+                               context: &Stream| {
+                let original_shape = routed_hidden.shape().to_vec();
+                let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
+                execute_pipeline_cached_neutral_deepseek_v3(
+                    args,
+                    requested_layer,
+                    &flattened,
+                    ids,
+                    weights,
+                    ExpertPass::Decode,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    context,
+                )
+                .and_then(|value| value.reshape(&original_shape, context).map_err(Into::into))
+                .map_err(|error: Error| Exception::custom(error.to_string()))
+            };
+            let mut provider = crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(&mut execute);
+            match (tensor_group, embedded.as_ref()) {
+                (Some(group), Some(embedded)) => self
+                    .architecture
+                    .pipeline_forward_prediction_parallel_with_provider(
+                        &mut unit.inner,
                         hidden,
-                        ids,
-                        weights,
+                        embedded,
+                        tokens,
+                        layer_cache,
                         ExpertPass::Decode,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        &mut self.routing_statistics,
+                        &mut provider,
                         stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))
-                };
-            return self
-                .layer_adapter
-                .forward_pipeline_mtp(
+                        |value, context| {
+                            safemlx::distributed::all_sum(&value, group, context)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                    ),
+                (None, None) => self.architecture.pipeline_forward_prediction_with_provider(
+                    &mut unit.inner,
                     hidden,
                     tokens,
-                    depth,
-                    cache,
-                    execution,
-                    Some(&mut execute),
+                    layer_cache,
+                    ExpertPass::Decode,
+                    &mut provider,
                     stream,
-                )
-                .map_err(Into::into);
+                ),
+                _ => unreachable!("V3 MTP tensor execution and embedding are paired"),
+            }
+        } else {
+            if expert_group.is_some() {
+                return Err(Error::Parallel(
+                    "neutral DeepSeek V3 MTP received EP without external experts".into(),
+                ));
+            }
+            match (tensor_group, embedded.as_ref()) {
+                (Some(group), Some(embedded)) => self
+                    .architecture
+                    .pipeline_forward_prediction_parallel(
+                        &mut unit.inner,
+                        hidden,
+                        embedded,
+                        tokens,
+                        layer_cache,
+                        stream,
+                        |value, context| {
+                            safemlx::distributed::all_sum(&value, group, context)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                    ),
+                (None, None) => self.architecture.pipeline_forward_prediction(
+                    &mut unit.inner,
+                    hidden,
+                    tokens,
+                    layer_cache,
+                    stream,
+                ),
+                _ => unreachable!("V3 MTP tensor execution and embedding are paired"),
+            }
         }
-        if expert_group.is_some() {
-            return Err(Error::Parallel(
-                "DeepSeek pipeline MTP with EP requires rank-owned expert residency".into(),
-            ));
-        }
-        self.layer_adapter
-            .forward_pipeline_mtp::<
-                fn(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-            >(hidden, tokens, depth, cache, execution, None, stream)
-            .map_err(Into::into)
+        .map_err(|error| Error::Parallel(format!("V3 MTP layer {layer}: {error}")))?;
+        Ok(EmbeddedMtpOutput {
+            logits: output.logits,
+            hidden: output.hidden,
+            tokens: output.tokens,
+        })
     }
-
     fn prompt_cache_model_identity(
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let layout = PromptCacheModelIdentity::compressed_layouts(
-            self.range.len(),
-            self.args.kv_lora_rank,
-            self.args.qk_rope_head_dim,
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let full = eredu_architectures::deepseek::v3::state_layout(&self.args)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let policies = full
+            .layers()
+            .iter()
+            .skip(self.range.start)
+            .take(self.range.len())
+            .cloned()
+            .collect::<Vec<_>>();
+        let layout = crate::LayerSchedule::new(policies.len(), policies)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok(pipeline_prompt_cache_identity(
             topology,
             "deepseek_v3",
             &self.args.model_type,
-            crate::composition::mlx_architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
-                &self.args,
-            ),
-            usize::try_from(self.args.num_hidden_layers)
-                .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
+            eredu_architectures::deepseek::v3_architecture_fingerprint(&self.args),
+            self.args.num_hidden_layers as usize,
             self.range.clone(),
             layout,
         ))
     }
-
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -2704,13 +3029,8 @@ impl PipelineStageSemantics for DeepSeekStage {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        if self.expert_storage.is_external() {
-            self.forward_expert_parallel(input, step, mask, cache, None, stream)
-        } else {
-            DeepSeekStage::forward(self, input, step, mask, cache, stream)
-        }
+        self.forward_stage(input, step, mask, cache, None, None, stream)
     }
-
     fn forward_with_execution(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -2721,36 +3041,303 @@ impl PipelineStageSemantics for DeepSeekStage {
         expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        if let Some(group) = expert_group {
-            if let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) {
-                return self.forward_tensor_parallel(
-                    input,
-                    step,
-                    mask,
-                    cache,
-                    execution,
-                    Some(group),
-                );
-            }
-            return self.forward_expert_parallel(input, step, mask, cache, Some(group), stream);
+        self.forward_stage(input, step, mask, cache, execution, expert_group, stream)
+    }
+}
+
+impl NeutralDeepSeekV4Stage {
+    fn forward_stage(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if caches.len() != self.layers.len() {
+            return Err(Error::Parallel(format!(
+                "neutral DeepSeek V4 stage cache has {} entries, expected {}",
+                caches.len(),
+                self.layers.len()
+            )));
         }
-        match execution {
-            Some(execution) if execution.is_tensor_parallel() => {
-                self.forward_tensor_parallel(input, step, mask, cache, execution, None)
+        let tensor_group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .map(|execution| {
+                execution.group().ok_or_else(|| {
+                    Error::Parallel(
+                        "neutral DeepSeek V4 tensor stage has no TP communicator".into(),
+                    )
+                })
+            })
+            .transpose()?;
+        let (mut hidden, mut auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => {
+                let hidden = match execution.filter(|execution| execution.is_tensor_parallel()) {
+                    Some(execution) => {
+                        let embedded = self
+                            .parallel_embedding
+                            .as_mut()
+                            .ok_or_else(|| {
+                                Error::Parallel(
+                                    "first neutral DeepSeek V4 tensor stage has no embedding shard"
+                                        .into(),
+                                )
+                            })?
+                            .forward(tokens, execution)?;
+                        self.architecture
+                            .pipeline_broadcast_embedding(&embedded, stream)
+                            .map_err(|error| Error::Parallel(error.to_string()))?
+                    }
+                    None => self
+                        .architecture
+                        .pipeline_embed(tokens, stream)
+                        .map_err(|error| Error::Parallel(error.to_string()))?,
+                };
+                let mut tensors = vec![tokens.as_dtype(Dtype::Float32, stream)?];
+                if let Some(dspark) = &self.args.dspark {
+                    tensors.extend(
+                        dspark
+                            .target_layer_ids
+                            .iter()
+                            .map(|_| {
+                                safemlx::ops::zeros_dtype(
+                                    &[step.batch_size, step.sequence_length, self.args.hidden_size],
+                                    Dtype::Float32,
+                                    stream,
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
+                }
+                (hidden, PipelineAuxiliaryState::new(tensors))
             }
-            _ if self.expert_storage.is_external() => {
-                self.forward_expert_parallel(input, step, mask, cache, None, stream)
-            }
-            _ => self.forward(input, step, mask, cache, stream),
+            PipelineStageInput::Hidden(payload) => (
+                payload.hidden.reshape(
+                    &[
+                        step.batch_size,
+                        step.sequence_length,
+                        self.args.hc_mult,
+                        self.args.hidden_size,
+                    ],
+                    stream,
+                )?,
+                payload.auxiliary.clone(),
+            ),
+        };
+        let input_ids = auxiliary
+            .tensors
+            .first()
+            .ok_or_else(|| {
+                Error::Parallel("neutral DeepSeek V4 pipeline payload is missing token ids".into())
+            })?
+            .as_dtype(Dtype::Uint32, stream)?;
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        self.routing_statistics = RoutingStatistics::default();
+        let args = self.local_args.as_ref().unwrap_or(&self.args);
+        let architecture = &mut self.architecture;
+        let expert_cache = self.expert_storage.cache();
+        let assignment = self.expert_assignment.as_ref();
+        let statistics = &mut self.routing_statistics;
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| {
+                crate::composition::deepseek::new_v4_unit(
+                    args,
+                    global_layer,
+                    expert_cache.is_some(),
+                    stream,
+                )
+            },
+            |global_layer, unit, hidden, cache, stream| {
+                let PipelineLayerCache::PoolingAttention {
+                    global_layer: cached,
+                    cache,
+                } = cache
+                else {
+                    return Err(Error::Parallel(format!(
+                        "neutral DeepSeek V4 cache is not pooling state at layer {global_layer}"
+                    )));
+                };
+                if *cached != global_layer {
+                    return Err(Error::Parallel(format!(
+                        "neutral DeepSeek V4 cache identity mismatch at layer {global_layer}"
+                    )));
+                }
+                let (next, capture) = if let Some(expert_cache) = expert_cache {
+                    let assignment = assignment.ok_or_else(|| {
+                        Error::Parallel(
+                            "neutral DeepSeek V4 external experts have no assignment".into(),
+                        )
+                    })?;
+                    let mut execute = |layer,
+                                       routed_hidden: &Array,
+                                       ids: &Array,
+                                       weights: &Array,
+                                       context: &Stream| {
+                        let original_shape = routed_hidden.shape().to_vec();
+                        let flattened =
+                            routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
+                        execute_pipeline_cached_neutral_deepseek_v4(
+                            args,
+                            layer,
+                            &flattened,
+                            ids,
+                            weights,
+                            pass,
+                            expert_cache,
+                            assignment,
+                            expert_group,
+                            statistics,
+                            context,
+                        )
+                        .and_then(|output| {
+                            output.reshape(&original_shape, context).map_err(Into::into)
+                        })
+                        .map_err(|error: Error| Exception::custom(error.to_string()))
+                    };
+                    let mut provider = crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(&mut execute);
+                    match tensor_group {
+                        Some(group) => architecture.pipeline_forward_target_parallel_with_provider(
+                            global_layer,
+                            &mut unit.inner,
+                            hidden,
+                            &input_ids,
+                            mask,
+                            cache,
+                            pass,
+                            &mut provider,
+                            stream,
+                            |value, context| {
+                                safemlx::distributed::all_sum(&value, group, context)
+                                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                            },
+                        ),
+                        None => architecture.pipeline_forward_target_with_provider(
+                            global_layer,
+                            &mut unit.inner,
+                            hidden,
+                            &input_ids,
+                            mask,
+                            cache,
+                            pass,
+                            &mut provider,
+                            stream,
+                        ),
+                    }
+                    .map_err(|error| Error::Parallel(error.to_string()))?
+                } else {
+                    if expert_group.is_some() {
+                        return Err(Error::Parallel(
+                            "neutral DeepSeek V4 received an EP group without external experts"
+                                .into(),
+                        ));
+                    }
+                    match tensor_group {
+                        Some(group) => architecture.pipeline_forward_target_parallel(
+                            global_layer,
+                            &mut unit.inner,
+                            hidden,
+                            &input_ids,
+                            mask,
+                            cache,
+                            stream,
+                            |value, context| {
+                                safemlx::distributed::all_sum(&value, group, context)
+                                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                            },
+                        ),
+                        None => architecture.pipeline_forward_target(
+                            global_layer,
+                            &mut unit.inner,
+                            hidden,
+                            &input_ids,
+                            mask,
+                            cache,
+                            stream,
+                        ),
+                    }
+                    .map_err(|error| Error::Parallel(error.to_string()))?
+                };
+                if let (Some(config), Some(capture)) = (&args.dspark, capture) {
+                    if let Some(position) = config
+                        .target_layer_ids
+                        .iter()
+                        .position(|wanted| usize::try_from(*wanted).ok() == Some(global_layer))
+                    {
+                        auxiliary.tensors[position + 1] =
+                            capture.as_dtype(Dtype::Float32, stream)?;
+                    }
+                }
+                Ok(next)
+            },
+        )?;
+        if self.range.end == self.args.num_hidden_layers as usize {
+            let capture = if self.args.dspark.is_some() {
+                safemlx::ops::concatenate_axis(&auxiliary.tensors[1..], -1, stream)?
+            } else {
+                hidden.clone()
+            };
+            let logits = match execution.filter(|execution| execution.is_tensor_parallel()) {
+                Some(execution) => {
+                    let hidden = self
+                        .architecture
+                        .pipeline_finish_hidden(&hidden, stream)
+                        .map_err(|error| Error::Parallel(error.to_string()))?;
+                    self.parallel_lm_head
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::Parallel(
+                                "last neutral DeepSeek V4 tensor stage has no head shard".into(),
+                            )
+                        })?
+                        .forward(&hidden, execution)?
+                        .all_gather(execution)?
+                }
+                None => self
+                    .architecture
+                    .pipeline_finish(&hidden, stream)
+                    .map_err(|error| Error::Parallel(error.to_string()))?,
+            };
+            Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                logits,
+                hidden: capture,
+            })
+        } else {
+            let hidden = hidden.reshape(
+                &[
+                    step.batch_size,
+                    step.sequence_length,
+                    self.args.hc_mult * self.args.hidden_size,
+                ],
+                stream,
+            )?;
+            Ok(PipelineStageOutput::Hidden(PipelinePayload {
+                hidden,
+                auxiliary,
+            }))
         }
     }
 }
 
-impl PipelineStageSemantics for DeepSeekV4Stage {
+impl PipelineStageSemantics for NeutralDeepSeekV4Stage {
     fn model_kind(&self) -> ModelKind {
         ModelKind::DeepSeekV4
     }
-
     fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>> {
         let mut shapes = vec![vec![step.batch_size, step.sequence_length]];
         if let Some(dspark) = &self.args.dspark {
@@ -2763,52 +3350,228 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
         }
         shapes
     }
-
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
-
     fn expert_cache(&self) -> Option<&ExpertCache> {
         self.expert_storage.cache()
     }
-
     fn embedded_mtp_len(&self) -> usize {
-        self.layer_adapter.embedded_mtp_len()
+        self.args.num_nextn_predict_layers as usize
     }
-
     fn new_embedded_mtp_cache(
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
-        let cache = match paged {
-            Some((manager, rank)) => self
-                .layer_adapter
-                .embedded_mtp_cache_with_manager(manager, rank)?,
-            None => self.layer_adapter.embedded_mtp_cache(),
-        };
-        Ok(PipelineMtpCache::DeepSeekV4(cache))
+        let target = self.args.num_hidden_layers as usize;
+        let caches = (0..self.mtp_layers.len())
+            .map(|depth| {
+                let layer = target + depth;
+                let ratio = match self.args.attention_policy(layer) {
+                    Some(eredu_architectures::deepseek::V4AttentionPolicy::Local) => 0,
+                    Some(eredu_architectures::deepseek::V4AttentionPolicy::Compressed {
+                        ratio,
+                    }) => ratio,
+                    None => return Err(Error::Parallel(format!("missing V4 MTP layer {layer}"))),
+                };
+                match &paged {
+                    Some((manager, rank)) => MlxPoolingAttentionCache::paged(
+                        ratio,
+                        self.args.sliding_window,
+                        manager.clone(),
+                        layer,
+                        0,
+                        *rank,
+                    )
+                    .map_err(Into::into),
+                    None => MlxPoolingAttentionCache::resident(ratio, self.args.sliding_window)
+                        .map_err(Into::into),
+                }
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(PipelineMtpCache::NeutralDeepSeekV4(caches))
     }
-
     fn forward_embedded_mtp_draft(
         &mut self,
         hidden: &Array,
         tokens: &Array,
         depth: usize,
         cache: &mut PipelineMtpCache,
-        _execution: Option<&ParallelExecutionContext<'_>>,
-        _expert_group: Option<&Group>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Error> {
-        let PipelineMtpCache::DeepSeekV4(cache) = cache else {
+        if self.args.dspark.is_some() {
             return Err(Error::Parallel(
-                "DeepSeek V4 pipeline draft cache mismatch".into(),
+                "neutral DSpark uses fused proposals, not sequential MTP".into(),
+            ));
+        }
+        let tensor_execution = execution.filter(|execution| execution.is_tensor_parallel());
+        let tensor_group = tensor_execution
+            .map(|execution| {
+                execution.group().ok_or_else(|| {
+                    Error::Parallel("neutral DeepSeek V4 MTP has no TP communicator".into())
+                })
+            })
+            .transpose()?;
+        let PipelineMtpCache::NeutralDeepSeekV4(caches) = cache else {
+            return Err(Error::Parallel(
+                "neutral DeepSeek V4 MTP cache mismatch".into(),
             ));
         };
-        Ok(self
-            .layer_adapter
-            .forward_pipeline_mtp(hidden, tokens, depth, cache, stream)?)
+        let unit = self.mtp_layers.get_mut(depth).ok_or_else(|| {
+            Error::Parallel(format!(
+                "neutral DeepSeek V4 MTP depth {depth} is unavailable"
+            ))
+        })?;
+        let layer_cache = caches.get_mut(depth).ok_or_else(|| {
+            Error::Parallel(format!(
+                "neutral DeepSeek V4 MTP cache depth {depth} is unavailable"
+            ))
+        })?;
+        let hidden = if hidden.ndim() == 3 {
+            hidden.reshape(
+                &[
+                    hidden.dim(0),
+                    hidden.dim(1),
+                    self.args.hc_mult,
+                    self.args.hidden_size,
+                ],
+                stream,
+            )?
+        } else {
+            hidden.clone()
+        };
+        let embedded = tensor_execution
+            .map(|execution| {
+                self.parallel_embedding
+                    .as_mut()
+                    .ok_or_else(|| {
+                        Error::Parallel("neutral DeepSeek V4 MTP has no embedding shard".into())
+                    })?
+                    .forward(tokens, execution)
+            })
+            .transpose()?;
+        let layer = self.args.num_hidden_layers as usize + depth;
+        let output = if let Some(expert_cache) = self.expert_storage.cache() {
+            let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+                Error::Parallel("neutral DeepSeek V4 MTP experts have no assignment".into())
+            })?;
+            let args = self.local_args.as_ref().unwrap_or(&self.args);
+            let mut execute = |requested_layer,
+                               routed_hidden: &Array,
+                               ids: &Array,
+                               weights: &Array,
+                               context: &Stream| {
+                let original_shape = routed_hidden.shape().to_vec();
+                let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
+                execute_pipeline_cached_neutral_deepseek_v4(
+                    args,
+                    requested_layer,
+                    &flattened,
+                    ids,
+                    weights,
+                    ExpertPass::Decode,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    context,
+                )
+                .and_then(|value| value.reshape(&original_shape, context).map_err(Into::into))
+                .map_err(|error: Error| Exception::custom(error.to_string()))
+            };
+            let mut provider = crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(&mut execute);
+            match (tensor_execution, tensor_group, embedded.as_ref()) {
+                (Some(execution), Some(group), Some(embedded)) => {
+                    let head = self.parallel_lm_head.as_mut().ok_or_else(|| {
+                        Error::Parallel("neutral DeepSeek V4 MTP has no head shard".into())
+                    })?;
+                    self.architecture.pipeline_forward_prediction_parallel_with_provider(
+                        &mut unit.inner,
+                        &hidden,
+                        embedded,
+                        tokens,
+                        layer_cache,
+                        ExpertPass::Decode,
+                        &mut provider,
+                        stream,
+                        |value, context| {
+                            safemlx::distributed::all_sum(&value, group, context)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                        |value, _| {
+                            head.forward(value, execution)
+                                .and_then(|value| value.all_gather(execution))
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                    )
+                }
+                (None, None, None) => self.architecture.pipeline_forward_prediction_with_provider(
+                    &mut unit.inner,
+                    &hidden,
+                    tokens,
+                    layer_cache,
+                    ExpertPass::Decode,
+                    &mut provider,
+                    stream,
+                ),
+                _ => unreachable!("V4 MTP tensor execution and embedding are paired"),
+            }
+        } else {
+            if expert_group.is_some() {
+                return Err(Error::Parallel(
+                    "neutral DeepSeek V4 MTP received EP without external experts".into(),
+                ));
+            }
+            match (tensor_execution, tensor_group, embedded.as_ref()) {
+                (Some(execution), Some(group), Some(embedded)) => {
+                    let head = self.parallel_lm_head.as_mut().ok_or_else(|| {
+                        Error::Parallel("neutral DeepSeek V4 MTP has no head shard".into())
+                    })?;
+                    self.architecture.pipeline_forward_prediction_parallel(
+                        &mut unit.inner,
+                        &hidden,
+                        embedded,
+                        tokens,
+                        layer_cache,
+                        stream,
+                        |value, context| {
+                            safemlx::distributed::all_sum(&value, group, context)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                        |value, _| {
+                            head.forward(value, execution)
+                                .and_then(|value| value.all_gather(execution))
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                    )
+                }
+                (None, None, None) => self.architecture.pipeline_forward_prediction(
+                    &mut unit.inner,
+                    &hidden,
+                    tokens,
+                    layer_cache,
+                    stream,
+                ),
+                _ => unreachable!("V4 MTP tensor execution and embedding are paired"),
+            }
+        }
+        .map_err(|error| Error::Parallel(format!("V4 MTP layer {layer}: {error}")))?;
+        let hidden = output.hidden.reshape(
+            &[
+                output.hidden.dim(0),
+                output.hidden.dim(1),
+                self.args.hc_mult * self.args.hidden_size,
+            ],
+            stream,
+        )?;
+        Ok(EmbeddedMtpOutput {
+            logits: output.logits,
+            hidden,
+            tokens: output.tokens,
+        })
     }
-
     fn prefill_embedded_mtp_cache(
         &mut self,
         output: &EmbeddedMtpOutput,
@@ -2816,49 +3579,201 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
         cache: &mut PipelineMtpCache,
         stream: &Stream,
     ) -> Result<bool, Error> {
-        let PipelineMtpCache::DeepSeekV4(cache) = cache else {
-            return Err(Error::Parallel(
-                "DeepSeek V4 pipeline draft cache mismatch".into(),
-            ));
+        if self.args.dspark.is_some() {
+            let PipelineMtpCache::NeutralDeepSeekV4(caches) = cache else {
+                return Err(Error::Parallel("neutral DSpark cache mismatch".into()));
+            };
+            self.architecture
+                .pipeline_prefill_dspark_context(
+                    &mut self.mtp_layers,
+                    &output.hidden,
+                    caches,
+                    stream,
+                )
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            return Ok(true);
+        }
+        if self.parallel_layout.is_some()
+            || self
+                .expert_assignment
+                .as_ref()
+                .is_some_and(|assignment| assignment.group_size() > 1)
+        {
+            // The speculative wrapper will replay these prefixes through
+            // `forward_draft`, which carries the live TP/EP execution context.
+            return Ok(false);
+        }
+        let sequence = tokens.dim(1);
+        if sequence <= 1 {
+            return Ok(true);
+        }
+        let hidden = if output.hidden.ndim() == 3 {
+            output.hidden.reshape(
+                &[
+                    output.hidden.dim(0),
+                    output.hidden.dim(1),
+                    self.args.hc_mult,
+                    self.args.hidden_size,
+                ],
+                stream,
+            )?
+        } else {
+            output.hidden.clone()
         };
-        self.layer_adapter
-            .prefill_pipeline_draft_cache(output, tokens, cache, stream)?;
+        let hidden = hidden.try_index_device((.., ..sequence - 1, .., ..), stream)?;
+        let next = tokens.try_index_device((.., 1..), stream)?;
+        for depth in 0..self.mtp_layers.len() {
+            let output =
+                self.forward_embedded_mtp_draft(&hidden, &next, depth, cache, None, None, stream)?;
+            synchronize_outputs([&output.hidden, &output.logits])?;
+        }
         Ok(true)
     }
-
     fn fused_embedded_mtp_logits(
         &mut self,
-        hidden: &Array,
+        _hidden: &Array,
         last_token: u32,
         proposal_capacity: usize,
         cache: &mut PipelineMtpCache,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<Option<Array>, Error> {
-        let PipelineMtpCache::DeepSeekV4(cache) = cache else {
-            return Err(Error::Parallel(
-                "DeepSeek V4 pipeline draft cache mismatch".into(),
-            ));
+        if self.args.dspark.is_none() {
+            return Ok(None);
+        }
+        let tensor_execution = execution.filter(|execution| execution.is_tensor_parallel());
+        let tensor_group = tensor_execution
+            .map(|execution| {
+                execution
+                    .group()
+                    .ok_or_else(|| Error::Parallel("neutral DSpark has no TP communicator".into()))
+            })
+            .transpose()?;
+        let PipelineMtpCache::NeutralDeepSeekV4(caches) = cache else {
+            return Err(Error::Parallel("neutral DSpark cache mismatch".into()));
         };
-        Ok(self.layer_adapter.fused_pipeline_draft_logits(
-            hidden,
-            last_token,
-            proposal_capacity,
-            cache,
-            stream,
-        )?)
+        let mut proposal = caches.clone();
+        let anchor = Array::from_slice(&[last_token], &[1, 1]);
+        let logits = if let Some(expert_cache) = self.expert_storage.cache() {
+            let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+                Error::Parallel("neutral DSpark experts have no assignment".into())
+            })?;
+            let args = self.local_args.as_ref().unwrap_or(&self.args);
+            let mut execute = |requested_layer,
+                               routed_hidden: &Array,
+                               ids: &Array,
+                               weights: &Array,
+                               context: &Stream| {
+                let original_shape = routed_hidden.shape().to_vec();
+                let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
+                execute_pipeline_cached_neutral_deepseek_v4(
+                    args,
+                    requested_layer,
+                    &flattened,
+                    ids,
+                    weights,
+                    ExpertPass::Decode,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    context,
+                )
+                .and_then(|value| value.reshape(&original_shape, context).map_err(Into::into))
+                .map_err(|error: Error| Exception::custom(error.to_string()))
+            };
+            let mut provider = crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(&mut execute);
+            match (tensor_execution, tensor_group) {
+                (Some(execution), Some(group)) => {
+                    let embedding = self.parallel_embedding.as_mut().ok_or_else(|| {
+                        Error::Parallel("neutral DSpark has no embedding shard".into())
+                    })?;
+                    let head = self.parallel_lm_head.as_mut().ok_or_else(|| {
+                        Error::Parallel("neutral DSpark has no head shard".into())
+                    })?;
+                    self.architecture.pipeline_dspark_proposal_parallel_with_provider(
+                        &mut self.mtp_layers,
+                        &anchor,
+                        proposal_capacity,
+                        &mut proposal,
+                        ExpertPass::Decode,
+                        &mut provider,
+                        stream,
+                        |tokens, _| {
+                            embedding.forward(tokens, execution)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                        |value, context| {
+                            safemlx::distributed::all_sum(&value, group, context)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                        |value, _| {
+                            head.forward(value, execution)
+                                .and_then(|value| value.all_gather(execution))
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                    )
+                }
+                (None, None) => self.architecture.pipeline_dspark_proposal_with_provider(
+                    &mut self.mtp_layers,
+                    &anchor,
+                    proposal_capacity,
+                    &mut proposal,
+                    ExpertPass::Decode,
+                    &mut provider,
+                    stream,
+                ),
+                _ => unreachable!("DSpark tensor execution and group are paired"),
+            }
+        } else {
+            if expert_group.is_some() {
+                return Err(Error::Parallel(
+                    "neutral DSpark received EP without external experts".into(),
+                ));
+            }
+            match (tensor_execution, tensor_group) {
+                (Some(execution), Some(group)) => {
+                    let embedding = self.parallel_embedding.as_mut().ok_or_else(|| {
+                        Error::Parallel("neutral DSpark has no embedding shard".into())
+                    })?;
+                    let head = self.parallel_lm_head.as_mut().ok_or_else(|| {
+                        Error::Parallel("neutral DSpark has no head shard".into())
+                    })?;
+                    self.architecture.pipeline_dspark_proposal_parallel(
+                        &mut self.mtp_layers,
+                        &anchor,
+                        proposal_capacity,
+                        &mut proposal,
+                        stream,
+                        |tokens, _| {
+                            embedding.forward(tokens, execution)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                        |value, context| {
+                            safemlx::distributed::all_sum(&value, group, context)
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                        |value, _| {
+                            head.forward(value, execution)
+                                .and_then(|value| value.all_gather(execution))
+                                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+                        },
+                    )
+                }
+                (None, None) => self.architecture.pipeline_dspark_proposal(
+                    &mut self.mtp_layers,
+                    &anchor,
+                    proposal_capacity,
+                    &mut proposal,
+                    stream,
+                ),
+                _ => unreachable!("DSpark tensor execution and group are paired"),
+            }
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(Some(logits))
     }
-
-    fn adjust_fused_embedded_mtp_logits(
-        &mut self,
-        logits: Array,
-        last_token: u32,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        Ok(self
-            .layer_adapter
-            .adjust_pipeline_fused_logits(logits, last_token, stream)?)
-    }
-
     fn advance_embedded_mtp_cache(
         &mut self,
         hidden: &Array,
@@ -2866,67 +3781,91 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
         cache: &mut PipelineMtpCache,
         stream: &Stream,
     ) -> Result<bool, Error> {
-        let PipelineMtpCache::DeepSeekV4(cache) = cache else {
-            return Err(Error::Parallel(
-                "DeepSeek V4 pipeline draft cache mismatch".into(),
-            ));
-        };
-        self.layer_adapter
-            .advance_pipeline_draft_cache(hidden, tokens, cache, stream)?;
+        if self.args.dspark.is_some() {
+            let PipelineMtpCache::NeutralDeepSeekV4(caches) = cache else {
+                return Err(Error::Parallel("neutral DSpark cache mismatch".into()));
+            };
+            self.architecture
+                .pipeline_prefill_dspark_context(&mut self.mtp_layers, hidden, caches, stream)
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            return Ok(true);
+        }
+        if self.parallel_layout.is_some()
+            || self
+                .expert_assignment
+                .as_ref()
+                .is_some_and(|assignment| assignment.group_size() > 1)
+        {
+            return Ok(false);
+        }
+        for depth in 0..self.mtp_layers.len() {
+            let _ =
+                self.forward_embedded_mtp_draft(hidden, tokens, depth, cache, None, None, stream)?;
+        }
         Ok(true)
     }
-
     fn prompt_cache_model_identity(
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let target_count = self.args.num_hidden_layers as usize;
-        let layer_count =
-            crate::composition::mlx_architectures::deepseek_v4::model::prompt_cache_layer_count(
-                &self.args,
-            );
-        let range = if self.range.end == target_count {
-            self.range.start..layer_count
-        } else {
-            self.range.clone()
-        };
-        crate::composition::mlx_architectures::deepseek_v4::model::prompt_cache_model_identity_for_range(
-            &self.args,
-            crate::backend::mlx::cache::prompt_cache_topology(topology),
-            range,
-        )
+        let full = eredu_architectures::deepseek::v4::state_layout(&self.args)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let policies = full
+            .layers()
+            .iter()
+            .skip(self.range.start)
+            .take(self.range.len())
+            .cloned()
+            .collect::<Vec<_>>();
+        let layout = crate::LayerSchedule::new(policies.len(), policies)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "deepseek_v4",
+            &self.args.model_type,
+            eredu_architectures::deepseek::v4_architecture_fingerprint(&self.args),
+            self.args.num_hidden_layers as usize,
+            self.range.clone(),
+            layout,
+        ))
     }
-
     fn new_cache_layers(
         &self,
-        _identity: &PromptCacheModelIdentity,
+        identity: &PromptCacheModelIdentity,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<Vec<PipelineLayerCache>, Error> {
+        let pinned_prefix_tokens = i32::try_from(identity.sink_tokens)
+            .map_err(|_| Error::Parallel("V4 attention sink count exceeds i32".into()))?;
         self.range
             .clone()
             .map(|global_layer| {
+                let ratio = match self.args.attention_policy(global_layer) {
+                    Some(eredu_architectures::deepseek::V4AttentionPolicy::Local) => 0,
+                    Some(eredu_architectures::deepseek::V4AttentionPolicy::Compressed {
+                        ratio,
+                    }) => ratio,
+                    None => {
+                        return Err(Error::Parallel(format!("missing V4 layer {global_layer}")))
+                    }
+                };
                 let cache = match &paged {
-                    Some((manager, rank)) => crate::composition::mlx_architectures::deepseek_v4::attention::AttentionCache::new_paged_for_ratio(
-                        self.args.compress_ratios[global_layer],
+                    Some((manager, rank)) => MlxPoolingAttentionCache::paged(
+                        ratio,
                         self.args.sliding_window,
                         manager.clone(),
                         global_layer,
-                        0,
+                        pinned_prefix_tokens,
                         *rank,
                     )?,
-                    None => crate::composition::mlx_architectures::deepseek_v4::attention::AttentionCache::new_for_ratio(
-                        self.args.compress_ratios[global_layer],
-                        self.args.sliding_window,
-                    )?,
+                    None => MlxPoolingAttentionCache::resident(ratio, self.args.sliding_window)?,
                 };
-                Ok(PipelineLayerCache::DeepSeekV4 {
+                Ok(PipelineLayerCache::PoolingAttention {
                     global_layer,
                     cache,
                 })
             })
             .collect()
     }
-
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -2935,9 +3874,8 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_distributed(input, step, mask, cache, None, None, stream)
+        self.forward_stage(input, step, mask, cache, None, None, stream)
     }
-
     fn forward_with_execution(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -2948,7 +3886,7 @@ impl PipelineStageSemantics for DeepSeekV4Stage {
         expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        self.forward_distributed(input, step, mask, cache, execution, expert_group, stream)
+        self.forward_stage(input, step, mask, cache, execution, expert_group, stream)
     }
 }
 
@@ -4064,7 +5002,6 @@ where
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn forward_qwen_pipeline_external_experts<C, P>(
     block: &mut MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>,
     hidden: &Array,
@@ -4341,7 +5278,7 @@ fn qwen3_vl_pipeline_rope_delta(
             PipelineLayerCache::StateSlots { slots, .. }
             | PipelineLayerCache::KeyValue { slots, .. }
             | PipelineLayerCache::CompressedLatent { slots, .. } => slots,
-            PipelineLayerCache::DeepSeekV4 { .. } => continue,
+            PipelineLayerCache::PoolingAttention { .. } => continue,
         };
         if let Some(slot) = slots
             .iter()
@@ -4367,7 +5304,7 @@ fn qwen3_vl_set_pipeline_rope_delta(
             PipelineLayerCache::StateSlots { slots, .. }
             | PipelineLayerCache::KeyValue { slots, .. }
             | PipelineLayerCache::CompressedLatent { slots, .. } => slots,
-            PipelineLayerCache::DeepSeekV4 { .. } => continue,
+            PipelineLayerCache::PoolingAttention { .. } => continue,
         };
         if let Some(slot) = slots
             .iter_mut()
@@ -5777,7 +6714,7 @@ impl PipelineModel {
                         "pipeline prompt persistence requires a paged cache".into(),
                     ));
                 }
-                PipelineLayerCache::DeepSeekV4 { cache, .. } => {
+                PipelineLayerCache::PoolingAttention { cache, .. } => {
                     cache.finalize()?;
                     if cache.residency_manager().is_none() {
                         return Err(Error::Parallel(
@@ -5787,16 +6724,11 @@ impl PipelineModel {
                 }
             }
         }
-        if let PipelineMtpCache::DeepSeekV4(caches) = &mut cache.mtp {
-            for cache in caches {
-                cache.finalize()?;
-            }
-        }
         let expected_offset = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Error::Parallel("pipeline prompt length exceeds i32".into()))?;
         let mut state_arrays = Vec::new();
         for layer in &cache.layers {
-            if let PipelineLayerCache::DeepSeekV4 {
+            if let PipelineLayerCache::PoolingAttention {
                 global_layer,
                 cache,
             } = layer
@@ -5819,7 +6751,7 @@ impl PipelineModel {
                     slots,
                     ..
                 } => (*global_layer, slots),
-                PipelineLayerCache::DeepSeekV4 { .. } => unreachable!(),
+                PipelineLayerCache::PoolingAttention { .. } => unreachable!(),
             };
             for slot in slots {
                 match slot.value.as_ref() {
@@ -5917,7 +6849,7 @@ impl PipelineModel {
                     slots,
                     ..
                 } => (*global_layer, slots),
-                PipelineLayerCache::DeepSeekV4 {
+                PipelineLayerCache::PoolingAttention {
                     global_layer,
                     cache,
                 } => {
@@ -6012,7 +6944,7 @@ impl PipelineModel {
         // traffic can overtake a peer receive and deadlock; the world channel
         // already provides the required ordering.
         if self.topology.pipeline_parallel_size < self.topology.world_size {
-            let barrier = distributed::all_sum(&Array::from_int(0), pipeline, stream)?;
+            let barrier = distributed::all_sum(&Array::from_f32(0.0), pipeline, stream)?;
             output.retain(barrier);
         }
         output.submit()
@@ -6059,7 +6991,7 @@ impl PipelineModel {
             stream,
         )?;
         if self.topology.pipeline_parallel_size < self.topology.world_size {
-            let barrier = distributed::all_sum(&Array::from_int(0), pipeline, stream)?;
+            let barrier = distributed::all_sum(&Array::from_f32(0.0), pipeline, stream)?;
             output.retain(barrier);
         }
         output.submit()
@@ -6105,75 +7037,111 @@ impl PipelineModel {
         execution: &crate::backend::mlx::MlxDistributedSession<'_>,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Exception> {
-        // Every TP/EP replica on the final PP coordinate owns the same gathered
-        // logits and decoder hidden state. Count those contributors explicitly
-        // instead of assuming one particular global-rank numbering convention.
-        let contributes = local_logits.is_some() && local_hidden.is_some();
-        let contribution_count = distributed::all_sum(
-            &Array::from_int(i32::from(contributes)),
-            execution.world(),
-            stream,
-        )?;
-        let vocabulary_sum = distributed::all_sum(
-            &Array::from_int(local_logits.as_ref().map_or(0, |logits| logits.dim(-1))),
-            execution.world(),
-            stream,
-        )?;
-        synchronize_outputs([&contribution_count, &vocabulary_sum])?;
-        let contribution_count = contribution_count.try_item::<i32>(stream)?;
-        if contribution_count <= 0 {
-            return Err(Exception::custom(
-                "pipeline embedded MTP final stage did not publish output tensors",
-            ));
-        }
-        let vocabulary_sum = vocabulary_sum.try_item::<i32>(stream)?;
-        if vocabulary_sum <= 0 || vocabulary_sum % contribution_count != 0 {
-            return Err(Exception::custom(
-                "pipeline embedded MTP replicas published inconsistent vocabulary widths",
-            ));
-        }
-        let vocabulary = vocabulary_sum / contribution_count;
-        let shape = [tokens.dim(0), tokens.dim(1), vocabulary];
-        let logits = if contributes {
-            local_logits
-                .expect("contributing pipeline MTP rank has logits")
-                .as_dtype(Dtype::Float32, stream)?
+        let pipeline = execution.pipeline_group().ok_or_else(|| {
+            Exception::custom("pipeline embedded MTP requires a pipeline communicator")
+        })?;
+        let arrays = if self.info.is_last {
+            vec![
+                local_logits
+                    .ok_or_else(|| {
+                        Exception::custom(
+                            "pipeline embedded MTP final stage did not publish logits",
+                        )
+                    })?
+                    .as_dtype(Dtype::Float32, stream)?,
+                local_hidden.ok_or_else(|| {
+                    Exception::custom(
+                        "pipeline embedded MTP final stage did not publish hidden state",
+                    )
+                })?,
+            ]
         } else {
-            safemlx::ops::zeros_dtype(&shape, Dtype::Float32, stream)?
+            recv_array_bundle(
+                self.info.pipeline_stage + 1,
+                PIPELINE_MTP_OUTPUT_ROUTE,
+                pipeline,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?
         };
-        let hidden_width_sum = distributed::all_sum(
-            &Array::from_int(local_hidden.as_ref().map_or(0, |hidden| hidden.dim(-1))),
-            execution.world(),
-            stream,
-        )?;
-        synchronize_outputs([&hidden_width_sum])?;
-        let hidden_width_sum = hidden_width_sum.try_item::<i32>(stream)?;
-        if hidden_width_sum <= 0 || hidden_width_sum % contribution_count != 0 {
+        if arrays.len() != 2 {
+            return Err(Exception::custom(format!(
+                "pipeline embedded MTP output contained {} tensors instead of two",
+                arrays.len()
+            )));
+        }
+        if !self.info.is_first {
+            send_array_bundle(
+                &arrays,
+                PIPELINE_MTP_OUTPUT_ROUTE,
+                self.info.pipeline_stage - 1,
+                pipeline,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        }
+        let mut arrays = arrays.into_iter();
+        let logits = arrays.next().expect("validated MTP logits");
+        let hidden = arrays.next().expect("validated MTP hidden state");
+        if logits.shape()[..2] != tokens.shape()[..2] || hidden.shape()[..2] != tokens.shape()[..2]
+        {
             return Err(Exception::custom(
-                "pipeline embedded MTP replicas published inconsistent hidden widths",
+                "pipeline embedded MTP output batch/token geometry is inconsistent",
             ));
         }
-        let hidden_shape = [
-            tokens.dim(0),
-            tokens.dim(1),
-            hidden_width_sum / contribution_count,
-        ];
-        let hidden = if contributes {
-            local_hidden.expect("contributing pipeline MTP rank has hidden state")
-        } else {
-            safemlx::ops::zeros_dtype(&hidden_shape, self.info.activation_dtype, stream)?
-        };
-        let divisor = Array::from_f32(contribution_count as f32);
-        let logits =
-            distributed::all_sum(&logits, execution.world(), stream)?.divide(&divisor, stream)?;
-        let hidden = distributed::all_sum(&hidden, execution.world(), stream)?
-            .divide(divisor.as_dtype(hidden.dtype(), stream)?, stream)?;
-        synchronize_outputs([&logits, &hidden])?;
         Ok(EmbeddedMtpOutput {
             logits,
             hidden,
             tokens,
         })
+    }
+
+    fn synchronize_embedded_mtp_control(
+        &self,
+        local: Option<bool>,
+        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
+        stream: &Stream,
+    ) -> Result<bool, Exception> {
+        let pipeline = execution.pipeline_group().ok_or_else(|| {
+            Exception::custom("pipeline embedded MTP requires a pipeline communicator")
+        })?;
+        let arrays = if self.info.is_last {
+            vec![Array::from_slice(
+                &[i32::from(local.ok_or_else(|| {
+                    Exception::custom("final pipeline stage omitted MTP control state")
+                })?)],
+                &[1],
+            )]
+        } else {
+            recv_array_bundle(
+                self.info.pipeline_stage + 1,
+                PIPELINE_MTP_CONTROL_ROUTE,
+                pipeline,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?
+        };
+        if arrays.len() != 1 || arrays[0].shape() != [1] || arrays[0].dtype() != Dtype::Int32 {
+            return Err(Exception::custom(
+                "pipeline embedded MTP control payload is malformed",
+            ));
+        }
+        if !self.info.is_first {
+            send_array_bundle(
+                &arrays,
+                PIPELINE_MTP_CONTROL_ROUTE,
+                self.info.pipeline_stage - 1,
+                pipeline,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        }
+        Ok(arrays
+            .into_iter()
+            .next()
+            .expect("validated MTP control tensor")
+            .try_item::<i32>(stream)?
+            != 0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6575,6 +7543,87 @@ impl PipelineModel {
         result
     }
 
+    /// Samples complete final-stage logits and propagates the token backward
+    /// through each pipeline column without crossing a world collective after
+    /// point-to-point activation traffic.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sample_and_synchronize_token<
+        S: crate::backend::mlx::runtime::generation::sampler::Sampler,
+    >(
+        &self,
+        logits: Option<&Array>,
+        batch_size: i32,
+        sampler: &mut S,
+        temperature: f32,
+        prng_state: Option<&mut safemlx::random::RandomState>,
+        finished: bool,
+        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
+    ) -> Result<crate::backend::mlx::runtime::distributed::parallel::SynchronizedToken, Error> {
+        if execution.topology() != self.topology {
+            return Err(Error::Parallel(
+                "pipeline sampling topology does not match distributed session".into(),
+            ));
+        }
+        if batch_size <= 0 {
+            return Err(Error::Parallel(format!(
+                "pipeline sampling batch size must be positive, got {batch_size}"
+            )));
+        }
+        let pipeline = execution.pipeline_group().ok_or_else(|| {
+            Error::Parallel("pipeline sampling requires a pipeline communicator".into())
+        })?;
+        let arrays = if self.info.is_last {
+            let logits = logits.ok_or_else(|| {
+                Error::Parallel("final pipeline stage requires complete sampling logits".into())
+            })?;
+            if logits.dim(0) != batch_size {
+                return Err(Error::Parallel(format!(
+                    "sampling logits batch {} does not match declared batch {batch_size}",
+                    logits.dim(0)
+                )));
+            }
+            let logits = if logits.ndim() == 3 {
+                logits.try_index_device((.., -1, ..), execution.stream())?
+            } else {
+                logits.clone()
+            };
+            vec![sampler
+                .sample(&logits, temperature, prng_state, execution.stream())?
+                .reshape(&[batch_size, 1], execution.stream())?
+                .as_dtype(Dtype::Uint32, execution.stream())?]
+        } else {
+            recv_array_bundle(
+                self.info.pipeline_stage + 1,
+                PIPELINE_SAMPLE_ROUTE,
+                pipeline,
+                execution.stream(),
+            )?
+        };
+        if arrays.len() != 1
+            || arrays[0].shape() != [batch_size, 1]
+            || arrays[0].dtype() != Dtype::Uint32
+        {
+            return Err(Error::Parallel(
+                "pipeline sampling produced a malformed token payload".into(),
+            ));
+        }
+        if !self.info.is_first {
+            send_array_bundle(
+                &arrays,
+                PIPELINE_SAMPLE_ROUTE,
+                self.info.pipeline_stage - 1,
+                pipeline,
+                execution.stream(),
+            )?;
+        }
+        Ok(
+            crate::backend::mlx::runtime::distributed::parallel::SynchronizedToken {
+                token: arrays.into_iter().next().expect("validated token payload"),
+                finished,
+            },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_pipeline_on_group(
         &mut self,
@@ -6863,13 +7912,14 @@ impl PipelineModel {
         finished: bool,
         execution: &crate::backend::mlx::MlxDistributedSession<'_>,
     ) -> Result<crate::backend::mlx::runtime::distributed::parallel::SynchronizedToken, Error> {
-        execution.sample_and_synchronize(
+        self.sample_and_synchronize_token(
             logits,
             step.batch_size,
             sampler,
             temperature,
             prng_state,
             finished,
+            execution,
         )
     }
 
@@ -6962,17 +8012,11 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
                 cache,
                 self.execution,
             )
-        };
-        let (failed, _) = self
-            .execution
-            .operation_consensus(local.is_err(), false)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        if failed {
-            return Err(local.map_or_else(
-                |error| Exception::custom(error.to_string()),
-                |_| Exception::custom("a peer failed pipeline embedded MTP prefill"),
-            ));
         }
+        .and_then(|completion| {
+            completion.synchronize()?;
+            Ok(completion)
+        });
         let logits = local
             .map_err(|error| Exception::custom(error.to_string()))?
             .into_submitted_logits();
@@ -6989,23 +8033,19 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
     ) -> Result<EmbeddedMtpOutput, Exception> {
         let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))
             .map_err(|error| Exception::custom(error.to_string()))?;
-        let local = self.model.forward_distributed(
-            self.model.info.is_first.then_some(tokens),
-            step,
-            None,
-            cache,
-            self.execution,
-        );
-        let (failed, _) = self
-            .execution
-            .operation_consensus(local.is_err(), false)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        if failed {
-            return Err(local.map_or_else(
-                |error| Exception::custom(error.to_string()),
-                |_| Exception::custom("a peer failed pipeline embedded MTP verification"),
-            ));
-        }
+        let local = self
+            .model
+            .forward_distributed(
+                self.model.info.is_first.then_some(tokens),
+                step,
+                None,
+                cache,
+                self.execution,
+            )
+            .and_then(|completion| {
+                completion.synchronize()?;
+                Ok(completion)
+            });
         let logits = local
             .map_err(|error| Exception::custom(error.to_string()))?
             .into_submitted_logits();
@@ -7027,29 +8067,25 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
         stream: &Stream,
     ) -> Result<(), Exception> {
         let handled = if self.model.info.is_last {
-            self.model
+            let handled = self
+                .model
                 .stage
                 .prefill_embedded_mtp_cache(output, tokens, &mut cache.mtp, stream)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+            if let PipelineMtpCache::NeutralDeepSeekV4(caches) = &cache.mtp {
+                synchronize_outputs(
+                    caches
+                        .iter()
+                        .flat_map(MlxPoolingAttentionCache::retained_arrays),
+                )?;
+            }
+            Some(handled)
         } else {
-            Ok(false)
+            None
         };
-        let (failed, _) = self
-            .execution
-            .operation_consensus(handled.is_err(), false)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        if failed {
-            return Err(handled.map_or_else(
-                |error| Exception::custom(error.to_string()),
-                |_| Exception::custom("a peer failed pipeline draft-cache prefill"),
-            ));
-        }
-        let handled = distributed::all_sum(
-            &Array::from_int(i32::from(handled.unwrap_or(false))),
-            self.execution.world(),
-            stream,
-        )?
-        .try_item::<i32>(stream)?
-            > 0;
+        let handled =
+            self.model
+                .synchronize_embedded_mtp_control(handled, self.execution, stream)?;
         if handled {
             return Ok(());
         }
@@ -7070,7 +8106,16 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
     }
 
     fn draft_cache(cache: &Self::Cache) -> Self::DraftCache {
-        cache.mtp.clone()
+        match &cache.mtp {
+            PipelineMtpCache::NeutralDeepSeekV4(caches) => PipelineMtpCache::NeutralDeepSeekV4(
+                caches
+                    .iter()
+                    .map(MlxPoolingAttentionCache::deep_clone_state)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("evaluated neutral V4 MTP cache must be forkable"),
+            ),
+            cache => cache.clone(),
+        }
     }
 
     fn commit_draft_cache(cache: &mut Self::Cache, draft: &Self::DraftCache) {
@@ -7098,29 +8143,18 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
         stream: &Stream,
     ) -> Result<(), Exception> {
         let handled = if self.model.info.is_last {
-            self.model
-                .stage
-                .advance_embedded_mtp_cache(hidden, tokens, cache, stream)
+            Some(
+                self.model
+                    .stage
+                    .advance_embedded_mtp_cache(hidden, tokens, cache, stream)
+                    .map_err(|error| Exception::custom(error.to_string()))?,
+            )
         } else {
-            Ok(false)
+            None
         };
-        let (failed, _) = self
-            .execution
-            .operation_consensus(handled.is_err(), false)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        if failed {
-            return Err(handled.map_or_else(
-                |error| Exception::custom(error.to_string()),
-                |_| Exception::custom("a peer failed pipeline draft-cache advance"),
-            ));
-        }
-        let handled = distributed::all_sum(
-            &Array::from_int(i32::from(handled.unwrap_or(false))),
-            self.execution.world(),
-            stream,
-        )?
-        .try_item::<i32>(stream)?
-            > 0;
+        let handled =
+            self.model
+                .synchronize_embedded_mtp_control(handled, self.execution, stream)?;
         if handled {
             return Ok(());
         }
@@ -7173,12 +8207,18 @@ impl PipelineEmbeddedMtpTarget<'_> {
         cache: &mut PipelineMtpCache,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
+        let tensor = self
+            .execution
+            .tensor_context()
+            .map_err(|error| Exception::custom(error.to_string()))?;
         let local = if self.model.info.is_last {
             self.model.stage.fused_embedded_mtp_logits(
                 hidden,
                 last_token,
                 proposal_capacity,
                 cache,
+                Some(&tensor),
+                self.execution.expert_group(),
                 stream,
             )
         } else {
@@ -7192,54 +8232,39 @@ impl PipelineEmbeddedMtpTarget<'_> {
         local: Result<Option<Array>, Error>,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
-        let (failed, _) = self
-            .execution
-            .operation_consensus(local.is_err(), false)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        if failed {
-            return Err(local.map_or_else(
-                |error| Exception::custom(error.to_string()),
-                |_| Exception::custom("a peer failed fused pipeline drafting"),
+        let pipeline = self.execution.pipeline_group().ok_or_else(|| {
+            Exception::custom("pipeline embedded MTP requires a pipeline communicator")
+        })?;
+        let arrays = if self.model.info.is_last {
+            local
+                .map_err(|error| Exception::custom(error.to_string()))?
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            recv_array_bundle(
+                self.model.info.pipeline_stage + 1,
+                PIPELINE_MTP_FUSED_ROUTE,
+                pipeline,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?
+        };
+        if arrays.len() > 1 {
+            return Err(Exception::custom(
+                "pipeline fused MTP output contained more than one tensor",
             ));
         }
-        let local = local.map_err(|error| Exception::custom(error.to_string()))?;
-        let count = distributed::all_sum(
-            &Array::from_int(i32::from(local.is_some())),
-            self.execution.world(),
-            stream,
-        )?;
-        let dimensions = (0..3)
-            .map(|axis| {
-                distributed::all_sum(
-                    &Array::from_int(local.as_ref().map_or(0, |array| array.dim(axis))),
-                    self.execution.world(),
-                    stream,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        synchronize_outputs(std::iter::once(&count).chain(dimensions.iter()))?;
-        let count = count.try_item::<i32>(stream)?;
-        if count == 0 {
-            return Ok(None);
+        if !self.model.info.is_first {
+            send_array_bundle(
+                &arrays,
+                PIPELINE_MTP_FUSED_ROUTE,
+                self.model.info.pipeline_stage - 1,
+                pipeline,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
         }
-        let mut shape = Vec::with_capacity(3);
-        for dimension in dimensions {
-            let dimension = dimension.try_item::<i32>(stream)?;
-            if dimension % count != 0 {
-                return Err(Exception::custom(
-                    "pipeline fused-draft replicas published inconsistent shapes",
-                ));
-            }
-            shape.push(dimension / count);
-        }
-        let contribution = match local {
-            Some(array) => array.as_dtype(Dtype::Float32, stream)?,
-            None => safemlx::ops::zeros_dtype(&shape, Dtype::Float32, stream)?,
-        };
-        let output = distributed::all_sum(&contribution, self.execution.world(), stream)?
-            .divide(Array::from_f32(count as f32), stream)?;
-        synchronize_outputs([&output])?;
-        Ok(Some(output))
+        Ok(arrays.into_iter().next())
     }
 
     fn forward_draft(
@@ -7270,16 +8295,6 @@ impl PipelineEmbeddedMtpTarget<'_> {
         } else {
             Ok(None)
         };
-        let (failed, _) = self
-            .execution
-            .operation_consensus(local.is_err(), false)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        if failed {
-            return Err(local.map_or_else(
-                |error| Exception::custom(error.to_string()),
-                |_| Exception::custom("a peer failed pipeline embedded MTP drafting"),
-            ));
-        }
         let local = local.map_err(|error| Exception::custom(error.to_string()))?;
         self.model.synchronize_embedded_mtp_output(
             local.as_ref().map(|output| output.logits.clone()),
@@ -8437,20 +9452,18 @@ pub(crate) fn load_pipeline_model_with_options(
         .into_loader_result()?;
         return match architecture {
             crate::core::GgufArchitecture::DeepSeek4 => {
-                let prepared = deepseek_v4::prepare_gguf_checkpoint(&checkpoint, &metadata)?;
-                let gguf_plan =
-                    crate::composition::mlx_architectures::deepseek_v4::checkpoint::gguf_plan(
-                        &prepared.args,
-                    )
+                let args = eredu_architectures::deepseek::parse_v4_gguf(&metadata)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                let gguf_plan = eredu_architectures::deepseek::v4_gguf_plan(&args)
                     .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
-                    deepseek_v4::translate_gguf_weight_name,
+                    eredu_architectures::deepseek::translate_v4_gguf_weight_name,
                     max_mapped_shards,
                 )?);
-                load_deepseek_v4_pipeline(
-                    prepared.args,
+                load_neutral_deepseek_v4_pipeline(
+                    args,
                     store,
                     topology,
                     options.quantization,
@@ -8507,25 +9520,21 @@ pub(crate) fn load_pipeline_model_with_options(
                 )
             }
             crate::core::GgufArchitecture::DeepSeek2 => {
-                let prepared = deepseek_v3::prepare_gguf_checkpoint(
-                    &checkpoint,
+                let args = eredu_architectures::deepseek::parse_v3_gguf(
+                    &PipelineDeepSeekGgufCatalog(&checkpoint),
                     &metadata,
-                    None,
-                    weights_stream,
-                )?;
-                let gguf_plan =
-                    crate::composition::mlx_architectures::deepseek_v3::checkpoint::gguf_plan(
-                        &prepared.args,
-                    )
+                )
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                let gguf_plan = eredu_architectures::deepseek::v3_gguf_plan(&args)
                     .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
-                    deepseek_v3::translate_gguf_weight_name,
+                    eredu_architectures::deepseek::translate_v3_gguf_weight_name,
                     max_mapped_shards,
                 )?);
-                load_deepseek_pipeline(
-                    prepared.args,
+                load_neutral_deepseek_v3_pipeline(
+                    args,
                     store,
                     topology,
                     options.quantization,
@@ -8847,6 +9856,7 @@ pub(crate) fn load_pipeline_model_with_options(
             model_type,
             Some(
                 "deepseek_v3"
+                    | "deepseek_v4"
                     | "qwen3_moe"
                     | "qwen3_vl_moe"
                     | "qwen3_vl_moe_text"
@@ -8875,6 +9885,7 @@ pub(crate) fn load_pipeline_model_with_options(
             model_type,
             Some(
                 "deepseek_v3"
+                    | "deepseek_v4"
                     | "kimi_linear"
                     | "inkling_mm_model"
                     | "qwen3_moe"
@@ -8905,6 +9916,7 @@ pub(crate) fn load_pipeline_model_with_options(
             model_type,
             Some(
                 "deepseek_v3"
+                    | "deepseek_v4"
                     | "kimi_linear"
                     | "inkling_mm_model"
                     | "llama"
@@ -8956,8 +9968,16 @@ pub(crate) fn load_pipeline_model_with_options(
             )
         }
         Some("deepseek_v3") => {
-            load_deepseek_pipeline(
-                deepseek_v3::get_model_args(model_dir)?,
+            let value: serde_json::Value = serde_json::from_reader(std::fs::File::open(
+                model_dir.join("config.json"),
+            )?)?;
+            let args = eredu_architectures::deepseek::parse_v3_config(&value)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            let plan = eredu_architectures::deepseek::v3_safetensors_plan(&args, true)
+                .map_err(Error::UnsupportedArchitecture)?;
+            let store = resolve_pipeline_safetensors_store(store, &plan, &args.model_type)?;
+            load_neutral_deepseek_v3_pipeline(
+                args,
                 store,
                 topology,
                 options.quantization,
@@ -8968,8 +9988,16 @@ pub(crate) fn load_pipeline_model_with_options(
             )
         }
         Some("deepseek_v4") => {
-            load_deepseek_v4_pipeline(
-                deepseek_v4::get_model_args(model_dir)?,
+            let value: serde_json::Value = serde_json::from_reader(std::fs::File::open(
+                model_dir.join("config.json"),
+            )?)?;
+            let args = eredu_architectures::deepseek::parse_v4_config(&value)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            let plan = eredu_architectures::deepseek::v4_safetensors_plan(&args)
+                .map_err(Error::UnsupportedArchitecture)?;
+            let store = resolve_pipeline_safetensors_store(store, &plan, &args.model_type)?;
+            load_neutral_deepseek_v4_pipeline(
+                args,
                 store,
                 topology,
                 options.quantization,
@@ -9648,695 +10676,6 @@ impl LlamaStage {
     }
 }
 
-enum DeepSeekCartesianLayerExecution<'a> {
-    Tensor(&'a Group),
-    Expert {
-        assignment: &'a ExpertAssignment,
-        group: &'a Group,
-        statistics: &'a mut RoutingStatistics,
-    },
-    TensorExpert {
-        tensor_group: &'a Group,
-        assignment: &'a ExpertAssignment,
-        expert_group: &'a Group,
-        statistics: &'a mut RoutingStatistics,
-    },
-    External {
-        args: &'a deepseek_v3::ModelArgs,
-        global_layer: usize,
-        tensor_group: Option<&'a Group>,
-        assignment: &'a ExpertAssignment,
-        expert_group: Option<&'a Group>,
-        pass: ExpertPass,
-        cache: &'a ExpertCache,
-        statistics: &'a mut RoutingStatistics,
-    },
-}
-
-fn forward_deepseek_cartesian_layer(
-    layer: &mut deepseek_v3::DecoderLayer,
-    global_layer: usize,
-    hidden: &Array,
-    mask: Option<&Array>,
-    cache: &mut PipelineLayerCache,
-    execution: &mut DeepSeekCartesianLayerExecution<'_>,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    let PipelineLayerCache::CompressedLatent {
-        global_layer: cached,
-        cache,
-        slots,
-    } = cache
-    else {
-        return Err(Error::Parallel(format!(
-            "DeepSeek Cartesian cache is not compressed-latent state at global layer {global_layer}"
-        )));
-    };
-    if *cached != global_layer || !slots.is_empty() {
-        return Err(Error::Parallel(format!(
-            "DeepSeek Cartesian cache does not match global layer {global_layer}"
-        )));
-    }
-    match execution {
-        DeepSeekCartesianLayerExecution::Tensor(group) => {
-            Ok(layer.forward_tensor_parallel(hidden, mask, Some(cache), group, stream)?)
-        }
-        DeepSeekCartesianLayerExecution::Expert {
-            assignment,
-            group,
-            statistics,
-        } => Ok(layer.forward_expert_parallel(
-            hidden,
-            mask,
-            Some(cache),
-            assignment,
-            group,
-            statistics,
-            &format!("model.layers.{global_layer}"),
-            None,
-            stream,
-        )?),
-        DeepSeekCartesianLayerExecution::TensorExpert {
-            tensor_group,
-            assignment,
-            expert_group,
-            statistics,
-        } => Ok(layer.forward_tensor_expert_parallel(
-            hidden,
-            mask,
-            Some(cache),
-            tensor_group,
-            assignment,
-            expert_group,
-            statistics,
-            stream,
-        )?),
-        DeepSeekCartesianLayerExecution::External {
-            args,
-            global_layer,
-            tensor_group,
-            assignment,
-            expert_group,
-            pass,
-            cache: expert_cache,
-            statistics,
-        } => {
-            let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                execute_pipeline_cached_deepseek(
-                    args,
-                    *global_layer,
-                    hidden,
-                    ids,
-                    weights,
-                    *pass,
-                    expert_cache,
-                    assignment,
-                    *expert_group,
-                    statistics,
-                    stream,
-                )
-                .map_err(|error| Exception::custom(error.to_string()))
-            };
-            match tensor_group {
-                Some(group) => Ok(layer.forward_tensor_with_expert_executor(
-                    hidden,
-                    mask,
-                    Some(cache),
-                    group,
-                    stream,
-                    execute,
-                )?),
-                None => {
-                    Ok(layer.forward_sparse_experts(hidden, mask, Some(cache), stream, execute)?)
-                }
-            }
-        }
-    }
-}
-
-impl DeepSeekStage {
-    fn forward_tensor_parallel(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        explicit_mask: Option<&Array>,
-        caches: &mut [PipelineLayerCache],
-        execution: &ParallelExecutionContext<'_>,
-        expert_group: Option<&Group>,
-    ) -> Result<PipelineStageOutput, Error> {
-        let group = execution.group().ok_or_else(|| {
-            Error::Parallel("tensor-sharded DeepSeek pipeline stage has no TP communicator".into())
-        })?;
-        if caches.len() != self.layers.len() {
-            return Err(Error::Parallel(format!(
-                "DeepSeek TP+PP stage cache has {} entries, expected {}",
-                caches.len(),
-                self.layers.len()
-            )));
-        }
-        let stream = execution.stream();
-        let (mut hidden, auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) => (
-                self.parallel_embedding
-                    .as_mut()
-                    .ok_or_else(|| {
-                        Error::Parallel("first DeepSeek TP+PP stage has no embedding shard".into())
-                    })?
-                    .forward(tokens, execution)?,
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Hidden(payload) => {
-                (payload.hidden.clone(), payload.auxiliary.clone())
-            }
-        };
-        let offset = caches.first().map_or(0, |cache| match cache {
-            PipelineLayerCache::CompressedLatent { cache, .. } => cache.offset(),
-            _ => 0,
-        });
-        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1 && offset > 0)
-            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
-            .transpose()?;
-        let mask = explicit_mask.or(generated_mask.as_ref());
-        let expert_assignment = self.expert_assignment.clone();
-        if let Some(assignment) = expert_assignment.as_ref() {
-            validate_pipeline_expert_dispatch(
-                assignment,
-                expert_group,
-                self.expert_storage.is_external(),
-            )?;
-        }
-        self.routing_statistics = RoutingStatistics::default();
-        let pass = if step.sequence_length > 1 {
-            ExpertPass::Prefill
-        } else {
-            ExpertPass::Decode
-        };
-        let args = self.args.clone();
-        let expert_cache = self.expert_storage.cache();
-        let layer_adapter = &self.layer_adapter;
-        let parallel_layout = self.parallel_layout.clone();
-        hidden = execute_pipeline_layer_range(
-            PipelineLayerExecution {
-                range: self.range.clone(),
-                resident_layers: &mut self.layers,
-                dense_layers: self.dense_layers.as_ref(),
-                step,
-                caches,
-                hidden,
-                stream,
-            },
-            |global_layer, stream| {
-                layer_adapter.new_cartesian_layer(
-                    0,
-                    global_layer,
-                    parallel_layout.as_ref(),
-                    expert_assignment.as_ref(),
-                    stream,
-                )
-            },
-            |global_layer, layer, hidden, cache, stream| {
-                let mut mode = match (
-                    expert_assignment.as_ref(),
-                    self.expert_storage.is_external(),
-                    expert_cache,
-                ) {
-                    (Some(assignment), true, Some(expert_cache)) => {
-                        DeepSeekCartesianLayerExecution::External {
-                            args: &args,
-                            global_layer,
-                            tensor_group: Some(group),
-                            assignment,
-                            expert_group,
-                            pass,
-                            cache: expert_cache,
-                            statistics: &mut self.routing_statistics,
-                        }
-                    }
-                    (Some(_), true, None) | (None, true, None) => {
-                        DeepSeekCartesianLayerExecution::Tensor(group)
-                    }
-                    (Some(assignment), false, None) => {
-                        DeepSeekCartesianLayerExecution::TensorExpert {
-                            tensor_group: group,
-                            assignment,
-                            expert_group: expert_group
-                                .expect("validated resident DeepSeek EP group"),
-                            statistics: &mut self.routing_statistics,
-                        }
-                    }
-                    (None, false, _) => DeepSeekCartesianLayerExecution::Tensor(group),
-                    (None, true, Some(_)) | (Some(_), false, Some(_)) => unreachable!(
-                        "DeepSeek expert storage and assignment are internally coherent"
-                    ),
-                };
-                let forwarded = forward_deepseek_cartesian_layer(
-                    layer,
-                    global_layer,
-                    hidden,
-                    mask,
-                    cache,
-                    &mut mode,
-                    stream,
-                )?;
-                synchronize_outputs([&forwarded])?;
-                Ok(forwarded)
-            },
-        )?;
-        if let Some(norm) = &mut self.norm {
-            let mtp_hidden = hidden.clone();
-            hidden = norm.forward(&hidden, stream)?;
-            let sharded = self
-                .parallel_lm_head
-                .as_mut()
-                .ok_or_else(|| {
-                    Error::Parallel("last DeepSeek TP+PP stage has no head shard".into())
-                })?
-                .forward(&hidden, execution)?;
-            Ok(PipelineStageOutput::EmbeddedMtpLogits {
-                logits: sharded.all_gather(execution)?,
-                hidden: mtp_hidden,
-            })
-        } else {
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden,
-                auxiliary,
-            }))
-        }
-    }
-
-    fn forward_expert_parallel(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        explicit_mask: Option<&Array>,
-        caches: &mut [PipelineLayerCache],
-        group: Option<&Group>,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
-            Error::Parallel("DeepSeek PP+EP stage has no rank-local expert assignment".into())
-        })?;
-        validate_pipeline_expert_dispatch(assignment, group, self.expert_storage.is_external())?;
-        if caches.len() != self.layers.len() {
-            return Err(Error::Parallel(format!(
-                "DeepSeek PP+EP stage cache has {} entries, expected {}",
-                caches.len(),
-                self.layers.len()
-            )));
-        }
-        let (mut hidden, auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) => (
-                self.embedding
-                    .as_mut()
-                    .expect("first DeepSeek PP+EP stage embedding")
-                    .forward(tokens, stream)?,
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Hidden(payload) => {
-                (payload.hidden.clone(), payload.auxiliary.clone())
-            }
-        };
-        let offset = caches.first().map_or(0, |cache| match cache {
-            PipelineLayerCache::CompressedLatent { cache, .. } => cache.offset(),
-            _ => 0,
-        });
-        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1 && offset > 0)
-            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
-            .transpose()?;
-        let mask = explicit_mask.or(generated_mask.as_ref());
-        self.routing_statistics = RoutingStatistics::default();
-        let layer_adapter = &self.layer_adapter;
-        let expert_assignment = assignment.clone();
-        let expert_cache = self.expert_storage.cache();
-        let pass = if step.sequence_length > 1 {
-            ExpertPass::Prefill
-        } else {
-            ExpertPass::Decode
-        };
-        let args = self.args.clone();
-        hidden = execute_pipeline_layer_range(
-            PipelineLayerExecution {
-                range: self.range.clone(),
-                resident_layers: &mut self.layers,
-                dense_layers: self.dense_layers.as_ref(),
-                step,
-                caches,
-                hidden,
-                stream,
-            },
-            |global_layer, stream| {
-                layer_adapter.new_cartesian_layer(
-                    0,
-                    global_layer,
-                    None,
-                    Some(&expert_assignment),
-                    stream,
-                )
-            },
-            |global_layer, layer, hidden, cache, stream| {
-                let forwarded = match (self.expert_storage.is_external(), expert_cache) {
-                    (true, Some(expert_cache)) => {
-                        let mut mode = DeepSeekCartesianLayerExecution::External {
-                            args: &args,
-                            global_layer,
-                            tensor_group: None,
-                            assignment: &expert_assignment,
-                            expert_group: group,
-                            pass,
-                            cache: expert_cache,
-                            statistics: &mut self.routing_statistics,
-                        };
-                        forward_deepseek_cartesian_layer(
-                            layer,
-                            global_layer,
-                            hidden,
-                            mask,
-                            cache,
-                            &mut mode,
-                            stream,
-                        )?
-                    }
-                    (true, None) => layer.forward_stage(
-                        hidden,
-                        mask,
-                        match cache {
-                            PipelineLayerCache::CompressedLatent {
-                                global_layer: cached,
-                                cache,
-                                slots,
-                            } if *cached == global_layer && slots.is_empty() => Some(cache),
-                            _ => {
-                                return Err(Error::Parallel(format!(
-                                    "DeepSeek external-expert cache does not match global layer {global_layer}"
-                                )))
-                            }
-                        },
-                        stream,
-                    )?,
-                    (false, None) => {
-                        let mut mode = DeepSeekCartesianLayerExecution::Expert {
-                            assignment: &expert_assignment,
-                            group: group.expect("validated resident DeepSeek EP group"),
-                            statistics: &mut self.routing_statistics,
-                        };
-                        forward_deepseek_cartesian_layer(
-                            layer,
-                            global_layer,
-                            hidden,
-                            mask,
-                            cache,
-                            &mut mode,
-                            stream,
-                        )?
-                    }
-                    (false, Some(_)) => {
-                        unreachable!("resident DeepSeek stage cannot own expert cache")
-                    }
-                };
-                synchronize_outputs([&forwarded])?;
-                Ok(forwarded)
-            },
-        )?;
-        if let Some(norm) = &mut self.norm {
-            let mtp_hidden = hidden.clone();
-            hidden = norm.forward(&hidden, stream)?;
-            Ok(PipelineStageOutput::EmbeddedMtpLogits {
-                logits: self
-                    .lm_head
-                    .as_mut()
-                    .expect("last DeepSeek PP+EP stage head")
-                    .forward(&hidden, stream)?,
-                hidden: mtp_hidden,
-            })
-        } else {
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden,
-                auxiliary,
-            }))
-        }
-    }
-}
-
-impl DeepSeekV4Stage {
-    fn new(
-        args: deepseek_v4::ModelArgs,
-        range: Range<usize>,
-        external_experts: bool,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let layer_adapter = if external_experts {
-            DeepSeekV4LayerwiseAdapter::new_external_experts(args.clone(), stream)?
-        } else {
-            DeepSeekV4LayerwiseAdapter::new(args.clone(), stream)?
-        };
-        Ok(Self {
-            args,
-            layer_adapter,
-            range,
-            layers: Vec::new(),
-            dense_layers: None,
-            parallel_layout: None,
-            expert_assignment: None,
-            expert_storage: if external_experts {
-                PipelineExpertStorage::ExternalEmpty
-            } else {
-                PipelineExpertStorage::LayerLocal
-            },
-            routing_statistics: RoutingStatistics::default(),
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn forward_distributed(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        caches: &mut [PipelineLayerCache],
-        execution: Option<&ParallelExecutionContext<'_>>,
-        expert_group: Option<&Group>,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        if caches.len() != self.range.len() {
-            return Err(Error::Parallel(format!(
-                "DeepSeek V4 stage cache has {} entries, expected {}",
-                caches.len(),
-                self.range.len()
-            )));
-        }
-        let active_stream = execution.map_or(stream, ParallelExecutionContext::stream);
-        let (mut hidden, mut auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) => {
-                let hidden = self.layer_adapter.pipeline_embed(tokens, active_stream)?;
-                // Token ids must remain exact across PP even when model activations
-                // use a 16-bit dtype. Float32 represents the supported vocabulary
-                // domain exactly and shares the pipeline payload dtype.
-                let mut tensors = vec![tokens.as_dtype(Dtype::Float32, active_stream)?];
-                if let Some(dspark) = &self.args.dspark {
-                    for _ in &dspark.target_layer_ids {
-                        tensors.push(safemlx::ops::zeros_dtype(
-                            &[step.batch_size, step.sequence_length, self.args.hidden_size],
-                            Dtype::Float32,
-                            active_stream,
-                        )?);
-                    }
-                }
-                (hidden, PipelineAuxiliaryState::new(tensors))
-            }
-            PipelineStageInput::Hidden(payload) => {
-                let hidden = payload.hidden.reshape(
-                    &[
-                        step.batch_size,
-                        step.sequence_length,
-                        self.args.hc_mult,
-                        self.args.hidden_size,
-                    ],
-                    active_stream,
-                )?;
-                (hidden, payload.auxiliary.clone())
-            }
-        };
-        let expected_aux = 1 + self
-            .args
-            .dspark
-            .as_ref()
-            .map_or(0, |config| config.target_layer_ids.len());
-        if auxiliary.tensors.len() != expected_aux {
-            return Err(Error::Parallel(format!(
-                "DeepSeek V4 pipeline payload has {} auxiliary tensors, expected {expected_aux}",
-                auxiliary.tensors.len()
-            )));
-        }
-        let input_ids = auxiliary.tensors[0].as_dtype(Dtype::Uint32, active_stream)?;
-        let tensor_group = execution
-            .filter(|execution| execution.is_tensor_parallel())
-            .and_then(ParallelExecutionContext::group);
-        let assignment = self.expert_assignment.clone();
-        if let Some(assignment) = assignment.as_ref() {
-            validate_pipeline_expert_dispatch(
-                assignment,
-                expert_group,
-                self.expert_storage.is_external(),
-            )?;
-        } else if expert_group.is_some() {
-            return Err(Error::Parallel(
-                "DeepSeek V4 pipeline received an EP group without an expert assignment".into(),
-            ));
-        }
-        self.routing_statistics = RoutingStatistics::default();
-        let pass = if step.sequence_length > 1 {
-            ExpertPass::Prefill
-        } else {
-            ExpertPass::Decode
-        };
-        let args = self.args.clone();
-        let expert_cache = self.expert_storage.cache();
-        let layer_adapter = &self.layer_adapter;
-        let parallel_layout = self.parallel_layout.clone();
-        hidden = execute_pipeline_layer_range(
-            PipelineLayerExecution {
-                range: self.range.clone(),
-                resident_layers: &mut self.layers,
-                dense_layers: self.dense_layers.as_ref(),
-                step,
-                caches,
-                hidden,
-                stream: active_stream,
-            },
-            |global_layer, stream| {
-                layer_adapter.new_cartesian_layer(
-                    0,
-                    global_layer,
-                    parallel_layout.as_ref(),
-                    assignment.as_ref(),
-                    stream,
-                )
-            },
-            |global_layer, layer, hidden, cache, stream| {
-                let PipelineLayerCache::DeepSeekV4 {
-                    global_layer: cached_layer,
-                    cache,
-                } = cache
-                else {
-                    return Err(Error::Parallel(format!(
-                        "DeepSeek V4 cache type mismatch at global layer {global_layer}"
-                    )));
-                };
-                if *cached_layer != global_layer {
-                    return Err(Error::Parallel(format!(
-                        "DeepSeek V4 cache owns layer {cached_layer}, expected {global_layer}"
-                    )));
-                }
-                let output = if let (Some(assignment), Some(expert_cache)) =
-                    (assignment.as_ref(), expert_cache)
-                {
-                    let execute = |flat: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                        execute_pipeline_cached_deepseek_v4(
-                            &args,
-                            global_layer,
-                            flat,
-                            ids,
-                            weights,
-                            pass,
-                            expert_cache,
-                            assignment,
-                            expert_group,
-                            &mut self.routing_statistics,
-                            stream,
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))
-                    };
-                    match tensor_group {
-                        Some(group) => layer.forward_tensor_with_expert_executor(
-                            hidden,
-                            mask,
-                            Some(cache),
-                            &input_ids,
-                            group,
-                            stream,
-                            execute,
-                        )?,
-                        None => layer.forward_with_expert_executor(
-                            hidden,
-                            mask,
-                            Some(cache),
-                            &input_ids,
-                            stream,
-                            execute,
-                        )?,
-                    }
-                } else {
-                    match tensor_group {
-                        Some(group) => layer.forward_tensor_parallel(
-                            hidden,
-                            mask,
-                            Some(cache),
-                            &input_ids,
-                            group,
-                            stream,
-                        )?,
-                        None => layer.forward(hidden, mask, Some(cache), &input_ids, stream)?,
-                    }
-                };
-                if let Some(position) = args.dspark.as_ref().and_then(|config| {
-                    config
-                        .target_layer_ids
-                        .iter()
-                        .position(|wanted| *wanted == global_layer as i32)
-                }) {
-                    auxiliary.tensors[position + 1] =
-                        safemlx::ops::mean_axis(&output, 2, false, stream)?
-                            .as_dtype(Dtype::Float32, stream)?;
-                }
-                synchronize_outputs([&output])?;
-                Ok(output)
-            },
-        )?;
-        if self.range.end == self.args.num_hidden_layers as usize {
-            let draft_hidden = if let Some(dspark) = &self.args.dspark {
-                let captures = auxiliary.tensors[1..]
-                    .iter()
-                    .take(dspark.target_layer_ids.len())
-                    .collect::<Vec<_>>();
-                safemlx::ops::concatenate_axis(&captures, -1, active_stream)?
-            } else {
-                hidden.reshape(
-                    &[
-                        step.batch_size,
-                        step.sequence_length,
-                        self.args.hc_mult * self.args.hidden_size,
-                    ],
-                    active_stream,
-                )?
-            };
-            let logits = self.layer_adapter.pipeline_finish(&hidden, active_stream)?;
-            if self.layer_adapter.embedded_mtp_len() > 0 {
-                Ok(PipelineStageOutput::EmbeddedMtpLogits {
-                    logits,
-                    hidden: draft_hidden,
-                })
-            } else {
-                Ok(PipelineStageOutput::Logits(logits))
-            }
-        } else {
-            let hidden = hidden
-                .reshape(
-                    &[
-                        step.batch_size,
-                        step.sequence_length,
-                        self.args.hc_mult * self.args.hidden_size,
-                    ],
-                    active_stream,
-                )?
-                .as_dtype(Dtype::Float32, active_stream)?;
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden,
-                auxiliary,
-            }))
-        }
-    }
-}
-
 impl LlamaStage {
     fn forward_tensor_parallel(
         &mut self,
@@ -10857,8 +11196,6 @@ fn load_qwen_pipeline(
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
     PipelineModel::from_adapter(topology, info, PipelineStage(stage))
 }
-
-#[allow(clippy::too_many_arguments)]
 fn load_muse_glimmer_pipeline(
     source_args: muse_glimmer::DecoderConfig,
     store: SharedCheckpointSource,
@@ -12601,8 +12938,8 @@ fn execute_pipeline_cached_gemma4(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_pipeline_cached_deepseek(
-    args: &deepseek_v3::ModelArgs,
+fn execute_pipeline_cached_neutral_deepseek_v3(
+    args: &eredu_architectures::deepseek::V3Args,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -12614,24 +12951,53 @@ fn execute_pipeline_cached_deepseek(
     statistics: &mut RoutingStatistics,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
-                   stream: &Stream| {
-        super::expert::execute_cached_deepseek(args, global_layer, routes, pass, cache, stream)
-    };
-    let returned = match expert_group {
-        Some(group) => dispatch_replicated_with(
-            hidden, expert_ids, weights, assignment, group, stream, execute,
-        )?,
-        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
-    };
-    statistics.accumulate(&returned.statistics);
-    Ok(returned.reduced_output)
+    execute_pipeline_cached_neutral_deepseek(
+        crate::composition::deepseek_expert::v3_spec(args, global_layer),
+        global_layer,
+        hidden,
+        expert_ids,
+        weights,
+        pass,
+        cache,
+        assignment,
+        expert_group,
+        statistics,
+        stream,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_pipeline_cached_deepseek_v4(
-    args: &deepseek_v4::ModelArgs,
+fn execute_pipeline_cached_neutral_deepseek_v4(
+    args: &eredu_architectures::deepseek::V4Args,
+    global_layer: usize,
+    hidden: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    execute_pipeline_cached_neutral_deepseek(
+        crate::composition::deepseek_expert::v4_spec(args, global_layer),
+        global_layer,
+        hidden,
+        expert_ids,
+        weights,
+        pass,
+        cache,
+        assignment,
+        expert_group,
+        statistics,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_pipeline_cached_neutral_deepseek(
+    spec: crate::backend::mlx::runtime::residency::expert_provider::CachedSwiGluBankSpec,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -12646,7 +13012,15 @@ fn execute_pipeline_cached_deepseek_v4(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        super::expert::execute_cached_deepseek_v4(args, global_layer, routes, pass, cache, stream)
+        crate::backend::mlx::runtime::residency::expert_provider::execute_cached_swiglu_dispatched(
+            cache,
+            spec,
+            global_layer,
+            &routes.hidden,
+            &routes.global_expert_ids,
+            pass,
+            stream,
+        )
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
@@ -22268,7 +22642,7 @@ impl GemmaStage {
                     ..
                 } => Some(cache.offset()),
                 PipelineLayerCache::CompressedLatent { .. } => None,
-                PipelineLayerCache::DeepSeekV4 { cache, .. } => Some(cache.offset()),
+                PipelineLayerCache::PoolingAttention { cache, .. } => Some(cache.offset()),
             })
             .max()
             .unwrap_or(0);
@@ -22441,406 +22815,212 @@ impl GemmaStage {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn load_deepseek_pipeline(
-    source_args: deepseek_v3::ModelArgs,
+fn v3_pipeline_static_owned(name: &str, first: bool, last: bool, owns_mtp: bool) -> bool {
+    ((first || owns_mtp) && name.starts_with("model.embed_tokens."))
+        || (last && (name.starts_with("model.norm.") || name.starts_with("lm_head.")))
+}
+
+struct PipelineDeepSeekGgufCatalog<'a>(&'a GgufCheckpoint);
+
+impl eredu_architectures::deepseek::GgufTensorCatalog for PipelineDeepSeekGgufCatalog<'_> {
+    fn contains(&self, name: &str) -> bool {
+        crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames::contains_gguf_tensor(
+            self.0, name,
+        )
+    }
+}
+
+fn resolve_pipeline_safetensors_store(
     store: SharedCheckpointSource,
+    plan: &eredu_checkpoint::schema::SafetensorsCheckpointPlan,
+    identity: &str,
+) -> Result<SharedCheckpointSource, Error> {
+    let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), plan)
+        .map_err(|validation| {
+            Error::UnsupportedArchitecture(format!(
+                "{identity} pipeline checkpoint contract did not resolve: {validation:?}"
+            ))
+        })?;
+    Ok(Arc::new(
+        eredu_checkpoint::store::ResolvedCheckpointSource::new(store, resolved),
+    ))
+}
+
+fn v4_pipeline_static_owned(name: &str, first: bool, last: bool, owns_mtp: bool) -> bool {
+    ((first || owns_mtp) && name.starts_with("embed."))
+        || (last
+            && (name.starts_with("norm.")
+                || name.starts_with("head.")
+                || name.starts_with("hc_head_")
+                || name.starts_with("dspark.")))
+}
+
+fn exact_local_width(value: i32, partitions: usize, label: &str) -> Result<i32, Error> {
+    let partitions = i32::try_from(partitions)
+        .map_err(|_| Error::Parallel(format!("{label} partition count exceeds i32")))?;
+    if partitions <= 0 || value % partitions != 0 {
+        return Err(Error::Parallel(format!(
+            "{label} width {value} is not divisible by {partitions} tensor ranks"
+        )));
+    }
+    Ok(value / partitions)
+}
+
+fn v3_local_parallel_args(
+    args: &eredu_architectures::deepseek::V3Args,
     topology: MlxParallelContext,
-    requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<PipelineLayerLoadOptions>,
-    expert_cache_options: Option<ExpertCacheLoadOptions>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<PipelineModel, Error> {
-    let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
-    let mut binding_adapter = if external_experts {
-        crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new_external_experts(
-            source_args.clone(),
-            stream,
-        )?
-    } else {
-        crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new(
-            source_args.clone(),
-            stream,
-        )?
-    };
-    let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
-    topology.preflight(
-        Some(source_args.layer_schedule.len()),
-        expert_assignment
-            .as_ref()
-            .map(ExpertAssignment::global_expert_count),
+) -> Result<eredu_architectures::deepseek::V3Args, Error> {
+    let mut local = args.clone();
+    local.num_attention_heads = exact_local_width(
+        args.num_attention_heads,
+        topology.tensor_parallel_size,
+        "V3 attention heads",
     )?;
-    if requested_quantization.is_some() && source_args.native_fp8_config().is_some() {
-        return Err(Error::Quantization(
-            "native DeepSeek block-FP8 pipeline weights cannot be implicitly requantized".into(),
-        ));
+    local.intermediate_size = exact_local_width(
+        args.intermediate_size,
+        topology.tensor_parallel_size,
+        "V3 dense intermediate",
+    )?;
+    local.moe_intermediate_size = exact_local_width(
+        args.moe_intermediate_size,
+        topology.tensor_parallel_size,
+        "V3 expert intermediate",
+    )?;
+    local
+        .validate()
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    Ok(local)
+}
+
+fn v4_local_parallel_args(
+    args: &eredu_architectures::deepseek::V4Args,
+    topology: MlxParallelContext,
+) -> Result<eredu_architectures::deepseek::V4Args, Error> {
+    let mut local = args.clone();
+    local.num_attention_heads = exact_local_width(
+        args.num_attention_heads,
+        topology.tensor_parallel_size,
+        "V4 attention heads",
+    )?;
+    local.o_groups = exact_local_width(
+        args.o_groups,
+        topology.tensor_parallel_size,
+        "V4 attention output groups",
+    )?;
+    local.moe_intermediate_size = exact_local_width(
+        args.moe_intermediate_size,
+        topology.tensor_parallel_size,
+        "V4 expert intermediate",
+    )?;
+    local
+        .validate()
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    Ok(local)
+}
+
+fn v3_parallel_layout(
+    args: &eredu_architectures::deepseek::V3Args,
+    topology: MlxParallelContext,
+) -> Result<eredu_runtime::LocalModelLayout, Error> {
+    let mut planner = ParallelBuildContext::new(topology, ShardingPolicy::Require).planner();
+    for group in eredu_architectures::deepseek::parallel::v3_static_parameter_groups(args)? {
+        planner.register(group)?;
     }
-    let quantize_on_load = requested_quantization
-        .map(|requested| {
-            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
-                "DeepSeek pipeline",
-                source_args.affine_quantization()?,
-                requested,
-            )
-            .map(|required| required.then_some(requested))
-        })
-        .transpose()?
-        .flatten();
-    let mut target_args = source_args.clone();
-    if let Some(quantization) = quantize_on_load {
-        target_args.quantization_config = None;
-        target_args.quantization = Some(quantization);
-    }
-    let mut target_binding_adapter = if external_experts {
-        crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new_external_experts(
-            target_args.clone(),
-            stream,
-        )?
-    } else {
-        crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new(
-            target_args.clone(),
-            stream,
-        )?
-    };
-    let range = topology.layer_range(source_args.layer_schedule.len())?;
-    let mut info = base_info(
-        topology,
-        range.clone(),
-        source_args.layer_schedule.len(),
-        ModelKind::DeepSeekV3,
-        source_args.hidden_size,
-    );
-    let mut stage =
-        DeepSeekStage::new(target_args.clone(), range, &info, external_experts, stream)?;
-    stage.expert_assignment = expert_assignment;
-    if let Some(assignment) = stage.expert_assignment.as_ref() {
-        info.global_expert_count = Some(assignment.global_expert_count());
-        if stage.range.clone().any(|layer| {
-            source_args.layer_policy(layer) == Some(&deepseek_v3::LayerPolicy::SparseMoe)
-        }) {
-            info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+    let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
+        .map_err(|_| Error::Parallel("invalid V3 unit count".into()))?;
+    for layer in 0..total {
+        for group in
+            eredu_architectures::deepseek::parallel::v3_layer_parameter_groups(args, layer)?
+        {
+            planner.register(group)?;
         }
     }
-    let parallel_layout = if topology.tensor_parallel_size > 1 {
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let mut planner = build.planner();
-        binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
-        let (_, layout) = planner.finish()?;
-        binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
-        target_binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
-        stage
-            .layer_adapter
-            .configure_cartesian_layout(build, &layout, stream)?;
-        stage.parallel_embedding = info
-            .is_first
-            .then(|| {
-                crate::backend::mlx::nn::parallel::VocabParallelEmbedding::unloaded(
-                    target_args.vocab_size as usize,
-                    target_args.hidden_size,
-                    target_args.weight_quantization_for("model.embed_tokens.weight"),
-                    build,
-                    stream,
-                )
-            })
-            .transpose()?;
-        stage.parallel_lm_head = info
-            .is_last
-            .then(|| {
-                crate::backend::mlx::nn::parallel::VocabParallelLmHead::unloaded(
-                    target_args.hidden_size,
-                    target_args.vocab_size as usize,
-                    target_args.weight_quantization_for("lm_head.weight"),
-                    build,
-                    stream,
-                )
-            })
-            .transpose()?;
-        stage.embedding = None;
-        stage.lm_head = None;
-        Some(layout)
-    } else {
-        None
-    };
-    stage.parallel_layout = parallel_layout.clone();
-    stage.layers = stage
-        .range
-        .clone()
-        .map(|global_layer| {
-            stage.layer_adapter.new_cartesian_layer(
-                0,
-                global_layer,
-                parallel_layout.as_ref(),
-                stage.expert_assignment.as_ref(),
-                stream,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let owns_mtp = info.is_last && stage.layer_adapter.embedded_mtp_len() > 0;
-    info.owns_embedded_mtp = owns_mtp;
-    info.embedded_mtp_layers = if owns_mtp {
-        stage.layer_adapter.embedded_mtp_len()
-    } else {
-        0
-    };
-    let static_roles = selected_pipeline_static_roles([
-        (
-            "embedding",
-            stage.embedding.is_some() || stage.parallel_embedding.is_some() || owns_mtp,
-        ),
-        ("norm", stage.norm.is_some()),
-        (
-            "output",
-            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
-        ),
-        ("mtp", owns_mtp),
-    ]);
-    let (store, materialization) = match quantize_on_load {
-        Some(quantization) => {
-            let (store, report) = quantize_pipeline_stage_store(
-                store,
-                &binding_adapter,
-                &target_binding_adapter,
-                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
-                quantization,
-                stream,
-            )?;
-            (store, Some(report))
-        }
-        None => (store, None),
-    };
-    let expert_quantization = quantize_on_load;
-    let quantize_on_load = materialization
-        .is_none()
-        .then_some(quantize_on_load)
-        .flatten();
-    let binding_adapter = if materialization.is_some() {
-        &target_binding_adapter
-    } else {
-        &binding_adapter
-    };
-    info.materialization = materialization;
-    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
-    let mut loaded = PipelineLoadAccumulator::new("DeepSeek");
-    if owns_mtp {
-        for role in ["embedding", "mtp"] {
-            let bindings = pipeline_cartesian_static_bindings(
-                &static_units,
-                role,
-                store.as_ref(),
-                parallel_layout.as_ref(),
-            )?;
-            let target = stage
-                .layer_adapter
-                .pipeline_static_mut(role)
-                .expect("selected DeepSeek MTP static target");
-            if external_experts && role == "mtp" {
-                loaded.load_excluding(
-                    target,
-                    store.as_ref(),
-                    &bindings,
-                    quantize_on_load,
-                    weights_stream,
-                    stream,
-                    &|name| name.contains(".decoder.mlp.experts."),
-                )?;
-            } else {
-                loaded.load(
-                    target,
-                    store.as_ref(),
-                    &bindings,
-                    quantize_on_load,
-                    weights_stream,
-                    stream,
-                )?;
-            }
+    planner.finish().map(|(_, layout)| layout)
+}
+
+fn v4_parallel_layout(
+    args: &eredu_architectures::deepseek::V4Args,
+    topology: MlxParallelContext,
+) -> Result<eredu_runtime::LocalModelLayout, Error> {
+    let mut planner = ParallelBuildContext::new(topology, ShardingPolicy::Require).planner();
+    for group in eredu_architectures::deepseek::parallel::v4_static_parameter_groups(args)? {
+        planner.register(group)?;
+    }
+    let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
+        .map_err(|_| Error::Parallel("invalid V4 unit count".into()))?;
+    for layer in 0..total {
+        for group in
+            eredu_architectures::deepseek::parallel::v4_layer_parameter_groups(args, layer)?
+        {
+            planner.register(group)?;
         }
     }
-    if let Some(module) = &mut stage.parallel_embedding {
-        let bindings = shard_layer_bindings(
-            pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
-            "",
-            store.as_ref(),
-            parallel_layout.as_ref().expect("TP layout"),
-        )?;
-        loaded.load(
-            module.inner_mut(),
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    } else if let Some(module) = &mut stage.embedding {
-        loaded.load(
-            module,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "embedding")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if let Some(module) = &mut stage.norm {
-        loaded.load(
-            module,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "norm")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if let Some(module) = &mut stage.parallel_lm_head {
-        let bindings = shard_layer_bindings(
-            pipeline_static_bindings(&static_units, "output")?.to_vec(),
-            "",
-            store.as_ref(),
-            parallel_layout.as_ref().expect("TP layout"),
-        )?;
-        loaded.load(
-            module.inner_mut(),
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    } else if let Some(module) = &mut stage.lm_head {
-        loaded.load(
-            module,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "output")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if dense_stream.is_none() {
-        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
-            let bindings = binding_adapter.cartesian_layer_bindings(
-                0,
-                global_layer,
-                layer,
-                store.as_ref(),
-                parallel_layout.as_ref(),
-                stage.expert_assignment.as_ref(),
-                stream,
-            )?;
-            if external_experts {
-                loaded.load_excluding(
-                    layer,
-                    store.as_ref(),
-                    &bindings,
-                    quantize_on_load,
-                    weights_stream,
-                    stream,
-                    &|name| name.starts_with("mlp.experts."),
-                )?;
-            } else {
-                loaded.load(
-                    layer,
-                    store.as_ref(),
-                    &bindings,
-                    quantize_on_load,
-                    weights_stream,
-                    stream,
-                )?;
-            }
-        }
-    }
-    let static_device_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.source_diagnostics()?;
-    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
-    if let Some(dense_stream) = dense_stream {
-        let streamed_layout = parallel_layout.clone();
-        let streamed_assignment = stage.expert_assignment.clone();
-        let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_layer_storage(
-            Arc::clone(&store),
-            stage.range.clone(),
-            dense_stream,
-            static_device_bytes,
-            info.materialization.clone(),
-            stream,
-            weights_stream,
-            |global_layer, stream| {
-                streamed_adapter.new_cartesian_layer(
-                    0,
-                    global_layer,
-                    streamed_layout.as_ref(),
-                    streamed_assignment.as_ref(),
-                    stream,
-                )
-            },
-            |global_layer, layer, store| {
-                binding_adapter.cartesian_layer_bindings(
-                    0,
-                    global_layer,
-                    layer,
-                    store,
-                    streamed_layout.as_ref(),
-                    streamed_assignment.as_ref(),
-                    stream,
-                )
-            },
-        )?);
-        if external_experts {
-            stage.dense_layers = stage
-                .dense_layers
-                .take()
-                .map(|storage| storage.with_independent_experts("mlp.experts."));
-        }
-        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
-        info.planned_owned_parameter_bytes = static_device_bytes
-            .checked_add(layer_bytes)
-            .ok_or_else(|| {
-                Error::Parallel("pipeline planned-owned byte total overflowed".into())
-            })?;
-    } else {
-        info.planned_owned_parameter_bytes = static_device_bytes;
-    }
-    if external_experts {
-        let entries =
-            crate::composition::mlx_architectures::deepseek_v3::layerwise::deepseek_pipeline_expert_catalog(
-                &source_args,
-                store.as_ref(),
-                stage.range.clone(),
-                info.is_last,
-            )?
-            .into_iter()
-            .filter(|entry| {
-                stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
-                })
-            })
-            .collect::<Vec<_>>();
-        if !entries.is_empty() {
-            let cache = build_pipeline_expert_cache(
-                Arc::clone(&store),
-                entries,
-                expert_cache_options,
-                expert_quantization,
-                weights_stream,
-                stream,
-            )?;
-            info.planned_owned_parameter_bytes = info
-                .planned_owned_parameter_bytes
-                .checked_add(cache.report()?.owned_bytes)
+    planner.finish().map(|(_, layout)| layout)
+}
+
+fn rename_binding_prefix(
+    bindings: Vec<WeightBinding>,
+    prefix: &str,
+) -> Result<Vec<WeightBinding>, Error> {
+    bindings
+        .into_iter()
+        .map(|binding| {
+            let name = binding
+                .name()
+                .strip_prefix(prefix)
                 .ok_or_else(|| {
-                    Error::Parallel("DeepSeek pipeline expert byte total overflowed".into())
-                })?;
-            stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
-        }
-    }
-    info.opened_checkpoint_shards = materialized_shards;
-    info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
-    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
+                    Error::Parallel(format!(
+                        "parallel binding {:?} does not start with {prefix:?}",
+                        binding.name()
+                    ))
+                })?
+                .to_string();
+            binding.with_name(name).map_err(Into::into)
+        })
+        .collect()
+}
+
+fn v3_sharded_unit_bindings(
+    args: &eredu_architectures::deepseek::V3Args,
+    ordinal: usize,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    external_experts: bool,
+    layout: &eredu_runtime::LocalModelLayout,
+    stream: &Stream,
+) -> Result<Vec<WeightBinding>, Error> {
+    let probe = crate::composition::deepseek::new_v3_unit(args, ordinal, external_experts, stream)?;
+    let bindings = crate::composition::deepseek::v3_unit_bindings(
+        args,
+        ordinal,
+        &probe,
+        store,
+        external_experts,
+    )?;
+    shard_layer_bindings(bindings, "", store, layout)
+}
+
+fn v4_sharded_unit_bindings(
+    args: &eredu_architectures::deepseek::V4Args,
+    ordinal: usize,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    external_experts: bool,
+    layout: &eredu_runtime::LocalModelLayout,
+    stream: &Stream,
+) -> Result<Vec<WeightBinding>, Error> {
+    let probe = crate::composition::deepseek::new_v4_unit(args, ordinal, external_experts, stream)?;
+    let bindings = crate::composition::deepseek::v4_unit_bindings(
+        args,
+        ordinal,
+        &probe,
+        store,
+        external_experts,
+    )?;
+    shard_layer_bindings(bindings, "", store, layout)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_deepseek_v4_pipeline(
-    source_args: deepseek_v4::ModelArgs,
+fn load_neutral_deepseek_v3_pipeline(
+    source_args: eredu_architectures::deepseek::V3Args,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -22849,233 +23029,350 @@ fn load_deepseek_v4_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let quantize_on_load = source_args
-        .resolve_load_time_quantization("DeepSeek V4 pipeline", requested_quantization)?;
     let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
-    let mut binding_adapter = if external_experts {
-        DeepSeekV4LayerwiseAdapter::new_external_experts(source_args.clone(), stream)?
-    } else {
-        DeepSeekV4LayerwiseAdapter::new(source_args.clone(), stream)?
-    };
-    let target_args = match quantize_on_load {
-        Some(quantization) => source_args.with_load_time_quantization(quantization)?,
-        None => source_args.clone(),
-    };
-    let mut target_binding_adapter = if let Some(quantization) = quantize_on_load {
-        binding_adapter.load_time_quantized(quantization, stream)?
-    } else if external_experts {
-        DeepSeekV4LayerwiseAdapter::new_external_experts(target_args.clone(), stream)?
-    } else {
-        DeepSeekV4LayerwiseAdapter::new(target_args.clone(), stream)?
-    };
-    let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
+    let expert_assignment = external_experts
+        .then(|| {
+            ExpertAssignment::balanced(
+                source_args.n_routed_experts as usize,
+                topology.expert_parallel_size,
+                topology.expert_parallel_rank,
+            )
+        })
+        .transpose()?;
     topology.preflight(
         Some(source_args.num_hidden_layers as usize),
         expert_assignment
             .as_ref()
             .map(ExpertAssignment::global_expert_count),
     )?;
-    let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
-    let mut info = base_info(
-        topology,
-        range.clone(),
-        source_args.num_hidden_layers as usize,
-        ModelKind::DeepSeekV4,
-        source_args.hidden_size,
-    );
-    info.activation_hidden_size = source_args
-        .hidden_size
-        .checked_mul(source_args.hc_mult)
-        .ok_or_else(|| Error::Parallel("DeepSeek V4 pipeline hidden width overflowed".into()))?;
-    let mut stage = DeepSeekV4Stage::new(target_args.clone(), range, external_experts, stream)?;
-    stage.expert_assignment = expert_assignment;
-    if let Some(assignment) = stage.expert_assignment.as_ref() {
-        info.global_expert_count = Some(assignment.global_expert_count());
-        info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
-    }
-    let parallel_layout = if topology.tensor_parallel_size > 1 {
-        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let mut planner = build.planner();
-        binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
-        let (_, layout) = planner.finish()?;
-        binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
-        target_binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
-        stage
-            .layer_adapter
-            .configure_cartesian_layout(build, &layout, stream)?;
-        Some(layout)
-    } else {
-        None
-    };
-    stage.parallel_layout = parallel_layout.clone();
-    stage.layers = stage
-        .range
-        .clone()
-        .map(|global_layer| {
-            stage.layer_adapter.new_cartesian_layer(
-                0,
-                global_layer,
-                parallel_layout.as_ref(),
-                stage.expert_assignment.as_ref(),
-                stream,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let owns_draft = info.is_last && stage.layer_adapter.embedded_mtp_len() > 0;
-    info.owns_embedded_mtp = owns_draft;
-    info.embedded_mtp_layers = if owns_draft {
-        stage.layer_adapter.embedded_mtp_len()
-    } else {
-        0
-    };
-    let static_roles = selected_pipeline_static_roles([
-        ("embedding", info.is_first || owns_draft),
-        ("norm", info.is_last),
-        ("hc_head", info.is_last),
-        ("output", info.is_last),
-        ("draft", owns_draft),
-    ]);
-    let (store, materialization) = match quantize_on_load {
+    let (store, args, materialization) = match requested_quantization {
         Some(quantization) => {
-            let (store, report) = quantize_pipeline_stage_store(
+            let (store, args, report) = crate::composition::deepseek::quantize_v3_store(
                 store,
-                &binding_adapter,
-                &target_binding_adapter,
-                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                &source_args,
                 quantization,
                 stream,
             )?;
-            (store, Some(report))
+            (store, args, Some(report))
         }
-        None => (store, None),
+        None => (store, source_args, None),
     };
-    let expert_quantization = quantize_on_load;
-    let quantize_on_load = materialization
-        .is_none()
-        .then_some(quantize_on_load)
-        .flatten();
-    let binding_adapter = if materialization.is_some() {
-        &target_binding_adapter
+    let range = topology.layer_range(args.num_hidden_layers as usize)?;
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        args.num_hidden_layers as usize,
+        ModelKind::DeepSeekV3,
+        args.hidden_size,
+    );
+    let owns_mtp = info.is_last && args.num_nextn_predict_layers > 0;
+    info.owns_embedded_mtp = owns_mtp;
+    info.embedded_mtp_layers = if owns_mtp {
+        args.num_nextn_predict_layers as usize
     } else {
-        &binding_adapter
+        0
     };
+    if let Some(assignment) = &expert_assignment {
+        info.global_expert_count = Some(assignment.global_expert_count());
+        info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+    }
     info.materialization = materialization.clone();
-    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
-    let mut loaded = PipelineLoadAccumulator::new("DeepSeek V4");
-    for role in &static_roles {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            role,
+    let tensor_parallel = topology.tensor_parallel_size > 1;
+    let parallel_layout = tensor_parallel
+        .then(|| v3_parallel_layout(&args, topology))
+        .transpose()?;
+    let local_args = tensor_parallel
+        .then(|| v3_local_parallel_args(&args, topology))
+        .transpose()?;
+    let parallel_build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+    let mut parallel_embedding = (tensor_parallel && (info.is_first || owns_mtp))
+        .then(|| {
+            crate::backend::mlx::nn::parallel::VocabParallelEmbedding::unloaded(
+                args.vocab_size as usize,
+                args.hidden_size,
+                None,
+                parallel_build,
+                stream,
+            )
+        })
+        .transpose()?;
+    let mut parallel_lm_head = (tensor_parallel && info.is_last)
+        .then(|| {
+            crate::backend::mlx::nn::parallel::VocabParallelLmHead::unloaded(
+                args.hidden_size,
+                args.vocab_size as usize,
+                None,
+                parallel_build,
+                stream,
+            )
+        })
+        .transpose()?;
+    let mut architecture = NeutralV3Architecture::new(args.clone(), stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let mut static_module = MlxModule::new(architecture.static_modules().clone());
+    let static_bindings = build_module_bindings(&static_module, "", store.as_ref())?
+        .into_iter()
+        .filter(|binding| {
+            v3_pipeline_static_owned(binding.name(), info.is_first, info.is_last, owns_mtp)
+        })
+        .collect::<Vec<_>>();
+    let mut loaded = PipelineLoadAccumulator::new("neutral DeepSeek V3");
+    let architecture_static_bindings = static_bindings
+        .iter()
+        .filter(|binding| {
+            !tensor_parallel
+                || (!binding.name().starts_with("model.embed_tokens.")
+                    && !binding.name().starts_with("lm_head."))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    loaded.load_excluding(
+        &mut static_module,
+        store.as_ref(),
+        &architecture_static_bindings,
+        None,
+        weights_stream,
+        stream,
+        &|name| {
+            !v3_pipeline_static_owned(name, info.is_first, info.is_last, owns_mtp)
+                || (tensor_parallel
+                    && (name.starts_with("model.embed_tokens.") || name.starts_with("lm_head.")))
+        },
+    )?;
+    if let Some(module) = &mut parallel_embedding {
+        let bindings = shard_layer_bindings(
+            static_bindings
+                .iter()
+                .filter(|binding| binding.name().starts_with("model.embed_tokens."))
+                .cloned()
+                .collect(),
+            "",
             store.as_ref(),
-            parallel_layout.as_ref(),
+            parallel_layout.as_ref().expect("TP layout"),
         )?;
-        let target = stage
-            .layer_adapter
-            .pipeline_static_mut(role)
-            .expect("selected DeepSeek V4 pipeline static target");
+        let bindings = rename_binding_prefix(bindings, "model.embed_tokens.")?;
         loaded.load(
-            target,
+            module.inner_mut(),
             store.as_ref(),
             &bindings,
-            quantize_on_load,
+            None,
             weights_stream,
             stream,
         )?;
     }
+    if let Some(module) = &mut parallel_lm_head {
+        let bindings = shard_layer_bindings(
+            static_bindings
+                .iter()
+                .filter(|binding| binding.name().starts_with("lm_head."))
+                .cloned()
+                .collect(),
+            "",
+            store.as_ref(),
+            parallel_layout.as_ref().expect("TP layout"),
+        )?;
+        let bindings = rename_binding_prefix(bindings, "lm_head.")?;
+        loaded.load(
+            module.inner_mut(),
+            store.as_ref(),
+            &bindings,
+            None,
+            weights_stream,
+            stream,
+        )?;
+    }
+    architecture.replace_static_modules(static_module.inner);
+    let unit_args = local_args.as_ref().unwrap_or(&args);
+    let mut layers = range
+        .clone()
+        .map(|layer| {
+            crate::composition::deepseek::new_v3_unit(unit_args, layer, external_experts, stream)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     if dense_stream.is_none() {
-        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
-            let bindings = binding_adapter.cartesian_layer_bindings(
-                0,
-                global_layer,
-                layer,
-                store.as_ref(),
-                parallel_layout.as_ref(),
-                stage.expert_assignment.as_ref(),
-                stream,
-            )?;
+        for (global_layer, unit) in range.clone().zip(&mut layers) {
+            let bindings = match &parallel_layout {
+                Some(layout) => v3_sharded_unit_bindings(
+                    &args,
+                    global_layer,
+                    store.as_ref(),
+                    external_experts,
+                    layout,
+                    stream,
+                )?,
+                None => crate::composition::deepseek::v3_unit_bindings(
+                    &args,
+                    global_layer,
+                    unit,
+                    store.as_ref(),
+                    external_experts,
+                )?,
+            };
             if external_experts {
                 loaded.load_excluding(
-                    layer,
+                    unit,
                     store.as_ref(),
                     &bindings,
-                    quantize_on_load,
+                    None,
                     weights_stream,
                     stream,
-                    &|name| name.starts_with("ffn.switch_mlp."),
+                    &|name| name.contains(".mlp.experts."),
                 )?;
             } else {
                 loaded.load(
-                    layer,
+                    unit,
                     store.as_ref(),
                     &bindings,
-                    quantize_on_load,
+                    None,
                     weights_stream,
                     stream,
                 )?;
             }
         }
     }
-    let static_device_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.source_diagnostics()?;
-    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
-    if let Some(dense_stream) = dense_stream {
-        let streamed_layout = parallel_layout.clone();
-        let streamed_assignment = stage.expert_assignment.clone();
-        let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_layer_storage(
-            Arc::clone(&store),
-            stage.range.clone(),
-            dense_stream,
-            static_device_bytes,
-            info.materialization.clone(),
-            stream,
-            weights_stream,
-            |global_layer, stream| {
-                streamed_adapter.new_cartesian_layer(
-                    0,
-                    global_layer,
-                    streamed_layout.as_ref(),
-                    streamed_assignment.as_ref(),
+    let target_layers = args.num_hidden_layers as usize;
+    let mut mtp_layers = if owns_mtp {
+        (0..args.num_nextn_predict_layers as usize)
+            .map(|depth| {
+                crate::composition::deepseek::new_v3_unit(
+                    unit_args,
+                    target_layers + depth,
+                    external_experts,
                     stream,
                 )
-            },
-            |global_layer, layer, store| {
-                binding_adapter.cartesian_layer_bindings(
-                    0,
-                    global_layer,
-                    layer,
-                    store,
-                    streamed_layout.as_ref(),
-                    streamed_assignment.as_ref(),
-                    stream,
-                )
-            },
-        )?);
-        if external_experts {
-            stage.dense_layers = stage
-                .dense_layers
-                .take()
-                .map(|storage| storage.with_independent_experts("ffn.switch_mlp."));
-        }
-        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
-        info.planned_owned_parameter_bytes = static_device_bytes
-            .checked_add(layer_bytes)
-            .ok_or_else(|| Error::Parallel("DeepSeek V4 pipeline byte total overflowed".into()))?;
+            })
+            .collect::<Result<Vec<_>, _>>()?
     } else {
-        info.planned_owned_parameter_bytes = static_device_bytes;
-    }
-    if external_experts {
-        let entries =
-            crate::composition::mlx_architectures::deepseek_v4::layerwise::expert_catalog(
-                &source_args,
+        Vec::new()
+    };
+    for (depth, unit) in mtp_layers.iter_mut().enumerate() {
+        let bindings = match &parallel_layout {
+            Some(layout) => v3_sharded_unit_bindings(
+                &args,
+                target_layers + depth,
                 store.as_ref(),
-            )?
+                external_experts,
+                layout,
+                stream,
+            )?,
+            None => crate::composition::deepseek::v3_unit_bindings(
+                &args,
+                target_layers + depth,
+                unit,
+                store.as_ref(),
+                external_experts,
+            )?,
+        };
+        if external_experts {
+            loaded.load_excluding(
+                unit,
+                store.as_ref(),
+                &bindings,
+                None,
+                weights_stream,
+                stream,
+                &|name| name.contains(".mlp.experts."),
+            )?;
+        } else {
+            loaded.load(
+                unit,
+                store.as_ref(),
+                &bindings,
+                None,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+    let static_device_bytes = loaded.finish(&mut info)?;
+    let mut dense_layers = dense_stream
+        .map(|options| {
+            let local_binding_args = unit_args.clone();
+            let global_binding_args = args.clone();
+            let binding_layout = parallel_layout.clone();
+            let binding_stream = stream.clone();
+            build_pipeline_layer_storage(
+                Arc::clone(&store),
+                range.clone(),
+                options,
+                static_device_bytes,
+                materialization.clone(),
+                stream,
+                weights_stream,
+                move |layer, stream| {
+                    crate::composition::deepseek::new_v3_unit(
+                        &local_binding_args,
+                        layer,
+                        external_experts,
+                        stream,
+                    )
+                },
+                {
+                    move |layer, unit, store| match &binding_layout {
+                        Some(layout) => v3_sharded_unit_bindings(
+                            &global_binding_args,
+                            layer,
+                            store,
+                            external_experts,
+                            layout,
+                            &binding_stream,
+                        ),
+                        None => crate::composition::deepseek::v3_unit_bindings(
+                            &global_binding_args,
+                            layer,
+                            unit,
+                            store,
+                            external_experts,
+                        ),
+                    }
+                },
+            )
+        })
+        .transpose()?;
+    if external_experts {
+        dense_layers =
+            dense_layers.map(|storage| storage.with_independent_experts(".mlp.experts."));
+    }
+    info.planned_owned_parameter_bytes = static_device_bytes
+        .checked_add(
+            dense_layers
+                .as_ref()
+                .map(PipelineLayerStorage::planned_layer_bytes)
+                .transpose()?
+                .unwrap_or(0),
+        )
+        .ok_or_else(|| Error::Parallel("neutral DeepSeek V3 owned byte total overflowed".into()))?;
+    let mut expert_storage = if external_experts {
+        PipelineExpertStorage::ExternalEmpty
+    } else {
+        PipelineExpertStorage::LayerLocal
+    };
+    if external_experts {
+        let assignment = expert_assignment
+            .as_ref()
+            .expect("external expert assignment");
+        let catalog = match &local_args {
+            Some(local) => {
+                let width = usize::try_from(local.moe_intermediate_size)
+                    .map_err(|_| Error::Parallel("invalid local V3 expert width".into()))?;
+                let start = topology
+                    .tensor_parallel_rank
+                    .checked_mul(width)
+                    .ok_or_else(|| Error::Parallel("local V3 expert range overflowed".into()))?;
+                crate::composition::deepseek_expert::v3_parallel_catalog(
+                    &args,
+                    start..start + width,
+                    store.as_ref(),
+                )?
+            }
+            None => crate::composition::deepseek_expert::v3_catalog(&args, store.as_ref())?,
+        };
+        let entries = catalog
             .into_iter()
-            .filter(|entry| stage.range.contains(&entry.identity().layer))
             .filter(|entry| {
-                stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
-                })
+                let layer = entry.identity().layer;
+                (range.contains(&layer) || (owns_mtp && layer >= target_layers))
+                    && assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
             })
             .collect::<Vec<_>>();
         if !entries.is_empty() {
@@ -23083,7 +23380,7 @@ fn load_deepseek_v4_pipeline(
                 Arc::clone(&store),
                 entries,
                 expert_cache_options,
-                expert_quantization,
+                None,
                 weights_stream,
                 stream,
             )?;
@@ -23091,321 +23388,430 @@ fn load_deepseek_v4_pipeline(
                 .planned_owned_parameter_bytes
                 .checked_add(cache.report()?.owned_bytes)
                 .ok_or_else(|| {
-                    Error::Parallel("DeepSeek V4 pipeline expert byte total overflowed".into())
+                    Error::Parallel("neutral DeepSeek V3 expert byte total overflowed".into())
                 })?;
-            stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
+            expert_storage = PipelineExpertStorage::External(Box::new(cache));
         }
     }
-    info.opened_checkpoint_shards = materialized_shards;
-    info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
-    // V4 transports exact token identity beside flattened mHC streams. Float32
-    // preserves both token ids and every architecture-owned auxiliary tensor.
-    info.activation_dtype = Dtype::Float32;
+    let diagnostics = store.source_diagnostics()?;
+    info.opened_checkpoint_shards = diagnostics.touched_shard_paths.clone();
+    info.checkpoint_diagnostics = Some(diagnostics);
+    let stage = NeutralDeepSeekV3Stage {
+        args,
+        architecture,
+        range,
+        layers,
+        mtp_layers,
+        parallel_embedding,
+        parallel_lm_head,
+        local_args,
+        dense_layers,
+        expert_assignment,
+        expert_storage,
+        routing_statistics: RoutingStatistics::default(),
+    };
     PipelineModel::from_adapter(topology, info, PipelineStage(stage))
 }
-
-impl DeepSeekStage {
-    fn new(
-        args: deepseek_v3::ModelArgs,
-        range: Range<usize>,
-        info: &PipelineStageInfo,
-        external_experts: bool,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let layer_adapter = if external_experts {
-            crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new_external_experts(
-                args.clone(),
-                stream,
-            )?
-        } else {
-            crate::composition::mlx_architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new(
-                args.clone(),
-                stream,
-            )?
-        };
-        let embedding = info
-            .is_first
-            .then(|| {
-                linear::unloaded_maybe_quantized_embedding(
-                    args.vocab_size,
-                    args.hidden_size,
-                    args.weight_quantization_for("model.embed_tokens.weight"),
-                    stream,
-                )
-            })
-            .transpose()?;
-        let layers = range
-            .clone()
-            .map(|layer| deepseek_v3::DecoderLayer::new(&args, layer as i32, stream))
-            .collect::<Result<_, _>>()?;
-        let norm = info
-            .is_last
-            .then(|| {
-                nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)
-            })
-            .transpose()?;
-        let lm_head = info
-            .is_last
-            .then(|| {
-                linear::unloaded_maybe_quantized_linear(
-                    args.hidden_size,
-                    args.vocab_size,
-                    false,
-                    args.weight_quantization_for("lm_head.weight"),
-                    stream,
-                )
-            })
-            .transpose()?;
-        Ok(Self {
-            args,
-            layer_adapter,
-            range,
-            embedding,
-            layers,
-            dense_layers: None,
-            norm,
-            lm_head,
-            parallel_embedding: None,
-            parallel_lm_head: None,
-            parallel_layout: None,
-            expert_assignment: None,
-            expert_storage: if external_experts {
-                PipelineExpertStorage::ExternalEmpty
-            } else {
-                PipelineExpertStorage::LayerLocal
-            },
-            routing_statistics: RoutingStatistics::default(),
-        })
-    }
-
-    fn forward(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        explicit_mask: Option<&Array>,
-        caches: &mut [PipelineLayerCache],
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        if caches.len() != self.layers.len() {
-            return Err(Error::Parallel(format!(
-                "DeepSeek stage cache has {} entries, expected {}",
-                caches.len(),
-                self.layers.len()
-            )));
-        }
-        let (mut hidden, auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) => (
-                self.embedding
-                    .as_mut()
-                    .expect("first stage embedding")
-                    .forward(tokens, stream)?,
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Hidden(payload) => {
-                (payload.hidden.clone(), payload.auxiliary.clone())
-            }
-        };
-        let offset = caches.first().map_or(0, |cache| match cache {
-            PipelineLayerCache::CompressedLatent { cache, .. } => cache.offset(),
-            _ => 0,
-        });
-        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1 && offset > 0)
-            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
-            .transpose()?;
-        let mask = explicit_mask.or(generated_mask.as_ref());
-        let args = &self.args;
-        hidden = execute_pipeline_layer_range(
-            PipelineLayerExecution {
-                range: self.range.clone(),
-                resident_layers: &mut self.layers,
-                dense_layers: self.dense_layers.as_ref(),
-                step,
-                caches,
-                hidden,
-                stream,
-            },
-            |global_layer, stream| {
-                Ok(deepseek_v3::DecoderLayer::new_layerwise(
-                    args,
-                    global_layer as i32,
-                    stream,
-                )?)
-            },
-            |global_layer, layer, hidden, cache, stream| {
-                let PipelineLayerCache::CompressedLatent {
-                    global_layer: cached_layer,
-                    cache,
-                    ..
-                } = cache
-                else {
-                    return Err(Error::Parallel(format!(
-                        "DeepSeek stage cache is not compressed-latent state at global layer {global_layer}"
-                    )));
-                };
-                if *cached_layer != global_layer {
-                    return Err(Error::Parallel(format!(
-                        "DeepSeek stage cache does not match global layer {global_layer}"
-                    )));
-                }
-                Ok(layer.forward_stage(hidden, mask, Some(cache), stream)?)
-            },
-        )?;
-        let output = if let Some(norm) = &mut self.norm {
-            let mtp_hidden = hidden.clone();
-            hidden = norm.forward(&hidden, stream)?;
-            let logits = self
-                .lm_head
-                .as_mut()
-                .expect("last stage head")
-                .forward(&hidden, stream)?;
-            PipelineStageOutput::EmbeddedMtpLogits {
-                logits,
-                hidden: mtp_hidden,
-            }
-        } else {
-            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
-        };
-        Ok(output)
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn load_deepseek_experts(
-    moe: &mut deepseek_v3::Moe,
-    layer: usize,
-    dimensions: (i32, i32, i32),
-    tensors: &mut HashMap<String, Array>,
-    quantization: Option<WeightQuantization>,
+fn load_neutral_deepseek_v4_pipeline(
+    source_args: eredu_architectures::deepseek::V4Args,
+    store: SharedCheckpointSource,
+    topology: MlxParallelContext,
+    requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
-) -> Result<(), Error> {
-    let (num_experts, hidden_size, intermediate_size) = dimensions;
-    for projection in ["gate_proj", "up_proj", "down_proj"] {
-        let take_component = |component: &str,
-                              tensors: &mut HashMap<String, Array>|
-         -> Result<Option<Array>, Error> {
-            let mut values = Vec::with_capacity(num_experts as usize);
-            for expert in 0..num_experts {
-                let name =
-                    format!("model.layers.{layer}.mlp.experts.{expert}.{projection}.{component}");
-                match tensors.remove(&name) {
-                    Some(value) => values.push(value),
-                    None if expert == 0 => return Ok(None),
-                    None => {
-                        return Err(Error::StrictLoadValidation {
-                            missing: vec![name],
-                            unused: Vec::new(),
-                        })
-                    }
-                }
-            }
-            let refs = values.iter().collect::<Vec<_>>();
-            Ok(Some(stack_axis(&refs, 0, stream)?))
-        };
-        let weight =
-            take_component("weight", tensors)?.ok_or_else(|| Error::StrictLoadValidation {
-                missing: vec![format!(
-                    "model.layers.{layer}.mlp.experts.0.{projection}.weight"
-                )],
-                unused: Vec::new(),
-            })?;
-        let mut fp8_scale = take_component("weight_scale_inv", tensors)?;
-        let mut scales = take_component("scales", tensors)?;
-        let mut biases = take_component("biases", tensors)?;
-        let experts = &mut moe.experts;
-        let (output_dims, input_dims, affine) = match projection {
-            "gate_proj" => (intermediate_size, hidden_size, experts.gate_affine),
-            "up_proj" => (intermediate_size, hidden_size, experts.up_affine),
-            "down_proj" => (hidden_size, intermediate_size, experts.down_affine),
-            _ => unreachable!(),
-        };
-        let source_affine = quantization.is_none().then_some(affine).flatten();
-        let stored_input_dims = source_affine.map_or(input_dims, |quantization| {
-            quantized_packed_dimension(input_dims, quantization.bits())
-        });
-        validate_expert_bank_shape(
-            layer,
-            projection,
-            "weight",
-            &weight,
-            &[num_experts, output_dims, stored_input_dims],
+    weights_stream: &Stream,
+) -> Result<PipelineModel, Error> {
+    let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
+    let expert_assignment = external_experts
+        .then(|| {
+            ExpertAssignment::balanced(
+                source_args.n_routed_experts as usize,
+                topology.expert_parallel_size,
+                topology.expert_parallel_rank,
+            )
+        })
+        .transpose()?;
+    topology.preflight(
+        Some(source_args.num_hidden_layers as usize),
+        expert_assignment
+            .as_ref()
+            .map(ExpertAssignment::global_expert_count),
+    )?;
+    let (store, args, materialization) = match requested_quantization {
+        Some(quantization) => {
+            let (store, args, report) = crate::composition::deepseek::quantize_v4_store(
+                store,
+                &source_args,
+                quantization,
+                stream,
+            )?;
+            (store, args, Some(report))
+        }
+        None => (store, source_args, None),
+    };
+    let range = topology.layer_range(args.num_hidden_layers as usize)?;
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        args.num_hidden_layers as usize,
+        ModelKind::DeepSeekV4,
+        args.hidden_size,
+    );
+    info.activation_hidden_size = args
+        .hidden_size
+        .checked_mul(args.hc_mult)
+        .ok_or_else(|| Error::Parallel("neutral DeepSeek V4 activation width overflowed".into()))?;
+    let owns_mtp = info.is_last && args.num_nextn_predict_layers > 0;
+    info.owns_embedded_mtp = owns_mtp;
+    info.embedded_mtp_layers = if owns_mtp {
+        args.num_nextn_predict_layers as usize
+    } else {
+        0
+    };
+    if let Some(assignment) = &expert_assignment {
+        info.global_expert_count = Some(assignment.global_expert_count());
+        info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+    }
+    info.materialization = materialization.clone();
+    let tensor_parallel = topology.tensor_parallel_size > 1;
+    let parallel_layout = tensor_parallel
+        .then(|| v4_parallel_layout(&args, topology))
+        .transpose()?;
+    let local_args = tensor_parallel
+        .then(|| v4_local_parallel_args(&args, topology))
+        .transpose()?;
+    let parallel_build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+    let mut parallel_embedding = (tensor_parallel && (info.is_first || owns_mtp))
+        .then(|| {
+            crate::backend::mlx::nn::parallel::VocabParallelEmbedding::unloaded(
+                args.vocab_size as usize,
+                args.hidden_size,
+                None,
+                parallel_build,
+                stream,
+            )
+        })
+        .transpose()?;
+    let mut parallel_lm_head = (tensor_parallel && info.is_last)
+        .then(|| {
+            crate::backend::mlx::nn::parallel::VocabParallelLmHead::unloaded(
+                args.hidden_size,
+                args.vocab_size as usize,
+                args.linear_format_for("head.weight").weight_quantization(),
+                parallel_build,
+                stream,
+            )
+        })
+        .transpose()?;
+    let mut architecture = NeutralV4Architecture::new(args.clone(), stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let mut static_module = MlxModule::new(architecture.static_modules().clone());
+    let static_bindings = build_module_bindings(&static_module, "", store.as_ref())?
+        .into_iter()
+        .filter(|binding| {
+            v4_pipeline_static_owned(binding.name(), info.is_first, info.is_last, owns_mtp)
+        })
+        .collect::<Vec<_>>();
+    let mut loaded = PipelineLoadAccumulator::new("neutral DeepSeek V4");
+    let architecture_static_bindings = static_bindings
+        .iter()
+        .filter(|binding| {
+            !tensor_parallel
+                || (!binding.name().starts_with("embed.") && !binding.name().starts_with("head."))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    loaded.load_excluding(
+        &mut static_module,
+        store.as_ref(),
+        &architecture_static_bindings,
+        None,
+        weights_stream,
+        stream,
+        &|name| {
+            !v4_pipeline_static_owned(name, info.is_first, info.is_last, owns_mtp)
+                || (tensor_parallel && (name.starts_with("embed.") || name.starts_with("head.")))
+        },
+    )?;
+    if let Some(module) = &mut parallel_embedding {
+        let bindings = shard_layer_bindings(
+            static_bindings
+                .iter()
+                .filter(|binding| binding.name().starts_with("embed."))
+                .cloned()
+                .collect(),
+            "",
+            store.as_ref(),
+            parallel_layout.as_ref().expect("TP layout"),
         )?;
-        if let Some(scale) = &fp8_scale {
-            validate_expert_bank_shape(
-                layer,
-                projection,
-                "weight_scale_inv",
-                scale,
-                &[
-                    num_experts,
-                    (output_dims + 127) / 128,
-                    (input_dims + 127) / 128,
-                ],
+        let bindings = rename_binding_prefix(bindings, "embed.")?;
+        loaded.load(
+            module.inner_mut(),
+            store.as_ref(),
+            &bindings,
+            None,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut parallel_lm_head {
+        let bindings = shard_layer_bindings(
+            static_bindings
+                .iter()
+                .filter(|binding| binding.name().starts_with("head."))
+                .cloned()
+                .collect(),
+            "",
+            store.as_ref(),
+            parallel_layout.as_ref().expect("TP layout"),
+        )?;
+        let bindings = rename_binding_prefix(bindings, "head.")?;
+        loaded.load(
+            module.inner_mut(),
+            store.as_ref(),
+            &bindings,
+            None,
+            weights_stream,
+            stream,
+        )?;
+    }
+    architecture.replace_static_modules(static_module.inner);
+    let unit_args = local_args.as_ref().unwrap_or(&args);
+    let mut layers = range
+        .clone()
+        .map(|layer| {
+            crate::composition::deepseek::new_v4_unit(unit_args, layer, external_experts, stream)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if dense_stream.is_none() {
+        for (global_layer, unit) in range.clone().zip(&mut layers) {
+            let bindings = match &parallel_layout {
+                Some(layout) => v4_sharded_unit_bindings(
+                    &args,
+                    global_layer,
+                    store.as_ref(),
+                    external_experts,
+                    layout,
+                    stream,
+                )?,
+                None => crate::composition::deepseek::v4_unit_bindings(
+                    &args,
+                    global_layer,
+                    unit,
+                    store.as_ref(),
+                    external_experts,
+                )?,
+            };
+            if external_experts {
+                loaded.load_excluding(
+                    unit,
+                    store.as_ref(),
+                    &bindings,
+                    None,
+                    weights_stream,
+                    stream,
+                    &|name| {
+                        name.contains(".switch_mlp.")
+                            || name.contains(".expert_banks.")
+                            || name.contains(".ffn.experts.")
+                    },
+                )?;
+            } else {
+                loaded.load(
+                    unit,
+                    store.as_ref(),
+                    &bindings,
+                    None,
+                    weights_stream,
+                    stream,
+                )?;
+            }
+        }
+    }
+    let target_layers = args.num_hidden_layers as usize;
+    let mut mtp_layers = if owns_mtp {
+        (0..args.num_nextn_predict_layers as usize)
+            .map(|depth| {
+                crate::composition::deepseek::new_v4_unit(
+                    unit_args,
+                    target_layers + depth,
+                    external_experts,
+                    stream,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    for (depth, unit) in mtp_layers.iter_mut().enumerate() {
+        let bindings = match &parallel_layout {
+            Some(layout) => v4_sharded_unit_bindings(
+                &args,
+                target_layers + depth,
+                store.as_ref(),
+                external_experts,
+                layout,
+                stream,
+            )?,
+            None => crate::composition::deepseek::v4_unit_bindings(
+                &args,
+                target_layers + depth,
+                unit,
+                store.as_ref(),
+                external_experts,
+            )?,
+        };
+        if external_experts {
+            loaded.load_excluding(
+                unit,
+                store.as_ref(),
+                &bindings,
+                None,
+                weights_stream,
+                stream,
+                &|name| {
+                    name.contains(".switch_mlp.")
+                        || name.contains(".expert_banks.")
+                        || name.contains(".ffn.experts.")
+                },
+            )?;
+        } else {
+            loaded.load(
+                unit,
+                store.as_ref(),
+                &bindings,
+                None,
+                weights_stream,
+                stream,
             )?;
         }
-        if let Some(affine) = source_affine {
-            let expected = [num_experts, output_dims, input_dims / affine.group_size()];
-            if let Some(value) = &scales {
-                validate_expert_bank_shape(layer, projection, "scales", value, &expected)?;
-            }
-            if let Some(value) = &biases {
-                validate_expert_bank_shape(layer, projection, "biases", value, &expected)?;
-            }
-        }
-        let weight = if let Some(quantization) = quantization {
-            let quantized =
-                crate::backend::mlx::nn::moe::quantize_expert_bank(&weight, quantization, stream)?;
-            scales = Some(quantized.scales);
-            biases = quantized.biases;
-            quantized.weight
-        } else {
-            weight
-        };
-        synchronize_outputs(
-            [&weight]
-                .into_iter()
-                .chain(fp8_scale.as_ref())
-                .chain(scales.as_ref())
-                .chain(biases.as_ref()),
-        )?;
-        match projection {
-            "gate_proj" => {
-                experts.gate_proj = safemlx::module::Param::new(Some(weight));
-                experts.gate_proj_scale_inv = safemlx::module::Param::new(fp8_scale.take());
-                experts.gate_proj_scales = safemlx::module::Param::new(scales.take());
-                experts.gate_proj_biases = safemlx::module::Param::new(biases.take());
-            }
-            "up_proj" => {
-                experts.up_proj = safemlx::module::Param::new(Some(weight));
-                experts.up_proj_scale_inv = safemlx::module::Param::new(fp8_scale.take());
-                experts.up_proj_scales = safemlx::module::Param::new(scales.take());
-                experts.up_proj_biases = safemlx::module::Param::new(biases.take());
-            }
-            "down_proj" => {
-                experts.down_proj = safemlx::module::Param::new(Some(weight));
-                experts.down_proj_scale_inv = safemlx::module::Param::new(fp8_scale.take());
-                experts.down_proj_scales = safemlx::module::Param::new(scales.take());
-                experts.down_proj_biases = safemlx::module::Param::new(biases.take());
-            }
-            _ => unreachable!(),
-        }
     }
-    Ok(())
-}
-
-#[cfg(test)]
-fn validate_expert_bank_shape(
-    layer: usize,
-    projection: &str,
-    component: &str,
-    value: &Array,
-    expected: &[i32],
-) -> Result<(), Error> {
-    if value.shape() == expected {
-        Ok(())
+    let static_device_bytes = loaded.finish(&mut info)?;
+    let mut dense_layers = dense_stream
+        .map(|options| {
+            let local_binding_args = unit_args.clone();
+            let global_binding_args = args.clone();
+            let binding_layout = parallel_layout.clone();
+            let binding_stream = stream.clone();
+            build_pipeline_layer_storage(
+                Arc::clone(&store),
+                range.clone(),
+                options,
+                static_device_bytes,
+                materialization.clone(),
+                stream,
+                weights_stream,
+                move |layer, stream| {
+                    crate::composition::deepseek::new_v4_unit(
+                        &local_binding_args,
+                        layer,
+                        external_experts,
+                        stream,
+                    )
+                },
+                {
+                    move |layer, unit, store| match &binding_layout {
+                        Some(layout) => v4_sharded_unit_bindings(
+                            &global_binding_args,
+                            layer,
+                            store,
+                            external_experts,
+                            layout,
+                            &binding_stream,
+                        ),
+                        None => crate::composition::deepseek::v4_unit_bindings(
+                            &global_binding_args,
+                            layer,
+                            unit,
+                            store,
+                            external_experts,
+                        ),
+                    }
+                },
+            )
+        })
+        .transpose()?;
+    if external_experts {
+        dense_layers = dense_layers.map(|storage| storage.with_independent_experts(".switch_mlp."));
+    }
+    info.planned_owned_parameter_bytes = static_device_bytes
+        .checked_add(
+            dense_layers
+                .as_ref()
+                .map(PipelineLayerStorage::planned_layer_bytes)
+                .transpose()?
+                .unwrap_or(0),
+        )
+        .ok_or_else(|| Error::Parallel("neutral DeepSeek V4 owned byte total overflowed".into()))?;
+    let mut expert_storage = if external_experts {
+        PipelineExpertStorage::ExternalEmpty
     } else {
-        Err(Error::Parallel(format!(
-            "DeepSeek pipeline layer {layer} expert {projection}.{component} bank has shape {:?}, expected {expected:?}",
-            value.shape()
-        )))
+        PipelineExpertStorage::LayerLocal
+    };
+    if external_experts {
+        let assignment = expert_assignment
+            .as_ref()
+            .expect("external expert assignment");
+        let catalog = match &local_args {
+            Some(local) => {
+                let width = usize::try_from(local.moe_intermediate_size)
+                    .map_err(|_| Error::Parallel("invalid local V4 expert width".into()))?;
+                let start = topology
+                    .tensor_parallel_rank
+                    .checked_mul(width)
+                    .ok_or_else(|| Error::Parallel("local V4 expert range overflowed".into()))?;
+                crate::composition::deepseek_expert::v4_parallel_catalog(
+                    &args,
+                    start..start + width,
+                    store.as_ref(),
+                )?
+            }
+            None => crate::composition::deepseek_expert::v4_catalog(&args, store.as_ref())?,
+        };
+        let entries = catalog
+            .into_iter()
+            .filter(|entry| {
+                let layer = entry.identity().layer;
+                (range.contains(&layer) || (owns_mtp && layer >= target_layers))
+                    && assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+            })
+            .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            let cache = build_pipeline_expert_cache(
+                Arc::clone(&store),
+                entries,
+                expert_cache_options,
+                None,
+                weights_stream,
+                stream,
+            )?;
+            info.planned_owned_parameter_bytes = info
+                .planned_owned_parameter_bytes
+                .checked_add(cache.report()?.owned_bytes)
+                .ok_or_else(|| {
+                    Error::Parallel("neutral DeepSeek V4 expert byte total overflowed".into())
+                })?;
+            expert_storage = PipelineExpertStorage::External(Box::new(cache));
+        }
     }
+    let diagnostics = store.source_diagnostics()?;
+    info.opened_checkpoint_shards = diagnostics.touched_shard_paths.clone();
+    info.checkpoint_diagnostics = Some(diagnostics);
+    let stage = NeutralDeepSeekV4Stage {
+        args,
+        architecture,
+        range,
+        layers,
+        mtp_layers,
+        parallel_embedding,
+        parallel_lm_head,
+        parallel_layout,
+        local_args,
+        dense_layers,
+        expert_assignment,
+        expert_storage,
+        routing_statistics: RoutingStatistics::default(),
+    };
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
 }

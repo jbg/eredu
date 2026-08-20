@@ -7,7 +7,10 @@
 use std::marker::PhantomData;
 
 use eredu_core::{
-    cache::{LayerCachePolicy, PromptCacheError, PromptCacheModelIdentity, PromptCacheTopology},
+    cache::{
+        LayerCachePolicy, PromptCacheError, PromptCacheModelIdentity, PromptCacheTopology,
+        StateComponentPolicy,
+    },
     LayerSchedule,
 };
 use eredu_nn::NeuralBackend;
@@ -16,6 +19,7 @@ use eredu_nn::NeuralBackend;
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StateLayout {
     layers: LayerSchedule<LayerCachePolicy>,
+    components: Vec<Vec<StateComponentPolicy>>,
 }
 
 impl StateLayout {
@@ -32,7 +36,8 @@ impl StateLayout {
                     reason: error.to_string(),
                 })?;
         }
-        Ok(Self { layers })
+        let components = layers.iter().map(LayerCachePolicy::components).collect();
+        Ok(Self { layers, components })
     }
 
     /// Returns the number of architecture-global layers represented here.
@@ -53,6 +58,11 @@ impl StateLayout {
     /// Borrows the portable ordered layer schedule.
     pub const fn layers(&self) -> &LayerSchedule<LayerCachePolicy> {
         &self.layers
+    }
+
+    /// Returns ordered named semantic components for one layer.
+    pub fn components(&self, layer: usize) -> Option<&[StateComponentPolicy]> {
+        self.components.get(layer).map(Vec::as_slice)
     }
 }
 
@@ -164,6 +174,21 @@ pub struct DeviceState<B: NeuralBackend, L> {
     backend: PhantomData<fn() -> B>,
 }
 
+impl<B: NeuralBackend, L: Clone> Clone for DeviceState<B, L> {
+    fn clone(&self) -> Self {
+        Self {
+            layout: self.layout.clone(),
+            layers: self.layers.clone(),
+            backend: PhantomData,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.layout.clone_from(&source.layout);
+        self.layers.clone_from(&source.layers);
+    }
+}
+
 impl<B: NeuralBackend, L> DeviceState<B, L> {
     /// Realizes every layer through a backend-specific construction closure.
     pub fn create<E>(
@@ -226,6 +251,18 @@ where
         self.layers
             .get_mut(layer)
             .ok_or(StateError::UnknownLayer { layer, count })
+    }
+}
+
+impl<B: NeuralBackend, L> AsRef<[L]> for DeviceState<B, L> {
+    fn as_ref(&self) -> &[L] {
+        &self.layers
+    }
+}
+
+impl<B: NeuralBackend, L> AsMut<[L]> for DeviceState<B, L> {
+    fn as_mut(&mut self) -> &mut [L] {
+        &mut self.layers
     }
 }
 
@@ -363,5 +400,30 @@ mod tests {
         .prompt_cache_identity(&layout())
         .unwrap_err();
         assert!(matches!(error, PromptCacheError::Incompatible(_)));
+    }
+
+    #[test]
+    fn state_layout_exposes_stable_semantic_component_names() {
+        let layout = StateLayout::new(
+            LayerSchedule::new(
+                1,
+                vec![
+                    LayerCachePolicy::compressed_latent_rotary(AttentionPolicy::Full, 16, 8)
+                        .unwrap(),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let names = layout
+            .components(0)
+            .unwrap()
+            .iter()
+            .map(|component| component.role.stable_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["attention.compressed_latent", "attention.rotary_keys"]
+        );
     }
 }
