@@ -1224,6 +1224,31 @@ impl Relu2ExpertBankOperator<Array> for MlxRelu2ExpertBank {
         ))?;
         compute(output.reshape(shape, context))
     }
+
+    fn forward_routed_tensor_parallel(
+        &mut self,
+        input: &Array,
+        routes: &RoutingResult<Array>,
+        partitions: usize,
+        context: &Stream,
+    ) -> Result<TensorParallelExpertOutput<Array>, ComputeError> {
+        let shape = input.shape();
+        let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
+        let output = compute(self.module.forward_tensor_parallel(
+            &flattened,
+            &routes.expert_ids,
+            &routes.route_weights,
+            partitions,
+            context,
+        ))?;
+        Ok(TensorParallelExpertOutput {
+            reducible: compute(output.reducible.reshape(shape, context))?,
+            post_reduce: output
+                .post_reduce
+                .map(|bias| compute(bias.reshape(shape, context)))
+                .transpose()?,
+        })
+    }
 }
 
 impl crate::backend::mlx::runtime::distributed::expert::LocalExpertBank for MlxRelu2ExpertBank {

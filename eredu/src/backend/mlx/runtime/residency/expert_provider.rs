@@ -205,10 +205,6 @@ where
 {
     type Error = safemlx::error::Exception;
 
-    fn output_is_tensor_parallel_partial(&self) -> bool {
-        true
-    }
-
     fn forward_routed(
         &mut self,
         _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
@@ -240,6 +236,21 @@ where
         stream: &Stream,
     ) -> Result<Array, Self::Error> {
         execute_routed_callback(self.execute, request, stream)
+    }
+
+    fn forward_relu2_routed_tensor_parallel(
+        &mut self,
+        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        request: RoutedExpertRequest<'_, Array>,
+        _partitions: usize,
+        stream: &Stream,
+    ) -> Result<RoutedExpertTensorParallelOutput<Array>, Self::Error> {
+        execute_routed_callback(self.execute, request, stream).map(|reducible| {
+            RoutedExpertTensorParallelOutput::Partial(TensorParallelExpertOutput {
+                reducible,
+                post_reduce: None,
+            })
+        })
     }
 }
 

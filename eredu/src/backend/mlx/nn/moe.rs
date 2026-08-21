@@ -1124,6 +1124,27 @@ impl PackedRelu2Experts {
         weighted_route_sum(current, top_k_weights, &plan, num_tokens, stream)
     }
 
+    /// Returns the rank-local ReLU2 contribution for one tensor-parallel sum.
+    pub fn forward_tensor_parallel(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        partitions: usize,
+        stream: &Stream,
+    ) -> Result<TensorParallelExpertOutput<Array>, Exception> {
+        if partitions == 0 {
+            return Err(Exception::custom(
+                "tensor-parallel partition count must be positive",
+            ));
+        }
+        self.forward(hidden_states, top_k_index, top_k_weights, stream)
+            .map(|reducible| TensorParallelExpertOutput {
+                reducible,
+                post_reduce: None,
+            })
+    }
+
     /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
 }

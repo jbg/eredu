@@ -25,12 +25,13 @@ use eredu_nn::{
     PoolingAttentionCache, PoolingOverlap, PoolingWindows, RelativeAttentionInput,
     Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
     RotarySubspace, RoutedNeuralBackend, RoutingOperator, RoutingResult,
-    SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor, TopKRouterSpec,
-    TopKRoutingSpec,
+    SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
+    TensorParallelExpertOutput, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{
-    CompositeLayeredTraversalHook, DeviceState, LayerRuntimeState, LayeredTraversalHook,
-    PenaltyConfig, PredictionDirective, ResettableRuntimeLayerState, ResidentRuntime,
+    CompositeLayeredTraversalHook, DeviceState, ExpertPass, LayerRuntimeState,
+    LayeredTraversalHook, PenaltyConfig, PredictionDirective, ResettableRuntimeLayerState,
+    ResidentRuntime, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
     RuntimeLayerState, RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionDriver,
     SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
     TokenDomain,
@@ -2657,6 +2658,18 @@ impl NeuralBackend for NumericBackend {
         context: &NumericContext,
     ) -> Result<Self::Tensor, Error> {
         linear.forward(input, context)
+    }
+
+    fn sum_parallel(
+        value: Self::Tensor,
+        _: &(),
+        _: &NumericContext,
+    ) -> Result<Self::Tensor, Error> {
+        Ok(value)
+    }
+
+    fn parallel_size(_: &()) -> usize {
+        2
     }
 }
 
@@ -6742,6 +6755,85 @@ fn kimi_linear_mixed_kda_mla_prefill_decode_uses_one_heterogeneous_state() {
             whole_state.layer(layer).unwrap().position()
         );
     }
+}
+
+#[derive(Default)]
+struct TypedRelu2ProviderProbe {
+    replicated_calls: usize,
+    tensor_parallel_partitions: Vec<usize>,
+}
+
+impl RoutedExpertProvider<NumericBackend> for TypedRelu2ProviderProbe {
+    type Error = std::convert::Infallible;
+
+    fn forward_routed(
+        &mut self,
+        _resident_bank: &mut NumericExpertBank,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<NumericTensor, Self::Error> {
+        Ok(request.input.clone())
+    }
+
+    fn forward_relu2_routed(
+        &mut self,
+        _resident_bank: &mut NumericRelu2ExpertBank,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<NumericTensor, Self::Error> {
+        self.replicated_calls += 1;
+        Ok(request.input.clone())
+    }
+
+    fn forward_relu2_routed_tensor_parallel(
+        &mut self,
+        _resident_bank: &mut NumericRelu2ExpertBank,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        partitions: usize,
+        _: &NumericContext,
+    ) -> Result<RoutedExpertTensorParallelOutput<NumericTensor>, Self::Error> {
+        self.tensor_parallel_partitions.push(partitions);
+        Ok(RoutedExpertTensorParallelOutput::Partial(
+            TensorParallelExpertOutput {
+                reducible: request.input.clone(),
+                post_reduce: None,
+            },
+        ))
+    }
+}
+
+#[test]
+fn nemotron_h_relu2_provider_uses_typed_tensor_parallel_results() {
+    let args = nemotron_h::model_args_from_config_value(&serde_json::json!({
+        "model_type":"nemotron_h", "vocab_size":16, "hidden_size":8,
+        "intermediate_size":12, "num_hidden_layers":1,
+        "hybrid_override_pattern":"E", "num_attention_heads":2,
+        "num_key_value_heads":1, "head_dim":4, "mamba_num_heads":2,
+        "n_groups":1, "mamba_head_dim":4, "ssm_state_size":2,
+        "conv_kernel":2, "chunk_size":2, "n_routed_experts":4,
+        "n_shared_experts":1, "moe_intermediate_size":4,
+        "moe_shared_expert_intermediate_size":4, "num_experts_per_tok":2,
+        "n_group":2, "topk_group":1, "tie_word_embeddings":false
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let mut moe = nemotron_h::SparseMoe::<NumericBackend>::new(
+        &args,
+        0,
+        args.moe_intermediate_size,
+        args.moe_shared_expert_intermediate_size,
+        &context,
+    )
+    .unwrap();
+    let input = NumericTensor::new([1, args.hidden_size], vec![0.25; args.hidden_size as usize]);
+    let mut provider = TypedRelu2ProviderProbe::default();
+    let output = moe
+        .forward_parallel_with_provider(&input, ExpertPass::Decode, &(), &context, &mut provider)
+        .unwrap();
+
+    assert_eq!(output.shape, input.shape);
+    assert_eq!(provider.replicated_calls, 0);
+    assert_eq!(provider.tensor_parallel_partitions, [2]);
 }
 
 #[test]

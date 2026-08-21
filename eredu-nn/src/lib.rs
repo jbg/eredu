@@ -1900,6 +1900,28 @@ pub trait Relu2ExpertBankOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
         routes: &RoutingResult<T>,
         context: &T::Context,
     ) -> Result<T, Error>;
+
+    /// Executes a rank-local tensor-parallel partial and separates replicated
+    /// route-weighted down bias for one literal post-reduction addition.
+    fn forward_routed_tensor_parallel(
+        &mut self,
+        input: &T,
+        routes: &RoutingResult<T>,
+        partitions: usize,
+        context: &T::Context,
+    ) -> Result<TensorParallelExpertOutput<T>, Error> {
+        if partitions == 1 {
+            return self
+                .forward_routed(input, routes, context)
+                .map(|reducible| TensorParallelExpertOutput {
+                    reducible,
+                    post_reduce: None,
+                });
+        }
+        Err(Error::backend(
+            "tensor-parallel ReLU2 experts are not implemented by this backend",
+        ))
+    }
 }
 
 /// Neural backend extension for routed expert architectures.

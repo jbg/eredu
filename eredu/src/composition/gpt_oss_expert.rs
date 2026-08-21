@@ -277,10 +277,6 @@ impl LocalExpertBank for CachedLocalBank<'_> {
 impl RoutedExpertProvider<MlxBackend> for DistributedCachedProvider<'_> {
     type Error = Error;
 
-    fn output_is_tensor_parallel_partial(&self) -> bool {
-        true
-    }
-
     fn forward_routed(
         &mut self,
         _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,

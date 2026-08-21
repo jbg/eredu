@@ -287,7 +287,7 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
     {
         let routes = self.gate.route(input, context)?;
         let routed = provider
-            .forward_relu2_routed(
+            .forward_relu2_routed_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
                     layer: self.layer,
@@ -295,14 +295,12 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
                     routes: &routes,
                     pass,
                 },
+                B::parallel_size(parallel),
                 context,
             )
             .map_err(|error| Error::backend(error.to_string()))?;
-        let routed = if provider.output_is_tensor_parallel_partial() {
-            B::sum_parallel(routed, parallel, context)?
-        } else {
-            routed
-        };
+        let routed =
+            eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(routed, parallel, context)?;
         routed.add(
             &self
                 .shared_experts

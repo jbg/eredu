@@ -120,11 +120,6 @@ where
     /// Provider-specific acquisition or execution failure.
     type Error;
 
-    /// Whether legacy ReLU2 provider output is a rank-local partial.
-    fn output_is_tensor_parallel_partial(&self) -> bool {
-        false
-    }
-
     /// Executes one typed route batch while retaining its acquired resources.
     fn forward_routed(
         &mut self,
@@ -154,6 +149,20 @@ where
         request: RoutedExpertRequest<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
+
+    /// Executes a ReLU-squared route batch with an explicit complete or
+    /// rank-local tensor-parallel result.
+    fn forward_relu2_routed_tensor_parallel(
+        &mut self,
+        resident_bank: &mut B::Relu2ExpertBank,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        let _ = partitions;
+        self.forward_relu2_routed(resident_bank, request, context)
+            .map(RoutedExpertTensorParallelOutput::Complete)
+    }
 }
 
 /// Provider for a fully resident expert bank.
@@ -165,10 +174,6 @@ where
     B: RoutedNeuralBackend,
 {
     type Error = eredu_nn::Error;
-
-    fn output_is_tensor_parallel_partial(&self) -> bool {
-        true
-    }
 
     fn forward_routed(
         &mut self,
@@ -198,5 +203,17 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         resident_bank.forward_routed(request.input, request.routes, context)
+    }
+
+    fn forward_relu2_routed_tensor_parallel(
+        &mut self,
+        resident_bank: &mut B::Relu2ExpertBank,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        resident_bank
+            .forward_routed_tensor_parallel(request.input, request.routes, partitions, context)
+            .map(RoutedExpertTensorParallelOutput::Partial)
     }
 }
