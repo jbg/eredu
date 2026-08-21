@@ -1,6 +1,6 @@
 // MLX artifact and residency binding for the neutral Qwen3-VL graph.
 
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, path::Path, sync::Arc};
 
 use eredu_architectures::qwen::{self, vision, vl};
 use eredu_checkpoint::{
@@ -11,7 +11,8 @@ use eredu_checkpoint::{
 use eredu_runtime::{
     CacheResidencyPolicy, CausalModel, ExecutionResidency, ExecutionUnitLayout,
     LayerWeightResidency, LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
-    PagedCacheOptions, ResidencyReport, StaticUnitBindings, WeightBinding, WeightResidency,
+    PagedCacheOptions, ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding,
+    WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -31,7 +32,7 @@ use crate::backend::mlx::{
         },
         checkpoint::binding::{
             build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
-            populate_module_from_lease_excluding,
+            parameter_name_in_targets, parameter_role_targets, populate_module_from_lease_excluding,
         },
         checkpoint::{
             load::{gguf_quantization_configs, GgufTensorNames},
@@ -178,6 +179,21 @@ fn unit_recipes(
 #[derive(Clone)]
 struct UnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<BTreeSet<String>>,
+}
+
+fn unit_expert_targets(
+    architecture: &Architecture,
+    index: usize,
+    unit: &MlxModule<Unit>,
+) -> Result<BTreeSet<String>, Error> {
+    let Unit::Text(block) = &unit.inner else {
+        return Ok(BTreeSet::new());
+    };
+    Ok(parameter_role_targets(
+        &qwen::layer_parallel_parameter_groups(block, &architecture.args().text, index)?,
+        ParameterRole::ExpertIntermediate,
+    ))
 }
 
 /// Pipeline and Cartesian-parallel binder for the same neutral Qwen3-VL
@@ -367,6 +383,7 @@ impl QwenVlPipelineBindings {
         layer: &MlxModule<Unit>,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
+        let expert_targets = unit_expert_targets(architecture, index, layer)?;
         let recipes = if group_kind(architecture, group)
             == eredu_runtime::ArchitectureGroupKind::Decoder
         {
@@ -380,7 +397,7 @@ impl QwenVlPipelineBindings {
             "",
             store,
             recipes,
-            |name| self.external_experts && name.contains(".experts."),
+            |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
         )?)
     }
 
@@ -498,6 +515,7 @@ impl QwenVlPipelineBindings {
             }
             (Unit::Text(_), eredu_runtime::ArchitectureGroupKind::Decoder) => {
                 let args = architecture.args();
+                let expert_targets = unit_expert_targets(architecture, index, global_layer)?;
                 let recipes = if self.external_experts {
                     BTreeMap::new()
                 } else {
@@ -508,7 +526,7 @@ impl QwenVlPipelineBindings {
                     "",
                     store,
                     recipes,
-                    |name| self.external_experts && name.contains(".experts."),
+                    |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
                 )?;
                 if let Some(assignment) = assignment {
                     let indices = assignment.local_global_expert_ids().to_vec();
@@ -516,7 +534,7 @@ impl QwenVlPipelineBindings {
                         .into_iter()
                         .map(|binding| {
                             let target = binding.logical_target().unwrap_or_else(|| binding.name());
-                            if target.contains(".experts.") {
+                            if parameter_name_in_targets(target, &expert_targets) {
                                 binding
                                     .select_bounded_output(
                                         store,
@@ -554,7 +572,7 @@ impl MlxUnitPopulator<Unit> for UnitPopulator {
         lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".experts.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -1420,11 +1438,20 @@ fn load_store(
 ) -> Result<QwenVlModel, Error> {
     let mut architecture = Architecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(
+        architecture
+            .parameter_description(stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate),
+    );
     let layout = unit_layout(&architecture)?;
     let factory = UnitPopulator {
         external_experts,
+        expert_targets: Arc::clone(&expert_targets),
     };
     let binding_args = args.clone();
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
@@ -1435,7 +1462,9 @@ fn load_store(
         stream,
         weights_stream,
         move |key| {
-            key.ends_with("rotary_emb.inv_freq") || (external_experts && key.contains(".experts."))
+            key.ends_with("rotary_emb.inv_freq")
+                || (external_experts
+                    && parameter_name_in_targets(key, &excluded_expert_targets))
         },
         |modules, store| {
             build_module_bindings_with_recipes(
@@ -1452,7 +1481,9 @@ fn load_store(
                 "",
                 store,
                 unit_recipes(store, &binding_args, flat)?,
-                |name| external_experts && name.contains(".experts."),
+                |name| {
+                    external_experts && parameter_name_in_targets(name, &binding_expert_targets)
+                },
             )
             .map_err(Into::into)
         },

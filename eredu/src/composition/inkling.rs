@@ -15,8 +15,8 @@ use eredu_checkpoint::{
 };
 use eredu_runtime::{
     CacheResidencyPolicy, CausalModel, ExecutionGraph, ExecutionUnitLayout, LayerWeightResidency,
-    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, RuntimeState,
-    StaticUnitBindings, WeightBinding, WeightResidency,
+    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
+    RuntimeState, StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -37,6 +37,7 @@ use crate::backend::mlx::{
         checkpoint::{
             binding::{
                 binding_bytes, build_module_bindings_with_recipes_excluding,
+                parameter_name_in_targets, parameter_role_targets,
                 populate_module_from_lease_excluding,
             },
             load::{gguf_metadata, gguf_quantization_configs},
@@ -294,15 +295,25 @@ impl InklingBindings {
         &self,
         architecture: &NeutralArchitecture,
         group: usize,
-        _index: usize,
+        index: usize,
         layer: &InklingPipelineUnit,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         self.layer_count(architecture, group)?;
+        let expert_targets = if group_kind(architecture, group)
+            == eredu_runtime::ArchitectureGroupKind::Decoder
+        {
+            parameter_role_targets(
+                &eredu_architectures::inkling::layer_parameter_groups(architecture.args(), index)?,
+                ParameterRole::ExpertIntermediate,
+            )
+        } else {
+            Default::default()
+        };
         let recipes =
             crate::composition::inkling_expert::module_recipes(layer, architecture.args(), store)?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
-            self.external_experts && name.contains(".moe.") && name.contains("experts")
+            self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
         .map_err(Into::into)
     }
@@ -341,11 +352,13 @@ impl InklingBindings {
 #[derive(Clone)]
 struct UnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<std::collections::BTreeSet<String>>,
 }
 
 #[derive(Clone)]
 struct ParallelUnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<std::collections::BTreeSet<String>>,
 }
 
 impl MlxUnitPopulator<NeutralUnit> for UnitPopulator {
@@ -355,7 +368,7 @@ impl MlxUnitPopulator<NeutralUnit> for UnitPopulator {
         lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".moe.") && name.contains("experts")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -368,7 +381,7 @@ impl MlxUnitPopulator<NeutralUnit> for ParallelUnitPopulator {
         lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".moe.") && name.contains("experts")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -1815,19 +1828,30 @@ fn load_store(
 ) -> Result<InklingModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(
+        architecture
+            .parameter_description(stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate),
+    );
     let layout = inkling_execution_layout(&args)?;
     let static_args = args.clone();
     let unit_args = args.clone();
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
-        UnitPopulator { external_experts },
+        UnitPopulator {
+            external_experts,
+            expert_targets: Arc::clone(&expert_targets),
+        },
         std::marker::PhantomData::<MlxHybridState>,
         layout,
         layer_policy,
         stream,
         weights_stream,
-        move |key| external_experts && key.contains(".moe.") && key.contains("experts"),
+        move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
         move |modules, store| {
             let module = MlxModule::new(modules.clone());
             let recipes =
@@ -1840,7 +1864,7 @@ fn load_store(
             let recipes =
                 crate::composition::inkling_expert::module_recipes(&module, &unit_args, store)?;
             build_module_bindings_with_recipes_excluding(&module, "", store, recipes, |name| {
-                external_experts && name.contains(".moe.") && name.contains("experts")
+                external_experts && parameter_name_in_targets(name, &binding_expert_targets)
             })
             .map_err(Into::into)
         },
@@ -1997,6 +2021,7 @@ fn load_parallel_store(
         &mut architecture,
         ParallelUnitPopulator {
             external_experts: false,
+            expert_targets: Arc::new(Default::default()),
         },
         std::marker::PhantomData::<MlxHybridState>,
         unit_layout,

@@ -4,14 +4,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eredu_architectures::muse_glimmer::{DecoderConfig, TransformerBlock};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
-use eredu_runtime::{ExpertIdentity, OffloadUnit, WeightBinding};
+use eredu_runtime::{ExpertIdentity, OffloadUnit, ParameterRole, WeightBinding};
 use safemlx::{module::ModuleParameters, Stream};
 
 use crate::backend::mlx::{
     error::Error,
     nn::shared::{MlxBackend, MlxModule},
     runtime::{
-        checkpoint::binding::build_module_bindings_with_recipes_excluding,
+        checkpoint::binding::{
+            build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
+            parameter_role_targets,
+        },
         residency::{
             expert_cache::{ExpertCache, ExpertCatalogEntry},
             expert_provider::{CachedGatedProductBankSpec, CachedGatedProductExpertProvider},
@@ -165,10 +168,14 @@ pub(crate) fn expert_catalog(
         let block = TransformerBlock::<MlxBackend>::new(args, layer, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let module = MlxModule::new(block);
+        let expert_targets = parameter_role_targets(
+            &eredu_architectures::muse_glimmer::layer_parameter_groups(args, layer)?,
+            ParameterRole::ExpertIntermediate,
+        );
         let recipes = module_recipes(&module, args, store)?;
         let bank =
             build_module_bindings_with_recipes_excluding(&module, "", store, recipes, |name| {
-                !name.contains(".mlp.experts.")
+                !parameter_name_in_targets(name, &expert_targets)
             })?;
         for expert in 0..args.num_experts as usize {
             let selection = TensorSelection::Range {

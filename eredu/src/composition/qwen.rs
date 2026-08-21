@@ -308,8 +308,15 @@ fn load_neutral_qwen(
         .map_err(|_| Error::UnsupportedArchitecture("invalid Qwen layer count".into()))?;
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(
+        eredu_architectures::qwen::parameter_description(&architecture, stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate),
+    );
     let unit_layout = decoder_unit_layout(layer_count)?;
     let binding_args = args.clone();
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
@@ -322,7 +329,7 @@ fn load_neutral_qwen(
         move |key| {
             key.starts_with("rope_freqs.")
                 || key.ends_with(".rotary_emb.inv_freq")
-                || (external_experts && key.contains(".mlp.experts."))
+                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
         },
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
@@ -338,7 +345,7 @@ fn load_neutral_qwen(
                 "",
                 store,
                 recipes,
-                |name| external_experts && name.contains(".mlp.experts."),
+                |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )
             .map_err(Into::into)
         },
@@ -1176,6 +1183,11 @@ fn load_neutral_qwen_parallel(
         .map_err(|_| Error::UnsupportedArchitecture("invalid Qwen layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(
+        eredu_architectures::qwen::parameter_description(&global_architecture, stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate),
+    );
     let mut planner = build.planner();
     let static_modules = global_architecture.static_modules();
     for group in eredu_architectures::qwen::static_parallel_parameter_groups::<MlxBackend>(
@@ -1227,7 +1239,7 @@ fn load_neutral_qwen_parallel(
             "",
             store.as_ref(),
             recipes,
-            |name| external_experts && name.contains(".mlp.experts."),
+            |name| external_experts && parameter_name_in_targets(name, &expert_targets),
         )?)?;
         global_parameter_bytes = global_parameter_bytes
             .checked_add(bytes)
@@ -1238,6 +1250,8 @@ fn load_neutral_qwen_parallel(
     let global_static_modules = global_architecture.static_modules().clone();
     let binding_layout = layout.clone();
     let unit_layout = decoder_unit_layout(layer_count)?;
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
         &mut architecture,
@@ -1250,7 +1264,7 @@ fn load_neutral_qwen_parallel(
         move |key| {
             key.starts_with("rope_freqs.")
                 || key.ends_with(".rotary_emb.inv_freq")
-                || (external_experts && key.contains(".mlp.experts."))
+                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
         },
         move |_modules, store| {
             let global = MlxModule::new(global_static_modules.clone());
@@ -1271,7 +1285,7 @@ fn load_neutral_qwen_parallel(
                 "",
                 store,
                 recipes,
-                |name| external_experts && name.contains(".mlp.experts."),
+                |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
             shard_layer_bindings(
                 bindings,

@@ -1,6 +1,6 @@
 // MLX artifact and residency binding for the neutral Qwen hybrid graph.
 
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, path::Path, sync::Arc};
 
 use eredu_architectures::qwen::{
     hybrid::{
@@ -18,7 +18,8 @@ use eredu_checkpoint::{
 use eredu_runtime::{
     CacheResidencyPolicy, CausalModel, ExecutionResidency, ExecutionUnitLayout, ExpertIdentity,
     LayerWeightResidency, LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
-    OffloadUnit, PagedCacheOptions, ResidencyReport, StaticUnitBindings, WeightBinding,
+    OffloadUnit, PagedCacheOptions, ParameterRole, ResidencyReport, StaticUnitBindings,
+    WeightBinding,
 };
 use safemlx::{
     error::Exception,
@@ -38,7 +39,8 @@ use crate::backend::mlx::{
         },
         checkpoint::binding::{
             build_module_bindings, build_module_bindings_with_recipes,
-            build_module_bindings_with_recipes_excluding, populate_module_from_lease_excluding,
+            build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
+            parameter_role_targets, populate_module_from_lease_excluding,
         },
         checkpoint::binding_plan::{BindingPlan, PlannedBinding},
         checkpoint::{
@@ -149,11 +151,13 @@ impl QwenConditionalCheckpointTemplate {
 #[derive(Clone)]
 struct UnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<BTreeSet<String>>,
 }
 
 #[derive(Clone)]
 struct ConditionalUnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<BTreeSet<String>>,
 }
 
 impl MlxUnitPopulator<ConditionalUnit<MlxBackend>> for ConditionalUnitPopulator {
@@ -163,7 +167,7 @@ impl MlxUnitPopulator<ConditionalUnit<MlxBackend>> for ConditionalUnitPopulator 
         lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".experts.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -177,6 +181,35 @@ pub(crate) struct QwenHybridPipelineBindings {
 /// Pipeline/loading adapter over the neutral conditional Qwen3.5 graph.
 pub(crate) struct QwenConditionalPipelineBindings {
     external_experts: bool,
+}
+
+fn conditional_expert_targets(
+    architecture: &ConditionalArchitecture,
+    group: usize,
+    index: usize,
+    unit: &MlxModule<ConditionalUnit<MlxBackend>>,
+) -> Result<BTreeSet<String>, Error> {
+    let groups = match &unit.inner {
+        ConditionalUnit::Vision(_) => return Ok(BTreeSet::new()),
+        ConditionalUnit::Target(block) => hybrid::unit_parallel_parameter_groups(
+            &Unit::Target(block.clone()),
+            &architecture.parsed().text,
+            0,
+            index,
+        ),
+        ConditionalUnit::Prediction(prediction) => hybrid::unit_parallel_parameter_groups(
+            &Unit::Prediction(prediction.clone()),
+            &architecture.parsed().text,
+            group.checked_sub(1).ok_or_else(|| {
+                Error::Parallel("conditional Qwen prediction unit has no text group".into())
+            })?,
+            index,
+        ),
+    }?;
+    Ok(parameter_role_targets(
+        &groups,
+        ParameterRole::ExpertIntermediate,
+    ))
 }
 
 impl QwenConditionalPipelineBindings {
@@ -430,6 +463,7 @@ impl QwenConditionalPipelineBindings {
         layer: &MlxModule<ConditionalUnit<MlxBackend>>,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
+        let expert_targets = conditional_expert_targets(architecture, group, index, layer)?;
         let is_vision = <ConditionalArchitecture as LayeredArchitecture<
             MlxBackend,
             MlxHybridState,
@@ -463,7 +497,7 @@ impl QwenConditionalPipelineBindings {
             unit_recipes(store, &architecture.parsed().text, flat)?
         };
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
-            self.external_experts && name.contains(".experts.")
+            self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
         .map_err(Into::into)
     }
@@ -477,6 +511,8 @@ impl QwenConditionalPipelineBindings {
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
     ) -> Result<Vec<WeightBinding>, Error> {
+        let expert_targets =
+            conditional_expert_targets(architecture, group, index, global_layer)?;
         let is_vision = <ConditionalArchitecture as LayeredArchitecture<
             MlxBackend,
             MlxHybridState,
@@ -511,7 +547,7 @@ impl QwenConditionalPipelineBindings {
         };
         let bindings =
             build_module_bindings_with_recipes_excluding(global_layer, "", store, recipes, |name| {
-                self.external_experts && name.contains(".experts.")
+                self.external_experts && parameter_name_in_targets(name, &expert_targets)
             })?;
         match layout {
             Some(layout) => {
@@ -649,9 +685,18 @@ impl QwenHybridPipelineBindings {
         layer: &MlxModule<Block>,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
+        let expert_targets = parameter_role_targets(
+            &hybrid::unit_parallel_parameter_groups(
+                layer,
+                architecture.config(),
+                group,
+                index,
+            )?,
+            ParameterRole::ExpertIntermediate,
+        );
         let recipes = unit_recipes(store, architecture.config(), self.flat_index(architecture, group, index)?)?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
-            self.external_experts && name.contains(".experts.")
+            self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
         .map_err(Into::into)
     }
@@ -1149,7 +1194,7 @@ impl MlxUnitPopulator<Block> for UnitPopulator {
         lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".experts.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -2759,6 +2804,12 @@ fn load_conditional_store(
 ) -> Result<QwenHybridModel, Error> {
     let mut architecture = ConditionalArchitecture::new(parsed.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(
+        architecture
+            .parameter_description(stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate),
+    );
     let graph = <ConditionalArchitecture as LayeredArchitecture<
         MlxBackend,
         MlxHybridState,
@@ -2782,8 +2833,11 @@ fn load_conditional_store(
         .layer_count();
     let factory = ConditionalUnitPopulator {
         external_experts,
+        expert_targets: Arc::clone(&expert_targets),
     };
     let binding = parsed.text.clone();
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
@@ -2795,7 +2849,8 @@ fn load_conditional_store(
         weights_stream,
         move |key| {
             key.ends_with("rotary_emb.inv_freq")
-                || (external_experts && key.contains(".experts."))
+                || (external_experts
+                    && parameter_name_in_targets(key, &excluded_expert_targets))
         },
         |modules, store| {
             build_module_bindings_with_recipes(
@@ -2817,7 +2872,9 @@ fn load_conditional_store(
                 "",
                 store,
                 recipes,
-                |name| external_experts && name.contains(".experts."),
+                |name| {
+                    external_experts && parameter_name_in_targets(name, &binding_expert_targets)
+                },
             )
             .map_err(Into::into)
         },
@@ -2862,11 +2919,20 @@ fn load_store(
 ) -> Result<QwenHybridModel, Error> {
     let mut architecture = Architecture::new(parsed.text.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(
+        architecture
+            .parameter_description(stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate),
+    );
     let layout = unit_layout(&architecture)?;
     let factory = UnitPopulator {
         external_experts,
+        expert_targets: Arc::clone(&expert_targets),
     };
     let binding_config = parsed.text.clone();
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
@@ -2877,7 +2943,9 @@ fn load_store(
         stream,
         weights_stream,
         move |key| {
-            key.ends_with("rotary_emb.inv_freq") || (external_experts && key.contains(".experts."))
+            key.ends_with("rotary_emb.inv_freq")
+                || (external_experts
+                    && parameter_name_in_targets(key, &excluded_expert_targets))
         },
         |modules, store| {
             let recipes = static_transform_recipes(store)?;
@@ -2891,7 +2959,9 @@ fn load_store(
                 "",
                 store,
                 recipes,
-                |name| external_experts && name.contains(".experts."),
+                |name| {
+                    external_experts && parameter_name_in_targets(name, &binding_expert_targets)
+                },
             )
             .map_err(Into::into)
         },

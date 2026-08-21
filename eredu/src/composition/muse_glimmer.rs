@@ -12,7 +12,8 @@ use eredu_checkpoint::{
 use eredu_runtime::{
     CacheResidencyPolicy, CausalModel, ExecutionUnitLayout, LayerWeightResidency,
     LayeredArchitecture, LayeredForwardState, LayerwiseRuntime, PagedCacheOptions,
-    ParallelModelInfo, RuntimeState, StaticUnitBindings, WeightBinding, WeightResidency,
+    ParallelModelInfo, ParameterRole, RuntimeState, StaticUnitBindings, WeightBinding,
+    WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -29,8 +30,8 @@ use crate::backend::mlx::{
         checkpoint::{
             binding::{
                 binding_bytes, build_module_bindings, build_module_bindings_with_recipes_excluding,
-                materialize_module_bindings, populate_module_from_arrays_excluding,
-                populate_module_from_lease_excluding,
+                materialize_module_bindings, parameter_name_in_targets,
+                populate_module_from_arrays_excluding, populate_module_from_lease_excluding,
             },
             load::{gguf_metadata, gguf_quantization_configs, GgufTensorNames},
             quantization::should_quantize_on_load,
@@ -94,6 +95,7 @@ type ParallelBounded = LayerwiseRuntime<
 #[derive(Clone)]
 struct UnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<std::collections::BTreeSet<String>>,
 }
 
 impl MlxUnitPopulator<NeutralUnit> for UnitPopulator {
@@ -103,7 +105,7 @@ impl MlxUnitPopulator<NeutralUnit> for UnitPopulator {
         lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".mlp.experts.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -545,6 +547,10 @@ impl MuseGlimmerPipelineBindings {
         layout: Option<&eredu_runtime::LocalModelLayout>,
         _assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
+        let expert_targets = architecture
+            .parameter_description()
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate);
         let recipes = crate::composition::muse_glimmer_expert::module_recipes(
             global_layer,
             architecture.args(),
@@ -555,7 +561,7 @@ impl MuseGlimmerPipelineBindings {
             "",
             store,
             recipes,
-            |name| self.external_experts && name.contains(".mlp.experts."),
+            |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
         match layout {
             Some(layout) => {
@@ -587,13 +593,17 @@ impl MuseGlimmerPipelineBindings {
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         self.layer_count(architecture, group)?;
+        let expert_targets = architecture
+            .parameter_description()
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate);
         let recipes = crate::composition::muse_glimmer_expert::module_recipes(
             layer,
             architecture.args(),
             store,
         )?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
-            self.external_experts && name.contains(".mlp.experts.")
+            self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
         .map_err(Into::into)
     }
@@ -1452,18 +1462,29 @@ fn load_store(
 ) -> Result<MuseGlimmerModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(
+        architecture
+            .parameter_description()
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate),
+    );
     let static_args = args.clone();
     let unit_args = args.clone();
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
-        UnitPopulator { external_experts },
+        UnitPopulator {
+            external_experts,
+            expert_targets: Arc::clone(&expert_targets),
+        },
         std::marker::PhantomData::<MlxKeyValueState>,
         layout(&args)?,
         residency,
         stream,
         weights_stream,
-        move |key| external_experts && key.contains(".mlp.experts."),
+        move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
         move |modules, store| {
             let module = MlxModule::new(modules.clone());
             let recipes = crate::composition::muse_glimmer_expert::module_recipes(
@@ -1480,7 +1501,7 @@ fn load_store(
                 &module, &unit_args, store,
             )?;
             build_module_bindings_with_recipes_excluding(&module, "", store, recipes, |name| {
-                external_experts && name.contains(".mlp.experts.")
+                external_experts && parameter_name_in_targets(name, &binding_expert_targets)
             })
             .map_err(Into::into)
         },
@@ -1607,6 +1628,7 @@ fn load_parallel_store(
         &mut architecture,
         UnitPopulator {
             external_experts: false,
+            expert_targets: Arc::new(Default::default()),
         },
         std::marker::PhantomData::<MlxKeyValueState>,
         unit_layout,

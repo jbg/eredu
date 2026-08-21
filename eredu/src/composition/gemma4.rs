@@ -16,8 +16,8 @@ use eredu_checkpoint::{
 };
 use eredu_runtime::{
     CacheResidencyPolicy, CausalModel, ExecutionUnitLayout, LayerWeightResidency,
-    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, RuntimeState,
-    StaticUnitBindings, WeightBinding, WeightResidency,
+    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
+    RuntimeState, StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -42,8 +42,8 @@ use crate::backend::mlx::{
         checkpoint::{
             binding::{
                 binding_bytes, build_module_bindings, build_module_bindings_with_recipes_excluding,
-                materialize_module_bindings, populate_module_from_arrays_excluding,
-                populate_module_from_lease_excluding,
+                materialize_module_bindings, parameter_name_in_targets, parameter_role_targets,
+                populate_module_from_arrays_excluding, populate_module_from_lease_excluding,
             },
             load::{gguf_metadata, gguf_quantization_configs, GgufTensorNames},
             quantization::should_quantize_on_load,
@@ -247,16 +247,26 @@ impl Gemma4Bindings {
         layer: &Gemma4PipelineUnit,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let recipes = if group_kind(architecture, group)
-            == eredu_runtime::ArchitectureGroupKind::Decoder
-            && !self.external_experts
-        {
+        let is_decoder =
+            group_kind(architecture, group) == eredu_runtime::ArchitectureGroupKind::Decoder;
+        let expert_targets = if is_decoder {
+            parameter_role_targets(
+                &eredu_architectures::gemma4::layer_parameter_groups(
+                    &architecture.args().text,
+                    index,
+                )?,
+                ParameterRole::ExpertIntermediate,
+            )
+        } else {
+            Default::default()
+        };
+        let recipes = if is_decoder && !self.external_experts {
             gemma4_unit_recipes(&architecture.args().text, index, store)?
         } else {
             BTreeMap::new()
         };
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
-            self.external_experts && name.contains(".experts.switch_glu.")
+            self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
         .map_err(Into::into)
     }
@@ -272,6 +282,17 @@ impl Gemma4Bindings {
     ) -> Result<Vec<WeightBinding>, Error> {
         let is_decoder =
             group_kind(architecture, group) == eredu_runtime::ArchitectureGroupKind::Decoder;
+        let expert_targets = if is_decoder {
+            parameter_role_targets(
+                &eredu_architectures::gemma4::layer_parameter_groups(
+                    &architecture.args().text,
+                    index,
+                )?,
+                ParameterRole::ExpertIntermediate,
+            )
+        } else {
+            Default::default()
+        };
         let recipes = if is_decoder && !self.external_experts {
             gemma4_unit_recipes(&architecture.args().text, index, store)?
         } else {
@@ -282,7 +303,7 @@ impl Gemma4Bindings {
             "",
             store,
             recipes,
-            |name| self.external_experts && name.contains(".experts.switch_glu."),
+            |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
         match (is_decoder, layout) {
             (true, Some(layout)) => shard_layer_bindings(
@@ -323,6 +344,7 @@ type ParallelBounded = LayerwiseRuntime<
 #[derive(Clone)]
 struct UnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<std::collections::BTreeSet<String>>,
 }
 
 impl MlxUnitPopulator<NeutralUnit> for UnitPopulator {
@@ -332,7 +354,7 @@ impl MlxUnitPopulator<NeutralUnit> for UnitPopulator {
         lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".experts.switch_glu.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -1714,6 +1736,12 @@ fn load_store(
 ) -> Result<Gemma4Model, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(
+        architecture
+            .parameter_description(stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate),
+    );
     let vision_layers = args
         .vision
         .as_ref()
@@ -1724,16 +1752,21 @@ fn load_store(
         .map_or(0, |config| config.num_hidden_layers as usize);
     let binding_args = args.text.clone();
     let text_start = vision_layers + audio_layers;
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
-        UnitPopulator { external_experts },
+        UnitPopulator {
+            external_experts,
+            expert_targets: Arc::clone(&expert_targets),
+        },
         std::marker::PhantomData::<MlxHybridState>,
         execution_layout(&args)?,
         residency,
         stream,
         weights_stream,
-        move |key| external_experts && key.contains(".experts.switch_glu."),
+        move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
@@ -1766,7 +1799,7 @@ fn load_store(
                 "",
                 store,
                 recipes,
-                |name| external_experts && name.contains(".experts.switch_glu."),
+                |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )
             .map_err(Into::into)
         },
@@ -1909,6 +1942,7 @@ fn load_parallel_store(
         &mut architecture,
         UnitPopulator {
             external_experts: false,
+            expert_targets: Arc::new(Default::default()),
         },
         std::marker::PhantomData::<MlxHybridState>,
         unit_layout,

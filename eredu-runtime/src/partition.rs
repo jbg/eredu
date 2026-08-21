@@ -198,6 +198,20 @@ impl ArchitectureParameterDescription {
         &self.groups
     }
 
+    /// Returns every physical target owned by groups with the supplied semantic role.
+    ///
+    /// Selection happens after architecture ownership has been assigned, so callers
+    /// do not need to rediscover families, aliases, or packed companions from target
+    /// name syntax.
+    pub fn targets_for_role(&self, role: crate::ParameterRole) -> BTreeSet<String> {
+        self.groups
+            .iter()
+            .filter(|owned| owned.group().role() == role)
+            .flat_map(|owned| owned.group().members())
+            .map(|member| member.target().to_owned())
+            .collect()
+    }
+
     /// Selects rank-owned groups without discarding their architecture owner.
     pub fn select_owned<G, A>(
         &self,
@@ -1076,6 +1090,52 @@ mod tests {
         assert_eq!(
             selected[1].owner(),
             &ParameterGroupOwner::execution_unit(ExecutionGroupId::new("primary").unwrap(), 1,)
+        );
+    }
+
+    #[test]
+    fn parameter_description_selects_every_owned_target_for_a_role() {
+        let expert = ParameterGroupSpec::new(
+            "model.layers.1.expert_intermediate",
+            ParameterRole::ExpertIntermediate,
+            [
+                ParameterMemberSpec::new(
+                    "model.layers.1.moe.packed.weight",
+                    vec![4, 2],
+                    MemberSharding::Replicated,
+                ),
+                ParameterMemberSpec::new(
+                    "model.layers.1.moe.packed.scales",
+                    vec![4, 1],
+                    MemberSharding::Replicated,
+                ),
+                ParameterMemberSpec::new(
+                    "model.layers.1.moe.alias.biases",
+                    vec![4, 1],
+                    MemberSharding::Replicated,
+                ),
+            ],
+        )
+        .unwrap();
+        let replicated = parameter("router", "model.layers.1.moe.router.weight");
+        let owner =
+            ParameterGroupOwner::execution_unit(ExecutionGroupId::new("primary").unwrap(), 1);
+        let description = parameter_description(
+            vec![expert.clone(), replicated.clone()],
+            vec![
+                OwnedParameterGroupSpec::new(owner.clone(), expert),
+                OwnedParameterGroupSpec::new(owner, replicated),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            description.targets_for_role(ParameterRole::ExpertIntermediate),
+            BTreeSet::from([
+                "model.layers.1.moe.alias.biases".to_owned(),
+                "model.layers.1.moe.packed.scales".to_owned(),
+                "model.layers.1.moe.packed.weight".to_owned(),
+            ])
         );
     }
 

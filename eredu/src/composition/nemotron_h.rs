@@ -11,8 +11,8 @@ use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, Wei
 use eredu_runtime::{
     ActivationObserver, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionGraph,
     ExecutionUnitLayout, ExpertIdentity, LayerWeightResidency, LayerwiseModelMetadata,
-    LayerwiseRuntime, OffloadUnit, PagedCacheOptions, ParallelModelInfo, ResidencyReport,
-    StaticUnitBindings, WeightBinding, WeightResidency,
+    LayerwiseRuntime, OffloadUnit, PagedCacheOptions, ParallelModelInfo, ParameterRole,
+    ResidencyReport, StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -34,8 +34,8 @@ use crate::{
             checkpoint::{
                 binding::{
                     binding_bytes, build_module_bindings, build_module_bindings_with_recipes,
-                    build_module_bindings_with_recipes_excluding,
-                    populate_module_from_lease_excluding,
+                    build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
+                    parameter_role_targets, populate_module_from_lease_excluding,
                 },
                 binding_plan::{BindingPlan, PlannedBinding},
                 load::{gguf_quantization_configs, GgufTensorNames},
@@ -153,6 +153,7 @@ impl eredu_runtime::ActivationObserver<Array, eredu_nn::Error> for NeutralNemotr
 #[derive(Clone)]
 struct NemotronHUnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<std::collections::BTreeSet<String>>,
 }
 
 /// Pipeline/loading adapter over the same neutral Nemotron-H blocks used by resident
@@ -236,6 +237,19 @@ impl NemotronHBindings {
         layer: &MlxModule<NeutralBlock>,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
+        let flat = execution_layout(architecture.args())?
+            .ordinal(group, index)
+            .ok_or_else(|| {
+                Error::Parallel(format!("Nemotron-H has no unit {index} in group {group}"))
+            })?;
+        let expert_targets = parameter_role_targets(
+            &eredu_architectures::nemotron_h::unit_parallel_parameter_groups(
+                layer,
+                architecture.args(),
+                flat,
+            )?,
+            ParameterRole::ExpertIntermediate,
+        );
         let recipes = unit_recipes(
             store,
             architecture.args(),
@@ -244,7 +258,7 @@ impl NemotronHBindings {
             !self.external_experts,
         )?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
-            self.external_experts && name.contains(".experts.")
+            self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
         .map_err(Into::into)
     }
@@ -310,7 +324,7 @@ impl MlxUnitPopulator<NeutralBlock> for NemotronHUnitPopulator {
         lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".experts.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -343,6 +357,7 @@ fn build_unit(args: &ModelArgs, index: usize, stream: &Stream) -> Result<Neutral
 #[derive(Clone)]
 struct NemotronHParallelUnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<std::collections::BTreeSet<String>>,
 }
 
 impl MlxUnitPopulator<NeutralBlock> for NemotronHParallelUnitPopulator {
@@ -352,7 +367,7 @@ impl MlxUnitPopulator<NeutralBlock> for NemotronHParallelUnitPopulator {
         lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".experts.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -834,19 +849,31 @@ fn load_neutral(
 ) -> Result<NemotronHModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(
+        architecture
+            .parameter_description(stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate),
+    );
     let static_binding_args = args.clone();
     let binding_args = args.clone();
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
-        NemotronHUnitPopulator { external_experts },
+        NemotronHUnitPopulator {
+            external_experts,
+            expert_targets: Arc::clone(&expert_targets),
+        },
         std::marker::PhantomData::<MlxHybridState>,
         execution_layout(&args)?,
         options,
         stream,
         weights_stream,
         move |key| {
-            key.ends_with(".rotary_emb.inv_freq") || (external_experts && key.contains(".experts."))
+            key.ends_with(".rotary_emb.inv_freq")
+                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
         },
         move |modules, store| {
             build_module_bindings_with_recipes(
@@ -863,7 +890,7 @@ fn load_neutral(
                 "",
                 store,
                 unit_recipes_flat(store, &binding_args, index, !external_experts)?,
-                |name| external_experts && name.contains(".experts."),
+                |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )
             .map_err(Into::into)
         },
@@ -916,6 +943,12 @@ fn load_neutral_parallel(
         .ok_or_else(|| Error::Parallel("Nemotron-H unit count overflowed".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(
+        global_architecture
+            .parameter_description(stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate),
+    );
     let mut planner = build.planner();
     for group in eredu_architectures::nemotron_h::static_parallel_parameter_groups::<MlxBackend>(
         global_architecture.static_modules(),
@@ -943,7 +976,10 @@ fn load_neutral_parallel(
     let state_layout = architecture
         .runtime_state_layout()
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let factory = NemotronHParallelUnitPopulator { external_experts };
+    let factory = NemotronHParallelUnitPopulator {
+        external_experts,
+        expert_targets: Arc::clone(&expert_targets),
+    };
 
     let global_static = MlxModule::new(global_architecture.static_modules().clone());
     let global_static_bindings = build_module_bindings_with_recipes(
@@ -960,7 +996,7 @@ fn load_neutral_parallel(
             "",
             store.as_ref(),
             unit_recipes_flat(store.as_ref(), &args, layer, !external_experts)?,
-            |name| external_experts && name.contains(".experts."),
+            |name| external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
         global_parameter_bytes = global_parameter_bytes
             .checked_add(binding_bytes(&bindings)?)
@@ -975,6 +1011,8 @@ fn load_neutral_parallel(
     let static_binding_args = args.clone();
     let binding_args = args.clone();
     let global_static_modules = global_architecture.static_modules().clone();
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
         &mut architecture,
@@ -985,7 +1023,8 @@ fn load_neutral_parallel(
         stream,
         weights_stream,
         move |key| {
-            key.ends_with(".rotary_emb.inv_freq") || (external_experts && key.contains(".experts."))
+            key.ends_with(".rotary_emb.inv_freq")
+                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
         },
         move |_modules, store| {
             let global = MlxModule::new(global_static_modules.clone());
@@ -1004,7 +1043,7 @@ fn load_neutral_parallel(
                 "",
                 store,
                 unit_recipes_flat(store, &binding_args, layer, !external_experts)?,
-                |name| external_experts && name.contains(".experts."),
+                |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
             let target = binding_args.num_hidden_layers as usize;
             let prefix = if layer < target {

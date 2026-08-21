@@ -166,6 +166,7 @@ impl eredu_runtime::ActivationObserver<Array, eredu_nn::Error> for NeutralLfm2Ob
 #[derive(Clone)]
 struct Lfm2UnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<BTreeSet<String>>,
 }
 
 /// Pipeline/loading adapter over the same neutral LFM2 blocks used by resident
@@ -331,7 +332,7 @@ impl MlxUnitPopulator<NeutralBlock> for Lfm2UnitPopulator {
         lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".feed_forward.experts.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -340,6 +341,7 @@ impl MlxUnitPopulator<NeutralBlock> for Lfm2UnitPopulator {
 #[derive(Clone)]
 struct Lfm2ParallelUnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<BTreeSet<String>>,
 }
 
 impl MlxUnitPopulator<NeutralBlock> for Lfm2ParallelUnitPopulator {
@@ -349,7 +351,7 @@ impl MlxUnitPopulator<NeutralBlock> for Lfm2ParallelUnitPopulator {
         lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".feed_forward.experts.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -712,11 +714,22 @@ fn load_neutral(
         .map_err(|_| Error::UnsupportedArchitecture("invalid LFM2 layer count".into()))?;
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(
+        architecture
+            .parameter_description(stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate),
+    );
     let binding_args = args.clone();
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
-        Lfm2UnitPopulator { external_experts },
+        Lfm2UnitPopulator {
+            external_experts,
+            expert_targets: Arc::clone(&expert_targets),
+        },
         std::marker::PhantomData::<MlxHybridState>,
         execution_layout(count)?,
         options,
@@ -724,7 +737,7 @@ fn load_neutral(
         weights_stream,
         move |key| {
             key.ends_with(".rotary_emb.inv_freq")
-                || (external_experts && key.contains(".feed_forward.experts."))
+                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
         },
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
@@ -739,7 +752,7 @@ fn load_neutral(
                 } else {
                     unit_recipes(store, &binding_args, index)?
                 },
-                |name| external_experts && name.contains(".feed_forward.experts."),
+                |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )
             .map_err(Into::into)
         },
@@ -786,6 +799,12 @@ fn load_neutral_parallel(
         .map_err(|_| Error::Parallel("invalid LFM2 layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(
+        global_architecture
+            .parameter_description(stream)
+            .map_err(|error| Error::Parallel(error.to_string()))?
+            .targets_for_role(ParameterRole::ExpertIntermediate),
+    );
     let mut planner = build.planner();
     for group in eredu_architectures::lfm2::static_parallel_parameter_groups::<MlxBackend>(
         global_architecture.static_modules(),
@@ -814,7 +833,10 @@ fn load_neutral_parallel(
     let state_layout = architecture
         .runtime_state_layout()
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let factory = Lfm2ParallelUnitPopulator { external_experts };
+    let factory = Lfm2ParallelUnitPopulator {
+        external_experts,
+        expert_targets: Arc::clone(&expert_targets),
+    };
 
     let global_static = MlxModule::new(global_architecture.static_modules().clone());
     let global_static_bindings = build_module_bindings(&global_static, "", store.as_ref())?;
@@ -831,7 +853,7 @@ fn load_neutral_parallel(
             } else {
                 unit_recipes(store.as_ref(), &args, layer)?
             },
-            |name| external_experts && name.contains(".feed_forward.experts."),
+            |name| external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
         global_parameter_bytes = global_parameter_bytes
             .checked_add(binding_bytes(&bindings)?)
@@ -843,6 +865,8 @@ fn load_neutral_parallel(
     let unit_layout = Arc::clone(&shared_layout);
     let binding_args = args.clone();
     let global_static_modules = global_architecture.static_modules().clone();
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
         &mut architecture,
@@ -854,7 +878,7 @@ fn load_neutral_parallel(
         weights_stream,
         move |key| {
             key.ends_with(".rotary_emb.inv_freq")
-                || (external_experts && key.contains(".feed_forward.experts."))
+                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
         },
         move |_modules, store| {
             let global = MlxModule::new(global_static_modules.clone());
@@ -873,7 +897,7 @@ fn load_neutral_parallel(
                 } else {
                     unit_recipes(store, &binding_args, layer)?
                 },
-                |name| external_experts && name.contains(".feed_forward.experts."),
+                |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
             shard_layer_bindings(
                 bindings,

@@ -4,14 +4,17 @@ use std::collections::BTreeMap;
 
 use eredu_architectures::gemma4::{DenseBlock, ModelArgs};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
-use eredu_runtime::{ExpertIdentity, OffloadUnit, WeightBinding};
+use eredu_runtime::{ExpertIdentity, OffloadUnit, ParameterRole, WeightBinding};
 use safemlx::Stream;
 
 use crate::backend::mlx::{
     error::Error,
     nn::shared::{MlxBackend, MlxModule},
     runtime::{
-        checkpoint::binding::build_module_bindings_with_recipes_excluding,
+        checkpoint::binding::{
+            build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
+            parameter_role_targets,
+        },
         residency::{
             expert_cache::{ExpertCache, ExpertCatalogEntry},
             expert_provider::{CachedGatedProductBankSpec, CachedGatedProductExpertProvider},
@@ -50,12 +53,16 @@ pub(crate) fn expert_catalog(
         ]);
         let block = DenseBlock::<MlxBackend>::new(args, layer, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let expert_targets = parameter_role_targets(
+            &eredu_architectures::gemma4::layer_parameter_groups(args, layer)?,
+            ParameterRole::ExpertIntermediate,
+        );
         let bank = build_module_bindings_with_recipes_excluding(
             &MlxModule::new(block),
             "",
             store,
             recipes,
-            |name| !name.contains(".experts.switch_glu."),
+            |name| !parameter_name_in_targets(name, &expert_targets),
         )?;
         if bank.is_empty() {
             return Err(Error::UnsupportedArchitecture(format!(

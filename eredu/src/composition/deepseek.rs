@@ -10,7 +10,8 @@ use eredu_architectures::deepseek::{self, LayerPolicy, V3Args, V4Args, V4Attenti
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
     CacheResidencyPolicy, CausalModel, DeviceState, ExecutionUnitLayout, LayerWeightResidency,
-    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, RuntimeState, WeightResidency,
+    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole, RuntimeState,
+    WeightResidency,
 };
 use safemlx::{
     distributed::Group,
@@ -37,6 +38,7 @@ use crate::backend::mlx::{
         },
         checkpoint::binding::{
             build_module_bindings, build_module_bindings_with_recipes_excluding,
+            parameter_name_in_targets, parameter_role_targets,
             populate_module_from_lease_excluding,
         },
         checkpoint::load::gguf_quantization_configs,
@@ -143,6 +145,7 @@ impl eredu_runtime::ActivationObserver<Array, eredu_nn::Error> for NeutralDeepSe
 #[derive(Clone)]
 struct V3UnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<std::collections::BTreeSet<String>>,
 }
 
 impl MlxUnitPopulator<V3Unit> for V3UnitPopulator {
@@ -152,7 +155,7 @@ impl MlxUnitPopulator<V3Unit> for V3UnitPopulator {
         lease: &ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".mlp.experts.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -161,6 +164,7 @@ impl MlxUnitPopulator<V3Unit> for V3UnitPopulator {
 #[derive(Clone)]
 struct V4UnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<std::collections::BTreeSet<String>>,
 }
 
 impl MlxUnitPopulator<V4Unit> for V4UnitPopulator {
@@ -170,7 +174,7 @@ impl MlxUnitPopulator<V4Unit> for V4UnitPopulator {
         lease: &ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".switch_mlp.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -344,8 +348,17 @@ impl DeepSeekModel {
     ) -> Result<Self, Error> {
         let mut architecture = V3Architecture::new(args.clone(), stream).map_err(neutral_error)?;
         let layout = execution_layout::<V3Architecture, V3State>(&architecture)?;
+        let expert_targets = Arc::new(
+            deepseek::parallel::v3_parameter_description(&args)?
+                .targets_for_role(ParameterRole::ExpertIntermediate),
+        );
         let binding_args = args.clone();
-        let factory = V3UnitPopulator { external_experts };
+        let factory = V3UnitPopulator {
+            external_experts,
+            expert_targets: Arc::clone(&expert_targets),
+        };
+        let excluded_expert_targets = Arc::clone(&expert_targets);
+        let binding_expert_targets = Arc::clone(&expert_targets);
         let (policy, _metadata) = prepare_layerwise_policy_with_bindings(
             store,
             &mut architecture,
@@ -358,7 +371,8 @@ impl DeepSeekModel {
             move |key| {
                 key.starts_with("rope_freqs.")
                     || key.ends_with("rotary_emb.inv_freq")
-                    || (external_experts && key.contains(".mlp.experts."))
+                    || (external_experts
+                        && parameter_name_in_targets(key, &excluded_expert_targets))
             },
             |modules, store| {
                 build_module_bindings(&MlxModule::new(modules.clone()), "", store)
@@ -371,7 +385,9 @@ impl DeepSeekModel {
                     "",
                     store,
                     recipes,
-                    |name| external_experts && name.contains(".mlp.experts."),
+                    |name| {
+                        external_experts && parameter_name_in_targets(name, &binding_expert_targets)
+                    },
                 )
                 .map_err(Into::into)
             },
@@ -406,8 +422,17 @@ impl DeepSeekModel {
     ) -> Result<Self, Error> {
         let mut architecture = V4Architecture::new(args.clone(), stream).map_err(neutral_error)?;
         let layout = execution_layout::<V4Architecture, V4State>(&architecture)?;
+        let expert_targets = Arc::new(
+            deepseek::parallel::v4_parameter_description(&args)?
+                .targets_for_role(ParameterRole::ExpertIntermediate),
+        );
         let binding_args = args.clone();
-        let factory = V4UnitPopulator { external_experts };
+        let factory = V4UnitPopulator {
+            external_experts,
+            expert_targets: Arc::clone(&expert_targets),
+        };
+        let excluded_expert_targets = Arc::clone(&expert_targets);
+        let binding_expert_targets = Arc::clone(&expert_targets);
         let (policy, _metadata) = prepare_layerwise_policy_with_bindings(
             store,
             &mut architecture,
@@ -420,9 +445,7 @@ impl DeepSeekModel {
             move |key| {
                 key.ends_with("rotary_emb.inv_freq")
                     || (external_experts
-                        && (key.contains(".switch_mlp.")
-                            || key.contains(".expert_banks.")
-                            || key.contains(".ffn.experts.")))
+                        && parameter_name_in_targets(key, &excluded_expert_targets))
             },
             |modules, store| {
                 build_module_bindings(&MlxModule::new(modules.clone()), "", store)
@@ -439,7 +462,9 @@ impl DeepSeekModel {
                     "",
                     store,
                     recipes,
-                    |name| external_experts && name.contains(".switch_mlp."),
+                    |name| {
+                        external_experts && parameter_name_in_targets(name, &binding_expert_targets)
+                    },
                 )
                 .map_err(Into::into)
             },
@@ -487,11 +512,16 @@ impl DeepSeekModel {
         let (_, layout) = planner.finish()?;
         let geometry = deepseek::parallel::v3_local_geometry(&args, &layout)?;
         let global = V3Architecture::new(args.clone(), stream).map_err(neutral_error)?;
+        let expert_targets = Arc::new(
+            deepseek::parallel::v3_parameter_description(&args)?
+                .targets_for_role(ParameterRole::ExpertIntermediate),
+        );
         let global_static = global.static_modules().clone();
         let mut architecture =
             V3Architecture::new_parallel(args.clone(), geometry, stream).map_err(neutral_error)?;
         let factory = V3UnitPopulator {
             external_experts: true,
+            expert_targets: Arc::clone(&expert_targets),
         };
         let static_layout = Arc::new(layout);
         let unit_layout = Arc::clone(&static_layout);
@@ -506,10 +536,13 @@ impl DeepSeekModel {
             options,
             stream,
             weights_stream,
-            |key| {
-                key.starts_with("rope_freqs.")
-                    || key.ends_with("rotary_emb.inv_freq")
-                    || key.contains(".mlp.experts.")
+            {
+                let expert_targets = Arc::clone(&expert_targets);
+                move |key| {
+                    key.starts_with("rope_freqs.")
+                        || key.ends_with("rotary_emb.inv_freq")
+                        || parameter_name_in_targets(key, &expert_targets)
+                }
             },
             move |_modules, store| {
                 let bindings =
@@ -565,11 +598,16 @@ impl DeepSeekModel {
         let (_, layout) = planner.finish()?;
         let geometry = deepseek::parallel::v4_local_geometry(&args, &layout)?;
         let global = V4Architecture::new(args.clone(), stream).map_err(neutral_error)?;
+        let expert_targets = Arc::new(
+            deepseek::parallel::v4_parameter_description(&args)?
+                .targets_for_role(ParameterRole::ExpertIntermediate),
+        );
         let global_static = global.static_modules().clone();
         let mut architecture =
             V4Architecture::new_parallel(args.clone(), geometry, stream).map_err(neutral_error)?;
         let factory = V4UnitPopulator {
             external_experts: true,
+            expert_targets: Arc::clone(&expert_targets),
         };
         let static_layout = Arc::new(layout);
         let unit_layout = Arc::clone(&static_layout);
@@ -584,11 +622,12 @@ impl DeepSeekModel {
             options,
             stream,
             weights_stream,
-            |key| {
-                key.ends_with("rotary_emb.inv_freq")
-                    || key.contains(".switch_mlp.")
-                    || key.contains(".expert_banks.")
-                    || key.contains(".ffn.experts.")
+            {
+                let expert_targets = Arc::clone(&expert_targets);
+                move |key| {
+                    key.ends_with("rotary_emb.inv_freq")
+                        || parameter_name_in_targets(key, &expert_targets)
+                }
             },
             move |_modules, store| {
                 let bindings =
@@ -2894,9 +2933,13 @@ pub(crate) fn v3_unit_bindings(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     external_experts: bool,
 ) -> Result<Vec<eredu_runtime::WeightBinding>, Error> {
+    let expert_targets = parameter_role_targets(
+        &deepseek::parallel::v3_layer_parameter_groups(args, ordinal)?,
+        ParameterRole::ExpertIntermediate,
+    );
     let recipes = v3_unit_recipes(store, args, ordinal, external_experts)?;
     build_module_bindings_with_recipes_excluding(unit, "", store, recipes, |name| {
-        external_experts && name.contains(".mlp.experts.")
+        external_experts && parameter_name_in_targets(name, &expert_targets)
     })
     .map_err(Into::into)
 }
@@ -2921,16 +2964,17 @@ pub(crate) fn v4_unit_bindings(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     external_experts: bool,
 ) -> Result<Vec<eredu_runtime::WeightBinding>, Error> {
+    let expert_targets = parameter_role_targets(
+        &deepseek::parallel::v4_layer_parameter_groups(args, ordinal)?,
+        ParameterRole::ExpertIntermediate,
+    );
     let recipes = if external_experts {
         BTreeMap::new()
     } else {
         v4_unit_recipes(store, args, ordinal)?
     };
     build_module_bindings_with_recipes_excluding(unit, "", store, recipes, |name| {
-        external_experts
-            && (name.contains(".switch_mlp.")
-                || name.contains(".expert_banks.")
-                || name.contains(".ffn.experts."))
+        external_experts && parameter_name_in_targets(name, &expert_targets)
     })
     .map_err(Into::into)
 }
