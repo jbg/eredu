@@ -32,38 +32,6 @@ pub(crate) fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, Gguf
         .collect()
 }
 
-pub(crate) fn gguf_string(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    key: &str,
-) -> Result<String, Error> {
-    match metadata.get(key) {
-        Some(GgufMetadataValue::String(value)) => Ok(value.clone()),
-        Some(_) => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata key {key:?} has the wrong type"
-        ))),
-        None => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF metadata is missing required key {key:?}"
-        ))),
-    }
-}
-
-pub(crate) fn gguf_i32_catalog(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    key: &str,
-) -> Result<i32, Error> {
-    let value = metadata
-        .get(key)
-        .and_then(GgufMetadataValue::as_i64)
-        .ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
-                "GGUF metadata key {key:?} is missing or has the wrong type"
-            ))
-        })?;
-    i32::try_from(value).map_err(|_| {
-        Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
-    })
-}
-
 pub(crate) trait GgufTensorNames {
     fn contains_gguf_tensor(&self, name: &str) -> bool;
 

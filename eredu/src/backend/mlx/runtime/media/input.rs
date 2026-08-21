@@ -180,159 +180,6 @@ impl<'a> InputMetadata<'a> {
     }
 }
 
-/// Result of preparing typed input for a decoder model.
-#[derive(Debug)]
-pub(crate) enum PreparedPrefill {
-    /// Text-only token IDs, which can use the architecture's ordinary fast path.
-    Text(Array),
-    /// Token IDs paired with embeddings after encoded media has been inserted.
-    Embeddings { tokens: Array, embeddings: Array },
-}
-
-impl PreparedPrefill {
-    /// Returns the decoder token IDs represented by this prepared input.
-    pub(crate) fn tokens(&self) -> &Array {
-        match self {
-            Self::Text(tokens) => tokens,
-            Self::Embeddings { tokens, .. } => tokens,
-        }
-    }
-
-    /// Returns prepared embeddings when the input included model-native media.
-    pub(crate) fn embeddings(&self) -> Option<&Array> {
-        match self {
-            Self::Text(_) => None,
-            Self::Embeddings { embeddings, .. } => Some(embeddings),
-        }
-    }
-}
-
-/// Placeholder token associated with one non-text modality.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ModalityToken {
-    pub modality: Modality,
-    pub token_id: u32,
-}
-
-/// Assembles ordered typed input into decoder tokens and embeddings.
-///
-/// Architecture implementations supply only text embedding and media encoding;
-/// explicit media parts determine ordered insertion across model families.
-pub(crate) fn prepare_decoder_prefill(
-    input: ModelInput<'_>,
-    modality_tokens: &[ModalityToken],
-    hidden_size: i32,
-    model_name: &str,
-    stream: &Stream,
-    mut embed_text: impl FnMut(&Array, &Stream) -> Result<Array, Exception>,
-    mut encode_media: impl FnMut(&InputPart<'_>, &Stream) -> Result<Vec<Array>, Exception>,
-) -> Result<PreparedPrefill, Exception> {
-    validate(input)?;
-    if input
-        .parts
-        .iter()
-        .all(|part| part.modality == Modality::Text)
-    {
-        let tokens = text_token_ids(input, stream)?;
-        reject_modality_tokens(
-            &token_ids_from_array(&tokens, stream)?,
-            modality_tokens,
-            model_name,
-        )?;
-        return Ok(PreparedPrefill::Text(tokens));
-    }
-
-    let mut token_parts = Vec::new();
-    let mut embedding_parts = Vec::new();
-    for part in input.parts {
-        match (part.modality, part.payload) {
-            (Modality::Text, InputPayload::TokenIds(tokens)) => {
-                ensure_batch_one(tokens, &format!("{model_name} text tokens"))?;
-                reject_modality_tokens(
-                    &token_ids_from_array(tokens, stream)?,
-                    modality_tokens,
-                    model_name,
-                )?;
-                token_parts.push(tokens.clone());
-                embedding_parts.push(embed_text(tokens, stream)?);
-            }
-            (Modality::Text, InputPayload::Embeddings(_)) => {
-                return Err(Exception::custom(format!(
-                    "{model_name} typed input does not support text embeddings yet"
-                )));
-            }
-            (Modality::Text, InputPayload::Tensor(_)) => {
-                return Err(Exception::custom(format!(
-                    "{model_name} text input does not accept tensor payloads"
-                )));
-            }
-            (modality, _) => {
-                let token_id = modality_tokens
-                    .iter()
-                    .find(|entry| entry.modality == modality)
-                    .map(|entry| entry.token_id)
-                    .ok_or_else(|| {
-                        Exception::custom(format!(
-                            "{model_name} typed input does not support {} input yet",
-                            modality.as_str()
-                        ))
-                    })?;
-                let chunks = encode_media(part, stream)?;
-                if chunks.is_empty() {
-                    return Err(Exception::custom(format!(
-                        "{model_name} {} input produced no embeddings",
-                        modality.as_str()
-                    )));
-                }
-                for embeddings in chunks {
-                    ensure_batch_one(
-                        &embeddings,
-                        &format!("{model_name} {} embeddings", modality.as_str()),
-                    )?;
-                    ensure_hidden_size(
-                        &embeddings,
-                        hidden_size,
-                        &format!("{model_name} {} embeddings", modality.as_str()),
-                    )?;
-                    token_parts.push(media_tokens(token_id, embeddings.dim(1) as usize, stream)?);
-                    embedding_parts.push(embeddings);
-                }
-            }
-        }
-    }
-
-    Ok(PreparedPrefill::Embeddings {
-        tokens: concatenate_axis(&token_parts, 1, stream)?,
-        embeddings: concatenate_axis(&embedding_parts, 1, stream)?,
-    })
-}
-
-fn reject_modality_tokens(
-    token_ids: &[u32],
-    modality_tokens: &[ModalityToken],
-    model_name: &str,
-) -> Result<(), Exception> {
-    for entry in modality_tokens {
-        if token_ids.contains(&entry.token_id) {
-            return Err(Exception::custom(format!(
-                "{model_name} text input contains a {} media token; supply media as an explicit input part instead",
-                entry.modality.as_str()
-            )));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn ensure_batch_one(array: &Array, name: &str) -> Result<(), Exception> {
-    let shape = array.shape();
-    if shape.first() != Some(&1) {
-        return Err(Exception::custom(format!(
-            "{name} currently supports batch size 1, got shape {shape:?}"
-        )));
-    }
-    Ok(())
-}
-
 pub(crate) fn ensure_hidden_size(
     array: &Array,
     hidden_size: i32,
@@ -345,29 +192,6 @@ pub(crate) fn ensure_hidden_size(
         )));
     }
     Ok(())
-}
-
-fn media_tokens(token_id: u32, len: usize, stream: &Stream) -> Result<Array, Exception> {
-    token_ids_array(&vec![token_id; len], stream)
-}
-
-pub(crate) fn token_ids_from_array(tokens: &Array, stream: &Stream) -> Result<Vec<u32>, Exception> {
-    ensure_batch_one(tokens, "typed input token ids")?;
-    if tokens.ndim() != 2 {
-        return Err(Exception::custom(format!(
-            "typed input token ids must have rank 2, got {:?}",
-            tokens.shape()
-        )));
-    }
-    let mut ids = Vec::with_capacity(tokens.dim(1) as usize);
-    for index in 0..tokens.dim(1) {
-        ids.push(
-            tokens
-                .try_index_device((0, index), stream)?
-                .item::<u32>(stream),
-        );
-    }
-    Ok(ids)
 }
 
 /// Validates basic modality/payload compatibility.
@@ -515,15 +339,8 @@ fn validate_rank_at_least(tensor: &Array, min_rank: usize, name: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        prepare_decoder_prefill, validate, InputMetadata, InputPart, InputPayload, Modality,
-        ModalityToken, ModelInput, PreparedPrefill,
-    };
-    use safemlx::{Array, Device, DeviceType, Stream};
-
-    fn stream() -> Stream {
-        Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
-    }
+    use super::{validate, InputMetadata, InputPart, InputPayload, Modality, ModelInput};
+    use safemlx::Array;
 
     #[test]
     fn validates_text_token_part() {
@@ -573,69 +390,5 @@ mod tests {
         ];
 
         validate(ModelInput::new(&parts)).unwrap();
-    }
-
-    #[test]
-    fn shared_prefill_inserts_explicit_media_and_preserves_order() {
-        let stream = stream();
-        let before = Array::from_slice(&[10u32], &[1, 1]);
-        let after = Array::from_slice(&[11u32], &[1, 1]);
-        let image = Array::from_slice(&[1.0f32; 8], &[1, 2, 4]);
-        let parts = [
-            InputPart::text_token_ids(&before),
-            InputPart {
-                modality: Modality::Image,
-                payload: InputPayload::Embeddings(&image),
-                metadata: InputMetadata::empty(),
-            },
-            InputPart::text_token_ids(&after),
-        ];
-        let prepared = prepare_decoder_prefill(
-            ModelInput::new(&parts),
-            &[ModalityToken {
-                modality: Modality::Image,
-                token_id: 42,
-            }],
-            4,
-            "test",
-            &stream,
-            |_tokens, _stream| Ok(Array::from_slice(&[0.0f32; 4], &[1, 1, 4])),
-            |part, _stream| match part.payload {
-                InputPayload::Embeddings(value) => Ok(vec![value.clone()]),
-                _ => unreachable!(),
-            },
-        )
-        .unwrap();
-        let PreparedPrefill::Embeddings { tokens, embeddings } = prepared else {
-            panic!("expected prepared embeddings")
-        };
-        assert_eq!(tokens.shape(), &[1, 4]);
-        assert_eq!(embeddings.shape(), &[1, 4, 4]);
-        let ids = super::token_ids_from_array(&tokens, &stream).unwrap();
-        assert_eq!(ids, vec![10, 42, 42, 11]);
-    }
-
-    #[test]
-    fn shared_prefill_rejects_media_tokens_in_text() {
-        let stream = stream();
-        let tokens = Array::from_slice(&[42u32, 42], &[1, 2]);
-        let parts = [InputPart::text_token_ids(&tokens)];
-        let error = prepare_decoder_prefill(
-            ModelInput::new(&parts),
-            &[ModalityToken {
-                modality: Modality::Image,
-                token_id: 42,
-            }],
-            4,
-            "test",
-            &stream,
-            |_tokens, _stream| Ok(Array::from_slice(&[0.0f32; 4], &[1, 1, 4])),
-            |part, _stream| match part.payload {
-                InputPayload::Embeddings(value) => Ok(vec![value.clone()]),
-                _ => unreachable!(),
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("explicit input part"));
     }
 }

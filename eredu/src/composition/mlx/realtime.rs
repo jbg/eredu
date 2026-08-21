@@ -1689,12 +1689,12 @@ mod tests {
     #[test]
     fn model_identity_rejects_equal_geometry_from_another_artifact() {
         let expected = MlxRealtimeModelIdentity {
-            artifact: LoadedArtifactIdentity::in_memory(),
+            artifact: LoadedArtifactIdentity::Content([1; 32]),
             source_architecture: "source".into(),
             execution_architecture: "execution".into(),
         };
         let actual = MlxRealtimeModelIdentity {
-            artifact: LoadedArtifactIdentity::in_memory(),
+            artifact: LoadedArtifactIdentity::Content([2; 32]),
             source_architecture: "source".into(),
             execution_architecture: "execution".into(),
         };

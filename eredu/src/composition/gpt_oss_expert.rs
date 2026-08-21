@@ -30,14 +30,6 @@ use crate::backend::mlx::{
     },
 };
 
-/// Returns one independently leasable unit for every global GPT-OSS expert.
-pub(crate) fn expert_catalog(
-    args: &ModelArgs,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    expert_catalog_cartesian(args, store, None)
-}
-
 /// Builds expert-granular canonical bindings with optional semantic TP selection.
 ///
 /// The architecture recipe first normalizes alternating SafeTensors rows or

@@ -4,7 +4,6 @@ use std::{
     fs::File,
     io::{BufReader, Read},
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use sha2::{Digest, Sha256};
@@ -13,30 +12,17 @@ use crate::backend::mlx::error::Error;
 
 /// Immutable identity attached to a loaded model instance.
 ///
-/// File-backed loads use a content digest. Models assembled directly in memory
-/// receive a process-local identity so state can never be transferred to a
-/// merely shape-compatible model by accident.
+/// Loaded artifacts are identified by a digest of their exact content and
+/// logical file layout.
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) enum LoadedArtifactIdentity {
     Content([u8; 32]),
-    InMemory(u64),
-}
-
-impl LoadedArtifactIdentity {
-    pub(crate) fn in_memory() -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .expect("exhausted in-memory checkpoint identities");
-        Self::InMemory(id)
-    }
 }
 
 impl std::fmt::Debug for LoadedArtifactIdentity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Content(digest) => write!(formatter, "sha256:{}", hex(digest)),
-            Self::InMemory(id) => write!(formatter, "in-memory:{id}"),
         }
     }
 }

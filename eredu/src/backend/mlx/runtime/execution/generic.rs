@@ -388,17 +388,6 @@ impl<U> MlxResidentPolicy<U> {
             })
             .collect()
     }
-
-    pub(crate) fn clear_device_group(&self, id: &str) -> Result<(), Error> {
-        if (0..self.layout.group_count()).any(|group| {
-            self.layout
-                .group_id(group)
-                .is_some_and(|group_id| group_id.as_str() == id)
-        }) {
-            return Ok(());
-        }
-        Err(Error::Parallel(format!("unknown execution group {id}")))
-    }
 }
 
 impl<U> LayerwisePolicy<MlxBackend, U> for MlxResidentPolicy<U> {

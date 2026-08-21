@@ -27,8 +27,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{layers::silu, linear},
     backend::mlx::runtime::distributed::parallel::{
-        aligned_partition_units, partitioned_projection_members, register_replicated_module,
-        ParallelBuildContext, ParallelExecutionContext, ParallelPlanBuilder, ProjectionSharding,
+        aligned_partition_units, ParallelBuildContext, ParallelExecutionContext,
     },
     core::balanced_contiguous_range,
 };
@@ -42,84 +41,6 @@ pub enum LinearParallelism {
     Column,
     /// Input features are rank-local and output partials are summed.
     Row,
-}
-
-/// Registers all parameters in an architecture-owned module as replicated.
-pub(crate) fn register_replicated_parameter_group(
-    planner: &mut ParallelPlanBuilder,
-    module: &impl ModuleParametersTrait,
-    prefix: &str,
-) -> Result<(), Error> {
-    register_replicated_module(planner, module, prefix)
-}
-
-fn row_partition_alignment(projection: &MaybeQuantized<nn::Linear>) -> Result<usize, Error> {
-    match projection {
-        MaybeQuantized::Original(_) => Ok(1),
-        MaybeQuantized::Quantized(projection) => usize::try_from(projection.group_size)
-            .map_err(|_| Error::Parallel("projection quantization group exceeds usize".into())),
-    }
-}
-
-/// Checkpoint-facing names for the four projections that share one GQA head
-/// partition. Keeping names in the descriptor lets architecture modules reuse
-/// the same semantic planner without pretending their tensor catalogs match.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct GqaProjectionNames {
-    pub query: &'static str,
-    pub key: &'static str,
-    pub value: &'static str,
-    pub output: &'static str,
-}
-
-/// Builds the physical members for one GQA head domain. Architectures with
-/// additional per-head state, such as learned attention sinks, can append that
-/// state before registering the resulting atomic parameter group.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gqa_projection_members(
-    prefix: &str,
-    names: GqaProjectionNames,
-    q_proj: &MaybeQuantized<nn::Linear>,
-    k_proj: &MaybeQuantized<nn::Linear>,
-    v_proj: &MaybeQuantized<nn::Linear>,
-    o_proj: &MaybeQuantized<nn::Linear>,
-    query_heads: i32,
-    kv_heads: i32,
-    head_dim: i32,
-) -> Result<(usize, Vec<ParameterMemberSpec>), Error> {
-    let query_heads = usize::try_from(query_heads)
-        .map_err(|_| Error::Parallel("query-head count exceeds usize".into()))?;
-    let kv_heads = usize::try_from(kv_heads)
-        .map_err(|_| Error::Parallel("KV-head count exceeds usize".into()))?;
-    let head_dim = usize::try_from(head_dim)
-        .map_err(|_| Error::Parallel("attention head dimension exceeds usize".into()))?;
-    if head_dim == 0 || kv_heads == 0 || !query_heads.is_multiple_of(kv_heads) {
-        return Err(Error::Parallel(format!(
-            "attention head geometry q={query_heads}, kv={kv_heads}, dim={head_dim} does not form positive integral GQA groups"
-        )));
-    }
-    let group_width = (query_heads / kv_heads)
-        .checked_mul(head_dim)
-        .ok_or_else(|| Error::Parallel("GQA group width overflowed usize".into()))?;
-    let units = aligned_partition_units(
-        prefix,
-        kv_heads,
-        group_width,
-        row_partition_alignment(o_proj)?,
-    )?;
-    let q_prefix = format!("{prefix}.{}", names.query);
-    let k_prefix = format!("{prefix}.{}", names.key);
-    let v_prefix = format!("{prefix}.{}", names.value);
-    let o_prefix = format!("{prefix}.{}", names.output);
-    partitioned_projection_members(
-        &[
-            (q_proj, q_prefix.as_str(), ProjectionSharding::Column),
-            (k_proj, k_prefix.as_str(), ProjectionSharding::Column),
-            (v_proj, v_prefix.as_str(), ProjectionSharding::Column),
-            (o_proj, o_prefix.as_str(), ProjectionSharding::Row),
-        ],
-        units,
-    )
 }
 
 /// Returns the exact rank-local KV-head count selected for each decoder layer.

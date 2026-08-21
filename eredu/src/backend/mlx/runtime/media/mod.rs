@@ -165,14 +165,6 @@ impl OwnedInputMetadata {
     }
 
     #[cfg(feature = "mlx-image")]
-    pub(crate) fn patch_positions(value: Array) -> Self {
-        Self {
-            patch_positions: Some(value),
-            ..Self::default()
-        }
-    }
-
-    #[cfg(feature = "mlx-image")]
     pub(crate) fn patch_layout(grid: Array, positions: Array, extent: [i32; 3]) -> Self {
         Self {
             patch_grid: Some(grid),

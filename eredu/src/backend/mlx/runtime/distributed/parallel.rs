@@ -4,21 +4,21 @@
 //! members. This module converts those descriptions into rank-local placement
 //! and shape information without inspecting checkpoint-name substrings.
 
+#[cfg(test)]
+use eredu_runtime::ParameterRole;
 use eredu_runtime::{
     LocalModelLayout, LocalTensorLayout, MemberSharding, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, ShardingPolicy, TensorPlacement,
+    ShardingPolicy, TensorPlacement,
 };
 
 use safemlx::{
     distributed::{self, Group},
-    module::ModuleParameters,
     ops::{indexing::TryIndexOp, ones, zeros},
     Array, Dtype, Stream,
 };
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::runtime::checkpoint::binding::is_materialized_module_parameter,
     backend::mlx::runtime::distributed::{
         completion::synchronize_outputs, topology::PlacementPlan,
     },
@@ -139,262 +139,6 @@ pub(crate) fn aligned_partition_units(
     Ok(semantic_units / units_per_partition)
 }
 
-/// Sharding contract for an architecture-native projection module.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum ProjectionSharding {
-    /// Keep every projection parameter complete on every rank.
-    Replicated,
-    /// Partition projection output features.
-    Column,
-    /// Partition projection input features and replicate its output bias.
-    Row,
-}
-
-/// Returns TP placement for expert-major packed projection members.
-///
-/// Packed weights/quantization companions are `[experts, output, input]` and
-/// ordinary output biases are `[experts, output]`. Column sharding therefore
-/// uses axis 1 for every member; row sharding uses axis 2 for rank-3 members
-/// and replicates the rank-2 ordinary output bias.
-pub(crate) fn packed_expert_member_sharding(
-    name: &str,
-    shape: &[i32],
-    placement: ProjectionSharding,
-) -> Result<MemberSharding, Error> {
-    match placement {
-        ProjectionSharding::Replicated => Ok(MemberSharding::Replicated),
-        ProjectionSharding::Column if shape.len() >= 2 => Ok(MemberSharding::Equal { axis: 1 }),
-        ProjectionSharding::Row if shape.len() >= 3 => Ok(MemberSharding::Equal { axis: 2 }),
-        ProjectionSharding::Row if shape.len() == 2 && name.ends_with("bias") => {
-            Ok(MemberSharding::Replicated)
-        }
-        _ => Err(Error::Parallel(format!(
-            "unsupported packed expert member {name} with shape {shape:?} for {placement:?}",
-        ))),
-    }
-}
-
-/// Describes every parameter in a module as one typed logical group.
-pub(crate) fn module_parameter_group(
-    logical_name: &str,
-    role: ParameterRole,
-    module: &impl ModuleParameters,
-    prefix: &str,
-    sharding: impl Fn(&str, &[i32]) -> Result<MemberSharding, Error>,
-) -> Result<ParameterGroupSpec, Error> {
-    let parameters = module.parameters().flatten();
-    Ok(ParameterGroupSpec::new(
-        logical_name,
-        role,
-        parameters
-            .iter()
-            .filter(|(name, parameter)| {
-                is_materialized_module_parameter(name, parameter, &parameters)
-            })
-            .map(|(name, parameter)| {
-                let shape = parameter
-                    .shape()
-                    .iter()
-                    .map(|dimension| {
-                        usize::try_from(*dimension).map_err(|_| {
-                            Error::Parallel(format!(
-                                "parameter {prefix}.{name} has negative dimension {dimension}"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(ParameterMemberSpec::new(
-                    format!("{prefix}.{name}"),
-                    shape,
-                    sharding(name, parameter.shape())?,
-                ))
-            })
-            .collect::<Result<Vec<_>, Error>>()?,
-    )?)
-}
-
-/// Registers every parameter in a module as replicated.
-pub(crate) fn register_replicated_module(
-    planner: &mut ParallelPlanBuilder,
-    module: &impl ModuleParameters,
-    prefix: &str,
-) -> Result<(), Error> {
-    let parameters = module.parameters().flatten();
-    if !parameters
-        .iter()
-        .any(|(name, parameter)| is_materialized_module_parameter(name, parameter, &parameters))
-    {
-        return Ok(());
-    }
-    planner.register(module_parameter_group(
-        prefix,
-        ParameterRole::Replicated,
-        module,
-        prefix,
-        |_, _| Ok(MemberSharding::Replicated),
-    )?)
-}
-
-/// Registers an architecture-native projection and all quantization companions.
-pub(crate) fn register_projection_module(
-    planner: &mut ParallelPlanBuilder,
-    projection: &impl ModuleParameters,
-    prefix: &str,
-    placement: ProjectionSharding,
-) -> Result<(), Error> {
-    let role = match placement {
-        ProjectionSharding::Replicated => ParameterRole::Replicated,
-        ProjectionSharding::Column => ParameterRole::ColumnProjection,
-        ProjectionSharding::Row => ParameterRole::RowProjection,
-    };
-    planner.register(module_parameter_group(
-        prefix,
-        role,
-        projection,
-        prefix,
-        |name, shape| match placement {
-            ProjectionSharding::Replicated => Ok(MemberSharding::Replicated),
-            ProjectionSharding::Column => {
-                if shape.is_empty() {
-                    Err(Error::Parallel(format!(
-                        "column projection member {prefix}.{name} has scalar shape"
-                    )))
-                } else {
-                    Ok(MemberSharding::Equal { axis: 0 })
-                }
-            }
-            ProjectionSharding::Row => match name {
-                "bias" | "inner.bias" => Ok(MemberSharding::Replicated),
-                "weight"
-                | "inner.weight"
-                | "weight_scale_inv"
-                | "inner.weight_scale_inv"
-                | "scales"
-                | "biases"
-                    if shape.len() >= 2 =>
-                {
-                    Ok(MemberSharding::Equal { axis: 1 })
-                }
-                _ => Err(Error::Parallel(format!(
-                    "unsupported row-projection member {prefix}.{name} with shape {shape:?}"
-                ))),
-            },
-        },
-    )?)
-}
-
-/// Registers projections that must consume the same logical partition.
-///
-/// `preferred_units` expresses the finest semantically legal partition (KV
-/// groups for GQA, intermediate channels for a gated MLP). The planner reduces
-/// it to the greatest unit count represented integrally by every physical
-/// member, including packed weights and quantization companions. This makes
-/// uneven ranges safe without architecture-specific packed-shape arithmetic.
-pub(crate) fn register_partitioned_projection_group<M: ModuleParameters>(
-    planner: &mut ParallelPlanBuilder,
-    logical_name: &str,
-    role: ParameterRole,
-    projections: &[(&M, &str, ProjectionSharding)],
-    preferred_units: usize,
-) -> Result<(), Error> {
-    let (units, members) = partitioned_projection_members(projections, preferred_units)?;
-    planner.register(ParameterGroupSpec::partitioned(
-        logical_name,
-        role,
-        units,
-        members,
-    )?)
-}
-
-/// Builds physical members for projections sharing one logical partition.
-/// Architecture-owned compound groups can add non-linear members such as
-/// depthwise kernels while retaining the same packed-projection rules.
-pub(crate) fn partitioned_projection_members<M: ModuleParameters>(
-    projections: &[(&M, &str, ProjectionSharding)],
-    preferred_units: usize,
-) -> Result<(usize, Vec<ParameterMemberSpec>), Error> {
-    if preferred_units == 0 {
-        return Err(Error::Parallel(
-            "partitioned projection group has zero preferred units".into(),
-        ));
-    }
-
-    let mut raw_members = Vec::new();
-    let mut units = preferred_units;
-    for (module, prefix, placement) in projections {
-        let parameters = module.parameters().flatten();
-        for (name, parameter) in parameters.iter().filter(|(name, parameter)| {
-            is_materialized_module_parameter(name, parameter, &parameters)
-        }) {
-            let shape = parameter
-                .shape()
-                .iter()
-                .map(|dimension| {
-                    usize::try_from(*dimension).map_err(|_| {
-                        Error::Parallel(format!(
-                            "parameter {prefix}.{name} has negative dimension {dimension}"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let axis = projection_partition_axis(prefix, name, &shape, *placement)?;
-            if let Some(axis) = axis {
-                units = greatest_common_divisor(units, shape[axis]);
-            }
-            raw_members.push((format!("{prefix}.{name}"), shape, axis));
-        }
-    }
-    if raw_members.is_empty() {
-        return Err(Error::Parallel(
-            "partitioned projection group contains no parameters".into(),
-        ));
-    }
-
-    Ok((
-        units,
-        raw_members
-            .into_iter()
-            .map(|(target, shape, axis)| {
-                let sharding = axis.map_or(MemberSharding::Replicated, |axis| {
-                    MemberSharding::Partitioned { axis }
-                });
-                ParameterMemberSpec::new(target, shape, sharding)
-            })
-            .collect(),
-    ))
-}
-
-fn projection_partition_axis(
-    prefix: &str,
-    name: &str,
-    shape: &[usize],
-    placement: ProjectionSharding,
-) -> Result<Option<usize>, Error> {
-    match placement {
-        ProjectionSharding::Replicated => Ok(None),
-        ProjectionSharding::Column if shape.is_empty() => Err(Error::Parallel(format!(
-            "column projection member {prefix}.{name} has scalar shape"
-        ))),
-        ProjectionSharding::Column => Ok(Some(0)),
-        ProjectionSharding::Row => match name {
-            "bias" | "inner.bias" => Ok(None),
-            "weight"
-            | "inner.weight"
-            | "weight_scale_inv"
-            | "inner.weight_scale_inv"
-            | "scales"
-            | "biases"
-                if shape.len() >= 2 =>
-            {
-                Ok(Some(1))
-            }
-            _ => Err(Error::Parallel(format!(
-                "unsupported row-projection member {prefix}.{name} with shape {shape:?}"
-            ))),
-        },
-    }
-}
-
 const fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
     while right != 0 {
         let remainder = left % right;
@@ -402,27 +146,6 @@ const fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
         right = remainder;
     }
     left
-}
-
-/// Builds one typed member directly from an array parameter.
-pub(crate) fn array_parameter_member(
-    target: impl Into<String>,
-    array: &Array,
-    sharding: MemberSharding,
-) -> Result<ParameterMemberSpec, Error> {
-    let target = target.into();
-    let shape = array
-        .shape()
-        .iter()
-        .map(|dimension| {
-            usize::try_from(*dimension).map_err(|_| {
-                Error::Parallel(format!(
-                    "parameter {target} has negative dimension {dimension}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ParameterMemberSpec::new(target, shape, sharding))
 }
 
 /// Builds checkpoint placement and local model geometry from typed roles.
@@ -850,24 +573,6 @@ mod tests {
     fn topology(rank: usize, parts: usize) -> MlxParallelContext {
         MlxParallelContext::for_rank(rank, parts, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
             .unwrap()
-    }
-
-    #[test]
-    fn packed_expert_bias_uses_output_axis_or_replication() {
-        assert_eq!(
-            packed_expert_member_sharding(
-                "gate_up_proj_bias",
-                &[8, 64],
-                ProjectionSharding::Column,
-            )
-            .unwrap(),
-            MemberSharding::Equal { axis: 1 },
-        );
-        assert_eq!(
-            packed_expert_member_sharding("down_proj_bias", &[8, 32], ProjectionSharding::Row,)
-                .unwrap(),
-            MemberSharding::Replicated,
-        );
     }
 
     #[test]

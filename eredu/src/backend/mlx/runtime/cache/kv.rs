@@ -2909,10 +2909,7 @@ impl ConcatKeyValueCache {
     }
 
     /// Creates a bounded cache whose backing arrays grow in `step`-token chunks.
-    ///
-    /// Chunked growth avoids rebuilding the full retained cache on every decode
-    /// step. The returned key/value arrays are still sliced to the logical
-    /// sequence length, so attention semantics are unchanged.
+    #[cfg(test)]
     pub(crate) fn new_with_max_size_and_step(max_size: i32, step: i32) -> Self {
         Self {
             max_size: Some(max_size),

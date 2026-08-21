@@ -5,7 +5,8 @@ use eredu_core::{
     TokenizedMultimodalRequest,
 };
 
-use super::{MlxBackend, MlxModelInput};
+use super::MlxBackend;
+use crate::composition::mlx::MlxModelInput;
 use crate::{backend::mlx::error::Error, backend::mlx::runtime::media::ProcessorPreparationError};
 
 impl MultimodalPreparationBackend for MlxBackend<'_> {

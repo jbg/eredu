@@ -1792,25 +1792,6 @@ impl GptOssModel {
         }
     }
 
-    /// Adapts an external dispatched-expert callback to the neutral provider contract.
-    pub(crate) fn forward_with_expert_executor<F>(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        cache: &mut Cache,
-        mut execute: F,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-    {
-        let mut provider =
-            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
-                &mut execute,
-            );
-        self.forward_with_expert_provider(inputs, mask, cache, &mut provider, stream)
-    }
-
     /// Runs with stable layer-input, layer-output, and logits observations.
     pub fn forward_with_observer(
         &mut self,

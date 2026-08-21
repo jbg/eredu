@@ -4,28 +4,6 @@ use safemlx::{error::Exception, Array};
 
 pub use eredu_runtime::{NoopObserver, RoutingObservation as MoeRoutingObservation};
 
-/// Adapts a dynamically selected MLX observer to generic instrumented code.
-pub(crate) struct ActivationObserverProxy<'a>(
-    pub &'a mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
-);
-
-impl eredu_runtime::ActivationObserver<Array, Exception> for ActivationObserverProxy<'_> {
-    fn observe(&mut self, name: &str, value: &Array) -> Result<(), Exception> {
-        self.0.observe(name, value)
-    }
-
-    fn intervene(&mut self, name: &str, value: &Array) -> Result<Option<Array>, Exception> {
-        self.0.intervene(name, value)
-    }
-
-    fn observe_routing(
-        &mut self,
-        routing: MoeRoutingObservation<'_, Array>,
-    ) -> Result<(), Exception> {
-        self.0.observe_routing(routing)
-    }
-}
-
 /// A cloned activation captured by [`ActivationRecorder`].
 #[derive(Debug, Clone)]
 pub struct RecordedActivation {

@@ -404,21 +404,6 @@ where
     )
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum AttentionMask {
-    Array(Array),
-    Causal,
-}
-
-impl<'a> From<&'a AttentionMask> for ScaledDotProductAttentionMask<'a> {
-    fn from(mask: &'a AttentionMask) -> Self {
-        match mask {
-            AttentionMask::Array(array) => ScaledDotProductAttentionMask::Array(array),
-            AttentionMask::Causal => ScaledDotProductAttentionMask::Causal,
-        }
-    }
-}
-
 #[allow(non_snake_case)]
 pub(crate) fn create_causal_mask(
     N: i32,
@@ -446,58 +431,4 @@ pub(crate) fn create_causal_mask(
     }
 
     Ok(mask)
-}
-
-#[allow(non_snake_case)]
-pub(crate) fn create_attention_mask<C>(
-    h: &Array,
-    cache: &[Option<C>],
-    return_array: Option<bool>,
-    stream: &Stream,
-) -> Result<Option<AttentionMask>, Exception>
-where
-    C: KeyValueCache,
-{
-    create_attention_mask_from_cache(
-        h,
-        cache.first().and_then(Option::as_ref),
-        return_array,
-        stream,
-    )
-}
-
-pub(crate) fn create_attention_mask_from_cache<C>(
-    h: &Array,
-    cache: Option<&C>,
-    return_array: Option<bool>,
-    stream: &Stream,
-) -> Result<Option<AttentionMask>, Exception>
-where
-    C: KeyValueCache,
-{
-    let mut return_array = return_array.unwrap_or(false);
-    let t = h.shape()[1];
-    if t > 1 {
-        let mut offset = 0;
-        let mut window_size = None;
-        if let Some(c) = cache {
-            offset = c.offset();
-            if let Some(window_size_) = c.max_size() {
-                window_size = Some(window_size_);
-                offset = offset.min(window_size_);
-
-                return_array = return_array || (offset + t) > window_size_;
-            }
-        }
-
-        if return_array {
-            create_causal_mask(t, Some(offset), window_size, None, stream)
-                .map(AttentionMask::Array)
-                .map(Some)
-        } else {
-            Ok(Some(AttentionMask::Causal))
-        }
-    } else {
-        Ok(None)
-    }
 }
