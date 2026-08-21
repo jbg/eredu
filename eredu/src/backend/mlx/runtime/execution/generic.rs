@@ -432,6 +432,23 @@ impl<U> LayerwisePolicy<MlxBackend, U> for MlxResidentPolicy<U> {
         Ok(())
     }
 
+    fn abort(
+        &mut self,
+        active: Option<(usize, ExecutionUnitAddress, Self::Lease)>,
+        _stream: &Stream,
+    ) {
+        let Some((ordinal, _, lease)) = active else {
+            return;
+        };
+        debug_assert_eq!(lease.index, ordinal);
+        if let Some(slot) = self.units.get_mut(lease.index) {
+            debug_assert!(slot.is_none());
+            if slot.is_none() {
+                *slot = Some(lease.unit);
+            }
+        }
+    }
+
     fn acquire<E, BF>(
         &mut self,
         index: usize,
@@ -847,6 +864,27 @@ where
         dense.prefill = prefill;
         dense.forward = Some(forward);
         Ok(())
+    }
+
+    fn abort(
+        &mut self,
+        active: Option<(usize, ExecutionUnitAddress, Self::Lease)>,
+        _stream: &Stream,
+    ) {
+        drop(active);
+        while let Some((event, lease)) = self.pending.pop_front() {
+            let _ = event.synchronize();
+            drop(lease);
+        }
+        if let Some(dense) = &mut self.dense {
+            for window in &mut dense.windows {
+                window.take();
+            }
+            for group in &mut dense.groups {
+                group.take();
+            }
+            dense.forward.take();
+        }
     }
 
     fn acquire<E, BF>(

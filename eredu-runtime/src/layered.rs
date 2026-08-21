@@ -788,6 +788,19 @@ where
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), Self::Error>;
 
+    /// Aborts an incomplete forward and releases all policy-owned state.
+    ///
+    /// `active` contains the unit lease when execution stopped after
+    /// acquisition but before exact completion. Implementations with no
+    /// forward-scoped state may rely on the default, which simply drops it.
+    fn abort(
+        &mut self,
+        active: Option<(usize, crate::ExecutionUnitAddress, Self::Lease)>,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) {
+        drop(active);
+    }
+
     /// Acquires one populated unit for exclusive execution.
     ///
     /// The flat ordinal addresses storage while `address` preserves the
@@ -824,6 +837,106 @@ where
         output: &B::Tensor,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), Self::Error>;
+}
+
+/// Failure-safe ownership of one policy forward and its current unit lease.
+struct LayerwisePolicyForward<'a, B, U, P>
+where
+    B: NeuralBackend,
+    P: LayerwisePolicy<B, U>,
+{
+    policy: &'a mut P,
+    context: &'a <B::Tensor as eredu_nn::Tensor>::Context,
+    active: Option<(usize, crate::ExecutionUnitAddress, P::Lease)>,
+    finished: bool,
+    unit: std::marker::PhantomData<fn() -> U>,
+}
+
+impl<'a, B, U, P> LayerwisePolicyForward<'a, B, U, P>
+where
+    B: NeuralBackend,
+    P: LayerwisePolicy<B, U>,
+{
+    fn begin(
+        policy: &'a mut P,
+        initial: &B::Tensor,
+        context: &'a <B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<Self, P::Error> {
+        if let Err(error) = policy.begin(initial, context) {
+            policy.abort(None, context);
+            return Err(error);
+        }
+        Ok(Self {
+            policy,
+            context,
+            active: None,
+            finished: false,
+            unit: std::marker::PhantomData,
+        })
+    }
+
+    fn acquire<E, F>(
+        &mut self,
+        ordinal: usize,
+        address: crate::ExecutionUnitAddress,
+        build: F,
+    ) -> Result<&mut P::Lease, LayerwiseAcquireError<E, P::Error>>
+    where
+        F: FnOnce(&<B::Tensor as eredu_nn::Tensor>::Context) -> Result<U, E>,
+    {
+        debug_assert!(self.active.is_none());
+        let lease = self.policy.acquire(ordinal, address, build, self.context)?;
+        self.active = Some((ordinal, address, lease));
+        Ok(&mut self
+            .active
+            .as_mut()
+            .expect("acquired policy lease is active")
+            .2)
+    }
+
+    fn complete<'value, StateValues, ContextValues>(
+        &mut self,
+        output: &'value B::Tensor,
+        state_values: StateValues,
+        context_values: ContextValues,
+    ) -> Result<(), P::Error>
+    where
+        B::Tensor: 'value,
+        StateValues: Iterator<Item = &'value B::Tensor>,
+        ContextValues: Iterator<Item = &'value B::Tensor>,
+    {
+        let (ordinal, address, lease) = self
+            .active
+            .take()
+            .expect("policy completion follows one acquisition");
+        self.policy.complete(
+            ordinal,
+            address,
+            lease,
+            output,
+            state_values,
+            context_values,
+            self.context,
+        )
+    }
+
+    fn finish(&mut self, output: &B::Tensor) -> Result<(), P::Error> {
+        self.policy.finish(output, self.context)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl<B, U, P> Drop for LayerwisePolicyForward<'_, B, U, P>
+where
+    B: NeuralBackend,
+    P: LayerwisePolicy<B, U>,
+{
+    fn drop(&mut self) {
+        if !self.finished {
+            self.policy.abort(self.active.take(), self.context);
+        }
+    }
 }
 
 /// Failure while a layerwise policy acquires or populates one architecture unit.
@@ -1127,8 +1240,7 @@ where
             .then(|| B::submit(context, [&forward.hidden]))
             .transpose()
             .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
-        self.policy
-            .begin(&forward.hidden, context)
+        let mut policy = LayerwisePolicyForward::begin(&mut self.policy, &forward.hidden, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
         let initial = forward.hidden;
         let mut forward_context = forward.context;
@@ -1214,14 +1326,10 @@ where
                     let address = layout
                         .address(ordinal)
                         .expect("group-local unit has a stable policy address");
-                    let mut lease = self
-                        .policy
-                        .acquire(
-                            ordinal,
-                            address,
-                            |executor| self.architecture.build_unit(group, index, executor),
-                            executor,
-                        )
+                    let lease = policy
+                        .acquire(ordinal, address, |executor| {
+                            self.architecture.build_unit(group, index, executor)
+                        })
                         .map_err(|error| match error {
                             LayerwiseAcquireError::Architecture(error) => {
                                 LayerwiseRuntimeError::Architecture(error)
@@ -1234,7 +1342,7 @@ where
                         &mut self.architecture,
                         group,
                         index,
-                        &mut lease,
+                        lease,
                         &hidden,
                         state,
                         &mut forward_context,
@@ -1257,16 +1365,8 @@ where
                     let context_values =
                         self.architecture
                             .retained_context_values(&forward_context, group, index);
-                    self.policy
-                        .complete(
-                            ordinal,
-                            address,
-                            lease,
-                            &hidden,
-                            state_values.into_iter(),
-                            context_values,
-                            executor,
-                        )
+                    policy
+                        .complete(&hidden, state_values.into_iter(), context_values)
                         .map_err(LayerwiseRuntimeError::Policy)?;
                 }
             }
@@ -1303,8 +1403,8 @@ where
             .architecture
             .finish_forward(&hidden, state, &forward_context, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
-        self.policy
-            .finish(&output, context)
+        policy
+            .finish(&output)
             .map_err(LayerwiseRuntimeError::Policy)?;
         Ok((output, forward_context))
     }
@@ -1502,8 +1602,7 @@ where
             .then(|| B::submit(context, [&forward.hidden]))
             .transpose()
             .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
-        self.policy
-            .begin(&forward.hidden, context)
+        let mut policy = LayerwisePolicyForward::begin(&mut self.policy, &forward.hidden, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
         let initial = forward.hidden;
         let mut forward_context = forward.context;
@@ -1590,14 +1689,10 @@ where
                     let address = layout
                         .address(ordinal)
                         .expect("group-local unit has a stable policy address");
-                    let mut lease = self
-                        .policy
-                        .acquire(
-                            ordinal,
-                            address,
-                            |executor| self.architecture.build_unit(group, index, executor),
-                            executor,
-                        )
+                    let lease = policy
+                        .acquire(ordinal, address, |executor| {
+                            self.architecture.build_unit(group, index, executor)
+                        })
                         .map_err(|error| match error {
                             LayerwiseAcquireError::Architecture(error) => {
                                 LayerwiseRuntimeError::Architecture(error)
@@ -1610,7 +1705,7 @@ where
                         &mut self.architecture,
                         group,
                         index,
-                        &mut lease,
+                        lease,
                         &hidden,
                         state,
                         &mut forward_context,
@@ -1634,16 +1729,8 @@ where
                     let context_values =
                         self.architecture
                             .retained_context_values(&forward_context, group, index);
-                    self.policy
-                        .complete(
-                            ordinal,
-                            address,
-                            lease,
-                            &hidden,
-                            state_values.into_iter(),
-                            context_values,
-                            executor,
-                        )
+                    policy
+                        .complete(&hidden, state_values.into_iter(), context_values)
                         .map_err(LayerwiseRuntimeError::Policy)?;
                 }
             }
@@ -1687,8 +1774,8 @@ where
             .architecture
             .finish_forward_parallel(&hidden, state, &forward_context, parallel, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
-        self.policy
-            .finish(&output, context)
+        policy
+            .finish(&output)
             .map_err(LayerwiseRuntimeError::Policy)?;
         Ok((output, forward_context))
     }
@@ -1735,8 +1822,7 @@ where
             .then(|| B::submit(context, [&forward.hidden]))
             .transpose()
             .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
-        self.policy
-            .begin(&forward.hidden, context)
+        let mut policy = LayerwisePolicyForward::begin(&mut self.policy, &forward.hidden, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
         let initial = forward.hidden;
         let mut forward_context = forward.context;
@@ -1812,14 +1898,10 @@ where
                         .architecture
                         .unit_path(group, index)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
-                    let mut lease = self
-                        .policy
-                        .acquire(
-                            ordinal,
-                            address,
-                            |executor| self.architecture.build_unit(group, index, executor),
-                            executor,
-                        )
+                    let lease = policy
+                        .acquire(ordinal, address, |executor| {
+                            self.architecture.build_unit(group, index, executor)
+                        })
                         .map_err(|error| match error {
                             LayerwiseAcquireError::Architecture(error) => {
                                 LayerwiseRuntimeError::Architecture(error)
@@ -1834,7 +1916,7 @@ where
                         .forward_unit(
                             group,
                             index,
-                            &mut lease,
+                            lease,
                             &unit_input,
                             state,
                             &mut forward_context,
@@ -1858,16 +1940,8 @@ where
                     let context_values =
                         self.architecture
                             .retained_context_values(&forward_context, group, index);
-                    self.policy
-                        .complete(
-                            ordinal,
-                            address,
-                            lease,
-                            &hidden,
-                            state_values.into_iter(),
-                            context_values,
-                            executor,
-                        )
+                    policy
+                        .complete(&hidden, state_values.into_iter(), context_values)
                         .map_err(LayerwiseRuntimeError::Policy)?;
                 }
             }
@@ -1902,8 +1976,8 @@ where
             .architecture
             .finish_forward(&hidden, state, &forward_context, context)
             .map_err(LayerwiseRuntimeError::Architecture)?;
-        self.policy
-            .finish(&output, context)
+        policy
+            .finish(&output)
             .map_err(LayerwiseRuntimeError::Policy)?;
         Ok(output)
     }
@@ -1956,6 +2030,23 @@ where
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    fn abort(
+        &mut self,
+        active: Option<(usize, crate::ExecutionUnitAddress, Self::Lease)>,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) {
+        let Some((ordinal, _, lease)) = active else {
+            return;
+        };
+        debug_assert_eq!(lease.index, ordinal);
+        if let Some(slot) = self.units.get_mut(lease.index) {
+            debug_assert!(slot.is_none());
+            if slot.is_none() {
+                *slot = Some(lease.unit);
+            }
+        }
     }
 
     fn acquire<E, F>(

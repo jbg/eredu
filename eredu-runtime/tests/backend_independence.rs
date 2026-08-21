@@ -792,6 +792,8 @@ impl std::ops::DerefMut for RecordingLease {
 struct RecordingPolicy {
     units: Vec<Option<FakeUnit>>,
     addresses: Vec<(usize, usize, usize)>,
+    forward_active: bool,
+    aborts: usize,
 }
 
 impl RecordingPolicy {
@@ -799,6 +801,8 @@ impl RecordingPolicy {
         Self {
             units: units.into_iter().map(Some).collect(),
             addresses: Vec::new(),
+            forward_active: false,
+            aborts: 0,
         }
     }
 }
@@ -808,7 +812,20 @@ impl LayerwisePolicy<FakeBackend, FakeUnit> for RecordingPolicy {
     type Error = &'static str;
 
     fn begin(&mut self, _: &FakeTensor, _: &()) -> Result<(), Self::Error> {
+        if self.forward_active {
+            return Err("fixture forward remained active");
+        }
+        self.forward_active = true;
         Ok(())
+    }
+
+    fn abort(&mut self, active: Option<(usize, ExecutionUnitAddress, Self::Lease)>, _: &()) {
+        if let Some((ordinal, _, lease)) = active {
+            assert_eq!(lease.ordinal, ordinal);
+            assert!(self.units[ordinal].replace(lease.unit).is_none());
+        }
+        self.forward_active = false;
+        self.aborts += 1;
     }
 
     fn acquire<E, F>(
@@ -855,6 +872,7 @@ impl LayerwisePolicy<FakeBackend, FakeUnit> for RecordingPolicy {
     }
 
     fn finish(&mut self, _: &FakeTensor, _: &()) -> Result<(), Self::Error> {
+        self.forward_active = false;
         Ok(())
     }
 }
@@ -1097,6 +1115,36 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
     );
     assert_eq!(SUBMIT_COUNT.get(), 8);
     assert_eq!(ORDER_COUNT.get(), 10);
+}
+
+#[test]
+fn layerwise_runtime_aborts_active_lease_and_forward_after_observer_error() {
+    let mut state = fixture_state();
+    let architecture = GroupedFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+    };
+    let units = [0, 10, 20, 21]
+        .into_iter()
+        .map(|marker| FakeUnit { marker })
+        .collect();
+    let mut runtime =
+        LayerwiseRuntime::<_, FakeBackend, _, _>::new(architecture, RecordingPolicy::new(units));
+
+    let error = runtime
+        .forward_with_context_hook((), &mut state, &(), |_, _, _| {
+            Err(Error::backend("controlled observer failure"))
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("controlled observer failure"));
+    assert_eq!(runtime.policy().aborts, 1);
+    assert!(!runtime.policy().forward_active);
+    assert!(runtime.policy().units.iter().all(Option::is_some));
+
+    let output = runtime.forward((), &mut state, &()).unwrap();
+    assert_eq!(output, FakeTensor(vec![30, 20, 21]));
+    assert_eq!(runtime.policy().aborts, 1);
+    assert!(!runtime.policy().forward_active);
 }
 
 #[test]
