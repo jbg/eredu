@@ -242,7 +242,9 @@ associated implementation types.
 The repository mechanically verifies stable dependency and behavior boundaries:
 
 - `eredu-core` and `eredu-runtime` dependency-graph tests reject upward facade,
-  architecture, and accelerator-runtime dependencies; and
+  architecture, and accelerator-runtime dependencies;
+- the feature-disabled `portable_facade` and `backend_conformance` suites compile
+  and exercise the public contracts through mock backends; and
 - architecture, runtime, and backend conformance tests cover the relevant
   production contracts.
 

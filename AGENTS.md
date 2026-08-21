@@ -87,5 +87,7 @@ same change. Useful verification commands are:
 ```sh
 cargo test -p eredu-core --test dependency_boundary
 cargo test -p eredu-runtime --test dependency_boundary
+cargo test -p eredu --no-default-features --test portable_facade
+cargo test -p eredu --no-default-features --test backend_conformance
 cargo check -p eredu-architectures
 ```

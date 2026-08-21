@@ -20,6 +20,9 @@ pub(crate) mod inkling_expert;
 pub(crate) mod inkling_processor;
 #[cfg(feature = "mlx")]
 pub(crate) mod kimi_linear;
+// MLX adapter only; the neutral family is always available from
+// `eredu_architectures::lfm2`.
+#[cfg(feature = "mlx")]
 pub(crate) mod lfm2;
 #[cfg(feature = "mlx")]
 pub(crate) mod llama;

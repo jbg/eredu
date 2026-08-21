@@ -1,4 +1,4 @@
-//! Neutral LFM2/LFM2-MoE composition over MLX execution policies.
+//! MLX adapter for the backend-neutral LFM2/LFM2-MoE architecture.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},

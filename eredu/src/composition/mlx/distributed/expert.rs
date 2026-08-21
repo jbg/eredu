@@ -8,7 +8,7 @@
 //! the resulting token buffer. Sharded-token dispatch uses compact native or
 //! topology-routed variable-count all-to-all payload exchange.
 
-use eredu_architectures::{gpt_oss, kimi_linear};
+use eredu_architectures::{gpt_oss as gpt_oss_arch, kimi_linear as kimi_linear_arch};
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{ActivationObserver as RuntimeActivationObserver, ShardingPolicy};
 
@@ -49,10 +49,7 @@ use crate::{
     composition::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
-    composition::{
-        gpt_oss as neutral_gpt_oss, kimi_linear as neutral_kimi_linear, lfm2 as neutral_lfm2,
-        nemotron_h as neutral_nemotron_h,
-    },
+    composition::{gpt_oss, kimi_linear, lfm2, nemotron_h},
     core::generation::MtpConfig,
     core::ModelKind,
     core::{MtpCapability, MtpCheckpointKind, MtpStats},
@@ -340,13 +337,10 @@ macro_rules! impl_neutral_hybrid_expert_architecture {
     };
 }
 
+impl_neutral_hybrid_expert_architecture!(kimi_linear::KimiLinearModel, execute_cached_kimi_linear);
+impl_neutral_hybrid_expert_architecture!(lfm2::Lfm2Model, execute_cached_lfm2);
 impl_neutral_hybrid_expert_architecture!(
-    neutral_kimi_linear::KimiLinearModel,
-    execute_cached_kimi_linear
-);
-impl_neutral_hybrid_expert_architecture!(neutral_lfm2::Lfm2Model, execute_cached_lfm2);
-impl_neutral_hybrid_expert_architecture!(
-    neutral_nemotron_h::NemotronHModel,
+    nemotron_h::NemotronHModel,
     execute_cached_nemotron_h,
     fn mtp_len(&self) -> usize {
         self.mtp_len()
@@ -448,7 +442,7 @@ enum ExpertArchitecture {
     DeepSeek(Box<crate::composition::deepseek::DeepSeekModel>),
     NeutralHybrid(Box<dyn NeutralHybridExpertArchitecture>),
     Qwen(Box<crate::composition::qwen::QwenModel>),
-    GptOss(Box<neutral_gpt_oss::GptOssModel>),
+    GptOss(Box<gpt_oss::GptOssModel>),
 }
 
 impl ExpertArchitecture {
@@ -1084,7 +1078,7 @@ impl ExpertParallelModel {
                 }
                 (ExpertArchitecture::GptOss(model), ExpertParallelCache::KeyValue(cache)) => {
                     let args = model.args().clone();
-                    let mut provider = neutral_gpt_oss::expert::distributed_provider(
+                    let mut provider = gpt_oss::expert::distributed_provider(
                         &args,
                         assignment,
                         Some(group),
@@ -1812,7 +1806,7 @@ pub(crate) fn execute_cached_neutral_gemma4(
 }
 
 pub(crate) fn execute_cached_kimi_linear(
-    args: &kimi_linear::ModelArgs,
+    args: &kimi_linear_arch::ModelArgs,
     layer: usize,
     routes: &DispatchedRoutes,
     pass: ExpertPass,
@@ -2230,7 +2224,7 @@ fn load_external_gguf_ep(
 ) -> Result<ExpertParallelModel, Error> {
     match architecture {
         "kimi-linear" => {
-            let prepared = neutral_kimi_linear::prepare_gguf(checkpoint, metadata)?;
+            let prepared = kimi_linear::prepare_gguf(checkpoint, metadata)?;
             let args = prepared.args;
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
@@ -2244,7 +2238,7 @@ fn load_external_gguf_ep(
                     max_mapped_shards,
                 )?);
             let model = if topology.tensor_parallel_size > 1 {
-                neutral_kimi_linear::load_external_expert_parallel_base_with_store(
+                kimi_linear::load_external_expert_parallel_base_with_store(
                         store.clone(),
                         args.clone(),
                         non_expert,
@@ -2253,7 +2247,7 @@ fn load_external_gguf_ep(
                         weights_stream,
                     )?
             } else {
-                neutral_kimi_linear::load_external_expert_base_with_store(
+                kimi_linear::load_external_expert_base_with_store(
                         store.clone(),
                         args.clone(),
                         non_expert,
@@ -2262,7 +2256,7 @@ fn load_external_gguf_ep(
                     )?
             };
             let store = model.checkpoint_store_arc();
-            let entries = neutral_kimi_linear::expert_catalog(&args, store.as_ref())?;
+            let entries = kimi_linear::expert_catalog(&args, store.as_ref())?;
             let replicated_parameter_bytes =
                 planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
@@ -2421,7 +2415,7 @@ fn load_external_gguf_ep(
         }
         "gpt-oss" => {
             let prepared =
-                neutral_gpt_oss::prepare_gpt_oss_gguf_checkpoint(checkpoint, metadata)?;
+                gpt_oss::prepare_gpt_oss_gguf_checkpoint(checkpoint, metadata)?;
             let args = prepared.args;
             let assignment = resolve_model_assignment(
                 assignment,
@@ -2429,12 +2423,12 @@ fn load_external_gguf_ep(
                 topology,
             )?;
             let gguf_plan =
-                gpt_oss::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
+                gpt_oss_arch::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
             let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
                 std::sync::Arc::new(open_gguf_checkpoint_source(
                     checkpoint.clone(),
                     &gguf_plan,
-                    gpt_oss::translate_gguf_weight_name,
+                    gpt_oss_arch::translate_gguf_weight_name,
                     max_mapped_shards,
                 )?);
             let build = if topology.tensor_parallel_size > 1 {
@@ -2445,7 +2439,7 @@ fn load_external_gguf_ep(
             } else {
                 None
             };
-            let model = neutral_gpt_oss::load_external_experts_with_store(
+            let model = gpt_oss::load_external_experts_with_store(
                 store.clone(),
                 args.clone(),
                 non_expert,
@@ -2474,7 +2468,7 @@ fn load_external_gguf_ep(
             "Inkling expert parallelism is served by the neutral pipeline runtime".into(),
         )),
         "lfm2moe" => {
-            let prepared = neutral_lfm2::prepare_gguf(checkpoint, metadata)?;
+            let prepared = lfm2::prepare_gguf(checkpoint, metadata)?;
             let args = prepared.args;
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
@@ -2488,7 +2482,7 @@ fn load_external_gguf_ep(
                     max_mapped_shards,
                 )?);
             let model = if topology.tensor_parallel_size > 1 {
-                neutral_lfm2::load_external_expert_parallel_base_with_store(
+                lfm2::load_external_expert_parallel_base_with_store(
                     store.clone(),
                     args.clone(),
                     non_expert,
@@ -2497,7 +2491,7 @@ fn load_external_gguf_ep(
                     weights_stream,
                 )?
             } else {
-                neutral_lfm2::load_external_expert_base_with_store(
+                lfm2::load_external_expert_base_with_store(
                     store.clone(),
                     args.clone(),
                     non_expert,
@@ -2506,7 +2500,7 @@ fn load_external_gguf_ep(
                 )?
             };
             let store = model.checkpoint_store_arc();
-            let entries = neutral_lfm2::expert_catalog(&args, store.as_ref())?;
+            let entries = lfm2::expert_catalog(&args, store.as_ref())?;
             let replicated_parameter_bytes =
                 planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
@@ -2523,7 +2517,7 @@ fn load_external_gguf_ep(
             )
         }
         "nemotron_h_moe" => {
-            let prepared = neutral_nemotron_h::prepare_gguf(checkpoint, metadata)?;
+            let prepared = nemotron_h::prepare_gguf(checkpoint, metadata)?;
             let args = prepared.args;
             let assignment =
                 resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
@@ -2537,7 +2531,7 @@ fn load_external_gguf_ep(
                     max_mapped_shards,
                 )?);
             let model = if topology.tensor_parallel_size > 1 {
-                neutral_nemotron_h::load_external_expert_parallel_base_with_store(
+                nemotron_h::load_external_expert_parallel_base_with_store(
                         store.clone(),
                         args.clone(),
                         non_expert,
@@ -2546,7 +2540,7 @@ fn load_external_gguf_ep(
                         weights_stream,
                     )?
             } else {
-                neutral_nemotron_h::load_external_expert_base_with_store(
+                nemotron_h::load_external_expert_base_with_store(
                         store.clone(),
                         args.clone(),
                         non_expert,
@@ -2555,7 +2549,7 @@ fn load_external_gguf_ep(
                     )?
             };
             let store = model.checkpoint_store_arc();
-            let entries = neutral_nemotron_h::expert_catalog(&args, store.as_ref())?;
+            let entries = nemotron_h::expert_catalog(&args, store.as_ref())?;
             let replicated_parameter_bytes =
                 planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
@@ -2670,7 +2664,7 @@ fn load_kimi_linear_external_ep(
         SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
     );
     let model = if topology.tensor_parallel_size > 1 {
-        neutral_kimi_linear::load_external_expert_parallel_base_with_store(
+        kimi_linear::load_external_expert_parallel_base_with_store(
             store.clone(),
             args.clone(),
             non_expert,
@@ -2679,7 +2673,7 @@ fn load_kimi_linear_external_ep(
             weights_stream,
         )?
     } else {
-        neutral_kimi_linear::load_external_expert_base_with_store(
+        kimi_linear::load_external_expert_base_with_store(
             store.clone(),
             args.clone(),
             non_expert,
@@ -2688,7 +2682,7 @@ fn load_kimi_linear_external_ep(
         )?
     };
     let store = model.checkpoint_store_arc();
-    let entries = neutral_kimi_linear::expert_catalog(&args, store.as_ref())?;
+    let entries = kimi_linear::expert_catalog(&args, store.as_ref())?;
     let replicated_parameter_bytes = planned_replicated_bytes(&model.residency_report()?)?;
     finish_external_ep(
         topology,
@@ -3208,7 +3202,7 @@ fn load_additional_external_ep(
     let store = open_external_safetensors_store(model_dir, max_mapped_shards)?;
     let (assignment, architecture, store, entries, replicated_parameter_bytes) = match kind {
         ModelKind::GptOss => {
-            let args = neutral_gpt_oss::load_model_args(model_dir)?;
+            let args = gpt_oss::load_model_args(model_dir)?;
             let assignment =
                 resolve_model_assignment(assignment, args.num_local_experts as usize, topology)?;
             let build = if topology.tensor_parallel_size > 1 {
@@ -3216,7 +3210,7 @@ fn load_additional_external_ep(
             } else {
                 None
             };
-            let model = neutral_gpt_oss::load_external_experts_with_store(
+            let model = gpt_oss::load_external_experts_with_store(
                 store.clone(),
                 args.clone(),
                 non_expert,
@@ -3241,7 +3235,7 @@ fn load_additional_external_ep(
             ))
         }
         ModelKind::Lfm2 => {
-            let args = neutral_lfm2::load_model_args(model_dir)?;
+            let args = lfm2::load_model_args(model_dir)?;
             if !args.has_sparse_moe_layers() {
                 return Err(Error::UnsupportedArchitecture(
                     "expert parallelism requires an LFM2 MoE checkpoint".into(),
@@ -3250,7 +3244,7 @@ fn load_additional_external_ep(
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
             let model = if topology.tensor_parallel_size > 1 {
-                neutral_lfm2::load_external_expert_parallel_base_with_store(
+                lfm2::load_external_expert_parallel_base_with_store(
                     store.clone(),
                     args.clone(),
                     non_expert,
@@ -3259,7 +3253,7 @@ fn load_additional_external_ep(
                     weights_stream,
                 )?
             } else {
-                neutral_lfm2::load_external_expert_base_with_store(
+                lfm2::load_external_expert_base_with_store(
                     store.clone(),
                     args.clone(),
                     non_expert,
@@ -3268,7 +3262,7 @@ fn load_additional_external_ep(
                 )?
             };
             let store = model.checkpoint_store_arc();
-            let entries = neutral_lfm2::expert_catalog(&args, store.as_ref())?;
+            let entries = lfm2::expert_catalog(&args, store.as_ref())?;
             let replicated = planned_replicated_bytes(&model.residency_report()?)?;
             (
                 assignment,
@@ -3279,7 +3273,7 @@ fn load_additional_external_ep(
             )
         }
         ModelKind::NemotronH => {
-            let args = neutral_nemotron_h::load_model_args(model_dir)?;
+            let args = nemotron_h::load_model_args(model_dir)?;
             if !args.has_sparse_moe_layers() {
                 return Err(Error::UnsupportedArchitecture(
                     "expert parallelism requires a Nemotron-H MoE checkpoint".into(),
@@ -3288,7 +3282,7 @@ fn load_additional_external_ep(
             let assignment =
                 resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
             let model = if topology.tensor_parallel_size > 1 {
-                neutral_nemotron_h::load_external_expert_parallel_base_with_store(
+                nemotron_h::load_external_expert_parallel_base_with_store(
                     store.clone(),
                     args.clone(),
                     non_expert,
@@ -3297,7 +3291,7 @@ fn load_additional_external_ep(
                     weights_stream,
                 )?
             } else {
-                neutral_nemotron_h::load_external_expert_base_with_store(
+                nemotron_h::load_external_expert_base_with_store(
                     store.clone(),
                     args.clone(),
                     non_expert,
@@ -3306,7 +3300,7 @@ fn load_additional_external_ep(
                 )?
             };
             let store = model.checkpoint_store_arc();
-            let entries = neutral_nemotron_h::expert_catalog(&args, store.as_ref())?;
+            let entries = nemotron_h::expert_catalog(&args, store.as_ref())?;
             let replicated = planned_replicated_bytes(&model.residency_report()?)?;
             (
                 assignment,
