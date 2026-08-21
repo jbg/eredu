@@ -799,7 +799,10 @@ impl ReasoningStream {
         }
         if !self.open {
             match output {
-                ReasoningOutput::InteractiveDimmed => stderr.write_all(b"\x1b[2m")?,
+                // Some terminals accept SGR faint but render it at normal
+                // intensity. Pair it with the standard muted foreground so
+                // interactive reasoning remains visibly secondary there.
+                ReasoningOutput::InteractiveDimmed => stderr.write_all(b"\x1b[2;90m")?,
                 ReasoningOutput::Verbose => {
                     writeln!(stderr, "--- reasoning content (stderr) ---")?;
                 }
@@ -4146,7 +4149,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(stdout, b"visible answer");
-        assert_eq!(stderr, b"\x1b[2mprivate thought\n\x1b[0m");
+        assert_eq!(stderr, b"\x1b[2;90mprivate thought\n\x1b[0m");
         assert_eq!(streamed_text, "visible answer");
 
         let mut plain_stderr = Vec::new();
