@@ -761,15 +761,21 @@ fn write_semantic_event(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReasoningOutput {
     Hidden,
+    InteractivePlain,
+    InteractiveDimmed,
     Verbose,
 }
 
 impl ReasoningOutput {
-    fn for_streams(verbose: bool, _stdout_is_terminal: bool, _stderr_is_terminal: bool) -> Self {
+    fn for_streams(verbose: bool, stdout_is_terminal: bool, stderr_is_terminal: bool) -> Self {
         if verbose {
             Self::Verbose
-        } else {
+        } else if !stdout_is_terminal {
             Self::Hidden
+        } else if stderr_is_terminal {
+            Self::InteractiveDimmed
+        } else {
+            Self::InteractivePlain
         }
     }
 }
@@ -793,10 +799,11 @@ impl ReasoningStream {
         }
         if !self.open {
             match output {
+                ReasoningOutput::InteractiveDimmed => stderr.write_all(b"\x1b[2m")?,
                 ReasoningOutput::Verbose => {
                     writeln!(stderr, "--- reasoning content (stderr) ---")?;
                 }
-                ReasoningOutput::Hidden => {}
+                ReasoningOutput::Hidden | ReasoningOutput::InteractivePlain => {}
             }
             self.open = true;
         }
@@ -814,10 +821,11 @@ impl ReasoningStream {
             writeln!(stderr)?;
         }
         match output {
+            ReasoningOutput::InteractiveDimmed => stderr.write_all(b"\x1b[0m")?,
             ReasoningOutput::Verbose => {
                 writeln!(stderr, "--- end reasoning content (stderr) ---")?;
             }
-            ReasoningOutput::Hidden => {}
+            ReasoningOutput::Hidden | ReasoningOutput::InteractivePlain => {}
         }
         stderr.flush()?;
         self.open = false;
@@ -4112,7 +4120,7 @@ mod tests {
     }
 
     #[test]
-    fn non_verbose_semantic_output_hides_reasoning_on_terminal_streams() {
+    fn interactive_semantic_output_dims_reasoning_on_terminal_stderr() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut streamed_text = String::new();
@@ -4124,7 +4132,7 @@ mod tests {
             &mut stderr,
             &mut streamed_text,
             &mut reasoning_stream,
-            ReasoningOutput::for_streams(false, true, true),
+            ReasoningOutput::InteractiveDimmed,
         )
         .unwrap();
         write_semantic_event(
@@ -4133,28 +4141,42 @@ mod tests {
             &mut stderr,
             &mut streamed_text,
             &mut reasoning_stream,
-            ReasoningOutput::for_streams(false, true, true),
+            ReasoningOutput::InteractiveDimmed,
         )
         .unwrap();
 
         assert_eq!(stdout, b"visible answer");
-        assert!(stderr.is_empty());
+        assert_eq!(stderr, b"\x1b[2mprivate thought\n\x1b[0m");
         assert_eq!(streamed_text, "visible answer");
+
+        let mut plain_stderr = Vec::new();
+        let mut reasoning_stream = ReasoningStream::default();
+        reasoning_stream
+            .write_delta(
+                &mut plain_stderr,
+                "redirected reasoning",
+                ReasoningOutput::InteractivePlain,
+            )
+            .unwrap();
+        reasoning_stream
+            .close(&mut plain_stderr, ReasoningOutput::InteractivePlain)
+            .unwrap();
+        assert_eq!(plain_stderr, b"redirected reasoning\n");
     }
 
     #[test]
-    fn reasoning_output_requires_verbose_mode_regardless_of_terminal_state() {
+    fn reasoning_output_follows_stdout_terminal_and_colors_only_terminal_stderr() {
         assert_eq!(
             ReasoningOutput::for_streams(false, false, true),
             ReasoningOutput::Hidden
         );
         assert_eq!(
             ReasoningOutput::for_streams(false, true, false),
-            ReasoningOutput::Hidden
+            ReasoningOutput::InteractivePlain
         );
         assert_eq!(
             ReasoningOutput::for_streams(false, true, true),
-            ReasoningOutput::Hidden
+            ReasoningOutput::InteractiveDimmed
         );
         assert_eq!(
             ReasoningOutput::for_streams(true, false, false),
