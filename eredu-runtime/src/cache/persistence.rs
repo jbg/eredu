@@ -181,6 +181,7 @@ pub struct PromptCachePublication {
     parent: PathBuf,
     generations: PathBuf,
     generation_name: String,
+    publication_root: Option<PathBuf>,
     staging: PathBuf,
     replacing: bool,
     nonce: u128,
@@ -225,29 +226,55 @@ impl PromptCachePublication {
             .unwrap_or_default()
             .as_nanos();
         let generation_name = format!("generation-{nonce}");
-        let generations = destination.join(PROMPT_CACHE_GENERATIONS_DIRECTORY);
-        if replacing {
+        let (generations, staging, publication_root) = if replacing {
+            let generations = destination.join(PROMPT_CACHE_GENERATIONS_DIRECTORY);
             fs::create_dir_all(&generations).map_err(|source| PromptCachePersistenceError::Io {
                 action: "create prompt cache generation directory",
                 path: generations.clone(),
                 source,
             })?;
-        }
-        let staging = if replacing {
-            generations.join(format!(".tmp-{nonce}"))
+            let staging = generations.join(format!(".tmp-{nonce}"));
+            fs::create_dir(&staging).map_err(|source| PromptCachePersistenceError::Io {
+                action: "create temporary prompt cache",
+                path: staging.clone(),
+                source,
+            })?;
+            (generations, staging, None)
         } else {
-            parent.join(format!(".{file_name}.tmp-{nonce}"))
+            let publication_root = parent.join(format!(".{file_name}.tmp-{nonce}"));
+            fs::create_dir(&publication_root).map_err(|source| {
+                PromptCachePersistenceError::Io {
+                    action: "create temporary prompt cache root",
+                    path: publication_root.clone(),
+                    source,
+                }
+            })?;
+            let generations = publication_root.join(PROMPT_CACHE_GENERATIONS_DIRECTORY);
+            if let Err(source) = fs::create_dir(&generations) {
+                let _ = fs::remove_dir_all(&publication_root);
+                return Err(PromptCachePersistenceError::Io {
+                    action: "create prompt cache generation directory",
+                    path: generations,
+                    source,
+                });
+            }
+            let staging = generations.join(&generation_name);
+            if let Err(source) = fs::create_dir(&staging) {
+                let _ = fs::remove_dir_all(&publication_root);
+                return Err(PromptCachePersistenceError::Io {
+                    action: "create temporary prompt cache",
+                    path: staging,
+                    source,
+                });
+            }
+            (generations, staging, Some(publication_root))
         };
-        fs::create_dir(&staging).map_err(|source| PromptCachePersistenceError::Io {
-            action: "create temporary prompt cache",
-            path: staging.clone(),
-            source,
-        })?;
         Ok(Self {
             destination,
             parent,
             generations,
             generation_name,
+            publication_root,
             staging,
             replacing,
             nonce,
@@ -305,7 +332,13 @@ impl PromptCachePublication {
             sync_directory(&self.generations)?;
             publish_generation_pointer(&self.destination, &self.generation_name, self.nonce)?;
         } else {
-            durable_rename(&self.staging, &self.destination, false).map_err(|source| {
+            sync_directory(&self.generations)?;
+            let publication_root = self
+                .publication_root
+                .as_ref()
+                .expect("new prompt-cache publication owns a staging root");
+            publish_generation_pointer(publication_root, &self.generation_name, self.nonce)?;
+            durable_rename(publication_root, &self.destination, false).map_err(|source| {
                 PromptCachePersistenceError::Io {
                     action: "publish prompt cache",
                     path: self.destination.clone(),
@@ -321,8 +354,11 @@ impl PromptCachePublication {
 
 impl Drop for PromptCachePublication {
     fn drop(&mut self) {
-        if !self.committed && self.staging.exists() {
-            let _ = fs::remove_dir_all(&self.staging);
+        if !self.committed {
+            let staging = self.publication_root.as_ref().unwrap_or(&self.staging);
+            if staging.exists() {
+                let _ = fs::remove_dir_all(staging);
+            }
         }
     }
 }
@@ -360,20 +396,23 @@ pub fn inspect_prompt_cache(
     Ok(manifest)
 }
 
-/// Resolves the active immutable generation, or the legacy direct cache root.
+/// Resolves the active immutable generation selected by the durable pointer.
 pub fn resolve_prompt_cache_root(directory: &Path) -> Result<PathBuf, PromptCachePersistenceError> {
     let current_path = directory.join(PROMPT_CACHE_CURRENT_FILE);
-    if !current_path.exists() {
-        return Ok(directory.to_path_buf());
-    }
-    let length = current_path
-        .metadata()
-        .map_err(|source| PromptCachePersistenceError::Io {
-            action: "stat prompt cache generation pointer",
-            path: current_path.clone(),
-            source,
-        })?
-        .len();
+    let metadata = current_path.metadata().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            PromptCachePersistenceError::MalformedStorage(
+                "prompt-cache generation pointer CURRENT is missing".into(),
+            )
+        } else {
+            PromptCachePersistenceError::Io {
+                action: "stat prompt cache generation pointer",
+                path: current_path.clone(),
+                source,
+            }
+        }
+    })?;
+    let length = metadata.len();
     if length == 0 || length > 256 {
         return Err(PromptCachePersistenceError::MalformedStorage(
             "prompt-cache generation pointer has an invalid length".into(),
@@ -916,12 +955,43 @@ mod tests {
         let first = manifest(&publication.staging_directory().join("block.safetensors"));
         publication.commit(&first).unwrap();
         assert_eq!(inspect_prompt_cache(&destination).unwrap(), first);
+        assert!(destination.join(PROMPT_CACHE_CURRENT_FILE).is_file());
+        let first_root = resolve_prompt_cache_root(&destination).unwrap();
+        assert_eq!(
+            first_root.parent().unwrap(),
+            destination.join(PROMPT_CACHE_GENERATIONS_DIRECTORY)
+        );
+        assert!(first_root.join("manifest.json").is_file());
 
         let publication = PromptCachePublication::begin(&destination, true).unwrap();
         let second = manifest(&publication.staging_directory().join("block.safetensors"));
         publication.commit(&second).unwrap();
         assert_eq!(inspect_prompt_cache(&destination).unwrap(), second);
         assert!(destination.join(PROMPT_CACHE_CURRENT_FILE).is_file());
+    }
+
+    #[test]
+    fn pointerless_legacy_prompt_cache_layout_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("cache");
+        fs::create_dir(&destination).unwrap();
+        let legacy = manifest(&destination.join("block.safetensors"));
+        serde_json::to_writer(
+            File::create(destination.join("manifest.json")).unwrap(),
+            &legacy,
+        )
+        .unwrap();
+
+        for result in [
+            resolve_prompt_cache_root(&destination).map(|_| ()),
+            inspect_prompt_cache(&destination).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(PromptCachePersistenceError::MalformedStorage(reason))
+                    if reason == "prompt-cache generation pointer CURRENT is missing"
+            ));
+        }
     }
 
     #[test]
@@ -952,7 +1022,17 @@ mod tests {
     #[test]
     fn malformed_manifest_is_rejected_before_tensor_loading() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("manifest.json"), b"{not-json").unwrap();
+        let generation = directory
+            .path()
+            .join(PROMPT_CACHE_GENERATIONS_DIRECTORY)
+            .join("generation-test");
+        fs::create_dir_all(&generation).unwrap();
+        fs::write(generation.join("manifest.json"), b"{not-json").unwrap();
+        fs::write(
+            directory.path().join(PROMPT_CACHE_CURRENT_FILE),
+            b"generation-test\n",
+        )
+        .unwrap();
         assert!(matches!(
             inspect_prompt_cache(directory.path()),
             Err(PromptCachePersistenceError::ManifestJson(_))
