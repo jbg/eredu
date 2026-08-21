@@ -4,7 +4,7 @@
 //! policies select a residency realization, while concrete backends retain
 //! their native layer-state and tensor types.
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, ops::Range};
 
 use eredu_core::{
     cache::{
@@ -15,16 +15,126 @@ use eredu_core::{
 };
 use eredu_nn::NeuralBackend;
 
+/// Stable name assigned to the implicit segment of a simple state layout.
+pub const DEFAULT_STATE_SEGMENT_ID: &str = "state";
+
+/// Validated stable identity of one contiguous mutable-state segment.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct StateSegmentId(String);
+
+impl StateSegmentId {
+    /// Creates a non-empty stable segment identity.
+    pub fn new(id: impl Into<String>) -> Result<Self, StateError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(StateError::EmptySegmentId);
+        }
+        Ok(Self(id))
+    }
+
+    /// Returns the stable segment name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for StateSegmentId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Lifetime policy attached to a named mutable-state segment.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum StateSegmentLifetime {
+    /// State survives from one model input or frame to the next.
+    Persistent,
+    /// State is reused within one frame and reset at the frame boundary.
+    FrameLocal,
+}
+
+/// One named contiguous range in an architecture's state layout.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StateSegmentSpec {
+    id: StateSegmentId,
+    layers: Range<usize>,
+    lifetime: StateSegmentLifetime,
+}
+
+impl StateSegmentSpec {
+    /// Creates a non-empty segment range.
+    pub fn new(
+        id: impl Into<String>,
+        layers: Range<usize>,
+        lifetime: StateSegmentLifetime,
+    ) -> Result<Self, StateError> {
+        let id = StateSegmentId::new(id)?;
+        if layers.is_empty() {
+            return Err(StateError::EmptySegmentRange {
+                segment: id,
+                start: layers.start,
+                end: layers.end,
+            });
+        }
+        Ok(Self {
+            id,
+            layers,
+            lifetime,
+        })
+    }
+
+    /// Returns the stable segment identity.
+    pub const fn id(&self) -> &StateSegmentId {
+        &self.id
+    }
+
+    /// Returns the architecture-global state-layer range.
+    pub fn layers(&self) -> Range<usize> {
+        self.layers.clone()
+    }
+
+    /// Returns whether the segment persists or resets at a frame boundary.
+    pub const fn lifetime(&self) -> StateSegmentLifetime {
+        self.lifetime
+    }
+}
+
 /// Complete ordered mutable-state geometry owned by one model instance.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StateLayout {
     layers: LayerSchedule<LayerCachePolicy>,
     components: Vec<Vec<StateComponentPolicy>>,
+    segments: Vec<StateSegmentSpec>,
 }
 
 impl StateLayout {
-    /// Creates and validates an ordered per-layer state layout.
+    /// Creates and validates a simple ordered layout with one persistent
+    /// segment named [`DEFAULT_STATE_SEGMENT_ID`].
     pub fn new(layers: LayerSchedule<LayerCachePolicy>) -> Result<Self, StateError> {
+        if layers.is_empty() {
+            return Err(StateError::EmptyLayout);
+        }
+        let count = layers.len();
+        Self::segmented(
+            layers,
+            [StateSegmentSpec::new(
+                DEFAULT_STATE_SEGMENT_ID,
+                0..count,
+                StateSegmentLifetime::Persistent,
+            )?],
+        )
+    }
+
+    /// Creates an ordered layout partitioned into named contiguous segments.
+    ///
+    /// Segment declarations are sorted into layer order and must form an exact,
+    /// non-overlapping partition of every state-bearing layer. Stable segment
+    /// identity and lifetime therefore participate in layout equality and
+    /// runtime-state compatibility checks.
+    pub fn segmented(
+        layers: LayerSchedule<LayerCachePolicy>,
+        segments: impl IntoIterator<Item = StateSegmentSpec>,
+    ) -> Result<Self, StateError> {
         if layers.is_empty() {
             return Err(StateError::EmptyLayout);
         }
@@ -37,7 +147,53 @@ impl StateLayout {
                 })?;
         }
         let components = layers.iter().map(LayerCachePolicy::components).collect();
-        Ok(Self { layers, components })
+        let mut segments = segments.into_iter().collect::<Vec<_>>();
+        if segments.is_empty() {
+            return Err(StateError::EmptySegments);
+        }
+        segments.sort_by(|left, right| {
+            left.layers
+                .start
+                .cmp(&right.layers.start)
+                .then_with(|| left.layers.end.cmp(&right.layers.end))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let mut identities = std::collections::BTreeSet::new();
+        let mut frontier = 0usize;
+        for segment in &segments {
+            if !identities.insert(segment.id.clone()) {
+                return Err(StateError::DuplicateSegment {
+                    segment: segment.id.clone(),
+                });
+            }
+            if segment.layers.end > layers.len() {
+                return Err(StateError::SegmentOutOfBounds {
+                    segment: segment.id.clone(),
+                    start: segment.layers.start,
+                    end: segment.layers.end,
+                    layers: layers.len(),
+                });
+            }
+            if segment.layers.start < frontier {
+                return Err(StateError::OverlappingSegment {
+                    segment: segment.id.clone(),
+                    start: segment.layers.start,
+                    frontier,
+                });
+            }
+            if segment.layers.start > frontier {
+                return Err(StateError::UnassignedStateLayer { layer: frontier });
+            }
+            frontier = segment.layers.end;
+        }
+        if frontier != layers.len() {
+            return Err(StateError::UnassignedStateLayer { layer: frontier });
+        }
+        Ok(Self {
+            layers,
+            components,
+            segments,
+        })
     }
 
     /// Returns the number of architecture-global layers represented here.
@@ -63,6 +219,23 @@ impl StateLayout {
     /// Returns ordered named semantic components for one layer.
     pub fn components(&self, layer: usize) -> Option<&[StateComponentPolicy]> {
         self.components.get(layer).map(Vec::as_slice)
+    }
+
+    /// Returns named state segments in deterministic layer order.
+    pub fn segments(&self) -> &[StateSegmentSpec] {
+        &self.segments
+    }
+
+    /// Resolves one named state segment.
+    pub fn segment(&self, id: &StateSegmentId) -> Option<&StateSegmentSpec> {
+        self.segments.iter().find(|segment| segment.id() == id)
+    }
+
+    /// Resolves the unique named segment containing one state layer.
+    pub fn segment_for_layer(&self, layer: usize) -> Option<&StateSegmentSpec> {
+        self.segments
+            .iter()
+            .find(|segment| segment.layers.contains(&layer))
     }
 }
 
@@ -135,6 +308,15 @@ pub trait RuntimeLayerState<B: NeuralBackend> {
     fn retained_values(&self) -> Self::RetainedValues<'_>;
 }
 
+/// Reset capability for one concrete backend-native layer state.
+///
+/// Reset drops the semantic contents of the layer state without replacing its
+/// concrete cache type or inspecting backend-native values on the host.
+pub trait ResettableRuntimeLayerState<B: NeuralBackend>: RuntimeLayerState<B> {
+    /// Clears this layer state to its initial empty value.
+    fn reset(&mut self) -> Result<(), StateError>;
+}
+
 /// Mutable access to architecture-declared fixed state components.
 ///
 /// Operators address semantic roles rather than backend storage. Concrete
@@ -174,6 +356,12 @@ pub trait RuntimeState<B: NeuralBackend> {
         ordinal: usize,
         address: crate::ExecutionUnitAddress,
     ) -> Result<Self::RetainedValues<'_>, StateError>;
+}
+
+/// Named-segment reset supported by a concrete runtime-state realization.
+pub trait ResettableRuntimeState<B: NeuralBackend>: RuntimeState<B> {
+    /// Resets every layer in exactly one declared state segment.
+    fn reset_segment(&mut self, segment: &StateSegmentId) -> Result<(), StateError>;
 }
 
 /// Optional capability for architectures with one indexed state per layer.
@@ -274,6 +462,26 @@ where
     }
 }
 
+impl<B, L> ResettableRuntimeState<B> for DeviceState<B, L>
+where
+    B: NeuralBackend,
+    L: ResettableRuntimeLayerState<B>,
+{
+    fn reset_segment(&mut self, segment: &StateSegmentId) -> Result<(), StateError> {
+        let range = self
+            .layout
+            .segment(segment)
+            .map(StateSegmentSpec::layers)
+            .ok_or_else(|| StateError::UnknownSegment {
+                segment: segment.clone(),
+            })?;
+        for layer in &mut self.layers[range] {
+            layer.reset()?;
+        }
+        Ok(())
+    }
+}
+
 impl<B: NeuralBackend, L> AsRef<[L]> for DeviceState<B, L> {
     fn as_ref(&self) -> &[L] {
         &self.layers
@@ -340,6 +548,69 @@ pub enum StateError {
     /// A model declared no state-bearing layer slots.
     #[error("runtime state layout must contain at least one layer")]
     EmptyLayout,
+    /// A composite layout declared no named state segments.
+    #[error("runtime state layout must contain at least one named segment")]
+    EmptySegments,
+    /// A state segment identity was empty or whitespace-only.
+    #[error("runtime state segment identity must not be empty")]
+    EmptySegmentId,
+    /// A state segment range contained no layers.
+    #[error("runtime state segment {segment:?} has empty layer range {start}..{end}")]
+    EmptySegmentRange {
+        /// Invalid segment identity.
+        segment: StateSegmentId,
+        /// Inclusive range start.
+        start: usize,
+        /// Exclusive range end.
+        end: usize,
+    },
+    /// Two state segments used the same stable identity.
+    #[error("runtime state segment {segment:?} is declared more than once")]
+    DuplicateSegment {
+        /// Duplicated identity.
+        segment: StateSegmentId,
+    },
+    /// A state segment addressed layers outside the layout.
+    #[error(
+        "runtime state segment {segment:?} range {start}..{end} exceeds {layers} layout layers"
+    )]
+    SegmentOutOfBounds {
+        /// Invalid segment identity.
+        segment: StateSegmentId,
+        /// Inclusive range start.
+        start: usize,
+        /// Exclusive range end.
+        end: usize,
+        /// Total layout layer count.
+        layers: usize,
+    },
+    /// A state segment overlapped an earlier segment in layer order.
+    #[error(
+        "runtime state segment {segment:?} starts at layer {start}, before prior frontier {frontier}"
+    )]
+    OverlappingSegment {
+        /// Overlapping segment identity.
+        segment: StateSegmentId,
+        /// Inclusive range start.
+        start: usize,
+        /// End of the prior segment.
+        frontier: usize,
+    },
+    /// No named segment owned one layer in the state layout.
+    #[error("runtime state layer {layer} is not assigned to a named segment")]
+    UnassignedStateLayer {
+        /// First unassigned layer.
+        layer: usize,
+    },
+    /// A reset requested a segment absent from the realized layout.
+    #[error("runtime state layout has no segment {segment:?}")]
+    UnknownSegment {
+        /// Requested segment identity.
+        segment: StateSegmentId,
+    },
+    /// A concrete backend failed while clearing a declared state segment.
+    #[error("runtime state reset failed: {0}")]
+    ResetFailed(String),
     /// One layer supplied an invalid portable state policy.
     #[error("invalid runtime state policy for layer {layer}: {reason}")]
     InvalidLayer {
@@ -454,5 +725,106 @@ mod tests {
             names,
             ["attention.compressed_latent", "attention.rotary_keys"]
         );
+    }
+
+    fn four_layer_schedule() -> LayerSchedule<LayerCachePolicy> {
+        LayerSchedule::new(
+            4,
+            (0..4)
+                .map(|_| LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap())
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn composite_state_segments_are_canonical_and_cover_every_layer() {
+        let layout = StateLayout::segmented(
+            four_layer_schedule(),
+            [
+                StateSegmentSpec::new("depth", 2..4, StateSegmentLifetime::FrameLocal).unwrap(),
+                StateSegmentSpec::new("temporal", 0..2, StateSegmentLifetime::Persistent).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            layout
+                .segments()
+                .iter()
+                .map(|segment| (segment.id().as_str(), segment.layers(), segment.lifetime()))
+                .collect::<Vec<_>>(),
+            [
+                ("temporal", 0..2, StateSegmentLifetime::Persistent),
+                ("depth", 2..4, StateSegmentLifetime::FrameLocal),
+            ]
+        );
+        assert_eq!(
+            layout.segment_for_layer(0).unwrap().id().as_str(),
+            "temporal"
+        );
+        assert_eq!(layout.segment_for_layer(3).unwrap().id().as_str(), "depth");
+        assert!(layout.segment_for_layer(4).is_none());
+    }
+
+    #[test]
+    fn segment_identity_and_lifetime_participate_in_layout_equality() {
+        let layout = |depth_name, lifetime| {
+            StateLayout::segmented(
+                four_layer_schedule(),
+                [
+                    StateSegmentSpec::new("temporal", 0..2, StateSegmentLifetime::Persistent)
+                        .unwrap(),
+                    StateSegmentSpec::new(depth_name, 2..4, lifetime).unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        let canonical = layout("depth", StateSegmentLifetime::FrameLocal);
+        assert_ne!(
+            canonical,
+            layout("predictor", StateSegmentLifetime::FrameLocal)
+        );
+        assert_ne!(canonical, layout("depth", StateSegmentLifetime::Persistent));
+    }
+
+    #[test]
+    fn malformed_segment_partitions_fail_closed() {
+        let duplicate = StateLayout::segmented(
+            four_layer_schedule(),
+            [
+                StateSegmentSpec::new("cache", 0..2, StateSegmentLifetime::Persistent).unwrap(),
+                StateSegmentSpec::new("cache", 2..4, StateSegmentLifetime::FrameLocal).unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(duplicate, StateError::DuplicateSegment { .. }));
+
+        let overlap = StateLayout::segmented(
+            four_layer_schedule(),
+            [
+                StateSegmentSpec::new("left", 0..3, StateSegmentLifetime::Persistent).unwrap(),
+                StateSegmentSpec::new("right", 2..4, StateSegmentLifetime::FrameLocal).unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(overlap, StateError::OverlappingSegment { .. }));
+
+        let gap = StateLayout::segmented(
+            four_layer_schedule(),
+            [
+                StateSegmentSpec::new("left", 0..1, StateSegmentLifetime::Persistent).unwrap(),
+                StateSegmentSpec::new("right", 2..4, StateSegmentLifetime::FrameLocal).unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(gap, StateError::UnassignedStateLayer { layer: 1 });
+
+        let outside = StateLayout::segmented(
+            four_layer_schedule(),
+            [StateSegmentSpec::new("all", 0..5, StateSegmentLifetime::Persistent).unwrap()],
+        )
+        .unwrap_err();
+        assert!(matches!(outside, StateError::SegmentOutOfBounds { .. }));
     }
 }

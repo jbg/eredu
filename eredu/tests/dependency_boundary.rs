@@ -137,10 +137,9 @@ fn multimodal_decoder_cutover_has_neutral_ownership_and_no_legacy_trees() {
         }
     }
 
-    let pipeline = std::fs::read_to_string(
-        crate_root.join("src/composition/mlx_architectures/distributed/pipeline.rs"),
-    )
-    .expect("pipeline source must be readable");
+    let pipeline =
+        std::fs::read_to_string(crate_root.join("src/composition/mlx/distributed/pipeline.rs"))
+            .expect("pipeline source must be readable");
     for required in [
         "struct NeutralGemma4Stage",
         "struct NeutralInklingStage",
@@ -163,10 +162,9 @@ fn multimodal_decoder_cutover_has_neutral_ownership_and_no_legacy_trees() {
         );
     }
 
-    let expert = std::fs::read_to_string(
-        crate_root.join("src/composition/mlx_architectures/distributed/expert.rs"),
-    )
-    .expect("distributed expert source must be readable");
+    let expert =
+        std::fs::read_to_string(crate_root.join("src/composition/mlx/distributed/expert.rs"))
+            .expect("distributed expert source must be readable");
     for legacy in [
         "ExpertArchitecture::Gemma4",
         "ExpertArchitecture::Inkling",
@@ -251,10 +249,9 @@ fn hybrid_decoder_cutover_has_neutral_ownership_and_no_legacy_trees() {
         }
     }
 
-    let pipeline = std::fs::read_to_string(
-        crate_root.join("src/composition/mlx_architectures/distributed/pipeline.rs"),
-    )
-    .expect("pipeline source must be readable");
+    let pipeline =
+        std::fs::read_to_string(crate_root.join("src/composition/mlx/distributed/pipeline.rs"))
+            .expect("pipeline source must be readable");
     assert!(pipeline.contains("struct NeutralHybridPipelineStage<"));
     for legacy_wrapper in [
         "struct KimiLinearStage",
@@ -269,10 +266,9 @@ fn hybrid_decoder_cutover_has_neutral_ownership_and_no_legacy_trees() {
 
     let model = std::fs::read_to_string(crate_root.join("src/composition/mlx/model.rs"))
         .expect("MLX model facade must be readable");
-    let expert = std::fs::read_to_string(
-        crate_root.join("src/composition/mlx_architectures/distributed/expert.rs"),
-    )
-    .expect("distributed expert source must be readable");
+    let expert =
+        std::fs::read_to_string(crate_root.join("src/composition/mlx/distributed/expert.rs"))
+            .expect("distributed expert source must be readable");
     for legacy_cache in [
         "ModelCache::KimiLinear",
         "ModelCache::Lfm2",
@@ -363,21 +359,10 @@ fn deepseek_cutover_has_one_neutral_source_of_model_semantics() {
         }
     }
 
-    let architecture_root = crate_root.join("src/composition/mlx_architectures");
-    let mut architecture_sources = Vec::new();
-    rust_sources(&architecture_root, &mut architecture_sources);
-    for source in architecture_sources {
-        if source
-            .strip_prefix(&architecture_root)
-            .is_ok_and(|relative| {
-                relative
-                    .components()
-                    .next()
-                    .is_some_and(|component| component.as_os_str() == "qwen")
-            })
-        {
-            continue;
-        }
+    let distributed_root = crate_root.join("src/composition/mlx/distributed");
+    let mut distributed_sources = Vec::new();
+    rust_sources(&distributed_root, &mut distributed_sources);
+    for source in distributed_sources {
         let text = std::fs::read_to_string(&source).expect("architecture source must be readable");
         for forbidden in ["QwenLinear", "QwenWeightFormat", "qwen::hybrid::qwen3_5"] {
             assert!(
@@ -393,9 +378,10 @@ fn mlx_neural_operator_binding_is_architecture_agnostic() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let source = std::fs::read_to_string(root.join("src/backend/mlx/nn/shared.rs"))
         .expect("MLX neural operator binding must be readable");
+    let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
     for forbidden in ["eredu_architectures", "ModelArgs", "llama::", "Llama"] {
         assert!(
-            !source.contains(forbidden),
+            !production.contains(forbidden),
             "architecture dependency {forbidden:?} leaked into MLX operators"
         );
     }
@@ -409,9 +395,10 @@ fn mlx_backend_contains_no_llama_knowledge() {
     rust_sources(&backend, &mut sources);
     for source in sources {
         let text = std::fs::read_to_string(&source).expect("MLX source must be readable");
+        let production = text.split("#[cfg(test)]").next().unwrap_or(&text);
         for forbidden in ["llama", "Llama", "ModelArgs", "eredu_architectures::llama"] {
             assert!(
-                !text.contains(forbidden),
+                !production.contains(forbidden),
                 "Llama dependency {forbidden:?} leaked into MLX backend source {source:?}"
             );
         }
@@ -513,10 +500,9 @@ fn qwen_neutral_cutover_has_no_legacy_or_backend_model_knowledge() {
         }
     }
 
-    let pipeline = std::fs::read_to_string(
-        crate_root.join("src/composition/mlx_architectures/distributed/pipeline.rs"),
-    )
-    .expect("distributed pipeline source must be readable");
+    let pipeline =
+        std::fs::read_to_string(crate_root.join("src/composition/mlx/distributed/pipeline.rs"))
+            .expect("distributed pipeline source must be readable");
     assert!(!pipeline.contains("struct QwenStage"));
     assert!(pipeline.contains("type QwenStage = NeutralDecoderStage"));
     assert!(pipeline.contains("type NeutralQwenHybridStage = NeutralHybridPipelineStage"));
@@ -537,7 +523,7 @@ fn qwen_neutral_cutover_has_no_legacy_or_backend_model_knowledge() {
         "src/composition/qwen.rs",
         "src/composition/qwen_hybrid.rs",
         "src/composition/qwen_vl.rs",
-        "src/composition/mlx_architectures/distributed/pipeline.rs",
+        "src/composition/mlx/distributed/pipeline.rs",
     ] {
         let source = std::fs::read_to_string(crate_root.join(relative))
             .expect("Qwen composition source must be readable");
@@ -562,10 +548,9 @@ fn qwen_neutral_cutover_has_no_legacy_or_backend_model_knowledge() {
     }
     assert!(expert_composition.contains("CachedGatedProductExpertProvider"));
 
-    let distributed_expert = std::fs::read_to_string(
-        crate_root.join("src/composition/mlx_architectures/distributed/expert.rs"),
-    )
-    .expect("distributed expert source must be readable");
+    let distributed_expert =
+        std::fs::read_to_string(crate_root.join("src/composition/mlx/distributed/expert.rs"))
+            .expect("distributed expert source must be readable");
     for legacy in [
         "QwenHybridLayerwise",
         "Qwen3VlLayerwise",
@@ -626,10 +611,12 @@ fn gpt_oss_cutover_has_one_neutral_implementation() {
         }
     }
 
-    let legacy_module =
-        std::fs::read_to_string(crate_root.join("src/composition/mlx_architectures/mod.rs"))
-            .expect("legacy architecture module must be readable");
-    assert!(!legacy_module.contains("pub mod gpt_oss"));
+    assert!(
+        !crate_root
+            .join("src/composition/mlx_architectures")
+            .exists(),
+        "legacy MLX architecture namespace remains"
+    );
 
     let mut facade_sources = Vec::new();
     rust_sources(&crate_root.join("src"), &mut facade_sources);
@@ -675,31 +662,147 @@ fn gpt_oss_cutover_has_one_neutral_implementation() {
 }
 
 #[test]
-fn moshi_composition_uses_the_neutral_layered_runtime() {
+fn realtime_family_hard_cutover_has_no_legacy_or_general_layer_leaks() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source =
-        std::fs::read_to_string(root.join("src/composition/mlx_architectures/moshi/layerwise.rs"))
-            .expect("Moshi layered composition must be readable");
-    for required in [
-        "impl LayeredArchitecture<MlxBackend, MoshiCache> for MoshiArchitecture",
-        "impl ParallelLayeredArchitecture<MlxBackend, MoshiCache> for MoshiArchitecture",
-        "prepare_layerwise_policy_with_bindings",
+    let workspace = root.parent().expect("workspace root");
+    let legacy_directory = root.join("src/composition/mlx_architectures").join("moshi");
+    assert!(
+        !legacy_directory.exists(),
+        "legacy realtime-family implementation directory still exists"
+    );
+
+    let current_test = root.join("tests/dependency_boundary.rs");
+    let mut production_sources = Vec::new();
+    for relative in [
+        "eredu/src",
+        "eredu/examples",
+        "eredu-codec/src",
+        "eredu-codec/examples",
+        "eredu-architectures/src",
+        "eredu-core/src",
+        "eredu-nn/src",
+        "eredu-runtime/src",
+        "eredu-checkpoint/src",
+    ] {
+        rust_sources(&workspace.join(relative), &mut production_sources);
+    }
+    let forbidden_symbols = [
+        ["mlx_architectures", "::", "moshi"].concat(),
+        ["Moshi", "LayerwiseModel"].concat(),
+        ["Moshi", "Architecture"].concat(),
+        ["Moshi", "Cache"].concat(),
+        ["load_", "moshi", "_layerwise_model"].concat(),
+        ["load_", "personaplex", "_layerwise_model"].concat(),
+    ];
+    for source in production_sources {
+        if source == current_test {
+            continue;
+        }
+        let text = std::fs::read_to_string(&source).expect("Rust source must be readable");
+        for forbidden in &forbidden_symbols {
+            assert!(
+                !text.contains(forbidden),
+                "legacy realtime-family symbol {forbidden:?} remains in {source:?}"
+            );
+        }
+    }
+
+    for relative in [
+        "eredu-nn/src",
+        "eredu-runtime/src",
+        "eredu-checkpoint/src",
+        "eredu/src/backend",
+    ] {
+        let mut general_sources = Vec::new();
+        rust_sources(&workspace.join(relative), &mut general_sources);
+        for source in general_sources {
+            let text = std::fs::read_to_string(&source)
+                .expect("general-layer source must be readable")
+                .to_ascii_lowercase();
+            assert!(
+                !text.contains("moshi") && !text.contains("personaplex"),
+                "realtime-family implementation knowledge leaked into {source:?}"
+            );
+        }
+    }
+
+    for allowed in [
+        "eredu-core/src/artifact.rs",
+        "eredu-architectures/src/moshi/config.rs",
+        "eredu-architectures/src/moshi/checkpoint.rs",
+        "eredu/src/composition/mlx/realtime/personaplex_prompt.rs",
     ] {
         assert!(
-            source.contains(required),
-            "Moshi composition is missing neutral runtime contract {required:?}"
+            workspace.join(allowed).is_file(),
+            "declared registry/config/checkpoint/prompt boundary is missing: {allowed}"
         );
     }
-    for legacy in [
-        "impl ArchitectureAdapter",
-        "LayerwiseModel<Moshi",
-        "load_layerwise_model_with_quantization",
-        "load_tensor_parallel_layerwise_model(",
-    ] {
-        assert!(
-            !source.contains(legacy),
-            "Moshi composition still depends on legacy execution contract {legacy:?}"
-        );
+
+    let neutral_root = workspace.join("eredu-architectures/src/moshi");
+    let mut neutral_sources = Vec::new();
+    rust_sources(&neutral_root, &mut neutral_sources);
+    let layered_model_definitions = neutral_sources
+        .iter()
+        .map(|source| {
+            std::fs::read_to_string(source)
+                .expect("neutral realtime-family source must be readable")
+                .matches("pub struct LayeredModel<")
+                .count()
+        })
+        .sum::<usize>();
+    assert_eq!(
+        layered_model_definitions, 1,
+        "the neutral realtime family must define exactly one LayeredModel"
+    );
+
+    let production_binder = std::fs::read_to_string(root.join("src/composition/moshi.rs"))
+        .expect("neutral realtime-family binder must be readable");
+    assert!(
+        production_binder.contains("LayeredModel<MlxBackend>"),
+        "the production binder must construct the one neutral LayeredModel"
+    );
+
+    let mut composition_sources = Vec::new();
+    rust_sources(&root.join("src/composition"), &mut composition_sources);
+    for source in composition_sources.into_iter().filter(|source| {
+        source
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("moshi"))
+    }) {
+        let text = std::fs::read_to_string(&source)
+            .expect("realtime-family composition source must be readable");
+        for forbidden in [
+            "struct MoshiParallelComposition",
+            "impl ParallelLayeredArchitecture",
+            "forward_temporal_block_parallel",
+            "forward_embedded_parallel",
+            "in_proj_weight",
+            "depformer_text_emb",
+            "depformer_emb.",
+            "depformer_in.",
+            "out_norm.alpha",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "composition owns realtime-family lifecycle/equation/checkpoint policy {forbidden:?} in {source:?}"
+            );
+        }
+    }
+
+    let mut persona_sources = Vec::new();
+    rust_sources(&root.join("src"), &mut persona_sources);
+    for source in persona_sources {
+        if source.ends_with("composition/mlx/realtime/personaplex_prompt.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&source).expect("facade source must be readable");
+        for forbidden in ["struct PersonaPlex", "enum PersonaPlex", "type PersonaPlex"] {
+            assert!(
+                !text.contains(forbidden),
+                "PersonaPlex must not define a separate production model type in {source:?}"
+            );
+        }
     }
 }
 
@@ -1407,8 +1510,12 @@ fn crate_root_does_not_reexport_mlx_implementation_types() {
         "MLX backend does not own reusable neural capabilities"
     );
     assert!(
-        manifest.join("src/composition/mlx_architectures").is_dir(),
-        "high-level MLX model composition is missing"
+        manifest.join("src/composition/mlx/distributed").is_dir(),
+        "distributed MLX composition is missing"
+    );
+    assert!(
+        !manifest.join("src/composition/mlx_architectures").exists(),
+        "legacy MLX architecture namespace remains"
     );
     assert!(
         !manifest.join("src/backend/mlx/architectures").exists(),
@@ -1425,6 +1532,7 @@ fn generic_loaded_model_source_does_not_import_backend_implementations() {
         "safemlx_sys::",
         "crate::backend::mlx",
         "crate::composition::mlx_architectures",
+        "crate::composition::mlx::distributed",
         "cfg(feature = \"mlx\")",
     ] {
         assert!(
@@ -1444,6 +1552,7 @@ fn portable_api_tests_do_not_depend_on_backend_implementations() {
         "safemlx_sys::",
         "crate::backend::mlx",
         "crate::composition::mlx_architectures",
+        "crate::composition::mlx::distributed",
         "crate::backend::mlx::nn",
     ] {
         assert!(

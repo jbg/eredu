@@ -504,6 +504,111 @@ where
     ParameterGroupSpec::partitioned(logical_name, role, units, members)
 }
 
+/// Describes a component-major fused column projection and its row-parallel
+/// output as one shared logical partition.
+///
+/// The same ordered segment selection is attached to the fused weight and all
+/// encoding companions exposed by the module. The row projection consumes the
+/// corresponding local hidden partition and is reduced once by the backend.
+pub fn segmented_projection_group<T, M>(
+    logical_name: impl Into<String>,
+    role: ParameterRole,
+    fused: &M,
+    row: &M,
+    segments: Vec<Range<usize>>,
+    preferred_units: usize,
+) -> Result<ParameterGroupSpec, ParallelPlanError>
+where
+    T: Tensor,
+    M: Parameterized<T>,
+{
+    if preferred_units == 0 || segments.is_empty() {
+        return Err(ParallelPlanError::InvalidGroup(
+            "segmented projection requires positive logical units and at least one segment".into(),
+        ));
+    }
+    let mut previous_end = 0usize;
+    for segment in &segments {
+        if segment.start != previous_end || segment.start >= segment.end {
+            return Err(ParallelPlanError::InvalidGroup(format!(
+                "segmented projection ranges must be positive, contiguous, and ordered, got {segments:?}"
+            )));
+        }
+        previous_end = segment.end;
+    }
+
+    let mut units = preferred_units;
+    for segment in &segments {
+        units = greatest_common_divisor(units, segment.len());
+    }
+    let fused_group =
+        projection_parameter_group::<T, M>("fused", role, fused, ProjectionSharding::Column)?;
+    let row_group = projection_parameter_group::<T, M>("row", role, row, ProjectionSharding::Row)?;
+    assemble_segmented_projection_group(
+        logical_name,
+        role,
+        fused_group,
+        row_group,
+        segments,
+        units,
+        previous_end,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_segmented_projection_group(
+    logical_name: impl Into<String>,
+    role: ParameterRole,
+    fused_group: ParameterGroupSpec,
+    row_group: ParameterGroupSpec,
+    segments: Vec<Range<usize>>,
+    mut units: usize,
+    expected_fused_width: usize,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    let mut members = Vec::new();
+    for member in fused_group.members {
+        let dimension = member.global_shape.first().copied().ok_or_else(|| {
+            ParallelPlanError::InvalidTensor(format!(
+                "segmented projection parameter {} is scalar",
+                member.target
+            ))
+        })?;
+        if dimension != expected_fused_width {
+            return Err(ParallelPlanError::InvalidTensor(format!(
+                "segmented projection parameter {} has output dimension {dimension}, expected {expected_fused_width}",
+                member.target
+            )));
+        }
+        members.push(ParameterMemberSpec::new(
+            member.target,
+            member.global_shape,
+            MemberSharding::PartitionedSegments {
+                axis: 0,
+                segments: segments.clone(),
+            },
+        ));
+    }
+    for member in row_group.members {
+        let sharding = if member.global_shape.len() >= 2 {
+            units = greatest_common_divisor(units, member.global_shape[1]);
+            MemberSharding::Partitioned { axis: 1 }
+        } else {
+            MemberSharding::Replicated
+        };
+        members.push(ParameterMemberSpec::new(
+            member.target,
+            member.global_shape,
+            sharding,
+        ));
+    }
+    if units == 0 {
+        return Err(ParallelPlanError::InvalidGroup(
+            "segmented projection has no common logical partition".into(),
+        ));
+    }
+    ParameterGroupSpec::partitioned(logical_name, role, units, members)
+}
+
 /// Returns the finest legal logical-unit count for an aligned partition.
 pub fn aligned_partition_units(
     name: &str,
@@ -770,6 +875,107 @@ mod tests {
             )],
         )
         .is_ok());
+    }
+
+    #[test]
+    fn segmented_projection_applies_identical_ranges_to_every_fused_companion() {
+        let fused = ParameterGroupSpec::new(
+            "fused",
+            ParameterRole::FeedForwardIntermediate,
+            [
+                ParameterMemberSpec::new(
+                    "gate_up.weight",
+                    [12, 8],
+                    MemberSharding::Equal { axis: 0 },
+                ),
+                ParameterMemberSpec::new(
+                    "gate_up.scales",
+                    [12, 2],
+                    MemberSharding::Equal { axis: 0 },
+                ),
+                ParameterMemberSpec::new(
+                    "gate_up.biases",
+                    [12, 2],
+                    MemberSharding::Equal { axis: 0 },
+                ),
+            ],
+        )
+        .unwrap();
+        let row = ParameterGroupSpec::new(
+            "row",
+            ParameterRole::FeedForwardIntermediate,
+            [
+                ParameterMemberSpec::new("down.weight", [8, 6], MemberSharding::Equal { axis: 1 }),
+                ParameterMemberSpec::new("down.scales", [8, 2], MemberSharding::Equal { axis: 1 }),
+                ParameterMemberSpec::new("down.bias", [8], MemberSharding::Replicated),
+            ],
+        )
+        .unwrap();
+        let segments = vec![0..4, 4..8, 8..12];
+        let group = assemble_segmented_projection_group(
+            "mlp.projections",
+            ParameterRole::FeedForwardIntermediate,
+            fused,
+            row,
+            segments.clone(),
+            2,
+            12,
+        )
+        .unwrap();
+        assert_eq!(group.partition_units(), Some(2));
+        for member in &group.members()[..3] {
+            assert_eq!(
+                member.sharding(),
+                &MemberSharding::PartitionedSegments {
+                    axis: 0,
+                    segments: segments.clone(),
+                }
+            );
+        }
+        assert_eq!(
+            group.members()[3].sharding(),
+            &MemberSharding::Partitioned { axis: 1 }
+        );
+        assert_eq!(
+            group.members()[4].sharding(),
+            &MemberSharding::Partitioned { axis: 1 }
+        );
+        assert_eq!(group.members()[5].sharding(), &MemberSharding::Replicated);
+    }
+
+    #[test]
+    fn segmented_projection_rejects_one_misaligned_companion_atomically() {
+        let fused = ParameterGroupSpec::new(
+            "fused",
+            ParameterRole::AttentionHeads,
+            [
+                ParameterMemberSpec::new("qkv.weight", [12, 8], MemberSharding::Equal { axis: 0 }),
+                ParameterMemberSpec::new("qkv.scales", [11, 2], MemberSharding::Equal { axis: 0 }),
+            ],
+        )
+        .unwrap();
+        let row = ParameterGroupSpec::new(
+            "row",
+            ParameterRole::AttentionHeads,
+            [ParameterMemberSpec::new(
+                "output.weight",
+                [8, 4],
+                MemberSharding::Equal { axis: 1 },
+            )],
+        )
+        .unwrap();
+        assert!(matches!(
+            assemble_segmented_projection_group(
+                "attention.projections",
+                ParameterRole::AttentionHeads,
+                fused,
+                row,
+                vec![0..4, 4..8, 8..12],
+                2,
+                12,
+            ),
+            Err(ParallelPlanError::InvalidTensor(_))
+        ));
     }
 
     #[test]

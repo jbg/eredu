@@ -1,32 +1,39 @@
 use std::{cell::Cell, collections::BTreeMap};
 
 use eredu_architectures::{
-    decoder, deepseek, gemma4, gpt_oss, inkling, kimi_linear, lfm2, muse_glimmer, nemotron_h, qwen,
+    decoder, deepseek, gemma4, gpt_oss, inkling, kimi_linear, lfm2, moshi, muse_glimmer,
+    nemotron_h, qwen,
 };
 use eredu_core::cache::{LayerCachePolicy, StateTensorRole};
+use eredu_core::TokenFilter;
 use eredu_nn::{
     reference_gated_delta_scan, reference_selective_state_space_scan, validate_parameter_topology,
     AttentionCache, AttentionMask, AttentionRequest, BlockwiseAttentionBackend,
     BlockwiseAttentionSpec, CausalDepthwiseConvolution, CausalDepthwiseConvolutionSpec,
     CompressedAttentionBlock, CompressedAttentionCache, CompressedAttentionScan,
-    CompressedAttentionState, CompressedAttentionView, ConvolutionActivation, EmbeddingOperator,
-    EmbeddingSpec, Error, GatedDeltaScanInput, GatedDeltaScanOutput,
+    CompressedAttentionState, CompressedAttentionView, ConvolutionActivation,
+    EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, FusedProjectionLayout,
+    FusedProjectionSegment, GatedDeltaScanInput, GatedDeltaScanOutput,
     GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
-    GatedShortConvolution, GatedShortConvolutionSpec, HyperConnection, HyperConnectionOperator,
-    HyperConnectionSpec, HyperConnectionState, HyperHead, HyperHeadOperator, HyperHeadSpec,
-    HyperNeuralBackend, Index, IndexedAttentionInput, JointExpertRoutingInput,
-    JointExpertRoutingResult, LinearOperator, LinearSpec, LowRankProjection, LowRankProjectionSpec,
-    NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode, ParameterMetadata,
-    ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
-    PooledPositionInput, PoolingAttentionCache, PoolingOverlap, PoolingWindows,
-    RelativeAttentionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator,
-    RotaryPosition, RotarySpec, RotarySubspace, RoutedNeuralBackend, RoutingOperator,
-    RoutingResult, SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
-    TopKRouterSpec, TopKRoutingSpec,
+    GatedProductPolicy, GatedShortConvolution, GatedShortConvolutionSpec, HyperConnection,
+    HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState, HyperHead,
+    HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, Index, IndexedAttentionInput,
+    JointExpertRoutingInput, JointExpertRoutingResult, LinearOperator, LinearSpec,
+    LowRankProjection, LowRankProjectionSpec, NeuralBackend, NormalizationOperator,
+    NormalizationSpec, PadMode, ParameterMetadata, ParameterSpec, ParameterVisitor,
+    ParameterVisitorMut, Parameterized, PooledAttentionInput, PooledPositionInput,
+    PoolingAttentionCache, PoolingOverlap, PoolingWindows, RelativeAttentionInput,
+    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
+    RotarySubspace, RoutedNeuralBackend, RoutingOperator, RoutingResult,
+    SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor, TopKRouterSpec,
+    TopKRoutingSpec,
 };
 use eredu_runtime::{
-    DeviceState, LayerRuntimeState, ResidentRuntime, RuntimeLayerState, RuntimeStateComponents,
-    StateError,
+    CompositeLayeredTraversalHook, DeviceState, LayerRuntimeState, LayeredTraversalHook,
+    PenaltyConfig, PredictionDirective, ResettableRuntimeLayerState, ResidentRuntime,
+    RuntimeLayerState, RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionDriver,
+    SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
+    TokenDomain,
 };
 
 #[derive(Debug, Clone)]
@@ -1396,6 +1403,35 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         linear(input, &self.weight, None)
+    }
+
+    fn lookup(
+        &mut self,
+        input: &NumericTensor,
+        policy: EmbeddingLookupPolicy,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        policy.validate()?;
+        let EmbeddingLookupPolicy::ZeroSentinel(sentinel) = policy else {
+            return self.forward(input, context);
+        };
+        let vocabulary = self.weight.shape[0] as usize;
+        let dimensions = self.weight.shape[1] as usize;
+        let mut shape = input.shape.clone();
+        shape.push(dimensions as i32);
+        let mut output = NumericTensor::zeros(shape);
+        for (token_index, token) in input.data.iter().copied().enumerate() {
+            if token == sentinel as f32 {
+                continue;
+            }
+            let row = token as usize;
+            if token < 0.0 || row >= vocabulary || row as f32 != token {
+                return Err(Error::backend("numeric embedding token is invalid"));
+            }
+            output.data[token_index * dimensions..(token_index + 1) * dimensions]
+                .copy_from_slice(&self.weight.data[row * dimensions..(row + 1) * dimensions]);
+        }
+        Ok(output)
     }
 }
 
@@ -3587,6 +3623,159 @@ impl HyperNeuralBackend for NumericBackend {
     }
 }
 
+impl SamplingBackend for NumericBackend {
+    type Logits = NumericTensor;
+    type Token = NumericTensor;
+    type RandomState = i32;
+    type Context = NumericContext;
+    type Error = Error;
+
+    fn error(message: String) -> Self::Error {
+        Error::backend(message)
+    }
+
+    fn validate_token(
+        token: &Self::Token,
+        domain: TokenDomain,
+        _: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        if token.data.iter().all(|value| {
+            *value >= 0.0 && value.fract() == 0.0 && (*value as usize) < domain.cardinality()
+        }) {
+            Ok(token.clone())
+        } else {
+            Err(Error::backend(
+                "numeric token is outside its decision domain",
+            ))
+        }
+    }
+
+    fn scale_temperature(
+        logits: &Self::Logits,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn apply_penalties(
+        logits: &Self::Logits,
+        _: &[u32],
+        _: PenaltyConfig,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn apply_top_k(
+        logits: Self::Logits,
+        _: i32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits)
+    }
+
+    fn apply_top_p(
+        logits: Self::Logits,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits)
+    }
+
+    fn apply_min_p(
+        logits: Self::Logits,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits)
+    }
+
+    fn apply_token_filter(
+        logits: &Self::Logits,
+        _: &TokenFilter,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn apply_mirostat(
+        logits: &Self::Logits,
+        _: &[u32],
+        _: PenaltyConfig,
+        _: f32,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn sample_raw(
+        logits: &Self::Logits,
+        _: f32,
+        random: Option<&mut Self::RandomState>,
+        _: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        let vocabulary = usize::try_from(*logits.shape.last().unwrap()).map_err(Error::backend)?;
+        let rows = logits.data.len() / vocabulary;
+        let mut shape = logits.shape.clone();
+        shape.pop();
+        let mut tokens = Vec::with_capacity(rows);
+        for row in logits.data.chunks_exact(vocabulary) {
+            let index = row
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index)
+                .unwrap_or_default();
+            tokens.push(index as f32);
+        }
+        if let Some(random) = random {
+            *random += 1;
+        }
+        Ok(NumericTensor::new(shape, tokens))
+    }
+
+    fn sample_processed(
+        logits: &Self::Logits,
+        temperature: f32,
+        random: Option<&mut Self::RandomState>,
+        context: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        Self::sample_raw(logits, temperature, random, context)
+    }
+
+    fn token_id(token: &Self::Token, _: &Self::Context) -> Result<u32, Self::Error> {
+        let value = *token
+            .data
+            .first()
+            .ok_or_else(|| Error::backend("numeric token is empty"))?;
+        if value < 0.0 || value.fract() != 0.0 {
+            return Err(Error::backend("numeric token is invalid"));
+        }
+        Ok(value as u32)
+    }
+
+    fn token_probability(_: &Self::Logits, _: u32, _: &Self::Context) -> Result<f32, Self::Error> {
+        Ok(1.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NumericSampler;
+
+impl Sampler<NumericBackend> for NumericSampler {
+    fn sample(
+        &mut self,
+        logits: &NumericTensor,
+        temperature: f32,
+        random: Option<&mut i32>,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        NumericBackend::sample_raw(logits, temperature, random, context)
+    }
+}
+
 impl RoutedNeuralBackend for NumericBackend {
     type Router = NumericRouter;
     type GatedProductExpertBank = NumericExpertBank;
@@ -3965,6 +4154,7 @@ struct NumericHybridLayerState {
     compressed: Option<NumericCompressedCache>,
     fixed: BTreeMap<StateTensorRole, Option<NumericTensor>>,
     fixed_offset: i32,
+    resets: usize,
 }
 
 impl NumericHybridLayerState {
@@ -3987,6 +4177,7 @@ impl NumericHybridLayerState {
                 .map(|tensor| (tensor.role, None))
                 .collect(),
             fixed_offset: 0,
+            resets: 0,
         }
     }
 }
@@ -4010,6 +4201,24 @@ impl RuntimeLayerState<NumericBackend> for NumericHybridLayerState {
         }
         values.extend(self.fixed.values().filter_map(Option::as_ref));
         values.into_iter()
+    }
+}
+
+impl ResettableRuntimeLayerState<NumericBackend> for NumericHybridLayerState {
+    fn reset(&mut self) -> Result<(), StateError> {
+        self.resets += 1;
+        if let Some(attention) = &mut self.attention {
+            attention.offset = 0;
+            attention.keys = None;
+            attention.values = None;
+        }
+        if let Some(compressed) = &mut self.compressed {
+            compressed.state = None;
+            compressed.offset = 0;
+        }
+        self.fixed.values_mut().for_each(|value| *value = None);
+        self.fixed_offset = 0;
+        Ok(())
     }
 }
 
@@ -4187,6 +4396,842 @@ fn config(model_type: &str, tied: bool) -> serde_json::Value {
         config["norm_topk_prob"] = true.into();
     }
     config
+}
+
+fn numeric_moshi_config() -> moshi::MoshiConfig {
+    moshi::MoshiConfig::from_json(
+        r#"{
+            "model_type":"moshi", "dim":4, "text_card":5,
+            "n_q":2, "dep_q":1, "generated_audio_codebooks":1, "card":4,
+            "num_heads":1, "num_layers":1, "dim_feedforward":6,
+            "causal":true, "context":3, "max_period":10000.0,
+            "positional_embedding":"rope", "depformer_dim":4,
+            "depformer_dim_feedforward":6, "depformer_num_heads":1,
+            "depformer_num_layers":1, "depformer_context":2,
+            "depformer_max_period":10000.0, "depformer_pos_emb":"none",
+            "delays":[0,0,1]
+        }"#,
+    )
+    .unwrap()
+}
+
+fn explicit_numeric_linear(name: &str, output: i32, input: i32, values: &[f32]) -> NumericLinear {
+    let spec = ParameterSpec::trainable(name).unwrap();
+    NumericLinear {
+        weight: NumericTensor::new([output, input], values.to_vec()),
+        weight_metadata: ParameterMetadata::from_spec(&spec, spec.trainable),
+        bias: None,
+    }
+}
+
+#[test]
+fn fused_and_split_qkv_are_numerically_identical_through_cached_attention() {
+    let context = NumericContext::default();
+    let query = [0.5, -0.25, 0.75, 0.125];
+    let key = [-0.5, 0.375, 0.25, 0.625];
+    let value = [0.125, 0.5, -0.75, 0.25];
+    let output = [1.0, 0.0, 0.0, 1.0];
+    let mut split = decoder::Attention::<NumericBackend>::from_parts(
+        1,
+        1,
+        2,
+        explicit_numeric_linear("split.q", 2, 2, &query),
+        explicit_numeric_linear("split.k", 2, 2, &key),
+        explicit_numeric_linear("split.v", 2, 2, &value),
+        explicit_numeric_linear("split.out", 2, 2, &output),
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let mut fused = decoder::Attention::<NumericBackend>::from_parts(
+        1,
+        1,
+        2,
+        explicit_numeric_linear("unused.q", 2, 2, &query),
+        explicit_numeric_linear("unused.k", 2, 2, &key),
+        explicit_numeric_linear("unused.v", 2, 2, &value),
+        explicit_numeric_linear("fused.out", 2, 2, &output),
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let fused_weight = query
+        .into_iter()
+        .chain(key)
+        .chain(value)
+        .collect::<Vec<_>>();
+    fused.input_projection =
+        decoder::AttentionInputProjection::Fused(decoder::FusedAttentionProjection {
+            projection: explicit_numeric_linear("fused.qkv", 6, 2, &fused_weight),
+            layout: FusedProjectionLayout::new([
+                FusedProjectionSegment::new("query", 2).unwrap(),
+                FusedProjectionSegment::new("key", 2).unwrap(),
+                FusedProjectionSegment::new("value", 2).unwrap(),
+            ])
+            .unwrap(),
+        });
+    let mut split_cache = NumericCache::new(None);
+    let mut fused_cache = NumericCache::new(None);
+    for hidden in [
+        NumericTensor::new([1, 2, 2], vec![0.25, -0.5, 0.75, 0.125]),
+        NumericTensor::new([1, 1, 2], vec![-0.25, 0.875]),
+    ] {
+        let split_output = split
+            .forward(
+                decoder::AttentionInput {
+                    hidden: &hidden,
+                    mask: None,
+                    cache: Some(&mut split_cache),
+                    allow_sliding_prefill: false,
+                    rotary_position: None,
+                },
+                &context,
+            )
+            .unwrap();
+        let fused_output = fused
+            .forward(
+                decoder::AttentionInput {
+                    hidden: &hidden,
+                    mask: None,
+                    cache: Some(&mut fused_cache),
+                    allow_sliding_prefill: false,
+                    rotary_position: None,
+                },
+                &context,
+            )
+            .unwrap();
+        assert_tensor_close(&fused_output, &split_output, "fused QKV attention");
+    }
+    assert_eq!(split_cache.offset, 3);
+    assert_eq!(fused_cache.offset, 3);
+}
+
+#[test]
+fn fused_and_split_gate_up_are_numerically_identical_through_silu_and_output() {
+    let context = NumericContext::default();
+    let input = NumericTensor::new([1, 2, 2], vec![0.25, -0.5, 0.75, 0.125]);
+    let gate_weight = [0.5, -0.25, 0.75, 0.125, -0.5, 0.375];
+    let up_weight = [0.125, 0.5, -0.75, 0.25, 0.625, -0.125];
+    let down_weight = [0.5, -0.25, 0.75, -0.125, 0.625, 0.25];
+    let gate = explicit_numeric_linear("split.gate", 3, 2, &gate_weight)
+        .forward(&input, &context)
+        .unwrap();
+    let up = explicit_numeric_linear("split.up", 3, 2, &up_weight)
+        .forward(&input, &context)
+        .unwrap();
+    let split_hidden =
+        NumericBackend::gated_product(gate, up, GatedProductPolicy::ordinary_silu(), &context)
+            .unwrap();
+
+    let fused_weight = gate_weight.into_iter().chain(up_weight).collect::<Vec<_>>();
+    let fused_projected = explicit_numeric_linear("fused.gate_up", 6, 2, &fused_weight)
+        .forward(&input, &context)
+        .unwrap();
+    let layout = FusedProjectionLayout::new([
+        FusedProjectionSegment::new("gate", 3).unwrap(),
+        FusedProjectionSegment::new("up", 3).unwrap(),
+    ])
+    .unwrap();
+    let mut fused_components = layout
+        .split(&fused_projected, &context)
+        .unwrap()
+        .into_iter();
+    let fused_hidden = NumericBackend::gated_product(
+        fused_components.next().unwrap(),
+        fused_components.next().unwrap(),
+        GatedProductPolicy::ordinary_silu(),
+        &context,
+    )
+    .unwrap();
+    assert!(fused_components.next().is_none());
+    assert_tensor_close(&fused_hidden, &split_hidden, "fused gate/up product");
+
+    let mut split_down = explicit_numeric_linear("split.down", 2, 3, &down_weight);
+    let mut fused_down = explicit_numeric_linear("fused.down", 2, 3, &down_weight);
+    let split_output = split_down.forward(&split_hidden, &context).unwrap();
+    let fused_output = fused_down.forward(&fused_hidden, &context).unwrap();
+    assert_tensor_close(&fused_output, &split_output, "fused gate/up output");
+}
+
+#[test]
+fn zero_sentinel_and_ordered_multi_table_sum_have_exact_scalar_results() {
+    let context = NumericContext::default();
+    let parameter = ParameterSpec::trainable("sentinel.weight").unwrap();
+    let mut sentinel = NumericEmbedding {
+        weight: NumericTensor::new([3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        metadata: ParameterMetadata::from_spec(&parameter, parameter.trainable),
+    };
+    let looked_up = sentinel
+        .lookup(
+            &NumericTensor::new([1, 3], vec![-1.0, 0.0, 2.0]),
+            EmbeddingLookupPolicy::ZeroSentinel(-1),
+            &context,
+        )
+        .unwrap();
+    assert_eq!(looked_up.data, [0.0, 0.0, 1.0, 2.0, 5.0, 6.0]);
+    for invalid in [-2.0, 3.0] {
+        assert!(sentinel
+            .lookup(
+                &NumericTensor::new([1, 1], vec![invalid]),
+                EmbeddingLookupPolicy::ZeroSentinel(-1),
+                &context,
+            )
+            .is_err());
+    }
+
+    let specs = [
+        decoder::NamedEmbeddingSpec {
+            name: "first".into(),
+            embedding: EmbeddingSpec {
+                vocabulary: 3,
+                dimensions: 2,
+                weight: ParameterSpec::trainable("first.weight").unwrap(),
+                quantization: None,
+            },
+            lookup: EmbeddingLookupPolicy::ZeroSentinel(-1),
+        },
+        decoder::NamedEmbeddingSpec {
+            name: "second".into(),
+            embedding: EmbeddingSpec {
+                vocabulary: 3,
+                dimensions: 2,
+                weight: ParameterSpec::trainable("second.weight").unwrap(),
+                quantization: None,
+            },
+            lookup: EmbeddingLookupPolicy::ZeroSentinel(-1),
+        },
+    ];
+    let mut sum = decoder::MultiTableEmbedding::<NumericBackend>::new(specs, &context).unwrap();
+    sum.tables[0].embedding.weight =
+        NumericTensor::new([3, 2], vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0]);
+    sum.tables[1].embedding.weight =
+        NumericTensor::new([3, 2], vec![0.5, 5.0, 1.5, 15.0, 2.5, 25.0]);
+    let first = NumericTensor::new([1, 2], vec![0.0, -1.0]);
+    let second = NumericTensor::new([1, 2], vec![2.0, 1.0]);
+    let actual = sum.forward(&[&first, &second], &context).unwrap();
+    assert_eq!(sum.names().collect::<Vec<_>>(), ["first", "second"]);
+    assert_eq!(actual.shape, [1, 2, 2]);
+    assert_eq!(actual.data, [3.5, 35.0, 1.5, 15.0]);
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct StatefulNumericSampler {
+    calls: usize,
+    invalid: bool,
+}
+
+impl Sampler<NumericBackend> for StatefulNumericSampler {
+    fn sample(
+        &mut self,
+        logits: &NumericTensor,
+        temperature: f32,
+        random: Option<&mut i32>,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        self.calls += 1;
+        if self.invalid {
+            if let Some(random) = random {
+                *random += 1;
+            }
+            return Ok(NumericTensor::token_ids(&[usize::MAX / 2]));
+        }
+        NumericBackend::sample_raw(logits, temperature, random, context)
+    }
+}
+
+#[derive(Debug)]
+struct NumericMoshiFrame {
+    sources: Vec<SequentialDecisionSource>,
+    tokens: Vec<usize>,
+    diagnostic_shapes: Vec<Vec<i32>>,
+    text_shape: Vec<i32>,
+    previous_depth_token: Vec<f32>,
+    samplers: Vec<StatefulNumericSampler>,
+    random: Option<i32>,
+}
+
+#[derive(Default)]
+struct NumericMoshiObservationCapture {
+    order: Vec<String>,
+    values: BTreeMap<String, NumericTensor>,
+}
+
+impl NumericMoshiObservationCapture {
+    fn capture(
+        &mut self,
+        point: moshi::ObservationPoint,
+        value: &NumericTensor,
+    ) -> Result<(), Error> {
+        let path = point.path();
+        self.order.push(path.clone());
+        if self.values.insert(path.clone(), value.clone()).is_some() {
+            return Err(Error::backend(format!(
+                "numeric Moshi observation {path} was captured twice"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl LayeredTraversalHook<NumericBackend, moshi::ForwardContext<NumericTensor>, Error>
+    for NumericMoshiObservationCapture
+{
+    fn before_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        _: usize,
+        value: &NumericTensor,
+        _: &mut moshi::ForwardContext<NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<eredu_runtime::LayeredUnitAction, Error> {
+        if (group, index) == (0, 0) {
+            self.capture(moshi::ObservationPoint::TemporalInput, value)?;
+        }
+        Ok(eredu_runtime::LayeredUnitAction::Execute)
+    }
+
+    fn after_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        value: &NumericTensor,
+        _: &mut moshi::ForwardContext<NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<(), Error> {
+        match group {
+            0 => self.capture(
+                moshi::ObservationPoint::TemporalLayer { layer: index },
+                value,
+            ),
+            1 => self.capture(
+                moshi::ObservationPoint::DepthSliceLogits { slice: index },
+                value,
+            ),
+            _ => Err(Error::backend(format!(
+                "numeric Moshi observed unknown execution group {group}"
+            ))),
+        }
+    }
+
+    fn after_group(
+        &mut self,
+        group: usize,
+        _: &NumericTensor,
+        forward: &mut moshi::ForwardContext<NumericTensor>,
+        _: &NumericContext,
+    ) -> Result<(), Error> {
+        if group == 0 {
+            let logits = forward
+                .text_logits()
+                .ok_or_else(|| Error::backend("numeric Moshi text logits are unavailable"))?
+                .clone();
+            self.capture(moshi::ObservationPoint::TextLogits, &logits)?;
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_numeric_moshi_frame(
+    runtime: &mut ResidentRuntime<
+        moshi::LayeredModel<NumericBackend>,
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    >,
+    state: &mut DeviceState<NumericBackend, NumericHybridLayerState>,
+    config: &moshi::MoshiConfig,
+    text_id: usize,
+    audio_ids: [usize; 2],
+    directives: [PredictionDirective<NumericTensor>; 2],
+    retain_diagnostics: bool,
+    samplers: Vec<StatefulNumericSampler>,
+    temperatures: Vec<f32>,
+    random: Option<i32>,
+    context: &NumericContext,
+) -> Result<NumericMoshiFrame, String> {
+    let plan = SequentialDecisionPlan::new(directives, retain_diagnostics, true)
+        .map_err(|error| error.to_string())?;
+    let mut driver = SequentialDecisionDriver::new(plan, samplers, temperatures, random)
+        .map_err(|error| error.to_string())?;
+    let mut boundary = moshi::DecisionBoundary::new(config).map_err(|error| error.to_string())?;
+    let text = NumericTensor::token_ids(&[text_id]);
+    let audio_values = audio_ids.map(|id| NumericTensor::token_ids(&[id]));
+    let audio = audio_values.iter().collect::<Vec<_>>();
+    let (text_logits, forward) = {
+        let mut traversal = SequentialDecisionTraversal::new(&mut driver, &mut boundary);
+        runtime
+            .forward_with_traversal_hook(
+                moshi::Input {
+                    text: &text,
+                    audio: &audio,
+                    mask: None,
+                },
+                state,
+                context,
+                &mut traversal,
+            )
+            .map_err(|error| error.to_string())?
+    };
+    driver.finish().map_err(|error| error.to_string())?;
+    let sources = driver
+        .decisions()
+        .iter()
+        .map(|decision| decision.source())
+        .collect();
+    let tokens = driver
+        .decisions()
+        .iter()
+        .map(|decision| decision.token().data[0] as usize)
+        .collect();
+    let diagnostic_shapes = driver
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| diagnostic.logits().shape.clone())
+        .collect();
+    let previous_depth_token = forward
+        .previous_depth_token()
+        .ok_or_else(|| "numeric Moshi frame has no accepted depth token".to_string())?
+        .data
+        .clone();
+    let (samplers, random) = driver
+        .finish_into_sampling_state()
+        .map_err(|error| error.to_string())?;
+    Ok(NumericMoshiFrame {
+        sources,
+        tokens,
+        diagnostic_shapes,
+        text_shape: text_logits.shape,
+        previous_depth_token,
+        samplers,
+        random,
+    })
+}
+
+#[test]
+fn moshi_numeric_autoregressive_decisions_continue_one_cache_and_roll_back_failures() {
+    let config = numeric_moshi_config();
+    let context = NumericContext::default();
+    let layout = moshi::state_layout(&config).unwrap();
+    let mut state =
+        DeviceState::<NumericBackend, NumericHybridLayerState>::create(layout, |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .unwrap();
+    let architecture =
+        moshi::LayeredModel::<NumericBackend>::new(config.clone(), &context).unwrap();
+    let mut runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let mut samplers = vec![
+        StatefulNumericSampler {
+            calls: 0,
+            invalid: false,
+        };
+        2
+    ];
+    let mut random = None;
+
+    let greedy = execute_numeric_moshi_frame(
+        &mut runtime,
+        &mut state,
+        &config,
+        1,
+        [2, 3],
+        [PredictionDirective::Sample, PredictionDirective::Sample],
+        true,
+        samplers,
+        vec![0.0; 2],
+        random,
+        &context,
+    )
+    .unwrap();
+    assert_eq!(greedy.sources, [SequentialDecisionSource::Sampled; 2]);
+    assert_eq!(greedy.tokens, [4, 3]);
+    assert_eq!(greedy.diagnostic_shapes, [vec![1, 1, 5], vec![1, 1, 4]]);
+    assert_eq!(greedy.text_shape, [1, 1, 5]);
+    assert_eq!(greedy.previous_depth_token, [3.0]);
+    assert_eq!(state.as_ref()[0].position(), 1);
+    assert_eq!((state.as_ref()[0].resets, state.as_ref()[1].resets), (0, 1));
+    samplers = greedy.samplers;
+    random = Some(10);
+
+    let seeded = execute_numeric_moshi_frame(
+        &mut runtime,
+        &mut state,
+        &config,
+        2,
+        [1, 0],
+        [PredictionDirective::Sample, PredictionDirective::Sample],
+        true,
+        samplers,
+        vec![0.7; 2],
+        random,
+        &context,
+    )
+    .unwrap();
+    assert_eq!(seeded.sources, [SequentialDecisionSource::Sampled; 2]);
+    assert_eq!(seeded.tokens, [3, 2]);
+    assert_eq!(seeded.diagnostic_shapes, [vec![1, 1, 5], vec![1, 1, 4]]);
+    assert_eq!(seeded.random, Some(12));
+    assert_eq!(
+        seeded
+            .samplers
+            .iter()
+            .map(|sampler| sampler.calls)
+            .collect::<Vec<_>>(),
+        [2, 2]
+    );
+    assert_eq!(state.as_ref()[0].position(), 2);
+    assert_eq!(state.as_ref()[1].position(), 1);
+    assert_eq!(state.as_ref()[1].resets, 2);
+    samplers = seeded.samplers;
+    random = seeded.random;
+
+    let forced = execute_numeric_moshi_frame(
+        &mut runtime,
+        &mut state,
+        &config,
+        3,
+        [0, 1],
+        [
+            PredictionDirective::Force(NumericTensor::token_ids(&[1])),
+            PredictionDirective::Force(NumericTensor::token_ids(&[3])),
+        ],
+        false,
+        samplers,
+        vec![0.7; 2],
+        random,
+        &context,
+    )
+    .unwrap();
+    assert_eq!(
+        forced.sources,
+        [
+            SequentialDecisionSource::Forced,
+            SequentialDecisionSource::ForcedTailSkipped,
+        ]
+    );
+    assert_eq!(forced.tokens, [1, 3]);
+    assert!(forced.diagnostic_shapes.is_empty());
+    assert_eq!(forced.previous_depth_token, [3.0]);
+    assert_eq!(forced.random, Some(12));
+    assert_eq!(
+        forced
+            .samplers
+            .iter()
+            .map(|sampler| sampler.calls)
+            .collect::<Vec<_>>(),
+        [2, 2]
+    );
+    assert_eq!(state.as_ref()[0].position(), 3);
+    assert_eq!(state.as_ref()[1].position(), 0);
+    assert_eq!(state.as_ref()[1].resets, 3);
+    samplers = forced.samplers;
+    random = forced.random;
+
+    let canonical_state = state.clone();
+    let canonical_samplers = samplers.clone();
+    let canonical_random = random;
+    let mut rejected_state = state.clone();
+    let mut rejected_samplers = samplers.clone();
+    rejected_samplers[0].invalid = true;
+    let error = execute_numeric_moshi_frame(
+        &mut runtime,
+        &mut rejected_state,
+        &config,
+        4,
+        [1, 2],
+        [PredictionDirective::Sample, PredictionDirective::Sample],
+        true,
+        rejected_samplers,
+        vec![0.7; 2],
+        random,
+        &context,
+    )
+    .unwrap_err();
+    assert!(error.contains("outside its decision domain"));
+    assert_eq!(
+        state
+            .as_ref()
+            .iter()
+            .map(|layer| (layer.position(), layer.resets))
+            .collect::<Vec<_>>(),
+        canonical_state
+            .as_ref()
+            .iter()
+            .map(|layer| (layer.position(), layer.resets))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(samplers, canonical_samplers);
+    assert_eq!(random, canonical_random);
+
+    let partial = execute_numeric_moshi_frame(
+        &mut runtime,
+        &mut state,
+        &config,
+        4,
+        [1, 2],
+        [
+            PredictionDirective::Force(NumericTensor::token_ids(&[2])),
+            PredictionDirective::Sample,
+        ],
+        true,
+        samplers,
+        vec![0.7; 2],
+        random,
+        &context,
+    )
+    .unwrap();
+    assert_eq!(
+        partial.sources,
+        [
+            SequentialDecisionSource::Forced,
+            SequentialDecisionSource::Sampled,
+        ]
+    );
+    assert_eq!(partial.tokens, [2, 2]);
+    assert_eq!(partial.diagnostic_shapes, [vec![1, 1, 5], vec![1, 1, 4]]);
+    assert_eq!(partial.previous_depth_token, [2.0]);
+    assert_eq!(partial.random, Some(13));
+    assert_eq!(
+        partial
+            .samplers
+            .iter()
+            .map(|sampler| sampler.calls)
+            .collect::<Vec<_>>(),
+        [2, 3]
+    );
+    assert_eq!(state.as_ref()[0].position(), 4);
+    assert_eq!(state.as_ref()[1].position(), 1);
+    assert_eq!((state.as_ref()[0].resets, state.as_ref()[1].resets), (0, 4));
+}
+
+#[test]
+fn moshi_numeric_teacher_forced_logits_are_exact_across_continuation() {
+    let config = numeric_moshi_config();
+    let context = NumericContext::default();
+    let layout = moshi::state_layout(&config).unwrap();
+    let mut state =
+        DeviceState::<NumericBackend, NumericHybridLayerState>::create(layout, |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .unwrap();
+    let architecture =
+        moshi::LayeredModel::<NumericBackend>::new(config.clone(), &context).unwrap();
+    let mut runtime = ResidentRuntime::new(architecture, &context).unwrap();
+
+    let text = NumericTensor::token_ids(&[1]);
+    let audio_values = [
+        NumericTensor::token_ids(&[2]),
+        NumericTensor::token_ids(&[3]),
+    ];
+    let audio = audio_values.iter().collect::<Vec<_>>();
+    let plan = SequentialDecisionPlan::new(
+        [
+            PredictionDirective::Force(NumericTensor::token_ids(&[2])),
+            PredictionDirective::Force(NumericTensor::token_ids(&[1])),
+        ],
+        true,
+        false,
+    )
+    .unwrap();
+    let mut driver =
+        SequentialDecisionDriver::new(plan, vec![NumericSampler; 2], vec![0.0; 2], None).unwrap();
+    let mut boundary = moshi::DecisionBoundary::new(&config).unwrap();
+    let (first_text, _) = {
+        let mut traversal = SequentialDecisionTraversal::new(&mut driver, &mut boundary);
+        runtime
+            .forward_with_traversal_hook(
+                moshi::Input {
+                    text: &text,
+                    audio: &audio,
+                    mask: None,
+                },
+                &mut state,
+                &context,
+                &mut traversal,
+            )
+            .unwrap()
+    };
+    driver.finish().unwrap();
+    let first_audio = driver.diagnostics()[1].logits().clone();
+
+    let text = NumericTensor::token_ids(&[2]);
+    let audio_values = [
+        NumericTensor::token_ids(&[1]),
+        NumericTensor::token_ids(&[0]),
+    ];
+    let audio = audio_values.iter().collect::<Vec<_>>();
+    let plan = SequentialDecisionPlan::new(
+        [
+            PredictionDirective::Force(NumericTensor::token_ids(&[3])),
+            PredictionDirective::Force(NumericTensor::token_ids(&[2])),
+        ],
+        true,
+        false,
+    )
+    .unwrap();
+    let mut driver =
+        SequentialDecisionDriver::new(plan, vec![NumericSampler; 2], vec![0.0; 2], None).unwrap();
+    let (second_text, observations) = {
+        let decisions = SequentialDecisionTraversal::new(&mut driver, &mut boundary);
+        let capture = NumericMoshiObservationCapture::default();
+        let mut traversal = CompositeLayeredTraversalHook::new(decisions, capture);
+        let (text_logits, _) = runtime
+            .forward_with_traversal_hook(
+                moshi::Input {
+                    text: &text,
+                    audio: &audio,
+                    mask: None,
+                },
+                &mut state,
+                &context,
+                &mut traversal,
+            )
+            .unwrap();
+        let (decisions, observations) = traversal.into_parts();
+        drop(decisions);
+        (text_logits, observations)
+    };
+    driver.finish().unwrap();
+    let second_audio = driver.diagnostics()[1].logits().clone();
+
+    assert_tensor_close(
+        &first_text,
+        &NumericTensor::new(
+            vec![1, 1, 5],
+            vec![
+                -0.06355038,
+                -0.033500876,
+                -0.06604099,
+                -0.06899042,
+                -0.008079363,
+            ],
+        ),
+        "first Moshi text logits",
+    );
+    assert_tensor_close(
+        &first_audio,
+        &NumericTensor::new(
+            vec![1, 1, 4],
+            vec![-0.0025060514, -0.0005943443, 0.0011221073, -0.0010868304],
+        ),
+        "first Moshi audio logits",
+    );
+    assert_tensor_close(
+        &second_text,
+        &NumericTensor::new(
+            vec![1, 1, 5],
+            vec![
+                0.007951072,
+                -0.020567559,
+                0.017594583,
+                0.07032819,
+                0.010250918,
+            ],
+        ),
+        "continued Moshi text logits",
+    );
+    assert_tensor_close(
+        &second_audio,
+        &NumericTensor::new(
+            vec![1, 1, 4],
+            vec![-0.001689149, -0.0018042361, 0.0036688647, 0.0020801048],
+        ),
+        "continued Moshi audio logits",
+    );
+    assert_eq!(
+        observations.order.as_slice(),
+        moshi::observation_points(&config)
+            .into_iter()
+            .map(moshi::ObservationPoint::path)
+            .collect::<Vec<_>>()
+            .as_slice()
+    );
+    assert_tensor_close(
+        observations.values.get("temporal.input").unwrap(),
+        &NumericTensor::new(
+            vec![1, 1, 4],
+            vec![0.012679999, 0.058, 0.064959995, -0.029040001],
+        ),
+        "continued Moshi temporal input",
+    );
+    assert_tensor_close(
+        observations
+            .values
+            .get("transformer.layers.0.output")
+            .unwrap(),
+        &NumericTensor::new(
+            vec![1, 1, 4],
+            vec![0.012538117, 0.059593383, 0.06597139, -0.030165773],
+        ),
+        "continued Moshi temporal layer output",
+    );
+    assert_tensor_close(
+        observations.values.get("text_linear.logits").unwrap(),
+        &NumericTensor::new(
+            vec![1, 1, 5],
+            vec![
+                0.007951072,
+                -0.020567559,
+                0.017594583,
+                0.07032819,
+                0.010250918,
+            ],
+        ),
+        "observed continued Moshi text logits",
+    );
+    assert_tensor_close(
+        observations
+            .values
+            .get("depformer.slices.0.logits")
+            .unwrap(),
+        &NumericTensor::new(
+            vec![1, 1, 4],
+            vec![-0.001689149, -0.0018042361, 0.0036688647, 0.0020801048],
+        ),
+        "observed continued Moshi depth-slice logits",
+    );
+    assert_eq!(state.as_ref()[0].position(), 2);
+    assert_eq!(state.as_ref()[1].position(), 1);
+}
+
+#[test]
+fn moshi_numeric_rejects_out_of_range_tokens_before_cache_mutation() {
+    let config = numeric_moshi_config();
+    let context = NumericContext::default();
+    let layout = moshi::state_layout(&config).unwrap();
+    let mut state =
+        DeviceState::<NumericBackend, NumericHybridLayerState>::create(layout, |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .unwrap();
+    let architecture = moshi::LayeredModel::<NumericBackend>::new(config, &context).unwrap();
+    let mut runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let invalid_text = NumericTensor::token_ids(&[99]);
+    let audio_values = [
+        NumericTensor::token_ids(&[1]),
+        NumericTensor::token_ids(&[2]),
+    ];
+    let audio = audio_values.iter().collect::<Vec<_>>();
+    let error = runtime
+        .forward(
+            moshi::Input {
+                text: &invalid_text,
+                audio: &audio,
+                mask: None,
+            },
+            &mut state,
+            &context,
+        )
+        .err()
+        .expect("out-of-range token must fail");
+    assert!(error.to_string().contains("embedding token is invalid"));
+    assert_eq!(state.as_ref()[0].position(), 0);
+    assert_eq!(state.as_ref()[1].position(), 0);
 }
 
 #[derive(Debug, Clone)]

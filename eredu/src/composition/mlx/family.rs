@@ -3,7 +3,6 @@
 use serde_json::Value;
 
 use crate::backend::mlx::error::Error;
-use crate::composition::mlx_architectures::moshi::personaplex;
 
 /// Canonical resolution of a model configuration supported by MLX.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -33,6 +32,9 @@ impl std::fmt::Display for ModelConfigResolutionError {
 pub(crate) fn resolve_model_config(
     config: &Value,
 ) -> Result<ResolvedModelConfig, ModelConfigResolutionError> {
+    if let Some(resolved) = resolve_moshi_config(config)? {
+        return Ok(resolved);
+    }
     let resolved =
         eredu_core::resolve_model_configuration(config).map_err(|error| match error {
             eredu_core::artifact::ArtifactError::Json(error) => {
@@ -49,6 +51,34 @@ pub(crate) fn resolve_model_config(
         model_type: resolved.declared_model_type,
         effective_model_type: resolved.effective_model_type,
     })
+}
+
+fn resolve_moshi_config(
+    config: &Value,
+) -> Result<Option<ResolvedModelConfig>, ModelConfigResolutionError> {
+    match eredu_architectures::moshi::MoshiConfig::from_config_value(Some(config)) {
+        Ok(config) => {
+            let effective = config.effective_model_type().as_str().to_string();
+            Ok(Some(ResolvedModelConfig {
+                kind: eredu_core::ModelKind::Moshi,
+                model_type: effective.clone(),
+                effective_model_type: effective,
+            }))
+        }
+        Err(error) => {
+            let explicitly_moshi = config
+                .get("model_type")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == "moshi" || value == "personaplex");
+            if explicitly_moshi {
+                Err(ModelConfigResolutionError::Loader(
+                    Error::UnsupportedArchitecture(error.to_string()),
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 fn validate_model_config(kind: eredu_core::ModelKind, config: &Value) -> Result<(), Error> {
@@ -103,7 +133,11 @@ fn validate_model_config(kind: eredu_core::ModelKind, config: &Value) -> Result<
                 .map(|_| ())
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         }
-        ModelKind::PersonaPlex => personaplex::validate_model_config_value(config),
+        ModelKind::Moshi => {
+            eredu_architectures::moshi::MoshiConfig::from_config_value(Some(config))
+                .map(|_| ())
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        }
         ModelKind::Qwen2 | ModelKind::Qwen3 => {
             eredu_architectures::qwen::model_args_from_config_value(config)
                 .map(|_| ())

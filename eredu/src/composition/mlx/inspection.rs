@@ -882,6 +882,9 @@ fn modalities_for_safetensors(kind: ModelKind, config: &Value) -> Vec<ArtifactMo
             modalities.insert(ArtifactModality::Image);
             modalities.insert(ArtifactModality::Video);
         }
+        ModelKind::Moshi => {
+            modalities.insert(ArtifactModality::Audio);
+        }
         ModelKind::DeepSeekV3
         | ModelKind::DeepSeekV4
         | ModelKind::GptOss
@@ -889,7 +892,6 @@ fn modalities_for_safetensors(kind: ModelKind, config: &Value) -> Vec<ArtifactMo
         | ModelKind::Llama
         | ModelKind::Lfm2
         | ModelKind::NemotronH
-        | ModelKind::PersonaPlex
         | ModelKind::Qwen2
         | ModelKind::Qwen3
         | ModelKind::Qwen3Next

@@ -42,6 +42,27 @@ pub trait CausalModel<S> {
     }
 }
 
+/// Portable cardinality of one zero-based token-id domain.
+///
+/// Backends validate native token tensors without copying their values to the
+/// host. Architectures select the exact domain for each prediction boundary.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TokenDomain {
+    cardinality: usize,
+}
+
+impl TokenDomain {
+    /// Creates the token IDs `0..cardinality`.
+    pub const fn new(cardinality: usize) -> Self {
+        Self { cardinality }
+    }
+
+    /// Number of valid zero-based token IDs.
+    pub const fn cardinality(self) -> usize {
+        self.cardinality
+    }
+}
+
 /// Backend primitives required by generic token-sampling policies.
 ///
 /// The runtime owns ordering, history, adaptive state, and constraint rollback.
@@ -61,6 +82,16 @@ pub trait SamplingBackend {
 
     /// Creates a backend error for a portable policy or constraint failure.
     fn error(message: String) -> Self::Error;
+
+    /// Validates a native token tensor against one architecture-selected domain.
+    ///
+    /// The returned token must retain a backend-native dependency on the range
+    /// check so lazy backends cannot commit an unchecked forced token.
+    fn validate_token(
+        token: &Self::Token,
+        domain: TokenDomain,
+        context: &Self::Context,
+    ) -> Result<Self::Token, Self::Error>;
 
     /// Scales logits by inverse temperature, preserving the native tensor.
     fn scale_temperature(

@@ -1475,6 +1475,19 @@ fn load_expert_parallel_model_impl(
     let config: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
     let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
+    let kind = model_type
+        .and_then(|model_type| ModelKind::from_model_type(model_type).ok())
+        .or_else(|| {
+            crate::composition::mlx::resolve_model_config(&config)
+                .ok()
+                .map(|resolved| resolved.kind)
+        });
+    if kind.is_some_and(ModelKind::requires_realtime_loader) {
+        return Err(Error::UnsupportedArchitecture(
+            "Moshi-family models use a realtime multi-stream temporal/depth contract, not expert-parallel decoder execution"
+                .into(),
+        ));
+    }
     if topology.tensor_parallel_size > 1
         && !matches!(
             model_type,

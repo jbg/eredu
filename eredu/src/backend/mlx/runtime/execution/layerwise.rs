@@ -466,6 +466,9 @@ where
     let mut recipes = BTreeMap::new();
     let mut collect = |bindings: &[WeightBinding], selected: &BTreeMap<String, RecipeDtype>| {
         for binding in bindings {
+            if binding.is_alias() {
+                continue;
+            }
             let recipe = binding.source_recipe();
             let metadata = recipe.infer(store.as_ref())?;
             if !matches!(
@@ -609,6 +612,9 @@ where
     let mut recipes = BTreeMap::new();
     let mut collect = |bindings: &[WeightBinding], selected: &BTreeMap<String, RecipeDtype>| {
         for binding in bindings {
+            if binding.is_alias() {
+                continue;
+            }
             let recipe = binding.source_recipe();
             let metadata = recipe.infer(store.as_ref())?;
             if !matches!(
@@ -756,6 +762,9 @@ where
         |bindings: &[WeightBinding],
          selected_local_weights: Option<&BTreeMap<String, RecipeDtype>>| {
             for binding in bindings {
+                if binding.is_alias() {
+                    continue;
+                }
                 let recipe = binding.source_recipe();
                 let metadata = recipe.infer(store.as_ref())?;
                 if !matches!(
@@ -1034,16 +1043,21 @@ pub(crate) fn shard_layer_bindings(
     let store_keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut output = Vec::with_capacity(bindings.len());
     for binding in bindings {
+        if binding.is_alias() {
+            output.push(binding);
+            continue;
+        }
         let canonical_name =
             crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&format!(
                 "{prefix}.{}",
                 binding.name()
             ));
-        let logical_target = binding.logical_target();
+        let logical_target = binding.logical_target().map(str::to_owned);
         let tensor = logical_target
+            .as_deref()
             .and_then(|target| layout.tensor(target))
             .or_else(|| {
-                logical_target.and_then(|logical| {
+                logical_target.as_deref().and_then(|logical| {
                     let canonical_logical =
                         crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(logical);
                     layout.tensors().find_map(|(target, tensor)| {
@@ -1066,7 +1080,7 @@ pub(crate) fn shard_layer_bindings(
             })
             .or_else(|| {
                 [
-                    logical_target.map(str::to_string),
+                    logical_target.clone(),
                     Some(binding.checkpoint_key().to_string()),
                     Some(canonical_name.clone()),
                 ]
@@ -1109,12 +1123,16 @@ pub(crate) fn shard_layer_bindings(
                         binding.name()
                     ))
                 })?;
-            output.push(WeightBinding::new(
+            let mut sharded = WeightBinding::new(
                 binding.name(),
                 binding.checkpoint_key(),
                 selection,
                 expected_bytes,
-            )?);
+            )?;
+            if let Some(target) = logical_target {
+                sharded = sharded.with_logical_target(target)?;
+            }
+            output.push(sharded);
             continue;
         }
         let recipe = binding.source_recipe();
@@ -1126,7 +1144,10 @@ pub(crate) fn shard_layer_bindings(
         }
         let recipe = recipe.select_bounded(store, selection)?;
         let expected_bytes = recipe.infer(store)?.byte_len();
-        let sharded = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?;
+        let mut sharded = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?;
+        if let Some(target) = logical_target {
+            sharded = sharded.with_logical_target(target)?;
+        }
         output.push(sharded);
     }
     Ok(output)

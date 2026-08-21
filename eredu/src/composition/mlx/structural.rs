@@ -12,7 +12,7 @@ use eredu_core::{GgufArchitecture, ModelKind};
 use super::ModelLoadOptions;
 use crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames;
 use crate::backend::mlx::{error::Error, runtime::checkpoint::store::SafetensorsWeightStore};
-use crate::composition::{llama_checkpoint, mlx_architectures::moshi::personaplex_checkpoint};
+use crate::composition::llama_checkpoint;
 
 pub(crate) use eredu_checkpoint::validation::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,
@@ -108,7 +108,7 @@ pub(crate) const fn safetensors_policy(kind: ModelKind) -> StructuralValidationP
         | ModelKind::Llama
         | ModelKind::MuseGlimmer
         | ModelKind::NemotronH
-        | ModelKind::PersonaPlex
+        | ModelKind::Moshi
         | ModelKind::Qwen2
         | ModelKind::Qwen3
         | ModelKind::Qwen3Next
@@ -163,7 +163,7 @@ pub(crate) fn validate_safetensors(
             ModelKind::Llama => llama_checkpoint::validate_safetensors(config, store),
             ModelKind::MuseGlimmer => validate_neutral_muse_glimmer_safetensors(config, store),
             ModelKind::NemotronH => validate_neutral_nemotron_safetensors(config, store),
-            ModelKind::PersonaPlex => personaplex_checkpoint::validate_safetensors(config, store),
+            ModelKind::Moshi => validate_neutral_moshi_safetensors(config, store),
             ModelKind::Qwen2 | ModelKind::Qwen3 => validate_neutral_qwen_safetensors(config, store),
             ModelKind::Qwen3Next | ModelKind::Qwen35 => {
                 validate_neutral_qwen_hybrid_safetensors(config, store)
@@ -175,6 +175,28 @@ pub(crate) fn validate_safetensors(
         StructuralValidationPolicy::Unverified => unverified(kind.model_type_name()),
     };
     validation.with_strict_catalog(options.weight_residency.strict_loading())
+}
+
+fn validate_neutral_moshi_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let config = match eredu_architectures::moshi::MoshiConfig::from_config_value(Some(config)) {
+        Ok(config) => config,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::moshi::safetensors_plan(&config) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    let validation = eredu_checkpoint::validation::validate_safetensors_plan(store, &plan);
+    if validation != StructuralValidation::Exact {
+        return validation;
+    }
+    match eredu_architectures::moshi::canonical_recipes(&config, store) {
+        Ok(_) => StructuralValidation::Exact,
+        Err(error) => invalid_geometry(error),
+    }
 }
 
 #[cfg(test)]
@@ -1054,6 +1076,14 @@ mod admission_policy_tests {
             Error::StrictLoadValidation { missing, unused }
                 if missing.is_empty() && unused == ["unrelated.weight"]
         ));
+    }
+
+    #[test]
+    fn moshi_family_requires_exact_neutral_structural_validation() {
+        assert_eq!(
+            safetensors_policy(ModelKind::Moshi),
+            StructuralValidationPolicy::Exact
+        );
     }
 }
 

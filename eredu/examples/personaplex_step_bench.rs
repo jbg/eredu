@@ -2,8 +2,7 @@ use std::{path::PathBuf, time::Instant};
 
 use eredu::{
     backend::mlx::ModelLoadOptions,
-    composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
-    composition::mlx_architectures::moshi::personaplex,
+    composition::mlx::realtime::{personaplex_prompt, MlxRealtimeBackend, MlxRealtimeInput},
     load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
     RealtimeScheduler, RequestId, SchedulerLimits,
 };
@@ -79,7 +78,7 @@ fn benchmark_model(
     frames: i32,
     stream: &Stream,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let input = personaplex::sine_frame(1, stream)?;
+    let input = personaplex_prompt::sine_frame(1, stream)?;
     let _ = run_steps(model, &input, 4, stream)?;
     let result = run_steps(model, &input, frames, stream)?;
     report(

@@ -108,8 +108,11 @@ pub use media::{
 };
 pub use realtime::{
     load_realtime_model, load_realtime_model_with_options, RealtimeBackend, RealtimeCompletedStep,
-    RealtimeConfigError, RealtimeError, RealtimeModel, RealtimeModelLoadingBackend,
-    RealtimeSampling, RealtimeScheduler, RealtimeSession, RealtimeSpeechConfig,
+    RealtimeConfigError, RealtimeError, RealtimeFrameConvention, RealtimeFrameForcing,
+    RealtimeFrameScheduleState, RealtimeFrameSlot, RealtimeFrameTransition, RealtimeModel,
+    RealtimeModelLoadingBackend, RealtimeSampling, RealtimeScheduleError, RealtimeScheduler,
+    RealtimeSession, RealtimeSlotCoordinate, RealtimeSlotOccupancy, RealtimeSpeechConfig,
+    RealtimeTargetDecision, RealtimeTargetSource, RealtimeTemporalSource, MAX_REALTIME_FRAME_DELAY,
 };
 pub use residency::{
     BackgroundPrefetchReport, PrefetchAdmission, PrefetchCompletion, PrefetchDemandObservation,

@@ -1,4 +1,4 @@
-//! Architecture-dispatched distributed model adapters.
+//! Architecture-neutral distributed MLX model composition.
 
 /// Executable expert-parallel model adapters.
 pub mod expert;

@@ -1,7 +1,7 @@
 //! Executable pipeline parallelism for decoder-only language models.
 
 //!
-//! A [`crate::composition::mlx_architectures::distributed::pipeline::PipelineModel`] owns one
+//! A [`crate::composition::mlx::distributed::pipeline::PipelineModel`] owns one
 //! dependency-safe, balanced contiguous decoder-layer range and the boundary
 //! modules required by its explicit stage role. Request scheduling belongs to
 //! the backend-neutral core; this module only executes rank-local MLX stages.
@@ -10728,6 +10728,19 @@ pub(crate) fn load_pipeline_model_with_options(
     let config: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
     let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
+    let kind = model_type
+        .and_then(|model_type| ModelKind::from_model_type(model_type).ok())
+        .or_else(|| {
+            crate::composition::mlx::resolve_model_config(&config)
+                .ok()
+                .map(|resolved| resolved.kind)
+        });
+    if kind.is_some_and(ModelKind::requires_realtime_loader) {
+        return Err(Error::UnsupportedArchitecture(
+            "Moshi-family models use a realtime multi-stream temporal/depth contract, not the decoder pipeline"
+                .into(),
+        ));
+    }
     if expert_cache.is_some()
         && !matches!(
             model_type,
@@ -11081,10 +11094,6 @@ pub(crate) fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("personaplex") => Err(Error::UnsupportedArchitecture(
-            "PersonaPlex/Moshi is a realtime multi-stream temporal/depth model, not a single-hidden-stream decoder pipeline; use RealtimeInferenceScheduler"
-                .into(),
-        )),
         Some(model_type) => Err(Error::UnsupportedArchitecture(format!(
             "pipeline execution supports Llama-compatible, DeepSeek-V3/R1, Gemma 4, Qwen2/Qwen3/Qwen3-MoE, Qwen3-VL/Qwen3-VL-MoE, GPT-OSS, LFM2/LFM2-MoE, Nemotron-H, Kimi Linear, Qwen3-Next/Qwen3.5 text, and Inkling models, not {model_type}"
         ))),

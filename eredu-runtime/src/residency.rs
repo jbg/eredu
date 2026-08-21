@@ -112,6 +112,7 @@ impl ResidencyReport {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WeightBinding {
     name: String,
+    alias_of: Option<String>,
     logical_target: Option<String>,
     checkpoint_key: String,
     selection: TensorSelection,
@@ -135,6 +136,7 @@ impl WeightBinding {
         validate_size(&name, expected_bytes)?;
         Ok(Self {
             name,
+            alias_of: None,
             logical_target: None,
             checkpoint_key,
             selection,
@@ -154,6 +156,7 @@ impl WeightBinding {
         let checkpoint_key = first_source(&name, &recipe)?;
         Ok(Self {
             name,
+            alias_of: None,
             logical_target: None,
             checkpoint_key,
             selection: TensorSelection::Full,
@@ -162,9 +165,41 @@ impl WeightBinding {
         })
     }
 
+    /// Creates one logical destination that shares an already materialized
+    /// owner binding in the same atomic unit.
+    pub fn alias(
+        name: impl Into<String>,
+        owner: impl Into<String>,
+        expected_bytes: u64,
+    ) -> Result<Self, ResidencyDeclarationError> {
+        let name = validate_name(name.into())?;
+        let owner = validate_name(owner.into())?;
+        validate_size(&name, expected_bytes)?;
+        Ok(Self {
+            name,
+            alias_of: Some(owner),
+            logical_target: None,
+            checkpoint_key: String::new(),
+            selection: TensorSelection::Full,
+            recipe: None,
+            expected_bytes,
+        })
+    }
+
     /// Returns the stable name used to look up a resident value.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the logical owner when this binding is an alias.
+    pub fn alias_of(&self) -> Option<&str> {
+        self.alias_of.as_deref()
+    }
+
+    /// Returns whether this binding reuses another logical binding's native
+    /// materialization.
+    pub const fn is_alias(&self) -> bool {
+        self.alias_of.is_some()
     }
 
     /// Replaces the stable name used to address this value inside its resident unit.
@@ -204,6 +239,10 @@ impl WeightBinding {
 
     /// Returns the complete source recipe represented by this binding.
     pub fn source_recipe(&self) -> DerivedWeightRecipe {
+        assert!(
+            self.alias_of.is_none(),
+            "logical aliases have no physical recipe"
+        );
         self.recipe.clone().unwrap_or_else(|| {
             DerivedWeightRecipe::source(self.checkpoint_key.clone(), self.selection.clone())
         })
@@ -211,6 +250,9 @@ impl WeightBinding {
 
     /// Returns every checkpoint key consumed by this binding.
     pub fn checkpoint_keys(&self) -> Vec<&str> {
+        if self.alias_of.is_some() {
+            return Vec::new();
+        }
         self.recipe.as_ref().map_or_else(
             || vec![self.checkpoint_key.as_str()],
             DerivedWeightRecipe::source_keys,
@@ -228,6 +270,9 @@ impl WeightBinding {
         recipe: DerivedWeightRecipe,
         expected_bytes: u64,
     ) -> Result<Self, ResidencyDeclarationError> {
+        if self.alias_of.is_some() {
+            return Err(ResidencyDeclarationError::AliasHasPhysicalSource { name: self.name });
+        }
         validate_size(&self.name, expected_bytes)?;
         self.checkpoint_key = first_source(&self.name, &recipe)?;
         self.selection = TensorSelection::Full;
@@ -245,6 +290,86 @@ impl WeightBinding {
         let recipe = self.source_recipe().select_bounded(catalog, selection)?;
         let bytes = recipe.infer(catalog)?.byte_len();
         Ok(self.with_source_recipe(recipe, bytes)?)
+    }
+}
+
+/// Validated owner/alias partition for one atomic binding unit.
+#[derive(Debug)]
+pub struct WeightBindingPlan<'a> {
+    owners: Vec<&'a WeightBinding>,
+    aliases: Vec<(&'a WeightBinding, &'a WeightBinding)>,
+}
+
+impl<'a> WeightBindingPlan<'a> {
+    /// Validates unique identities, owner existence, cycles, and byte geometry.
+    pub fn new(bindings: &'a [WeightBinding]) -> Result<Self, ResidencyDeclarationError> {
+        let by_name = bindings
+            .iter()
+            .map(|binding| (binding.name(), binding))
+            .collect::<BTreeMap<_, _>>();
+        if by_name.len() != bindings.len() {
+            let duplicate = bindings
+                .iter()
+                .map(WeightBinding::name)
+                .find(|name| bindings.iter().filter(|item| item.name() == *name).count() > 1)
+                .unwrap_or("<unknown>");
+            return Err(ResidencyDeclarationError::DuplicateLogicalBinding {
+                name: duplicate.to_owned(),
+            });
+        }
+
+        fn resolve<'a>(
+            binding: &'a WeightBinding,
+            by_name: &BTreeMap<&str, &'a WeightBinding>,
+            visiting: &mut BTreeSet<String>,
+        ) -> Result<&'a WeightBinding, ResidencyDeclarationError> {
+            let Some(owner_name) = binding.alias_of() else {
+                return Ok(binding);
+            };
+            if !visiting.insert(binding.name().to_owned()) {
+                return Err(ResidencyDeclarationError::BindingAliasCycle {
+                    name: binding.name().to_owned(),
+                });
+            }
+            let owner = by_name.get(owner_name).copied().ok_or_else(|| {
+                ResidencyDeclarationError::UnknownBindingAliasOwner {
+                    alias: binding.name().to_owned(),
+                    owner: owner_name.to_owned(),
+                }
+            })?;
+            let resolved = resolve(owner, by_name, visiting)?;
+            visiting.remove(binding.name());
+            Ok(resolved)
+        }
+
+        let owners = bindings
+            .iter()
+            .filter(|binding| !binding.is_alias())
+            .collect::<Vec<_>>();
+        let mut aliases = Vec::new();
+        for alias in bindings.iter().filter(|binding| binding.is_alias()) {
+            let owner = resolve(alias, &by_name, &mut BTreeSet::new())?;
+            if alias.expected_bytes() != owner.expected_bytes() {
+                return Err(ResidencyDeclarationError::BindingAliasByteMismatch {
+                    alias: alias.name().to_owned(),
+                    owner: owner.name().to_owned(),
+                    alias_bytes: alias.expected_bytes(),
+                    owner_bytes: owner.expected_bytes(),
+                });
+            }
+            aliases.push((alias, owner));
+        }
+        Ok(Self { owners, aliases })
+    }
+
+    /// Canonical bindings which require physical materialization.
+    pub fn owners(&self) -> impl Iterator<Item = &'a WeightBinding> + '_ {
+        self.owners.iter().copied()
+    }
+
+    /// Logical aliases paired with their resolved canonical owners.
+    pub fn aliases(&self) -> impl Iterator<Item = (&'a WeightBinding, &'a WeightBinding)> + '_ {
+        self.aliases.iter().copied()
     }
 }
 
@@ -276,6 +401,7 @@ pub struct OffloadUnit {
 pub struct ResidencyController {
     ledger: ResidencyLedger,
     units: BTreeMap<OffloadUnitId, OffloadUnit>,
+    alias_owners: BTreeMap<(OffloadUnitId, String), (OffloadUnitId, String)>,
 }
 
 /// One validated immutable-weight acquisition batch and its initial hit/miss state.
@@ -612,32 +738,36 @@ impl ResidencyController {
             return Err(ResidencyControllerError::UnexpectedUnitDefinition { id });
         }
 
+        let alias_owners = validate_global_binding_aliases(&definitions)?;
+
         for spec in plan.units() {
             let unit = definitions
                 .get(spec.id())
                 .expect("definition identity validated above");
             let mut total = 0u64;
-            for binding in unit.bindings() {
+            for binding in unit.bindings().iter().filter(|binding| !binding.is_alias()) {
                 total = total.checked_add(binding.expected_bytes()).ok_or(
                     ResidencyControllerError::ArithmeticOverflow {
                         context: "unit binding byte total",
                     },
                 )?;
-                let actual = binding
-                    .source_recipe()
-                    .infer(catalog)
-                    .map_err(|source| ResidencyControllerError::Recipe {
-                        binding: binding.name().to_owned(),
-                        source,
-                    })?
-                    .byte_len();
-                if actual != binding.expected_bytes() {
-                    return Err(ResidencyControllerError::BindingByteMismatch {
-                        id: unit.id().clone(),
-                        binding: binding.name().to_owned(),
-                        expected_bytes: binding.expected_bytes(),
-                        actual_bytes: actual,
-                    });
+                if !binding.is_alias() {
+                    let actual = binding
+                        .source_recipe()
+                        .infer(catalog)
+                        .map_err(|source| ResidencyControllerError::Recipe {
+                            binding: binding.name().to_owned(),
+                            source,
+                        })?
+                        .byte_len();
+                    if actual != binding.expected_bytes() {
+                        return Err(ResidencyControllerError::BindingByteMismatch {
+                            id: unit.id().clone(),
+                            binding: binding.name().to_owned(),
+                            expected_bytes: binding.expected_bytes(),
+                            actual_bytes: actual,
+                        });
+                    }
                 }
             }
             if total != spec.bytes() {
@@ -652,6 +782,7 @@ impl ResidencyController {
         Ok(Self {
             ledger: ResidencyLedger::new(plan),
             units: definitions,
+            alias_owners,
         })
     }
 
@@ -663,6 +794,45 @@ impl ResidencyController {
     /// Returns declarations in stable unit-identifier order.
     pub fn units(&self) -> impl ExactSizeIterator<Item = &OffloadUnit> {
         self.units.values()
+    }
+
+    /// Resolves a logical alias to its canonical owner unit and binding.
+    pub fn binding_owner(
+        &self,
+        unit: &OffloadUnitId,
+        binding: &WeightBinding,
+    ) -> Option<(&OffloadUnitId, &WeightBinding)> {
+        let (owner_unit, owner_name) = self
+            .alias_owners
+            .get(&(unit.clone(), binding.name().to_owned()))?;
+        let owner = self.units.get(owner_unit)?;
+        let binding = owner
+            .bindings()
+            .iter()
+            .find(|binding| binding.name() == owner_name)?;
+        Some((owner_unit, binding))
+    }
+
+    /// Returns the canonical owner location when a binding participates in a
+    /// shared alias family, including the canonical owner itself.
+    pub fn shared_binding_owner(
+        &self,
+        unit: &OffloadUnitId,
+        binding: &WeightBinding,
+    ) -> Option<(&OffloadUnitId, &WeightBinding)> {
+        if binding.is_alias() {
+            return self.binding_owner(unit, binding);
+        }
+        let location = (unit.clone(), binding.name().to_owned());
+        if !self.alias_owners.values().any(|owner| owner == &location) {
+            return None;
+        }
+        let (owner_unit, owner) = self.units.get_key_value(unit)?;
+        let owner = owner
+            .bindings()
+            .iter()
+            .find(|candidate| candidate.name() == binding.name())?;
+        Some((owner_unit, owner))
     }
 
     /// Returns immutable ownership, capacity, and telemetry state.
@@ -832,9 +1002,94 @@ impl ResidencyController {
     }
 }
 
+fn validate_global_binding_aliases(
+    units: &BTreeMap<OffloadUnitId, OffloadUnit>,
+) -> Result<BTreeMap<(OffloadUnitId, String), (OffloadUnitId, String)>, ResidencyControllerError> {
+    type Location = (OffloadUnitId, String);
+    let mut identities = BTreeMap::<String, Vec<Location>>::new();
+    let mut aliases = BTreeMap::<Location, String>::new();
+    let mut bytes = BTreeMap::<Location, u64>::new();
+    for (unit_id, unit) in units {
+        for binding in unit.bindings() {
+            let location = (unit_id.clone(), binding.name().to_owned());
+            let identity = binding
+                .logical_target()
+                .unwrap_or(binding.name())
+                .to_owned();
+            identities
+                .entry(identity)
+                .or_default()
+                .push(location.clone());
+            bytes.insert(location.clone(), binding.expected_bytes());
+            if let Some(owner) = binding.alias_of() {
+                aliases.insert(location, owner.to_owned());
+            }
+        }
+    }
+
+    fn resolve(
+        location: &Location,
+        identities: &BTreeMap<String, Vec<Location>>,
+        aliases: &BTreeMap<Location, String>,
+        visiting: &mut BTreeSet<Location>,
+    ) -> Result<Location, ResidencyControllerError> {
+        let Some(destination) = aliases.get(location) else {
+            return Ok(location.clone());
+        };
+        if !visiting.insert(location.clone()) {
+            return Err(ResidencyControllerError::Declaration(
+                ResidencyDeclarationError::BindingAliasCycle {
+                    name: location.1.clone(),
+                },
+            ));
+        }
+        let candidates = identities.get(destination).ok_or_else(|| {
+            ResidencyControllerError::Declaration(
+                ResidencyDeclarationError::UnknownBindingAliasOwner {
+                    alias: location.1.clone(),
+                    owner: destination.clone(),
+                },
+            )
+        })?;
+        if candidates.len() != 1 {
+            return Err(ResidencyControllerError::Declaration(
+                ResidencyDeclarationError::AmbiguousBindingAliasOwner {
+                    alias: location.1.clone(),
+                    owner: destination.clone(),
+                },
+            ));
+        }
+        let owner = resolve(&candidates[0], identities, aliases, visiting)?;
+        visiting.remove(location);
+        Ok(owner)
+    }
+
+    let mut resolved = BTreeMap::new();
+    for alias in aliases.keys() {
+        let owner = resolve(alias, &identities, &aliases, &mut BTreeSet::new())?;
+        let alias_bytes = bytes[alias];
+        let owner_bytes = bytes[&owner];
+        if alias_bytes != owner_bytes {
+            return Err(ResidencyControllerError::Declaration(
+                ResidencyDeclarationError::BindingAliasByteMismatch {
+                    alias: alias.1.clone(),
+                    owner: owner.1.clone(),
+                    alias_bytes,
+                    owner_bytes,
+                },
+            ));
+        }
+        resolved.insert(alias.clone(), owner);
+    }
+    Ok(resolved)
+}
+
 /// Failure while validating a residency control plane.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyControllerError {
+    /// A binding alias graph was invalid.
+    #[error(transparent)]
+    Declaration(#[from] ResidencyDeclarationError),
     /// More than one definition used the same plan identifier.
     #[error("duplicate residency unit definition: {id}")]
     DuplicateUnitDefinition {
@@ -1307,6 +1562,52 @@ pub enum ResidencyDeclarationError {
         /// Duplicated local name.
         name: String,
     },
+    /// A general binding list repeated one logical identity.
+    #[error("duplicate logical weight binding {name:?}")]
+    DuplicateLogicalBinding {
+        /// Repeated logical identity.
+        name: String,
+    },
+    /// An alias named no binding in its atomic unit.
+    #[error("weight binding alias {alias:?} has unknown owner {owner:?}")]
+    UnknownBindingAliasOwner {
+        /// Alias identity.
+        alias: String,
+        /// Missing owner identity.
+        owner: String,
+    },
+    /// An alias destination did not identify one unique global owner.
+    #[error("weight binding alias {alias:?} has ambiguous owner {owner:?}")]
+    AmbiguousBindingAliasOwner {
+        /// Alias identity.
+        alias: String,
+        /// Ambiguous owner identity.
+        owner: String,
+    },
+    /// Alias declarations formed a cycle.
+    #[error("weight binding alias cycle contains {name:?}")]
+    BindingAliasCycle {
+        /// One member of the cycle.
+        name: String,
+    },
+    /// Alias and resolved owner disagreed on materialized byte geometry.
+    #[error("weight binding alias {alias:?} declares {alias_bytes} bytes but owner {owner:?} declares {owner_bytes}")]
+    BindingAliasByteMismatch {
+        /// Alias identity.
+        alias: String,
+        /// Resolved canonical owner.
+        owner: String,
+        /// Alias byte declaration.
+        alias_bytes: u64,
+        /// Owner byte declaration.
+        owner_bytes: u64,
+    },
+    /// An alias was incorrectly rewritten with a physical source.
+    #[error("weight binding alias {name:?} cannot own a physical checkpoint source")]
+    AliasHasPhysicalSource {
+        /// Alias identity.
+        name: String,
+    },
 }
 
 #[cfg(test)]
@@ -1645,6 +1946,62 @@ mod tests {
         assert_eq!(controller.units().len(), 1);
         assert_eq!(controller.unit(&id).unwrap().bindings().len(), 2);
         assert!(!controller.ledger().initialized());
+    }
+
+    #[test]
+    fn controller_resolves_aliases_across_independent_units() {
+        let catalog = Catalog(BTreeMap::from([
+            ("physical.owner".into(), metadata("physical.owner", vec![1])),
+            ("slice.local".into(), metadata("slice.local", vec![1])),
+        ]));
+        let owner_id = OffloadUnitId::new("slice.0").unwrap();
+        let alias_id = OffloadUnitId::new("slice.1").unwrap();
+        let owner_binding =
+            WeightBinding::new("weight", "physical.owner", TensorSelection::Full, 4)
+                .unwrap()
+                .with_logical_target("shared.owner")
+                .unwrap();
+        let alias_binding = WeightBinding::alias("weight", "shared.owner", 4)
+            .unwrap()
+            .with_logical_target("slice.1.weight")
+            .unwrap();
+        let local_binding =
+            WeightBinding::new("local", "slice.local", TensorSelection::Full, 4).unwrap();
+        let units = [
+            OffloadUnit::new(owner_id.clone(), [owner_binding]).unwrap(),
+            OffloadUnit::new(alias_id.clone(), [alias_binding, local_binding]).unwrap(),
+        ];
+        let plan = OffloadPlan::new(
+            OffloadConfig::default(),
+            [
+                OffloadUnitSpec::new(
+                    owner_id.clone(),
+                    4,
+                    ResidencyPolicy::Windowed,
+                    MemoryTier::Disk,
+                )
+                .unwrap(),
+                OffloadUnitSpec::new(
+                    alias_id.clone(),
+                    4,
+                    ResidencyPolicy::Windowed,
+                    MemoryTier::Disk,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let controller = ResidencyController::new(&catalog, plan, units).unwrap();
+        let alias = controller
+            .unit(&alias_id)
+            .unwrap()
+            .bindings()
+            .iter()
+            .find(|binding| binding.is_alias())
+            .unwrap();
+        let (resolved_unit, resolved) = controller.binding_owner(&alias_id, alias).unwrap();
+        assert_eq!(resolved_unit, &owner_id);
+        assert_eq!(resolved.logical_target(), Some("shared.owner"));
     }
 
     #[test]

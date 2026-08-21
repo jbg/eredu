@@ -506,8 +506,8 @@ fn new_mlp<B: RoutedNeuralBackend>(
     intermediate: i32,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Mlp<B>, Error> {
-    Ok(Mlp {
-        gate: new_linear::<B>(
+    Ok(Mlp::from_parts(
+        new_linear::<B>(
             config,
             &format!("{prefix}.gate_proj"),
             config.hidden_size,
@@ -515,7 +515,7 @@ fn new_mlp<B: RoutedNeuralBackend>(
             false,
             context,
         )?,
-        up: new_linear::<B>(
+        new_linear::<B>(
             config,
             &format!("{prefix}.up_proj"),
             config.hidden_size,
@@ -523,7 +523,7 @@ fn new_mlp<B: RoutedNeuralBackend>(
             false,
             context,
         )?,
-        down: new_linear::<B>(
+        new_linear::<B>(
             config,
             &format!("{prefix}.down_proj"),
             intermediate,
@@ -531,8 +531,8 @@ fn new_mlp<B: RoutedNeuralBackend>(
             false,
             context,
         )?,
-        limit: None,
-    })
+        None,
+    ))
 }
 
 fn new_linear<B: RoutedNeuralBackend>(

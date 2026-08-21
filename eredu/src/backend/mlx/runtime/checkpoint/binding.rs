@@ -8,7 +8,7 @@ use eredu_checkpoint::{
     store::{ReadPolicy, TensorReadRequest},
     WeightQuantization,
 };
-use eredu_runtime::WeightBinding;
+use eredu_runtime::{WeightBinding, WeightBindingPlan};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -192,10 +192,26 @@ pub(crate) fn materialize_module_bindings(
     source_stream: &Stream,
     execution_stream: &Stream,
 ) -> Result<BTreeMap<String, Array>, ModuleBindingError> {
+    let plan = WeightBindingPlan::new(bindings)
+        .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
+    for binding in plan.owners() {
+        let actual = binding
+            .source_recipe()
+            .infer(store)
+            .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?
+            .byte_len();
+        if actual != binding.expected_bytes() {
+            return Err(ModuleBindingError::BindingPlan(format!(
+                "binding {:?} declares {} bytes but materializes {actual}",
+                binding.name(),
+                binding.expected_bytes()
+            )));
+        }
+    }
     let mut arrays = BTreeMap::new();
     let mut pending = VecDeque::with_capacity(MODEL_LOAD_MATERIALIZATION_BUFFERS);
     let context = MlxParameterMaterializationContext::new(source_stream, execution_stream);
-    for binding in bindings {
+    for binding in plan.owners() {
         let materialization = loop {
             match submit_module_binding(store, binding, source_stream, execution_stream, &context) {
                 Ok(materialization) => break materialization,
@@ -216,6 +232,13 @@ pub(crate) fn materialize_module_bindings(
     }
     while !pending.is_empty() {
         finish_module_binding(&mut pending, &mut arrays)?;
+    }
+    for (alias, owner) in plan.aliases() {
+        let value = arrays
+            .get(owner.name())
+            .expect("validated canonical binding was materialized")
+            .clone();
+        arrays.insert(alias.name().to_owned(), value);
     }
     Ok(arrays)
 }
@@ -639,6 +662,9 @@ where
 /// Returns the checked total byte count of a binding collection.
 pub fn binding_bytes(bindings: &[WeightBinding]) -> Result<u64, ModuleBindingError> {
     bindings.iter().try_fold(0u64, |total, binding| {
+        if binding.is_alias() {
+            return Ok(total);
+        }
         total
             .checked_add(binding.expected_bytes())
             .ok_or(ModuleBindingError::ArithmeticOverflow {

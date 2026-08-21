@@ -300,7 +300,7 @@ pub(crate) fn materialize_model_plan(
             )
         {
             let model =
-                crate::composition::mlx_architectures::distributed::pipeline::load_pipeline_model_with_options(
+                crate::composition::mlx::distributed::pipeline::load_pipeline_model_with_options(
                     path,
                     options,
                     stream,
@@ -311,7 +311,7 @@ pub(crate) fn materialize_model_plan(
         }
         if topology.expert_parallel_size > 1 {
             let model =
-                crate::composition::mlx_architectures::distributed::expert::load_expert_parallel_model_with_options(
+                crate::composition::mlx::distributed::expert::load_expert_parallel_model_with_options(
                     path,
                     options,
                     stream,
@@ -516,8 +516,8 @@ fn materialize_tensor_parallel(
         ModelKind::Qwen35 => Err(Error::UnsupportedArchitecture(
             "neutral Qwen3.5 tensor-parallel binding is not initialized".into(),
         )),
-        ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
-            "PersonaPlex does not use the text Model tensor-parallel session".into(),
+        ModelKind::Moshi => Err(Error::UnsupportedArchitecture(
+            "Moshi-family models do not use the text Model tensor-parallel session".into(),
         )),
     }
 }
@@ -1109,8 +1109,8 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )),
-        ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
-            "PersonaPlex bounded layer residency is selected through the realtime loader".into(),
+        ModelKind::Moshi => Err(Error::UnsupportedArchitecture(
+            "Moshi-family bounded layer residency is selected through the realtime loader".into(),
         )),
     }
 }

@@ -9,7 +9,7 @@ use std::{
 
 use eredu::{
     backend::mlx::{DeviceAssignment, MlxBackend, MlxParallelContext},
-    composition::mlx_architectures::distributed::expert::{AllToAllVPlan, RoutedTransport},
+    composition::mlx::distributed::expert::{AllToAllVPlan, RoutedTransport},
     core::{CollectiveScope, DistributedSession},
 };
 use safemlx::{

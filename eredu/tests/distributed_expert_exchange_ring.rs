@@ -15,7 +15,7 @@ use eredu::{
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCatalogEntry, ExpertRouteBatch,
     },
-    composition::mlx_architectures::distributed::expert::{
+    composition::mlx::distributed::expert::{
         dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
         DispatchedRoutes, ExpertAssignment, LocalExpertBank, RoutedTransport, ShardedRouteBlocks,
     },

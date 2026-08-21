@@ -20,6 +20,8 @@ pub mod store;
 /// Header-only validation of declarative SafeTensors and GGUF plans.
 pub mod validation;
 
+pub use recipe::{AtomicMatrixRecipeFamily, MatrixRecipeMember, RecipeAlias};
+
 /// Backend-neutral description of a checkpoint's stored scalar encoding.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum StoredDtype {

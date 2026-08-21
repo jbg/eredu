@@ -1,6 +1,16 @@
-use std::{cell::Cell, convert::Infallible};
+use std::{
+    cell::{Cell, RefCell},
+    convert::Infallible,
+    rc::Rc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
-use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, Completion, LayerSchedule};
+use eredu_core::{
+    cache::LayerCachePolicy, AttentionPolicy, Completion, LayerSchedule, TokenFilter,
+};
 use eredu_nn::{
     AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, GatedProductPolicy, Index,
     LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode,
@@ -8,10 +18,15 @@ use eredu_nn::{
     RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_bindings, CollectiveBackend, DeviceState, ExecutionGraph,
-    ExecutionGroupSpec, ExecutionUnitAddress, LayeredArchitecture, LayeredForwardState,
-    LayerwisePolicy, LayerwiseRuntime, ParameterBackend, RuntimeLayerState, StateLayout,
-    SubmissionBackend, TransferBackend, WeightBinding,
+    bind_materialized_unit, materialize_bindings, CollectiveBackend, CompositeLayeredTraversalHook,
+    DeviceState, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, LayeredArchitecture,
+    LayeredForwardState, LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction,
+    LayerwisePolicy, LayerwiseRuntime, ParameterBackend, PenaltyConfig, PredictionDirective,
+    ResettableRuntimeLayerState, ResettableRuntimeState, ResidentRuntime, RuntimeLayerState,
+    Sampler, SamplingBackend, SequentialDecisionBoundary, SequentialDecisionDriver,
+    SequentialDecisionError, SequentialDecisionPlan, SequentialDecisionSource,
+    SequentialDecisionTraversal, StateError, StateLayout, StateSegmentId, StateSegmentLifetime,
+    StateSegmentSpec, SubmissionBackend, TokenDomain, TransferBackend, WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -300,6 +315,129 @@ impl NeuralBackend for FakeBackend {
     }
 }
 
+impl SamplingBackend for FakeBackend {
+    type Logits = FakeTensor;
+    type Token = FakeTensor;
+    type RandomState = i32;
+    type Context = ();
+    type Error = Error;
+
+    fn error(message: String) -> Self::Error {
+        Error::backend(message)
+    }
+
+    fn validate_token(
+        token: &Self::Token,
+        domain: TokenDomain,
+        _: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        token
+            .0
+            .first()
+            .copied()
+            .and_then(|token| usize::try_from(token).ok())
+            .filter(|token| *token < domain.cardinality())
+            .map(|_| token.clone())
+            .ok_or_else(|| Error::backend("token is outside its decision domain"))
+    }
+
+    fn scale_temperature(
+        logits: &Self::Logits,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn apply_penalties(
+        logits: &Self::Logits,
+        _: &[u32],
+        _: PenaltyConfig,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn apply_top_k(
+        logits: Self::Logits,
+        _: i32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits)
+    }
+
+    fn apply_top_p(
+        logits: Self::Logits,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits)
+    }
+
+    fn apply_min_p(
+        logits: Self::Logits,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits)
+    }
+
+    fn apply_token_filter(
+        logits: &Self::Logits,
+        _: &TokenFilter,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn apply_mirostat(
+        logits: &Self::Logits,
+        _: &[u32],
+        _: PenaltyConfig,
+        _: f32,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn sample_raw(
+        logits: &Self::Logits,
+        _: f32,
+        random: Option<&mut Self::RandomState>,
+        _: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        if let Some(random) = random {
+            *random += 1;
+        }
+        Ok(logits.clone())
+    }
+
+    fn sample_processed(
+        logits: &Self::Logits,
+        temperature: f32,
+        random: Option<&mut Self::RandomState>,
+        context: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        Self::sample_raw(logits, temperature, random, context)
+    }
+
+    fn token_id(token: &Self::Token, _: &Self::Context) -> Result<u32, Self::Error> {
+        token
+            .0
+            .first()
+            .copied()
+            .ok_or_else(|| Error::backend("fixture token is empty"))
+            .and_then(|token| {
+                u32::try_from(token).map_err(|error| Error::backend(error.to_string()))
+            })
+    }
+
+    fn token_probability(_: &Self::Logits, _: u32, _: &Self::Context) -> Result<f32, Self::Error> {
+        Ok(1.0)
+    }
+}
+
 #[derive(Debug)]
 struct Done;
 
@@ -387,6 +525,17 @@ impl ParameterBackend for FakeBackend {
     ) -> Result<Self::MaterializedWeight, Infallible> {
         Ok(materialization)
     }
+    fn share_materialized_weight(
+        weight: &Self::MaterializedWeight,
+    ) -> Result<Self::MaterializedWeight, Infallible> {
+        Ok(weight.clone())
+    }
+    fn validate_bind(
+        _parameter: &Self::Parameter,
+        _weight: &Self::MaterializedWeight,
+    ) -> Result<(), Infallible> {
+        Ok(())
+    }
     fn bind(
         parameter: &mut Self::Parameter,
         weight: Self::MaterializedWeight,
@@ -470,8 +619,87 @@ fn neutral_loader_materializes_and_binds_the_fake_backend() {
     assert_eq!(module.weight, FakeTensor(vec![2, 2]));
 }
 
+struct CountingSource {
+    inner: eredu_checkpoint::store::MemoryWeightStore,
+    leases: Arc<AtomicUsize>,
+}
+
+impl eredu_checkpoint::store::CheckpointSource for CountingSource {
+    fn source_keys(&self) -> Vec<String> {
+        eredu_checkpoint::store::CheckpointSource::source_keys(&self.inner)
+    }
+
+    fn source_metadata(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError> {
+        eredu_checkpoint::store::CheckpointSource::source_metadata(&self.inner, key)
+    }
+
+    fn acquire_lease(
+        &self,
+        request: eredu_checkpoint::store::TensorReadRequest,
+    ) -> Result<eredu_checkpoint::store::CheckpointLease, eredu_checkpoint::store::StoreError> {
+        self.leases.fetch_add(1, Ordering::SeqCst);
+        eredu_checkpoint::store::CheckpointSource::acquire_lease(&self.inner, request)
+    }
+
+    fn source_diagnostics(
+        &self,
+    ) -> Result<eredu_checkpoint::store::WeightStoreDiagnostics, eredu_checkpoint::store::StoreError>
+    {
+        eredu_checkpoint::store::CheckpointSource::source_diagnostics(&self.inner)
+    }
+}
+
+fn counting_source() -> (CountingSource, Arc<AtomicUsize>) {
+    let leases = Arc::new(AtomicUsize::new(0));
+    let inner = eredu_checkpoint::store::MemoryWeightStore::from_safetensors([(
+        "owner".to_owned(),
+        safetensors::Dtype::F32,
+        vec![2, 2],
+        vec![0; 16],
+    )])
+    .unwrap();
+    (
+        CountingSource {
+            inner,
+            leases: Arc::clone(&leases),
+        },
+        leases,
+    )
+}
+
+#[test]
+fn aliases_share_one_fake_backend_materialization() {
+    use eredu_checkpoint::store::TensorSelection;
+
+    let (source, leases) = counting_source();
+    let bindings = vec![
+        WeightBinding::new("owner", "owner", TensorSelection::Full, 16).unwrap(),
+        WeightBinding::alias("alias-a", "owner", 16).unwrap(),
+        WeightBinding::alias("alias-b", "alias-a", 16).unwrap(),
+    ];
+    let unit = materialize_bindings::<FakeBackend>(&source, &bindings, &()).unwrap();
+    assert_eq!(unit.len(), 3);
+    assert_eq!(leases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn invalid_alias_graph_fails_before_any_physical_read() {
+    use eredu_checkpoint::store::TensorSelection;
+
+    let (source, leases) = counting_source();
+    let bindings = vec![
+        WeightBinding::new("owner", "owner", TensorSelection::Full, 16).unwrap(),
+        WeightBinding::alias("alias", "missing", 16).unwrap(),
+    ];
+    assert!(materialize_bindings::<FakeBackend>(&source, &bindings, &()).is_err());
+    assert_eq!(leases.load(Ordering::SeqCst), 0);
+}
+
 #[derive(Debug)]
-struct FakeLayerState;
+struct FakeLayerState(i32);
 
 impl RuntimeLayerState<FakeBackend> for FakeLayerState {
     type RetainedValues<'a> = std::iter::Empty<&'a FakeTensor>;
@@ -479,6 +707,60 @@ impl RuntimeLayerState<FakeBackend> for FakeLayerState {
     fn retained_values(&self) -> Self::RetainedValues<'_> {
         std::iter::empty()
     }
+}
+
+impl ResettableRuntimeLayerState<FakeBackend> for FakeLayerState {
+    fn reset(&mut self) -> Result<(), StateError> {
+        self.0 = 0;
+        Ok(())
+    }
+}
+
+#[test]
+fn named_frame_local_segment_resets_without_touching_persistent_state() {
+    let policies = (0..4)
+        .map(|_| LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap())
+        .collect();
+    let layout = StateLayout::segmented(
+        LayerSchedule::new(4, policies).unwrap(),
+        [
+            StateSegmentSpec::new("temporal", 0..2, StateSegmentLifetime::Persistent).unwrap(),
+            StateSegmentSpec::new("depth", 2..4, StateSegmentLifetime::FrameLocal).unwrap(),
+        ],
+    )
+    .unwrap();
+    let mut state = DeviceState::<FakeBackend, FakeLayerState>::create(layout, |layer, _| {
+        Ok::<_, Infallible>(FakeLayerState(i32::try_from(layer).unwrap() + 1))
+    })
+    .unwrap();
+
+    state
+        .reset_segment(&StateSegmentId::new("depth").unwrap())
+        .unwrap();
+    assert_eq!(
+        state
+            .as_ref()
+            .iter()
+            .map(|layer| layer.0)
+            .collect::<Vec<_>>(),
+        [1, 2, 0, 0]
+    );
+
+    let error = state
+        .reset_segment(&StateSegmentId::new("missing").unwrap())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        eredu_runtime::StateError::UnknownSegment { .. }
+    ));
+    assert_eq!(
+        state
+            .as_ref()
+            .iter()
+            .map(|layer| layer.0)
+            .collect::<Vec<_>>(),
+        [1, 2, 0, 0]
+    );
 }
 
 #[derive(Debug)]
@@ -717,7 +999,7 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
         .collect();
     let layout = StateLayout::new(LayerSchedule::new(4, policies).unwrap()).unwrap();
     let mut state = DeviceState::<FakeBackend, FakeLayerState>::create(layout, |_, _| {
-        Ok::<_, Infallible>(FakeLayerState)
+        Ok::<_, Infallible>(FakeLayerState(0))
     })
     .unwrap();
     let architecture = GroupedFixture {
@@ -760,7 +1042,7 @@ fn neutral_layerwise_runtime_accepts_a_static_unit_executor() {
         .collect();
     let layout = StateLayout::new(LayerSchedule::new(4, policies).unwrap()).unwrap();
     let mut state = DeviceState::<FakeBackend, FakeLayerState>::create(layout, |_, _| {
-        Ok::<_, Infallible>(FakeLayerState)
+        Ok::<_, Infallible>(FakeLayerState(0))
     })
     .unwrap();
     let architecture = GroupedFixture {
@@ -792,4 +1074,290 @@ fn neutral_layerwise_runtime_accepts_a_static_unit_executor() {
     assert_eq!(output, FakeTensor(vec![30, 20, 21]));
     assert_eq!(trace, vec![(0, 0), (1, 0), (2, 0), (2, 1)]);
     assert!(runtime.architecture().trace.is_empty());
+}
+
+#[derive(Clone)]
+struct FixtureDecisionSampler(i32);
+
+impl Sampler<FakeBackend> for FixtureDecisionSampler {
+    fn sample(
+        &mut self,
+        logits: &FakeTensor,
+        _: f32,
+        random: Option<&mut i32>,
+        _: &(),
+    ) -> Result<FakeTensor, Error> {
+        if let Some(random) = random {
+            *random += 1;
+        }
+        let mut token = logits.clone();
+        token.0.push(self.0);
+        Ok(token)
+    }
+}
+
+#[derive(Default)]
+struct FixtureDecisionBoundary {
+    accepted: Vec<(usize, LayeredTraversalPoint, FakeTensor)>,
+}
+
+impl SequentialDecisionBoundary<FakeBackend, Vec<(usize, usize)>, Error>
+    for FixtureDecisionBoundary
+{
+    fn prediction_at(
+        &self,
+        point: LayeredTraversalPoint,
+        _: &Vec<(usize, usize)>,
+    ) -> Option<usize> {
+        match point {
+            LayeredTraversalPoint::Group { group: 0 } => Some(0),
+            LayeredTraversalPoint::Unit { group: 2, index } => Some(index + 1),
+            _ => None,
+        }
+    }
+
+    fn logits(
+        &mut self,
+        _: usize,
+        _: LayeredTraversalPoint,
+        value: &FakeTensor,
+        _: &mut Vec<(usize, usize)>,
+        _: &(),
+    ) -> Result<FakeTensor, Error> {
+        Ok(value.clone())
+    }
+
+    fn token_domain(
+        &mut self,
+        _: usize,
+        _: LayeredTraversalPoint,
+        _: &Vec<(usize, usize)>,
+    ) -> Result<TokenDomain, Error> {
+        Ok(TokenDomain::new(10_000))
+    }
+
+    fn accept(
+        &mut self,
+        prediction: usize,
+        point: LayeredTraversalPoint,
+        token: &FakeTensor,
+        forward: &mut Vec<(usize, usize)>,
+        _: &(),
+    ) -> Result<(), Error> {
+        let token_marker = token
+            .0
+            .first()
+            .copied()
+            .ok_or_else(|| Error::backend("fixture decision token is empty"))?;
+        forward.push((
+            prediction,
+            usize::try_from(token_marker).map_err(|error| Error::backend(error.to_string()))?,
+        ));
+        self.accepted.push((prediction, point, token.clone()));
+        Ok(())
+    }
+
+    fn decision_error(&mut self, error: SequentialDecisionError<Error>) -> Error {
+        Error::backend(error.to_string())
+    }
+}
+
+fn fixture_decision_driver() -> SequentialDecisionDriver<FakeBackend, FixtureDecisionSampler> {
+    let plan = SequentialDecisionPlan::new(
+        [
+            PredictionDirective::Sample,
+            PredictionDirective::Force(FakeTensor(vec![81])),
+            PredictionDirective::Force(FakeTensor(vec![82])),
+        ],
+        false,
+        true,
+    )
+    .unwrap();
+    SequentialDecisionDriver::new(
+        plan,
+        vec![FixtureDecisionSampler(100); 3],
+        vec![0.0; 3],
+        Some(7),
+    )
+    .unwrap()
+}
+
+fn fixture_state() -> DeviceState<FakeBackend, FakeLayerState> {
+    let policies = (0..4)
+        .map(|_| LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 1).unwrap())
+        .collect();
+    let layout = StateLayout::new(LayerSchedule::new(4, policies).unwrap()).unwrap();
+    DeviceState::create(layout, |_, _| Ok::<_, Infallible>(FakeLayerState(0))).unwrap()
+}
+
+#[test]
+fn sequential_decision_driver_is_shared_by_resident_and_layerwise_traversal() {
+    let resident_architecture = GroupedFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+    };
+    let mut resident =
+        ResidentRuntime::<_, FakeBackend, DeviceState<_, _>>::new(resident_architecture, &())
+            .unwrap();
+    let mut resident_state = fixture_state();
+    let mut resident_driver = fixture_decision_driver();
+    let mut resident_boundary = FixtureDecisionBoundary::default();
+    let (resident_output, resident_context) = {
+        let mut hook =
+            SequentialDecisionTraversal::new(&mut resident_driver, &mut resident_boundary);
+        resident
+            .forward_with_traversal_hook((), &mut resident_state, &(), &mut hook)
+            .unwrap()
+    };
+
+    resident_driver.finish().unwrap();
+    assert_eq!(resident_output, FakeTensor(vec![30]));
+    assert_eq!(resident.architecture().trace, vec![(0, 0), (1, 0)]);
+    assert_eq!(resident_context, vec![(0, 10), (1, 81), (2, 82)]);
+    assert_eq!(resident_driver.random_state(), Some(&8));
+    assert_eq!(
+        resident_driver
+            .decisions()
+            .iter()
+            .map(|decision| decision.source())
+            .collect::<Vec<_>>(),
+        [
+            SequentialDecisionSource::Sampled,
+            SequentialDecisionSource::ForcedTailSkipped,
+            SequentialDecisionSource::ForcedTailSkipped,
+        ]
+    );
+
+    let layerwise_architecture = GroupedFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+    };
+    let units = [0, 10, 20, 21]
+        .into_iter()
+        .map(|marker| FakeUnit { marker })
+        .collect();
+    let mut layerwise = LayerwiseRuntime::<_, FakeBackend, _, _>::new(
+        layerwise_architecture,
+        RecordingPolicy::new(units),
+    );
+    let mut layerwise_state = fixture_state();
+    let mut layerwise_driver = fixture_decision_driver();
+    let mut layerwise_boundary = FixtureDecisionBoundary::default();
+    let (layerwise_output, layerwise_context) = {
+        let mut hook =
+            SequentialDecisionTraversal::new(&mut layerwise_driver, &mut layerwise_boundary);
+        layerwise
+            .forward_with_traversal_hook((), &mut layerwise_state, &(), &mut hook)
+            .unwrap()
+    };
+
+    layerwise_driver.finish().unwrap();
+    assert_eq!(layerwise_output, resident_output);
+    assert_eq!(
+        layerwise.architecture().trace,
+        resident.architecture().trace
+    );
+    assert_eq!(layerwise_context, resident_context);
+    assert_eq!(layerwise.policy().addresses, vec![(0, 0, 0), (1, 1, 0)]);
+    assert_eq!(
+        layerwise_driver
+            .decisions()
+            .iter()
+            .map(|decision| decision.source())
+            .collect::<Vec<_>>(),
+        resident_driver
+            .decisions()
+            .iter()
+            .map(|decision| decision.source())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(layerwise_boundary.accepted, resident_boundary.accepted);
+}
+
+struct RecordingTraversalHook {
+    name: &'static str,
+    skip: bool,
+    events: Rc<RefCell<Vec<String>>>,
+}
+
+impl LayeredTraversalHook<FakeBackend, (), Error> for RecordingTraversalHook {
+    fn before_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        _: usize,
+        _: &FakeTensor,
+        _: &mut (),
+        _: &(),
+    ) -> Result<LayeredUnitAction, Error> {
+        self.events
+            .borrow_mut()
+            .push(format!("{}.before.{group}.{index}", self.name));
+        Ok(if self.skip {
+            LayeredUnitAction::SkipRemainingGroup
+        } else {
+            LayeredUnitAction::Execute
+        })
+    }
+
+    fn after_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        _: &FakeTensor,
+        _: &mut (),
+        _: &(),
+    ) -> Result<(), Error> {
+        self.events
+            .borrow_mut()
+            .push(format!("{}.unit.{group}.{index}", self.name));
+        Ok(())
+    }
+
+    fn after_group(
+        &mut self,
+        group: usize,
+        _: &FakeTensor,
+        _: &mut (),
+        _: &(),
+    ) -> Result<(), Error> {
+        self.events
+            .borrow_mut()
+            .push(format!("{}.group.{group}", self.name));
+        Ok(())
+    }
+}
+
+#[test]
+fn composite_traversal_hook_preserves_order_and_combines_tail_skip() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let left = RecordingTraversalHook {
+        name: "left",
+        skip: false,
+        events: Rc::clone(&events),
+    };
+    let right = RecordingTraversalHook {
+        name: "right",
+        skip: true,
+        events: Rc::clone(&events),
+    };
+    let mut hook = CompositeLayeredTraversalHook::new(left, right);
+    let value = FakeTensor(vec![1]);
+    assert_eq!(
+        hook.before_unit(1, 2, 3, &value, &mut (), &()).unwrap(),
+        LayeredUnitAction::SkipRemainingGroup
+    );
+    hook.after_unit(1, 2, &value, &mut (), &()).unwrap();
+    hook.after_group(1, &value, &mut (), &()).unwrap();
+    assert_eq!(
+        events.borrow().as_slice(),
+        [
+            "left.before.1.2",
+            "right.before.1.2",
+            "left.unit.1.2",
+            "right.unit.1.2",
+            "left.group.1",
+            "right.group.1",
+        ]
+    );
 }

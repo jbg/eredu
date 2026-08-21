@@ -39,9 +39,9 @@ use eredu::{
     ModelResourceProfile, ModelRuntime, MtpCapability, MtpCheckpointKind,
     MultimodalPreparationBackend, Observed, OffloadConfig, OffloadPlan, OffloadUnitId,
     OffloadUnitSpec, ParallelAxis, ParallelTopology, PhysicalMemorySemantics, PreparedModel,
-    RealizedDrafting, RealtimeBackend, RealtimeModelLoadingBackend, RealtimeSampling,
-    RealtimeScheduler, RealtimeSpeechConfig, RequestId, ResidencyLedger, ResidencyPlan,
-    ResidencyPolicy, RuntimeStateEstimate, SchedulerLimits, SemanticEvent,
+    RealizedDrafting, RealtimeBackend, RealtimeFrameConvention, RealtimeModelLoadingBackend,
+    RealtimeSampling, RealtimeScheduler, RealtimeSpeechConfig, RequestId, ResidencyLedger,
+    ResidencyPlan, ResidencyPolicy, RuntimeStateEstimate, SchedulerLimits, SemanticEvent,
     SemanticStateTransaction, SpeculativeDraft, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest,
     SpeculativeGenerationOutput, SpeculativeGenerationRequest, SpeculativeTokenFilterController,
@@ -1325,7 +1325,17 @@ impl RealtimeBackend for MockRealtimeBackend {
     }
 
     fn speech_config(&self, _: &Self::Model) -> RealtimeSpeechConfig {
-        RealtimeSpeechConfig::new(2, 1, 1, 1, 0, 0, vec![0, 1]).unwrap()
+        RealtimeSpeechConfig::new(
+            2,
+            1,
+            1,
+            1,
+            0,
+            0,
+            RealtimeFrameConvention::FeedbackAlignedHistory,
+            vec![0, 0, 1],
+        )
+        .unwrap()
     }
 
     fn create_session(

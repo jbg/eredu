@@ -3921,6 +3921,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn layer_truncation_clears_only_the_selected_pages_and_mutable_tail() {
+        let manager = CacheResidencyManager::new(
+            PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true),
+        )
+        .unwrap();
+        let block_id = |global_layer| CacheBlockId {
+            session_id: manager.session_id,
+            global_layer,
+            representation: CacheRepresentation::KeyValue,
+            start: 0,
+            end: 4,
+            rank: None,
+        };
+        {
+            let mut state = manager.lock().unwrap();
+            for global_layer in 0..=1 {
+                let id = block_id(global_layer);
+                let mut location = missing_location(
+                    Path::new("/nonexistent/eredu-cache-test"),
+                    &format!("layer-{global_layer}.safetensors"),
+                );
+                location.persistent = true;
+                insert_test_record(
+                    &mut state,
+                    CacheBlockRecord {
+                        physical: MlxCacheBlockStorage::disk(id, location),
+                        bytes: 0,
+                        shapes: [vec![1, 1, 1, 1], vec![1, 1, 1, 1]],
+                        dtypes: ["Float32".into(), "Float32".into()],
+                        imported: false,
+                    },
+                    false,
+                    0,
+                );
+            }
+        }
+        manager.set_tail_state(0, 40, 5).unwrap();
+        manager.set_tail_state(1, 56, 7).unwrap();
+        let generation_before = manager.lock().unwrap().generation;
+
+        manager
+            .truncate_layer_transaction(1, CacheRepresentation::KeyValue, 0, None, 0)
+            .unwrap();
+
+        let state = manager.lock().unwrap();
+        assert_eq!(state.generation, generation_before + 1);
+        assert!(state.blocks.contains_key(&block_id(0)));
+        assert!(!state.blocks.contains_key(&block_id(1)));
+        assert_eq!(
+            state.lifecycle.tail(0),
+            Some(MutableCacheTail { bytes: 40, end: 5 })
+        );
+        assert_eq!(
+            state.lifecycle.tail(1),
+            Some(MutableCacheTail { bytes: 0, end: 0 })
+        );
+    }
+
     fn missing_location(root: &Path, name: &str) -> DiskLocation {
         DiskLocation {
             path: root.join(name),
@@ -4755,7 +4816,7 @@ mod tests {
     fn model_reset_surfaces_propagate_paged_clear_failures() {
         use crate::{
             backend::mlx::runtime::cache::{state::MlxKeyValueState, PagedKeyValueCache},
-            composition::mlx_architectures::distributed::pipeline::{
+            composition::mlx::distributed::pipeline::{
                 PipelineCache, PipelineKeyValueCache, PipelineLayerCache,
             },
         };
@@ -4777,7 +4838,7 @@ mod tests {
 
         let manager = manager_with_leased_block();
         let mut pipeline = PipelineCache::new(
-            crate::core::ModelKind::PersonaPlex,
+            crate::core::ModelKind::Llama,
             vec![PipelineLayerCache::KeyValue {
                 global_layer: 0,
                 cache: PipelineKeyValueCache::Paged(

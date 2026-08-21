@@ -3,6 +3,7 @@
 pub(crate) mod artifact;
 pub mod automatic;
 mod capability;
+pub mod distributed;
 mod family;
 mod inspection;
 pub(crate) mod loading;

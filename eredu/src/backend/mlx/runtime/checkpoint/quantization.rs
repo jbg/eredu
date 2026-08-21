@@ -508,12 +508,6 @@ fn write_quantized_config(
     let value = serde_json::to_value(quantization)?;
     object.insert("quantization".into(), value.clone());
     object.insert("quantization_config".into(), value);
-    if object.contains_key("moshi_name") {
-        object.insert(
-            "moshi_name".into(),
-            Value::String("model.safetensors".into()),
-        );
-    }
     fs::write(
         output_dir.join("config.json"),
         serde_json::to_vec_pretty(&config)?,
@@ -564,6 +558,34 @@ mod tests {
             quantization,
             WeightQuantization::Affine(AffineQuantization::new(64, 4).unwrap())
         );
+    }
+
+    #[test]
+    fn quantized_config_preserves_unknown_artifact_fields() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "safemlx-neutral-quantization-config-{}-{suffix}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        let output = root.join("output");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::write(
+            source.join("config.json"),
+            br#"{"model_type":"opaque","artifact_filename":"custom.safetensors"}"#,
+        )
+        .unwrap();
+
+        write_quantized_config(&source, &output, WeightQuantization::MxFp4).unwrap();
+        let config: Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config["artifact_filename"], "custom.safetensors");
+        assert_eq!(config["quantization"]["mode"], "mxfp4");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

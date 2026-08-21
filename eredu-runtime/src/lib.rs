@@ -11,6 +11,8 @@ pub mod backend;
 pub mod cache;
 /// Typed multimodal component graphs and residency accounting.
 pub mod component;
+/// Backend-neutral sequential prediction decisions and layered handoff.
+pub mod decision;
 /// Backend-neutral dense-stream residency telemetry.
 pub mod dense;
 /// Backend-neutral speculative-state fork, commit, and rollback ownership.
@@ -31,6 +33,8 @@ pub mod parallel;
 pub mod parameter;
 /// Backend-neutral bounded background weight-prefetch execution.
 pub mod prefetch;
+/// Atomic realtime model, schedule, sampler, and random-state transactions.
+pub mod realtime;
 /// Backend-neutral immutable-weight residency declarations and orchestration.
 pub mod residency;
 /// Architecture-declared mutable state and concrete runtime realizations.
@@ -59,6 +63,12 @@ pub use component::{
     ComponentDomain, ComponentGraph, ComponentGraphError, ComponentKind, ComponentResidencyClass,
     ComponentSpec,
 };
+pub use decision::{
+    FullyForcedTailDecision, PredictionDirective, SequentialDecision, SequentialDecisionBoundary,
+    SequentialDecisionDiagnostic, SequentialDecisionDriver, SequentialDecisionError,
+    SequentialDecisionMode, SequentialDecisionPlan, SequentialDecisionPlanError,
+    SequentialDecisionSource, SequentialDecisionTraversal,
+};
 pub use dense::{
     DenseCacheMetrics, DenseDiskStreamReport, DenseExecutionGroupReport, DensePassCounterSnapshot,
     DensePassReport, DenseStreamTelemetry, DenseStreamTelemetryError, DenseTierResidencyReport,
@@ -78,6 +88,7 @@ pub use expert::{
 pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
     PenaltyConfig, Sampler, SamplingBackend, SamplingConfigurationError, SpeculativeSampler,
+    TokenDomain,
 };
 pub use input::{PreparedInputPart, PreparedInputPayload, PreparedModelInput};
 pub use inspection::{
@@ -85,30 +96,39 @@ pub use inspection::{
     TargetStateCapture, TargetStateCaptureError, TargetStateTap,
 };
 pub use layered::{
-    LayeredArchitecture, LayeredForwardState, LayerwisePolicy, LayerwiseRuntime,
+    CompositeLayeredTraversalHook, LayeredArchitecture, LayeredForwardState, LayeredTraversalHook,
+    LayeredTraversalPoint, LayeredUnitAction, LayerwisePolicy, LayerwiseRuntime,
     LayerwiseRuntimeError, ParallelLayeredArchitecture, ResidentRuntime, ResidentUnitWindow,
     ResidentUnitWindowError,
 };
 pub use parallel::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    partitioned_projection_group, projection_parameter_group, LocalModelLayout, LocalTensorLayout,
-    MemberSharding, ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, ProjectionSharding, ShardingPolicy, TensorPlacement,
+    partitioned_projection_group, projection_parameter_group, segmented_projection_group,
+    LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelModelInfo, ParallelPlanError,
+    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ProjectionSharding, ShardingPolicy,
+    TensorPlacement,
 };
 pub use parameter::{
-    bind_materialized_unit, materialize_bindings, MaterializedUnit, ParameterOrchestrationError,
+    bind_materialized_unit, bindings_from_recipe_set, materialize_bindings, MaterializedUnit,
+    ParameterOrchestrationError, RecipeBindingError,
 };
 pub use prefetch::{BackgroundPrefetchWorker, BackgroundPrefetchWorkerError};
+pub use realtime::{
+    RealtimeCompletionAttachmentError, RealtimeGenerationBranch, RealtimeGenerationState,
+    RealtimeGenerationTransactionError,
+};
 pub use residency::{
     DeviceLayerWindow, OffloadUnit, ResidencyAcquisition, ResidencyController,
     ResidencyControllerError, ResidencyDeclarationError, ResidencyLease, ResidencyLeaseOwner,
     ResidencyLeaseStorage, ResidencyReport, ResidencyTransfer, ResidencyTransferOwner,
     ResidencyWindowError, ResidencyWindowManager, ResidentLayerGroup, ResidentLayerGroupReport,
-    WeightBinding, WeightBindingSelectionError, WeightMaterializationReport,
+    WeightBinding, WeightBindingPlan, WeightBindingSelectionError, WeightMaterializationReport,
 };
 pub use state::{
-    DeviceState, LayerRuntimeState, ModelStateIdentity, PagedStatePlan, RuntimeLayerState,
-    RuntimeState, RuntimeStateComponents, StateError, StateLayout, StateResidencyPlan,
+    DeviceState, LayerRuntimeState, ModelStateIdentity, PagedStatePlan,
+    ResettableRuntimeLayerState, ResettableRuntimeState, RuntimeLayerState, RuntimeState,
+    RuntimeStateComponents, StateError, StateLayout, StateResidencyPlan, StateSegmentId,
+    StateSegmentLifetime, StateSegmentSpec, DEFAULT_STATE_SEGMENT_ID,
 };
 pub use weight_residency::{
     DenseDiskStreamLoadOptions, DenseTransferSchedule, DenseTransferScheduleError,

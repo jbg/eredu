@@ -22,7 +22,7 @@ use eredu::{
     backend::mlx::{
         DeviceAssignment, MlxBackend, MlxDistributedSession, MlxParallelContext, ModelLoadOptions,
     },
-    composition::mlx_architectures::distributed::pipeline::{
+    composition::mlx::distributed::pipeline::{
         load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
     },
     core::{residency::OffloadConfig, BackendProvider as _, BackendSession as _},
@@ -1259,10 +1259,10 @@ fn assert_final_logits_close(actual: &Array, expected: &[f32], tolerance: f32) {
 }
 
 fn forward_pipeline_model(
-    model: &mut eredu::composition::mlx_architectures::distributed::pipeline::PipelineModel,
+    model: &mut eredu::composition::mlx::distributed::pipeline::PipelineModel,
     tokens: Option<&Array>,
     step: PipelineStep,
-    cache: &mut eredu::composition::mlx_architectures::distributed::pipeline::PipelineCache,
+    cache: &mut eredu::composition::mlx::distributed::pipeline::PipelineCache,
     execution: &MlxDistributedSession<'_>,
 ) -> Option<Array> {
     model
@@ -1275,12 +1275,12 @@ fn forward_pipeline_model(
 fn assert_family_cache(
     family: FixtureFamily,
     rank: usize,
-    cache: &eredu::composition::mlx_architectures::distributed::pipeline::PipelineCache,
+    cache: &eredu::composition::mlx::distributed::pipeline::PipelineCache,
     expected_offset: i32,
 ) {
     let populated = expected_offset > 0;
     let assert_slots =
-        |slots: &[eredu::composition::mlx_architectures::distributed::pipeline::PipelineStateSlot], count| {
+        |slots: &[eredu::composition::mlx::distributed::pipeline::PipelineStateSlot], count| {
             assert_eq!(slots.len(), count);
             for slot in slots {
                 assert_eq!(slot.value().is_some(), populated);

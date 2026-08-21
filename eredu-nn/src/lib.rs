@@ -815,6 +815,172 @@ pub struct EmbeddingSpec {
     pub quantization: Option<WeightQuantization>,
 }
 
+/// One rank's validated contiguous vocabulary ownership.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct VocabularyParallelRange {
+    /// Complete logical vocabulary size.
+    pub global_vocabulary: usize,
+    /// Half-open row range materialized by this rank.
+    pub local: std::ops::Range<usize>,
+}
+
+impl VocabularyParallelRange {
+    /// Validates non-empty in-bounds ownership.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.global_vocabulary == 0
+            || self.local.is_empty()
+            || self.local.end > self.global_vocabulary
+        {
+            return Err(Error::backend(format!(
+                "invalid vocabulary-parallel range {:?} of {}",
+                self.local, self.global_vocabulary
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validates that an operator's declared global row count is exactly this
+    /// ownership range's global vocabulary.
+    pub fn validate_global_rows(&self, rows: i32) -> Result<(), Error> {
+        self.validate()?;
+        if usize::try_from(rows).ok() != Some(self.global_vocabulary) {
+            return Err(Error::backend(format!(
+                "vocabulary-parallel operator declares {rows} rows but ownership covers {}",
+                self.global_vocabulary
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Token validation and sentinel behavior for one embedding lookup.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EmbeddingLookupPolicy {
+    /// Every token must be a non-negative row index in the embedding table.
+    Strict,
+    /// One negative token value produces an exact zero row instead of indexing
+    /// the embedding table. Every other token remains subject to strict lookup.
+    ZeroSentinel(i32),
+}
+
+impl EmbeddingLookupPolicy {
+    /// Validates that the optional sentinel cannot alias an ordinary row.
+    pub fn validate(self) -> Result<(), Error> {
+        if let Self::ZeroSentinel(sentinel) = self {
+            if sentinel >= 0 {
+                return Err(Error::backend(format!(
+                    "embedding zero sentinel must be negative, got {sentinel}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One named, positive-width component of a fused projection output.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FusedProjectionSegment {
+    name: String,
+    width: i32,
+}
+
+impl FusedProjectionSegment {
+    /// Creates a validated component declaration.
+    pub fn new(name: impl Into<String>, width: i32) -> Result<Self, Error> {
+        let name = name.into();
+        if name.trim().is_empty() || width <= 0 {
+            return Err(Error::backend(format!(
+                "fused projection segments require a name and positive width, got name={name:?} width={width}"
+            )));
+        }
+        Ok(Self { name, width })
+    }
+
+    /// Returns the stable component name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the component width on the final projection axis.
+    pub const fn width(&self) -> i32 {
+        self.width
+    }
+}
+
+/// Validated component-major layout of one fused affine projection.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FusedProjectionLayout {
+    segments: Vec<FusedProjectionSegment>,
+    output_width: i32,
+}
+
+impl FusedProjectionLayout {
+    /// Validates ordered unique components and checked total width.
+    pub fn new(segments: impl IntoIterator<Item = FusedProjectionSegment>) -> Result<Self, Error> {
+        let segments = segments.into_iter().collect::<Vec<_>>();
+        if segments.is_empty() {
+            return Err(Error::backend(
+                "fused projection layout must contain at least one segment",
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut output_width = 0i32;
+        for segment in &segments {
+            if !names.insert(segment.name.clone()) {
+                return Err(Error::backend(format!(
+                    "fused projection segment {:?} is duplicated",
+                    segment.name
+                )));
+            }
+            output_width = output_width.checked_add(segment.width).ok_or_else(|| {
+                Error::backend("fused projection output width overflowed signed 32-bit geometry")
+            })?;
+        }
+        Ok(Self {
+            segments,
+            output_width,
+        })
+    }
+
+    /// Returns component declarations in physical output order.
+    pub fn segments(&self) -> &[FusedProjectionSegment] {
+        &self.segments
+    }
+
+    /// Returns the checked total output width.
+    pub const fn output_width(&self) -> i32 {
+        self.output_width
+    }
+
+    /// Splits one fused result into component-major final-axis views.
+    pub fn split<T: Tensor>(&self, output: &T, context: &T::Context) -> Result<Vec<T>, Error> {
+        let actual = output
+            .shape()
+            .last()
+            .copied()
+            .ok_or_else(|| Error::backend("fused projection output has no feature axis"))?;
+        if actual != self.output_width {
+            return Err(Error::backend(format!(
+                "fused projection emitted width {actual}, expected {}",
+                self.output_width
+            )));
+        }
+        let mut start = 0i32;
+        let mut indexes = vec![Index::Full; output.shape().len()];
+        self.segments
+            .iter()
+            .map(|segment| {
+                let end = start + segment.width;
+                let last = indexes.len() - 1;
+                indexes[last] = Index::Range(start, end);
+                let selected = output.index(&indexes, context);
+                start = end;
+                selected
+            })
+            .collect()
+    }
+}
+
 /// Complete construction specification for normalization.
 #[derive(Debug, Clone)]
 pub struct NormalizationSpec {
@@ -928,6 +1094,21 @@ pub trait LinearOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
 pub trait EmbeddingOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
     /// Looks up token embeddings.
     fn forward(&mut self, input: &T, context: &T::Context) -> Result<T, Error>;
+    /// Looks up token embeddings under an explicit validation/sentinel policy.
+    fn lookup(
+        &mut self,
+        input: &T,
+        policy: EmbeddingLookupPolicy,
+        context: &T::Context,
+    ) -> Result<T, Error> {
+        policy.validate()?;
+        match policy {
+            EmbeddingLookupPolicy::Strict => self.forward(input, context),
+            EmbeddingLookupPolicy::ZeroSentinel(sentinel) => Err(Error::backend(format!(
+                "embedding backend does not implement zero sentinel {sentinel}"
+            ))),
+        }
+    }
     /// Projects hidden states through the transposed embedding table.
     fn as_linear(&mut self, input: &T, context: &T::Context) -> Result<T, Error>;
 }
@@ -2311,6 +2492,51 @@ pub trait NeuralBackend: Sized + 'static {
         spec: EmbeddingSpec,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Embedding, Error>;
+    /// Builds one rank-local vocabulary embedding under validated ownership.
+    fn vocabulary_parallel_embedding(
+        spec: EmbeddingSpec,
+        range: VocabularyParallelRange,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Embedding, Error> {
+        let _ = (spec, range, context);
+        Err(Error::backend(
+            "backend does not implement vocabulary-parallel embeddings",
+        ))
+    }
+    /// Builds one rank-local vocabulary output projection.
+    fn vocabulary_parallel_linear(
+        spec: LinearSpec,
+        range: VocabularyParallelRange,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Linear, Error> {
+        let _ = (spec, range, context);
+        Err(Error::backend(
+            "backend does not implement vocabulary-parallel projections",
+        ))
+    }
+    /// Looks up global token IDs and sums this rank's local contribution.
+    fn vocabulary_parallel_lookup(
+        _embedding: &mut Self::Embedding,
+        _input: &Self::Tensor,
+        _policy: EmbeddingLookupPolicy,
+        _parallel: &Self::ParallelContext,
+        _context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        Err(Error::backend(
+            "backend does not implement vocabulary-parallel lookup",
+        ))
+    }
+    /// Projects to local vocabulary rows and gathers complete logits.
+    fn vocabulary_parallel_project(
+        _linear: &mut Self::Linear,
+        _input: &Self::Tensor,
+        _parallel: &Self::ParallelContext,
+        _context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        Err(Error::backend(
+            "backend does not implement vocabulary-parallel projection",
+        ))
+    }
     /// Builds one RMS normalization operator.
     fn rms_norm(
         spec: NormalizationSpec,
@@ -3165,6 +3391,18 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         let _ = (rhs, context);
         Err(Error::backend(
             "logical disjunction is not implemented by this tensor backend",
+        ))
+    }
+    /// Selects elements from two broadcast-compatible tensors using a boolean condition.
+    fn where_condition(
+        condition: &Self,
+        when_true: &Self,
+        when_false: &Self,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let _ = (condition, when_true, when_false, context);
+        Err(Error::backend(
+            "conditional selection is not implemented by this tensor backend",
         ))
     }
     /// Scatters source rows into the true entries of a boolean mask.
@@ -4135,6 +4373,56 @@ mod parameter_topology_tests {
             validate_parameter_topology::<i32, _>(&alias),
             Err(ParameterTopologyError::MissingAliasDestination { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod fused_projection_layout_tests {
+    use super::*;
+
+    #[test]
+    fn component_major_layout_is_checked_and_stable() {
+        let layout = FusedProjectionLayout::new([
+            FusedProjectionSegment::new("query", 8).unwrap(),
+            FusedProjectionSegment::new("key", 4).unwrap(),
+            FusedProjectionSegment::new("value", 4).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(layout.output_width(), 16);
+        assert_eq!(
+            layout
+                .segments()
+                .iter()
+                .map(|segment| (segment.name(), segment.width()))
+                .collect::<Vec<_>>(),
+            [("query", 8), ("key", 4), ("value", 4)]
+        );
+        assert!(FusedProjectionLayout::new(Vec::new()).is_err());
+        assert!(FusedProjectionLayout::new([
+            FusedProjectionSegment::new("same", 1).unwrap(),
+            FusedProjectionSegment::new("same", 1).unwrap(),
+        ])
+        .is_err());
+        assert!(FusedProjectionSegment::new("", 1).is_err());
+        assert!(FusedProjectionSegment::new("bad", 0).is_err());
+    }
+
+    #[test]
+    fn zero_sentinel_cannot_alias_an_embedding_row() {
+        EmbeddingLookupPolicy::Strict.validate().unwrap();
+        EmbeddingLookupPolicy::ZeroSentinel(-1).validate().unwrap();
+        assert!(EmbeddingLookupPolicy::ZeroSentinel(0).validate().is_err());
+    }
+
+    #[test]
+    fn vocabulary_parallel_ownership_requires_exact_global_rows() {
+        let range = VocabularyParallelRange {
+            global_vocabulary: 5,
+            local: 0..3,
+        };
+        range.validate_global_rows(5).unwrap();
+        assert!(range.validate_global_rows(4).is_err());
+        assert!(range.validate_global_rows(-1).is_err());
     }
 }
 

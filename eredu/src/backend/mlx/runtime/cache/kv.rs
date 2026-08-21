@@ -1217,7 +1217,15 @@ impl PagedCompressedLatentCache {
     }
 
     fn clear(&mut self) -> Result<(), Exception> {
-        self.manager.clear().map_err(cache_residency_exception)?;
+        self.manager
+            .truncate_layer_transaction(
+                self.global_layer,
+                CacheRepresentation::CompressedLatentRotary,
+                0,
+                None,
+                0,
+            )
+            .map_err(cache_residency_exception)?;
         self.tail_latent = None;
         self.tail_rotary = None;
         self.tail_start = 0;
@@ -1313,6 +1321,19 @@ pub struct PagedKeyValueCache {
     tail_values: Option<Array>,
     tail_start: i64,
     offset: i64,
+}
+
+/// Rollback metadata for one sequential semantic branch.
+///
+/// The local tail arrays are already deep-cloned into the branch. This value
+/// records only the shared-manager state that a discarded append must restore.
+#[derive(Debug)]
+pub(crate) struct PagedKeyValueTransactionCheckpoint {
+    session_id: u64,
+    global_layer: usize,
+    offset: i64,
+    tail_bytes: u64,
+    block_ids: Vec<CacheBlockId>,
 }
 
 /// A live key/value cache whose residency is selected independently from the
@@ -1549,6 +1570,95 @@ impl PagedKeyValueCache {
         Ok(clone)
     }
 
+    /// Captures the shared-manager frontier required to discard one
+    /// sequential speculative branch.
+    ///
+    /// Sliding paging is excluded because advancing it may irreversibly
+    /// discard immutable blocks before the branch is committed. Full-attention
+    /// paging is append-only, so rollback removes only newly sealed blocks and
+    /// restores the canonical mutable-tail accounting.
+    pub(crate) fn transaction_checkpoint(
+        &self,
+    ) -> Result<PagedKeyValueTransactionCheckpoint, Exception> {
+        if self.sliding_window.is_some() {
+            return Err(Exception::custom(
+                "transactional branching is unsupported for paged sliding attention",
+            ));
+        }
+        let block_ids = self
+            .manager
+            .layer_block_ids(
+                self.global_layer,
+                CacheRepresentation::KeyValue,
+                0,
+                i64::MAX,
+                0,
+            )
+            .map_err(cache_residency_exception)?;
+        Ok(PagedKeyValueTransactionCheckpoint {
+            session_id: self.manager.session_id(),
+            global_layer: self.global_layer,
+            offset: self.offset,
+            tail_bytes: self.tail_bytes(),
+            block_ids,
+        })
+    }
+
+    /// Removes all manager-visible state appended by a discarded sequential
+    /// branch. Existing immutable blocks are retained even if their physical
+    /// residency changed while the branch was executing.
+    pub(crate) fn rollback_transaction(
+        &mut self,
+        checkpoint: &PagedKeyValueTransactionCheckpoint,
+    ) -> Result<(), Exception> {
+        if checkpoint.session_id != self.manager.session_id()
+            || checkpoint.global_layer != self.global_layer
+        {
+            return Err(Exception::custom(
+                "paged transaction checkpoint does not belong to this cache layer",
+            ));
+        }
+        let current = self
+            .manager
+            .layer_block_ids(
+                self.global_layer,
+                CacheRepresentation::KeyValue,
+                0,
+                i64::MAX,
+                0,
+            )
+            .map_err(cache_residency_exception)?;
+        if checkpoint
+            .block_ids
+            .iter()
+            .any(|expected| !current.contains(expected))
+        {
+            return Err(Exception::custom(
+                "paged transaction removed canonical immutable blocks",
+            ));
+        }
+        let mut first_error = None;
+        for id in current
+            .into_iter()
+            .rev()
+            .filter(|id| !checkpoint.block_ids.contains(id))
+        {
+            if let Err(error) = self.manager.remove_block(&id) {
+                first_error.get_or_insert_with(|| cache_residency_exception(error));
+            }
+        }
+        if let Err(error) =
+            self.manager
+                .set_tail_state(self.global_layer, checkpoint.tail_bytes, checkpoint.offset)
+        {
+            first_error.get_or_insert_with(|| cache_residency_exception(error));
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Creates one layer cache with pinned-prefix and rank-local identity.
     pub fn new_with_layout(
         manager: CacheResidencyManager,
@@ -1628,6 +1738,19 @@ impl PagedKeyValueCache {
     /// Returns the shared model-wide residency manager.
     pub const fn manager(&self) -> &CacheResidencyManager {
         &self.manager
+    }
+
+    /// Returns whether another cache has the same immutable transaction
+    /// identity. Speculative branches may advance their tails independently,
+    /// but must not switch residency sessions, ranks, layers, or geometry when
+    /// they are published back into canonical state.
+    pub(crate) fn has_same_transaction_identity(&self, other: &Self) -> bool {
+        self.manager.session_id() == other.manager.session_id()
+            && self.global_layer == other.global_layer
+            && self.rank == other.rank
+            && self.sliding_window == other.sliding_window
+            && self.key_only == other.key_only
+            && self.prefix_tokens == other.prefix_tokens
     }
 
     /// Returns the global layer identity of this cache.
@@ -1777,7 +1900,15 @@ impl PagedKeyValueCache {
 
     /// Clears live state while preserving paging configuration.
     pub fn clear(&mut self) -> Result<(), Exception> {
-        self.manager.clear().map_err(cache_residency_exception)?;
+        self.manager
+            .truncate_layer_transaction(
+                self.global_layer,
+                CacheRepresentation::KeyValue,
+                0,
+                None,
+                0,
+            )
+            .map_err(cache_residency_exception)?;
         self.tail_keys = None;
         self.tail_values = None;
         self.tail_start = 0;

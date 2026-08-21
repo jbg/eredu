@@ -938,6 +938,53 @@ mod tests {
     }
 
     #[test]
+    fn segmented_weight_and_quantization_companions_share_exact_indices() {
+        let segments = vec![0..4, 4..8, 8..12];
+        let mut planner = ParallelPlanBuilder::new(topology(1, 2));
+        planner
+            .register(
+                ParameterGroupSpec::partitioned(
+                    "attention.qkv",
+                    ParameterRole::Segmented,
+                    4,
+                    [
+                        ParameterMemberSpec::new(
+                            "qkv.weight",
+                            [12, 8],
+                            MemberSharding::PartitionedSegments {
+                                axis: 0,
+                                segments: segments.clone(),
+                            },
+                        ),
+                        ParameterMemberSpec::new(
+                            "qkv.scales",
+                            [12, 2],
+                            MemberSharding::PartitionedSegments {
+                                axis: 0,
+                                segments: segments.clone(),
+                            },
+                        ),
+                        ParameterMemberSpec::new(
+                            "qkv.biases",
+                            [12, 2],
+                            MemberSharding::PartitionedSegments { axis: 0, segments },
+                        ),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let (_, local) = planner.finish().unwrap();
+        let expected = TensorPlacement::Indices {
+            axis: 0,
+            indices: vec![2, 3, 6, 7, 10, 11],
+        };
+        for target in ["qkv.weight", "qkv.scales", "qkv.biases"] {
+            assert_eq!(local.tensor(target).unwrap().placement(), &expected);
+        }
+    }
+
+    #[test]
     fn permissive_policy_replicates_the_complete_group() {
         let mut planner =
             ParallelPlanBuilder::with_policy(topology(0, 3), ShardingPolicy::ReplicateUnsupported);

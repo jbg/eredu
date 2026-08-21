@@ -38,8 +38,8 @@ pub enum ModelKind {
     Lfm2,
     /// Nemotron-H hybrid architecture.
     NemotronH,
-    /// PersonaPlex realtime speech architecture.
-    PersonaPlex,
+    /// Moshi-family realtime speech architecture, including PersonaPlex.
+    Moshi,
     /// Qwen2/Qwen2.5 dense decoder.
     Qwen2,
     /// Qwen3 dense or MoE decoder.
@@ -67,7 +67,7 @@ impl ModelKind {
         Self::MuseGlimmer,
         Self::Lfm2,
         Self::NemotronH,
-        Self::PersonaPlex,
+        Self::Moshi,
         Self::Qwen2,
         Self::Qwen3,
         Self::Qwen3Next,
@@ -89,7 +89,7 @@ impl ModelKind {
             "muse_glimmer" | "muse_glimmer_text" => Ok(Self::MuseGlimmer),
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "nemotron_h" => Ok(Self::NemotronH),
-            "personaplex" => Ok(Self::PersonaPlex),
+            "moshi" | "personaplex" => Ok(Self::Moshi),
             "qwen2" => Ok(Self::Qwen2),
             "qwen3" | "qwen3_moe" => Ok(Self::Qwen3),
             "qwen3_next" => Ok(Self::Qwen3Next),
@@ -113,7 +113,7 @@ impl ModelKind {
             Self::MuseGlimmer => "muse_glimmer",
             Self::Lfm2 => "lfm2/lfm2_moe",
             Self::NemotronH => "nemotron_h",
-            Self::PersonaPlex => "personaplex",
+            Self::Moshi => "moshi",
             Self::Qwen2 => "qwen2",
             Self::Qwen3 => "qwen3",
             Self::Qwen3Next => "qwen3_next",
@@ -121,6 +121,11 @@ impl ModelKind {
             Self::Qwen3VlMoe => "qwen3_vl_moe",
             Self::Qwen35 => "qwen3_5",
         }
+    }
+
+    /// Whether this family requires the realtime multi-stream loader contract.
+    pub const fn requires_realtime_loader(self) -> bool {
+        matches!(self, Self::Moshi)
     }
 }
 
@@ -519,7 +524,7 @@ pub fn validate_preparation_policy(
     format: ArtifactFormat,
     policy: PreparationPolicy,
 ) -> Result<MaterializationRoute, ArtifactError> {
-    if kind == ModelKind::PersonaPlex {
+    if kind.requires_realtime_loader() {
         return Err(ArtifactError::RealtimeModelRequiresRealtimeLoader);
     }
     if policy.quantization.is_some()
@@ -901,8 +906,8 @@ pub enum ArtifactError {
     /// Requested residency mode is unavailable for the artifact.
     #[error("unsupported model residency policy: {0}")]
     UnsupportedResidencyPolicy(String),
-    /// PersonaPlex uses a distinct realtime model/session contract.
-    #[error("PersonaPlex must be prepared through the realtime model loader")]
+    /// Moshi-family models use a distinct realtime model/session contract.
+    #[error("Moshi-family models must be prepared through the realtime model loader")]
     RealtimeModelRequiresRealtimeLoader,
     /// Ordinary filesystem error.
     #[error(transparent)]
@@ -950,6 +955,23 @@ mod tests {
         assert_eq!(resolved.declared_model_type, "qwen3_5");
         assert_eq!(resolved.effective_model_type, "qwen3_5_moe");
         assert_eq!(resolved.json.as_ref(), Some(&json));
+    }
+
+    #[test]
+    fn moshi_family_identity_covers_native_and_personaplex_metadata() {
+        assert_eq!(
+            ModelKind::from_model_type("moshi").unwrap(),
+            ModelKind::Moshi
+        );
+        assert_eq!(
+            ModelKind::from_model_type("personaplex").unwrap(),
+            ModelKind::Moshi
+        );
+        assert!(ModelKind::Moshi.requires_realtime_loader());
+        assert_eq!(
+            serde_json::to_value(ModelKind::Moshi).unwrap(),
+            serde_json::json!("moshi")
+        );
     }
 
     #[test]

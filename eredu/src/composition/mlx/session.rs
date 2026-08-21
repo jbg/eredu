@@ -19,7 +19,7 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
     backend::mlx::runtime::media::input,
-    composition::mlx_architectures::distributed::{
+    composition::mlx::distributed::{
         expert::ExpertParallelCache,
         pipeline::{PipelineCache, PipelineStageCompletion, PipelineStep},
     },
@@ -241,11 +241,11 @@ pub struct MlxModelSession<'a> {
 enum MlxSessionKind {
     Complete(Model, ModelCache),
     Pipeline(
-        crate::composition::mlx_architectures::distributed::pipeline::PipelineModel,
+        crate::composition::mlx::distributed::pipeline::PipelineModel,
         PipelineCache,
     ),
     Expert(
-        crate::composition::mlx_architectures::distributed::expert::ExpertParallelModel,
+        crate::composition::mlx::distributed::expert::ExpertParallelModel,
         ExpertParallelCache,
     ),
 }

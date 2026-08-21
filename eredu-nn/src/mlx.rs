@@ -159,6 +159,17 @@ impl Tensor for Array {
         backend(Array::logical_or(self, rhs, context))
     }
 
+    fn where_condition(
+        condition: &Self,
+        when_true: &Self,
+        when_false: &Self,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        backend(safemlx::ops::r#where(
+            condition, when_true, when_false, context,
+        ))
+    }
+
     fn masked_scatter(
         &self,
         mask: &Self,

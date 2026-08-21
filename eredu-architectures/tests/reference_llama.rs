@@ -1,24 +1,53 @@
+use std::cell::RefCell;
+
 use eredu_architectures::{
+    decoder::{self, AttentionProjectionLayout, GatedProjectionLayout, TransformerBlock},
     llama::{self, LayeredInput, ModelArgs},
-    qwen,
+    moshi, qwen,
 };
-use eredu_core::{AttentionPolicy, Completion, LayerSchedule};
+use eredu_core::{AttentionPolicy, Completion, LayerSchedule, TokenFilter};
 use eredu_nn::{
-    AttentionCache, AttentionMask, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
-    GatedProductExpertBankOperator, GatedProductExpertBankSpec, Index, LinearOperator, LinearSpec,
-    NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode, ParameterMetadata,
-    ParameterVisitor, ParameterVisitorMut, Parameterized, Relu2ExpertBankOperator,
-    Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend,
-    RoutingOperator, RoutingResult, Tensor, TopKRouterSpec,
+    AttentionCache, AttentionMask, AttentionRequest, EmbeddingLookupPolicy, EmbeddingOperator,
+    EmbeddingSpec, Error, GatedProductExpertBankOperator, GatedProductExpertBankSpec, Index,
+    LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode,
+    ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized,
+    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
+    RoutedNeuralBackend, RoutingOperator, RoutingResult, Tensor, TopKRouterSpec,
+    VocabularyParallelRange,
 };
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, DeviceState, ExpertPass, LayerRuntimeState,
-    LayerwiseRuntime, ParameterBackend, ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider,
-    RoutedExpertRequest, RuntimeLayerState, SubmissionBackend, WeightBinding,
+    LayeredArchitecture, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, ParameterBackend,
+    PenaltyConfig, PredictionDirective, ResettableRuntimeLayerState, ResidentRuntime,
+    ResidentUnitWindow, RoutedExpertProvider, RoutedExpertRequest, RuntimeLayerState, RuntimeState,
+    Sampler, SamplingBackend, SequentialDecisionDriver, SequentialDecisionMode,
+    SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
+    SubmissionBackend, TensorPlacement, TokenDomain, WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ReferenceTensor(Vec<i32>);
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+struct ReferenceTrace {
+    linear_outputs: Vec<(String, Vec<i32>)>,
+    embedding_lookups: Vec<(String, Vec<i32>)>,
+    rotary_offsets: Vec<i32>,
+    sliding_attention: Vec<(i32, i32)>,
+    causal_masks: Vec<(i32, i32, Option<i32>)>,
+}
+
+thread_local! {
+    static REFERENCE_TRACE: RefCell<ReferenceTrace> = RefCell::new(ReferenceTrace::default());
+}
+
+fn clear_reference_trace() {
+    REFERENCE_TRACE.with(|trace| *trace.borrow_mut() = ReferenceTrace::default());
+}
+
+fn reference_trace() -> ReferenceTrace {
+    REFERENCE_TRACE.with(|trace| trace.borrow().clone())
+}
 
 impl ReferenceTensor {
     fn with_last(&self, dimension: i32) -> Self {
@@ -235,7 +264,14 @@ impl Parameterized<ReferenceTensor> for ReferenceLinear {
 
 impl LinearOperator<ReferenceTensor> for ReferenceLinear {
     fn forward(&mut self, input: &ReferenceTensor, _: &()) -> Result<ReferenceTensor, Error> {
-        Ok(input.with_last(self.output))
+        let output = input.with_last(self.output);
+        REFERENCE_TRACE.with(|trace| {
+            trace
+                .borrow_mut()
+                .linear_outputs
+                .push((self.metadata.id.as_str().to_owned(), output.0.clone()));
+        });
+        Ok(output)
     }
 }
 
@@ -324,6 +360,21 @@ impl EmbeddingOperator<ReferenceTensor> for ReferenceEmbedding {
         shape.push(self.dimensions);
         Ok(ReferenceTensor(shape))
     }
+    fn lookup(
+        &mut self,
+        input: &ReferenceTensor,
+        policy: EmbeddingLookupPolicy,
+        context: &(),
+    ) -> Result<ReferenceTensor, Error> {
+        policy.validate()?;
+        REFERENCE_TRACE.with(|trace| {
+            trace
+                .borrow_mut()
+                .embedding_lookups
+                .push((self.metadata.id.as_str().to_owned(), input.0.clone()));
+        });
+        self.forward(input, context)
+    }
     fn as_linear(&mut self, input: &ReferenceTensor, _: &()) -> Result<ReferenceTensor, Error> {
         Ok(input.with_last(self.vocabulary))
     }
@@ -380,9 +431,12 @@ impl RotaryOperator<ReferenceTensor> for ReferenceRotary {
     fn forward(
         &mut self,
         input: &ReferenceTensor,
-        _: RotaryPosition<'_, ReferenceTensor>,
+        position: RotaryPosition<'_, ReferenceTensor>,
         _: &(),
     ) -> Result<ReferenceTensor, Error> {
+        if let RotaryPosition::Offset(offset) = position {
+            REFERENCE_TRACE.with(|trace| trace.borrow_mut().rotary_offsets.push(offset));
+        }
         Ok(input.clone())
     }
 }
@@ -411,6 +465,48 @@ impl NeuralBackend for ReferenceBackend {
             weight: ReferenceTensor(vec![spec.vocabulary, spec.dimensions]),
             metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
         })
+    }
+    fn vocabulary_parallel_embedding(
+        spec: EmbeddingSpec,
+        range: VocabularyParallelRange,
+        _: &(),
+    ) -> Result<Self::Embedding, Error> {
+        range.validate()?;
+        Ok(ReferenceEmbedding {
+            vocabulary: spec.vocabulary,
+            dimensions: spec.dimensions,
+            weight: ReferenceTensor(vec![range.local.len() as i32, spec.dimensions]),
+            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+        })
+    }
+    fn vocabulary_parallel_linear(
+        spec: LinearSpec,
+        range: VocabularyParallelRange,
+        _: &(),
+    ) -> Result<Self::Linear, Error> {
+        range.validate()?;
+        Ok(ReferenceLinear {
+            output: spec.output,
+            weight: ReferenceTensor(vec![range.local.len() as i32, spec.input]),
+            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+        })
+    }
+    fn vocabulary_parallel_lookup(
+        embedding: &mut Self::Embedding,
+        input: &Self::Tensor,
+        policy: EmbeddingLookupPolicy,
+        _: &(),
+        context: &(),
+    ) -> Result<Self::Tensor, Error> {
+        embedding.lookup(input, policy, context)
+    }
+    fn vocabulary_parallel_project(
+        linear: &mut Self::Linear,
+        input: &Self::Tensor,
+        _: &(),
+        context: &(),
+    ) -> Result<Self::Tensor, Error> {
+        linear.forward(input, context)
     }
     fn rms_norm(spec: NormalizationSpec, _: &()) -> Result<Self::Normalization, Error> {
         Ok(ReferenceNorm {
@@ -448,13 +544,30 @@ impl NeuralBackend for ReferenceBackend {
         _: Self::Tensor,
         _: Self::Tensor,
         _: f32,
-        _: i32,
-        _: i32,
+        window: i32,
+        position_offset: i32,
         _: &(),
     ) -> Result<Self::Tensor, Error> {
+        REFERENCE_TRACE.with(|trace| {
+            trace
+                .borrow_mut()
+                .sliding_attention
+                .push((window, position_offset));
+        });
         Ok(queries)
     }
-    fn causal_mask(sequence: i32, _: i32, _: Option<i32>, _: &()) -> Result<Self::Tensor, Error> {
+    fn causal_mask(
+        sequence: i32,
+        offset: i32,
+        window: Option<i32>,
+        _: &(),
+    ) -> Result<Self::Tensor, Error> {
+        REFERENCE_TRACE.with(|trace| {
+            trace
+                .borrow_mut()
+                .causal_masks
+                .push((sequence, offset, window));
+        });
         Ok(ReferenceTensor(vec![sequence, sequence]))
     }
     fn row_parallel_linear(
@@ -615,6 +728,20 @@ impl ParameterBackend for ReferenceBackend {
         Ok(materialization)
     }
 
+    fn share_materialized_weight(
+        weight: &Self::MaterializedWeight,
+    ) -> Result<Self::MaterializedWeight, Self::ParameterError> {
+        Ok(weight.clone())
+    }
+
+    fn validate_bind(
+        parameter: &Self::Parameter,
+        weight: &Self::MaterializedWeight,
+    ) -> Result<(), Self::ParameterError> {
+        assert_eq!(parameter.0, weight.0);
+        Ok(())
+    }
+
     fn bind(
         parameter: &mut Self::Parameter,
         weight: Self::MaterializedWeight,
@@ -624,10 +751,142 @@ impl ParameterBackend for ReferenceBackend {
     }
 }
 
+impl SamplingBackend for ReferenceBackend {
+    type Logits = ReferenceTensor;
+    type Token = ReferenceTensor;
+    type RandomState = i32;
+    type Context = ();
+    type Error = Error;
+
+    fn error(message: String) -> Self::Error {
+        Error::backend(message)
+    }
+
+    fn validate_token(
+        token: &Self::Token,
+        domain: TokenDomain,
+        _: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        token
+            .0
+            .first()
+            .copied()
+            .and_then(|token| usize::try_from(token).ok())
+            .filter(|token| *token < domain.cardinality())
+            .map(|_| token.clone())
+            .ok_or_else(|| Error::backend("reference token is outside its decision domain"))
+    }
+
+    fn scale_temperature(
+        logits: &Self::Logits,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn apply_penalties(
+        logits: &Self::Logits,
+        _: &[u32],
+        _: PenaltyConfig,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn apply_top_k(
+        logits: Self::Logits,
+        _: i32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits)
+    }
+
+    fn apply_top_p(
+        logits: Self::Logits,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits)
+    }
+
+    fn apply_min_p(
+        logits: Self::Logits,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits)
+    }
+
+    fn apply_token_filter(
+        logits: &Self::Logits,
+        _: &TokenFilter,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn apply_mirostat(
+        logits: &Self::Logits,
+        _: &[u32],
+        _: PenaltyConfig,
+        _: f32,
+        _: f32,
+        _: &Self::Context,
+    ) -> Result<Self::Logits, Self::Error> {
+        Ok(logits.clone())
+    }
+
+    fn sample_raw(
+        _: &Self::Logits,
+        _: f32,
+        random: Option<&mut Self::RandomState>,
+        _: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        if let Some(random) = random {
+            *random += 1;
+        }
+        Ok(ReferenceTensor(vec![1, 1]))
+    }
+
+    fn sample_processed(
+        logits: &Self::Logits,
+        temperature: f32,
+        random: Option<&mut Self::RandomState>,
+        context: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        Self::sample_raw(logits, temperature, random, context)
+    }
+
+    fn token_id(token: &Self::Token, _: &Self::Context) -> Result<u32, Self::Error> {
+        Ok(token.0.first().copied().unwrap_or_default() as u32)
+    }
+
+    fn token_probability(_: &Self::Logits, _: u32, _: &Self::Context) -> Result<f32, Self::Error> {
+        Ok(1.0)
+    }
+}
+
+#[derive(Clone)]
+struct ReferenceSampler;
+
+impl Sampler<ReferenceBackend> for ReferenceSampler {
+    fn sample(
+        &mut self,
+        logits: &ReferenceTensor,
+        temperature: f32,
+        random: Option<&mut i32>,
+        context: &(),
+    ) -> Result<ReferenceTensor, Error> {
+        ReferenceBackend::sample_raw(logits, temperature, random, context)
+    }
+}
+
 #[derive(Debug)]
 struct ReferenceCache {
     offset: i32,
     window: Option<i32>,
+    resets: usize,
 }
 
 impl AttentionCache<ReferenceTensor> for ReferenceCache {
@@ -663,6 +922,14 @@ impl RuntimeLayerState<ReferenceBackend> for ReferenceCache {
     }
 }
 
+impl ResettableRuntimeLayerState<ReferenceBackend> for ReferenceCache {
+    fn reset(&mut self) -> Result<(), StateError> {
+        self.offset = 0;
+        self.resets += 1;
+        Ok(())
+    }
+}
+
 fn tiny_args() -> ModelArgs {
     ModelArgs {
         model_type: "llama".into(),
@@ -687,6 +954,1060 @@ fn tiny_args() -> ModelArgs {
         quantized_weights: None,
         quantized_weight_configs: None,
     }
+}
+
+struct ProjectionLayoutConfig {
+    args: ModelArgs,
+    fused: bool,
+    empty_field: bool,
+    alternate_fields: bool,
+}
+
+impl decoder::Config for ProjectionLayoutConfig {
+    fn model_identity(&self) -> &str {
+        &self.args.model_type
+    }
+
+    fn validate_config(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn block_parameter_fields(&self) -> decoder::BlockParameterFields<'_> {
+        if self.alternate_fields {
+            decoder::BlockParameterFields {
+                attention_output: "out_proj",
+                feed_forward: "gating",
+                feed_forward_output: "linear_out",
+                input_norm: "norm1",
+                post_attention_norm: "norm2",
+                ..decoder::BlockParameterFields::default()
+            }
+        } else {
+            decoder::BlockParameterFields::default()
+        }
+    }
+
+    fn hidden_size(&self) -> i32 {
+        self.args.hidden_size
+    }
+
+    fn num_hidden_layers(&self) -> i32 {
+        self.args.num_hidden_layers
+    }
+
+    fn intermediate_size(&self) -> i32 {
+        self.args.intermediate_size
+    }
+
+    fn num_attention_heads(&self) -> i32 {
+        self.args.num_attention_heads
+    }
+
+    fn num_key_value_heads(&self) -> i32 {
+        self.args.num_key_value_heads
+    }
+
+    fn head_dim(&self) -> i32 {
+        self.args.head_dim
+    }
+
+    fn rms_norm_epsilon(&self) -> f32 {
+        self.args.rms_norm_eps
+    }
+
+    fn vocabulary_size(&self) -> i32 {
+        self.args.vocab_size
+    }
+
+    fn attention_bias(&self, _: decoder::AttentionProjection) -> bool {
+        false
+    }
+
+    fn attention_projection_layout(&self) -> AttentionProjectionLayout<'_> {
+        if self.fused {
+            AttentionProjectionLayout::Fused {
+                field: if self.empty_field { "" } else { "in_proj" },
+            }
+        } else {
+            AttentionProjectionLayout::Split
+        }
+    }
+
+    fn mlp_bias(&self) -> bool {
+        false
+    }
+
+    fn gated_projection_layout(&self) -> GatedProjectionLayout<'_> {
+        if self.fused {
+            GatedProjectionLayout::Fused {
+                field: if self.empty_field {
+                    ""
+                } else if self.alternate_fields {
+                    "linear_in"
+                } else {
+                    "gate_up_proj"
+                },
+            }
+        } else {
+            GatedProjectionLayout::Split
+        }
+    }
+
+    fn tie_word_embeddings(&self) -> bool {
+        self.args.tie_word_embeddings
+    }
+
+    fn attention_schedule(&self) -> &LayerSchedule<AttentionPolicy> {
+        &self.args.attention_schedule
+    }
+
+    fn weight_quantization(&self, _: &str) -> Option<eredu_checkpoint::WeightQuantization> {
+        None
+    }
+
+    fn rotary_spec(&self, dimensions: i32) -> RotarySpec<'_> {
+        RotarySpec {
+            dimensions,
+            base: self.args.rope_theta,
+            traditional: self.args.rope_traditional,
+            max_positions: self.args.max_position_embeddings,
+            scaling: None,
+        }
+    }
+}
+
+#[test]
+fn fused_and_split_decoder_blocks_publish_equivalent_projection_geometry() {
+    let split = TransformerBlock::<ReferenceBackend>::new(
+        &ProjectionLayoutConfig {
+            args: tiny_args(),
+            fused: false,
+            empty_field: false,
+            alternate_fields: false,
+        },
+        0,
+        &(),
+    )
+    .unwrap();
+    let fused = TransformerBlock::<ReferenceBackend>::new(
+        &ProjectionLayoutConfig {
+            args: tiny_args(),
+            fused: true,
+            empty_field: false,
+            alternate_fields: false,
+        },
+        0,
+        &(),
+    )
+    .unwrap();
+    let split = topology(&split);
+    let fused = topology(&fused);
+    let elements = |topology: &[(String, Vec<usize>)]| {
+        topology
+            .iter()
+            .map(|(_, shape)| shape.iter().product::<usize>())
+            .sum::<usize>()
+    };
+    assert_eq!(elements(&split), elements(&fused));
+    assert!(split
+        .iter()
+        .any(|(name, shape)| name.ends_with("self_attn.q_proj.weight") && shape == &[8, 8]));
+    assert!(split
+        .iter()
+        .any(|(name, shape)| name.ends_with("self_attn.k_proj.weight") && shape == &[4, 8]));
+    assert!(split
+        .iter()
+        .any(|(name, shape)| name.ends_with("mlp.gate_proj.weight") && shape == &[16, 8]));
+    assert!(fused
+        .iter()
+        .any(|(name, shape)| name.ends_with("self_attn.in_proj.weight") && shape == &[16, 8]));
+    assert!(fused
+        .iter()
+        .any(|(name, shape)| name.ends_with("mlp.gate_up_proj.weight") && shape == &[32, 8]));
+    assert!(!fused.iter().any(|(name, _)| {
+        name.ends_with("q_proj.weight")
+            || name.ends_with("k_proj.weight")
+            || name.ends_with("gate_proj.weight")
+    }));
+}
+
+#[test]
+fn alternate_block_fields_drive_parameter_topology_and_parallel_groups() {
+    let config = ProjectionLayoutConfig {
+        args: tiny_args(),
+        fused: true,
+        empty_field: false,
+        alternate_fields: true,
+    };
+    let block = TransformerBlock::<ReferenceBackend>::new(&config, 0, &()).unwrap();
+    let expected = std::collections::BTreeSet::from([
+        "model.layers.0.gating.linear_in.weight".to_string(),
+        "model.layers.0.gating.linear_out.weight".to_string(),
+        "model.layers.0.norm1.weight".to_string(),
+        "model.layers.0.norm2.weight".to_string(),
+        "model.layers.0.self_attn.in_proj.weight".to_string(),
+        "model.layers.0.self_attn.out_proj.weight".to_string(),
+    ]);
+    let topology_names = topology(&block)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(topology_names, expected);
+
+    let groups = decoder::layer_parallel_parameter_groups(&block, &config, 0).unwrap();
+    let group_names = groups
+        .iter()
+        .map(|group| group.logical_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        group_names,
+        std::collections::BTreeSet::from([
+            "model.layers.0.gating.projections",
+            "model.layers.0.norm1",
+            "model.layers.0.norm2",
+            "model.layers.0.self_attn.projections",
+        ])
+    );
+    let member_names = groups
+        .iter()
+        .flat_map(|group| group.members())
+        .map(|member| member.target().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(member_names, expected);
+}
+
+fn tiny_moshi_config() -> moshi::MoshiConfig {
+    moshi::MoshiConfig::from_json(
+        r#"{
+            "model_type": "moshi",
+            "dim": 32,
+            "text_card": 101,
+            "n_q": 4,
+            "dep_q": 3,
+            "generated_audio_codebooks": 2,
+            "card": 64,
+            "num_heads": 4,
+            "num_layers": 2,
+            "dim_feedforward": 48,
+            "causal": true,
+            "context": 7,
+            "max_period": 10000.0,
+            "positional_embedding": "rope",
+            "depformer_dim": 24,
+            "depformer_dim_feedforward": 36,
+            "depformer_num_heads": 4,
+            "depformer_num_layers": 2,
+            "depformer_context": 3,
+            "depformer_max_period": 10000.0,
+            "depformer_pos_emb": "none",
+            "delays": [0, 0, 1, 2, 1]
+        }"#,
+    )
+    .unwrap()
+}
+
+fn minimal_moshi_config() -> moshi::MoshiConfig {
+    moshi::MoshiConfig::from_json(
+        r#"{
+            "model_type": "moshi",
+            "dim": 32,
+            "text_card": 101,
+            "n_q": 2,
+            "dep_q": 1,
+            "generated_audio_codebooks": 1,
+            "card": 64,
+            "num_heads": 4,
+            "num_layers": 1,
+            "dim_feedforward": 48,
+            "causal": true,
+            "context": 7,
+            "max_period": 10000.0,
+            "positional_embedding": "rope",
+            "depformer_dim": 24,
+            "depformer_dim_feedforward": 36,
+            "depformer_num_heads": 4,
+            "depformer_num_layers": 1,
+            "depformer_context": 3,
+            "depformer_max_period": 10000.0,
+            "depformer_pos_emb": "none",
+            "delays": [0, 0, 1]
+        }"#,
+    )
+    .unwrap()
+}
+
+type ReferenceMoshiState = DeviceState<ReferenceBackend, ReferenceCache>;
+
+fn reference_moshi_state(config: &moshi::MoshiConfig) -> ReferenceMoshiState {
+    let layout = moshi::state_layout(config).unwrap();
+    DeviceState::create(layout, |_, policy| {
+        Ok::<_, std::convert::Infallible>(ReferenceCache {
+            offset: 0,
+            window: policy
+                .attention()
+                .and_then(|attention| attention.window())
+                .map(|window| window.get() as i32),
+            resets: 0,
+        })
+    })
+    .unwrap()
+}
+
+fn reference_decision_driver(
+    retain_diagnostics: bool,
+) -> SequentialDecisionDriver<ReferenceBackend, ReferenceSampler> {
+    let plan = SequentialDecisionPlan::new(
+        [
+            PredictionDirective::Sample,
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+        ],
+        retain_diagnostics,
+        true,
+    )
+    .unwrap();
+    SequentialDecisionDriver::new(plan, vec![ReferenceSampler; 4], vec![0.0; 4], Some(0)).unwrap()
+}
+
+fn execute_reference_moshi_frame(
+    config: &moshi::MoshiConfig,
+    directives: Vec<PredictionDirective<ReferenceTensor>>,
+    retain_diagnostics: bool,
+    allow_tail_skip: bool,
+    random: Option<i32>,
+) -> (
+    ReferenceTensor,
+    moshi::ForwardContext<ReferenceTensor>,
+    SequentialDecisionDriver<ReferenceBackend, ReferenceSampler>,
+    ReferenceMoshiState,
+    ReferenceTrace,
+) {
+    let architecture = moshi::LayeredModel::<ReferenceBackend>::new(config.clone(), &()).unwrap();
+    let decision_count = architecture.decision_count();
+    assert_eq!(directives.len(), decision_count);
+    let mut runtime =
+        ResidentRuntime::<_, ReferenceBackend, ReferenceMoshiState>::new(architecture, &())
+            .unwrap();
+    let mut state = reference_moshi_state(config);
+    let plan =
+        SequentialDecisionPlan::new(directives, retain_diagnostics, allow_tail_skip).unwrap();
+    let mut driver = SequentialDecisionDriver::new(
+        plan,
+        vec![ReferenceSampler; decision_count],
+        vec![0.0; decision_count],
+        random,
+    )
+    .unwrap();
+    let text = ReferenceTensor(vec![1, 1]);
+    let audio_values = (0..config.frame_schedule().total_audio_codebooks())
+        .map(|_| ReferenceTensor(vec![1, 1]))
+        .collect::<Vec<_>>();
+    let audio = audio_values.iter().collect::<Vec<_>>();
+    clear_reference_trace();
+    let mut boundary = moshi::DecisionBoundary::new(&config).unwrap();
+    let (logits, forward) = {
+        let mut hook = SequentialDecisionTraversal::new(&mut driver, &mut boundary);
+        runtime
+            .forward_with_traversal_hook(
+                moshi::Input {
+                    text: &text,
+                    audio: &audio,
+                    mask: None,
+                },
+                &mut state,
+                &(),
+                &mut hook,
+            )
+            .unwrap()
+    };
+    driver.finish().unwrap();
+    (logits, forward, driver, state, reference_trace())
+}
+
+fn replicated_moshi_parallel_layout(config: &moshi::MoshiConfig) -> LocalModelLayout {
+    let architecture = moshi::LayeredModel::<ReferenceBackend>::new(config.clone(), &()).unwrap();
+    let mut groups = architecture.static_parameter_groups().unwrap();
+    for group in 0..2 {
+        let count = <moshi::LayeredModel<ReferenceBackend> as LayeredArchitecture<
+            ReferenceBackend,
+            ReferenceMoshiState,
+        >>::group_unit_count(&architecture, group)
+        .unwrap();
+        for index in 0..count {
+            let unit = <moshi::LayeredModel<ReferenceBackend> as LayeredArchitecture<
+                ReferenceBackend,
+                ReferenceMoshiState,
+            >>::build_unit(&architecture, group, index, &())
+            .unwrap();
+            groups.extend(moshi::unit_parameter_groups(&unit, config, group, index).unwrap());
+        }
+    }
+    let mut layout = LocalModelLayout::default();
+    for group in groups {
+        let logical_range = group.partition_units().map(|units| 0..units);
+        for member in group.members() {
+            layout.insert(
+                member.target().to_owned(),
+                LocalTensorLayout::new(
+                    group.logical_name(),
+                    group.role(),
+                    member.global_shape().to_vec(),
+                    member.global_shape().to_vec(),
+                    TensorPlacement::Replicated,
+                    group.partition_units(),
+                    logical_range.clone(),
+                    false,
+                ),
+            );
+        }
+    }
+    layout
+}
+
+#[test]
+fn one_portable_moshi_model_runs_replicated_and_parallel_lifecycles() {
+    let config = minimal_moshi_config();
+    let replicated = execute_reference_moshi_frame(
+        &config,
+        vec![
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+        ],
+        true,
+        true,
+        None,
+    );
+
+    let layout = replicated_moshi_parallel_layout(&config);
+    let geometry = moshi::local_geometry(&config, &layout, std::iter::empty()).unwrap();
+    let architecture =
+        moshi::LayeredModel::<ReferenceBackend>::new_parallel(config.clone(), geometry, &())
+            .unwrap();
+    let mut units = Vec::new();
+    for group in 0..2 {
+        let count = <moshi::LayeredModel<ReferenceBackend> as LayeredArchitecture<
+            ReferenceBackend,
+            ReferenceMoshiState,
+        >>::group_unit_count(&architecture, group)
+        .unwrap();
+        for index in 0..count {
+            units.push(
+                <moshi::LayeredModel<ReferenceBackend> as LayeredArchitecture<
+                    ReferenceBackend,
+                    ReferenceMoshiState,
+                >>::build_unit(&architecture, group, index, &())
+                .unwrap(),
+            );
+        }
+    }
+    let mut runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+    let mut state = reference_moshi_state(&config);
+    let plan = SequentialDecisionPlan::new(
+        [
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+        ],
+        true,
+        true,
+    )
+    .unwrap();
+    let mut driver =
+        SequentialDecisionDriver::new(plan, vec![ReferenceSampler; 2], vec![0.0; 2], None).unwrap();
+    let text = ReferenceTensor(vec![1, 1]);
+    let audio_values = (0..config.frame_schedule().total_audio_codebooks())
+        .map(|_| ReferenceTensor(vec![1, 1]))
+        .collect::<Vec<_>>();
+    let audio = audio_values.iter().collect::<Vec<_>>();
+    let mut boundary = moshi::DecisionBoundary::new(&config).unwrap();
+    let (parallel_logits, _) = {
+        let mut traversal = SequentialDecisionTraversal::new(&mut driver, &mut boundary);
+        runtime
+            .forward_parallel_with_traversal_hook(
+                moshi::Input {
+                    text: &text,
+                    audio: &audio,
+                    mask: None,
+                },
+                &mut state,
+                &(),
+                &(),
+                &mut traversal,
+            )
+            .unwrap()
+    };
+    driver.finish().unwrap();
+
+    assert_eq!(parallel_logits, replicated.0);
+    assert_eq!(driver.decisions(), replicated.2.decisions());
+    assert_eq!(
+        state.layout(),
+        &runtime.architecture().runtime_state_layout().unwrap()
+    );
+}
+
+#[test]
+fn tiny_moshi_executes_one_temporal_block_and_one_depth_slice_with_exact_logit_geometry() {
+    let config = minimal_moshi_config();
+    let forced_text = ReferenceTensor(vec![1, 1]);
+    let forced_audio = ReferenceTensor(vec![1, 1]);
+    let (text_logits, forward, driver, state, trace) = execute_reference_moshi_frame(
+        &config,
+        vec![
+            PredictionDirective::Force(forced_text),
+            PredictionDirective::Force(forced_audio.clone()),
+        ],
+        true,
+        true,
+        None,
+    );
+
+    assert_eq!(driver.plan().mode(), SequentialDecisionMode::TeacherForced);
+    assert_eq!(text_logits, ReferenceTensor(vec![1, 1, 101]));
+    assert_eq!(
+        driver
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| (diagnostic.prediction(), diagnostic.logits().clone()))
+            .collect::<Vec<_>>(),
+        [
+            (0, ReferenceTensor(vec![1, 1, 101])),
+            (1, ReferenceTensor(vec![1, 1, 64])),
+        ]
+    );
+    assert_eq!(forward.previous_depth_token(), Some(&forced_audio));
+    assert_eq!(state.as_ref()[0].offset, 1);
+    assert_eq!(state.as_ref()[1].offset, 1);
+    assert_eq!(state.as_ref()[0].resets, 0);
+    assert_eq!(state.as_ref()[1].resets, 1);
+    assert!(trace
+        .linear_outputs
+        .contains(&("text_linear.weight".into(), vec![1, 1, 101])));
+    assert!(trace.linear_outputs.contains(&(
+        "depformer.slices.0.linear_out.weight".into(),
+        vec![1, 1, 64]
+    )));
+}
+
+#[test]
+fn moshi_frame_decisions_cover_greedy_seeded_partial_forced_and_tail_skip() {
+    let config = tiny_moshi_config();
+    let count = config.frame_schedule().depth_audio_codebooks() + 1;
+    let sampled = vec![PredictionDirective::Sample; count];
+
+    let (_, _, greedy, _, _) =
+        execute_reference_moshi_frame(&config, sampled.clone(), true, true, None);
+    assert_eq!(greedy.plan().mode(), SequentialDecisionMode::Autoregressive);
+    assert!(greedy.random_state().is_none());
+    assert!(greedy
+        .decisions()
+        .iter()
+        .all(|decision| decision.source() == SequentialDecisionSource::Sampled));
+
+    let (_, _, seeded, _, _) =
+        execute_reference_moshi_frame(&config, sampled, true, true, Some(17));
+    assert_eq!(seeded.random_state(), Some(&21));
+    assert_eq!(seeded.diagnostics().len(), count);
+
+    let partial = vec![
+        PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+        PredictionDirective::Sample,
+        PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+        PredictionDirective::Sample,
+    ];
+    let (_, _, partial, _, _) =
+        execute_reference_moshi_frame(&config, partial, true, true, Some(4));
+    assert_eq!(
+        partial.plan().mode(),
+        SequentialDecisionMode::PartiallyForced
+    );
+    assert_eq!(partial.random_state(), Some(&6));
+    assert_eq!(
+        partial
+            .decisions()
+            .iter()
+            .map(|decision| decision.source())
+            .collect::<Vec<_>>(),
+        [
+            SequentialDecisionSource::Forced,
+            SequentialDecisionSource::Sampled,
+            SequentialDecisionSource::Forced,
+            SequentialDecisionSource::Sampled,
+        ]
+    );
+
+    let forced = (0..count)
+        .map(|_| PredictionDirective::Force(ReferenceTensor(vec![1, 1])))
+        .collect::<Vec<_>>();
+    let (_, _, forced, state, _) =
+        execute_reference_moshi_frame(&config, forced, false, true, None);
+    assert_eq!(forced.plan().mode(), SequentialDecisionMode::TeacherForced);
+    assert_eq!(
+        forced
+            .decisions()
+            .iter()
+            .map(|decision| decision.source())
+            .collect::<Vec<_>>(),
+        [
+            SequentialDecisionSource::Forced,
+            SequentialDecisionSource::ForcedTailSkipped,
+            SequentialDecisionSource::ForcedTailSkipped,
+            SequentialDecisionSource::ForcedTailSkipped,
+        ]
+    );
+    assert_eq!(state.as_ref()[2].offset, 0);
+    assert_eq!(state.as_ref()[3].offset, 0);
+    assert_eq!(state.as_ref()[2].resets, 1);
+    assert_eq!(state.as_ref()[3].resets, 1);
+}
+
+#[test]
+fn moshi_depth_codebooks_receive_the_immediately_preceding_decision() {
+    let config = tiny_moshi_config();
+    let symbolic_tokens = [
+        ReferenceTensor(vec![1, 2]),
+        ReferenceTensor(vec![1, 3]),
+        ReferenceTensor(vec![1, 4]),
+        ReferenceTensor(vec![1, 5]),
+    ];
+    let directives = symbolic_tokens
+        .iter()
+        .cloned()
+        .map(PredictionDirective::Force)
+        .collect::<Vec<_>>();
+    let (_, forward, _, _, trace) =
+        execute_reference_moshi_frame(&config, directives, true, false, None);
+    let depth_lookups = trace
+        .embedding_lookups
+        .iter()
+        .filter(|(name, _)| name.starts_with("depformer.slices."))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        depth_lookups,
+        [
+            ("depformer.slices.0.emb.weight".into(), vec![1, 2]),
+            ("depformer.slices.1.emb.weight".into(), vec![1, 3]),
+            ("depformer.slices.2.emb.weight".into(), vec![1, 4]),
+        ]
+    );
+    assert_eq!(forward.previous_depth_token(), Some(&symbolic_tokens[3]));
+}
+
+#[test]
+fn moshi_depth_resets_once_per_frame_and_temporal_rope_uses_absolute_offset() {
+    let config = minimal_moshi_config();
+    assert_eq!(config.temporal().context(), 7);
+    assert_eq!(config.temporal().attention_window(), 8);
+    let architecture = moshi::LayeredModel::<ReferenceBackend>::new(config.clone(), &()).unwrap();
+    let mut runtime =
+        ResidentRuntime::<_, ReferenceBackend, ReferenceMoshiState>::new(architecture, &())
+            .unwrap();
+    let mut state = reference_moshi_state(&config);
+    assert_eq!(state.as_ref()[0].window, Some(8));
+    assert_eq!(state.as_ref()[1].window, Some(3));
+
+    let prefill_text = ReferenceTensor(vec![1, 3]);
+    let prefill_audio_values = [ReferenceTensor(vec![1, 3]), ReferenceTensor(vec![1, 3])];
+    let prefill_audio = prefill_audio_values.iter().collect::<Vec<_>>();
+    let prefill_plan = SequentialDecisionPlan::new(
+        [
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+        ],
+        true,
+        true,
+    )
+    .unwrap();
+    let mut prefill_driver =
+        SequentialDecisionDriver::new(prefill_plan, vec![ReferenceSampler; 2], vec![0.0; 2], None)
+            .unwrap();
+    clear_reference_trace();
+    let mut boundary = moshi::DecisionBoundary::new(&config).unwrap();
+    {
+        let mut hook = SequentialDecisionTraversal::new(&mut prefill_driver, &mut boundary);
+        runtime
+            .forward_with_traversal_hook(
+                moshi::Input {
+                    text: &prefill_text,
+                    audio: &prefill_audio,
+                    mask: None,
+                },
+                &mut state,
+                &(),
+                &mut hook,
+            )
+            .unwrap();
+    }
+    prefill_driver.finish().unwrap();
+    let prefill_trace = reference_trace();
+    assert_eq!(prefill_trace.rotary_offsets, [0, 0]);
+    assert_eq!(prefill_trace.sliding_attention, [(8, 0), (3, 0)]);
+    assert_eq!(prefill_trace.causal_masks, [(3, 0, None), (3, 0, None)]);
+    assert_eq!(state.as_ref()[0].offset, 3);
+    assert_eq!(state.as_ref()[1].offset, 3);
+    assert_eq!(state.as_ref()[0].resets, 0);
+    assert_eq!(state.as_ref()[1].resets, 1);
+
+    let decode_text = ReferenceTensor(vec![1, 1]);
+    let decode_audio_values = [ReferenceTensor(vec![1, 1]), ReferenceTensor(vec![1, 1])];
+    let decode_audio = decode_audio_values.iter().collect::<Vec<_>>();
+    let decode_plan = SequentialDecisionPlan::new(
+        [
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+        ],
+        true,
+        true,
+    )
+    .unwrap();
+    let mut decode_driver =
+        SequentialDecisionDriver::new(decode_plan, vec![ReferenceSampler; 2], vec![0.0; 2], None)
+            .unwrap();
+    clear_reference_trace();
+    {
+        let mut hook = SequentialDecisionTraversal::new(&mut decode_driver, &mut boundary);
+        runtime
+            .forward_with_traversal_hook(
+                moshi::Input {
+                    text: &decode_text,
+                    audio: &decode_audio,
+                    mask: None,
+                },
+                &mut state,
+                &(),
+                &mut hook,
+            )
+            .unwrap();
+    }
+    decode_driver.finish().unwrap();
+    let decode_trace = reference_trace();
+    assert_eq!(decode_trace.rotary_offsets, [3, 3]);
+    assert!(decode_trace.sliding_attention.is_empty());
+    assert!(decode_trace.causal_masks.is_empty());
+    assert_eq!(state.as_ref()[0].offset, 4);
+    assert_eq!(state.as_ref()[1].offset, 1);
+    assert_eq!(state.as_ref()[0].resets, 0);
+    assert_eq!(state.as_ref()[1].resets, 2);
+}
+
+#[test]
+fn moshi_rejects_mismatched_cache_layout_and_depth_block_drift() {
+    let config = minimal_moshi_config();
+    let architecture = moshi::LayeredModel::<ReferenceBackend>::new(config.clone(), &()).unwrap();
+    let mut runtime =
+        ResidentRuntime::<_, ReferenceBackend, ReferenceMoshiState>::new(architecture, &())
+            .unwrap();
+    let text = ReferenceTensor(vec![1, 1]);
+    let audio_values = [ReferenceTensor(vec![1, 1]), ReferenceTensor(vec![1, 1])];
+    let audio = audio_values.iter().collect::<Vec<_>>();
+    let malformed_audio_values = [ReferenceTensor(vec![1, 1]), ReferenceTensor(vec![1, 2])];
+    let malformed_audio = malformed_audio_values.iter().collect::<Vec<_>>();
+    let mut valid_state = reference_moshi_state(&config);
+    let error = runtime
+        .forward(
+            moshi::Input {
+                text: &text,
+                audio: &malformed_audio,
+                mask: None,
+            },
+            &mut valid_state,
+            &(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("token shape"));
+    assert!(valid_state.as_ref().iter().all(|cache| cache.resets == 0));
+
+    let mut wrong_state = reference_moshi_state(&tiny_moshi_config());
+    let error = runtime
+        .forward(
+            moshi::Input {
+                text: &text,
+                audio: &audio,
+                mask: None,
+            },
+            &mut wrong_state,
+            &(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("state layout mismatch"));
+    assert!(wrong_state.as_ref().iter().all(|cache| cache.resets == 0));
+
+    let moshi::Unit::Depth(depth) = &mut runtime.units_mut()[1][0] else {
+        panic!("depth group owns depth units");
+    };
+    depth.blocks.pop();
+    let mut state = reference_moshi_state(&config);
+    let plan = SequentialDecisionPlan::new(
+        [
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+            PredictionDirective::Force(ReferenceTensor(vec![1, 1])),
+        ],
+        true,
+        false,
+    )
+    .unwrap();
+    let mut driver =
+        SequentialDecisionDriver::new(plan, vec![ReferenceSampler; 2], vec![0.0; 2], None).unwrap();
+    let mut boundary = moshi::DecisionBoundary::new(&config).unwrap();
+    let error = {
+        let mut hook = SequentialDecisionTraversal::new(&mut driver, &mut boundary);
+        runtime
+            .forward_with_traversal_hook(
+                moshi::Input {
+                    text: &text,
+                    audio: &audio,
+                    mask: None,
+                },
+                &mut state,
+                &(),
+                &mut hook,
+            )
+            .err()
+            .expect("drifted depth block count must fail")
+    };
+    assert!(error.to_string().contains("depth block count drifted"));
+}
+
+#[test]
+fn portable_moshi_topology_state_and_decision_order_are_backend_independent() {
+    let config = tiny_moshi_config();
+    let layout = moshi::state_layout(&config).unwrap();
+    assert_eq!(layout.layers().len(), 4);
+    assert_eq!(layout.segments().len(), 2);
+    assert_eq!(layout.segments()[0].id().as_str(), "temporal");
+    assert_eq!(layout.segments()[0].layers(), 0..2);
+    assert_eq!(layout.segments()[1].id().as_str(), "depth");
+    assert_eq!(layout.segments()[1].layers(), 2..4);
+
+    let architecture = moshi::LayeredModel::<ReferenceBackend>::new(config.clone(), &()).unwrap();
+    let mut runtime =
+        ResidentRuntime::<_, ReferenceBackend, ReferenceMoshiState>::new(architecture, &())
+            .unwrap();
+    assert_eq!(runtime.units().len(), 2);
+    assert_eq!(runtime.units()[0].len(), 2);
+    assert_eq!(runtime.units()[1].len(), 3);
+    assert!(runtime.units()[0].iter().all(|unit| match unit {
+        moshi::Unit::Temporal(block) => block.self_attention.rotary.is_some(),
+        moshi::Unit::Depth(_) => false,
+    }));
+    assert!(runtime.units()[1].iter().all(|unit| match unit {
+        moshi::Unit::Depth(slice) => slice
+            .blocks
+            .iter()
+            .all(|block| block.self_attention.rotary.is_none()),
+        moshi::Unit::Temporal(_) => false,
+    }));
+    let graph = <moshi::LayeredModel<ReferenceBackend> as LayeredArchitecture<
+        ReferenceBackend,
+        ReferenceMoshiState,
+    >>::execution_graph(runtime.architecture())
+    .unwrap();
+    assert_eq!(graph.execution_order(), &[0, 1]);
+    assert_eq!(
+        graph.groups()[1].dependencies(),
+        &["temporal_transformer".to_string()]
+    );
+    let retained = <moshi::LayeredModel<ReferenceBackend> as LayeredArchitecture<
+        ReferenceBackend,
+        ReferenceMoshiState,
+    >>::retained_state_ordinals(runtime.architecture(), 1, 2, 4);
+    assert_eq!(retained, 2..4);
+
+    let mut names = topology(runtime.architecture().static_modules());
+    for group in runtime.units() {
+        for unit in group {
+            names.extend(topology(unit));
+        }
+    }
+    let names = names
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<std::collections::BTreeSet<_>>();
+    for expected in [
+        "text_emb.weight",
+        "audio_embs.3.weight",
+        "out_norm.weight",
+        "text_linear.weight",
+        "transformer.layers.0.norm1.weight",
+        "transformer.layers.0.self_attn.in_proj.weight",
+        "transformer.layers.0.self_attn.out_proj.weight",
+        "transformer.layers.0.gating.linear_in.weight",
+        "transformer.layers.0.gating.linear_out.weight",
+        "depformer.slices.2.emb.weight",
+        "depformer.slices.2.linear_in.weight",
+        "depformer.slices.2.linear_out.weight",
+        "depformer.slices.2.transformer.layers.1.norm2.weight",
+    ] {
+        assert!(names.contains(expected), "missing {expected}");
+    }
+    assert!(!names.iter().any(|name| {
+        name.contains("input_layernorm")
+            || name.contains("post_attention_layernorm")
+            || name.contains(".mlp.")
+            || name.contains(".o_proj.")
+    }));
+
+    let static_groups = runtime.architecture().static_parameter_groups().unwrap();
+    assert_eq!(static_groups.len(), 7);
+    let depth_groups = moshi::unit_parameter_groups(&runtime.units()[1][0], &config, 1, 0).unwrap();
+    assert!(depth_groups
+        .iter()
+        .any(|group| group.logical_name() == "depformer.slices.0.linear_in"));
+    assert!(depth_groups
+        .iter()
+        .any(|group| group.logical_name() == "depformer.slices.0.transformer.layers.1.norm2"));
+    for name in ["depformer.slices.0.emb", "depformer.slices.0.linear_out"] {
+        let group = depth_groups
+            .iter()
+            .find(|group| group.logical_name() == name)
+            .unwrap();
+        assert_eq!(group.role(), eredu_runtime::ParameterRole::Vocabulary);
+        assert!(group.members().iter().all(|member| matches!(
+            member.sharding(),
+            eredu_runtime::MemberSharding::Balanced { axis: 0 }
+        )));
+    }
+    let linear_in = depth_groups
+        .iter()
+        .find(|group| group.logical_name() == "depformer.slices.0.linear_in")
+        .unwrap();
+    assert_eq!(linear_in.role(), eredu_runtime::ParameterRole::Replicated);
+    assert!(linear_in
+        .members()
+        .iter()
+        .all(|member| member.sharding() == &eredu_runtime::MemberSharding::Replicated));
+
+    let text = ReferenceTensor(vec![1, 1]);
+    let audio_values = [
+        ReferenceTensor(vec![1, 1]),
+        ReferenceTensor(vec![1, 1]),
+        ReferenceTensor(vec![1, 1]),
+        ReferenceTensor(vec![1, 1]),
+    ];
+    let audio = audio_values.iter().collect::<Vec<_>>();
+    let mut state = reference_moshi_state(&config);
+    state.as_mut()[2].offset = 9;
+    state.as_mut()[3].offset = 9;
+    let error = runtime
+        .forward(
+            moshi::Input {
+                text: &text,
+                audio: &audio[..3],
+                mask: None,
+            },
+            &mut state,
+            &(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("3 audio codebooks, expected 4"));
+    assert_eq!(state.as_ref()[2].offset, 9);
+    assert_eq!(state.as_ref()[3].offset, 9);
+
+    let mut driver = reference_decision_driver(true);
+    let mut boundary = moshi::DecisionBoundary::new(&config).unwrap();
+    let (_, forward) = {
+        let mut hook = SequentialDecisionTraversal::new(&mut driver, &mut boundary);
+        runtime
+            .forward_with_traversal_hook(
+                moshi::Input {
+                    text: &text,
+                    audio: &audio,
+                    mask: None,
+                },
+                &mut state,
+                &(),
+                &mut hook,
+            )
+            .unwrap()
+    };
+    driver.finish().unwrap();
+    assert_eq!(driver.diagnostics().len(), 4);
+    assert_eq!(driver.random_state(), Some(&1));
+    assert_eq!(
+        driver
+            .decisions()
+            .iter()
+            .map(|decision| decision.source())
+            .collect::<Vec<_>>(),
+        [
+            SequentialDecisionSource::Sampled,
+            SequentialDecisionSource::Forced,
+            SequentialDecisionSource::Forced,
+            SequentialDecisionSource::Forced,
+        ]
+    );
+    assert_eq!(
+        forward.previous_depth_token(),
+        Some(&ReferenceTensor(vec![1, 1]))
+    );
+    assert_eq!(state.as_ref()[2].offset, 3);
+    assert_eq!(state.as_ref()[3].offset, 3);
+    assert_eq!(state.as_ref()[2].resets, 1);
+    assert_eq!(state.as_ref()[3].resets, 1);
+
+    let architecture = moshi::LayeredModel::<ReferenceBackend>::new(config.clone(), &()).unwrap();
+    let mut runtime =
+        ResidentRuntime::<_, ReferenceBackend, ReferenceMoshiState>::new(architecture, &())
+            .unwrap();
+    let mut tail_driver = reference_decision_driver(false);
+    let (_, forward) = {
+        let mut hook = SequentialDecisionTraversal::new(&mut tail_driver, &mut boundary);
+        runtime
+            .forward_with_traversal_hook(
+                moshi::Input {
+                    text: &text,
+                    audio: &audio,
+                    mask: None,
+                },
+                &mut state,
+                &(),
+                &mut hook,
+            )
+            .unwrap()
+    };
+    tail_driver.finish().unwrap();
+    assert_eq!(
+        tail_driver
+            .decisions()
+            .iter()
+            .map(|decision| decision.source())
+            .collect::<Vec<_>>(),
+        [
+            SequentialDecisionSource::Sampled,
+            SequentialDecisionSource::ForcedTailSkipped,
+            SequentialDecisionSource::ForcedTailSkipped,
+            SequentialDecisionSource::ForcedTailSkipped,
+        ]
+    );
+    assert_eq!(
+        forward.previous_depth_token(),
+        Some(&ReferenceTensor(vec![1, 1]))
+    );
+    assert_eq!(state.as_ref()[2].offset, 0);
+    assert_eq!(state.as_ref()[3].offset, 0);
+    assert_eq!(state.as_ref()[2].resets, 2);
+    assert_eq!(state.as_ref()[3].resets, 2);
+    assert_eq!(state.as_ref()[0].offset, 2);
+    assert_eq!(state.as_ref()[1].offset, 2);
+}
+
+#[test]
+fn fused_decoder_projection_fields_must_be_named() {
+    let error = match TransformerBlock::<ReferenceBackend>::new(
+        &ProjectionLayoutConfig {
+            args: tiny_args(),
+            fused: true,
+            empty_field: true,
+            alternate_fields: false,
+        },
+        0,
+        &(),
+    ) {
+        Ok(_) => panic!("empty fused projection fields must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("field must not be empty"));
 }
 
 fn topology<M: Parameterized<ReferenceTensor>>(module: &M) -> Vec<(String, Vec<usize>)> {
@@ -740,6 +2061,7 @@ fn shared_llama_runs_prefill_and_decode_without_mlx() {
                 .attention()
                 .and_then(|attention| attention.window())
                 .map(|window| window.get() as i32),
+            resets: 0,
         })
     })
     .unwrap();
@@ -865,6 +2187,7 @@ fn shared_decoder_runs_qwen2_and_qwen3_without_mlx() {
                         .attention()
                         .and_then(|attention| attention.window())
                         .map(|window| window.get() as i32),
+                    resets: 0,
                 })
             })
             .unwrap();

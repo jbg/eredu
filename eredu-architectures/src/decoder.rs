@@ -7,16 +7,102 @@ use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::cache::LayerCachePolicy;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
-    AttentionCache, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error, GatedProductPolicy,
-    Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec,
-    Parameter, ParameterSpec, RotaryOperator, RotaryPosition, RotarySpec, RotarySubspace, Tensor,
+    AttentionCache, AttentionRequest, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec,
+    Error, FusedProjectionLayout, FusedProjectionSegment, GatedProductPolicy, Index,
+    LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec, Parameter,
+    ParameterSpec, RotaryOperator, RotaryPosition, RotarySpec, RotarySubspace, Tensor,
 };
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    partitioned_projection_group, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole, ProjectionSharding,
-    StateLayout,
+    partitioned_projection_group, segmented_projection_group, LayerRuntimeState,
+    LayeredArchitecture, LayeredForwardState, MemberSharding, ParallelPlanError,
+    ParameterGroupSpec, ParameterRole, ProjectionSharding, StateLayout,
 };
+
+/// Canonical field segments used by one shared decoder block.
+///
+/// Architecture families can replace checkpoint vocabulary without replacing
+/// the shared attention, residual, feed-forward, or parallel-placement logic.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct BlockParameterFields<'a> {
+    /// Self-attention module below one layer.
+    pub attention: &'a str,
+    /// Query projection below the attention module.
+    pub attention_query: &'a str,
+    /// Key projection below the attention module.
+    pub attention_key: &'a str,
+    /// Value projection below the attention module.
+    pub attention_value: &'a str,
+    /// Output projection below the attention module.
+    pub attention_output: &'a str,
+    /// Optional learned attention-sink parameter.
+    pub attention_sinks: &'a str,
+    /// Optional query normalization below the attention module.
+    pub attention_query_norm: &'a str,
+    /// Optional key normalization below the attention module.
+    pub attention_key_norm: &'a str,
+    /// Feed-forward module below one layer.
+    pub feed_forward: &'a str,
+    /// Gate projection below a split feed-forward module.
+    pub feed_forward_gate: &'a str,
+    /// Up projection below a split feed-forward module.
+    pub feed_forward_up: &'a str,
+    /// Output projection below the feed-forward module.
+    pub feed_forward_output: &'a str,
+    /// Pre-attention normalization below one layer.
+    pub input_norm: &'a str,
+    /// Pre-feed-forward normalization below one layer.
+    pub post_attention_norm: &'a str,
+}
+
+impl Default for BlockParameterFields<'_> {
+    fn default() -> Self {
+        Self {
+            attention: "self_attn",
+            attention_query: "q_proj",
+            attention_key: "k_proj",
+            attention_value: "v_proj",
+            attention_output: "o_proj",
+            attention_sinks: "sinks",
+            attention_query_norm: "q_norm",
+            attention_key_norm: "k_norm",
+            feed_forward: "mlp",
+            feed_forward_gate: "gate_proj",
+            feed_forward_up: "up_proj",
+            feed_forward_output: "down_proj",
+            input_norm: "input_layernorm",
+            post_attention_norm: "post_attention_layernorm",
+        }
+    }
+}
+
+impl BlockParameterFields<'_> {
+    fn validate(self) -> Result<Self, Error> {
+        for (role, field) in [
+            ("attention module", self.attention),
+            ("attention query projection", self.attention_query),
+            ("attention key projection", self.attention_key),
+            ("attention value projection", self.attention_value),
+            ("attention output projection", self.attention_output),
+            ("attention sinks", self.attention_sinks),
+            ("attention query norm", self.attention_query_norm),
+            ("attention key norm", self.attention_key_norm),
+            ("feed-forward module", self.feed_forward),
+            ("feed-forward gate projection", self.feed_forward_gate),
+            ("feed-forward up projection", self.feed_forward_up),
+            ("feed-forward output projection", self.feed_forward_output),
+            ("input norm", self.input_norm),
+            ("post-attention norm", self.post_attention_norm),
+        ] {
+            if field.trim().is_empty() {
+                return Err(Error::backend(format!(
+                    "decoder block {role} field must not be empty"
+                )));
+            }
+        }
+        Ok(self)
+    }
+}
 
 /// Geometry and policy required by the shared decoder mechanics.
 pub trait Config: 'static {
@@ -25,6 +111,10 @@ pub trait Config: 'static {
     /// Canonical parameter namespace for this decoder body.
     fn parameter_root(&self) -> &str {
         "model"
+    }
+    /// Canonical parameter fields used within each shared decoder block.
+    fn block_parameter_fields(&self) -> BlockParameterFields<'_> {
+        BlockParameterFields::default()
     }
     /// Validates architecture-owned configuration policy.
     fn validate_config(&self) -> Result<(), Error>;
@@ -46,6 +136,10 @@ pub trait Config: 'static {
     fn vocabulary_size(&self) -> i32;
     /// Whether one attention projection owns a learned bias.
     fn attention_bias(&self, projection: AttentionProjection) -> bool;
+    /// Physical construction of the query/key/value input projection.
+    fn attention_projection_layout(&self) -> AttentionProjectionLayout<'_> {
+        AttentionProjectionLayout::Split
+    }
     /// Whether each attention layer owns one learned logit per query head.
     fn learned_attention_sinks(&self) -> bool {
         false
@@ -56,6 +150,10 @@ pub trait Config: 'static {
     }
     /// Whether projections own MLP biases.
     fn mlp_bias(&self) -> bool;
+    /// Physical construction of the gate/up input projection.
+    fn gated_projection_layout(&self) -> GatedProjectionLayout<'_> {
+        GatedProjectionLayout::Split
+    }
     /// Optional equation policy applied by each dense gated product.
     fn gated_product_policy(&self) -> Option<GatedProductPolicy> {
         None
@@ -68,6 +166,10 @@ pub trait Config: 'static {
     fn weight_quantization(&self, name: &str) -> Option<WeightQuantization>;
     /// Complete rotary-position construction specification.
     fn rotary_spec(&self, dimensions: i32) -> RotarySpec<'_>;
+    /// Whether this decoder stack applies rotary position encoding.
+    fn rotary_enabled(&self) -> bool {
+        true
+    }
 }
 
 /// Semantic attention projection selected by architecture policy.
@@ -81,6 +183,215 @@ pub enum AttentionProjection {
     Value,
     /// Output projection.
     Output,
+}
+
+/// Architecture-selected physical query/key/value projection layout.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AttentionProjectionLayout<'a> {
+    /// Independent query, key, and value affine projections.
+    Split,
+    /// One component-major query/key/value affine projection.
+    Fused {
+        /// Canonical projection field below the attention module.
+        field: &'a str,
+    },
+}
+
+/// Architecture-selected physical gate/up projection layout.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GatedProjectionLayout<'a> {
+    /// Independent gate and up affine projections.
+    Split,
+    /// One component-major gate/up affine projection.
+    Fused {
+        /// Canonical projection field below the MLP module.
+        field: &'a str,
+    },
+}
+
+/// Construction policy for one named table in a deterministic embedding sum.
+#[derive(Debug, Clone)]
+pub struct NamedEmbeddingSpec {
+    /// Stable semantic stream name used for validation diagnostics.
+    pub name: String,
+    /// Canonical embedding parameter and physical format.
+    pub embedding: EmbeddingSpec,
+    /// Strict or diagnostic zero-sentinel lookup behavior.
+    pub lookup: EmbeddingLookupPolicy,
+}
+
+/// One backend-native named table participating in an embedding sum.
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct NamedEmbedding<B: NeuralBackend> {
+    /// Backend-native embedding operator.
+    pub embedding: B::Embedding,
+    #[parameter(skip)]
+    name: String,
+    #[parameter(skip)]
+    lookup: EmbeddingLookupPolicy,
+}
+
+/// Ordered multi-stream embedding lookup and deterministic sum.
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct MultiTableEmbedding<B: NeuralBackend> {
+    /// Tables in semantic stream order.
+    pub tables: Vec<NamedEmbedding<B>>,
+}
+
+impl<B: NeuralBackend> MultiTableEmbedding<B> {
+    /// Builds validated named tables without materializing checkpoint values.
+    pub fn new(
+        specs: impl IntoIterator<Item = NamedEmbeddingSpec>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let specs = specs.into_iter().collect::<Vec<_>>();
+        if specs.is_empty() {
+            return Err(Error::backend(
+                "multi-table embedding sum requires at least one table",
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut dimensions = None;
+        let mut tables = Vec::with_capacity(specs.len());
+        for spec in specs {
+            if spec.name.trim().is_empty() || !names.insert(spec.name.clone()) {
+                return Err(Error::backend(format!(
+                    "multi-table embedding name {:?} is empty or duplicated",
+                    spec.name
+                )));
+            }
+            spec.lookup.validate()?;
+            if spec.embedding.vocabulary <= 0 || spec.embedding.dimensions <= 0 {
+                return Err(Error::backend(format!(
+                    "embedding table {:?} has invalid geometry vocabulary={} dimensions={}",
+                    spec.name, spec.embedding.vocabulary, spec.embedding.dimensions
+                )));
+            }
+            if dimensions
+                .replace(spec.embedding.dimensions)
+                .is_some_and(|expected| expected != spec.embedding.dimensions)
+            {
+                return Err(Error::backend(format!(
+                    "embedding table {:?} width {} differs from preceding width {:?}",
+                    spec.name, spec.embedding.dimensions, dimensions
+                )));
+            }
+            tables.push(NamedEmbedding {
+                embedding: B::embedding(spec.embedding, context)?,
+                name: spec.name,
+                lookup: spec.lookup,
+            });
+        }
+        Ok(Self { tables })
+    }
+
+    /// Builds rank-local vocabulary tables with validated global ownership.
+    pub fn new_vocabulary_parallel(
+        specs: impl IntoIterator<Item = NamedEmbeddingSpec>,
+        ranges: impl IntoIterator<Item = eredu_nn::VocabularyParallelRange>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let specs = specs.into_iter().collect::<Vec<_>>();
+        let ranges = ranges.into_iter().collect::<Vec<_>>();
+        if specs.is_empty() || specs.len() != ranges.len() {
+            return Err(Error::backend(
+                "parallel multi-table embeddings require one range per table",
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut dimensions = None;
+        let mut tables = Vec::with_capacity(specs.len());
+        for (spec, range) in specs.into_iter().zip(ranges) {
+            if spec.name.trim().is_empty() || !names.insert(spec.name.clone()) {
+                return Err(Error::backend(
+                    "parallel embedding name is empty or duplicated",
+                ));
+            }
+            spec.lookup.validate()?;
+            if dimensions
+                .replace(spec.embedding.dimensions)
+                .is_some_and(|expected| expected != spec.embedding.dimensions)
+            {
+                return Err(Error::backend("parallel embedding widths differ"));
+            }
+            tables.push(NamedEmbedding {
+                embedding: B::vocabulary_parallel_embedding(spec.embedding, range, context)?,
+                name: spec.name,
+                lookup: spec.lookup,
+            });
+        }
+        Ok(Self { tables })
+    }
+
+    /// Looks up every global-token stream and reduces rank-local contributions.
+    pub fn forward_parallel(
+        &mut self,
+        inputs: &[&B::Tensor],
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if inputs.len() != self.tables.len() {
+            return Err(Error::backend("parallel embedding input count drifted"));
+        }
+        let mut output: Option<B::Tensor> = None;
+        for (table, input) in self.tables.iter_mut().zip(inputs) {
+            let value = B::vocabulary_parallel_lookup(
+                &mut table.embedding,
+                input,
+                table.lookup,
+                parallel,
+                context,
+            )?;
+            output = Some(match output {
+                Some(output) => output.add(&value, context)?,
+                None => value,
+            });
+        }
+        output.ok_or_else(|| Error::backend("parallel embedding sum is empty"))
+    }
+
+    /// Looks up one token tensor per table and sums in declared stream order.
+    pub fn forward(
+        &mut self,
+        tokens: &[&B::Tensor],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if tokens.len() != self.tables.len() {
+            return Err(Error::backend(format!(
+                "multi-table embedding received {} token streams, expected {}",
+                tokens.len(),
+                self.tables.len()
+            )));
+        }
+        let expected_shape = tokens
+            .first()
+            .map(|tokens| tokens.shape().to_vec())
+            .ok_or_else(|| Error::backend("multi-table embedding received no token streams"))?;
+        let mut sum: Option<B::Tensor> = None;
+        for (table, tokens) in self.tables.iter_mut().zip(tokens.iter().copied()) {
+            if tokens.shape() != expected_shape {
+                return Err(Error::backend(format!(
+                    "embedding stream {:?} has token shape {:?}, expected {:?}",
+                    table.name,
+                    tokens.shape(),
+                    expected_shape
+                )));
+            }
+            let embedded = table.embedding.lookup(tokens, table.lookup, context)?;
+            sum = Some(match sum {
+                Some(sum) => sum.add(&embedded, context)?,
+                None => embedded,
+            });
+        }
+        sum.ok_or_else(|| Error::backend("multi-table embedding received no tables"))
+    }
+
+    /// Returns stable table names in deterministic stream order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tables.iter().map(|table| table.name.as_str())
+    }
 }
 
 /// Derives the canonical backend-neutral cache layout for this decoder.
@@ -215,6 +526,34 @@ pub struct AttentionInput<'a, T, C> {
 /// Shared grouped-query self attention.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
+pub struct FusedAttentionProjection<B: NeuralBackend> {
+    /// Component-major affine projection.
+    pub projection: B::Linear,
+    /// Validated query/key/value component geometry.
+    #[parameter(skip)]
+    pub layout: FusedProjectionLayout,
+}
+
+/// Split or fused physical query/key/value operators feeding one attention path.
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub enum AttentionInputProjection<B: NeuralBackend> {
+    /// Independent projections used by conventional decoder checkpoints.
+    Split {
+        /// Query projection.
+        query: B::Linear,
+        /// Key projection.
+        key: B::Linear,
+        /// Value projection.
+        value: B::Linear,
+    },
+    /// One component-major fused projection.
+    Fused(FusedAttentionProjection<B>),
+}
+
+/// Shared grouped-query self attention.
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
 pub struct Attention<B: NeuralBackend> {
     /// Number of query heads.
     #[parameter(skip)]
@@ -225,12 +564,8 @@ pub struct Attention<B: NeuralBackend> {
     /// Inverse square-root head scaling.
     #[parameter(skip)]
     pub scale: f32,
-    /// Query projection.
-    pub query: B::Linear,
-    /// Key projection.
-    pub key: B::Linear,
-    /// Value projection.
-    pub value: B::Linear,
+    /// Split or fused query/key/value projections.
+    pub input_projection: AttentionInputProjection<B>,
     /// Output projection.
     pub output: B::Linear,
     /// Optional learned logit participating in attention softmax for each query head.
@@ -249,7 +584,7 @@ pub struct Attention<B: NeuralBackend> {
     pub query_output_gate: bool,
 }
 
-struct AttentionProjections<T> {
+struct ProjectedAttention<T> {
     queries: T,
     keys: T,
     values: T,
@@ -351,9 +686,7 @@ impl<B: NeuralBackend> Attention<B> {
             query_heads,
             key_value_heads,
             scale: (head_dim as f32).sqrt().recip(),
-            query,
-            key,
-            value,
+            input_projection: AttentionInputProjection::Split { query, key, value },
             output,
             sinks: None,
             query_norm,
@@ -370,7 +703,12 @@ impl<B: NeuralBackend> Attention<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{}.layers.{layer}.self_attn", config.parameter_root());
+        let fields = config.block_parameter_fields().validate()?;
+        let prefix = format!(
+            "{}.layers.{layer}.{}",
+            config.parameter_root(),
+            fields.attention
+        );
         let hidden = config.hidden_size();
         let head = config.head_dim();
         let query_heads = config.num_attention_heads();
@@ -397,31 +735,66 @@ impl<B: NeuralBackend> Attention<B> {
                 "decoder attention schedule has no policy for layer {layer}"
             ))
         })?;
+        let query_width = query_heads
+            .checked_mul(head)
+            .ok_or_else(|| Error::backend("decoder query projection width overflowed"))?;
+        let key_value_width = key_value_heads
+            .checked_mul(head)
+            .ok_or_else(|| Error::backend("decoder key/value projection width overflowed"))?;
+        let input_projection = match config.attention_projection_layout() {
+            AttentionProjectionLayout::Split => AttentionInputProjection::Split {
+                query: linear(
+                    fields.attention_query,
+                    hidden,
+                    query_width,
+                    config.attention_bias(AttentionProjection::Query),
+                )?,
+                key: linear(
+                    fields.attention_key,
+                    hidden,
+                    key_value_width,
+                    config.attention_bias(AttentionProjection::Key),
+                )?,
+                value: linear(
+                    fields.attention_value,
+                    hidden,
+                    key_value_width,
+                    config.attention_bias(AttentionProjection::Value),
+                )?,
+            },
+            AttentionProjectionLayout::Fused { field } => {
+                if field.trim().is_empty() {
+                    return Err(Error::backend(
+                        "fused QKV projection field must not be empty",
+                    ));
+                }
+                let biases = [
+                    config.attention_bias(AttentionProjection::Query),
+                    config.attention_bias(AttentionProjection::Key),
+                    config.attention_bias(AttentionProjection::Value),
+                ];
+                if biases.iter().any(|bias| *bias != biases[0]) {
+                    return Err(Error::backend(
+                        "fused QKV projection requires identical query/key/value bias policy",
+                    ));
+                }
+                let layout = FusedProjectionLayout::new([
+                    FusedProjectionSegment::new("query", query_width)?,
+                    FusedProjectionSegment::new("key", key_value_width)?,
+                    FusedProjectionSegment::new("value", key_value_width)?,
+                ])?;
+                let projection = linear(field, hidden, layout.output_width(), biases[0])?;
+                AttentionInputProjection::Fused(FusedAttentionProjection { projection, layout })
+            }
+        };
         Ok(Self {
             query_heads,
             key_value_heads,
             scale: (head as f32).sqrt().recip(),
-            query: linear(
-                "q_proj",
-                hidden,
-                query_heads * head,
-                config.attention_bias(AttentionProjection::Query),
-            )?,
-            key: linear(
-                "k_proj",
-                hidden,
-                key_value_heads * head,
-                config.attention_bias(AttentionProjection::Key),
-            )?,
-            value: linear(
-                "v_proj",
-                hidden,
-                key_value_heads * head,
-                config.attention_bias(AttentionProjection::Value),
-            )?,
+            input_projection,
             output: linear(
-                "o_proj",
-                query_heads * head,
+                fields.attention_output,
+                query_width,
                 hidden,
                 config.attention_bias(AttentionProjection::Output),
             )?,
@@ -429,7 +802,7 @@ impl<B: NeuralBackend> Attention<B> {
                 .learned_attention_sinks()
                 .then(|| {
                     Parameter::unloaded(
-                        ParameterSpec::trainable(format!("{prefix}.sinks"))
+                        ParameterSpec::trainable(format!("{prefix}.{}", fields.attention_sinks))
                             .map_err(Error::backend)?,
                         &[query_heads],
                         context,
@@ -443,8 +816,11 @@ impl<B: NeuralBackend> Attention<B> {
                         NormalizationSpec {
                             dimensions: head,
                             epsilon,
-                            weight: ParameterSpec::trainable(format!("{prefix}.q_norm.weight"))
-                                .map_err(Error::backend)?,
+                            weight: ParameterSpec::trainable(format!(
+                                "{prefix}.{}.weight",
+                                fields.attention_query_norm
+                            ))
+                            .map_err(Error::backend)?,
                         },
                         context,
                     )
@@ -457,14 +833,20 @@ impl<B: NeuralBackend> Attention<B> {
                         NormalizationSpec {
                             dimensions: head,
                             epsilon,
-                            weight: ParameterSpec::trainable(format!("{prefix}.k_norm.weight"))
-                                .map_err(Error::backend)?,
+                            weight: ParameterSpec::trainable(format!(
+                                "{prefix}.{}.weight",
+                                fields.attention_key_norm
+                            ))
+                            .map_err(Error::backend)?,
                         },
                         context,
                     )
                 })
                 .transpose()?,
-            rotary: Some(B::rotary(config.rotary_spec(head), context)?),
+            rotary: config
+                .rotary_enabled()
+                .then(|| B::rotary(config.rotary_spec(head), context))
+                .transpose()?,
             sliding_window: policy
                 .window()
                 .map(|window| i32::try_from(window.get()))
@@ -478,7 +860,7 @@ impl<B: NeuralBackend> Attention<B> {
         &mut self,
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<AttentionProjections<B::Tensor>, Error> {
+    ) -> Result<ProjectedAttention<B::Tensor>, Error> {
         let batch = hidden.dim(0);
         let sequence = hidden.dim(1);
         let reshape = |tensor: B::Tensor, heads| {
@@ -486,7 +868,33 @@ impl<B: NeuralBackend> Attention<B> {
                 .reshape(&[batch, sequence, heads, -1], context)?
                 .transpose_axes(&[0, 2, 1, 3], context)
         };
-        let query = self.query.forward(hidden, context)?.reshape(
+        let (query, key, value) = match &mut self.input_projection {
+            AttentionInputProjection::Split { query, key, value } => (
+                query.forward(hidden, context)?,
+                key.forward(hidden, context)?,
+                value.forward(hidden, context)?,
+            ),
+            AttentionInputProjection::Fused(fused) => {
+                let projected = fused.projection.forward(hidden, context)?;
+                let mut components = fused.layout.split(&projected, context)?.into_iter();
+                let query = components.next().ok_or_else(|| {
+                    Error::backend("fused QKV projection is missing its query component")
+                })?;
+                let key = components.next().ok_or_else(|| {
+                    Error::backend("fused QKV projection is missing its key component")
+                })?;
+                let value = components.next().ok_or_else(|| {
+                    Error::backend("fused QKV projection is missing its value component")
+                })?;
+                if components.next().is_some() {
+                    return Err(Error::backend(
+                        "fused QKV projection produced unexpected extra components",
+                    ));
+                }
+                (query, key, value)
+            }
+        };
+        let query = query.reshape(
             &[
                 batch,
                 sequence,
@@ -529,12 +937,12 @@ impl<B: NeuralBackend> Attention<B> {
         if let Some(norm) = &mut self.query_norm {
             queries = norm.forward(&queries, context)?;
         }
-        let mut keys = reshape(self.key.forward(hidden, context)?, self.key_value_heads)?;
+        let mut keys = reshape(key, self.key_value_heads)?;
         if let Some(norm) = &mut self.key_norm {
             keys = norm.forward(&keys, context)?;
         }
-        let values = reshape(self.value.forward(hidden, context)?, self.key_value_heads)?;
-        Ok(AttentionProjections {
+        let values = reshape(value, self.key_value_heads)?;
+        Ok(ProjectedAttention {
             queries,
             keys,
             values,
@@ -553,7 +961,7 @@ impl<B: NeuralBackend> Attention<B> {
         rotary_position: Option<RotaryPosition<'_, B::Tensor>>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let AttentionProjections {
+        let ProjectedAttention {
             queries,
             keys,
             values,
@@ -653,14 +1061,38 @@ impl<B: NeuralBackend> Attention<B> {
     }
 }
 
+/// One component-major fused gate/up affine projection.
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub struct FusedGatedProjection<B: NeuralBackend> {
+    /// Fused affine operator.
+    pub projection: B::Linear,
+    /// Validated gate/up component geometry.
+    #[parameter(skip)]
+    pub layout: FusedProjectionLayout,
+}
+
+/// Split or fused physical gate/up operators feeding one gated product.
+#[derive(Debug, Clone, eredu_nn::Parameterized)]
+#[parameterized(tensor = "B::Tensor")]
+pub enum GatedInputProjection<B: NeuralBackend> {
+    /// Independent gate and up projections.
+    Split {
+        /// Gate projection.
+        gate: B::Linear,
+        /// Up projection.
+        up: B::Linear,
+    },
+    /// One component-major fused projection.
+    Fused(FusedGatedProjection<B>),
+}
+
 /// Shared dense SwiGLU feed-forward network.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Mlp<B: NeuralBackend> {
-    /// Gating projection.
-    pub gate: B::Linear,
-    /// Up projection.
-    pub up: B::Linear,
+    /// Split or fused gate/up input projection.
+    pub input_projection: GatedInputProjection<B>,
     /// Down projection.
     pub down: B::Linear,
     /// Optional shared pre-activation bound.
@@ -669,13 +1101,32 @@ pub struct Mlp<B: NeuralBackend> {
 }
 
 impl<B: NeuralBackend> Mlp<B> {
+    /// Assembles a dense gated network from independent gate/up projections.
+    pub fn from_parts(
+        gate: B::Linear,
+        up: B::Linear,
+        down: B::Linear,
+        policy: Option<GatedProductPolicy>,
+    ) -> Self {
+        Self {
+            input_projection: GatedInputProjection::Split { gate, up },
+            down,
+            limit: policy,
+        }
+    }
+
     /// Builds an unloaded dense SwiGLU network for one global layer.
     pub fn new<C: Config>(
         config: &C,
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{}.layers.{layer}.mlp", config.parameter_root());
+        let fields = config.block_parameter_fields().validate()?;
+        let prefix = format!(
+            "{}.layers.{layer}.{}",
+            config.parameter_root(),
+            fields.feed_forward
+        );
         let build = |field: &str, input, output| {
             let weight_name = format!("{prefix}.{field}.weight");
             let bias = config
@@ -694,15 +1145,39 @@ impl<B: NeuralBackend> Mlp<B> {
                 context,
             )
         };
+        let input_projection = match config.gated_projection_layout() {
+            GatedProjectionLayout::Split => GatedInputProjection::Split {
+                gate: build(
+                    fields.feed_forward_gate,
+                    config.hidden_size(),
+                    config.intermediate_size(),
+                )?,
+                up: build(
+                    fields.feed_forward_up,
+                    config.hidden_size(),
+                    config.intermediate_size(),
+                )?,
+            },
+            GatedProjectionLayout::Fused { field } => {
+                if field.trim().is_empty() {
+                    return Err(Error::backend(
+                        "fused gate/up projection field must not be empty",
+                    ));
+                }
+                let layout = FusedProjectionLayout::new([
+                    FusedProjectionSegment::new("gate", config.intermediate_size())?,
+                    FusedProjectionSegment::new("up", config.intermediate_size())?,
+                ])?;
+                GatedInputProjection::Fused(FusedGatedProjection {
+                    projection: build(field, config.hidden_size(), layout.output_width())?,
+                    layout,
+                })
+            }
+        };
         Ok(Self {
-            gate: build(
-                "gate_proj",
-                config.hidden_size(),
-                config.intermediate_size(),
-            )?,
-            up: build("up_proj", config.hidden_size(), config.intermediate_size())?,
+            input_projection,
             down: build(
-                "down_proj",
+                fields.feed_forward_output,
                 config.intermediate_size(),
                 config.hidden_size(),
             )?,
@@ -715,8 +1190,27 @@ impl<B: NeuralBackend> Mlp<B> {
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let gate = self.gate.forward(input, context)?;
-        let up = self.up.forward(input, context)?;
+        let (gate, up) = match &mut self.input_projection {
+            GatedInputProjection::Split { gate, up } => {
+                (gate.forward(input, context)?, up.forward(input, context)?)
+            }
+            GatedInputProjection::Fused(fused) => {
+                let projected = fused.projection.forward(input, context)?;
+                let mut components = fused.layout.split(&projected, context)?.into_iter();
+                let gate = components.next().ok_or_else(|| {
+                    Error::backend("fused gate/up projection is missing its gate component")
+                })?;
+                let up = components.next().ok_or_else(|| {
+                    Error::backend("fused gate/up projection is missing its up component")
+                })?;
+                if components.next().is_some() {
+                    return Err(Error::backend(
+                        "fused gate/up projection produced unexpected extra components",
+                    ));
+                }
+                (gate, up)
+            }
+        };
         B::gated_product(gate, up, self.limit.unwrap_or_default(), context)
     }
 
@@ -798,6 +1292,7 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let fields = config.block_parameter_fields().validate()?;
         Ok(Self {
             self_attention: Attention::new(config, layer, context)?,
             mlp: Mlp::new(config, layer, context)?,
@@ -806,8 +1301,9 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
                     dimensions: config.hidden_size(),
                     epsilon: config.rms_norm_epsilon(),
                     weight: ParameterSpec::trainable(format!(
-                        "{}.layers.{layer}.input_layernorm.weight",
-                        config.parameter_root()
+                        "{}.layers.{layer}.{}.weight",
+                        config.parameter_root(),
+                        fields.input_norm
                     ))
                     .map_err(Error::backend)?,
                 },
@@ -818,8 +1314,9 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
                     dimensions: config.hidden_size(),
                     epsilon: config.rms_norm_epsilon(),
                     weight: ParameterSpec::trainable(format!(
-                        "{}.layers.{layer}.post_attention_layernorm.weight",
-                        config.parameter_root()
+                        "{}.layers.{layer}.{}.weight",
+                        config.parameter_root(),
+                        fields.post_attention_norm
                     ))
                     .map_err(Error::backend)?,
                 },
@@ -950,6 +1447,11 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     let prefix = format!("{}.layers.{layer}", config.parameter_root());
+    let fields = config
+        .block_parameter_fields()
+        .validate()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let attention_prefix = format!("{prefix}.{}", fields.attention);
     let query_heads = usize::try_from(config.num_attention_heads()).map_err(|_| {
         ParallelPlanError::InvalidGroup("decoder query-head count exceeds usize".into())
     })?;
@@ -970,7 +1472,10 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
             ParallelPlanError::InvalidGroup("decoder GQA group width overflowed".into())
         })?;
     let attention_alignment = config
-        .weight_quantization(&format!("{prefix}.self_attn.o_proj.weight"))
+        .weight_quantization(&format!(
+            "{attention_prefix}.{}.weight",
+            fields.attention_output
+        ))
         .map_or(Ok(1), |quantization| {
             usize::try_from(quantization.group_size()).map_err(|_| {
                 ParallelPlanError::InvalidGroup(
@@ -979,31 +1484,45 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
             })
         })?;
     let attention_units = aligned_partition_units(
-        &format!("{prefix}.self_attn"),
+        &attention_prefix,
         key_value_heads,
         group_width,
         attention_alignment,
     )?;
-    let attention = partitioned_projection_group::<B::Tensor, B::Linear>(
-        format!("{prefix}.self_attn.projections"),
-        ParameterRole::AttentionHeads,
-        &[
-            (&block.self_attention.query, ProjectionSharding::Column),
-            (&block.self_attention.key, ProjectionSharding::Column),
-            (&block.self_attention.value, ProjectionSharding::Column),
-            (&block.self_attention.output, ProjectionSharding::Row),
-        ],
-        attention_units,
-    )?;
+    let attention = match &block.self_attention.input_projection {
+        AttentionInputProjection::Split { query, key, value } => {
+            partitioned_projection_group::<B::Tensor, B::Linear>(
+                format!("{attention_prefix}.projections"),
+                ParameterRole::AttentionHeads,
+                &[
+                    (query, ProjectionSharding::Column),
+                    (key, ProjectionSharding::Column),
+                    (value, ProjectionSharding::Column),
+                    (&block.self_attention.output, ProjectionSharding::Row),
+                ],
+                attention_units,
+            )?
+        }
+        AttentionInputProjection::Fused(fused) => {
+            segmented_projection_group::<B::Tensor, B::Linear>(
+                format!("{attention_prefix}.projections"),
+                ParameterRole::AttentionHeads,
+                &fused.projection,
+                &block.self_attention.output,
+                fused_projection_ranges(&fused.layout)?,
+                attention_units,
+            )?
+        }
+    };
 
     let input_norm = module_parameter_group::<B::Tensor, _>(
-        format!("{prefix}.input_layernorm"),
+        format!("{prefix}.{}", fields.input_norm),
         ParameterRole::Replicated,
         &block.input_norm,
         |_, _| Ok(MemberSharding::Replicated),
     )?;
     let post_attention_norm = module_parameter_group::<B::Tensor, _>(
-        format!("{prefix}.post_attention_layernorm"),
+        format!("{prefix}.{}", fields.post_attention_norm),
         ParameterRole::Replicated,
         &block.post_attention_norm,
         |_, _| Ok(MemberSharding::Replicated),
@@ -1011,7 +1530,7 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     let mut groups = vec![attention];
     if let Some(sinks) = &block.self_attention.sinks {
         groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-            format!("{prefix}.self_attn.sinks"),
+            format!("{attention_prefix}.{}", fields.attention_sinks),
             ParameterRole::AttentionHeads,
             query_heads,
             sinks,
@@ -1027,7 +1546,7 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     }
     if let Some(norm) = &block.self_attention.query_norm {
         groups.push(module_parameter_group::<B::Tensor, _>(
-            format!("{prefix}.self_attn.q_norm"),
+            format!("{attention_prefix}.{}", fields.attention_query_norm),
             ParameterRole::Replicated,
             norm,
             |_, _| Ok(MemberSharding::Replicated),
@@ -1035,7 +1554,7 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     }
     if let Some(norm) = &block.self_attention.key_norm {
         groups.push(module_parameter_group::<B::Tensor, _>(
-            format!("{prefix}.self_attn.k_norm"),
+            format!("{attention_prefix}.{}", fields.attention_key_norm),
             ParameterRole::Replicated,
             norm,
             |_, _| Ok(MemberSharding::Replicated),
@@ -1051,12 +1570,20 @@ pub fn dense_mlp_parallel_parameter_group<B: NeuralBackend>(
     config: &impl Config,
     layer: usize,
 ) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    let prefix = format!("{}.layers.{layer}.mlp", config.parameter_root());
+    let fields = config
+        .block_parameter_fields()
+        .validate()
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let prefix = format!(
+        "{}.layers.{layer}.{}",
+        config.parameter_root(),
+        fields.feed_forward
+    );
     let intermediate = usize::try_from(config.intermediate_size()).map_err(|_| {
         ParallelPlanError::InvalidGroup("decoder feed-forward width exceeds usize".into())
     })?;
     let alignment = config
-        .weight_quantization(&format!("{prefix}.down_proj.weight"))
+        .weight_quantization(&format!("{prefix}.{}.weight", fields.feed_forward_output))
         .map_or(Ok(1), |quantization| {
             usize::try_from(quantization.group_size()).map_err(|_| {
                 ParallelPlanError::InvalidGroup(
@@ -1065,16 +1592,54 @@ pub fn dense_mlp_parallel_parameter_group<B: NeuralBackend>(
             })
         })?;
     let units = aligned_partition_units(&prefix, intermediate, 1, alignment)?;
-    partitioned_projection_group::<B::Tensor, B::Linear>(
-        format!("{prefix}.projections"),
-        ParameterRole::FeedForwardIntermediate,
-        &[
-            (&mlp.gate, ProjectionSharding::Column),
-            (&mlp.up, ProjectionSharding::Column),
-            (&mlp.down, ProjectionSharding::Row),
-        ],
-        units,
-    )
+    match &mlp.input_projection {
+        GatedInputProjection::Split { gate, up } => {
+            partitioned_projection_group::<B::Tensor, B::Linear>(
+                format!("{prefix}.projections"),
+                ParameterRole::FeedForwardIntermediate,
+                &[
+                    (gate, ProjectionSharding::Column),
+                    (up, ProjectionSharding::Column),
+                    (&mlp.down, ProjectionSharding::Row),
+                ],
+                units,
+            )
+        }
+        GatedInputProjection::Fused(fused) => segmented_projection_group::<B::Tensor, B::Linear>(
+            format!("{prefix}.projections"),
+            ParameterRole::FeedForwardIntermediate,
+            &fused.projection,
+            &mlp.down,
+            fused_projection_ranges(&fused.layout)?,
+            units,
+        ),
+    }
+}
+
+fn fused_projection_ranges(
+    layout: &FusedProjectionLayout,
+) -> Result<Vec<std::ops::Range<usize>>, ParallelPlanError> {
+    let mut start = 0usize;
+    layout
+        .segments()
+        .iter()
+        .map(|segment| {
+            let width = usize::try_from(segment.width()).map_err(|_| {
+                ParallelPlanError::InvalidTensor(format!(
+                    "fused projection segment {} exceeds usize",
+                    segment.name()
+                ))
+            })?;
+            let end = start.checked_add(width).ok_or_else(|| {
+                ParallelPlanError::InvalidTensor(
+                    "fused projection segment ranges overflowed usize".into(),
+                )
+            })?;
+            let range = start..end;
+            start = end;
+            Ok(range)
+        })
+        .collect()
 }
 
 /// Declares every rank-local placement group for one dense shared decoder block.

@@ -12,19 +12,19 @@ use eredu_checkpoint::WeightQuantization;
 use eredu_core::Completion;
 use eredu_nn::{
     validate_parameter_topology, AttentionCache, AttentionRequest, BlockwiseAttentionBackend,
-    BlockwiseAttentionSpec, EmbeddingOperator, EmbeddingSpec, Error as ComputeError,
-    GatedDeltaScanInput, GatedDeltaScanOutput, GatedProductExpertBankOperator,
-    GatedProductExpertBankSpec, GatedProductExpertLayout, GatedProductPolicy,
-    HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState, HyperHeadOperator,
-    HyperHeadSpec, HyperNeuralBackend, IndexedAttentionInput, JointExpertRoutingInput,
-    JointExpertRoutingResult, LinearFormat, LinearOperator, LinearSpec, NeuralBackend,
-    NormalizationConstructionSpec, NormalizationOperator, NormalizationScale, NormalizationSpec,
-    ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized,
-    PooledAttentionInput, PooledPositionInput, RelativeAttentionInput, Relu2ExpertBankOperator,
-    Relu2ExpertBankSpec, RopeValue, RotaryOperator, RotaryPosition, RotarySpec,
-    RoutedNeuralBackend, RoutingOperator, RoutingResult, RoutingScoring, SegmentedAttentionInput,
-    SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
-    TensorParallelExpertOutput, TopKRouterSpec,
+    BlockwiseAttentionSpec, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec,
+    Error as ComputeError, GatedDeltaScanInput, GatedDeltaScanOutput,
+    GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
+    GatedProductPolicy, HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState,
+    HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, IndexedAttentionInput,
+    JointExpertRoutingInput, JointExpertRoutingResult, LinearFormat, LinearOperator, LinearSpec,
+    NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, NormalizationScale,
+    NormalizationSpec, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
+    Parameterized, PooledAttentionInput, PooledPositionInput, RelativeAttentionInput,
+    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RopeValue, RotaryOperator, RotaryPosition,
+    RotarySpec, RoutedNeuralBackend, RoutingOperator, RoutingResult, RoutingScoring,
+    SegmentedAttentionInput, SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
+    TensorParallelExpertOutput, TopKRouterSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
 use safemlx::ops::{
@@ -45,7 +45,10 @@ use safemlx::{
 };
 
 use crate::backend::mlx::{
-    nn::{self as common, tensor::rope::RopeVariant},
+    nn::{
+        self as common,
+        tensor::{rope::RopeVariant, validate_token_domain},
+    },
     runtime::cache::{
         BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueAttentionBlock, KeyValueCache,
         PagedKeyValueCache, SlidingKeyValueCache,
@@ -659,6 +662,7 @@ macro_rules! delegate_parameters {
 pub struct MlxLinear {
     module: common::linear::PhysicalLinear,
     topology: BTreeMap<String, ParameterSpec>,
+    vocabulary_range: Option<VocabularyParallelRange>,
 }
 
 delegate_parameters!(MlxLinear, module);
@@ -692,6 +696,8 @@ impl Parameterized<Array> for MlxLinear {
 pub struct MlxEmbedding {
     module: MaybeQuantized<nn::Embedding>,
     topology: BTreeMap<String, ParameterSpec>,
+    vocabulary: i32,
+    vocabulary_range: Option<VocabularyParallelRange>,
 }
 
 impl Deref for MlxEmbedding {
@@ -710,6 +716,42 @@ delegate_parameters!(MlxEmbedding, module);
 impl EmbeddingOperator<Array> for MlxEmbedding {
     fn forward(&mut self, input: &Array, context: &Stream) -> Result<Array, ComputeError> {
         compute(self.module.forward(input, context))
+    }
+
+    fn lookup(
+        &mut self,
+        input: &Array,
+        policy: EmbeddingLookupPolicy,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        policy.validate()?;
+        let sentinel = match policy {
+            EmbeddingLookupPolicy::Strict => None,
+            EmbeddingLookupPolicy::ZeroSentinel(sentinel) => Some(sentinel),
+        };
+        let input = compute(validate_token_domain(
+            input,
+            self.vocabulary,
+            sentinel,
+            context,
+        ))?;
+        let Some(sentinel) = sentinel else {
+            return compute(self.module.forward(&input, context));
+        };
+        let sentinel_mask = input.equal_i32(sentinel, context)?;
+        let nonnegative = compute(input.ge(Array::from_int(0), context))?;
+        let below_vocabulary = compute(input.lt(Array::from_int(self.vocabulary), context))?;
+        let ordinary_mask = compute(nonnegative.logical_and(&below_vocabulary, context))?;
+        let safe_tokens =
+            Array::where_condition(&ordinary_mask, &input, &input.zeros_like(context)?, context)?;
+        let embedded = compute(self.module.forward(&safe_tokens, context))?;
+        let output_mask = compute(sentinel_mask.expand_dims(-1, context))?;
+        Array::where_condition(
+            &output_mask,
+            &embedded.zeros_like(context)?,
+            &embedded,
+            context,
+        )
     }
 
     fn as_linear(&mut self, input: &Array, context: &Stream) -> Result<Array, ComputeError> {
@@ -1417,6 +1459,28 @@ impl ParameterBackend for MlxBackend {
         Ok(materialization.synchronize()?)
     }
 
+    fn share_materialized_weight(
+        weight: &Self::MaterializedWeight,
+    ) -> Result<Self::MaterializedWeight, Self::ParameterError> {
+        Ok(weight.clone())
+    }
+
+    fn validate_bind(
+        parameter: &Self::Parameter,
+        weight: &Self::MaterializedWeight,
+    ) -> Result<(), Self::ParameterError> {
+        if parameter.shape() != weight.shape() {
+            return Err(MlxParameterError::Mlx(safemlx::error::Exception::custom(
+                format!(
+                    "parameter shape {:?} does not match materialized weight {:?}",
+                    parameter.shape(),
+                    weight.shape()
+                ),
+            )));
+        }
+        Ok(())
+    }
+
     fn bind(
         parameter: &mut Self::Parameter,
         weight: Self::MaterializedWeight,
@@ -1443,7 +1507,11 @@ impl NeuralBackend for MlxBackend {
             context,
         ))?;
         let topology = parameter_topology(&module, spec.weight, spec.bias)?;
-        Ok(MlxLinear { module, topology })
+        Ok(MlxLinear {
+            module,
+            topology,
+            vocabulary_range: None,
+        })
     }
 
     fn embedding(spec: EmbeddingSpec, context: &Stream) -> Result<MlxEmbedding, ComputeError> {
@@ -1454,7 +1522,131 @@ impl NeuralBackend for MlxBackend {
             context,
         ))?;
         let topology = parameter_topology(&module, spec.weight, None)?;
-        Ok(MlxEmbedding { module, topology })
+        Ok(MlxEmbedding {
+            module,
+            topology,
+            vocabulary: spec.vocabulary,
+            vocabulary_range: None,
+        })
+    }
+
+    fn vocabulary_parallel_embedding(
+        spec: EmbeddingSpec,
+        range: VocabularyParallelRange,
+        context: &Stream,
+    ) -> Result<MlxEmbedding, ComputeError> {
+        range.validate_global_rows(spec.vocabulary)?;
+        let global = i32::try_from(range.global_vocabulary).map_err(ComputeError::backend)?;
+        let local = i32::try_from(range.local.len()).map_err(ComputeError::backend)?;
+        let module = compute(common::linear::unloaded_maybe_quantized_embedding(
+            local,
+            spec.dimensions,
+            spec.quantization,
+            context,
+        ))?;
+        let topology = parameter_topology(&module, spec.weight, None)?;
+        Ok(MlxEmbedding {
+            module,
+            topology,
+            vocabulary: global,
+            vocabulary_range: Some(range),
+        })
+    }
+
+    fn vocabulary_parallel_linear(
+        spec: LinearSpec,
+        range: VocabularyParallelRange,
+        context: &Stream,
+    ) -> Result<MlxLinear, ComputeError> {
+        range.validate_global_rows(spec.output)?;
+        let local = i32::try_from(range.local.len()).map_err(ComputeError::backend)?;
+        let module = compute(common::linear::PhysicalLinear::unloaded(
+            spec.input,
+            local,
+            spec.bias.is_some(),
+            spec.format,
+            context,
+        ))?;
+        let topology = parameter_topology(&module, spec.weight, spec.bias)?;
+        Ok(MlxLinear {
+            module,
+            topology,
+            vocabulary_range: Some(range),
+        })
+    }
+
+    fn vocabulary_parallel_lookup(
+        embedding: &mut MlxEmbedding,
+        input: &Array,
+        policy: EmbeddingLookupPolicy,
+        parallel: &Group,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        policy.validate()?;
+        let range = embedding
+            .vocabulary_range
+            .as_ref()
+            .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
+        let sentinel = match policy {
+            EmbeddingLookupPolicy::Strict => None,
+            EmbeddingLookupPolicy::ZeroSentinel(sentinel) => Some(sentinel),
+        };
+        let input = compute(validate_token_domain(
+            input,
+            embedding.vocabulary,
+            sentinel,
+            context,
+        ))?;
+        let start =
+            Array::from_int(i32::try_from(range.local.start).map_err(ComputeError::backend)?);
+        let end = Array::from_int(i32::try_from(range.local.end).map_err(ComputeError::backend)?);
+        let valid = compute(input.ge(&start, context))?
+            .logical_and(&compute(input.lt(&end, context))?, context)
+            .map_err(ComputeError::backend)?;
+        let local = compute(input.subtract(&start, context))?;
+        let safe = compute(safemlx::ops::r#where(
+            &valid,
+            &local,
+            Array::from_int(0),
+            context,
+        ))?;
+        let value = compute(embedding.module.forward(&safe, context))?;
+        let mask = compute(valid.expand_dims(-1, context))?;
+        let value = compute(safemlx::ops::r#where(
+            &mask,
+            &value,
+            value.zeros_like(context)?,
+            context,
+        ))?;
+        compute(safemlx::distributed::all_sum(&value, parallel, context))
+    }
+
+    fn vocabulary_parallel_project(
+        linear: &mut MlxLinear,
+        input: &Array,
+        parallel: &Group,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        let range = linear
+            .vocabulary_range
+            .as_ref()
+            .ok_or_else(|| ComputeError::backend("projection has no vocabulary ownership"))?;
+        let local = compute(linear.module.forward(input, context))?;
+        let widths = (0..parallel.size())
+            .map(|rank| {
+                eredu_core::balanced_contiguous_range(
+                    range.global_vocabulary,
+                    parallel.size(),
+                    rank,
+                    false,
+                )
+                .map(|range| range.len())
+                .map_err(ComputeError::backend)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        compute(safemlx::distributed::all_gather_uneven_axis(
+            &local, -1, &widths, parallel, context,
+        ))
     }
 
     fn rms_norm(spec: NormalizationSpec, context: &Stream) -> Result<MlxRmsNorm, ComputeError> {
@@ -2618,14 +2810,25 @@ impl eredu_nn::AuxiliaryConvolutionState<Array>
 
 #[cfg(test)]
 mod neutral_semantic_operator_tests {
+    use eredu_architectures::decoder::{MultiTableEmbedding, NamedEmbeddingSpec};
+    use eredu_checkpoint::{AffineQuantization, LinearFormat, WeightQuantization};
     use eredu_nn::{
-        reference_expand_heads, reference_segmented_attention, HeadExpansion,
-        JointExpertRoutingInput, NeuralBackend, NormalizationConstructionSpec, NormalizationScale,
-        RelativeAttentionInput, SegmentedAttentionInput,
+        reference_expand_heads, reference_segmented_attention, EmbeddingLookupPolicy,
+        EmbeddingOperator, EmbeddingSpec, FusedProjectionLayout, FusedProjectionSegment,
+        HeadExpansion, JointExpertRoutingInput, LinearOperator, LinearSpec, NeuralBackend,
+        NormalizationConstructionSpec, NormalizationScale, ParameterSpec, RelativeAttentionInput,
+        SegmentedAttentionInput, Tensor,
     };
-    use safemlx::{Array, Device, DeviceType, ExecutionContext};
+    use safemlx::{
+        ops::{quantize_with_mode, QuantizationMode},
+        quantization::MaybeQuantized,
+        transforms::async_eval_with_event,
+        Array, Device, DeviceType, ExecutionContext,
+    };
 
-    use super::MlxBackend;
+    use crate::backend::mlx::nn::tensor::TokenValidationScope;
+
+    use super::{MlxBackend, MlxEmbedding, MlxLinear};
 
     fn close(actual: &Array, expected: &[f32], tolerance: f32) {
         let actual = actual.evaluated().unwrap();
@@ -2635,6 +2838,358 @@ mod neutral_semantic_operator_tests {
             .iter()
             .zip(expected)
             .all(|(left, right)| (left - right).abs() <= tolerance));
+    }
+
+    fn parameter(name: &str) -> ParameterSpec {
+        ParameterSpec::trainable(name).unwrap()
+    }
+
+    fn bind_linear(
+        linear: &mut MlxLinear,
+        weight: Array,
+        format: LinearFormat,
+        stream: &safemlx::Stream,
+    ) {
+        match format.weight_quantization() {
+            None => linear.module.weight.value = weight,
+            Some(quantization) => {
+                let mode = match quantization {
+                    WeightQuantization::Affine(_) => QuantizationMode::Affine,
+                    WeightQuantization::MxFp4 => QuantizationMode::MxFp4,
+                    WeightQuantization::GgufIQuant { .. } => {
+                        panic!("test helper does not synthesize GGUF blocks")
+                    }
+                };
+                let arrays = quantize_with_mode(
+                    &weight,
+                    quantization.group_size(),
+                    quantization.bits(),
+                    mode,
+                    stream,
+                )
+                .unwrap();
+                linear.module.weight.value = arrays.weight;
+                linear.module.scales.value = Some(arrays.scales);
+                linear.module.biases.value = arrays.biases;
+            }
+        }
+    }
+
+    fn linear(
+        name: &str,
+        input: i32,
+        output: i32,
+        format: LinearFormat,
+        weight: &[f32],
+        stream: &safemlx::Stream,
+    ) -> MlxLinear {
+        let mut linear = <MlxBackend as NeuralBackend>::linear(
+            LinearSpec {
+                input,
+                output,
+                weight: parameter(name),
+                bias: None,
+                format,
+            },
+            stream,
+        )
+        .unwrap();
+        bind_linear(
+            &mut linear,
+            Array::from_slice(weight, &[output, input]),
+            format,
+            stream,
+        );
+        linear
+    }
+
+    fn bind_embedding(embedding: &mut MlxEmbedding, weight: Array, stream: &safemlx::Stream) {
+        match &mut embedding.module {
+            MaybeQuantized::Original(embedding) => embedding.weight.value = weight,
+            MaybeQuantized::Quantized(embedding) => {
+                let arrays = quantize_with_mode(
+                    &weight,
+                    embedding.group_size,
+                    embedding.bits,
+                    embedding.mode,
+                    stream,
+                )
+                .unwrap();
+                embedding.inner.weight.value = arrays.weight;
+                embedding.scales.value = arrays.scales;
+                embedding.biases.value = arrays.biases;
+            }
+        }
+    }
+
+    fn embedding(
+        name: &str,
+        vocabulary: i32,
+        dimensions: i32,
+        quantization: Option<WeightQuantization>,
+        weight: &[f32],
+        stream: &safemlx::Stream,
+    ) -> MlxEmbedding {
+        let mut embedding = <MlxBackend as NeuralBackend>::embedding(
+            EmbeddingSpec {
+                vocabulary,
+                dimensions,
+                weight: parameter(name),
+                quantization,
+            },
+            stream,
+        )
+        .unwrap();
+        bind_embedding(
+            &mut embedding,
+            Array::from_slice(weight, &[vocabulary, dimensions]),
+            stream,
+        );
+        embedding
+    }
+
+    fn supported_embedding_formats() -> [Option<WeightQuantization>; 3] {
+        [
+            None,
+            Some(WeightQuantization::Affine(
+                AffineQuantization::new(32, 4).unwrap(),
+            )),
+            Some(WeightQuantization::MxFp4),
+        ]
+    }
+
+    #[test]
+    fn hot_path_api_construction_keeps_values_backend_native() {
+        fn lookup(
+            embedding: &mut MlxEmbedding,
+            tokens: &Array,
+            stream: &safemlx::Stream,
+        ) -> Result<Array, eredu_nn::Error> {
+            embedding.lookup(tokens, EmbeddingLookupPolicy::ZeroSentinel(-1), stream)
+        }
+        fn project(
+            linear: &mut MlxLinear,
+            input: &Array,
+            stream: &safemlx::Stream,
+        ) -> Result<Array, eredu_nn::Error> {
+            linear.forward(input, stream)
+        }
+        fn sum(
+            embeddings: &mut MultiTableEmbedding<MlxBackend>,
+            tokens: &[&Array],
+            stream: &safemlx::Stream,
+        ) -> Result<Array, eredu_nn::Error> {
+            embeddings.forward(tokens, stream)
+        }
+
+        let _: fn(&mut MlxEmbedding, &Array, &safemlx::Stream) -> Result<Array, eredu_nn::Error> =
+            lookup;
+        let _: fn(&mut MlxLinear, &Array, &safemlx::Stream) -> Result<Array, eredu_nn::Error> =
+            project;
+        let _: fn(
+            &mut MultiTableEmbedding<MlxBackend>,
+            &[&Array],
+            &safemlx::Stream,
+        ) -> Result<Array, eredu_nn::Error> = sum;
+    }
+
+    fn assert_fused_split_equivalence(format: LinearFormat) {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = execution.stream();
+        let input_width = 32;
+        let segment_width = 2;
+        let output_width = 6;
+        let input = (0..input_width)
+            .map(|index| (index as f32 - 15.0) / 16.0)
+            .collect::<Vec<_>>();
+        let weight = (0..output_width * input_width)
+            .map(|index| ((index % 19) as f32 - 9.0) / 32.0)
+            .collect::<Vec<_>>();
+        let input_array = Array::from_slice(&input, &[1, input_width]);
+        let mut fused = linear(
+            "fused.weight",
+            input_width,
+            output_width,
+            format,
+            &weight,
+            stream,
+        );
+        let fused_output = fused.forward(&input_array, stream).unwrap();
+
+        let mut split_outputs = Vec::new();
+        for segment in 0..3 {
+            let start = segment * segment_width * input_width;
+            let end = start + segment_width * input_width;
+            let mut split = linear(
+                &format!("split.{segment}.weight"),
+                input_width,
+                segment_width,
+                format,
+                &weight[start as usize..end as usize],
+                stream,
+            );
+            split_outputs.push(split.forward(&input_array, stream).unwrap());
+        }
+        let split_output = Array::concatenate(&split_outputs, -1, stream).unwrap();
+        let fused_evaluated = fused_output.evaluated().unwrap();
+        let split_evaluated = split_output.evaluated().unwrap();
+        assert_eq!(
+            fused_evaluated.as_slice::<f32>(),
+            split_evaluated.as_slice::<f32>()
+        );
+
+        let qkv = FusedProjectionLayout::new([
+            FusedProjectionSegment::new("query", 2).unwrap(),
+            FusedProjectionSegment::new("key", 2).unwrap(),
+            FusedProjectionSegment::new("value", 2).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(qkv.split(&fused_output, stream).unwrap().len(), 3);
+        let gate_up = FusedProjectionLayout::new([
+            FusedProjectionSegment::new("gate", 3).unwrap(),
+            FusedProjectionSegment::new("up", 3).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(gate_up.split(&fused_output, stream).unwrap().len(), 2);
+
+        if format == LinearFormat::Dense {
+            let expected = weight
+                .chunks_exact(input_width as usize)
+                .map(|row| {
+                    row.iter()
+                        .zip(&input)
+                        .map(|(left, right)| left * right)
+                        .sum()
+                })
+                .collect::<Vec<f32>>();
+            close(&fused_output, &expected, 1e-6);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local MLX Metal execution"]
+    fn stage8_mlx_dense_fused_projection_equivalence() {
+        assert_fused_split_equivalence(LinearFormat::Dense);
+    }
+
+    #[test]
+    #[ignore = "requires local MLX Metal execution"]
+    fn stage8_mlx_affine_fused_projection_equivalence() {
+        assert_fused_split_equivalence(LinearFormat::Affine(
+            AffineQuantization::new(32, 4).unwrap(),
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires local MLX Metal execution"]
+    fn stage8_mlx_mxfp4_fused_projection_equivalence() {
+        assert_fused_split_equivalence(LinearFormat::MxFp4);
+    }
+
+    #[test]
+    #[ignore = "requires local MLX Metal execution"]
+    fn stage8_mlx_sentinel_embedding_validation() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = execution.stream();
+        let dimensions = 32;
+        let vocabulary = 4;
+        let weight = (0..vocabulary * dimensions)
+            .map(|index| (index as f32 + 1.0) / 64.0)
+            .collect::<Vec<_>>();
+        for quantization in supported_embedding_formats() {
+            let mut embedding = embedding(
+                "embedding.weight",
+                vocabulary,
+                dimensions,
+                quantization,
+                &weight,
+                stream,
+            );
+            let valid = Array::from_slice(&[-1_i32, 0, 3], &[3]);
+            let scope = TokenValidationScope::begin().unwrap();
+            let output = embedding
+                .lookup(&valid, EmbeddingLookupPolicy::ZeroSentinel(-1), stream)
+                .unwrap();
+            let output = output.as_type::<f32>(stream).unwrap();
+            let validations = scope.finish();
+            let event = async_eval_with_event(std::iter::once(&output).chain(validations.arrays()))
+                .unwrap();
+            event.synchronize().unwrap();
+            validations.validate_completed().unwrap();
+            let output = output.evaluated().unwrap();
+            assert!(output.as_slice::<f32>()[..dimensions as usize]
+                .iter()
+                .all(|value| value.to_bits() == 0));
+
+            for invalid in [-2_i32, vocabulary] {
+                let tokens = Array::from_slice(&[invalid], &[1]);
+                let scope = TokenValidationScope::begin().unwrap();
+                let output = embedding
+                    .lookup(&tokens, EmbeddingLookupPolicy::ZeroSentinel(-1), stream)
+                    .expect("lazy lookup must not synchronize while building the graph");
+                let validations = scope.finish();
+                let event =
+                    async_eval_with_event(std::iter::once(&output).chain(validations.arrays()))
+                        .unwrap();
+                event.synchronize().unwrap();
+                assert!(
+                    validations.validate_completed().is_err(),
+                    "embedding accepted invalid token {invalid} under {quantization:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local MLX Metal execution"]
+    fn stage8_mlx_multi_table_embedding_sum_is_ordered_and_sentinel_safe() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = execution.stream();
+        let dimensions = 32;
+        for quantization in supported_embedding_formats() {
+            let specs = (0..3)
+                .map(|table| NamedEmbeddingSpec {
+                    name: format!("stream-{table}"),
+                    embedding: EmbeddingSpec {
+                        vocabulary: 4,
+                        dimensions,
+                        weight: parameter(&format!("tables.{table}.weight")),
+                        quantization,
+                    },
+                    lookup: EmbeddingLookupPolicy::ZeroSentinel(-1),
+                })
+                .collect::<Vec<_>>();
+            let mut embeddings = MultiTableEmbedding::<MlxBackend>::new(specs, stream).unwrap();
+            for (table, named) in embeddings.tables.iter_mut().enumerate() {
+                let weight = (0..4 * dimensions)
+                    .map(|index| (table as f32 + 1.0) * (index as f32 + 1.0) / 128.0)
+                    .collect::<Vec<_>>();
+                bind_embedding(
+                    &mut named.embedding,
+                    Array::from_slice(&weight, &[4, dimensions]),
+                    stream,
+                );
+            }
+            let first = Array::from_slice(&[0_i32], &[1]);
+            let sentinel = Array::from_slice(&[-1_i32], &[1]);
+            let third = Array::from_slice(&[2_i32], &[1]);
+            let scope = TokenValidationScope::begin().unwrap();
+            let output = embeddings
+                .forward(&[&first, &sentinel, &third], stream)
+                .unwrap();
+            assert_eq!(output.shape(), &[1, dimensions]);
+            let output = output.as_type::<f32>(stream).unwrap();
+            let validations = scope.finish();
+            let event = async_eval_with_event(std::iter::once(&output).chain(validations.arrays()))
+                .unwrap();
+            event.synchronize().unwrap();
+            validations.validate_completed().unwrap();
+            let output = output.evaluated().unwrap();
+            assert!(output
+                .as_slice::<f32>()
+                .iter()
+                .all(|value| value.is_finite()));
+        }
     }
 
     #[test]

@@ -2,16 +2,16 @@
 
 use std::collections::HashMap;
 
-use eredu_runtime::{PenaltyConfig, SamplingBackend};
+use eredu_runtime::{PenaltyConfig, SamplingBackend, TokenDomain};
 use safemlx::{
     argmax_axis, array,
     error::Exception,
     ops::indexing::TryIndexOp,
     random::{self, RandomState},
-    Array, Stream,
+    Array, Dtype, Stream,
 };
 
-use crate::core::TokenFilter;
+use crate::{backend::mlx::nn::tensor::validate_token_domain, core::TokenFilter};
 
 /// SafeMLX token-sampling capability implementation.
 #[derive(Debug, Clone, Copy)]
@@ -26,6 +26,25 @@ impl SamplingBackend for MlxSamplingBackend {
 
     fn error(message: String) -> Self::Error {
         Exception::custom(message)
+    }
+
+    fn validate_token(
+        token: &Self::Token,
+        domain: TokenDomain,
+        stream: &Self::Context,
+    ) -> Result<Self::Token, Self::Error> {
+        if !matches!(token.dtype(), Dtype::Int32 | Dtype::Uint32) {
+            return Err(Exception::custom(format!(
+                "token IDs must use int32 or uint32 storage, got {:?}",
+                token.dtype()
+            )));
+        }
+        let cardinality = i32::try_from(domain.cardinality())
+            .map_err(|_| Exception::custom("token domain exceeds MLX int32 range"))?;
+        if cardinality <= 0 {
+            return Err(Exception::custom("token domain must be non-empty"));
+        }
+        validate_token_domain(token, cardinality, None, stream)
     }
 
     fn scale_temperature(
@@ -277,7 +296,11 @@ fn mask_logits(mask: Array, logits: Array, stream: &Stream) -> Result<Array, Exc
 
 #[cfg(test)]
 mod tests {
-    use super::effective_allowed_mask;
+    use super::{effective_allowed_mask, MlxSamplingBackend};
+    use eredu_runtime::{SamplingBackend, TokenDomain};
+    use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext};
+
+    use crate::backend::mlx::nn::tensor::TokenValidationScope;
 
     #[test]
     fn token_filter_accepts_a_truncated_output_vocabulary_prefix() {
@@ -287,5 +310,40 @@ mod tests {
         );
         assert!(effective_allowed_mask(&[false, false, true], 2).is_err());
         assert!(effective_allowed_mask(&[true], 2).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires local MLX Metal execution"]
+    fn stage8_mlx_token_domain_validation_is_deferred_to_completion() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = execution.stream();
+        let scope = TokenValidationScope::begin().unwrap();
+        let valid = MlxSamplingBackend::validate_token(
+            &Array::from_slice(&[0_u32, 4], &[2]),
+            TokenDomain::new(5),
+            stream,
+        )
+        .unwrap();
+        assert_eq!(valid.dtype(), safemlx::Dtype::Int32);
+        let validations = scope.finish();
+        let event =
+            async_eval_with_event(std::iter::once(&valid).chain(validations.arrays())).unwrap();
+        event.synchronize().unwrap();
+        validations.validate_completed().unwrap();
+
+        for invalid in [-1_i32, 5] {
+            let scope = TokenValidationScope::begin().unwrap();
+            let token = MlxSamplingBackend::validate_token(
+                &Array::from_slice(&[invalid], &[1]),
+                TokenDomain::new(5),
+                stream,
+            )
+            .expect("lazy device validation must not synchronize while building the graph");
+            let validations = scope.finish();
+            let event =
+                async_eval_with_event(std::iter::once(&token).chain(validations.arrays())).unwrap();
+            event.synchronize().unwrap();
+            assert!(validations.validate_completed().is_err());
+        }
     }
 }

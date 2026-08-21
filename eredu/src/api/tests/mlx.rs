@@ -2962,6 +2962,59 @@ fn resolve_model_config_reports_supported_llama() {
 }
 
 #[test]
+fn resolve_model_config_normalizes_moshi_family_before_text_loader_admission() {
+    let native = json!({
+        "model_type": "moshi", "dim": 32, "text_card": 101,
+        "n_q": 4, "dep_q": 3, "generated_audio_codebooks": 2, "card": 64,
+        "num_heads": 4, "num_layers": 2, "dim_feedforward": 48,
+        "causal": true, "context": 7, "max_period": 10000.0,
+        "positional_embedding": "rope", "depformer_dim": 24,
+        "depformer_dim_feedforward": 36, "depformer_num_heads": 4,
+        "depformer_num_layers": 2, "depformer_context": 3,
+        "depformer_max_period": 10000.0, "depformer_pos_emb": "none",
+        "delays": [0, 0, 1, 2, 1]
+    });
+    let resolved = resolve_model_config(&native).unwrap();
+    assert_eq!(resolved.kind, ModelKind::Moshi);
+    assert_eq!(resolved.model_type, "moshi");
+    assert_eq!(resolved.effective_model_type, "moshi");
+    let normalized =
+        eredu_architectures::moshi::MoshiConfig::from_config_value(Some(&native)).unwrap();
+    assert_eq!(
+        normalized.artifact_profile(),
+        eredu_architectures::moshi::ArtifactProfile::NativeConfig
+    );
+    assert_eq!(
+        normalized.checkpoint_layout(),
+        eredu_architectures::moshi::CheckpointLayout::NativeMlx
+    );
+    assert!(ModelLoadOptions::default()
+        .validate_preparation(resolved.kind, None, eredu_core::ArtifactFormat::SafeTensors,)
+        .unwrap_err()
+        .to_string()
+        .contains("realtime"));
+
+    let persona = json!({"model_type": "personaplex", "version": "7b-v1"});
+    let resolved = resolve_model_config(&persona).unwrap();
+    assert_eq!(resolved.kind, ModelKind::Moshi);
+    assert_eq!(resolved.model_type, "personaplex");
+    assert_eq!(resolved.effective_model_type, "personaplex");
+    let normalized =
+        eredu_architectures::moshi::MoshiConfig::from_config_value(Some(&persona)).unwrap();
+    assert_eq!(
+        normalized.artifact_profile(),
+        eredu_architectures::moshi::ArtifactProfile::PersonaPlex7bV1
+    );
+    assert_eq!(
+        normalized.checkpoint_layout(),
+        eredu_architectures::moshi::CheckpointLayout::PersonaPlexPytorch
+    );
+
+    let invalid = json!({"model_type": "personaplex", "version": "nearby"});
+    assert!(resolve_model_config(&invalid).is_err());
+}
+
+#[test]
 fn resolve_model_config_recognizes_exact_qwen2_identity() {
     let config = json!({
         "architectures": ["Qwen2ForCausalLM"],

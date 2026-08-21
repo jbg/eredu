@@ -4,7 +4,7 @@ use std::{num::NonZeroUsize, path::Path};
 
 use eredu_core::{
     generation::{resolve_generation_config, FinishReason, SemanticEvent},
-    DraftingPlan, ExternalDraftArtifact, ModelKind, MtpCapability, SpeculativeGenerationBackend,
+    DraftingPlan, ExternalDraftArtifact, MtpCapability, SpeculativeGenerationBackend,
     SpeculativeGenerationBatchOutput, SpeculativeGenerationBatchRequest, SpeculativeGenerationLane,
     SpeculativeGenerationOutput, SpeculativeGenerationRequest,
 };
@@ -638,9 +638,9 @@ fn loaded_text_artifact(
 ) -> Result<(ChatTokenizer, LoadedTextModelConfig), TextMetadataError> {
     let path = inspection.path();
     let configuration = inspection.configuration();
-    if configuration.kind == ModelKind::PersonaPlex {
+    if configuration.kind.requires_realtime_loader() {
         return Err(TextMetadataError::UnsupportedArchitecture(
-            "PersonaPlex is a realtime speech-to-speech token model; use the realtime backend contract instead of LoadedModel".into(),
+            "Moshi-family models use a realtime speech-to-speech token contract; use the realtime backend contract instead of LoadedModel".into(),
         ));
     }
 

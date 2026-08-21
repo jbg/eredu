@@ -149,6 +149,7 @@ pub struct RecipeMetadata {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct AtomicRecipeSet {
     outputs: BTreeMap<String, DerivedWeightRecipe>,
+    aliases: BTreeMap<String, String>,
 }
 
 impl AtomicRecipeSet {
@@ -157,6 +158,19 @@ impl AtomicRecipeSet {
     pub fn new<C: RecipeCatalog + ?Sized>(
         catalog: &C,
         outputs: impl IntoIterator<Item = (String, DerivedWeightRecipe)>,
+    ) -> Result<Self, RecipeError> {
+        Self::new_with_aliases(catalog, outputs, std::iter::empty())
+    }
+
+    /// Validates canonical outputs and logical aliases as one publication.
+    ///
+    /// Alias destinations may name another alias in the input declarations,
+    /// but the returned map always points directly at a canonical output.
+    /// No output or alias is observable when any recipe or alias is invalid.
+    pub fn new_with_aliases<C: RecipeCatalog + ?Sized>(
+        catalog: &C,
+        outputs: impl IntoIterator<Item = (String, DerivedWeightRecipe)>,
+        aliases: impl IntoIterator<Item = RecipeAlias>,
     ) -> Result<Self, RecipeError> {
         let mut validated = BTreeMap::new();
         for (target, recipe) in outputs {
@@ -173,12 +187,28 @@ impl AtomicRecipeSet {
         for recipe in validated.values() {
             recipe.infer(catalog)?;
         }
-        Ok(Self { outputs: validated })
+        let aliases = validate_recipe_aliases(validated.keys(), aliases)?;
+        Ok(Self {
+            outputs: validated,
+            aliases,
+        })
     }
 
     /// Returns the validated recipe for one canonical output.
     pub fn get(&self, target: &str) -> Option<&DerivedWeightRecipe> {
         self.outputs.get(target)
+    }
+
+    /// Resolves a canonical output or logical alias without cloning its recipe.
+    pub fn get_resolved(&self, target: &str) -> Option<(&str, &DerivedWeightRecipe)> {
+        let owner = self
+            .aliases
+            .get(target)
+            .map(String::as_str)
+            .unwrap_or(target);
+        self.outputs
+            .get_key_value(owner)
+            .map(|(owner, recipe)| (owner.as_str(), recipe))
     }
 
     /// Iterates canonical outputs in stable sorted order.
@@ -188,9 +218,291 @@ impl AtomicRecipeSet {
             .map(|(target, recipe)| (target.as_str(), recipe))
     }
 
+    /// Iterates logical alias and canonical-owner identities in stable order.
+    pub fn aliases(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.aliases
+            .iter()
+            .map(|(alias, owner)| (alias.as_str(), owner.as_str()))
+    }
+
     /// Consumes the validated set for a backend binding plan.
     pub fn into_outputs(self) -> BTreeMap<String, DerivedWeightRecipe> {
         self.outputs
+    }
+
+    /// Consumes the publication into canonical recipes and logical aliases.
+    pub fn into_parts(
+        self,
+    ) -> (
+        BTreeMap<String, DerivedWeightRecipe>,
+        BTreeMap<String, String>,
+    ) {
+        (self.outputs, self.aliases)
+    }
+}
+
+/// One logical parameter alias published alongside canonical recipes.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RecipeAlias {
+    /// Logical alias identity.
+    pub alias: String,
+    /// Canonical output or another declared alias.
+    pub destination: String,
+}
+
+impl RecipeAlias {
+    /// Creates an alias declaration validated when its recipe set is published.
+    pub fn new(alias: impl Into<String>, destination: impl Into<String>) -> Self {
+        Self {
+            alias: alias.into(),
+            destination: destination.into(),
+        }
+    }
+}
+
+fn validate_recipe_aliases<'a>(
+    outputs: impl IntoIterator<Item = &'a String>,
+    aliases: impl IntoIterator<Item = RecipeAlias>,
+) -> Result<BTreeMap<String, String>, RecipeError> {
+    let outputs = outputs.into_iter().cloned().collect::<BTreeSet<_>>();
+    let mut declarations = BTreeMap::new();
+    for declaration in aliases {
+        if declaration.alias.trim().is_empty() {
+            return Err(RecipeError::EmptyAliasName);
+        }
+        if declaration.destination.trim().is_empty() {
+            return Err(RecipeError::InvalidAliasDestination {
+                alias: declaration.alias,
+                destination: declaration.destination,
+            });
+        }
+        if outputs.contains(&declaration.alias) {
+            return Err(RecipeError::AliasOutputCollision {
+                alias: declaration.alias,
+            });
+        }
+        if declarations
+            .insert(declaration.alias.clone(), declaration.destination)
+            .is_some()
+        {
+            return Err(RecipeError::DuplicateAlias {
+                alias: declaration.alias,
+            });
+        }
+    }
+
+    fn resolve(
+        alias: &str,
+        outputs: &BTreeSet<String>,
+        declarations: &BTreeMap<String, String>,
+        resolved: &mut BTreeMap<String, String>,
+        visiting: &mut BTreeSet<String>,
+    ) -> Result<String, RecipeError> {
+        if let Some(owner) = resolved.get(alias) {
+            return Ok(owner.clone());
+        }
+        if !visiting.insert(alias.to_owned()) {
+            return Err(RecipeError::AliasCycle {
+                alias: alias.to_owned(),
+            });
+        }
+        let destination = declarations
+            .get(alias)
+            .expect("resolver receives a declared alias");
+        let owner = if outputs.contains(destination) {
+            destination.clone()
+        } else if declarations.contains_key(destination) {
+            resolve(destination, outputs, declarations, resolved, visiting)?
+        } else {
+            return Err(RecipeError::InvalidAliasDestination {
+                alias: alias.to_owned(),
+                destination: destination.clone(),
+            });
+        };
+        visiting.remove(alias);
+        resolved.insert(alias.to_owned(), owner.clone());
+        Ok(owner)
+    }
+
+    let mut resolved = BTreeMap::new();
+    for alias in declarations.keys() {
+        resolve(
+            alias,
+            &outputs,
+            &declarations,
+            &mut resolved,
+            &mut BTreeSet::new(),
+        )?;
+    }
+    Ok(resolved)
+}
+
+/// One named weight or quantization-companion recipe in a matrix family.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MatrixRecipeMember {
+    /// Canonical target identity published by the family.
+    pub target: String,
+    /// Recipe producing the target value.
+    pub recipe: DerivedWeightRecipe,
+}
+
+impl MatrixRecipeMember {
+    /// Creates one member validated when its family is constructed.
+    pub fn new(target: impl Into<String>, recipe: DerivedWeightRecipe) -> Self {
+        Self {
+            target: target.into(),
+            recipe,
+        }
+    }
+}
+
+/// Atomic weight, scale, and optional affine-bias recipe family.
+///
+/// Every companion must have the weight's rank and leading matrix geometry;
+/// only the final packed/group dimension may differ. Transformations return a
+/// new validated family, so malformed members never become partially visible.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AtomicMatrixRecipeFamily {
+    weight: MatrixRecipeMember,
+    scales: Option<MatrixRecipeMember>,
+    biases: Option<MatrixRecipeMember>,
+}
+
+impl AtomicMatrixRecipeFamily {
+    /// Validates a complete dense or packed matrix family.
+    pub fn new<C: RecipeCatalog + ?Sized>(
+        catalog: &C,
+        weight: MatrixRecipeMember,
+        scales: Option<MatrixRecipeMember>,
+        biases: Option<MatrixRecipeMember>,
+    ) -> Result<Self, RecipeError> {
+        if biases.is_some() && scales.is_none() {
+            return Err(RecipeError::MatrixBiasWithoutScales);
+        }
+        let family = Self {
+            weight,
+            scales,
+            biases,
+        };
+        family.validate(catalog)?;
+        Ok(family)
+    }
+
+    /// Canonical weight member.
+    pub const fn weight(&self) -> &MatrixRecipeMember {
+        &self.weight
+    }
+
+    /// Optional quantization-scale member.
+    pub const fn scales(&self) -> Option<&MatrixRecipeMember> {
+        self.scales.as_ref()
+    }
+
+    /// Optional affine-bias member.
+    pub const fn biases(&self) -> Option<&MatrixRecipeMember> {
+        self.biases.as_ref()
+    }
+
+    /// Applies one bounded range or ordered-index selection on leading axis 0.
+    ///
+    /// The identical logical selection is pushed through the weight and every
+    /// present companion before the resulting family is validated atomically.
+    pub fn select_leading_axis<C: RecipeCatalog + ?Sized>(
+        &self,
+        catalog: &C,
+        selection: TensorSelection,
+    ) -> Result<Self, RecipeError> {
+        match &selection {
+            TensorSelection::Full
+            | TensorSelection::Range { axis: 0, .. }
+            | TensorSelection::Indices { axis: 0, .. } => {}
+            TensorSelection::Range { axis, .. } | TensorSelection::Indices { axis, .. } => {
+                return Err(RecipeError::MatrixFamilySelectionAxis { axis: *axis });
+            }
+            TensorSelection::Contiguous { .. } => {
+                return Err(RecipeError::MatrixFamilyContiguousSelection);
+            }
+        }
+        let select = |member: &MatrixRecipeMember| -> Result<MatrixRecipeMember, RecipeError> {
+            Ok(MatrixRecipeMember {
+                target: member.target.clone(),
+                recipe: member.recipe.select_bounded(catalog, selection.clone())?,
+            })
+        };
+        Self::new(
+            catalog,
+            select(&self.weight)?,
+            self.scales.as_ref().map(select).transpose()?,
+            self.biases.as_ref().map(select).transpose()?,
+        )
+    }
+
+    /// Publishes this family and its aliases as one atomic recipe set.
+    pub fn publish<C: RecipeCatalog + ?Sized>(
+        &self,
+        catalog: &C,
+        aliases: impl IntoIterator<Item = RecipeAlias>,
+    ) -> Result<AtomicRecipeSet, RecipeError> {
+        self.validate(catalog)?;
+        AtomicRecipeSet::new_with_aliases(
+            catalog,
+            std::iter::once(&self.weight)
+                .chain(self.scales.iter())
+                .chain(self.biases.iter())
+                .map(|member| (member.target.clone(), member.recipe.clone())),
+            aliases,
+        )
+    }
+
+    fn validate<C: RecipeCatalog + ?Sized>(&self, catalog: &C) -> Result<(), RecipeError> {
+        let members = std::iter::once(&self.weight)
+            .chain(self.scales.iter())
+            .chain(self.biases.iter())
+            .collect::<Vec<_>>();
+        let mut targets = BTreeSet::new();
+        for member in &members {
+            if member.target.trim().is_empty() {
+                return Err(RecipeError::EmptyOutputName);
+            }
+            if !targets.insert(member.target.clone()) {
+                return Err(RecipeError::DuplicateOutput {
+                    target: member.target.clone(),
+                });
+            }
+        }
+        let weight = self.weight.recipe.infer(catalog)?;
+        if weight.shape.len() < 2 {
+            return Err(RecipeError::InvalidMatrixFamilyWeight {
+                shape: weight.shape,
+            });
+        }
+        let leading = &weight.shape[..weight.shape.len() - 1];
+        let mut scale_shape = None;
+        for (kind, member) in [
+            ("scales", self.scales.as_ref()),
+            ("biases", self.biases.as_ref()),
+        ] {
+            let Some(member) = member else { continue };
+            let metadata = member.recipe.infer(catalog)?;
+            if metadata.shape.len() != weight.shape.len()
+                || metadata.shape[..metadata.shape.len() - 1] != *leading
+            {
+                return Err(RecipeError::MatrixCompanionGeometry {
+                    member: kind,
+                    weight: weight.shape.clone(),
+                    companion: metadata.shape,
+                });
+            }
+            if kind == "scales" {
+                scale_shape = Some(metadata.shape);
+            } else if scale_shape.as_ref() != Some(&metadata.shape) {
+                return Err(RecipeError::MatrixScaleBiasGeometry {
+                    scales: scale_shape.unwrap_or_default(),
+                    biases: metadata.shape,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1515,6 +1827,37 @@ pub enum RecipeError {
     EmptyOutputs,
     #[error("derived-weight output {target:?} is declared more than once")]
     DuplicateOutput { target: String },
+    #[error("derived-weight alias name must not be empty")]
+    EmptyAliasName,
+    #[error("derived-weight alias {alias:?} is declared more than once")]
+    DuplicateAlias { alias: String },
+    #[error("derived-weight alias {alias:?} collides with a canonical output")]
+    AliasOutputCollision { alias: String },
+    #[error("derived-weight alias {alias:?} has unknown destination {destination:?}")]
+    InvalidAliasDestination { alias: String, destination: String },
+    #[error("derived-weight alias cycle contains {alias:?}")]
+    AliasCycle { alias: String },
+    #[error("matrix-family affine biases require a scale companion")]
+    MatrixBiasWithoutScales,
+    #[error("matrix-family weight must have rank at least two, got {shape:?}")]
+    InvalidMatrixFamilyWeight { shape: Vec<usize> },
+    #[error(
+        "matrix-family {member} geometry {companion:?} is incompatible with weight {weight:?}"
+    )]
+    MatrixCompanionGeometry {
+        member: &'static str,
+        weight: Vec<usize>,
+        companion: Vec<usize>,
+    },
+    #[error("matrix-family scale geometry {scales:?} differs from affine biases {biases:?}")]
+    MatrixScaleBiasGeometry {
+        scales: Vec<usize>,
+        biases: Vec<usize>,
+    },
+    #[error("matrix-family leading selection must use axis 0, got axis {axis}")]
+    MatrixFamilySelectionAxis { axis: usize },
+    #[error("matrix-family leading selection does not accept a scalar contiguous span")]
+    MatrixFamilyContiguousSelection,
     #[error("fused source {tensor:?} requires positive, named output segments")]
     InvalidFusedSplit { tensor: String },
     #[error(
@@ -1856,5 +2199,311 @@ mod tests {
         let recipe = ordered_axis_selection(&Catalog, "left", 1, vec![2, 0, 1]).unwrap();
         assert_eq!(recipe.infer(&Catalog).unwrap().shape(), &[2, 3]);
         assert!(ordered_axis_selection(&Catalog, "left", 1, vec![3]).is_err());
+    }
+
+    struct FamilyCatalog(BTreeMap<String, TensorMetadata>);
+
+    impl RecipeCatalog for FamilyCatalog {
+        fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+            self.0
+                .get(key)
+                .cloned()
+                .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
+        }
+    }
+
+    fn family_catalog(entries: &[(&str, &[usize], StoredDtype)]) -> FamilyCatalog {
+        FamilyCatalog(
+            entries
+                .iter()
+                .map(|(name, shape, dtype)| {
+                    (
+                        (*name).to_owned(),
+                        TensorMetadata {
+                            name: (*name).to_owned(),
+                            logical_shape: shape.to_vec(),
+                            physical_shape: shape.to_vec(),
+                            stored_dtype: dtype.clone(),
+                            encoded_byte_len: 1,
+                            backing_shard: Some("synthetic.safetensors".into()),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn member(target: &str, source: &str) -> MatrixRecipeMember {
+        MatrixRecipeMember::new(
+            target,
+            DerivedWeightRecipe::source(source, TensorSelection::Full),
+        )
+    }
+
+    #[test]
+    fn dense_matrix_family_selects_leading_rows_atomically() {
+        let catalog = family_catalog(&[("dense.weight", &[4, 6], StoredDtype::F16)]);
+        let family = AtomicMatrixRecipeFamily::new(
+            &catalog,
+            member("model.weight", "dense.weight"),
+            None,
+            None,
+        )
+        .unwrap();
+        let selected = family
+            .select_leading_axis(
+                &catalog,
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 1,
+                    end: 3,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            selected.weight().recipe.infer(&catalog).unwrap().shape(),
+            &[2, 6]
+        );
+        let published = selected.publish(&catalog, []).unwrap();
+        assert_eq!(published.iter().count(), 1);
+        assert_eq!(published.aliases().count(), 0);
+        assert_eq!(
+            published.get("model.weight").unwrap(),
+            &DerivedWeightRecipe::source(
+                "dense.weight",
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 1,
+                    end: 3,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn affine_matrix_family_selects_weight_scales_and_biases_coherently() {
+        let catalog = family_catalog(&[
+            ("affine.weight", &[4, 3], StoredDtype::U32),
+            ("affine.scales", &[4, 2], StoredDtype::F16),
+            ("affine.biases", &[4, 2], StoredDtype::F16),
+        ]);
+        let family = AtomicMatrixRecipeFamily::new(
+            &catalog,
+            member("model.weight", "affine.weight"),
+            Some(member("model.scales", "affine.scales")),
+            Some(member("model.biases", "affine.biases")),
+        )
+        .unwrap();
+        let selected = family
+            .select_leading_axis(
+                &catalog,
+                TensorSelection::Indices {
+                    axis: 0,
+                    indices: vec![3, 1],
+                },
+            )
+            .unwrap();
+        let published = selected.publish(&catalog, []).unwrap();
+        assert_eq!(published.iter().count(), 3);
+        assert_eq!(
+            published
+                .get("model.weight")
+                .unwrap()
+                .infer(&catalog)
+                .unwrap()
+                .shape(),
+            &[2, 3]
+        );
+        for companion in ["model.scales", "model.biases"] {
+            assert_eq!(
+                published
+                    .get(companion)
+                    .unwrap()
+                    .infer(&catalog)
+                    .unwrap()
+                    .shape(),
+                &[2, 2]
+            );
+        }
+    }
+
+    #[test]
+    fn mxfp4_matrix_family_preserves_scale_companion_without_biases() {
+        let catalog = family_catalog(&[
+            ("mxfp4.weight", &[4, 32], StoredDtype::F4),
+            ("mxfp4.scales", &[4, 1], StoredDtype::F8E8M0),
+        ]);
+        let family = AtomicMatrixRecipeFamily::new(
+            &catalog,
+            member("model.weight", "mxfp4.weight"),
+            Some(member("model.scales", "mxfp4.scales")),
+            None,
+        )
+        .unwrap();
+        let selected = family
+            .select_leading_axis(
+                &catalog,
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            selected.weight().recipe.infer(&catalog).unwrap().dtype(),
+            &RecipeDtype::F4
+        );
+        assert_eq!(
+            selected
+                .scales()
+                .unwrap()
+                .recipe
+                .infer(&catalog)
+                .unwrap()
+                .shape(),
+            &[1, 1]
+        );
+        assert!(selected.biases().is_none());
+    }
+
+    #[test]
+    fn matrix_family_rejects_malformed_companions_before_publication() {
+        let catalog = family_catalog(&[
+            ("weight", &[4, 8], StoredDtype::U32),
+            ("bad.scales", &[3, 2], StoredDtype::F16),
+            ("scales", &[4, 2], StoredDtype::F16),
+            ("bad.biases", &[4, 1], StoredDtype::F16),
+        ]);
+        assert!(matches!(
+            AtomicMatrixRecipeFamily::new(
+                &catalog,
+                member("model.weight", "weight"),
+                Some(member("model.scales", "bad.scales")),
+                None,
+            ),
+            Err(RecipeError::MatrixCompanionGeometry { .. })
+        ));
+        assert!(matches!(
+            AtomicMatrixRecipeFamily::new(
+                &catalog,
+                member("model.weight", "weight"),
+                None,
+                Some(member("model.biases", "bad.biases")),
+            ),
+            Err(RecipeError::MatrixBiasWithoutScales)
+        ));
+        assert!(matches!(
+            AtomicMatrixRecipeFamily::new(
+                &catalog,
+                member("model.weight", "weight"),
+                Some(member("model.scales", "scales")),
+                Some(member("model.biases", "bad.biases")),
+            ),
+            Err(RecipeError::MatrixScaleBiasGeometry { .. })
+        ));
+
+        let valid = AtomicMatrixRecipeFamily::new(
+            &catalog,
+            member("model.weight", "weight"),
+            Some(member("model.scales", "scales")),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            valid.select_leading_axis(
+                &catalog,
+                TensorSelection::Range {
+                    axis: 1,
+                    start: 0,
+                    end: 1,
+                }
+            ),
+            Err(RecipeError::MatrixFamilySelectionAxis { axis: 1 })
+        ));
+    }
+
+    #[test]
+    fn aliases_resolve_to_one_canonical_owner_without_recipe_duplication() {
+        let catalog = family_catalog(&[("shared", &[2, 3], StoredDtype::F16)]);
+        let family = AtomicMatrixRecipeFamily::new(
+            &catalog,
+            member("canonical.weight", "shared"),
+            None,
+            None,
+        )
+        .unwrap();
+        let published = family
+            .publish(
+                &catalog,
+                [
+                    RecipeAlias::new("slice.1.weight", "canonical.weight"),
+                    RecipeAlias::new("slice.2.weight", "slice.1.weight"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            published.aliases().collect::<Vec<_>>(),
+            vec![
+                ("slice.1.weight", "canonical.weight"),
+                ("slice.2.weight", "canonical.weight"),
+            ]
+        );
+        let (_, canonical) = published.get_resolved("canonical.weight").unwrap();
+        let (owner, aliased) = published.get_resolved("slice.2.weight").unwrap();
+        assert_eq!(owner, "canonical.weight");
+        assert!(std::ptr::eq(canonical, aliased));
+        let (outputs, aliases) = published.into_parts();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(aliases.len(), 2);
+    }
+
+    #[test]
+    fn alias_validation_rejects_collision_cycle_and_unknown_destination_atomically() {
+        let catalog = family_catalog(&[("shared", &[2, 3], StoredDtype::F16)]);
+        let outputs = || {
+            [(
+                "canonical.weight".to_owned(),
+                DerivedWeightRecipe::source("shared", TensorSelection::Full),
+            )]
+        };
+        assert!(matches!(
+            AtomicRecipeSet::new_with_aliases(
+                &catalog,
+                outputs(),
+                [RecipeAlias::new("canonical.weight", "canonical.weight")],
+            ),
+            Err(RecipeError::AliasOutputCollision { .. })
+        ));
+        assert!(matches!(
+            AtomicRecipeSet::new_with_aliases(
+                &catalog,
+                outputs(),
+                [
+                    RecipeAlias::new("first", "second"),
+                    RecipeAlias::new("second", "first"),
+                ],
+            ),
+            Err(RecipeError::AliasCycle { .. })
+        ));
+        assert!(matches!(
+            AtomicRecipeSet::new_with_aliases(
+                &catalog,
+                outputs(),
+                [RecipeAlias::new("orphan", "missing.weight")],
+            ),
+            Err(RecipeError::InvalidAliasDestination { .. })
+        ));
+        assert!(matches!(
+            AtomicRecipeSet::new_with_aliases(
+                &catalog,
+                outputs(),
+                [
+                    RecipeAlias::new("duplicate", "canonical.weight"),
+                    RecipeAlias::new("duplicate", "canonical.weight"),
+                ],
+            ),
+            Err(RecipeError::DuplicateAlias { .. })
+        ));
     }
 }

@@ -1149,6 +1149,21 @@ pub struct ShardedOutput {
     replicated: bool,
 }
 
+fn uneven_partition_widths(global_dimension: usize, parts: usize) -> Result<Vec<usize>, Error> {
+    if parts == 0 {
+        return Err(Error::Parallel(
+            "vocabulary partition count must be nonzero".into(),
+        ));
+    }
+    (0..parts)
+        .map(|rank| {
+            balanced_contiguous_range(global_dimension, parts, rank, false)
+                .map(|range| range.len())
+                .map_err(Into::into)
+        })
+        .collect()
+}
+
 impl ShardedOutput {
     /// Returns the local array.
     pub const fn array(&self) -> &Array {
@@ -1190,12 +1205,7 @@ impl ShardedOutput {
         let group = context.group().ok_or_else(|| {
             Error::Parallel("sharded output requires a tensor-parallel execution context".into())
         })?;
-        let widths = (0..context.size())
-            .map(|rank| {
-                balanced_contiguous_range(self.global_dimension, context.size(), rank, false)
-                    .map(|range| range.len())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let widths = uneven_partition_widths(self.global_dimension, context.size())?;
         Ok(safemlx::distributed::all_gather_uneven_axis(
             &self.array,
             self.axis,
@@ -1621,6 +1631,14 @@ mod tests {
         };
         let execution = ParallelExecutionContext::replicated(&stream);
         assert!(output.all_gather(&execution).is_err());
+    }
+
+    #[test]
+    fn uneven_vocabulary_gather_uses_exact_rank_widths() {
+        assert_eq!(uneven_partition_widths(11, 3).unwrap(), [4, 4, 3]);
+        assert_eq!(uneven_partition_widths(10, 4).unwrap(), [3, 3, 2, 2]);
+        assert!(uneven_partition_widths(2, 3).is_err());
+        assert!(uneven_partition_widths(8, 0).is_err());
     }
 
     #[test]

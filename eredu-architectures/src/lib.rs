@@ -26,6 +26,9 @@ pub mod gpt_oss;
 /// Llama and Mistral-compatible decoder architecture.
 pub mod llama;
 
+/// Moshi-family realtime temporal/depth architecture policy.
+pub mod moshi;
+
 /// Kimi Linear hybrid KDA/MLA decoder family.
 pub mod kimi_linear;
 /// LFM2 and LFM2-MoE hybrid decoder architecture.

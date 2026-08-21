@@ -79,7 +79,23 @@ pub trait ParameterBackend: NeuralBackend {
         materialization: Self::Materialization,
     ) -> Result<Self::MaterializedWeight, Self::ParameterError>;
 
+    /// Creates another native handle to identical materialized storage without
+    /// rereading or rematerializing checkpoint data.
+    fn share_materialized_weight(
+        weight: &Self::MaterializedWeight,
+    ) -> Result<Self::MaterializedWeight, Self::ParameterError>;
+
+    /// Validates destination shape/storage compatibility without publication.
+    fn validate_bind(
+        parameter: &Self::Parameter,
+        weight: &Self::MaterializedWeight,
+    ) -> Result<(), Self::ParameterError>;
+
     /// Binds one materialized weight to its destination parameter.
+    ///
+    /// After successful [`Self::validate_bind`] on unchanged arguments this
+    /// operation must not fail, allowing orchestration to validate an entire
+    /// atomic unit before publishing any destination.
     fn bind(
         parameter: &mut Self::Parameter,
         weight: Self::MaterializedWeight,

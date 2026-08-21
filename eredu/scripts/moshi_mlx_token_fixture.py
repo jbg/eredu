@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Export deterministic Moshi token-only parity tensors from moshi_mlx."""
+"""Export deterministic native-Moshi parity tensors from ``moshi_mlx``.
+
+By default ``model_dir`` must already contain the native artifact consumed by
+the Rust example. ``--create-tiny`` is an explicit test-only mode that writes a
+small native-config checkpoint; it does not represent a released profile.
+
+The matching command is:
+
+  cargo run -p eredu --features mlx --example moshi_token_parity -- \
+    MODEL_DIR OUTPUT.safetensors
+"""
 
 import argparse
 import importlib.metadata
@@ -233,6 +243,50 @@ def main() -> None:
         tensors["generation.expected_audio"] = mx.stack(generated_audio, axis=2)
     else:
         tensors["generation.expected_audio"] = mx.zeros(
+            (args.batch_size, config.generated_codebooks, 0), dtype=mx.int32
+        )
+
+    seeded_seed = args.seed + 4
+    seeded_text_temperature = 0.7
+    seeded_audio_temperature = 0.8
+    seeded_model = models.Lm(config)
+    seeded_model.set_dtype(mx.bfloat16)
+    if ".q4." in weights_name or ".q8." in weights_name:
+        bits = 4 if ".q4." in weights_name else 8
+        group_size = 32 if bits == 4 else 64
+        nn.quantize(seeded_model, bits=bits, group_size=group_size)
+    seeded_model.load_weights(str(args.model_dir / weights_name), strict=True)
+    # Model construction/loading may consume the global MLX PRNG. Align the
+    # reference stream with Rust immediately before sampling begins.
+    mx.random.seed(seeded_seed)
+    seeded_generator = models.LmGen(
+        model=seeded_model,
+        max_steps=args.steps,
+        text_sampler=utils.Sampler(temp=seeded_text_temperature, top_p=1.0),
+        audio_sampler=utils.Sampler(temp=seeded_audio_temperature, top_p=1.0),
+        check=False,
+    )
+    seeded_text = []
+    seeded_audio = []
+    for step in range(args.steps):
+        step_result = seeded_generator.step(tensors["generation.input_audio"][:, :, step])
+        text_token = step_result[0] if isinstance(step_result, tuple) else step_result
+        seeded_text.append(text_token.squeeze(-1))
+        audio_tokens = seeded_generator.last_audio_tokens()
+        if audio_tokens is not None:
+            seeded_audio.append(audio_tokens)
+    tensors["generation.seeded.seed"] = mx.array([seeded_seed], dtype=mx.int64)
+    tensors["generation.seeded.text_temperature"] = mx.array(
+        [seeded_text_temperature], dtype=mx.float32
+    )
+    tensors["generation.seeded.audio_temperature"] = mx.array(
+        [seeded_audio_temperature], dtype=mx.float32
+    )
+    tensors["generation.seeded.expected_text"] = mx.stack(seeded_text, axis=1)
+    if seeded_audio:
+        tensors["generation.seeded.expected_audio"] = mx.stack(seeded_audio, axis=2)
+    else:
+        tensors["generation.seeded.expected_audio"] = mx.zeros(
             (args.batch_size, config.generated_codebooks, 0), dtype=mx.int32
         )
 

@@ -1,19 +1,25 @@
 //! Reusable MLX realization of architecture-declared key/value state.
 
-use std::{collections::BTreeMap, ops::Range, path::Path};
+use std::{
+    collections::BTreeMap,
+    ops::{Deref, DerefMut, Range},
+    path::Path,
+};
 
 use eredu_core::cache::{
     LayerCachePolicy, PoolingStateComponent, PromptCacheDescriptor, PromptCacheManifest,
     PromptCacheOptions, StateTensorOwner, StateTensorRole,
 };
+use eredu_core::scheduler::SemanticStateTransaction;
 use eredu_nn::{
     AttentionCache, AttentionRequest, CompressedAttentionBlock, CompressedAttentionCache,
     CompressedAttentionScan, CompressedAttentionState, CompressedAttentionView,
     Error as ComputeError, PoolingAttentionCache, PoolingOverlap, PoolingWindows,
 };
 use eredu_runtime::{
-    CacheResidencyReport, LayerRuntimeState, RuntimeLayerState, RuntimeState,
-    RuntimeStateComponents, StateError, StateLayout,
+    CacheResidencyReport, LayerRuntimeState, ResettableRuntimeLayerState, ResettableRuntimeState,
+    RuntimeLayerState, RuntimeState, RuntimeStateComponents, StateError, StateLayout,
+    StateSegmentId, StateSegmentSpec,
 };
 use safemlx::{
     error::Exception,
@@ -30,7 +36,7 @@ use crate::{
         runtime::cache::{
             kv::{
                 CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-                PoolingCacheState, RetainedArrayIter,
+                PagedKeyValueTransactionCheckpoint, PoolingCacheState, RetainedArrayIter,
             },
             residency::{
                 CacheResidencyManager, LoadedPromptCacheStateTensor, PromptCacheStateArray,
@@ -667,11 +673,44 @@ impl RuntimeLayerState<MlxBackend> for MlxKeyValueLayerState {
     }
 }
 
+impl ResettableRuntimeLayerState<MlxBackend> for MlxKeyValueLayerState {
+    fn reset(&mut self) -> Result<(), StateError> {
+        self.clear()
+            .map_err(|error| StateError::ResetFailed(error.to_string()))
+    }
+}
+
 /// Model-wide MLX key/value state created solely from a neutral layout.
 #[derive(Debug, Clone)]
 pub struct MlxKeyValueState {
     layout: StateLayout,
     layers: Vec<MlxKeyValueLayerState>,
+    paged_transaction_branch: bool,
+}
+
+/// Unpublished, independently mutable resident MLX key/value state.
+///
+/// The private wrapper prevents callers from satisfying a semantic transaction
+/// with the public shallow [`Clone`] implementation. It can only be created by
+/// [`SemanticStateTransaction::branch`], which uses exact deep array clones.
+#[derive(Debug)]
+pub struct MlxKeyValueTransactionBranch {
+    state: MlxKeyValueState,
+    paged_rollback: Vec<Option<PagedKeyValueTransactionCheckpoint>>,
+}
+
+impl Deref for MlxKeyValueTransactionBranch {
+    type Target = MlxKeyValueState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl DerefMut for MlxKeyValueTransactionBranch {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
 }
 
 impl MlxKeyValueState {
@@ -689,7 +728,11 @@ impl MlxKeyValueState {
                 }))
             })
             .collect::<Result<Vec<_>, Exception>>()?;
-        Ok(Self { layout, layers })
+        Ok(Self {
+            layout,
+            layers,
+            paged_transaction_branch: false,
+        })
     }
 
     /// Creates block-addressable state using one shared residency manager.
@@ -708,7 +751,11 @@ impl MlxKeyValueState {
                     .map(MlxKeyValueLayerState::Paged)
             })
             .collect::<Result<Vec<_>, Exception>>()?;
-        Ok(Self { layout, layers })
+        Ok(Self {
+            layout,
+            layers,
+            paged_transaction_branch: false,
+        })
     }
 
     /// Returns the common absolute token offset, or zero for an empty state.
@@ -724,6 +771,14 @@ impl MlxKeyValueState {
         Ok(())
     }
 
+    /// Borrows every native array retained by the complete model state.
+    pub fn retained_arrays(&self) -> Vec<&Array> {
+        self.layers
+            .iter()
+            .flat_map(RuntimeLayerState::<MlxBackend>::retained_values)
+            .collect()
+    }
+
     /// Creates an independently advanceable speculative fork.
     pub(crate) fn deep_clone_state(&self) -> Result<Self, Exception> {
         Ok(Self {
@@ -733,7 +788,25 @@ impl MlxKeyValueState {
                 .iter()
                 .map(MlxKeyValueLayerState::deep_clone_state)
                 .collect::<Result<_, _>>()?,
+            paged_transaction_branch: self.paged_transaction_branch,
         })
+    }
+
+    fn has_same_transaction_identity(&self, other: &Self) -> bool {
+        self.layout == other.layout
+            && self.layers.len() == other.layers.len()
+            && self
+                .layers
+                .iter()
+                .zip(&other.layers)
+                .all(|(canonical, branch)| match (canonical, branch) {
+                    (MlxKeyValueLayerState::Device(_), MlxKeyValueLayerState::Device(_)) => true,
+                    (
+                        MlxKeyValueLayerState::Paged(canonical),
+                        MlxKeyValueLayerState::Paged(branch),
+                    ) => canonical.has_same_transaction_identity(branch),
+                    _ => false,
+                })
     }
 
     /// Restores every append-only layer to an exact speculative checkpoint.
@@ -789,6 +862,70 @@ impl MlxKeyValueState {
     }
 }
 
+impl SemanticStateTransaction for MlxKeyValueState {
+    type Branch = MlxKeyValueTransactionBranch;
+    type Error = Exception;
+
+    fn branch(&self) -> Result<Self::Branch, Self::Error> {
+        let paged_rollback = self
+            .layers
+            .iter()
+            .map(|layer| match layer {
+                MlxKeyValueLayerState::Device(_) => Ok(None),
+                MlxKeyValueLayerState::Paged(cache) => cache.transaction_checkpoint().map(Some),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.deep_clone_state().map(|mut state| {
+            state.paged_transaction_branch = paged_rollback.iter().any(Option::is_some);
+            MlxKeyValueTransactionBranch {
+                state,
+                paged_rollback,
+            }
+        })
+    }
+
+    fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Self::Error> {
+        if !self.has_same_transaction_identity(&branch.state) {
+            Self::discard_branch(branch)?;
+            return Err(Exception::custom(
+                "key/value transaction branch identity does not match canonical state",
+            ));
+        }
+        let mut state = branch.state;
+        state.paged_transaction_branch = false;
+        *self = state;
+        Ok(())
+    }
+
+    fn discard_branch(mut branch: Self::Branch) -> Result<(), Self::Error> {
+        let mut first_error = None;
+        for (layer, checkpoint) in branch
+            .state
+            .layers
+            .iter_mut()
+            .zip(branch.paged_rollback.iter())
+        {
+            let (MlxKeyValueLayerState::Paged(cache), Some(checkpoint)) = (layer, checkpoint)
+            else {
+                continue;
+            };
+            if let Err(error) = cache.rollback_transaction(checkpoint) {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn permits_parallel_branches(&self) -> bool {
+        self.layers
+            .iter()
+            .all(|layer| matches!(layer, MlxKeyValueLayerState::Device(_)))
+    }
+}
+
 impl RuntimeState<MlxBackend> for MlxKeyValueState {
     type RetainedValues<'a> = RetainedArrayIter<'a>;
 
@@ -820,6 +957,32 @@ impl LayerRuntimeState<MlxBackend> for MlxKeyValueState {
         self.layers
             .get_mut(layer)
             .ok_or(StateError::UnknownLayer { layer, count })
+    }
+}
+
+impl ResettableRuntimeState<MlxBackend> for MlxKeyValueState {
+    fn reset_segment(&mut self, segment: &StateSegmentId) -> Result<(), StateError> {
+        let range = self
+            .layout
+            .segment(segment)
+            .map(StateSegmentSpec::layers)
+            .ok_or_else(|| StateError::UnknownSegment {
+                segment: segment.clone(),
+            })?;
+        if self.paged_transaction_branch
+            && self.layers[range.clone()]
+                .iter()
+                .any(|layer| matches!(layer, MlxKeyValueLayerState::Paged(_)))
+        {
+            return Err(StateError::ResetFailed(
+                "paged state segments cannot be reset inside a transaction branch without copy-on-write page ownership"
+                    .into(),
+            ));
+        }
+        for layer in &mut self.layers[range] {
+            ResettableRuntimeLayerState::<MlxBackend>::reset(layer)?;
+        }
+        Ok(())
     }
 }
 
@@ -1758,5 +1921,209 @@ fn hybrid_attention_policy(
         LayerCachePolicy::CompressedLatentRotary { .. } => {
             Ok(Some(HybridAttentionPolicy::Compressed))
         }
+    }
+}
+
+#[cfg(test)]
+mod semantic_transaction_tests {
+    use super::*;
+    use eredu_core::{cache::CacheRepresentation, AttentionPolicy, LayerSchedule};
+    use eredu_runtime::{PagedCacheOptions, StateSegmentLifetime};
+
+    fn layout(window: Option<i32>) -> StateLayout {
+        StateLayout::new(
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::key_value(
+                    AttentionPolicy::from_sliding_window(window).unwrap(),
+                    1,
+                    8,
+                )
+                .unwrap()],
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn manager() -> CacheResidencyManager {
+        CacheResidencyManager::new(
+            PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true),
+        )
+        .unwrap()
+    }
+
+    fn segmented_layout() -> StateLayout {
+        let policy = LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap();
+        StateLayout::segmented(
+            LayerSchedule::new(2, vec![policy.clone(), policy]).unwrap(),
+            [
+                StateSegmentSpec::new("temporal", 0..1, StateSegmentLifetime::Persistent).unwrap(),
+                StateSegmentSpec::new("depth", 1..2, StateSegmentLifetime::FrameLocal).unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn device_transaction_uses_an_independent_semantic_branch() {
+        let mut canonical = MlxKeyValueState::device(layout(Some(4))).unwrap();
+        let branch = canonical.branch().unwrap();
+
+        assert!(canonical.permits_parallel_branches());
+        assert!(canonical.has_same_transaction_identity(&branch));
+        canonical.commit_branch(branch).unwrap();
+    }
+
+    #[test]
+    fn transaction_rejects_layout_and_residency_changes() {
+        let canonical = MlxKeyValueState::device(layout(Some(4))).unwrap();
+        let different_layout = MlxKeyValueState::device(layout(Some(8))).unwrap();
+        assert!(!canonical.has_same_transaction_identity(&different_layout));
+
+        let paged = MlxKeyValueState::paged(layout(Some(4)), manager(), None).unwrap();
+        assert!(!canonical.has_same_transaction_identity(&paged));
+    }
+
+    #[test]
+    fn paged_transaction_discard_restores_shared_manager_frontier() {
+        let canonical = MlxKeyValueState::paged(layout(None), manager(), None).unwrap();
+        assert!(!canonical.permits_parallel_branches());
+        let branch = canonical.branch().unwrap();
+        let manager = match &branch.state.layers[0] {
+            MlxKeyValueLayerState::Paged(cache) => cache.manager().clone(),
+            MlxKeyValueLayerState::Device(_) => unreachable!(),
+        };
+        manager.set_tail_state(0, 0, 3).unwrap();
+        assert_eq!(manager.report().unwrap().logical_cached_tokens, 3);
+
+        MlxKeyValueState::discard_branch(branch).unwrap();
+
+        assert_eq!(canonical.offset(), 0);
+        assert_eq!(manager.report().unwrap().logical_cached_tokens, 0);
+    }
+
+    #[test]
+    fn paged_transaction_rejects_segment_reset_before_shared_page_mutation() {
+        let canonical = MlxKeyValueState::paged(segmented_layout(), manager(), None).unwrap();
+        let mut branch = canonical.branch().unwrap();
+
+        let error = branch
+            .reset_segment(&StateSegmentId::new("depth").unwrap())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("copy-on-write page ownership"));
+        MlxKeyValueState::discard_branch(branch).unwrap();
+        assert_eq!(canonical.offset(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires local MLX execution"]
+    fn paged_depth_segment_reset_preserves_temporal_pages_and_later_rollback() {
+        let manager = manager();
+        let mut canonical =
+            MlxKeyValueState::paged(segmented_layout(), manager.clone(), None).unwrap();
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        for (layer, value) in [(0usize, 1.0f32), (1, 2.0)] {
+            canonical.layers[layer]
+                .update_and_fetch(
+                    Array::from_slice(&[value; 5], &[1, 1, 5, 1]),
+                    Array::from_slice(&[value + 10.0; 5], &[1, 1, 5, 1]),
+                    &stream,
+                )
+                .unwrap();
+        }
+        assert_eq!(KeyValueCache::offset(&canonical.layers[0]), 5);
+        assert_eq!(KeyValueCache::offset(&canonical.layers[1]), 5);
+        assert!(!manager
+            .layer_block_ids(0, CacheRepresentation::KeyValue, 0, i64::MAX, 0)
+            .unwrap()
+            .is_empty());
+        assert!(!manager
+            .layer_block_ids(1, CacheRepresentation::KeyValue, 0, i64::MAX, 0)
+            .unwrap()
+            .is_empty());
+
+        canonical
+            .reset_segment(&StateSegmentId::new("depth").unwrap())
+            .unwrap();
+
+        assert_eq!(KeyValueCache::offset(&canonical.layers[0]), 5);
+        assert_eq!(KeyValueCache::offset(&canonical.layers[1]), 0);
+        assert!(!manager
+            .layer_block_ids(0, CacheRepresentation::KeyValue, 0, i64::MAX, 0)
+            .unwrap()
+            .is_empty());
+        assert!(manager
+            .layer_block_ids(1, CacheRepresentation::KeyValue, 0, i64::MAX, 0)
+            .unwrap()
+            .is_empty());
+
+        let mut discarded = canonical.branch().unwrap();
+        discarded.layers[1]
+            .update_and_fetch(
+                Array::from_slice(&[3.0f32; 2], &[1, 1, 2, 1]),
+                Array::from_slice(&[4.0f32; 2], &[1, 1, 2, 1]),
+                &stream,
+            )
+            .unwrap();
+        MlxKeyValueState::discard_branch(discarded).unwrap();
+        assert_eq!(KeyValueCache::offset(&canonical.layers[0]), 5);
+        assert_eq!(KeyValueCache::offset(&canonical.layers[1]), 0);
+
+        let mut resumed = canonical.branch().unwrap();
+        resumed.layers[1]
+            .update_and_fetch(
+                Array::from_slice(&[5.0f32; 2], &[1, 1, 2, 1]),
+                Array::from_slice(&[6.0f32; 2], &[1, 1, 2, 1]),
+                &stream,
+            )
+            .unwrap();
+        canonical.commit_branch(resumed).unwrap();
+        assert_eq!(KeyValueCache::offset(&canonical.layers[0]), 5);
+        assert_eq!(KeyValueCache::offset(&canonical.layers[1]), 2);
+    }
+
+    #[test]
+    fn paged_sliding_transaction_fails_before_branch_publication() {
+        let canonical = MlxKeyValueState::paged(layout(Some(4)), manager(), None).unwrap();
+        let error = canonical.branch().unwrap_err();
+        assert!(error.to_string().contains("paged sliding attention"));
+    }
+
+    #[test]
+    #[ignore = "requires local MLX execution"]
+    fn stage8_mlx_realtime_transaction_paged_rollback_release_resume() {
+        let mut canonical = MlxKeyValueState::paged(layout(None), manager(), None).unwrap();
+        let mut branch = canonical.branch().unwrap();
+        let manager = match &branch.state.layers[0] {
+            MlxKeyValueLayerState::Paged(cache) => cache.manager().clone(),
+            MlxKeyValueLayerState::Device(_) => unreachable!(),
+        };
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let keys = Array::from_slice(&[1.0_f32; 5], &[1, 1, 5, 1]);
+        let values = Array::from_slice(&[2.0_f32; 5], &[1, 1, 5, 1]);
+        branch.state.layers[0]
+            .update_and_fetch(keys, values, &stream)
+            .unwrap();
+        assert_eq!(manager.report().unwrap().logical_cached_tokens, 5);
+
+        MlxKeyValueState::discard_branch(branch).unwrap();
+
+        let report = manager.report().unwrap();
+        assert_eq!(report.logical_cached_tokens, 0);
+        assert_eq!(canonical.offset(), 0);
+
+        let mut resumed = canonical.branch().unwrap();
+        let keys = Array::from_slice(&[3.0_f32; 2], &[1, 1, 2, 1]);
+        let values = Array::from_slice(&[4.0_f32; 2], &[1, 1, 2, 1]);
+        resumed.state.layers[0]
+            .update_and_fetch(keys, values, &stream)
+            .unwrap();
+        canonical.commit_branch(resumed).unwrap();
+        assert_eq!(canonical.offset(), 2);
+        assert_eq!(manager.report().unwrap().logical_cached_tokens, 2);
     }
 }

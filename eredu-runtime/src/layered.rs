@@ -16,6 +16,203 @@ pub struct LayeredForwardState<T, C> {
     pub context: C,
 }
 
+/// Stable layered traversal boundary exposed to generic runtime drivers.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LayeredTraversalPoint {
+    /// Output of one execution unit before the next unit starts.
+    Unit {
+        /// Execution-group index.
+        group: usize,
+        /// Group-local unit index.
+        index: usize,
+    },
+    /// Output of one completed execution group.
+    Group {
+        /// Execution-group index.
+        group: usize,
+    },
+}
+
+/// Decision returned immediately before one execution unit is acquired.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LayeredUnitAction {
+    /// Execute this unit normally.
+    Execute,
+    /// Omit this unit and every remaining unit in the current group.
+    SkipRemainingGroup,
+}
+
+/// Statically dispatched hook shared by resident and bounded layered traversal.
+///
+/// The hook can observe unit/group outputs and can omit only a complete group
+/// tail. Drivers are responsible for proving that an omission preserves their
+/// semantics before returning [`LayeredUnitAction::SkipRemainingGroup`].
+pub trait LayeredTraversalHook<B, C, E>
+where
+    B: NeuralBackend,
+{
+    /// Chooses whether to execute the next unit.
+    fn before_unit(
+        &mut self,
+        _group: usize,
+        _index: usize,
+        _remaining_units: usize,
+        _value: &B::Tensor,
+        _forward: &mut C,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<LayeredUnitAction, E> {
+        Ok(LayeredUnitAction::Execute)
+    }
+
+    /// Observes one executed unit output.
+    fn after_unit(
+        &mut self,
+        _group: usize,
+        _index: usize,
+        _value: &B::Tensor,
+        _forward: &mut C,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        Ok(())
+    }
+
+    /// Observes one completed execution-group output.
+    fn after_group(
+        &mut self,
+        _group: usize,
+        _value: &B::Tensor,
+        _forward: &mut C,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        Ok(())
+    }
+}
+
+/// Statically combines two traversal hooks over one production forward pass.
+///
+/// Both hooks observe every reached boundary in left-to-right order. A unit is
+/// skipped when either hook proves that the remaining group tail can be
+/// omitted; errors stop delegation before any later callback is invoked.
+pub struct CompositeLayeredTraversalHook<L, R> {
+    left: L,
+    right: R,
+}
+
+impl<L, R> CompositeLayeredTraversalHook<L, R> {
+    /// Creates one ordered pair of traversal hooks.
+    pub const fn new(left: L, right: R) -> Self {
+        Self { left, right }
+    }
+
+    /// Returns both hooks after traversal.
+    pub fn into_parts(self) -> (L, R) {
+        (self.left, self.right)
+    }
+}
+
+impl<B, C, E, L, R> LayeredTraversalHook<B, C, E> for CompositeLayeredTraversalHook<L, R>
+where
+    B: NeuralBackend,
+    L: LayeredTraversalHook<B, C, E>,
+    R: LayeredTraversalHook<B, C, E>,
+{
+    fn before_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        remaining_units: usize,
+        value: &B::Tensor,
+        forward: &mut C,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<LayeredUnitAction, E> {
+        let left = self
+            .left
+            .before_unit(group, index, remaining_units, value, forward, context)?;
+        let right =
+            self.right
+                .before_unit(group, index, remaining_units, value, forward, context)?;
+        Ok(
+            if left == LayeredUnitAction::SkipRemainingGroup
+                || right == LayeredUnitAction::SkipRemainingGroup
+            {
+                LayeredUnitAction::SkipRemainingGroup
+            } else {
+                LayeredUnitAction::Execute
+            },
+        )
+    }
+
+    fn after_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        value: &B::Tensor,
+        forward: &mut C,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        self.left
+            .after_unit(group, index, value, forward, context)?;
+        self.right.after_unit(group, index, value, forward, context)
+    }
+
+    fn after_group(
+        &mut self,
+        group: usize,
+        value: &B::Tensor,
+        forward: &mut C,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        self.left.after_group(group, value, forward, context)?;
+        self.right.after_group(group, value, forward, context)
+    }
+}
+
+struct NoopLayeredTraversalHook;
+
+impl<B, C, E> LayeredTraversalHook<B, C, E> for NoopLayeredTraversalHook where B: NeuralBackend {}
+
+struct AfterUnitTraversalHook<F> {
+    after_unit: F,
+}
+
+struct AfterUnitContextTraversalHook<F> {
+    after_unit: F,
+}
+
+impl<B, C, E, F> LayeredTraversalHook<B, C, E> for AfterUnitTraversalHook<F>
+where
+    B: NeuralBackend,
+    F: FnMut(usize, usize, &B::Tensor, &mut C) -> Result<(), E>,
+{
+    fn after_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        value: &B::Tensor,
+        forward: &mut C,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        (self.after_unit)(group, index, value, forward)
+    }
+}
+
+impl<B, C, E, F> LayeredTraversalHook<B, C, E> for AfterUnitContextTraversalHook<F>
+where
+    B: NeuralBackend,
+    F: FnMut(usize, usize, &mut C) -> Result<(), E>,
+{
+    fn after_unit(
+        &mut self,
+        group: usize,
+        index: usize,
+        _value: &B::Tensor,
+        forward: &mut C,
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        (self.after_unit)(group, index, forward)
+    }
+}
+
 /// Backend-neutral lifecycle implemented once by a layered architecture.
 ///
 /// All hot values remain concrete associated types. Resident and bounded
@@ -101,6 +298,21 @@ where
     /// and remap later groups onto their semantic decoder or predictor layers.
     fn state_ordinal(&self, _group: usize, _index: usize, ordinal: usize) -> usize {
         ordinal
+    }
+
+    /// Returns every architecture-global state slot retained by one unit.
+    ///
+    /// The default retains the single slot returned by [`Self::state_ordinal`].
+    /// Composite units can return a contiguous range when one residency unit
+    /// internally executes several stateful layers.
+    fn retained_state_ordinals(
+        &self,
+        group: usize,
+        index: usize,
+        ordinal: usize,
+    ) -> std::ops::Range<usize> {
+        let state = self.state_ordinal(group, index, ordinal);
+        state..state + 1
     }
 
     /// Executes one ordered unit against its concrete mutable layer state.
@@ -279,6 +491,20 @@ where
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(B::Tensor, A::ForwardContext), A::Error> {
+        self.forward_with_traversal_hook(input, state, context, &mut NoopLayeredTraversalHook)
+    }
+
+    /// Runs one resident pass through a statically dispatched traversal hook.
+    pub fn forward_with_traversal_hook<'a, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        hook: &mut H,
+    ) -> Result<(B::Tensor, A::ForwardContext), A::Error>
+    where
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error>,
+    {
         let forward = self.architecture.begin_forward(input, state, context)?;
         let initial = forward.hidden;
         let mut forward_context = forward.context;
@@ -315,7 +541,19 @@ where
                 .architecture
                 .should_execute_group(group, &forward_context)
             {
+                let unit_count = self.units[group].len();
                 for (index, unit) in self.units[group].iter_mut().enumerate() {
+                    if hook.before_unit(
+                        group,
+                        index,
+                        unit_count - index,
+                        &hidden,
+                        &mut forward_context,
+                        context,
+                    )? == LayeredUnitAction::SkipRemainingGroup
+                    {
+                        break;
+                    }
                     hidden = self.architecture.forward_unit(
                         group,
                         index,
@@ -325,6 +563,7 @@ where
                         &mut forward_context,
                         context,
                     )?;
+                    hook.after_unit(group, index, &hidden, &mut forward_context, context)?;
                 }
             }
             hidden = self.architecture.complete_execution_group(
@@ -334,6 +573,7 @@ where
                 &mut forward_context,
                 context,
             )?;
+            hook.after_group(group, &hidden, &mut forward_context, context)?;
             outputs[group] = Some(hidden);
             schedule
                 .ordered(group)
@@ -613,8 +853,8 @@ where
         input: A::Input<'a>,
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        mut execute: E,
-        mut hook: H,
+        execute: E,
+        hook: H,
     ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
         E: FnMut(
@@ -628,6 +868,59 @@ where
             &<B::Tensor as eredu_nn::Tensor>::Context,
         ) -> Result<B::Tensor, A::Error>,
         H: FnMut(usize, usize, &B::Tensor, &mut A::ForwardContext) -> Result<(), A::Error>,
+    {
+        self.forward_with_unit_executor_and_traversal_hook(
+            input,
+            state,
+            context,
+            execute,
+            &mut AfterUnitTraversalHook { after_unit: hook },
+        )
+    }
+
+    /// Runs one bounded pass through a statically dispatched traversal hook.
+    pub fn forward_with_traversal_hook<'a, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        hook: &mut H,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error>,
+    {
+        self.forward_with_unit_executor_and_traversal_hook(
+            input,
+            state,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, context| {
+                architecture.forward_unit(group, index, unit, hidden, state, forward, context)
+            },
+            hook,
+        )
+    }
+
+    /// Runs one bounded pass with custom unit execution and a shared traversal hook.
+    pub fn forward_with_unit_executor_and_traversal_hook<'a, E, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        hook: &mut H,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error>,
     {
         let graph = self
             .architecture
@@ -713,11 +1006,25 @@ where
                 .architecture
                 .should_execute_group(group, &forward_context)
             {
-                for index in 0..layout
+                let unit_count = layout
                     .group_range(group)
                     .expect("layout covers every graph group")
-                    .len()
-                {
+                    .len();
+                for index in 0..unit_count {
+                    if hook
+                        .before_unit(
+                            group,
+                            index,
+                            unit_count - index,
+                            &hidden,
+                            &mut forward_context,
+                            executor,
+                        )
+                        .map_err(LayerwiseRuntimeError::Architecture)?
+                        == LayeredUnitAction::SkipRemainingGroup
+                    {
+                        break;
+                    }
                     let ordinal = layout
                         .ordinal(group, index)
                         .expect("group-local unit belongs to the layout");
@@ -739,12 +1046,19 @@ where
                         executor,
                     )
                     .map_err(LayerwiseRuntimeError::Architecture)?;
-                    hook(group, index, &hidden, &mut forward_context)
+                    hook.after_unit(group, index, &hidden, &mut forward_context, executor)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
-                    let state_ordinal = self.architecture.state_ordinal(group, index, ordinal);
-                    let state_values = state
-                        .retained_values(state_ordinal, address.with_index(state_ordinal))
-                        .map_err(LayerwiseRuntimeError::State)?;
+                    let mut state_values = Vec::new();
+                    for state_ordinal in self
+                        .architecture
+                        .retained_state_ordinals(group, index, ordinal)
+                    {
+                        state_values.extend(
+                            state
+                                .retained_values(state_ordinal, address.with_index(state_ordinal))
+                                .map_err(LayerwiseRuntimeError::State)?,
+                        );
+                    }
                     let context_values =
                         self.architecture
                             .retained_context_values(&forward_context, group, index);
@@ -754,7 +1068,7 @@ where
                             address,
                             lease,
                             &hidden,
-                            state_values,
+                            state_values.into_iter(),
                             context_values,
                             executor,
                         )
@@ -764,6 +1078,8 @@ where
             hidden = self
                 .architecture
                 .complete_execution_group(group, &hidden, state, &mut forward_context, executor)
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            hook.after_group(group, &hidden, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             outputs[group] = Some(hidden);
             if graph.groups().len() > 1 {
@@ -826,7 +1142,7 @@ where
         A: ParallelLayeredArchitecture<B, S>,
         H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), A::Error>,
     {
-        self.forward_parallel_with_unit_executor_and_context_hook(
+        self.forward_parallel_with_unit_executor_and_traversal_hook(
             input,
             state,
             parallel,
@@ -836,7 +1152,7 @@ where
                     group, index, unit, hidden, state, forward, parallel, context,
                 )
             },
-            hook,
+            &mut AfterUnitContextTraversalHook { after_unit: hook },
         )
     }
 
@@ -881,8 +1197,8 @@ where
         state: &mut S,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        mut execute: E,
-        mut hook: H,
+        execute: E,
+        hook: H,
     ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
         A: ParallelLayeredArchitecture<B, S>,
@@ -898,6 +1214,68 @@ where
             &<B::Tensor as eredu_nn::Tensor>::Context,
         ) -> Result<B::Tensor, A::Error>,
         H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), A::Error>,
+    {
+        self.forward_parallel_with_unit_executor_and_traversal_hook(
+            input,
+            state,
+            parallel,
+            context,
+            execute,
+            &mut AfterUnitContextTraversalHook { after_unit: hook },
+        )
+    }
+
+    /// Runs one parallel pass through a statically dispatched traversal hook.
+    pub fn forward_parallel_with_traversal_hook<'a, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        hook: &mut H,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error>,
+    {
+        self.forward_parallel_with_unit_executor_and_traversal_hook(
+            input,
+            state,
+            parallel,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, parallel, context| {
+                architecture.forward_unit_parallel(
+                    group, index, unit, hidden, state, forward, parallel, context,
+                )
+            },
+            hook,
+        )
+    }
+
+    /// Runs one parallel pass with custom unit execution and a shared traversal hook.
+    pub fn forward_parallel_with_unit_executor_and_traversal_hook<'a, E, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        hook: &mut H,
+    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &B::ParallelContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error>,
     {
         let graph = self
             .architecture
@@ -984,11 +1362,25 @@ where
                 .architecture
                 .should_execute_group(group, &forward_context)
             {
-                for index in 0..layout
+                let unit_count = layout
                     .group_range(group)
                     .expect("layout covers every graph group")
-                    .len()
-                {
+                    .len();
+                for index in 0..unit_count {
+                    if hook
+                        .before_unit(
+                            group,
+                            index,
+                            unit_count - index,
+                            &hidden,
+                            &mut forward_context,
+                            executor,
+                        )
+                        .map_err(LayerwiseRuntimeError::Architecture)?
+                        == LayeredUnitAction::SkipRemainingGroup
+                    {
+                        break;
+                    }
                     let ordinal = layout
                         .ordinal(group, index)
                         .expect("group-local unit belongs to the layout");
@@ -1011,12 +1403,19 @@ where
                         executor,
                     )
                     .map_err(LayerwiseRuntimeError::Architecture)?;
-                    hook(group, index, &mut forward_context)
+                    hook.after_unit(group, index, &hidden, &mut forward_context, executor)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
-                    let state_ordinal = self.architecture.state_ordinal(group, index, ordinal);
-                    let state_values = state
-                        .retained_values(state_ordinal, address.with_index(state_ordinal))
-                        .map_err(LayerwiseRuntimeError::State)?;
+                    let mut state_values = Vec::new();
+                    for state_ordinal in self
+                        .architecture
+                        .retained_state_ordinals(group, index, ordinal)
+                    {
+                        state_values.extend(
+                            state
+                                .retained_values(state_ordinal, address.with_index(state_ordinal))
+                                .map_err(LayerwiseRuntimeError::State)?,
+                        );
+                    }
                     let context_values =
                         self.architecture
                             .retained_context_values(&forward_context, group, index);
@@ -1026,7 +1425,7 @@ where
                             address,
                             lease,
                             &hidden,
-                            state_values,
+                            state_values.into_iter(),
                             context_values,
                             executor,
                         )
@@ -1043,6 +1442,8 @@ where
                     parallel,
                     executor,
                 )
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            hook.after_group(group, &hidden, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             outputs[group] = Some(hidden);
             if graph.groups().len() > 1 {
@@ -1208,10 +1609,17 @@ where
                     hidden = hook(&path, &unit_input, &output)
                         .map_err(LayerwiseRuntimeError::Architecture)?
                         .unwrap_or(output);
-                    let state_ordinal = self.architecture.state_ordinal(group, index, ordinal);
-                    let state_values = state
-                        .retained_values(state_ordinal, address.with_index(state_ordinal))
-                        .map_err(LayerwiseRuntimeError::State)?;
+                    let mut state_values = Vec::new();
+                    for state_ordinal in self
+                        .architecture
+                        .retained_state_ordinals(group, index, ordinal)
+                    {
+                        state_values.extend(
+                            state
+                                .retained_values(state_ordinal, address.with_index(state_ordinal))
+                                .map_err(LayerwiseRuntimeError::State)?,
+                        );
+                    }
                     let context_values =
                         self.architecture
                             .retained_context_values(&forward_context, group, index);
@@ -1221,7 +1629,7 @@ where
                             address,
                             lease,
                             &hidden,
-                            state_values,
+                            state_values.into_iter(),
                             context_values,
                             executor,
                         )

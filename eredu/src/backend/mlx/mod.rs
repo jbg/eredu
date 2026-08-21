@@ -47,9 +47,7 @@ use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Strea
 use crate::composition::mlx::ModelProcessor;
 use crate::{
     backend::mlx::error::Error,
-    composition::mlx_architectures::distributed::{
-        expert::ExpertParallelModel, pipeline::PipelineModel,
-    },
+    composition::mlx::distributed::{expert::ExpertParallelModel, pipeline::PipelineModel},
 };
 
 /// Opaque MLX executable selected for one complete model session.
