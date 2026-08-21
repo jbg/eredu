@@ -58,7 +58,7 @@ fn prefill_tokens(
     model: &mut LoadedModel<eredu::backend::mlx::MlxBackend<'static>>,
 ) -> anyhow::Result<Array> {
     let parts = [InputPart::text_token_ids(tokens)];
-    let input = eredu::backend::mlx::MlxModelInput::from(ModelInput::new(&parts));
+    let input = eredu::composition::mlx::MlxModelInput::from(ModelInput::new(&parts));
     model
         .runtime_mut()
         .prefill(input)?

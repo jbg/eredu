@@ -17,18 +17,6 @@ pub mod residency;
 pub mod runtime;
 /// MLX process-local device binding for a canonical core rank topology.
 pub mod topology;
-pub use crate::composition::mlx::automatic;
-pub use crate::composition::mlx::{
-    available_memory, inspect_model, MlxGeneration, MlxInspectionOptions, MlxModelInput,
-    MlxModelOutput, MlxModelSession, MlxSessionCompletion, MlxTextCompletion,
-    MlxTextGenerationState, MlxTextToken, Model, ModelCache,
-};
-pub(crate) use crate::composition::mlx::{
-    gguf_eos_token_ids, submit_decode_with_cache, submit_prefill_with_cache,
-    validate_gguf_quantization_source,
-};
-#[cfg(test)]
-pub(crate) use crate::composition::mlx::{resolve_model_config, ResolvedModelConfig};
 pub(crate) use config::ensure_replicated_load_options;
 pub use config::ModelLoadOptions;
 pub(crate) use distributed::MlxDistributedConfig;
@@ -47,7 +35,10 @@ use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Strea
 use crate::composition::mlx::ModelProcessor;
 use crate::{
     backend::mlx::error::Error,
-    composition::mlx::distributed::{expert::ExpertParallelModel, pipeline::PipelineModel},
+    composition::mlx::{
+        distributed::{expert::ExpertParallelModel, pipeline::PipelineModel},
+        MlxModelSession, Model,
+    },
 };
 
 /// Opaque MLX executable selected for one complete model session.

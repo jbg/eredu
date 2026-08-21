@@ -6,7 +6,7 @@ cache, and paging a cache does not change where model weights live.
 
 ## Preflight
 
-Run `backend::mlx::inspect_model` with the same `MlxInspectionOptions` you
+Run `composition::mlx::inspect_model` with the same `MlxInspectionOptions` you
 intend to load on MLX.
 Inspection validates the artifact, architecture, requested quantization,
 residency policy, topology, processor, and media companion files without

@@ -306,7 +306,7 @@ impl<'a> DistributedBackend for MlxBackend<'a> {
     type DistributedSession = MlxDistributedSession<'a>;
 
     fn distributed_session<'session>(
-        session: &'session super::MlxModelSession<'a>,
+        session: &'session crate::composition::mlx::MlxModelSession<'a>,
     ) -> Option<&'session Self::DistributedSession> {
         session.distributed()
     }

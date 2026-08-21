@@ -188,10 +188,13 @@ collective tensor math remain backend-specific.
 
 ## MLX implementation
 
-The default MLX implementation lives under `eredu::backend::mlx`:
+The default MLX implementation is split between backend mechanics under
+`eredu::backend::mlx` and the public model facade under
+`eredu::composition::mlx`:
 
 - `MlxBackend` owns execution and weight-materialization streams.
-- `MlxModelSession` owns the executable model, cache, processor state, and
+- `composition::mlx::MlxModelSession` owns the executable model, cache,
+  processor state, and
   optional distributed context.
 - neural-network modules implement reusable MLX tensor operations;
 - runtime modules implement checkpoint materialization, sampling, caches,
@@ -199,7 +202,8 @@ The default MLX implementation lives under `eredu::backend::mlx`:
 - MLX events provide exact completion while retaining arrays and source
   resources required by submitted work.
 
-Model-family selection and MLX composition live under `eredu::composition`.
+Model-family selection and MLX composition live under `eredu::composition`;
+the backend module does not re-export that facade.
 The MLX backend directory contains no Llama configuration, checkpoint names,
 cache geometry, parallel head rules, or layer math.
 

@@ -3051,7 +3051,7 @@ pub(crate) fn load_gguf_tensor_parallel(
         metadata,
         layer_policy.max_mapped_shards(),
     )?;
-    let eos = crate::backend::mlx::gguf_eos_token_ids(metadata)?;
+    let eos = crate::composition::mlx::gguf_eos_token_ids(metadata)?;
     Ok((
         load_parallel_store(store, args, layer_policy, build, stream, weights_stream)?,
         eos,

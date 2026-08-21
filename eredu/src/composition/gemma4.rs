@@ -1780,7 +1780,7 @@ pub(crate) fn load_assistant_gguf(
             "Gemma 4 ordered assistant heads cannot be quantized".into(),
         ));
     }
-    crate::backend::mlx::validate_gguf_quantization_source(
+    crate::composition::mlx::validate_gguf_quantization_source(
         &checkpoint,
         &metadata,
         options.quantization,
@@ -3128,7 +3128,7 @@ pub(crate) fn load_gguf_tensor_parallel(
         metadata,
         residency.max_mapped_shards(),
     )?;
-    let eos = crate::backend::mlx::gguf_eos_token_ids(metadata)?;
+    let eos = crate::composition::mlx::gguf_eos_token_ids(metadata)?;
     Ok((
         load_parallel_store(store, args, residency, build, stream, weights_stream)?,
         eos,

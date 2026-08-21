@@ -12,9 +12,9 @@ use crate::{
     backend::mlx::runtime::execution::inspection::ActivationRecorder,
     backend::mlx::runtime::generation::sampler::{ConstrainedSampler, DefaultSampler},
     backend::mlx::runtime::media::input,
-    backend::mlx::{
-        resolve_model_config, validate_gguf_quantization_source, Model, ModelLoadOptions,
-        ResolvedModelConfig,
+    backend::mlx::ModelLoadOptions,
+    composition::mlx::{
+        resolve_model_config, validate_gguf_quantization_source, Model, ResolvedModelConfig,
     },
     core::generation::MtpSchedulerOptions,
     core::{ModelKind, SpeculativeExecutionTopology},
@@ -73,7 +73,7 @@ fn observer_forward_reports_attention_and_residual_hooks() {
         .unwrap();
     let mut recorder = ActivationRecorder::new();
     let parts = [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&input)];
-    let input = crate::backend::mlx::MlxModelInput::from(
+    let input = crate::composition::mlx::MlxModelInput::from(
         crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
     );
     let (backend, session) = model.runtime_mut().parts_mut();
@@ -173,7 +173,7 @@ fn prepared_chat_input_keeps_its_semantic_owner_with_an_opaque_backend_prompt() 
     ])
     .unwrap();
     let model_input =
-        model_input.with_model_input(|input| crate::backend::mlx::MlxModelInput::from(input));
+        model_input.with_model_input(|input| crate::composition::mlx::MlxModelInput::from(input));
     let input: PreparedChatInput<'_, crate::backend::mlx::MlxBackend<'static>> =
         PreparedChatInput::prepared_backend_input(&prepared, model_input);
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
@@ -1544,7 +1544,7 @@ fn tiny_gemma4_external_assistant_uses_neutral_transaction_path() {
     );
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [input::InputPart::text_token_ids(&tokens)];
-    let prepared = crate::backend::mlx::MlxModelInput::from(input::ModelInput::new(&parts));
+    let prepared = crate::composition::mlx::MlxModelInput::from(input::ModelInput::new(&parts));
     let streams = crate::composition::mlx::speculative::MtpExecutionStreams::single(stream);
     let prefill = executor.prefill(prepared, &mut cache, streams).unwrap();
     let mut draft = executor
@@ -1615,7 +1615,7 @@ fn tiny_inkling_embedded_mtp_uses_neutral_transaction_path() {
         crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(&mut target);
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [input::InputPart::text_token_ids(&tokens)];
-    let prepared = crate::backend::mlx::MlxModelInput::from(input::ModelInput::new(&parts));
+    let prepared = crate::composition::mlx::MlxModelInput::from(input::ModelInput::new(&parts));
     let streams = crate::composition::mlx::speculative::MtpExecutionStreams::single(stream);
     let prefill = executor.prefill(prepared, &mut cache, streams).unwrap();
     let mut draft = executor

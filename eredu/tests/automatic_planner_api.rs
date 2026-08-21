@@ -1,5 +1,5 @@
 use eredu::{
-    backend::mlx::automatic::MlxBackendFactory, core::realize_execution_plan_target,
+    composition::mlx::automatic::MlxBackendFactory, core::realize_execution_plan_target,
     AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, BackendProvider, DevicePlan,
     ExecutionPlan, AUTOMATIC_SCHEMA_VERSION,
 };

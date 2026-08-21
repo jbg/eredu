@@ -666,7 +666,7 @@ impl Model {
         stream: &Stream,
         observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<Array, Exception> {
-        crate::backend::mlx::MlxModelSession::forward_with_observer(
+        crate::composition::mlx::MlxModelSession::forward_with_observer(
             self,
             input_tokens,
             mask,
@@ -685,7 +685,7 @@ impl Model {
         stream: &Stream,
         observer: &mut impl RuntimeActivationObserver<Array, Exception>,
     ) -> Result<eredu_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
-        crate::backend::mlx::MlxModelSession::submit_complete_prefill_with_observer(
+        crate::composition::mlx::MlxModelSession::submit_complete_prefill_with_observer(
             self,
             input.into(),
             cache,
@@ -1014,7 +1014,7 @@ impl Model {
         cache: &mut ModelCache,
         stream: &Stream,
     ) -> Result<eredu_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
-        crate::backend::mlx::submit_prefill_with_cache(self, cache, input.into(), stream)
+        crate::composition::mlx::submit_prefill_with_cache(self, cache, input.into(), stream)
     }
 
     /// Submits cached decode through the selected MLX model session.
@@ -1024,7 +1024,7 @@ impl Model {
         cache: &mut ModelCache,
         stream: &Stream,
     ) -> Result<eredu_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
-        crate::backend::mlx::submit_decode_with_cache(self, cache, input, stream)
+        crate::composition::mlx::submit_decode_with_cache(self, cache, input, stream)
     }
 }
 

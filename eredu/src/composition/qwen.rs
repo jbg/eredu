@@ -1522,7 +1522,7 @@ pub(crate) fn prepare_qwen_gguf_checkpoint(
     args.quantization = None;
     Ok(PreparedQwenGguf {
         args,
-        eos_token_ids: crate::backend::mlx::gguf_eos_token_ids(metadata)?,
+        eos_token_ids: crate::composition::mlx::gguf_eos_token_ids(metadata)?,
     })
 }
 

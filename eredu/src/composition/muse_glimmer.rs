@@ -691,7 +691,7 @@ pub(crate) fn load_dflash_gguf(
         &checkpoint,
         eredu_architectures::muse_glimmer::translate_dflash_gguf_weight_name,
     )?;
-    crate::backend::mlx::validate_gguf_quantization_source(
+    crate::composition::mlx::validate_gguf_quantization_source(
         &checkpoint,
         &metadata,
         options.quantization,
@@ -2363,7 +2363,7 @@ pub(crate) fn load_gguf_tensor_parallel(
         metadata,
         residency.max_mapped_shards(),
     )?;
-    let eos = crate::backend::mlx::gguf_eos_token_ids(metadata)?;
+    let eos = crate::composition::mlx::gguf_eos_token_ids(metadata)?;
     Ok((
         load_parallel_store(store, args, residency, build, stream, weights_stream)?,
         eos,

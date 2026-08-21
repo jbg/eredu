@@ -2142,7 +2142,7 @@ fn load_gguf_ep(
             options.weight_residency
         )));
     }
-    crate::backend::mlx::validate_gguf_quantization_source(
+    crate::composition::mlx::validate_gguf_quantization_source(
         checkpoint,
         &metadata,
         options.quantization,

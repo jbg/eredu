@@ -2130,7 +2130,7 @@ pub(crate) fn prepare_gguf(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     Ok(PreparedGguf {
         args,
-        eos_token_ids: crate::backend::mlx::gguf_eos_token_ids(metadata)?,
+        eos_token_ids: crate::composition::mlx::gguf_eos_token_ids(metadata)?,
     })
 }
 

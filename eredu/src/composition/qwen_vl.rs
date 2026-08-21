@@ -1474,7 +1474,7 @@ pub fn load_gguf(
     } else {
         (store, None)
     };
-    let eos = crate::backend::mlx::gguf_eos_token_ids(metadata)?;
+    let eos = crate::composition::mlx::gguf_eos_token_ids(metadata)?;
     let mut model = load_store(
         store,
         args,

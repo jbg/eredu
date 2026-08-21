@@ -17,17 +17,16 @@ use eredu::{
         PreparedChatInput, PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest,
         ResidencyPlan, TextDecoder, TextModelError,
     },
-    backend::mlx::automatic::{
-        discover_hardware, expert_cache_telemetry, mtp_telemetry, residency_telemetry,
-        MlxBackendFactory,
-    },
     backend::mlx::runtime::generation::sampler::{MirostatV2Sampler, Sampler},
     backend::mlx::runtime::media::input::{InputPart, ModelInput},
     backend::mlx::runtime::residency::expert_cache::{ExpertPassStatistics, ExpertTierStatistics},
-    backend::mlx::{
-        inspect_model, MlxBackend, MlxInspectionOptions, MlxModelInput, ModelLoadOptions,
+    backend::mlx::{MlxBackend, ModelLoadOptions},
+    composition::mlx::automatic::{
+        discover_hardware, expert_cache_telemetry, mtp_telemetry, residency_telemetry,
+        MlxBackendFactory,
     },
     composition::mlx::speculative::MtpComponentTimingGuard,
+    composition::mlx::{inspect_model, MlxInspectionOptions, MlxModelInput},
     core::residency::{CacheEvictionPolicy, MemoryTier, TransferDirection},
     core::speculative::MtpStats,
     runtime::chat::{

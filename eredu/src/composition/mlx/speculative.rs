@@ -26,8 +26,9 @@ use safemlx::{
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
-    backend::mlx::{ModelCache, ModelLoadOptions},
+    backend::mlx::ModelLoadOptions,
     composition::gemma4::{load_assistant_gguf, load_assistant_safetensors, Gemma4AssistantModel},
+    composition::mlx::ModelCache,
     composition::muse_glimmer::{
         load_dflash_gguf, load_dflash_safetensors, MuseGlimmerDFlashModel,
     },

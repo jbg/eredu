@@ -1524,6 +1524,17 @@ fn crate_root_does_not_reexport_mlx_implementation_types() {
 }
 
 #[test]
+fn mlx_backend_does_not_reexport_the_composition_facade() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let backend = manifest.join("src/backend/mlx/mod.rs");
+    let source = std::fs::read_to_string(backend).expect("MLX backend module must be readable");
+    assert!(
+        !source.contains("pub use crate::composition::mlx"),
+        "backend::mlx must not preserve a public compatibility bridge to composition::mlx"
+    );
+}
+
+#[test]
 fn generic_loaded_model_source_does_not_import_backend_implementations() {
     let loaded = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/loaded.rs");
     let source = std::fs::read_to_string(loaded).expect("loaded-model source must be readable");

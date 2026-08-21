@@ -1475,7 +1475,7 @@ pub fn load_gguf(
     if let Some(expert_options) = expert_options {
         attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
     }
-    Ok((model, crate::backend::mlx::gguf_eos_token_ids(metadata)?))
+    Ok((model, crate::composition::mlx::gguf_eos_token_ids(metadata)?))
 }
 
 impl MlxUnitFactory<Block> for UnitFactory {

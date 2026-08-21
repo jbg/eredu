@@ -15,7 +15,7 @@ readiness matters:
 ```rust,no_run
 use eredu::{
     api::{inspect_text_model, TextInspectionOptions},
-    backend::mlx::{inspect_model, MlxInspectionOptions},
+    composition::mlx::{inspect_model, MlxInspectionOptions},
     InspectionSeverity,
 };
 
