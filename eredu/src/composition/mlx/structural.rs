@@ -88,91 +88,31 @@ impl GgufArchitectureValidation for GgufArchitecture {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-#[allow(dead_code)] // Reserved for fail-closed structural policies.
-pub(crate) enum StructuralValidationPolicy {
-    Exact,
-    Unverified,
-}
-
-/// Exhaustive policy table for high-level SafeTensors loader families.
-pub(crate) const fn safetensors_policy(kind: ModelKind) -> StructuralValidationPolicy {
-    match kind {
-        ModelKind::DeepSeekV3
-        | ModelKind::DeepSeekV4
-        | ModelKind::Gemma4
-        | ModelKind::GptOss
-        | ModelKind::Inkling
-        | ModelKind::KimiLinear
-        | ModelKind::Lfm2
-        | ModelKind::Llama
-        | ModelKind::MuseGlimmer
-        | ModelKind::NemotronH
-        | ModelKind::Moshi
-        | ModelKind::Qwen2
-        | ModelKind::Qwen3
-        | ModelKind::Qwen3Next
-        | ModelKind::Qwen3Vl
-        | ModelKind::Qwen3VlMoe
-        | ModelKind::Qwen35 => StructuralValidationPolicy::Exact,
-    }
-}
-
-/// Exhaustive policy table for concrete GGUF loader architectures.
-pub(crate) const fn gguf_policy(architecture: GgufArchitecture) -> StructuralValidationPolicy {
-    match architecture {
-        GgufArchitecture::Llama
-        | GgufArchitecture::Mistral
-        | GgufArchitecture::MuseGlimmer
-        | GgufArchitecture::DeepSeek2
-        | GgufArchitecture::DeepSeek4
-        | GgufArchitecture::Lfm2
-        | GgufArchitecture::Lfm2Moe
-        | GgufArchitecture::GptOss
-        | GgufArchitecture::Gemma4
-        | GgufArchitecture::Inkling
-        | GgufArchitecture::Qwen2
-        | GgufArchitecture::Qwen3
-        | GgufArchitecture::Qwen3Moe
-        | GgufArchitecture::NemotronH
-        | GgufArchitecture::NemotronHMoe
-        | GgufArchitecture::Qwen35
-        | GgufArchitecture::Qwen35Moe
-        | GgufArchitecture::Qwen3Next
-        | GgufArchitecture::Qwen3Vl
-        | GgufArchitecture::Qwen3VlMoe
-        | GgufArchitecture::KimiLinear => StructuralValidationPolicy::Exact,
-    }
-}
-
 pub(crate) fn validate_safetensors(
     kind: ModelKind,
     config: &Value,
     store: &SafetensorsWeightStore,
     options: ModelLoadOptions,
 ) -> StructuralValidation {
-    let validation = match safetensors_policy(kind) {
-        StructuralValidationPolicy::Exact => match kind {
-            ModelKind::DeepSeekV3 => validate_neutral_deepseek_v3_safetensors(config, store),
-            ModelKind::DeepSeekV4 => validate_neutral_deepseek_v4_safetensors(config, store),
-            ModelKind::Gemma4 => validate_neutral_gemma4_safetensors(config, store),
-            ModelKind::GptOss => validate_neutral_gpt_oss_safetensors(config, store),
-            ModelKind::Inkling => validate_neutral_inkling_safetensors(config, store),
-            ModelKind::KimiLinear => validate_neutral_kimi_safetensors(config, store),
-            ModelKind::Lfm2 => validate_neutral_lfm2_safetensors(config, store),
-            ModelKind::Llama => llama_checkpoint::validate_safetensors(config, store),
-            ModelKind::MuseGlimmer => validate_neutral_muse_glimmer_safetensors(config, store),
-            ModelKind::NemotronH => validate_neutral_nemotron_safetensors(config, store),
-            ModelKind::Moshi => validate_neutral_moshi_safetensors(config, store),
-            ModelKind::Qwen2 | ModelKind::Qwen3 => validate_neutral_qwen_safetensors(config, store),
-            ModelKind::Qwen3Next | ModelKind::Qwen35 => {
-                validate_neutral_qwen_hybrid_safetensors(config, store)
-            }
-            ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
-                validate_neutral_qwen_vl_safetensors(kind, config, store)
-            }
-        },
-        StructuralValidationPolicy::Unverified => unverified(kind.model_type_name()),
+    let validation = match kind {
+        ModelKind::DeepSeekV3 => validate_neutral_deepseek_v3_safetensors(config, store),
+        ModelKind::DeepSeekV4 => validate_neutral_deepseek_v4_safetensors(config, store),
+        ModelKind::Gemma4 => validate_neutral_gemma4_safetensors(config, store),
+        ModelKind::GptOss => validate_neutral_gpt_oss_safetensors(config, store),
+        ModelKind::Inkling => validate_neutral_inkling_safetensors(config, store),
+        ModelKind::KimiLinear => validate_neutral_kimi_safetensors(config, store),
+        ModelKind::Lfm2 => validate_neutral_lfm2_safetensors(config, store),
+        ModelKind::Llama => llama_checkpoint::validate_safetensors(config, store),
+        ModelKind::MuseGlimmer => validate_neutral_muse_glimmer_safetensors(config, store),
+        ModelKind::NemotronH => validate_neutral_nemotron_safetensors(config, store),
+        ModelKind::Moshi => validate_neutral_moshi_safetensors(config, store),
+        ModelKind::Qwen2 | ModelKind::Qwen3 => validate_neutral_qwen_safetensors(config, store),
+        ModelKind::Qwen3Next | ModelKind::Qwen35 => {
+            validate_neutral_qwen_hybrid_safetensors(config, store)
+        }
+        ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
+            validate_neutral_qwen_vl_safetensors(kind, config, store)
+        }
     };
     validation.with_strict_catalog(options.weight_residency.strict_loading())
 }
@@ -219,59 +159,52 @@ pub(crate) fn validate_gguf(
     metadata: &HashMap<String, GgufMetadataValue>,
     options: ModelLoadOptions,
 ) -> StructuralValidation {
-    let validation = match gguf_policy(architecture) {
-        StructuralValidationPolicy::Exact => match architecture {
-            GgufArchitecture::DeepSeek2 => validate_neutral_deepseek_v3_gguf(checkpoint, metadata),
-            GgufArchitecture::DeepSeek4 => validate_neutral_deepseek_v4_gguf(checkpoint, metadata),
-            GgufArchitecture::GptOss => validate_neutral_gpt_oss_gguf(checkpoint, metadata),
-            GgufArchitecture::Gemma4 => {
-                if let Err(error) = architecture.validate_load_policy(options) {
-                    invalid_geometry(error.to_string())
-                } else {
-                    validate_neutral_gemma4_gguf(checkpoint, metadata)
-                }
+    let validation = match architecture {
+        GgufArchitecture::DeepSeek2 => validate_neutral_deepseek_v3_gguf(checkpoint, metadata),
+        GgufArchitecture::DeepSeek4 => validate_neutral_deepseek_v4_gguf(checkpoint, metadata),
+        GgufArchitecture::GptOss => validate_neutral_gpt_oss_gguf(checkpoint, metadata),
+        GgufArchitecture::Gemma4 => {
+            if let Err(error) = architecture.validate_load_policy(options) {
+                invalid_geometry(error.to_string())
+            } else {
+                validate_neutral_gemma4_gguf(checkpoint, metadata)
             }
-            GgufArchitecture::Inkling => {
-                if let Err(error) = architecture.validate_load_policy(options) {
-                    invalid_geometry(error.to_string())
-                } else {
-                    validate_neutral_inkling_gguf(checkpoint, metadata)
-                }
+        }
+        GgufArchitecture::Inkling => {
+            if let Err(error) = architecture.validate_load_policy(options) {
+                invalid_geometry(error.to_string())
+            } else {
+                validate_neutral_inkling_gguf(checkpoint, metadata)
             }
-            GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
-                validate_neutral_lfm2_gguf(checkpoint, metadata)
+        }
+        GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
+            validate_neutral_lfm2_gguf(checkpoint, metadata)
+        }
+        GgufArchitecture::Llama | GgufArchitecture::Mistral => {
+            llama_checkpoint::validate_gguf(checkpoint, metadata)
+        }
+        GgufArchitecture::MuseGlimmer => validate_neutral_muse_glimmer_gguf(checkpoint, metadata),
+        GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
+            if let Err(error) = architecture.validate_load_policy(options) {
+                invalid_geometry(error.to_string())
+            } else {
+                validate_neutral_nemotron_gguf(checkpoint, metadata)
             }
-            GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-                llama_checkpoint::validate_gguf(checkpoint, metadata)
+        }
+        GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
+            validate_neutral_qwen_gguf(checkpoint, metadata)
+        }
+        architecture @ (GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe) => {
+            if let Err(error) = architecture.validate_load_policy(options) {
+                invalid_geometry(error.to_string())
+            } else {
+                validate_neutral_qwen_vl_gguf(architecture, checkpoint, metadata)
             }
-            GgufArchitecture::MuseGlimmer => {
-                validate_neutral_muse_glimmer_gguf(checkpoint, metadata)
-            }
-            GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
-                if let Err(error) = architecture.validate_load_policy(options) {
-                    invalid_geometry(error.to_string())
-                } else {
-                    validate_neutral_nemotron_gguf(checkpoint, metadata)
-                }
-            }
-            GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-                validate_neutral_qwen_gguf(checkpoint, metadata)
-            }
-            architecture @ (GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe) => {
-                if let Err(error) = architecture.validate_load_policy(options) {
-                    invalid_geometry(error.to_string())
-                } else {
-                    validate_neutral_qwen_vl_gguf(architecture, checkpoint, metadata)
-                }
-            }
-            GgufArchitecture::KimiLinear => validate_neutral_kimi_gguf(checkpoint, metadata),
-            GgufArchitecture::Qwen35
-            | GgufArchitecture::Qwen35Moe
-            | GgufArchitecture::Qwen3Next => {
-                validate_neutral_qwen_hybrid_gguf(checkpoint, metadata)
-            }
-        },
-        StructuralValidationPolicy::Unverified => unverified(architecture.metadata_name()),
+        }
+        GgufArchitecture::KimiLinear => validate_neutral_kimi_gguf(checkpoint, metadata),
+        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
+            validate_neutral_qwen_hybrid_gguf(checkpoint, metadata)
+        }
     };
     validation.with_strict_catalog(options.weight_residency.strict_loading())
 }
@@ -812,18 +745,6 @@ fn validate_neutral_qwen_vl_gguf(
     eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
 }
 
-fn unverified(architecture: &str) -> StructuralValidation {
-    StructuralValidation::Unverified(StructuralIssue {
-        kind: StructuralIssueKind::ValidationUnavailable,
-        detail: format!(
-            "exact header-only structural validation is not yet implemented for {architecture}"
-        ),
-        tensor_name: None,
-        tensor_type_code: None,
-        metadata_key: None,
-    })
-}
-
 pub(crate) fn validate_inkling_mmproj_gguf(
     model_checkpoint: &GgufCheckpoint,
     model_metadata: &HashMap<String, GgufMetadataValue>,
@@ -1076,14 +997,6 @@ mod admission_policy_tests {
             Error::StrictLoadValidation { missing, unused }
                 if missing.is_empty() && unused == ["unrelated.weight"]
         ));
-    }
-
-    #[test]
-    fn moshi_family_requires_exact_neutral_structural_validation() {
-        assert_eq!(
-            safetensors_policy(ModelKind::Moshi),
-            StructuralValidationPolicy::Exact
-        );
     }
 }
 
