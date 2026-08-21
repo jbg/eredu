@@ -483,7 +483,7 @@ fn apply_structural_validation(
             StructuralIssueKind::UnsupportedEncoding => {
                 InspectionIssueCode::UnsupportedTensorEncoding
             }
-            StructuralIssueKind::QuantizationCompanionMismatch => {
+            StructuralIssueKind::CompanionMismatch => {
                 InspectionIssueCode::QuantizationCompanionMismatch
             }
             StructuralIssueKind::InvalidGeometry => InspectionIssueCode::InvalidLayerOrExpertCount,

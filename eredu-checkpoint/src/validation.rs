@@ -64,12 +64,6 @@ pub enum CheckpointIssueKind {
     ValidationUnavailable,
 }
 
-impl CheckpointIssueKind {
-    /// Compatibility spelling for quantization companion mismatches.
-    #[allow(non_upper_case_globals)]
-    pub const QuantizationCompanionMismatch: Self = Self::CompanionMismatch;
-}
-
 /// One structured checkpoint diagnostic.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CheckpointIssue {
