@@ -66,9 +66,11 @@ remain the gate for multi-rank plans.
 The release-mode Metal tests for exact transfer completion, direct disk-to-device
 materialization, two-block GPU-ordered prefetch, and packed-byte residency all
 pass. LLVM IR for the concrete reference Llama hot path contains no indirect
-call and no tensor-to-bytes, synchronization, or evaluation symbol. Dependency
-tests enforce that MLX backend source has no Llama names/imports and that neutral
-architecture source has no MLX or integration dependency.
+call and no tensor-to-bytes, synchronization, or evaluation symbol. At the time
+of this validation, a migration-era source scan also checked for MLX/Llama
+imports. That layout-sensitive suite has since been retired; current dependency
+checks and review rules are described in
+[the backend architecture guide](backend-architecture.md#guarantees-and-verification).
 
 The benchmark exposed and permanently fixed two generic-policy defects before
 these measurements were accepted: an overlapping-window self-wait and failure

@@ -237,17 +237,34 @@ names, or constructing a Llama-specific cache. Backend-specific compiler
 artifacts, buffers, command queues, caches, and completion primitives remain
 associated implementation types.
 
-## Enforced guarantees
+## Guarantees and verification
 
-Tests verify that:
+The repository mechanically verifies stable dependency and behavior boundaries:
 
-- the core dependency graph contains no `safemlx` or native accelerator runtime;
-- architecture crates contain no backend imports and MLX backend sources contain
-  no model-family knowledge;
-- the neutral Llama hot path has no erased per-layer call, host tensor
-  conversion, or explicit evaluation boundary;
-- the feature-disabled facade compiles and exercises loading, generation,
-  capabilities, multimodal preparation, speculative execution, realtime,
-  distributed sessions, planning, and residency through a mock backend; and
-- the MLX implementation uses the same production contracts for loading,
-  prefill, decode, scheduling, and plan realization.
+- `eredu-core` and `eredu-runtime` dependency-graph tests reject upward facade,
+  architecture, and accelerator-runtime dependencies; and
+- architecture, runtime, and backend conformance tests cover the relevant
+  production contracts.
+
+The following ownership constraints are review rules rather than claims made by
+source-layout tests:
+
+- `eredu-architectures` contains model-family policy but no concrete backend
+  imports;
+- reusable modules under `eredu::backend::mlx` contain backend mechanics but no
+  model-family configuration, checkpoint naming policy, state geometry, or
+  layer equations;
+- native dependencies remain behind facade features, preserving the
+  `default-features = false` build; and
+- model families and their neutral execution remain available without enabling
+  a concrete backend feature; feature gates belong on backend adapters, not on
+  entire families; and
+- backend implementations do not depend upward on `eredu::api` or portable
+  facade runtime orchestration.
+
+These rules are recorded in the repository-root
+[architecture rules](../AGENTS.md). We intentionally do not enforce them by
+scanning Rust source for substrings or by asserting a particular file layout:
+those checks couple architecture to names and migration artifacts instead of
+semantic ownership. Repeated violations should be made unrepresentable with a
+crate boundary, visibility change, or manifest-level dependency check.
