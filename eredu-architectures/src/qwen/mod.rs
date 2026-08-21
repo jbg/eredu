@@ -19,7 +19,10 @@ pub use config::{
     TextConfigContext,
 };
 pub use moe::{FeedForward, RoutedGatedProduct};
-pub use parallel::{layer_parallel_parameter_groups, local_block_args, local_key_value_heads};
+pub use parallel::{
+    layer_parallel_parameter_groups, local_block_args, local_geometry, local_key_value_heads,
+    parameter_description, LocalGeometry,
+};
 
 pub use crate::decoder::{
     cache_layout, cache_layout_with_key_value_heads, create_caches, state_layout,

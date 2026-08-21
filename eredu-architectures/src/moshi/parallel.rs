@@ -116,6 +116,7 @@ pub struct LocalGeometry {
     depth: Vec<Vec<LocalTransformerGeometry>>,
     vocabulary_ranges: BTreeMap<String, Range<usize>>,
     state_layout: StateLayout,
+    architecture_fingerprint: String,
 }
 
 impl LocalGeometry {
@@ -137,6 +138,76 @@ impl LocalGeometry {
     /// Persistent-temporal plus reusable frame-local depth cache geometry.
     pub fn state_layout(&self) -> &StateLayout {
         &self.state_layout
+    }
+
+    /// Validates that every local width, vocabulary range, and state slot was
+    /// derived from this exact normalized Moshi configuration.
+    pub fn validate_for(&self, config: &MoshiConfig) -> Result<(), ParallelPlanError> {
+        let temporal_layers =
+            usize::try_from(config.temporal().num_hidden_layers()).map_err(|_| {
+                ParallelPlanError::InvalidGroup("Moshi temporal layer count exceeds usize".into())
+            })?;
+        let depth_slices = config.frame_schedule().depth_audio_codebooks();
+        let depth_layers =
+            usize::try_from(config.depth_template().num_hidden_layers()).map_err(|_| {
+                ParallelPlanError::InvalidGroup("Moshi depth layer count exceeds usize".into())
+            })?;
+        if self.architecture_fingerprint != config.architecture_fingerprint()
+            || self.temporal.len() != temporal_layers
+            || self.depth.len() != depth_slices
+            || self.depth.iter().any(|slice| slice.len() != depth_layers)
+        {
+            return Err(ParallelPlanError::InvalidGroup(
+                "rank-local Moshi geometry belongs to a different normalized configuration".into(),
+            ));
+        }
+
+        let expected_vocabularies = vocabulary_global_rows(config)?;
+        if self.vocabulary_ranges.len() != expected_vocabularies.len() {
+            return Err(ParallelPlanError::InvalidTensor(
+                "rank-local Moshi vocabulary ownership is incomplete".into(),
+            ));
+        }
+        for (target, global_rows) in expected_vocabularies {
+            let range = self.vocabulary_ranges.get(&target).ok_or_else(|| {
+                ParallelPlanError::InvalidTensor(format!(
+                    "rank-local Moshi geometry is missing vocabulary range for {target}"
+                ))
+            })?;
+            if range.start >= range.end || range.end > global_rows {
+                return Err(ParallelPlanError::InvalidTensor(format!(
+                    "rank-local Moshi vocabulary range {range:?} for {target} exceeds {global_rows} rows"
+                )));
+            }
+        }
+
+        let temporal_heads = self
+            .temporal
+            .iter()
+            .map(LocalTransformerGeometry::attention_heads)
+            .collect::<Vec<_>>();
+        let depth_heads = self.depth.first().ok_or_else(|| {
+            ParallelPlanError::InvalidGroup("rank-local Moshi geometry has no depth slices".into())
+        })?;
+        if self.depth.iter().any(|slice| slice != depth_heads) {
+            return Err(ParallelPlanError::InvalidGroup(
+                "rank-local Moshi depth slices have inconsistent geometry".into(),
+            ));
+        }
+        let expected_state = local_state_layout(
+            config,
+            &temporal_heads,
+            &depth_heads
+                .iter()
+                .map(LocalTransformerGeometry::attention_heads)
+                .collect::<Vec<_>>(),
+        )?;
+        if expected_state != self.state_layout {
+            return Err(ParallelPlanError::InvalidGroup(
+                "rank-local Moshi state layout drifted from transformer geometry".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Builds one rank-local temporal decoder configuration.
@@ -418,12 +489,52 @@ pub fn local_geometry<'a>(
             .map(LocalTransformerGeometry::attention_heads)
             .collect::<Vec<_>>(),
     )?;
-    Ok(LocalGeometry {
+    let geometry = LocalGeometry {
         temporal,
         depth,
         vocabulary_ranges,
         state_layout,
-    })
+        architecture_fingerprint: config.architecture_fingerprint().to_owned(),
+    };
+    geometry.validate_for(config)?;
+    Ok(geometry)
+}
+
+fn vocabulary_global_rows(
+    config: &MoshiConfig,
+) -> Result<BTreeMap<String, usize>, ParallelPlanError> {
+    let text = usize::try_from(config.text_vocabulary_size()).map_err(|_| {
+        ParallelPlanError::InvalidGroup("Moshi text vocabulary exceeds usize".into())
+    })?;
+    let audio = usize::try_from(config.audio_vocabulary_size()).map_err(|_| {
+        ParallelPlanError::InvalidGroup("Moshi audio vocabulary exceeds usize".into())
+    })?;
+    let text_embedding = text.checked_add(1).ok_or_else(|| {
+        ParallelPlanError::InvalidGroup("Moshi text embedding vocabulary overflowed".into())
+    })?;
+    let audio_embedding = audio.checked_add(1).ok_or_else(|| {
+        ParallelPlanError::InvalidGroup("Moshi audio embedding vocabulary overflowed".into())
+    })?;
+    let mut rows = BTreeMap::from([
+        ("text_emb.weight".into(), text_embedding),
+        ("text_linear.weight".into(), text),
+    ]);
+    rows.extend(
+        (0..config.frame_schedule().total_audio_codebooks())
+            .map(|codebook| (format!("audio_embs.{codebook}.weight"), audio_embedding)),
+    );
+    for slice in 0..config.frame_schedule().depth_audio_codebooks() {
+        rows.insert(
+            format!("depformer.slices.{slice}.emb.weight"),
+            if slice == 0 {
+                text_embedding
+            } else {
+                audio_embedding
+            },
+        );
+        rows.insert(format!("depformer.slices.{slice}.linear_out.weight"), audio);
+    }
+    Ok(rows)
 }
 
 fn vocabulary_targets(config: &MoshiConfig) -> Vec<String> {

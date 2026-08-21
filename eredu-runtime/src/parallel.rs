@@ -9,6 +9,7 @@ use std::{
     ops::Range,
 };
 
+use eredu_checkpoint::LinearFormat;
 use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized, Tensor};
 
 /// Architecture-neutral information for one rank-local parallel model.
@@ -631,6 +632,207 @@ pub fn aligned_partition_units(
     Ok(semantic_units / units_per_partition)
 }
 
+/// Rewrites semantic dense matrix declarations into their authoritative
+/// physical checkpoint representation and publishes every required companion
+/// in the same atomic parameter group.
+pub fn expand_linear_format_parameter_groups(
+    groups: Vec<ParameterGroupSpec>,
+    format: impl Fn(&str) -> LinearFormat,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    groups
+        .into_iter()
+        .map(|group| {
+            let mut members = Vec::new();
+            for source in group.members() {
+                members.extend(expand_linear_format_member(
+                    source,
+                    format(source.target()),
+                )?);
+            }
+            match group.partition_units() {
+                Some(mut units) => {
+                    for member in &members {
+                        match member.sharding() {
+                            MemberSharding::Partitioned { axis } => {
+                                units =
+                                    greatest_common_divisor(units, member.global_shape()[*axis]);
+                            }
+                            MemberSharding::PartitionedSegments { segments, .. }
+                            | MemberSharding::Segmented { segments, .. } => {
+                                for segment in segments {
+                                    units = greatest_common_divisor(units, segment.len());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    ParameterGroupSpec::partitioned(
+                        group.logical_name(),
+                        group.role(),
+                        units,
+                        members,
+                    )
+                }
+                None => ParameterGroupSpec::new(group.logical_name(), group.role(), members),
+            }
+        })
+        .collect()
+}
+
+fn remap_linear_segments(
+    sharding: &MemberSharding,
+    axis: usize,
+    divisor: usize,
+    name: &str,
+) -> Result<MemberSharding, ParallelPlanError> {
+    let remap = |segments: &[Range<usize>]| {
+        segments
+            .iter()
+            .map(|segment| {
+                if !segment.start.is_multiple_of(divisor) || !segment.end.is_multiple_of(divisor) {
+                    return Err(ParallelPlanError::InvalidTensor(format!(
+                        "packed companion {name} segment {segment:?} is not aligned to {divisor}"
+                    )));
+                }
+                Ok(segment.start / divisor..segment.end / divisor)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    match sharding {
+        MemberSharding::PartitionedSegments {
+            axis: selected,
+            segments,
+        } if *selected == axis => Ok(MemberSharding::PartitionedSegments {
+            axis: *selected,
+            segments: remap(segments)?,
+        }),
+        MemberSharding::Segmented {
+            axis: selected,
+            segments,
+        } if *selected == axis => Ok(MemberSharding::Segmented {
+            axis: *selected,
+            segments: remap(segments)?,
+        }),
+        other => Ok(other.clone()),
+    }
+}
+
+fn expand_linear_format_member(
+    source: &ParameterMemberSpec,
+    format: LinearFormat,
+) -> Result<Vec<ParameterMemberSpec>, ParallelPlanError> {
+    let name = source.target();
+    let shape = source.global_shape();
+    let expert_bank = name.ends_with(".gate_up_proj") || name.ends_with(".down_proj");
+    if (!name.ends_with(".weight") && !expert_bank)
+        || shape.len() < 2
+        || format == LinearFormat::Dense
+    {
+        return Ok(vec![source.clone()]);
+    }
+    let row_axis = shape.len() - 2;
+    let column_axis = shape.len() - 1;
+    let prefix = name.strip_suffix(".weight").unwrap_or(name);
+    let invalid = |detail: String| ParallelPlanError::InvalidTensor(detail);
+    match format {
+        LinearFormat::Dense => unreachable!(),
+        LinearFormat::E4M3BlockFp8(fp8) => {
+            fp8.validate().map_err(|error| invalid(error.to_string()))?;
+            let rows = usize::try_from(fp8.block_rows)
+                .map_err(|_| invalid(format!("invalid block rows for {name}")))?;
+            let columns = usize::try_from(fp8.block_columns)
+                .map_err(|_| invalid(format!("invalid block columns for {name}")))?;
+            let mut scale_shape = shape.to_vec();
+            scale_shape[row_axis] = scale_shape[row_axis].div_ceil(rows);
+            scale_shape[column_axis] = scale_shape[column_axis].div_ceil(columns);
+            let scale_sharding = remap_linear_segments(source.sharding(), row_axis, rows, name)
+                .and_then(|value| remap_linear_segments(&value, column_axis, columns, name))?;
+            Ok(vec![
+                source.clone(),
+                ParameterMemberSpec::new(
+                    if expert_bank {
+                        format!("{prefix}_scales")
+                    } else {
+                        format!("{prefix}.weight_scale_inv")
+                    },
+                    scale_shape,
+                    scale_sharding,
+                ),
+            ])
+        }
+        LinearFormat::GgufIQuant { ggml_type, .. } => {
+            let (block_values, block_bytes) = ggml_type
+                .block_and_bytes()
+                .map_err(|error| invalid(error.to_string()))?;
+            let block_values = usize::try_from(block_values)
+                .map_err(|_| invalid(format!("GGUF block width for {name} exceeds usize")))?;
+            let block_bytes = usize::try_from(block_bytes)
+                .map_err(|_| invalid(format!("GGUF block bytes for {name} exceeds usize")))?;
+            let input = shape[column_axis];
+            if !input.is_multiple_of(block_values) {
+                return Err(invalid(format!(
+                    "GGUF matrix {name} input {input} is not aligned to block {block_values}"
+                )));
+            }
+            let mut packed = shape.to_vec();
+            packed[column_axis] = input / block_values * block_bytes;
+            Ok(vec![ParameterMemberSpec::new(
+                name,
+                packed,
+                remap_linear_segments(source.sharding(), column_axis, block_values, name)?,
+            )])
+        }
+        LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
+            let quantization = format.weight_quantization().expect("packed format");
+            let bits = usize::try_from(quantization.bits())
+                .map_err(|_| invalid(format!("packed bit width for {name} exceeds usize")))?;
+            let group = usize::try_from(quantization.group_size())
+                .map_err(|_| invalid(format!("packed group width for {name} exceeds usize")))?;
+            let input = shape[column_axis];
+            let packed_bits = input
+                .checked_mul(bits)
+                .ok_or_else(|| invalid(format!("packed matrix {name} overflows")))?;
+            if group == 0 || !input.is_multiple_of(group) || !packed_bits.is_multiple_of(32) {
+                return Err(invalid(format!(
+                    "packed matrix {name} input {input} is incompatible with group {group} and {bits} bits"
+                )));
+            }
+            let mut packed = shape.to_vec();
+            packed[column_axis] = packed_bits / 32;
+            let mut companion = shape.to_vec();
+            companion[column_axis] = input / group;
+            let mut members = vec![ParameterMemberSpec::new(
+                name,
+                packed,
+                remap_linear_segments(source.sharding(), column_axis, 32 / bits, name)?,
+            )];
+            let companion_sharding =
+                remap_linear_segments(source.sharding(), column_axis, group, name)?;
+            members.push(ParameterMemberSpec::new(
+                if expert_bank {
+                    format!("{prefix}_scales")
+                } else {
+                    format!("{prefix}.scales")
+                },
+                companion.clone(),
+                companion_sharding.clone(),
+            ));
+            if quantization.has_biases() {
+                members.push(ParameterMemberSpec::new(
+                    if expert_bank {
+                        format!("{prefix}_biases")
+                    } else {
+                        format!("{prefix}.biases")
+                    },
+                    companion,
+                    companion_sharding,
+                ));
+            }
+            Ok(members)
+        }
+    }
+}
+
 const fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
     while right != 0 {
         let remainder = left % right;
@@ -836,6 +1038,8 @@ pub enum ParallelPlanError {
 
 #[cfg(test)]
 mod tests {
+    use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding};
+
     use super::*;
 
     #[test]
@@ -875,6 +1079,42 @@ mod tests {
             )],
         )
         .is_ok());
+    }
+
+    #[test]
+    fn fp8_expansion_publishes_inverse_scale_with_the_weight_atomically() {
+        let groups = vec![ParameterGroupSpec::partitioned(
+            "query",
+            ParameterRole::AttentionHeads,
+            8,
+            [ParameterMemberSpec::new(
+                "layers.0.q_proj.weight",
+                [256, 256],
+                MemberSharding::Partitioned { axis: 0 },
+            )],
+        )
+        .unwrap()];
+        let format = LinearFormat::E4M3BlockFp8(
+            BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::Ue8m0).unwrap(),
+        );
+
+        let expanded = expand_linear_format_parameter_groups(groups, |_| format).unwrap();
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].partition_units(), Some(2));
+        assert_eq!(expanded[0].members().len(), 2);
+        assert_eq!(
+            expanded[0]
+                .members()
+                .iter()
+                .map(ParameterMemberSpec::target)
+                .collect::<Vec<_>>(),
+            ["layers.0.q_proj.weight", "layers.0.q_proj.weight_scale_inv"]
+        );
+        assert_eq!(expanded[0].members()[1].global_shape(), [2, 2]);
+        assert_eq!(
+            expanded[0].members()[1].sharding(),
+            &MemberSharding::Partitioned { axis: 0 }
+        );
     }
 
     #[test]

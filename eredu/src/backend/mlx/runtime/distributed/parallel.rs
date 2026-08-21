@@ -112,42 +112,6 @@ pub(crate) fn sample_and_synchronize<S: Sampler>(
     })
 }
 
-/// Returns the finest legal logical-unit count for an aligned row partition.
-///
-/// `semantic_units` is the number of indivisible semantic groups, while
-/// `elements_per_unit` is their width on the row-sharded axis. The returned
-/// count combines adjacent semantic groups until every boundary is aligned to
-/// `required_alignment` (one for dense tensors, or a quantization block size).
-pub(crate) fn aligned_partition_units(
-    name: &str,
-    semantic_units: usize,
-    elements_per_unit: usize,
-    required_alignment: usize,
-) -> Result<usize, Error> {
-    if semantic_units == 0 || elements_per_unit == 0 || required_alignment == 0 {
-        return Err(Error::Parallel(format!(
-            "{name} aligned partition dimensions must be positive, got units={semantic_units}, width={elements_per_unit}, alignment={required_alignment}"
-        )));
-    }
-    let units_per_partition =
-        required_alignment / greatest_common_divisor(elements_per_unit, required_alignment);
-    if !semantic_units.is_multiple_of(units_per_partition) {
-        return Err(Error::Parallel(format!(
-            "{name} has {semantic_units} semantic units of width {elements_per_unit}, which cannot form complete alignment-{required_alignment} partitions"
-        )));
-    }
-    Ok(semantic_units / units_per_partition)
-}
-
-const fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
-    while right != 0 {
-        let remainder = left % right;
-        left = right;
-        right = remainder;
-    }
-    left
-}
-
 /// Builds checkpoint placement and local model geometry from typed roles.
 pub struct ParallelPlanBuilder {
     topology: MlxParallelContext,
@@ -876,13 +840,5 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("non-empty"));
-    }
-
-    #[test]
-    fn quantized_alignment_combines_complete_semantic_units() {
-        assert_eq!(aligned_partition_units("GQA", 6, 16, 32).unwrap(), 3);
-        assert_eq!(aligned_partition_units("SwiGLU", 96, 1, 32).unwrap(), 3);
-        let error = aligned_partition_units("GQA", 3, 16, 32).unwrap_err();
-        assert!(error.to_string().contains("cannot form complete"));
     }
 }

@@ -1,6 +1,6 @@
 //! Thin DeepSeek-V4 architecture policy.
 
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, sync::Arc};
 
 use eredu_core::{
     cache::{
@@ -10,11 +10,16 @@ use eredu_core::{
     AttentionPolicy, LayerSchedule,
 };
 use eredu_nn::{
-    EmbeddingOperator, EmbeddingSpec, Error, HyperHead, HyperHeadSpec, HyperNeuralBackend,
-    LinearOperator, LinearSpec, NormalizationOperator, NormalizationSpec, ParameterSpec,
-    Parameterized, PoolingAttentionCache, RoutedNeuralBackend, Tensor,
+    EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, HyperHead, HyperHeadSpec,
+    HyperNeuralBackend, Index, LinearOperator, LinearSpec, NormalizationOperator,
+    NormalizationSpec, ParameterSpec, Parameterized, PoolingAttentionCache, RoutedNeuralBackend,
+    Tensor,
 };
-use eredu_runtime::{LayerRuntimeState, LayeredArchitecture, LayeredForwardState, StateLayout};
+use eredu_runtime::{
+    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, ParallelLayeredArchitecture,
+    ParallelRoutedLayeredArchitecture, RoutedExpertProvider, RoutedLayeredArchitecture,
+    StateLayout,
+};
 
 use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat};
 
@@ -40,6 +45,63 @@ pub struct DsparkStatic<B: HyperNeuralBackend> {
     markov_embedding: B::Embedding,
     markov_output: B::Linear,
     confidence_head: B::Linear,
+}
+
+impl<B, S> RoutedLayeredArchitecture<B, S> for Model<B>
+where
+    B: HyperNeuralBackend + RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: PoolingAttentionCache<B::Tensor>,
+{
+    fn forward_unit_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        Model::forward_unit_with_provider(
+            self, group, index, unit, hidden, state, forward, pass, provider, context,
+        )
+    }
+}
+
+impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for Model<B>
+where
+    B: HyperNeuralBackend + RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: PoolingAttentionCache<B::Tensor>,
+{
+    fn forward_unit_parallel_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        Model::forward_unit_parallel_with_provider(
+            self, group, index, unit, hidden, state, forward, pass, parallel, provider, context,
+        )
+    }
 }
 
 /// One target, sequential MTP, or fused DSpark execution unit.
@@ -81,6 +143,118 @@ pub struct ForwardContext<T> {
     captures: Vec<Option<T>>,
 }
 
+/// Family-owned schema for immutable V4 target context crossing pipeline ranks.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TargetBoundarySchema {
+    capture_count: usize,
+}
+
+impl TargetBoundarySchema {
+    /// Creates a schema for the configured DSpark target captures.
+    pub const fn new(capture_count: usize) -> Self {
+        Self { capture_count }
+    }
+
+    /// Returns the number of configured capture tensors.
+    pub const fn capture_count(self) -> usize {
+        self.capture_count
+    }
+
+    /// Decodes tokens followed by configured captures.
+    pub fn decode<T>(
+        self,
+        tensors: Vec<T>,
+    ) -> Result<TargetBoundary<T>, eredu_runtime::ArchitectureBoundaryError> {
+        let expected = 1 + self.capture_count;
+        if tensors.len() != expected {
+            return Err(eredu_runtime::ArchitectureBoundaryError::TensorCount {
+                boundary: "deepseek_v4.target",
+                expected,
+                actual: tensors.len(),
+            });
+        }
+        let mut tensors = tensors.into_iter();
+        Ok(TargetBoundary {
+            input_ids: tensors.next().expect("validated target token ids"),
+            captures: tensors.collect(),
+        })
+    }
+
+    /// Encodes tokens followed by configured captures after validation.
+    pub fn encode<T>(
+        self,
+        boundary: TargetBoundary<T>,
+    ) -> Result<Vec<T>, eredu_runtime::ArchitectureBoundaryError> {
+        if boundary.captures.len() != self.capture_count {
+            return Err(eredu_runtime::ArchitectureBoundaryError::TensorCount {
+                boundary: "deepseek_v4.target.captures",
+                expected: self.capture_count,
+                actual: boundary.captures.len(),
+            });
+        }
+        Ok(std::iter::once(boundary.input_ids)
+            .chain(boundary.captures)
+            .collect())
+    }
+}
+
+/// Typed V4 target context transported alongside the evolving activation.
+pub struct TargetBoundary<T> {
+    /// Original target token identities.
+    pub input_ids: T,
+    /// Captures selected for DSpark target conditioning.
+    pub captures: Vec<T>,
+}
+
+impl<T> TargetBoundary<T> {
+    /// Creates a target boundary from tokens and configured captures.
+    pub const fn new(input_ids: T, captures: Vec<T>) -> Self {
+        Self {
+            input_ids,
+            captures,
+        }
+    }
+}
+
+/// Target input owned by either the first or a downstream V4 partition.
+pub enum TargetPartitionInput<'a, T> {
+    /// Token identities embedded by the input-owning partition.
+    Tokens(&'a T),
+    /// Evolving activation plus immutable target context from an upstream rank.
+    Hidden {
+        /// Flattened transported hyper-stream activation.
+        hidden: T,
+        /// Original token identities and configured captures.
+        boundary: TargetBoundary<T>,
+    },
+}
+
+/// Architecture-prepared target activation and cross-partition context.
+pub struct TargetPartitionForward<T> {
+    /// Hyper-stream activation consumed by target blocks.
+    pub hidden: T,
+    /// Typed immutable/mutable target boundary values.
+    pub boundary: TargetBoundary<T>,
+}
+
+/// Architecture-owned completion of one routed V4 target partition.
+pub enum TargetPartitionOutput<T> {
+    /// Final-owner logits and the hidden/capture value consumed by drafting.
+    Final {
+        /// Complete target logits.
+        logits: T,
+        /// Target hidden state or concatenated DSpark captures.
+        draft_hidden: T,
+    },
+    /// Transport-visible activation and typed context for the next owner.
+    Boundary {
+        /// Flattened hyper-stream activation.
+        hidden: T,
+        /// Original token ids and configured target captures.
+        boundary: TargetBoundary<T>,
+    },
+}
+
 impl<T> ForwardContext<T> {
     /// Borrows the final target hidden state or configured DSpark captures.
     pub const fn target_capture(&self) -> Option<&T> {
@@ -106,61 +280,241 @@ where
     args: V4Args,
     static_modules: StaticModules<B>,
     groups: SequentialPredictionGroups,
+    parallel_geometry: Option<Arc<super::parallel::V4LocalGeometry>>,
 }
 
 impl<B> Model<B>
 where
     B: HyperNeuralBackend + RoutedNeuralBackend,
 {
+    /// Enters a target partition using the canonical layered execution context.
+    pub fn begin_routed_target_partition(
+        &mut self,
+        input: TargetPartitionInput<'_, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error> {
+        let prepared = self.begin_partition_target_inner(input, parallel, context)?;
+        let TargetBoundary {
+            input_ids,
+            captures,
+        } = prepared.boundary;
+        Ok(LayeredForwardState {
+            hidden: prepared.hidden,
+            context: ForwardContext {
+                embedded: input_ids.clone(),
+                input_ids,
+                mask: mask.cloned(),
+                mode: ForwardMode::Target,
+                target_capture: None,
+                draft_logits: None,
+                draft_hidden: None,
+                captures: captures.into_iter().map(Some).collect(),
+            },
+        })
+    }
+
+    /// Reconstitutes the typed cross-partition target boundary after layered execution.
+    pub fn routed_target_boundary(
+        &self,
+        forward: &ForwardContext<B::Tensor>,
+    ) -> Result<TargetBoundary<B::Tensor>, Error> {
+        let captures = forward
+            .captures
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, capture)| {
+                capture.ok_or_else(|| {
+                    Error::backend(format!("missing V4 target capture slot {index}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(TargetBoundary::new(forward.input_ids.clone(), captures))
+    }
+
+    /// Completes a routed target partition without exposing hyper-stream
+    /// flattening or DSpark capture selection to distributed composition.
+    pub fn finish_routed_target_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        forward: &ForwardContext<B::Tensor>,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<TargetPartitionOutput<B::Tensor>, Error> {
+        let boundary = self.routed_target_boundary(forward)?;
+        if owns_output {
+            let draft_hidden = if self.args.dspark.is_some() {
+                B::Tensor::concatenate(&boundary.captures, -1, context)?
+            } else {
+                hidden.clone()
+            };
+            let logits = match parallel {
+                Some(parallel) => {
+                    self.finish_partition_target_parallel(hidden, parallel, context)?
+                }
+                None => self.finish_partition_target(hidden, context)?,
+            };
+            Ok(TargetPartitionOutput::Final {
+                logits,
+                draft_hidden,
+            })
+        } else {
+            let hidden = hidden.reshape(
+                &[
+                    hidden.dim(0),
+                    hidden.dim(1),
+                    self.args.hc_mult * self.args.hidden_size,
+                ],
+                context,
+            )?;
+            Ok(TargetPartitionOutput::Boundary { hidden, boundary })
+        }
+    }
+
+    fn begin_partition_target_inner(
+        &mut self,
+        input: TargetPartitionInput<'_, B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<TargetPartitionForward<B::Tensor>, Error> {
+        match input {
+            TargetPartitionInput::Tokens(tokens) => {
+                let hidden = match parallel {
+                    Some(parallel) => self.pipeline_embed_parallel(tokens, parallel, context)?,
+                    None => self.pipeline_embed(tokens, context)?,
+                };
+                let captures = (0..self
+                    .args
+                    .dspark
+                    .as_ref()
+                    .map_or(0, |config| config.target_layer_ids.len()))
+                    .map(|_| {
+                        B::Tensor::full_f32(
+                            0.0,
+                            &[tokens.dim(0), tokens.dim(1), self.args.hidden_size],
+                            context,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(TargetPartitionForward {
+                    hidden,
+                    boundary: TargetBoundary::new(tokens.clone(), captures),
+                })
+            }
+            TargetPartitionInput::Hidden { hidden, boundary } => {
+                let hidden = hidden.reshape(
+                    &[
+                        hidden.dim(0),
+                        hidden.dim(1),
+                        self.args.hc_mult,
+                        self.args.hidden_size,
+                    ],
+                    context,
+                )?;
+                Ok(TargetPartitionForward { hidden, boundary })
+            }
+        }
+    }
+
+    /// Records an optional target capture at its architecture-declared slot.
+    pub fn record_partition_target_capture(
+        &self,
+        layer: usize,
+        capture: Option<B::Tensor>,
+        boundary: &mut TargetBoundary<B::Tensor>,
+    ) -> Result<(), Error> {
+        let Some(capture) = capture else {
+            return Ok(());
+        };
+        let position = self
+            .args
+            .dspark
+            .as_ref()
+            .and_then(|config| {
+                config
+                    .target_layer_ids
+                    .iter()
+                    .position(|wanted| usize::try_from(*wanted).ok() == Some(layer))
+            })
+            .ok_or_else(|| {
+                Error::backend(format!("unexpected V4 target capture at layer {layer}"))
+            })?;
+        let slot = boundary.captures.get_mut(position).ok_or_else(|| {
+            Error::backend(format!(
+                "V4 target boundary is missing capture slot {position}"
+            ))
+        })?;
+        *slot = capture;
+        Ok(())
+    }
+
+    /// Finishes the serial target partition through the architecture output boundary.
+    pub fn finish_partition_target(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.pipeline_finish(hidden, context)
+    }
+
+    /// Finishes the tensor-parallel target partition through the architecture output boundary.
+    pub fn finish_partition_target_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.pipeline_finish_parallel(hidden, parallel, context)
+    }
+
     /// Builds unloaded pinned V4 modules.
     pub fn new(args: V4Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         args.validate().map_err(Error::backend)?;
-        let text = TextStaticModules::from_spec(
-            StaticModuleSpec {
-                embedding_weight: "embed.weight".into(),
-                normalization_weight: "norm.weight".into(),
-                head_weight: "head.weight".into(),
-                vocabulary: args.vocab_size,
-                hidden_size: args.hidden_size,
-                normalization_epsilon: args.rms_norm_eps,
-                normalization_offset: 0.0,
-                embedding_quantization: None,
-                head_format: args.linear_format_for("head.weight"),
-                tied_head: false,
-            },
-            context,
-        )?;
-        let hyper_head = HyperHead::new(
-            HyperHeadSpec {
-                streams: args.hc_mult,
-                hidden_size: args.hidden_size,
-                norm_epsilon: args.rms_norm_eps,
-                epsilon: args.hc_eps,
-                function: parameter("hc_head_fn")?,
-                base: parameter("hc_head_base")?,
-                scale: parameter("hc_head_scale")?,
-            },
-            context,
-        )?;
-        let dspark = args
-            .dspark
-            .as_ref()
-            .map(|config| DsparkStatic::new(&args, config, context))
-            .transpose()?;
+        let text = TextStaticModules::from_spec(text_static_spec(&args), context)?;
         Ok(Self {
-            groups: SequentialPredictionGroups::new(
-                "layers",
-                usize::try_from(args.num_hidden_layers).map_err(Error::backend)?,
-                (0..usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?)
-                    .map(|depth| format!("mtp.{depth}")),
-            )?,
+            groups: prediction_groups(&args)?,
+            static_modules: static_modules(&args, text, context)?,
             args,
-            static_modules: StaticModules {
-                text,
-                hyper_head,
-                dspark,
-            },
+            parallel_geometry: None,
         })
+    }
+
+    /// Builds unloaded V4 modules using one authoritative rank-local plan.
+    pub fn new_parallel(
+        args: V4Args,
+        geometry: super::parallel::V4LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        args.validate().map_err(Error::backend)?;
+        geometry.validate_for(&args).map_err(Error::backend)?;
+        let text = TextStaticModules::from_parallel_spec(
+            text_static_spec(&args),
+            geometry.embedding_range().clone(),
+            Some(geometry.output_range().clone()),
+            context,
+        )?;
+        Ok(Self {
+            groups: prediction_groups(&args)?,
+            static_modules: static_modules(&args, text, context)?,
+            args,
+            parallel_geometry: Some(Arc::new(geometry)),
+        })
+    }
+
+    /// Returns the state layout matching the modules this instance builds.
+    pub fn runtime_state_layout(&self) -> Result<StateLayout, Error> {
+        match &self.parallel_geometry {
+            Some(geometry) => Ok(geometry.state_layout().clone()),
+            None => state_layout(&self.args),
+        }
+    }
+
+    /// Borrows rank-local geometry for resident and streamed unit factories.
+    pub fn shared_parallel_geometry(&self) -> Option<Arc<super::parallel::V4LocalGeometry>> {
+        self.parallel_geometry.clone()
     }
 
     /// Returns the normalized V4 arguments.
@@ -184,6 +538,39 @@ where
         self.static_modules = static_modules;
     }
 
+    /// Constructs one target, sequential MTP, or DSpark unit from this model's
+    /// authoritative global or rank-local geometry.
+    pub fn construct_unit(
+        &self,
+        group: usize,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Unit<B>, Error> {
+        self.groups.unit_count(group)?;
+        let args = self
+            .parallel_geometry
+            .as_ref()
+            .map_or(&self.args, |geometry| geometry.args());
+        if group == 0 {
+            Ok(Unit::Target(V4Block::new(args, index, context)?))
+        } else if self.args.dspark.is_some() {
+            let global =
+                usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
+            Ok(Unit::Dspark(V4Block::new_at(
+                args,
+                global,
+                &format!("mtp.{}", group - 1),
+                context,
+            )?))
+        } else {
+            Ok(Unit::Prediction(V4PredictionLayer::new(
+                args,
+                group - 1,
+                context,
+            )?))
+        }
+    }
+
     /// Embeds tokens and broadcasts them across hyper-connection streams for
     /// a pipeline-partitioned target pass.
     pub fn pipeline_embed(
@@ -199,99 +586,21 @@ where
         broadcast_streams::<B>(&embedded, &self.args, context)
     }
 
-    /// Broadcasts a composition-owned embedding shard result across the
-    /// model's replicated hyper-connection streams.
-    pub fn pipeline_broadcast_embedding(
-        &self,
-        embedded: &B::Tensor,
+    /// Applies vocabulary-parallel lookup and architecture-owned stream broadcast.
+    pub fn pipeline_embed_parallel(
+        &mut self,
+        tokens: &B::Tensor,
+        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        broadcast_streams::<B>(embedded, &self.args, context)
-    }
-
-    /// Executes one V4 target block in a pipeline-owned layer range and
-    /// returns an optional DSpark capture for that global layer.
-    #[allow(clippy::too_many_arguments)]
-    pub fn pipeline_forward_target<C>(
-        &mut self,
-        layer: usize,
-        unit: &mut Unit<B>,
-        hidden: &B::Tensor,
-        input_ids: &B::Tensor,
-        mask: Option<&B::Tensor>,
-        cache: &mut C,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(B::Tensor, Option<B::Tensor>), Error>
-    where
-        C: PoolingAttentionCache<B::Tensor>,
-    {
-        let Unit::Target(block) = unit else {
-            return Err(Error::backend(
-                "a V4 draft unit cannot execute in the target pipeline range",
-            ));
-        };
-        let output = block.forward(hidden, input_ids, mask, Some(cache), context)?;
-        let capture = self
-            .args
-            .dspark
-            .as_ref()
-            .and_then(|config| {
-                config
-                    .target_layer_ids
-                    .iter()
-                    .any(|wanted| usize::try_from(*wanted).ok() == Some(layer))
-                    .then(|| B::Tensor::mean_axis(&output, 2, false, context))
-            })
-            .transpose()?;
-        Ok((output, capture))
-    }
-
-    /// Executes one V4 pipeline target block with runtime-supplied experts.
-    #[allow(clippy::too_many_arguments)]
-    pub fn pipeline_forward_target_with_provider<C, P>(
-        &mut self,
-        layer: usize,
-        unit: &mut Unit<B>,
-        hidden: &B::Tensor,
-        input_ids: &B::Tensor,
-        mask: Option<&B::Tensor>,
-        cache: &mut C,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<(B::Tensor, Option<B::Tensor>), Error>
-    where
-        C: PoolingAttentionCache<B::Tensor>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
-        P::Error: std::fmt::Display,
-    {
-        let Unit::Target(block) = unit else {
-            return Err(Error::backend(
-                "a V4 draft unit cannot execute in the target pipeline range",
-            ));
-        };
-        let output = block.forward_with_provider(
-            hidden,
-            input_ids,
-            mask,
-            Some(cache),
-            pass,
-            provider,
+        let embedded = B::vocabulary_parallel_lookup(
+            &mut self.static_modules.text.embeddings,
+            tokens,
+            EmbeddingLookupPolicy::Strict,
+            parallel,
             context,
         )?;
-        let capture = self
-            .args
-            .dspark
-            .as_ref()
-            .and_then(|config| {
-                config
-                    .target_layer_ids
-                    .iter()
-                    .any(|wanted| usize::try_from(*wanted).ok() == Some(layer))
-                    .then(|| B::Tensor::mean_axis(&output, 2, false, context))
-            })
-            .transpose()?;
-        Ok((output, capture))
+        broadcast_streams::<B>(&embedded, &self.args, context)
     }
 
     /// Collapses hyper streams, applies the final norm, and projects logits on
@@ -322,94 +631,24 @@ where
         self.static_modules.text.norm.forward(&hidden, context)
     }
 
-    /// Executes one tensor-partitioned V4 target block.
-    #[allow(clippy::too_many_arguments)]
-    pub fn pipeline_forward_target_parallel<C, F>(
+    /// Applies the complete tensor-parallel target output boundary.
+    pub fn pipeline_finish_parallel(
         &mut self,
-        layer: usize,
-        unit: &mut Unit<B>,
         hidden: &B::Tensor,
-        input_ids: &B::Tensor,
-        mask: Option<&B::Tensor>,
-        cache: &mut C,
+        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-        reduce: F,
-    ) -> Result<(B::Tensor, Option<B::Tensor>), Error>
-    where
-        C: PoolingAttentionCache<B::Tensor>,
-        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
-    {
-        let Unit::Target(block) = unit else {
-            return Err(Error::backend(
-                "a V4 draft unit cannot execute in the target pipeline range",
-            ));
-        };
-        let output =
-            block.forward_parallel(hidden, input_ids, mask, Some(cache), context, reduce)?;
-        let capture = self
-            .args
-            .dspark
-            .as_ref()
-            .and_then(|config| {
-                config
-                    .target_layer_ids
-                    .iter()
-                    .any(|wanted| usize::try_from(*wanted).ok() == Some(layer))
-                    .then(|| B::Tensor::mean_axis(&output, 2, false, context))
-            })
-            .transpose()?;
-        Ok((output, capture))
-    }
-
-    /// Tensor-partitioned V4 target execution with runtime-supplied experts.
-    #[allow(clippy::too_many_arguments)]
-    pub fn pipeline_forward_target_parallel_with_provider<C, P, F>(
-        &mut self,
-        layer: usize,
-        unit: &mut Unit<B>,
-        hidden: &B::Tensor,
-        input_ids: &B::Tensor,
-        mask: Option<&B::Tensor>,
-        cache: &mut C,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
-        context: &<B::Tensor as Tensor>::Context,
-        reduce: F,
-    ) -> Result<(B::Tensor, Option<B::Tensor>), Error>
-    where
-        C: PoolingAttentionCache<B::Tensor>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
-        P::Error: std::fmt::Display,
-        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
-    {
-        let Unit::Target(block) = unit else {
-            return Err(Error::backend(
-                "a V4 draft unit cannot execute in the target pipeline range",
-            ));
-        };
-        let output = block.forward_parallel_with_provider(
-            hidden,
-            input_ids,
-            mask,
-            Some(cache),
-            pass,
-            provider,
+    ) -> Result<B::Tensor, Error> {
+        let hidden = self.pipeline_finish_hidden(hidden, context)?;
+        B::vocabulary_parallel_project(
+            self.static_modules
+                .text
+                .lm_head
+                .as_mut()
+                .expect("validated V4 models have an untied output head"),
+            &hidden,
+            parallel,
             context,
-            reduce,
-        )?;
-        let capture = self
-            .args
-            .dspark
-            .as_ref()
-            .and_then(|config| {
-                config
-                    .target_layer_ids
-                    .iter()
-                    .any(|wanted| usize::try_from(*wanted).ok() == Some(layer))
-                    .then(|| B::Tensor::mean_axis(&output, 2, false, context))
-            })
-            .transpose()?;
-        Ok((output, capture))
+        )
     }
 
     /// Executes one sequential embedded-prediction unit owned by the final
@@ -492,65 +731,166 @@ where
         }
     }
 
-    /// Executes a tensor-partitioned sequential predictor using
-    /// composition-owned embedding and vocabulary shards.
-    #[allow(clippy::too_many_arguments)]
-    pub fn pipeline_forward_prediction_parallel<C, R, H>(
+    /// Executes a rank-local sequential predictor using the architecture-owned
+    /// vocabulary shards and the backend-neutral collective hooks.
+    pub fn pipeline_forward_prediction_neutral_parallel<C>(
         &mut self,
         unit: &mut Unit<B>,
         hidden: &B::Tensor,
-        embedded: &B::Tensor,
         tokens: &B::Tensor,
         cache: &mut C,
+        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-        reduce: R,
-        project: H,
     ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
-        R: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
-        H: FnMut(&B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
+        let embedded = B::vocabulary_parallel_lookup(
+            &mut self.static_modules.text.embeddings,
+            tokens,
+            EmbeddingLookupPolicy::Strict,
+            parallel,
+            context,
+        )?;
+        let head = self
+            .static_modules
+            .text
+            .lm_head
+            .as_mut()
+            .expect("validated V4 models have an untied output head");
         match unit {
-            Unit::Prediction(unit) => {
-                unit.forward_parallel(hidden, embedded, tokens, cache, context, reduce, project)
-            }
+            Unit::Prediction(unit) => unit.forward_parallel(
+                hidden,
+                &embedded,
+                tokens,
+                cache,
+                context,
+                |value, context| B::sum_parallel(value, parallel, context),
+                |value, context| B::vocabulary_parallel_project(head, value, parallel, context),
+            ),
             Unit::Target(_) | Unit::Dspark(_) => Err(Error::backend(
                 "a non-sequential V4 unit cannot execute as an embedded predictor",
             )),
         }
     }
 
-    /// Tensor-partitioned sequential predictor with supplied routed experts.
+    /// Executes a rank-local sequential predictor with supplied experts and
+    /// architecture-owned vocabulary shards.
     #[allow(clippy::too_many_arguments)]
-    pub fn pipeline_forward_prediction_parallel_with_provider<C, P, R, H>(
+    pub fn pipeline_forward_prediction_neutral_parallel_with_provider<C, P>(
         &mut self,
         unit: &mut Unit<B>,
         hidden: &B::Tensor,
-        embedded: &B::Tensor,
         tokens: &B::Tensor,
         cache: &mut C,
         pass: eredu_runtime::ExpertPass,
         provider: &mut P,
+        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-        reduce: R,
-        project: H,
     ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error>
     where
         C: PoolingAttentionCache<B::Tensor>,
         P: eredu_runtime::RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
-        R: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
-        H: FnMut(&B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
+        let embedded = B::vocabulary_parallel_lookup(
+            &mut self.static_modules.text.embeddings,
+            tokens,
+            EmbeddingLookupPolicy::Strict,
+            parallel,
+            context,
+        )?;
+        let head = self
+            .static_modules
+            .text
+            .lm_head
+            .as_mut()
+            .expect("validated V4 models have an untied output head");
         match unit {
             Unit::Prediction(unit) => unit.forward_parallel_with_provider(
-                hidden, embedded, tokens, cache, pass, provider, context, reduce, project,
+                hidden,
+                &embedded,
+                tokens,
+                cache,
+                pass,
+                provider,
+                context,
+                |value, context| B::sum_parallel(value, parallel, context),
+                |value, context| B::vocabulary_parallel_project(head, value, parallel, context),
             ),
             Unit::Target(_) | Unit::Dspark(_) => Err(Error::backend(
                 "a non-sequential V4 unit cannot execute as an embedded predictor",
             )),
         }
+    }
+
+    /// Converts the transport-visible target capture into the internal
+    /// head-expanded activation consumed by one V4 predictor.
+    pub fn begin_partition_prediction_hidden(
+        &self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if hidden.shape().len() == 3 {
+            hidden.reshape(
+                &[
+                    hidden.dim(0),
+                    hidden.dim(1),
+                    self.args.hc_mult,
+                    self.args.hidden_size,
+                ],
+                context,
+            )
+        } else {
+            Ok(hidden.clone())
+        }
+    }
+
+    /// Converts one completed V4 predictor result back to the canonical
+    /// transport-visible hidden width.
+    pub fn finish_partition_prediction_output(
+        &self,
+        output: super::mtp::PredictionOutput<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error> {
+        let hidden = output.hidden.reshape(
+            &[
+                output.hidden.dim(0),
+                output.hidden.dim(1),
+                self.args.hc_mult * self.args.hidden_size,
+            ],
+            context,
+        )?;
+        Ok(super::mtp::PredictionOutput {
+            logits: output.logits,
+            hidden,
+            tokens: output.tokens,
+        })
+    }
+
+    /// Selects the shifted prefix used to warm sequential prediction caches.
+    pub fn prepare_partition_prediction_replay(
+        &self,
+        hidden: &B::Tensor,
+        tokens: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<(B::Tensor, B::Tensor)>, Error> {
+        let sequence = tokens.dim(1);
+        if sequence <= 1 {
+            return Ok(None);
+        }
+        let hidden = self.begin_partition_prediction_hidden(hidden, context)?;
+        let hidden = hidden.index(
+            &[
+                Index::Full,
+                Index::Range(0, sequence - 1),
+                Index::Full,
+                Index::Full,
+            ],
+            context,
+        )?;
+        let next = tokens.index(&[Index::Full, Index::Range(1, sequence)], context)?;
+        Ok(Some((hidden, next)))
     }
 
     /// Rebuilds the fused DSpark context caches from concatenated target-layer
@@ -739,6 +1079,176 @@ where
             },
             project,
         )
+    }
+
+    /// Executes a tensor-partitioned DSpark proposal using the
+    /// architecture-owned vocabulary shards.
+    pub fn pipeline_dspark_proposal_neutral_parallel<C, M>(
+        &mut self,
+        units: &mut [M],
+        anchor: &B::Tensor,
+        capacity: usize,
+        caches: &mut [C],
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        M: AsMut<Unit<B>>,
+    {
+        self.pipeline_dspark_proposal_neutral_parallel_inner(
+            units,
+            anchor,
+            capacity,
+            caches,
+            parallel,
+            context,
+            |unit, hidden, tokens, mask, cache, context| {
+                unit.forward_parallel(
+                    hidden,
+                    tokens,
+                    Some(mask),
+                    Some(cache),
+                    context,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                )
+            },
+        )
+    }
+
+    /// Executes a tensor-partitioned DSpark proposal with supplied experts and
+    /// architecture-owned vocabulary shards.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pipeline_dspark_proposal_neutral_parallel_with_provider<C, M, P>(
+        &mut self,
+        units: &mut [M],
+        anchor: &B::Tensor,
+        capacity: usize,
+        caches: &mut [C],
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        M: AsMut<Unit<B>>,
+        P: eredu_runtime::RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.pipeline_dspark_proposal_neutral_parallel_inner(
+            units,
+            anchor,
+            capacity,
+            caches,
+            parallel,
+            context,
+            |unit, hidden, tokens, mask, cache, context| {
+                unit.forward_parallel_with_provider(
+                    hidden,
+                    tokens,
+                    Some(mask),
+                    Some(cache),
+                    pass,
+                    provider,
+                    context,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                )
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipeline_dspark_proposal_neutral_parallel_inner<C, M, F>(
+        &mut self,
+        units: &mut [M],
+        anchor: &B::Tensor,
+        capacity: usize,
+        caches: &mut [C],
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        mut forward: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+        M: AsMut<Unit<B>>,
+        F: FnMut(
+            &mut V4Block<B>,
+            &B::Tensor,
+            &B::Tensor,
+            &B::Tensor,
+            &mut C,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<B::Tensor, Error>,
+    {
+        let config = self
+            .args
+            .dspark
+            .as_ref()
+            .ok_or_else(|| Error::backend("V4 checkpoint has no DSpark module"))?;
+        if capacity == 0 || anchor.shape().len() != 2 || anchor.dim(1) != 1 {
+            return Err(Error::backend(
+                "DSpark proposal requires a positive capacity and [batch, 1] anchor",
+            ));
+        }
+        if units.len() != caches.len() {
+            return Err(Error::backend("DSpark unit/cache count mismatch"));
+        }
+        let input_ids = if capacity == 1 {
+            anchor.clone()
+        } else {
+            let noise = B::Tensor::full_i32(
+                config.noise_token_id,
+                &[
+                    anchor.dim(0),
+                    i32::try_from(capacity - 1).map_err(Error::backend)?,
+                ],
+                context,
+            )?;
+            B::Tensor::concatenate(&[anchor.clone(), noise], 1, context)?
+        };
+        let embedded = B::vocabulary_parallel_lookup(
+            &mut self.static_modules.text.embeddings,
+            &input_ids,
+            EmbeddingLookupPolicy::Strict,
+            parallel,
+            context,
+        )?;
+        let mut hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+        for (unit, cache) in units.iter_mut().zip(caches) {
+            let Unit::Dspark(unit) = unit.as_mut() else {
+                return Err(Error::backend("DSpark proposal received a non-DSpark unit"));
+            };
+            let keys = (cache.offset() + i32::try_from(capacity).map_err(Error::backend)?)
+                .min(self.args.sliding_window);
+            let mask = B::Tensor::full_f32(
+                0.0,
+                &[i32::try_from(capacity).map_err(Error::backend)?, keys],
+                context,
+            )?;
+            hidden = forward(unit, &hidden, &input_ids, &mask, cache, context)?;
+        }
+        let dspark = self
+            .static_modules
+            .dspark
+            .as_mut()
+            .expect("validated DSpark static modules");
+        let collapsed = dspark.hyper_head.forward(&hidden, context)?;
+        let normalized = dspark.output_norm.forward(&collapsed, context)?;
+        let mut logits = B::vocabulary_parallel_project(
+            self.static_modules
+                .text
+                .lm_head
+                .as_mut()
+                .expect("validated V4 models have an untied output head"),
+            &normalized,
+            parallel,
+            context,
+        )?;
+        let markov = dspark.markov_embedding.forward(anchor, context)?;
+        let adjustment = dspark.markov_output.forward(&markov, context)?;
+        logits = logits.add(&adjustment.broadcast_to(logits.shape(), context)?, context)?;
+        Ok(logits)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1003,6 +1513,107 @@ where
         }
     }
 
+    /// Executes one tensor-partitioned target, MTP, or DSpark unit while an
+    /// external provider owns routed experts. Tensor reductions and
+    /// vocabulary collectives remain scoped to `parallel`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_unit_parallel_with_provider<S, P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Unit<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        pass: eredu_runtime::ExpertPass,
+        parallel: &B::ParallelContext,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: PoolingAttentionCache<B::Tensor>,
+        P: eredu_runtime::RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.groups.unit_count(group)?;
+        match unit {
+            Unit::Target(unit) if group == 0 => {
+                let hidden = unit.forward_parallel_with_provider(
+                    hidden,
+                    &forward.input_ids,
+                    forward.mask.as_ref(),
+                    Some(state.layer(index).map_err(Error::backend)?),
+                    pass,
+                    provider,
+                    context,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                )?;
+                if let Some(config) = &self.args.dspark {
+                    if let Some(position) = config
+                        .target_layer_ids
+                        .iter()
+                        .position(|wanted| usize::try_from(*wanted).ok() == Some(index))
+                    {
+                        forward.captures[position] =
+                            Some(B::Tensor::mean_axis(&hidden, 2, false, context)?);
+                    }
+                }
+                Ok(hidden)
+            }
+            Unit::Prediction(unit) if group > 0 => {
+                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                    + group
+                    - 1;
+                let head = self
+                    .static_modules
+                    .text
+                    .lm_head
+                    .as_mut()
+                    .expect("validated V4 models have an untied output head");
+                let output = unit.forward_parallel_with_provider(
+                    hidden,
+                    &forward.embedded,
+                    &forward.input_ids,
+                    state.layer(layer).map_err(Error::backend)?,
+                    pass,
+                    provider,
+                    context,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                    |value, context| B::vocabulary_parallel_project(head, value, parallel, context),
+                )?;
+                forward.draft_logits = Some(output.logits);
+                Ok(output.hidden)
+            }
+            Unit::Dspark(unit) if group > 0 => {
+                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                    + group
+                    - 1;
+                let cache = state.layer(layer).map_err(Error::backend)?;
+                match forward.mode {
+                    ForwardMode::DsparkContext => {
+                        unit.prefill_attention_cache(hidden, cache, context)?;
+                        Ok(hidden.clone())
+                    }
+                    ForwardMode::DsparkProposal => unit.forward_parallel_with_provider(
+                        hidden,
+                        &forward.input_ids,
+                        forward.mask.as_ref(),
+                        Some(cache),
+                        pass,
+                        provider,
+                        context,
+                        |value, context| B::sum_parallel(value, parallel, context),
+                    ),
+                    _ => Err(Error::backend("DSpark unit selected outside DSpark mode")),
+                }
+            }
+            _ => Err(Error::backend(format!(
+                "V4 parallel execution unit does not match group {group}"
+            ))),
+        }
+    }
+
     /// Executes one graph unit with stable target/MTP/DSpark observation and
     /// intervention points.
     #[allow(clippy::too_many_arguments)]
@@ -1176,6 +1787,62 @@ where
     }
 }
 
+fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
+    StaticModuleSpec {
+        embedding_weight: "embed.weight".into(),
+        normalization_weight: "norm.weight".into(),
+        head_weight: "head.weight".into(),
+        vocabulary: args.vocab_size,
+        hidden_size: args.hidden_size,
+        normalization_epsilon: args.rms_norm_eps,
+        normalization_offset: 0.0,
+        embedding_quantization: None,
+        head_format: args.linear_format_for("head.weight"),
+        tied_head: false,
+    }
+}
+
+fn prediction_groups(args: &V4Args) -> Result<SequentialPredictionGroups, Error> {
+    SequentialPredictionGroups::new(
+        "layers",
+        usize::try_from(args.num_hidden_layers).map_err(Error::backend)?,
+        (0..usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?)
+            .map(|depth| format!("mtp.{depth}")),
+    )
+}
+
+fn static_modules<B>(
+    args: &V4Args,
+    text: TextStaticModules<B>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<StaticModules<B>, Error>
+where
+    B: HyperNeuralBackend + RoutedNeuralBackend,
+{
+    let hyper_head = HyperHead::new(
+        HyperHeadSpec {
+            streams: args.hc_mult,
+            hidden_size: args.hidden_size,
+            norm_epsilon: args.rms_norm_eps,
+            epsilon: args.hc_eps,
+            function: parameter("hc_head_fn")?,
+            base: parameter("hc_head_base")?,
+            scale: parameter("hc_head_scale")?,
+        },
+        context,
+    )?;
+    let dspark = args
+        .dspark
+        .as_ref()
+        .map(|config| DsparkStatic::new(args, config, context))
+        .transpose()?;
+    Ok(StaticModules {
+        text,
+        hyper_head,
+        dspark,
+    })
+}
+
 impl<B: HyperNeuralBackend> DsparkStatic<B> {
     fn new(
         args: &V4Args,
@@ -1259,6 +1926,18 @@ where
         B::Tensor: 'a;
     type Error = Error;
 
+    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+        if group == 0 {
+            eredu_runtime::ArchitectureGroupTransport::decoder()
+        } else {
+            let mut transport = eredu_runtime::ArchitectureGroupTransport::prediction();
+            if group == 1 {
+                transport.first_owner_static_roles.push("mtp".into());
+            }
+            transport
+        }
+    }
+
     fn model_identity(&self) -> &str {
         &self.args.model_type
     }
@@ -1289,25 +1968,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error> {
-        self.groups.unit_count(group)?;
-        if group == 0 {
-            Ok(Unit::Target(V4Block::new(&self.args, index, context)?))
-        } else if self.args.dspark.is_some() {
-            let global =
-                usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
-            Ok(Unit::Dspark(V4Block::new_at(
-                &self.args,
-                global,
-                &format!("mtp.{}", group - 1),
-                context,
-            )?))
-        } else {
-            Ok(Unit::Prediction(V4PredictionLayer::new(
-                &self.args,
-                group - 1,
-                context,
-            )?))
-        }
+        self.construct_unit(group, index, context)
     }
 
     fn begin_forward<'a>(
@@ -1316,7 +1977,7 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let expected = state_layout(&self.args)?;
+        let expected = self.runtime_state_layout()?;
         if state.layout() != &expected {
             return Err(Error::backend(format!(
                 "V4 runtime state layout {:?} does not match architecture layout {expected:?}",
@@ -1646,6 +2307,344 @@ where
             forward.draft_hidden.as_ref(),
         ])
         .with_extras(&forward.captures)
+    }
+}
+
+impl<B, S> ParallelLayeredArchitecture<B, S> for Model<B>
+where
+    B: HyperNeuralBackend + RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: PoolingAttentionCache<B::Tensor>,
+{
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self
+            .parallel_geometry
+            .as_ref()
+            .ok_or_else(|| Error::backend("V4 model was not built with local geometry"))?
+            .state_layout()
+            .clone();
+        if state.layout() != &expected {
+            return Err(Error::backend(format!(
+                "V4 runtime state layout {:?} does not match architecture layout {expected:?}",
+                state.layout()
+            )));
+        }
+        let (input_ids, embedded, hidden, mask, mode) = match input {
+            EmbeddedInput::Target { tokens, mask } => {
+                let embedded = B::vocabulary_parallel_lookup(
+                    &mut self.static_modules.text.embeddings,
+                    tokens,
+                    EmbeddingLookupPolicy::Strict,
+                    parallel,
+                    context,
+                )?;
+                let hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+                (
+                    tokens.clone(),
+                    embedded,
+                    hidden,
+                    mask.cloned(),
+                    ForwardMode::Target,
+                )
+            }
+            EmbeddedInput::Draft {
+                tokens,
+                hidden,
+                depth,
+            } => {
+                if self.args.dspark.is_some() || depth >= self.groups.prediction_count() {
+                    return Err(Error::backend(format!(
+                        "V4 sequential prediction depth {depth} is unavailable"
+                    )));
+                }
+                (
+                    tokens.clone(),
+                    B::vocabulary_parallel_lookup(
+                        &mut self.static_modules.text.embeddings,
+                        tokens,
+                        EmbeddingLookupPolicy::Strict,
+                        parallel,
+                        context,
+                    )?,
+                    hidden.clone(),
+                    None,
+                    ForwardMode::Draft(depth),
+                )
+            }
+            EmbeddedInput::DsparkContext { captures } => {
+                let dspark = self
+                    .static_modules
+                    .dspark
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("V4 checkpoint has no DSpark module"))?;
+                let main = dspark
+                    .main_norm
+                    .forward(&dspark.main_projection.forward(captures, context)?, context)?;
+                let hidden = broadcast_streams::<B>(&main, &self.args, context)?;
+                (
+                    captures.clone(),
+                    main,
+                    hidden,
+                    None,
+                    ForwardMode::DsparkContext,
+                )
+            }
+            EmbeddedInput::DsparkProposal { anchor, capacity } => {
+                let config = self
+                    .args
+                    .dspark
+                    .as_ref()
+                    .ok_or_else(|| Error::backend("V4 checkpoint has no DSpark module"))?;
+                if capacity == 0 || anchor.shape().len() != 2 || anchor.dim(1) != 1 {
+                    return Err(Error::backend(
+                        "DSpark proposal requires a positive capacity and [batch, 1] anchor",
+                    ));
+                }
+                let input_ids = if capacity == 1 {
+                    anchor.clone()
+                } else {
+                    let noise = B::Tensor::full_i32(
+                        config.noise_token_id,
+                        &[
+                            anchor.dim(0),
+                            i32::try_from(capacity - 1).map_err(Error::backend)?,
+                        ],
+                        context,
+                    )?;
+                    B::Tensor::concatenate(&[anchor.clone(), noise], 1, context)?
+                };
+                let embedded = B::vocabulary_parallel_lookup(
+                    &mut self.static_modules.text.embeddings,
+                    &input_ids,
+                    EmbeddingLookupPolicy::Strict,
+                    parallel,
+                    context,
+                )?;
+                let hidden = broadcast_streams::<B>(&embedded, &self.args, context)?;
+                let draft_start =
+                    usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?;
+                let offset = state.layer(draft_start).map_err(Error::backend)?.offset();
+                let keys = (offset + i32::try_from(capacity).map_err(Error::backend)?)
+                    .min(self.args.sliding_window);
+                let mask = Some(B::Tensor::full_f32(
+                    0.0,
+                    &[i32::try_from(capacity).map_err(Error::backend)?, keys],
+                    context,
+                )?);
+                (
+                    input_ids,
+                    embedded,
+                    hidden,
+                    mask,
+                    ForwardMode::DsparkProposal,
+                )
+            }
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                input_ids,
+                embedded,
+                mask,
+                mode,
+                target_capture: None,
+                draft_logits: None,
+                draft_hidden: None,
+                captures: self
+                    .args
+                    .dspark
+                    .as_ref()
+                    .map_or_else(Vec::new, |config| vec![None; config.target_layer_ids.len()]),
+            },
+        })
+    }
+
+    fn forward_unit_parallel(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.groups.unit_count(group)?;
+        match unit {
+            Unit::Target(unit) if group == 0 => {
+                let hidden = unit.forward_parallel(
+                    hidden,
+                    &forward.input_ids,
+                    forward.mask.as_ref(),
+                    Some(state.layer(index).map_err(Error::backend)?),
+                    context,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                )?;
+                if let Some(config) = &self.args.dspark {
+                    if let Some(position) = config
+                        .target_layer_ids
+                        .iter()
+                        .position(|wanted| usize::try_from(*wanted).ok() == Some(index))
+                    {
+                        forward.captures[position] =
+                            Some(B::Tensor::mean_axis(&hidden, 2, false, context)?);
+                    }
+                }
+                Ok(hidden)
+            }
+            Unit::Prediction(unit) if group > 0 => {
+                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                    + group
+                    - 1;
+                let output = unit.forward_parallel(
+                    hidden,
+                    &forward.embedded,
+                    &forward.input_ids,
+                    state.layer(layer).map_err(Error::backend)?,
+                    context,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                    |value, context| {
+                        B::vocabulary_parallel_project(
+                            self.static_modules
+                                .text
+                                .lm_head
+                                .as_mut()
+                                .expect("validated V4 models have an untied output head"),
+                            value,
+                            parallel,
+                            context,
+                        )
+                    },
+                )?;
+                forward.draft_logits = Some(output.logits);
+                Ok(output.hidden)
+            }
+            Unit::Dspark(unit) if group > 0 => {
+                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                    + group
+                    - 1;
+                let cache = state.layer(layer).map_err(Error::backend)?;
+                match forward.mode {
+                    ForwardMode::DsparkContext => {
+                        unit.prefill_attention_cache(hidden, cache, context)?;
+                        Ok(hidden.clone())
+                    }
+                    ForwardMode::DsparkProposal => unit.forward_parallel(
+                        hidden,
+                        &forward.input_ids,
+                        forward.mask.as_ref(),
+                        Some(cache),
+                        context,
+                        |value, context| B::sum_parallel(value, parallel, context),
+                    ),
+                    _ => Err(Error::backend("DSpark unit selected outside DSpark mode")),
+                }
+            }
+            _ => Err(Error::backend(format!(
+                "V4 parallel execution unit does not match group {group}"
+            ))),
+        }
+    }
+
+    fn complete_execution_group_parallel(
+        &mut self,
+        group: usize,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if group == 0 && matches!(forward.mode, ForwardMode::Target) {
+            forward.target_capture = if self.args.dspark.is_some() {
+                Some(B::Tensor::concatenate(
+                    &forward
+                        .captures
+                        .iter()
+                        .map(|capture| {
+                            capture.clone().ok_or_else(|| {
+                                Error::backend("configured DSpark target capture was not produced")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    -1,
+                    context,
+                )?)
+            } else {
+                Some(hidden.clone())
+            };
+        }
+        if group == self.groups.prediction_count()
+            && matches!(forward.mode, ForwardMode::DsparkProposal)
+        {
+            let dspark = self
+                .static_modules
+                .dspark
+                .as_mut()
+                .expect("DSpark proposal mode has pinned DSpark modules");
+            let collapsed = dspark.hyper_head.forward(hidden, context)?;
+            let normalized = dspark.output_norm.forward(&collapsed, context)?;
+            let mut logits = B::vocabulary_parallel_project(
+                self.static_modules
+                    .text
+                    .lm_head
+                    .as_mut()
+                    .expect("validated V4 models have an untied output head"),
+                &normalized,
+                parallel,
+                context,
+            )?;
+            let anchor = forward.input_ids.index(
+                &[eredu_nn::Index::Full, eredu_nn::Index::Range(0, 1)],
+                context,
+            )?;
+            let markov = dspark.markov_embedding.forward(&anchor, context)?;
+            let adjustment = dspark.markov_output.forward(&markov, context)?;
+            logits = logits.add(&adjustment.broadcast_to(logits.shape(), context)?, context)?;
+            forward.draft_logits = Some(logits);
+        }
+        if group > 0 && matches!(forward.mode, ForwardMode::Draft(_)) {
+            forward.draft_hidden = Some(hidden.clone());
+        }
+        Ok(hidden.clone())
+    }
+
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        match forward.mode {
+            ForwardMode::Target => {
+                let hidden = self.static_modules.hyper_head.forward(hidden, context)?;
+                let hidden = self.static_modules.text.norm.forward(&hidden, context)?;
+                B::vocabulary_parallel_project(
+                    self.static_modules
+                        .text
+                        .lm_head
+                        .as_mut()
+                        .expect("validated V4 models have an untied output head"),
+                    &hidden,
+                    parallel,
+                    context,
+                )
+            }
+            ForwardMode::Draft(_) | ForwardMode::DsparkProposal => forward
+                .draft_logits
+                .clone()
+                .ok_or_else(|| Error::backend("V4 draft group produced no logits")),
+            ForwardMode::DsparkContext => Ok(hidden.clone()),
+        }
     }
 }
 

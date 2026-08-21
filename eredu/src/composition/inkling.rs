@@ -13,15 +13,10 @@ use eredu_checkpoint::{
     store::{CheckpointSource, SharedCheckpointSource},
     WeightQuantization,
 };
-use eredu_nn::{
-    EmbeddingOperator, LinearOperator, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
-    Parameterized,
-};
 use eredu_runtime::{
     CacheResidencyPolicy, CausalModel, ExecutionGraph, ExecutionUnitLayout, LayerWeightResidency,
-    LayeredArchitecture, LayeredForwardState, LayerwiseRuntime, PagedCacheOptions,
-    ParallelLayeredArchitecture, ParallelModelInfo, RuntimeState, StaticUnitBindings,
-    WeightBinding, WeightResidency,
+    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, RuntimeState,
+    StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -31,10 +26,7 @@ use safemlx::{
 
 use crate::backend::mlx::{
     error::Error,
-    nn::{
-        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
-        shared::{MlxBackend, MlxModule, MlxNamedModule},
-    },
+    nn::shared::{MlxBackend, MlxModule},
     runtime::{
         cache::{
             residency::{
@@ -52,8 +44,8 @@ use crate::backend::mlx::{
         },
         execution::{
             generic::{
-                prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
-                MlxUnitFactory,
+                construct_architecture_unit, prepare_layerwise_policy_with_bindings,
+                MlxLayerwisePolicy, MlxResidentPolicy, MlxUnitPopulator,
             },
             layerwise::{
                 open_safetensors_weight_store, quantize_module_store_with_bindings,
@@ -69,6 +61,17 @@ use crate::composition::mlx::artifact::find_sibling_mmproj;
 type NeutralArchitecture = Architecture<MlxBackend>;
 type NeutralUnit = Unit<MlxBackend>;
 pub(crate) type InklingPipelineUnit = MlxModule<NeutralUnit>;
+
+fn group_kind(
+    architecture: &NeutralArchitecture,
+    group: usize,
+) -> eredu_runtime::ArchitectureGroupKind {
+    <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
+        MlxBackend,
+        MlxHybridState,
+    >>::group_transport(architecture, group)
+    .kind
+}
 type Resident = LayerwiseRuntime<
     NeutralArchitecture,
     MlxBackend,
@@ -79,20 +82,20 @@ type Bounded = LayerwiseRuntime<
     NeutralArchitecture,
     MlxBackend,
     MlxHybridState,
-    MlxLayerwisePolicy<NeutralUnit, UnitFactory>,
+    MlxLayerwisePolicy<NeutralUnit, UnitPopulator>,
 >;
 
 type ParallelResident = LayerwiseRuntime<
-    InklingParallelComposition,
+    NeutralArchitecture,
     MlxBackend,
     MlxHybridState,
-    MlxResidentPolicy<eredu_architectures::inkling::DecoderLayer<MlxBackend>>,
+    MlxResidentPolicy<NeutralUnit>,
 >;
 type ParallelBounded = LayerwiseRuntime<
-    InklingParallelComposition,
+    NeutralArchitecture,
     MlxBackend,
     MlxHybridState,
-    MlxLayerwisePolicy<eredu_architectures::inkling::DecoderLayer<MlxBackend>, ParallelUnitFactory>,
+    MlxLayerwisePolicy<NeutralUnit, ParallelUnitPopulator>,
 >;
 
 /// Complete neutral Inkling generation state, including checkpoint-embedded MTP.
@@ -124,75 +127,44 @@ impl InklingState {
     }
 }
 
-/// Pipeline ingress retained while hMLP units are placed across ranks.
-pub(crate) struct InklingPipelineIngressState {
-    forward: LayeredForwardState<Array, eredu_architectures::inkling::ForwardContext<Array>>,
-    state: MlxHybridState,
-}
-
-impl InklingPipelineIngressState {
-    pub(crate) fn hidden(&self) -> &Array {
-        &self.forward.hidden
-    }
-
-    pub(crate) fn replace_hidden(&mut self, hidden: Array) {
-        self.forward.hidden = hidden;
-    }
-}
-
-/// Pipeline/loading binder over the ordinary neutral Inkling architecture.
-pub(crate) struct InklingPipelineAdapter {
-    args: ModelArgs,
-    architecture: NeutralArchitecture,
-    parallel_embedding: Option<VocabParallelEmbedding>,
-    parallel_lm_head: Option<VocabParallelLmHead>,
-    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
+/// Binding-only helper for Inkling pipeline checkpoint materialization.
+pub(crate) struct InklingBindings {
     external_experts: bool,
 }
 
-impl InklingPipelineAdapter {
-    pub(crate) fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
-        Ok(Self {
-            architecture: NeutralArchitecture::new(args.clone(), stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-            args,
-            parallel_embedding: None,
-            parallel_lm_head: None,
-            parallel_layout: None,
+impl InklingBindings {
+    pub(crate) const fn new() -> Self {
+        Self {
             external_experts: false,
-        })
+        }
     }
 
-    pub(crate) fn new_external_experts(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
-        let mut adapter = Self::new(args, stream)?;
-        adapter.external_experts = true;
-        Ok(adapter)
+    pub(crate) const fn new_external_experts() -> Self {
+        Self {
+            external_experts: true,
+        }
     }
 
-    pub(crate) fn model_type(&self) -> &str {
-        &self.args.model_type
+    pub(crate) fn model_type<'a>(&self, architecture: &'a NeutralArchitecture) -> &'a str {
+        &architecture.args().model_type
     }
 
-    fn static_modules(&self) -> &eredu_architectures::inkling::StaticModules<MlxBackend> {
+    fn static_modules(
+        architecture: &NeutralArchitecture,
+    ) -> &eredu_architectures::inkling::StaticModules<MlxBackend> {
         <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-            &self.architecture,
-        )
-    }
-
-    fn static_modules_mut(
-        &mut self,
-    ) -> &mut eredu_architectures::inkling::StaticModules<MlxBackend> {
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules_mut(
-            &mut self.architecture,
+            architecture,
         )
     }
 
     pub(crate) fn selected_static_units(
         &self,
+        architecture: &NeutralArchitecture,
         store: &dyn CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let modules = self.static_modules();
+        let args = architecture.args();
+        let modules = Self::static_modules(architecture);
         let mut units = Vec::new();
         macro_rules! push_leaf {
             ($role:literal, $module:expr, $prefix:literal, $packed:expr) => {
@@ -200,7 +172,7 @@ impl InklingPipelineAdapter {
                     let module = MlxModule::new($module.clone());
                     let recipes = crate::composition::inkling_expert::module_recipes(
                         &module,
-                        &self.args,
+                        args,
                         store,
                     )?;
                     let prefix = concat!($prefix, ".");
@@ -242,9 +214,8 @@ impl InklingPipelineAdapter {
             ($role:literal, $module:expr) => {
                 if select(concat!("inkling.static.", $role)) {
                     let module = MlxModule::new($module.clone());
-                    let recipes = crate::composition::inkling_expert::module_recipes(
-                        &module, &self.args, store,
-                    )?;
+                    let recipes =
+                        crate::composition::inkling_expert::module_recipes(&module, args, store)?;
                     units.push(StaticUnitBindings::new(
                         concat!("inkling.static.", $role),
                         build_module_bindings_with_recipes_excluding(
@@ -262,8 +233,7 @@ impl InklingPipelineAdapter {
             "embedding",
             modules.embeddings,
             "model.embed_tokens",
-            self.args
-                .text_config
+            args.text_config
                 .linear_format_for("model.embed_tokens.weight")
                 .weight_quantization()
                 .is_some()
@@ -279,8 +249,7 @@ impl InklingPipelineAdapter {
             "output",
             modules.output,
             "lm_head",
-            self.args
-                .text_config
+            args.text_config
                 .linear_format_for("lm_head.weight")
                 .weight_quantization()
                 .is_some()
@@ -299,93 +268,39 @@ impl InklingPipelineAdapter {
 
     pub(crate) fn static_units(
         &self,
+        architecture: &NeutralArchitecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(store, &|_| true)
+        self.selected_static_units(architecture, store, &|_| true)
     }
 
     pub(crate) fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
         true
     }
 
-    pub(crate) fn layer_count(&self, group: usize) -> Result<usize, Error> {
-        match group {
-            0 => Ok(self
-                .args
-                .vision_config
-                .as_ref()
-                .map_or(0, |vision| vision.num_hidden_layers as usize)),
-            1 => Ok(self.args.text_config.num_hidden_layers as usize),
-            _ => Err(Error::Parallel(format!(
-                "Inkling has no execution group {group}"
-            ))),
-        }
-    }
-
-    pub(crate) fn new_layer(
+    pub(crate) fn layer_count(
         &self,
+        architecture: &NeutralArchitecture,
         group: usize,
-        index: usize,
-        stream: &Stream,
-    ) -> Result<InklingPipelineUnit, Error> {
-        self.new_cartesian_layer(group, index, None, stream)
-    }
-
-    pub(crate) fn new_cartesian_layer(
-        &self,
-        group: usize,
-        index: usize,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        stream: &Stream,
-    ) -> Result<InklingPipelineUnit, Error> {
-        let unit = match group {
-            0 => {
-                let vision = self.args.vision_config.as_ref().ok_or_else(|| {
-                    Error::UnsupportedArchitecture("Inkling vision config is missing".into())
-                })?;
-                NeutralUnit::Vision(
-                    eredu_architectures::inkling::VisionLayer::new(
-                        vision,
-                        index,
-                        vision.layer_specs()[index],
-                        stream,
-                    )
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-                )
-            }
-            1 => {
-                let text = match layout {
-                    Some(layout) => eredu_architectures::inkling::local_text_args(
-                        &self.args.text_config,
-                        index,
-                        layout,
-                    )
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                    None => self.args.text_config.clone(),
-                };
-                NeutralUnit::Text(
-                    eredu_architectures::inkling::DecoderLayer::new(&text, index, stream)
-                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-                )
-            }
-            _ => {
-                return Err(Error::Parallel(format!(
-                    "Inkling has no execution group {group}"
-                )))
-            }
-        };
-        Ok(MlxModule::new(unit))
+    ) -> Result<usize, Error> {
+        <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
+            MlxBackend,
+            MlxHybridState,
+        >>::group_unit_count(architecture, group)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 
     pub(crate) fn layer_bindings(
         &self,
+        architecture: &NeutralArchitecture,
         group: usize,
         _index: usize,
         layer: &InklingPipelineUnit,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
-        self.layer_count(group)?;
-        let recipes = crate::composition::inkling_expert::module_recipes(layer, &self.args, store)?;
+        self.layer_count(architecture, group)?;
+        let recipes =
+            crate::composition::inkling_expert::module_recipes(layer, architecture.args(), store)?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
             self.external_experts && name.contains(".moe.") && name.contains("experts")
         })
@@ -394,534 +309,46 @@ impl InklingPipelineAdapter {
 
     pub(crate) fn cartesian_layer_bindings(
         &self,
+        architecture: &NeutralArchitecture,
         group: usize,
         index: usize,
-        layer: &InklingPipelineUnit,
+        global_layer: &InklingPipelineUnit,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
-        match layout {
-            Some(layout) => {
-                let global = self.new_cartesian_layer(group, index, None, stream)?;
-                let bindings = self.layer_bindings(group, index, &global, store)?;
-                let prefix = match group {
-                    0 => format!("visual.layers.{index}"),
-                    1 => format!("model.layers.{index}"),
-                    _ => unreachable!(),
-                };
-                let _ = stream;
-                shard_layer_bindings(bindings, &prefix, store, layout)
-            }
-            None => self.layer_bindings(group, index, layer, store),
-        }
-    }
-
-    pub(crate) fn register_parallel_parameters(
-        &self,
-        _build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
-        _stream: &Stream,
-    ) -> Result<(), Error> {
-        for group in eredu_architectures::inkling::static_parameter_groups(&self.args)? {
-            planner.register(group)?;
-        }
-        for group in eredu_architectures::inkling::mtp_parameter_groups(&self.args)? {
-            planner.register(group)?;
-        }
-        for index in 0..self.args.text_config.num_hidden_layers as usize {
-            for group in eredu_architectures::inkling::layer_parameter_groups(&self.args, index)? {
-                planner.register(group)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn configure_parallel_static(
-        &mut self,
-        build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &eredu_runtime::LocalModelLayout,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        self.parallel_layout = Some(layout.clone());
-        self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
-            self.args.text_config.vocab_size as usize,
-            self.args.text_config.hidden_size,
-            self.args
-                .text_config
-                .linear_format_for("model.embed_tokens.weight")
-                .weight_quantization(),
-            build,
-            stream,
-        )?);
-        self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
-            self.args.text_config.hidden_size,
-            self.args.text_config.vocab_size as usize,
-            self.args
-                .text_config
-                .linear_format_for("lm_head.weight")
-                .weight_quantization(),
-            build,
-            stream,
-        )?);
-        Ok(())
-    }
-
-    pub(crate) fn embedding_mut(&mut self) -> &mut crate::backend::mlx::nn::shared::MlxEmbedding {
-        &mut self.static_modules_mut().embeddings
-    }
-
-    pub(crate) fn embedding_norm_mut(
-        &mut self,
-    ) -> &mut crate::backend::mlx::nn::shared::MlxRmsNorm {
-        &mut self.static_modules_mut().embedding_norm
-    }
-
-    pub(crate) fn norm_mut(&mut self) -> &mut crate::backend::mlx::nn::shared::MlxRmsNorm {
-        &mut self.static_modules_mut().final_norm
-    }
-
-    pub(crate) fn output_mut(&mut self) -> &mut crate::backend::mlx::nn::shared::MlxLinear {
-        &mut self.static_modules_mut().output
-    }
-
-    pub(crate) fn audio_mut(
-        &mut self,
-    ) -> Option<
-        crate::backend::mlx::nn::shared::MlxModuleRef<
-            '_,
-            eredu_architectures::inkling::AudioTower<MlxBackend>,
-        >,
-    > {
-        self.static_modules_mut()
-            .audio
-            .as_mut()
-            .map(crate::backend::mlx::nn::shared::MlxModuleRef::new)
-    }
-
-    pub(crate) fn vision_mut(
-        &mut self,
-    ) -> Option<
-        crate::backend::mlx::nn::shared::MlxModuleRef<
-            '_,
-            eredu_architectures::inkling::VisionStatic<MlxBackend>,
-        >,
-    > {
-        self.static_modules_mut()
-            .vision
-            .as_mut()
-            .map(crate::backend::mlx::nn::shared::MlxModuleRef::new)
-    }
-
-    pub(crate) fn mtp_mut(
-        &mut self,
-    ) -> Option<
-        crate::backend::mlx::nn::shared::MlxModuleRef<
-            '_,
-            eredu_architectures::inkling::MtpModel<MlxBackend>,
-        >,
-    > {
-        self.static_modules_mut()
-            .mtp
-            .as_mut()
-            .map(crate::backend::mlx::nn::shared::MlxModuleRef::new)
-    }
-
-    pub(crate) fn parallel_embedding_mut(&mut self) -> Option<&mut VocabParallelEmbedding> {
-        self.parallel_embedding.as_mut()
-    }
-
-    pub(crate) fn parallel_lm_head_mut(&mut self) -> Option<&mut VocabParallelLmHead> {
-        self.parallel_lm_head.as_mut()
-    }
-
-    pub(crate) fn prompt_cache_model_identity(
-        &self,
-        topology: Option<crate::backend::mlx::MlxParallelContext>,
-    ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
-        let layout = match topology {
-            Some(_) => {
-                let parallel = self.parallel_layout.as_ref().ok_or_else(|| {
-                    Error::Parallel("parallel Inkling cache layout is not configured".into())
-                })?;
-                let local = (0..self.args.text_config.num_hidden_layers as usize)
-                    .map(|layer| {
-                        eredu_architectures::inkling::local_text_args(
-                            &self.args.text_config,
-                            layer,
-                            parallel,
-                        )
-                        .map_err(|error| Error::Parallel(error.to_string()))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                eredu_architectures::inkling::parallel_state_layout(&self.args, &local)
-            }
-            None => eredu_architectures::inkling::state_layout(&self.args),
-        }
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        let mut identity = eredu_runtime::ModelStateIdentity {
-            model_family: "inkling".into(),
-            effective_model_type: self.args.model_type.clone(),
-            architecture_fingerprint: self.args.architecture_fingerprint(),
-            layer_count: layout.len(),
-            global_layer_start: 0,
-            sink_tokens: 0,
-            layer_prefix_offsets: vec![0; layout.len()],
-            topology: Default::default(),
-        }
-        .prompt_cache_identity(&layout)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        if let Some(topology) = topology {
-            identity.topology = crate::backend::mlx::cache::prompt_cache_topology(topology);
-        }
-        Ok(identity)
-    }
-
-    pub(crate) fn embedded_mtp_len(&self) -> usize {
-        self.architecture.mtp_len()
-    }
-
-    pub(crate) fn embedded_mtp_state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
-        eredu_architectures::inkling::mtp_state_layout(&self.args)
-            .map_err(|error| Error::Parallel(error.to_string()))
-            .and_then(|layout| {
-                layout.ok_or_else(|| {
-                    Error::UnsupportedArchitecture(
-                        "Inkling checkpoint has no embedded MTP predictor".into(),
-                    )
-                })
-            })
-    }
-
-    pub(crate) fn forward_pipeline_mtp(
-        &mut self,
-        hidden: &Array,
-        tokens: &Array,
-        depth: usize,
-        state: &mut MlxHybridState,
-        execution: Option<
-            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
-        >,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let embeddings = match execution.filter(|execution| execution.is_tensor_parallel()) {
-            Some(execution) => self
-                .parallel_embedding
-                .as_mut()
-                .ok_or_else(|| Error::Parallel("Inkling pipeline MTP has no TP embedding".into()))?
-                .forward(tokens, execution)?,
-            None => self
-                .architecture
-                .mtp_token_embeddings(tokens, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-        };
-        let embeddings = match execution.filter(|execution| execution.is_tensor_parallel()) {
-            Some(_) => self
-                .architecture
-                .normalize_mtp_embeddings(&embeddings, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-            None => embeddings,
-        };
-        let output = self
-            .architecture
-            .forward_mtp_step(
-                hidden,
-                &embeddings,
-                tokens,
-                depth,
-                state.layers_mut(),
-                stream,
-            )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let logits = match execution.filter(|execution| execution.is_tensor_parallel()) {
-            Some(execution) => {
-                let projection_input = self
-                    .architecture
-                    .final_mtp_parallel_hidden(&output.hidden, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-                let mut logits = self
-                    .parallel_lm_head
-                    .as_mut()
-                    .ok_or_else(|| {
-                        Error::Parallel("Inkling pipeline MTP has no TP output head".into())
-                    })?
-                    .forward(&projection_input, execution)?
-                    .all_gather(execution)?;
-                let vocabulary = self
-                    .args
-                    .text_config
-                    .unpadded_vocab_size
-                    .unwrap_or(self.args.text_config.vocab_size);
-                if vocabulary != self.args.text_config.vocab_size {
-                    logits = logits.try_index_device((.., .., ..vocabulary), stream)?;
+        let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
+        if let Some(layout) = layout {
+            let prefix = match group_kind(architecture, group) {
+                eredu_runtime::ArchitectureGroupKind::VisionEncoder => {
+                    format!("visual.layers.{index}")
                 }
-                logits
-            }
-            None => self
-                .architecture
-                .project_mtp_logits(&output.hidden, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-        };
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits,
-                hidden: output.hidden,
-                tokens: output.tokens,
-            },
-        )
-    }
-
-    pub(crate) fn begin_pipeline_ingress(
-        &mut self,
-        typed: input::ModelInput<'_>,
-        stream: &Stream,
-    ) -> Result<InklingPipelineIngressState, Error> {
-        let prepared = prepare_inkling_input(&self.args, typed, stream)?;
-        let parts = prepared
-            .tokens
-            .iter()
-            .zip(prepared.kinds.iter().copied())
-            .zip(&prepared.projected)
-            .map(|((tokens, kind), projected)| match projected {
-                Some(embeddings) => DecoderInputPart::Projected { tokens, embeddings },
-                None => match kind {
-                    input::Modality::Text => DecoderInputPart::Text(tokens),
-                    input::Modality::Image => DecoderInputPart::Image(tokens),
-                    input::Modality::Audio => DecoderInputPart::Audio(tokens),
-                    input::Modality::Video => unreachable!(),
-                },
-            })
-            .collect::<Vec<_>>();
-        let audio = prepared.audio.as_ref().map(|code_ids| AudioInput {
-            code_ids,
-            valid_frames: code_ids.dim(1),
-        });
-        let mut state = MlxHybridState::device(
-            eredu_architectures::inkling::state_layout(&self.args)
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-        )?;
-        let forward = <NeutralArchitecture as LayeredArchitecture<
-            MlxBackend,
-            MlxHybridState,
-        >>::begin_forward(
-            &mut self.architecture,
-            ModelInput {
-                parts: &parts,
-                vision_patches: prepared.images.as_ref(),
-                audio,
-            },
-            &mut state,
-            stream,
-        )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        Ok(InklingPipelineIngressState { forward, state })
-    }
-
-    pub(crate) fn pipeline_ingress_active(&self, state: &InklingPipelineIngressState) -> bool {
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::should_execute_group(
-            &self.architecture,
-            0,
-            &state.forward.context,
-        )
-    }
-
-    pub(crate) fn pipeline_ingress_arrays(
-        &self,
-        state: &InklingPipelineIngressState,
-    ) -> Vec<Array> {
-        vec![state.hidden().clone()]
-    }
-
-    pub(crate) fn replace_pipeline_ingress_arrays(
-        &self,
-        state: &mut InklingPipelineIngressState,
-        arrays: Vec<Array>,
-    ) -> Result<(), Error> {
-        let [hidden]: [Array; 1] = arrays.try_into().map_err(|arrays: Vec<Array>| {
-            Error::Parallel(format!(
-                "Inkling placed ingress expected one activation, got {}",
-                arrays.len()
-            ))
-        })?;
-        state.replace_hidden(hidden);
-        Ok(())
-    }
-
-    pub(crate) fn forward_pipeline_vision_layer(
-        &mut self,
-        index: usize,
-        layer: &mut InklingPipelineUnit,
-        state: &mut InklingPipelineIngressState,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        state.forward.hidden =
-            <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::forward_unit(
-                &mut self.architecture,
-                0,
-                index,
-                &mut **layer,
-                &state.forward.hidden,
-                &mut state.state,
-                &mut state.forward.context,
-                stream,
-            )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        Ok(())
-    }
-
-    pub(crate) fn finish_pipeline_ingress(
-        &mut self,
-        mut state: InklingPipelineIngressState,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        if self.pipeline_ingress_active(&state) {
-            state.forward.hidden = <NeutralArchitecture as LayeredArchitecture<
-                MlxBackend,
-                MlxHybridState,
-            >>::complete_execution_group(
-                &mut self.architecture,
-                0,
-                &state.forward.hidden,
-                &mut state.state,
-                &mut state.forward.context,
-                stream,
-            )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        }
-        Ok(state.forward.hidden)
-    }
-
-    pub(crate) fn prepare_pipeline_tokens(
-        &mut self,
-        tokens: &Array,
-        execution: Option<
-            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
-        >,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        match (self.parallel_embedding.as_mut(), execution) {
-            (Some(embedding), Some(execution)) => {
-                let hidden = embedding.forward(tokens, execution)?;
-                self.static_modules_mut()
-                    .embedding_norm
-                    .forward(&hidden, execution.stream())
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-            }
-            _ => {
-                let hidden = self
-                    .static_modules_mut()
-                    .embeddings
-                    .forward(tokens, stream)?;
-                self.static_modules_mut()
-                    .embedding_norm
-                    .forward(&hidden, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-            }
-        }
-    }
-
-    pub(crate) fn finish_pipeline_text(
-        &mut self,
-        hidden: &Array,
-        execution: Option<
-            &crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'_>,
-        >,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        if let (Some(head), Some(execution)) = (self.parallel_lm_head.as_mut(), execution) {
-            let hidden = self
-                .architecture
-                .final_parallel_hidden(hidden, execution.stream())
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-            let logits = head.forward(&hidden, execution)?.all_gather(execution)?;
-            let vocabulary = self
-                .args
-                .text_config
-                .unpadded_vocab_size
-                .unwrap_or(self.args.text_config.vocab_size);
-            return if vocabulary == self.args.text_config.vocab_size {
-                Ok(logits)
-            } else {
-                Ok(logits.try_index_device((.., .., ..vocabulary), execution.stream())?)
+                eredu_runtime::ArchitectureGroupKind::Decoder => {
+                    format!("model.layers.{index}")
+                }
+                kind => {
+                    return Err(Error::Parallel(format!(
+                        "Inkling cannot shard {kind:?} unit {index}"
+                    )))
+                }
             };
-        }
-        let hidden = self
-            .static_modules_mut()
-            .final_norm
-            .forward(hidden, stream)?;
-        let hidden = hidden.multiply(
-            Array::from_f32(self.args.text_config.logits_mup_width_multiplier.recip()),
-            stream,
-        )?;
-        let logits = self.static_modules_mut().output.forward(&hidden, stream)?;
-        let vocabulary = self
-            .args
-            .text_config
-            .unpadded_vocab_size
-            .unwrap_or(self.args.text_config.vocab_size);
-        if vocabulary == self.args.text_config.vocab_size {
-            Ok(logits)
+            shard_layer_bindings(bindings, &prefix, store, layout)
         } else {
-            Ok(logits.try_index_device((.., .., ..vocabulary), stream)?)
+            Ok(bindings)
         }
     }
 }
 
 #[derive(Clone)]
-struct UnitFactory {
-    args: ModelArgs,
-    vision_layers: usize,
+struct UnitPopulator {
     external_experts: bool,
 }
 
 #[derive(Clone)]
-struct ParallelUnitFactory {
-    args: Arc<Vec<eredu_architectures::inkling::TextArgs>>,
+struct ParallelUnitPopulator {
+    external_experts: bool,
 }
 
-impl MlxUnitFactory<eredu_architectures::inkling::DecoderLayer<MlxBackend>>
-    for ParallelUnitFactory
-{
-    fn build(
-        &mut self,
-        index: usize,
-        stream: &Stream,
-    ) -> Result<eredu_architectures::inkling::DecoderLayer<MlxBackend>, Error> {
-        let args = self.args.get(index).ok_or_else(|| {
-            Error::Parallel(format!(
-                "parallel Inkling layer {index} is outside {} local layouts",
-                self.args.len()
-            ))
-        })?;
-        eredu_architectures::inkling::DecoderLayer::new(args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-}
-
-impl MlxUnitFactory<NeutralUnit> for UnitFactory {
-    fn build(&mut self, index: usize, stream: &Stream) -> Result<NeutralUnit, Error> {
-        if index < self.vision_layers {
-            let vision = self.args.vision_config.as_ref().ok_or_else(|| {
-                Error::UnsupportedArchitecture("Inkling vision config is missing".into())
-            })?;
-            eredu_architectures::inkling::VisionLayer::new(
-                vision,
-                index,
-                vision.layer_specs()[index],
-                stream,
-            )
-            .map(NeutralUnit::Vision)
-        } else {
-            eredu_architectures::inkling::DecoderLayer::new(
-                &self.args.text_config,
-                index - self.vision_layers,
-                stream,
-            )
-            .map(NeutralUnit::Text)
-        }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-
+impl MlxUnitPopulator<NeutralUnit> for UnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<NeutralUnit>,
@@ -934,454 +361,16 @@ impl MlxUnitFactory<NeutralUnit> for UnitFactory {
     }
 }
 
-/// MLX-owned vocabulary shards around the ordinary neutral Inkling decoder.
-pub struct InklingParallelComposition {
-    architecture: NeutralArchitecture,
-    embedding: MlxNamedModule<VocabParallelEmbedding>,
-    output: MlxNamedModule<VocabParallelLmHead>,
-    vision_layers: Vec<eredu_architectures::inkling::VisionLayer<MlxBackend>>,
-    local_args: Arc<Vec<eredu_architectures::inkling::TextArgs>>,
-    topology: crate::backend::mlx::MlxParallelContext,
-}
-
-/// Rank-local input accepted by the neutral Inkling TP composition.
-pub enum InklingParallelInput<'a> {
-    /// Ordinary text-only decode or prefill input.
-    Text(&'a Array),
-    /// Prepared ordered text/media input for prefill.
-    Prepared(ModelInput<'a, Array>),
-}
-
-impl InklingParallelComposition {
-    fn new(
-        args: ModelArgs,
-        build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &eredu_runtime::LocalModelLayout,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let architecture = NeutralArchitecture::new(args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let local_args = Arc::new(
-            (0..args.text_config.num_hidden_layers as usize)
-                .map(|index| {
-                    eredu_architectures::inkling::local_text_args(&args.text_config, index, layout)
-                        .map_err(|error| Error::Parallel(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        let embedding_name = "model.embed_tokens.weight";
-        let output_name = "lm_head.weight";
-        let embedding = MlxNamedModule::new(
-            VocabParallelEmbedding::unloaded(
-                args.text_config.vocab_size as usize,
-                args.text_config.hidden_size,
-                args.text_config
-                    .linear_format_for(embedding_name)
-                    .weight_quantization(),
-                build,
-                stream,
-            )?,
-            ParameterSpec::trainable(embedding_name)
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-            None,
-        )?;
-        let output = MlxNamedModule::new(
-            VocabParallelLmHead::unloaded(
-                args.text_config.hidden_size,
-                args.text_config.vocab_size as usize,
-                args.text_config
-                    .linear_format_for(output_name)
-                    .weight_quantization(),
-                build,
-                stream,
-            )?,
-            ParameterSpec::trainable(output_name)
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-            None,
-        )?;
-        let vision_layers = args
-            .vision_config
-            .as_ref()
-            .map(|vision| {
-                (0..vision.num_hidden_layers as usize)
-                    .map(|index| {
-                        eredu_architectures::inkling::VisionLayer::new(
-                            vision,
-                            index,
-                            vision.layer_specs()[index],
-                            stream,
-                        )
-                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-                    })
-                    .collect::<Result<Vec<_>, Error>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
-        Ok(Self {
-            architecture,
-            embedding,
-            output,
-            vision_layers,
-            local_args,
-            topology: build.topology(),
-        })
-    }
-
-    fn local_state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
-        let mut args = self.architecture.args().clone();
-        for (index, local) in self.local_args.iter().enumerate() {
-            let policy = args
-                .text_config
-                .layer_policy(index)
-                .ok_or_else(|| Error::Parallel("missing Inkling local layer policy".into()))?;
-            if policy.attention.window().is_some() {
-                args.text_config.swa_num_attention_heads = local.swa_num_attention_heads;
-                args.text_config.swa_num_key_value_heads = local.swa_num_key_value_heads;
-            } else {
-                args.text_config.num_attention_heads = local.num_attention_heads;
-                args.text_config.num_key_value_heads = local.num_key_value_heads;
-            }
-        }
-        eredu_architectures::inkling::state_layout(&args)
-            .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    fn execution_context<'a>(
-        &self,
-        group: &'a safemlx::distributed::Group,
-        stream: &'a Stream,
-    ) -> Result<
-        crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'a>,
-        Error,
-    > {
-        crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
-            self.topology,
-            group,
-            stream,
-        )
-    }
-
-    fn mtp_len(&self) -> usize {
-        self.architecture.mtp_len()
-    }
-
-    fn forward_mtp_draft(
+impl MlxUnitPopulator<NeutralUnit> for ParallelUnitPopulator {
+    fn populate(
         &mut self,
-        hidden: &Array,
-        tokens: &Array,
-        depth: usize,
-        state: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let execution = self.execution_context(group, stream)?;
-        let embeddings = self.embedding.forward(tokens, &execution)?;
-        let embeddings = self
-            .architecture
-            .normalize_mtp_embeddings(&embeddings, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let output = self
-            .architecture
-            .forward_mtp_step(
-                hidden,
-                &embeddings,
-                tokens,
-                depth,
-                state.layers_mut(),
-                stream,
-            )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let projection_input = self
-            .architecture
-            .final_mtp_parallel_hidden(&output.hidden, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let mut logits = self
-            .output
-            .forward(&projection_input, &execution)?
-            .all_gather(&execution)?;
-        let vocabulary = self
-            .architecture
-            .args()
-            .text_config
-            .unpadded_vocab_size
-            .unwrap_or(self.architecture.args().text_config.vocab_size);
-        if vocabulary != self.architecture.args().text_config.vocab_size {
-            logits = logits.try_index_device((.., .., ..vocabulary), stream)?;
-        }
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits,
-                hidden: output.hidden,
-                tokens: output.tokens,
-            },
-        )
-    }
-}
-
-impl Parameterized<Array> for InklingParallelComposition {
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, Array>,
-    {
-        self.embedding.visit_parameters(visitor);
-        let modules = <NeutralArchitecture as LayeredArchitecture<
-            MlxBackend,
-            MlxHybridState,
-        >>::static_modules(&self.architecture);
-        modules.embedding_norm.visit_parameters(visitor);
-        modules.final_norm.visit_parameters(visitor);
-        modules.mtp.visit_parameters(visitor);
-        modules.audio.visit_parameters(visitor);
-        modules.vision.visit_parameters(visitor);
-        self.vision_layers.visit_parameters(visitor);
-        self.output.visit_parameters(visitor);
-    }
-
-    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
-    where
-        V: ParameterVisitorMut<'a, Array>,
-    {
-        self.embedding.visit_parameters_mut(visitor);
-        let modules = <NeutralArchitecture as LayeredArchitecture<
-            MlxBackend,
-            MlxHybridState,
-        >>::static_modules_mut(&mut self.architecture);
-        modules.embedding_norm.visit_parameters_mut(visitor);
-        modules.final_norm.visit_parameters_mut(visitor);
-        modules.mtp.visit_parameters_mut(visitor);
-        modules.audio.visit_parameters_mut(visitor);
-        modules.vision.visit_parameters_mut(visitor);
-        self.vision_layers.visit_parameters_mut(visitor);
-        self.output.visit_parameters_mut(visitor);
-    }
-
-    fn set_trainable(&mut self, trainable: bool) {
-        self.embedding.set_trainable(trainable);
-        let modules = <NeutralArchitecture as LayeredArchitecture<
-            MlxBackend,
-            MlxHybridState,
-        >>::static_modules_mut(&mut self.architecture);
-        modules.embedding_norm.set_trainable(trainable);
-        modules.final_norm.set_trainable(trainable);
-        modules.mtp.set_trainable(trainable);
-        modules.audio.set_trainable(trainable);
-        modules.vision.set_trainable(trainable);
-        self.vision_layers.set_trainable(trainable);
-        self.output.set_trainable(trainable);
-    }
-}
-
-impl LayeredArchitecture<MlxBackend, MlxHybridState> for InklingParallelComposition {
-    type Input<'a> = InklingParallelInput<'a>;
-    type StaticModules = Self;
-    type Unit = eredu_architectures::inkling::DecoderLayer<MlxBackend>;
-    type ForwardContext = eredu_architectures::inkling::ForwardContext<Array>;
-    type RetainedContextValues<'a> = std::option::IntoIter<&'a Array>;
-    type Error = Error;
-
-    fn model_identity(&self) -> &str {
-        &self.architecture.args().model_type
-    }
-
-    fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
-    }
-
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        if group != 0 {
-            return Err(Error::Parallel(format!(
-                "parallel Inkling decoder has no execution group {group}"
-            )));
-        }
-        Ok(self.local_args.len())
-    }
-
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        if index >= self.group_unit_count(group)? {
-            return Err(Error::Parallel(format!(
-                "parallel Inkling layer {index} is out of range"
-            )));
-        }
-        Ok(format!("model.layers.{index}"))
-    }
-
-    fn static_modules(&self) -> &Self::StaticModules {
-        self
-    }
-
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        self
-    }
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        stream: &Stream,
-    ) -> Result<Self::Unit, Self::Error> {
-        if group != 0 {
-            return Err(Error::Parallel("invalid Inkling TP execution group".into()));
-        }
-        eredu_architectures::inkling::DecoderLayer::new(
-            self.local_args
-                .get(index)
-                .ok_or_else(|| Error::Parallel("missing Inkling local layer args".into()))?,
-            index,
-            stream,
-        )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        _input: Self::Input<'a>,
-        _state: &mut MlxHybridState,
-        _stream: &Stream,
-    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Self::Error> {
-        Err(Error::Parallel(
-            "parallel Inkling composition requires a collective context".into(),
-        ))
-    }
-
-    fn forward_unit(
-        &mut self,
-        _group: usize,
-        _index: usize,
-        _unit: &mut Self::Unit,
-        _hidden: &Array,
-        _state: &mut MlxHybridState,
-        _forward: &mut Self::ForwardContext,
-        _stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        Err(Error::Parallel(
-            "parallel Inkling composition requires a collective context".into(),
-        ))
-    }
-
-    fn begin_execution_group(
-        &mut self,
-        group: usize,
-        initial: &Array,
-        dependencies: &[&Array],
-        _state: &mut MlxHybridState,
-        _forward: &mut Self::ForwardContext,
-        _stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        if group != 0 || !dependencies.is_empty() {
-            return Err(Error::Parallel(format!(
-                "parallel Inkling group {group} received {} dependencies",
-                dependencies.len()
-            )));
-        }
-        Ok(initial.clone())
-    }
-
-    fn finish_forward(
-        &mut self,
-        _hidden: &Array,
-        _state: &mut MlxHybridState,
-        _forward: &Self::ForwardContext,
-        _stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        Err(Error::Parallel(
-            "parallel Inkling composition requires a collective context".into(),
-        ))
-    }
-
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        _group: usize,
-        _index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        Some(forward.tokens()).into_iter()
-    }
-}
-
-impl ParallelLayeredArchitecture<MlxBackend, MlxHybridState> for InklingParallelComposition {
-    fn begin_forward_parallel<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Self::Error> {
-        let execution = self.execution_context(group, stream)?;
-        match input {
-            InklingParallelInput::Text(tokens) => {
-                let embeddings = self.embedding.forward(tokens, &execution)?;
-                self.architecture
-                    .begin_parallel_text(tokens, embeddings, state, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-            }
-            InklingParallelInput::Prepared(input) => {
-                let embeddings = input
-                    .parts
-                    .iter()
-                    .filter_map(|part| match part {
-                        DecoderInputPart::Text(tokens) => Some(
-                            self.embedding
-                                .forward(tokens, &execution)
-                                .map_err(|error| Error::Parallel(error.to_string())),
-                        ),
-                        DecoderInputPart::Image(_)
-                        | DecoderInputPart::Audio(_)
-                        | DecoderInputPart::Projected { .. } => None,
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.architecture
-                    .begin_parallel_input(
-                        input,
-                        &embeddings,
-                        &mut self.vision_layers,
-                        state,
-                        stream,
-                    )
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-            }
-        }
-    }
-
-    fn forward_unit_parallel(
-        &mut self,
-        group_index: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &Array,
-        state: &mut MlxHybridState,
-        forward: &mut Self::ForwardContext,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        if group_index != 0 {
-            return Err(Error::Parallel("invalid Inkling TP execution group".into()));
-        }
-        let output = self
-            .architecture
-            .forward_text_unit_parallel(index, unit, hidden, state, group, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        if index + 1 == self.local_args.len() {
-            forward.capture_target_hidden(output.clone());
-        }
-        Ok(output)
-    }
-
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &Array,
-        _state: &mut MlxHybridState,
-        _forward: &Self::ForwardContext,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        let execution = self.execution_context(group, stream)?;
-        let hidden = self
-            .architecture
-            .final_parallel_hidden(hidden, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        self.output
-            .forward(&hidden, &execution)?
-            .all_gather(&execution)
+        unit: &mut MlxModule<NeutralUnit>,
+        lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
+    ) -> Result<(), Error> {
+        populate_module_from_lease_excluding(unit, lease, |name| {
+            self.external_experts && name.contains(".moe.") && name.contains("experts")
+        })?;
+        Ok(())
     }
 }
 
@@ -1390,6 +379,23 @@ enum Execution {
     Bounded(Bounded),
     ParallelResident(Box<ParallelResident>),
     ParallelBounded(Box<ParallelBounded>),
+}
+
+impl Execution {
+    fn output_group(&self) -> Result<usize, Error> {
+        let architecture = match self {
+            Self::Resident(runtime) => runtime.architecture(),
+            Self::Bounded(runtime) => runtime.architecture(),
+            Self::ParallelResident(runtime) => runtime.architecture(),
+            Self::ParallelBounded(runtime) => runtime.architecture(),
+        };
+        <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
+            MlxBackend,
+            MlxHybridState,
+        >>::execution_graph(architecture)
+        .map(|graph| graph.output())
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1408,27 +414,59 @@ where
     P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
     P::Error: std::fmt::Display,
 {
-    if group == 1 {
-        let NeutralUnit::Text(layer) = unit else {
-            return Err(eredu_nn::Error::backend(
-                "Inkling text execution group received a vision unit",
-            ));
-        };
-        return architecture.forward_text_unit_with_provider(
-            index,
-            layer,
+    <NeutralArchitecture as eredu_runtime::RoutedLayeredArchitecture<
+        MlxBackend,
+        MlxHybridState,
+    >>::forward_unit_with_provider(
+        architecture,
+        group,
+        index,
+        unit,
+        hidden,
+        state,
+        forward,
+        if hidden.dim(1) > 1 {
+            eredu_runtime::ExpertPass::Prefill
+        } else {
+            eredu_runtime::ExpertPass::Decode
+        },
+        provider,
+        stream,
+    )
+}
+
+fn forward_mtp_draft_parallel_architecture(
+    architecture: &mut NeutralArchitecture,
+    hidden: &Array,
+    tokens: &Array,
+    depth: usize,
+    state: &mut MlxHybridState,
+    group: &safemlx::distributed::Group,
+    stream: &Stream,
+) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
+    let embeddings = architecture
+        .mtp_token_embeddings_parallel(tokens, group, stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let output = architecture
+        .forward_mtp_step(
             hidden,
-            state,
-            if hidden.dim(1) > 1 {
-                eredu_runtime::ExpertPass::Prefill
-            } else {
-                eredu_runtime::ExpertPass::Decode
-            },
-            provider,
+            &embeddings,
+            tokens,
+            depth,
+            state.layers_mut(),
             stream,
-        );
-    }
-    architecture.forward_unit(group, index, unit, hidden, state, forward, stream)
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let logits = architecture
+        .project_mtp_logits_parallel(&output.hidden, group, stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok(
+        crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
+            logits,
+            hidden: output.hidden,
+            tokens: output.tokens,
+        },
+    )
 }
 
 /// One neutral Inkling object shared by resident and bounded execution.
@@ -1729,6 +767,7 @@ impl InklingModel {
         }
         let mut final_text_hidden = None;
         let mut ordered_tokens = None;
+        let output_group = self.execution.output_group()?;
         if let Some(expert_cache) = self.expert_cache.take() {
             let args = self.args.clone();
             let mut provider =
@@ -1753,7 +792,7 @@ impl InklingModel {
                             )
                         },
                         |group, _index, hidden, forward| {
-                            if group == 1 {
+                            if group == output_group {
                                 final_text_hidden = Some(hidden.clone());
                                 ordered_tokens = Some(forward.tokens().clone());
                             }
@@ -1779,7 +818,7 @@ impl InklingModel {
                             )
                         },
                         |group, _index, hidden, forward| {
-                            if group == 1 {
+                            if group == output_group {
                                 final_text_hidden = Some(hidden.clone());
                                 ordered_tokens = Some(forward.tokens().clone());
                             }
@@ -1817,7 +856,7 @@ impl InklingModel {
                     architecture.forward_unit(group, index, unit, hidden, state, forward, stream)
                 },
                 |group, _index, hidden, forward| {
-                    if group == 1 {
+                    if group == output_group {
                         final_text_hidden = Some(hidden.clone());
                         ordered_tokens = Some(forward.tokens().clone());
                     }
@@ -1832,7 +871,7 @@ impl InklingModel {
                     architecture.forward_unit(group, index, unit, hidden, state, forward, stream)
                 },
                 |group, _index, hidden, forward| {
-                    if group == 1 {
+                    if group == output_group {
                         final_text_hidden = Some(hidden.clone());
                         ordered_tokens = Some(forward.tokens().clone());
                     }
@@ -1900,22 +939,18 @@ impl InklingModel {
                 "Inkling tensor-parallel cache layout mismatch".into(),
             ));
         }
+        let parts = [DecoderInputPart::Text(tokens)];
+        let input = ModelInput {
+            parts: &parts,
+            vision_patches: None,
+            audio: None,
+        };
         let logits = match &mut self.execution {
             Execution::ParallelResident(runtime) => runtime
-                .forward_parallel(
-                    InklingParallelInput::Text(tokens),
-                    &mut state.target,
-                    group,
-                    stream,
-                )
+                .forward_parallel(input, &mut state.target, group, stream)
                 .map_err(|error| Error::Parallel(error.to_string()))?,
             Execution::ParallelBounded(runtime) => runtime
-                .forward_parallel(
-                    InklingParallelInput::Text(tokens),
-                    &mut state.target,
-                    group,
-                    stream,
-                )
+                .forward_parallel(input, &mut state.target, group, stream)
                 .map_err(|error| Error::Parallel(error.to_string()))?,
             Execution::Resident(_) | Execution::Bounded(_) => {
                 return Err(Error::Parallel(
@@ -1949,7 +984,7 @@ impl InklingModel {
                 "Inkling tensor-parallel cache layout mismatch".into(),
             ));
         }
-        let prepared = prepare_inkling_input(&self.args, typed, stream)?;
+        let prepared = PreparedInklingInput::new(&self.args, typed, stream)?;
         let parts = prepared
             .tokens
             .iter()
@@ -1972,11 +1007,11 @@ impl InklingModel {
             code_ids,
             valid_frames: code_ids.dim(1),
         });
-        let input = InklingParallelInput::Prepared(ModelInput {
+        let input = ModelInput {
             parts: &parts,
             vision_patches: prepared.images.as_ref(),
             audio,
-        });
+        };
         let logits = match &mut self.execution {
             Execution::ParallelResident(runtime) => runtime
                 .forward_parallel(input, &mut state.target, group, stream)
@@ -2010,7 +1045,7 @@ impl InklingModel {
         state: &mut InklingState,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let prepared = prepare_inkling_input(&self.args, typed, stream)?;
+        let prepared = PreparedInklingInput::new(&self.args, typed, stream)?;
         let parts = prepared
             .tokens
             .iter()
@@ -2065,7 +1100,7 @@ impl InklingModel {
 
     fn forward_parallel_with_capture(
         &mut self,
-        input: InklingParallelInput<'_>,
+        input: ModelInput<'_, Array>,
         state: &mut InklingState,
         group: &safemlx::distributed::Group,
         stream: &Stream,
@@ -2126,7 +1161,7 @@ impl InklingModel {
         group: &safemlx::distributed::Group,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let prepared = prepare_inkling_input(&self.args, typed, stream)?;
+        let prepared = PreparedInklingInput::new(&self.args, typed, stream)?;
         let parts = prepared
             .tokens
             .iter()
@@ -2150,11 +1185,11 @@ impl InklingModel {
             valid_frames: code_ids.dim(1),
         });
         self.forward_parallel_with_capture(
-            InklingParallelInput::Prepared(ModelInput {
+            ModelInput {
                 parts: &parts,
                 vision_patches: prepared.images.as_ref(),
                 audio,
-            }),
+            },
             state,
             group,
             stream,
@@ -2171,12 +1206,24 @@ impl InklingModel {
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
         match &mut self.execution {
-            Execution::ParallelResident(runtime) => runtime
-                .architecture_mut()
-                .forward_mtp_draft(hidden, tokens, depth, state, group, stream),
-            Execution::ParallelBounded(runtime) => runtime
-                .architecture_mut()
-                .forward_mtp_draft(hidden, tokens, depth, state, group, stream),
+            Execution::ParallelResident(runtime) => forward_mtp_draft_parallel_architecture(
+                runtime.architecture_mut(),
+                hidden,
+                tokens,
+                depth,
+                state,
+                group,
+                stream,
+            ),
+            Execution::ParallelBounded(runtime) => forward_mtp_draft_parallel_architecture(
+                runtime.architecture_mut(),
+                hidden,
+                tokens,
+                depth,
+                state,
+                group,
+                stream,
+            ),
             Execution::Resident(_) | Execution::Bounded(_) => Err(Error::Parallel(
                 "Inkling was not loaded for tensor-parallel MTP".into(),
             )),
@@ -2227,54 +1274,54 @@ impl InklingModel {
     }
 }
 
-struct PreparedInklingInput {
-    tokens: Vec<Array>,
-    kinds: Vec<input::Modality>,
-    projected: Vec<Option<Array>>,
-    images: Option<Array>,
-    audio: Option<Array>,
+pub(crate) struct PreparedInklingInput {
+    pub(crate) tokens: Vec<Array>,
+    pub(crate) kinds: Vec<input::Modality>,
+    pub(crate) projected: Vec<Option<Array>>,
+    pub(crate) images: Option<Array>,
+    pub(crate) audio: Option<Array>,
 }
 
-fn prepare_inkling_input(
-    args: &ModelArgs,
-    typed: input::ModelInput<'_>,
-    stream: &Stream,
-) -> Result<PreparedInklingInput, Error> {
-    input::validate(typed)?;
-    let mut tokens = Vec::new();
-    let mut kinds = Vec::new();
-    let mut projected = Vec::new();
-    let mut images = Vec::new();
-    let mut audio = Vec::new();
-    for part in typed.parts {
-        match (part.modality, part.payload) {
-            (input::Modality::Text, input::InputPayload::TokenIds(value)) => {
-                tokens.push(value.clone());
-                kinds.push(input::Modality::Text);
-                projected.push(None);
-            }
-            (input::Modality::Image, input::InputPayload::Tensor(value)) => {
-                let count = value.dim(0);
-                tokens.push(Array::from_slice(
-                    &vec![args.image_token_id; count as usize],
-                    &[1, count],
-                ));
-                kinds.push(input::Modality::Image);
-                projected.push(None);
-                images.push(value.clone());
-            }
-            (input::Modality::Audio, input::InputPayload::Tensor(value)) => {
-                let frames = value.dim(1);
-                if let Some(mask) = part.metadata.audio_mask {
-                    if mask.shape() != [1, frames] {
-                        return Err(Error::UnsupportedArchitecture(format!(
-                            "Inkling audio mask must be shaped [1, {frames}], got {:?}",
-                            mask.shape()
-                        )));
-                    }
+impl PreparedInklingInput {
+    pub(crate) fn new(
+        args: &ModelArgs,
+        typed: input::ModelInput<'_>,
+        stream: &Stream,
+    ) -> Result<PreparedInklingInput, Error> {
+        input::validate(typed)?;
+        let mut tokens = Vec::new();
+        let mut kinds = Vec::new();
+        let mut projected = Vec::new();
+        let mut images = Vec::new();
+        let mut audio = Vec::new();
+        for part in typed.parts {
+            match (part.modality, part.payload) {
+                (input::Modality::Text, input::InputPayload::TokenIds(value)) => {
+                    tokens.push(value.clone());
+                    kinds.push(input::Modality::Text);
+                    projected.push(None);
                 }
-                let count =
-                    match part.metadata.audio_valid_frames {
+                (input::Modality::Image, input::InputPayload::Tensor(value)) => {
+                    let count = value.dim(0);
+                    tokens.push(Array::from_slice(
+                        &vec![args.image_token_id; count as usize],
+                        &[1, count],
+                    ));
+                    kinds.push(input::Modality::Image);
+                    projected.push(None);
+                    images.push(value.clone());
+                }
+                (input::Modality::Audio, input::InputPayload::Tensor(value)) => {
+                    let frames = value.dim(1);
+                    if let Some(mask) = part.metadata.audio_mask {
+                        if mask.shape() != [1, frames] {
+                            return Err(Error::UnsupportedArchitecture(format!(
+                                "Inkling audio mask must be shaped [1, {frames}], got {:?}",
+                                mask.shape()
+                            )));
+                        }
+                    }
+                    let count = match part.metadata.audio_valid_frames {
                         Some(valid) if valid > 0 && valid <= frames => valid,
                         Some(valid) => {
                             return Err(Error::UnsupportedArchitecture(format!(
@@ -2287,43 +1334,44 @@ fn prepare_inkling_input(
                                 .into(),
                         )),
                     };
-                tokens.push(Array::from_slice(
-                    &vec![args.audio_token_id; count as usize],
-                    &[1, count],
-                ));
-                kinds.push(input::Modality::Audio);
-                projected.push(None);
-                audio.push(value.try_index_device((.., ..count, ..), stream)?);
-            }
-            (
-                modality @ (input::Modality::Image | input::Modality::Audio),
-                input::InputPayload::Embeddings(value),
-            ) => {
-                let count = value.dim(1);
-                let token = if modality == input::Modality::Image {
-                    args.image_token_id
-                } else {
-                    args.audio_token_id
-                };
-                tokens.push(Array::from_slice(&vec![token; count as usize], &[1, count]));
-                kinds.push(modality);
-                projected.push(Some(value.clone()));
-            }
-            (modality, _) => {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "Inkling does not accept this {} payload",
-                    modality.as_str()
-                )))
+                    tokens.push(Array::from_slice(
+                        &vec![args.audio_token_id; count as usize],
+                        &[1, count],
+                    ));
+                    kinds.push(input::Modality::Audio);
+                    projected.push(None);
+                    audio.push(value.try_index_device((.., ..count, ..), stream)?);
+                }
+                (
+                    modality @ (input::Modality::Image | input::Modality::Audio),
+                    input::InputPayload::Embeddings(value),
+                ) => {
+                    let count = value.dim(1);
+                    let token = if modality == input::Modality::Image {
+                        args.image_token_id
+                    } else {
+                        args.audio_token_id
+                    };
+                    tokens.push(Array::from_slice(&vec![token; count as usize], &[1, count]));
+                    kinds.push(modality);
+                    projected.push(Some(value.clone()));
+                }
+                (modality, _) => {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "Inkling does not accept this {} payload",
+                        modality.as_str()
+                    )))
+                }
             }
         }
+        Ok(PreparedInklingInput {
+            tokens,
+            kinds,
+            projected,
+            images: concatenate(&images, 0, stream)?,
+            audio: concatenate(&audio, 1, stream)?,
+        })
     }
-    Ok(PreparedInklingInput {
-        tokens,
-        kinds,
-        projected,
-        images: concatenate(&images, 0, stream)?,
-        audio: concatenate(&audio, 1, stream)?,
-    })
 }
 
 fn concatenate(values: &[Array], axis: i32, stream: &Stream) -> Result<Option<Array>, Error> {
@@ -2518,9 +1566,14 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception> {
+        let parts = [DecoderInputPart::Text(tokens)];
         self.model
             .forward_parallel_with_capture(
-                InklingParallelInput::Text(tokens),
+                ModelInput {
+                    parts: &parts,
+                    vision_patches: None,
+                    audio: None,
+                },
                 cache,
                 self.group,
                 stream,
@@ -2672,25 +1725,14 @@ fn quantize_store(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let target_architecture = NeutralArchitecture::new(target.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let vision_layers = |args: &ModelArgs| {
-        args.vision_config
-            .as_ref()
-            .map_or(0, |vision| vision.num_hidden_layers as usize)
-    };
-    let mut source_factory = UnitFactory {
-        args: source.clone(),
-        vision_layers: vision_layers(source),
-        external_experts: false,
-    };
-    let mut target_factory = UnitFactory {
-        args: target.clone(),
-        vision_layers: vision_layers(&target),
-        external_experts: false,
-    };
-    let unit_count = source_factory
-        .vision_layers
+    let unit_count = source
+        .vision_config
+        .as_ref()
+        .map_or(0, |vision| vision.num_hidden_layers as usize)
         .checked_add(source.text_config.num_hidden_layers as usize)
         .ok_or_else(|| Error::Quantization("Inkling unit count overflowed".into()))?;
+    let source_layout = inkling_execution_layout(source)?;
+    let target_layout = inkling_execution_layout(&target)?;
     let source_static = MlxModule::new(
         <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
             &source_architecture,
@@ -2709,8 +1751,26 @@ fn quantize_store(
         store,
         &source_static,
         &target_static,
-        move |index, stream| Ok(MlxModule::new(source_factory.build(index, stream)?)),
-        move |index, stream| Ok(MlxModule::new(target_factory.build(index, stream)?)),
+        move |index, stream| {
+            construct_architecture_unit(
+                &source_architecture,
+                &source_layout,
+                index,
+                stream,
+                std::marker::PhantomData::<MlxHybridState>,
+            )
+            .map(MlxModule::new)
+        },
+        move |index, stream| {
+            construct_architecture_unit(
+                &target_architecture,
+                &target_layout,
+                index,
+                stream,
+                std::marker::PhantomData::<MlxHybridState>,
+            )
+            .map(MlxModule::new)
+        },
         unit_count,
         quantization,
         stream,
@@ -2730,6 +1790,20 @@ fn quantize_store(
     Ok((store, target, report))
 }
 
+fn inkling_execution_layout(args: &ModelArgs) -> Result<ExecutionUnitLayout, Error> {
+    let vision_layers = args
+        .vision_config
+        .as_ref()
+        .map_or(0, |vision| vision.num_hidden_layers as usize);
+    let graph = eredu_runtime::ExecutionGraph::chain(["vision", "text_decoder"])
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    ExecutionUnitLayout::new(
+        &graph,
+        [vision_layers, args.text_config.num_hidden_layers as usize],
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
 fn load_store(
     store: SharedCheckpointSource,
     args: ModelArgs,
@@ -2741,29 +1815,14 @@ fn load_store(
 ) -> Result<InklingModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let vision_layers = args
-        .vision_config
-        .as_ref()
-        .map_or(0, |vision| vision.num_hidden_layers as usize);
-    let graph = eredu_runtime::ExecutionGraph::chain(["vision", "text_decoder"])
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let layout = ExecutionUnitLayout::new(
-        &graph,
-        [vision_layers, args.text_config.num_hidden_layers as usize],
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let layout = inkling_execution_layout(&args)?;
     let static_args = args.clone();
     let unit_args = args.clone();
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules_mut(
-            &mut architecture,
-        ),
-        UnitFactory {
-            args: args.clone(),
-            vision_layers,
-            external_experts,
-        },
+        &mut architecture,
+        UnitPopulator { external_experts },
+        std::marker::PhantomData::<MlxHybridState>,
         layout,
         layer_policy,
         stream,
@@ -2771,34 +1830,18 @@ fn load_store(
         move |key| external_experts && key.contains(".moe.") && key.contains("experts"),
         move |modules, store| {
             let module = MlxModule::new(modules.clone());
-            let recipes = crate::composition::inkling_expert::module_recipes(
-                &module,
-                &static_args,
-                store,
-            )?;
-            build_module_bindings_with_recipes_excluding(
-                &module,
-                "",
-                store,
-                recipes,
-                |_| false,
-            )
-            .map_err(Into::into)
+            let recipes =
+                crate::composition::inkling_expert::module_recipes(&module, &static_args, store)?;
+            build_module_bindings_with_recipes_excluding(&module, "", store, recipes, |_| false)
+                .map_err(Into::into)
         },
         move |_ordinal, unit, store, _stream| {
             let module = MlxModule::new(unit);
-            let recipes = crate::composition::inkling_expert::module_recipes(
-                &module,
-                &unit_args,
-                store,
-            )?;
-            build_module_bindings_with_recipes_excluding(
-                &module,
-                "",
-                store,
-                recipes,
-                |name| external_experts && name.contains(".moe.") && name.contains("experts"),
-            )
+            let recipes =
+                crate::composition::inkling_expert::module_recipes(&module, &unit_args, store)?;
+            build_module_bindings_with_recipes_excluding(&module, "", store, recipes, |name| {
+                external_experts && name.contains(".moe.") && name.contains("experts")
+            })
             .map_err(Into::into)
         },
     )?;
@@ -2806,9 +1849,13 @@ fn load_store(
     metadata.set_quantization(args.text_config.weight_quantization);
     metadata.set_materialization(materialization);
     let execution = if layer_policy.is_fully_resident() {
-        Execution::Resident(LayerwiseRuntime::new(
+        Execution::Resident(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(
+                &architecture,
+                stream,
+                std::marker::PhantomData::<MlxHybridState>,
+            )?,
             architecture,
-            policy.into_resident(stream)?,
         ))
     } else {
         Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
@@ -2859,13 +1906,21 @@ fn load_parallel_store(
             "Inkling declared no tensor-parallel parameters".into(),
         ));
     }
-    let mut composition = InklingParallelComposition::new(args.clone(), build, &layout, stream)?;
-    let state_layout = composition.local_state_layout()?;
-    let local_args = Arc::clone(&composition.local_args);
-    let unit_layout = ExecutionUnitLayout::new(
-        &ExecutionGraph::chain(["text_decoder"])
+    let geometry = Arc::new(
+        eredu_architectures::inkling::local_geometry(&args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
-        [layer_count],
+    );
+    let mut architecture =
+        NeutralArchitecture::new_parallel(args.clone(), Arc::clone(&geometry), stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let state_layout = architecture
+        .runtime_state_layout()
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let vision_layers = geometry.vision_layers();
+    let unit_layout = ExecutionUnitLayout::new(
+        &ExecutionGraph::chain(["vision", "text_decoder"])
+            .map_err(|error| Error::Parallel(error.to_string()))?,
+        [vision_layers, layer_count],
     )
     .map_err(|error| Error::Parallel(error.to_string()))?;
 
@@ -2879,13 +1934,14 @@ fn load_parallel_store(
     );
     let static_recipes =
         crate::composition::inkling_expert::module_recipes(&global_static, &args, store.as_ref())?;
-    let mut global_static_bindings = build_module_bindings_with_recipes_excluding(
+    let global_static_bindings = build_module_bindings_with_recipes_excluding(
         &global_static,
         "",
         store.as_ref(),
         static_recipes,
         |_| false,
     )?;
+    let mut global_vision_bindings = Vec::new();
     if let Some(vision) = &args.vision_config {
         for (index, spec) in vision.layer_specs().into_iter().enumerate() {
             let layer = MlxModule::new(
@@ -2896,7 +1952,7 @@ fn load_parallel_store(
             );
             let recipes =
                 crate::composition::inkling_expert::module_recipes(&layer, &args, store.as_ref())?;
-            global_static_bindings.extend(build_module_bindings_with_recipes_excluding(
+            global_vision_bindings.extend(build_module_bindings_with_recipes_excluding(
                 &layer,
                 "",
                 store.as_ref(),
@@ -2905,7 +1961,9 @@ fn load_parallel_store(
             )?);
         }
     }
-    let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
+    let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?
+        .checked_add(binding_bytes(&global_vision_bindings)?)
+        .ok_or_else(|| Error::Parallel("Inkling global parameter bytes overflowed".into()))?;
     for index in 0..layer_count {
         let unit = MlxModule::new(
             eredu_architectures::inkling::DecoderLayer::<MlxBackend>::new(
@@ -2936,8 +1994,11 @@ fn load_parallel_store(
     let binding_args = args.clone();
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
-        &mut composition,
-        ParallelUnitFactory { args: local_args },
+        &mut architecture,
+        ParallelUnitPopulator {
+            external_experts: false,
+        },
+        std::marker::PhantomData::<MlxHybridState>,
         unit_layout,
         layer_policy,
         stream,
@@ -2947,26 +2008,43 @@ fn load_parallel_store(
             shard_layer_bindings(global_static_bindings, "", store, &static_layout)
         },
         move |index, _local, store, stream| {
-            let global = MlxModule::new(
-                eredu_architectures::inkling::DecoderLayer::<MlxBackend>::new(
-                    &binding_args.text_config,
-                    index,
-                    stream,
+            let (global, prefix) = if index < vision_layers {
+                let vision = binding_args.vision_config.as_ref().ok_or_else(|| {
+                    Error::UnsupportedArchitecture("Inkling vision config is missing".into())
+                })?;
+                (
+                    MlxModule::new(NeutralUnit::Vision(
+                        eredu_architectures::inkling::VisionLayer::<MlxBackend>::new(
+                            vision,
+                            index,
+                            vision.layer_specs()[index],
+                            stream,
+                        )
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                    )),
+                    format!("visual.layers.{index}"),
                 )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-            );
+            } else {
+                let text_index = index - vision_layers;
+                (
+                    MlxModule::new(NeutralUnit::Text(
+                        eredu_architectures::inkling::DecoderLayer::<MlxBackend>::new(
+                            &binding_args.text_config,
+                            text_index,
+                            stream,
+                        )
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                    )),
+                    format!("model.layers.{text_index}"),
+                )
+            };
             let recipes =
                 crate::composition::inkling_expert::module_recipes(&global, &binding_args, store)?;
             let bindings =
                 build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |_| {
                     false
                 })?;
-            shard_layer_bindings(
-                bindings,
-                &format!("model.layers.{index}"),
-                store,
-                &unit_sharding,
-            )
+            shard_layer_bindings(bindings, &prefix, store, &unit_sharding)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());
@@ -2996,12 +2074,16 @@ fn load_parallel_store(
         maximum_device_parameter_bytes,
     );
     let execution = if layer_policy.is_fully_resident() {
-        Execution::ParallelResident(Box::new(LayerwiseRuntime::new(
-            composition,
-            policy.into_resident(stream)?,
+        Execution::ParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(
+                &architecture,
+                stream,
+                std::marker::PhantomData::<MlxHybridState>,
+            )?,
+            architecture,
         )))
     } else {
-        Execution::ParallelBounded(Box::new(LayerwiseRuntime::new(composition, policy)))
+        Execution::ParallelBounded(Box::new(LayerwiseRuntime::new(architecture, policy)))
     };
     let mtp_state_layout = eredu_architectures::inkling::mtp_state_layout(&args)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;

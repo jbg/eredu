@@ -1869,9 +1869,11 @@ mod tests {
         reference_env: &str,
         expected_kind: RealtimeModelKind,
     ) {
-        let Some(model_path) = std::env::var_os(model_env) else {
-            return;
-        };
+        let model_path = std::env::var_os(model_env).unwrap_or_else(|| {
+            panic!(
+                "{model_env} must point at a released artifact when this ignored fixture test is explicitly enabled"
+            )
+        });
         let reference_path = std::env::var_os(reference_env)
             .unwrap_or_else(|| panic!("{reference_env} must be set when {model_env} is set"));
         assert!(
@@ -2117,9 +2119,9 @@ mod tests {
     #[test]
     #[ignore = "requires released PersonaPlex artifact and PyTorch realtime fixture"]
     fn moshi_personaplex_prompt_realtime_and_residency_parity() {
-        let Some(model_path) = std::env::var_os("EREDU_PERSONAPLEX_FIXTURE") else {
-            return;
-        };
+        let model_path = std::env::var_os("EREDU_PERSONAPLEX_FIXTURE").expect(
+            "EREDU_PERSONAPLEX_FIXTURE must point at a released artifact when this ignored fixture test is explicitly enabled",
+        );
         let fixture_path = std::env::var_os("EREDU_PERSONAPLEX_TEACHER_FIXTURE")
             .expect("EREDU_PERSONAPLEX_TEACHER_FIXTURE must accompany the model fixture");
         let execution =
@@ -2150,9 +2152,9 @@ mod tests {
     #[test]
     #[ignore = "requires released native Moshi artifact and seeded MLX fixture"]
     fn moshi_native_multiframe_seeded_realtime_parity() {
-        let Some(model_path) = std::env::var_os("EREDU_MOSHI_FIXTURE") else {
-            return;
-        };
+        let model_path = std::env::var_os("EREDU_MOSHI_FIXTURE").expect(
+            "EREDU_MOSHI_FIXTURE must point at a released artifact when this ignored fixture test is explicitly enabled",
+        );
         let fixture_path = std::env::var_os("EREDU_MOSHI_TEACHER_FIXTURE")
             .expect("EREDU_MOSHI_TEACHER_FIXTURE must accompany the model fixture");
         let execution =
@@ -2173,9 +2175,9 @@ mod tests {
     #[test]
     #[ignore = "requires EREDU_MOSHI_FIXTURE and an MLX runtime"]
     fn moshi_neutral_session_hook() {
-        let Some(fixture) = std::env::var_os("EREDU_MOSHI_FIXTURE") else {
-            return;
-        };
+        let fixture = std::env::var_os("EREDU_MOSHI_FIXTURE").expect(
+            "EREDU_MOSHI_FIXTURE must point at a released artifact when this ignored fixture test is explicitly enabled",
+        );
         assert!(
             Path::new(&fixture).exists(),
             "EREDU_MOSHI_FIXTURE does not exist: {}",
@@ -2196,9 +2198,9 @@ mod tests {
     #[test]
     #[ignore = "requires EREDU_PERSONAPLEX_FIXTURE and an MLX runtime"]
     fn moshi_personaplex_fixture_session_hook() {
-        let Some(fixture) = std::env::var_os("EREDU_PERSONAPLEX_FIXTURE") else {
-            return;
-        };
+        let fixture = std::env::var_os("EREDU_PERSONAPLEX_FIXTURE").expect(
+            "EREDU_PERSONAPLEX_FIXTURE must point at a released artifact when this ignored fixture test is explicitly enabled",
+        );
         assert!(
             Path::new(&fixture).exists(),
             "EREDU_PERSONAPLEX_FIXTURE does not exist: {}",

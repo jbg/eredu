@@ -35,7 +35,6 @@ use crate::backend::mlx::{
         execution::{
             generic::{
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
-                MlxUnitFactory,
             },
             layerwise::{
                 open_safetensors_weight_store, quantize_module_store_with_bindings,
@@ -51,20 +50,12 @@ type Architecture = LayeredModel<MlxBackend>;
 type MoshiUnit = Unit<MlxBackend>;
 type ResidentRuntime =
     LayerwiseRuntime<Architecture, MlxBackend, MlxKeyValueState, MlxResidentPolicy<MoshiUnit>>;
-type BoundedRuntime = LayerwiseRuntime<
-    Architecture,
-    MlxBackend,
-    MlxKeyValueState,
-    MlxLayerwisePolicy<MoshiUnit, MoshiUnitFactory>,
->;
+type BoundedRuntime =
+    LayerwiseRuntime<Architecture, MlxBackend, MlxKeyValueState, MlxLayerwisePolicy<MoshiUnit>>;
 type ParallelResidentRuntime =
     LayerwiseRuntime<Architecture, MlxBackend, MlxKeyValueState, MlxResidentPolicy<MoshiUnit>>;
-type ParallelBoundedRuntime = LayerwiseRuntime<
-    Architecture,
-    MlxBackend,
-    MlxKeyValueState,
-    MlxLayerwisePolicy<MoshiUnit, MoshiParallelUnitFactory>,
->;
+type ParallelBoundedRuntime =
+    LayerwiseRuntime<Architecture, MlxBackend, MlxKeyValueState, MlxLayerwisePolicy<MoshiUnit>>;
 
 enum Execution {
     Resident(ResidentRuntime),
@@ -77,37 +68,6 @@ enum Execution {
 struct CanonicalBindingRecipes {
     outputs: BTreeMap<String, DerivedWeightRecipe>,
     aliases: BTreeMap<String, String>,
-}
-
-struct MoshiUnitFactory {
-    config: MoshiConfig,
-    layout: ExecutionUnitLayout,
-}
-
-#[derive(Clone)]
-struct MoshiParallelUnitFactory {
-    config: MoshiConfig,
-    geometry: moshi::LocalGeometry,
-    layout: ExecutionUnitLayout,
-}
-
-impl MlxUnitFactory<MoshiUnit> for MoshiParallelUnitFactory {
-    fn build(&mut self, ordinal: usize, stream: &Stream) -> Result<MoshiUnit, Error> {
-        let address = self.layout.address(ordinal).ok_or_else(|| {
-            Error::Parallel(format!(
-                "Moshi TP ordinal {ordinal} is outside the unit layout"
-            ))
-        })?;
-        self.geometry
-            .build_unit(&self.config, address.group(), address.index(), stream)
-            .map_err(Into::into)
-    }
-}
-
-impl MlxUnitFactory<MoshiUnit> for MoshiUnitFactory {
-    fn build(&mut self, ordinal: usize, stream: &Stream) -> Result<MoshiUnit, Error> {
-        build_unit(&self.config, &self.layout, ordinal, stream)
-    }
 }
 
 /// Stable source-artifact and execution-topology identities for a loaded model.
@@ -372,16 +332,13 @@ pub fn load(
 
     let mut architecture = Architecture::new(target_config.clone(), stream)?;
     let layout = execution_layout(&architecture)?;
-    let factory = MoshiUnitFactory {
-        config: target_config.clone(),
-        layout: layout.clone(),
-    };
     let static_recipes = Arc::clone(&source_recipes);
     let unit_recipes = Arc::clone(&source_recipes);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
-        architecture.static_modules_mut(),
-        factory,
+        &mut architecture,
+        (),
+        std::marker::PhantomData::<MlxKeyValueState>,
         layout,
         options.weight_residency.layers(),
         stream,
@@ -403,9 +360,13 @@ pub fn load(
     metadata.set_materialization(materialization);
     let state_layout = moshi::state_layout(&target_config)?;
     let execution = if options.weight_residency.layers().is_fully_resident() {
-        Execution::Resident(LayerwiseRuntime::new(
+        Execution::Resident(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(
+                &architecture,
+                stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
+            )?,
             architecture,
-            policy.into_resident(stream)?,
         ))
     } else {
         Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
@@ -475,14 +436,8 @@ fn load_parallel(
             .map(|(alias, owner)| (alias.as_str(), owner.as_str())),
     )
     .map_err(|error| Error::Parallel(error.to_string()))?;
-    let mut composition =
-        Architecture::new_parallel(target_config.clone(), geometry.clone(), stream)?;
+    let mut composition = Architecture::new_parallel(target_config.clone(), geometry, stream)?;
     let state_layout = composition.runtime_state_layout()?;
-    let factory = MoshiParallelUnitFactory {
-        config: target_config.clone(),
-        geometry,
-        layout: layout.clone(),
-    };
     let local_layout = Arc::new(local_layout);
     let static_module = MlxModule::new(global.static_modules().clone());
     let static_recipes = Arc::clone(&source_recipes);
@@ -493,8 +448,9 @@ fn load_parallel(
     let unit_sharding = Arc::clone(&local_layout);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
-        composition.static_modules_mut(),
-        factory,
+        &mut composition,
+        (),
+        std::marker::PhantomData::<MlxKeyValueState>,
         layout,
         residency,
         stream,
@@ -522,9 +478,13 @@ fn load_parallel(
     metadata.set_quantization(target_config.native_quantization());
     metadata.set_materialization(materialization);
     let execution = if residency.is_fully_resident() {
-        Execution::ParallelResident(Box::new(LayerwiseRuntime::new(
+        Execution::ParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(
+                &composition,
+                stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
+            )?,
             composition,
-            policy.into_resident(stream)?,
         )))
     } else {
         Execution::ParallelBounded(Box::new(LayerwiseRuntime::new(composition, policy)))
@@ -756,9 +716,9 @@ mod tests {
     #[test]
     #[ignore = "requires EREDU_MOSHI_FIXTURE pointing at a complete released artifact"]
     fn moshi_native_fixture_loads_through_neutral_entrypoint() {
-        let Some(fixture) = std::env::var_os("EREDU_MOSHI_FIXTURE") else {
-            return;
-        };
+        let fixture = std::env::var_os("EREDU_MOSHI_FIXTURE").expect(
+            "EREDU_MOSHI_FIXTURE must point at a complete released artifact when this ignored fixture test is explicitly enabled",
+        );
         assert!(
             Path::new(&fixture).exists(),
             "EREDU_MOSHI_FIXTURE does not exist: {}",

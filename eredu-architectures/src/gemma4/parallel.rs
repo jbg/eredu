@@ -1,11 +1,343 @@
 //! Semantic parameter placement for Gemma 4 components.
 
-use eredu_nn::{AttentionStateSource, AttentionValueSource};
+use eredu_nn::{
+    AttentionStateSource, AttentionValueSource, NeuralBackend, VocabularyParallelRange,
+};
 use eredu_runtime::{
+    expand_linear_format_parameter_groups, module_parameter_group, LocalModelLayout,
     MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+    StateLayout, TensorPlacement,
 };
 
-use super::{FeedForwardPolicy, ModelArgs};
+use super::{
+    state_layout, AudioLayer, AudioStatic, FamilyConfig, FeedForwardPolicy, ModalityProjector,
+    ModelArgs, VisionLayer, VisionStatic,
+};
+
+/// Declares one replicated Gemma media execution unit.
+pub fn media_unit_parameter_groups<B: NeuralBackend>(
+    logical_name: impl Into<String>,
+    unit: &impl eredu_nn::Parameterized<B::Tensor>,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    Ok(vec![module_parameter_group::<B::Tensor, _>(
+        logical_name,
+        ParameterRole::Replicated,
+        unit,
+        |_, _| Ok(MemberSharding::Replicated),
+    )?])
+}
+
+/// Declares pinned Gemma vision modules as one atomic replicated group.
+pub fn vision_static_parameter_groups<B: NeuralBackend>(
+    modules: &VisionStatic<B>,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    media_unit_parameter_groups::<B>("model.vision_tower.static", modules)
+}
+
+/// Declares pinned Gemma audio modules as one atomic replicated group.
+pub fn audio_static_parameter_groups<B: NeuralBackend>(
+    modules: &AudioStatic<B>,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    media_unit_parameter_groups::<B>("model.audio_tower.static", modules)
+}
+
+/// Declares a Gemma modality projector as one atomic replicated group.
+pub fn modality_projection_parameter_groups<B: NeuralBackend>(
+    logical_name: impl Into<String>,
+    projector: &ModalityProjector<B>,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    media_unit_parameter_groups::<B>(logical_name, projector)
+}
+
+/// Declares one replicated Gemma vision layer.
+pub fn vision_layer_parameter_groups<B: NeuralBackend>(
+    layer: &VisionLayer<B>,
+    index: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    media_unit_parameter_groups::<B>(format!("model.vision_tower.encoder.layers.{index}"), layer)
+}
+
+/// Declares one replicated Gemma audio layer.
+pub fn audio_layer_parameter_groups<B: NeuralBackend>(
+    layer: &AudioLayer<B>,
+    index: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    media_unit_parameter_groups::<B>(format!("model.audio_tower.layers.{index}"), layer)
+}
+
+/// Complete planner-derived construction and state geometry for one Gemma 4 rank.
+#[derive(Debug, Clone)]
+pub struct LocalGeometry {
+    text_blocks: Vec<ModelArgs>,
+    embedding_range: VocabularyParallelRange,
+    output_range: Option<VocabularyParallelRange>,
+    per_layer_range: std::ops::Range<i32>,
+    state_layout: StateLayout,
+    vision_layers: usize,
+    audio_layers: usize,
+    architecture_fingerprint: String,
+}
+
+impl LocalGeometry {
+    /// Returns one rank-local decoder configuration.
+    pub fn text_block(&self, layer: usize) -> Option<&ModelArgs> {
+        self.text_blocks.get(layer)
+    }
+
+    /// Returns rank-local decoder configurations in execution order.
+    pub fn text_blocks(&self) -> &[ModelArgs] {
+        &self.text_blocks
+    }
+
+    /// Returns input-embedding vocabulary ownership.
+    pub const fn embedding_range(&self) -> &VocabularyParallelRange {
+        &self.embedding_range
+    }
+
+    /// Returns untied output-head vocabulary ownership.
+    pub const fn output_range(&self) -> Option<&VocabularyParallelRange> {
+        self.output_range.as_ref()
+    }
+
+    /// Returns the local width of each per-layer media input.
+    pub const fn per_layer_width(&self) -> i32 {
+        self.per_layer_range.end - self.per_layer_range.start
+    }
+
+    /// Returns the decoder-media channels owned by every local text block.
+    pub fn per_layer_range(&self) -> &std::ops::Range<i32> {
+        &self.per_layer_range
+    }
+
+    /// Returns the authoritative rank-local decoder state layout.
+    pub const fn state_layout(&self) -> &StateLayout {
+        &self.state_layout
+    }
+
+    /// Returns the replicated vision-unit count owned by this rank.
+    pub const fn vision_layers(&self) -> usize {
+        self.vision_layers
+    }
+
+    /// Returns the replicated audio-unit count owned by this rank.
+    pub const fn audio_layers(&self) -> usize {
+        self.audio_layers
+    }
+
+    pub(super) fn validate_for(&self, args: &FamilyConfig) -> Result<(), ParallelPlanError> {
+        let text_layers = args.text.num_hidden_layers();
+        let vision_layers = args
+            .vision
+            .as_ref()
+            .map_or(0, |config| config.num_hidden_layers as usize);
+        let audio_layers = args
+            .audio
+            .as_ref()
+            .map_or(0, |config| config.num_hidden_layers as usize);
+        if self.architecture_fingerprint != args.architecture_fingerprint()
+            || self.text_blocks.len() != text_layers
+            || self.vision_layers != vision_layers
+            || self.audio_layers != audio_layers
+        {
+            return Err(invalid(
+                "rank-local Gemma 4 geometry belongs to a different family configuration",
+            ));
+        }
+        self.embedding_range
+            .validate_global_rows(args.text.vocab_size)
+            .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
+        match (args.text.tie_word_embeddings, &self.output_range) {
+            (true, None) => {}
+            (false, Some(range)) => range
+                .validate_global_rows(args.text.vocab_size)
+                .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?,
+            (true, Some(_)) => return Err(invalid("tied Gemma 4 output has a separate range")),
+            (false, None) => return Err(invalid("untied Gemma 4 output has no local range")),
+        }
+        let local_text =
+            aggregate_local_text(&args.text, &self.text_blocks, self.per_layer_width())?;
+        let expected = state_layout(&local_text).map_err(|error| invalid(error.to_string()))?;
+        if expected != self.state_layout {
+            return Err(invalid(
+                "rank-local Gemma 4 state layout drifted from decoder geometry",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn aggregate_local_text(
+    global: &ModelArgs,
+    blocks: &[ModelArgs],
+    per_layer_width: i32,
+) -> Result<ModelArgs, ParallelPlanError> {
+    let mut local = blocks
+        .first()
+        .cloned()
+        .ok_or_else(|| invalid("Gemma 4 local geometry has no text blocks"))?;
+    local.layer_schedule = eredu_core::LayerSchedule::new(
+        blocks.len(),
+        blocks
+            .iter()
+            .enumerate()
+            .map(|(layer, args)| {
+                args.layer_policy(layer)
+                    .ok_or_else(|| invalid(format!("missing local Gemma 4 layer policy {layer}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    local.hidden_size_per_layer_input = per_layer_width;
+    local.vocab_size = global.vocab_size;
+    Ok(local)
+}
+
+fn vocabulary_range(
+    layout: &LocalModelLayout,
+    logical_name: &str,
+    vocabulary: usize,
+) -> Result<VocabularyParallelRange, ParallelPlanError> {
+    let mut selected = None;
+    for (target, tensor) in layout
+        .tensors()
+        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
+    {
+        if tensor.global_shape().first().copied() != Some(vocabulary) {
+            return Err(ParallelPlanError::InvalidTensor(format!(
+                "Gemma 4 vocabulary member {target} has global shape {:?}, expected {vocabulary} rows",
+                tensor.global_shape()
+            )));
+        }
+        let range = match tensor.placement() {
+            TensorPlacement::Range {
+                axis: 0,
+                start,
+                end,
+            } => *start..*end,
+            TensorPlacement::Replicated => 0..vocabulary,
+            placement => {
+                return Err(ParallelPlanError::InvalidTensor(format!(
+                    "Gemma 4 vocabulary member {target} has non-row placement {placement:?}"
+                )))
+            }
+        };
+        if selected.as_ref().is_some_and(|current| current != &range) {
+            return Err(ParallelPlanError::InvalidTensor(format!(
+                "Gemma 4 vocabulary group {logical_name} has inconsistent selections"
+            )));
+        }
+        selected = Some(range);
+    }
+    let range = VocabularyParallelRange {
+        global_vocabulary: vocabulary,
+        local: selected.ok_or_else(|| {
+            ParallelPlanError::InvalidTensor(format!(
+                "missing local Gemma 4 vocabulary layout for {logical_name}"
+            ))
+        })?,
+    };
+    range
+        .validate()
+        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
+    Ok(range)
+}
+
+fn local_per_layer_range(
+    args: &ModelArgs,
+    layout: &LocalModelLayout,
+    blocks: &[ModelArgs],
+) -> Result<std::ops::Range<i32>, ParallelPlanError> {
+    if args.hidden_size_per_layer_input == 0 {
+        return Ok(0..0);
+    }
+    let mut selected = None;
+    for layer in 0..args.num_hidden_layers() {
+        let target = format!("model.language_model.layers.{layer}.per_layer_input_gate.weight");
+        let tensor = layout.tensor(&target).ok_or_else(|| {
+            ParallelPlanError::InvalidTensor(format!(
+                "missing local Gemma 4 media-channel layout for {target}"
+            ))
+        })?;
+        let range = match tensor.placement() {
+            TensorPlacement::Range {
+                axis: 0,
+                start,
+                end,
+            } => {
+                i32::try_from(*start).map_err(|_| invalid("media range exceeds i32"))?
+                    ..i32::try_from(*end).map_err(|_| invalid("media range exceeds i32"))?
+            }
+            TensorPlacement::Replicated => 0..args.hidden_size_per_layer_input,
+            placement => {
+                return Err(ParallelPlanError::InvalidTensor(format!(
+                    "Gemma 4 media-channel member {target} has invalid placement {placement:?}"
+                )))
+            }
+        };
+        if selected.as_ref().is_some_and(|current| current != &range) {
+            return Err(ParallelPlanError::InvalidTensor(
+                "Gemma 4 text blocks own inconsistent media-channel ranges".into(),
+            ));
+        }
+        selected = Some(range);
+    }
+    let range = selected.ok_or_else(|| invalid("Gemma 4 has no local media-channel range"))?;
+    let width = range.end - range.start;
+    if blocks
+        .iter()
+        .any(|block| block.hidden_size_per_layer_input != width)
+    {
+        return Err(ParallelPlanError::InvalidTensor(
+            "Gemma 4 static and block-local media widths drifted".into(),
+        ));
+    }
+    Ok(range)
+}
+
+/// Derives all rank-local Gemma 4 construction geometry from one typed plan.
+pub fn local_geometry(
+    args: &FamilyConfig,
+    layout: &LocalModelLayout,
+) -> Result<LocalGeometry, ParallelPlanError> {
+    args.validate()
+        .map_err(|error| invalid(error.to_string()))?;
+    let text_blocks = (0..args.text.num_hidden_layers())
+        .map(|layer| local_block_args(&args.text, layer, layout))
+        .collect::<Result<Vec<_>, _>>()?;
+    let per_layer_range = local_per_layer_range(&args.text, layout, &text_blocks)?;
+    let local_text = aggregate_local_text(
+        &args.text,
+        &text_blocks,
+        per_layer_range.end - per_layer_range.start,
+    )?;
+    let state_layout = state_layout(&local_text).map_err(|error| invalid(error.to_string()))?;
+    let vocabulary = dim(args.text.vocab_size)?;
+    let embedding_range =
+        vocabulary_range(layout, "model.language_model.embed_tokens", vocabulary)?;
+    let output_range = if args.text.tie_word_embeddings {
+        None
+    } else {
+        Some(vocabulary_range(layout, "lm_head", vocabulary)?)
+    };
+    let geometry = LocalGeometry {
+        text_blocks,
+        embedding_range,
+        output_range,
+        per_layer_range,
+        state_layout,
+        vision_layers: args
+            .vision
+            .as_ref()
+            .map_or(0, |config| config.num_hidden_layers as usize),
+        audio_layers: args
+            .audio
+            .as_ref()
+            .map_or(0, |config| config.num_hidden_layers as usize),
+        architecture_fingerprint: args.architecture_fingerprint(),
+    };
+    geometry.validate_for(args)?;
+    Ok(geometry)
+}
 
 /// Derives one Gemma 4 decoder block's rank-local construction geometry.
 pub fn local_block_args(
@@ -108,6 +440,16 @@ fn local_axis(
     let value = *tensor.local_shape().get(axis).ok_or_else(|| {
         ParallelPlanError::InvalidTensor(format!("local Gemma 4 {label} tensor has no axis {axis}"))
     })?;
+    let global = *tensor.global_shape().get(axis).ok_or_else(|| {
+        ParallelPlanError::InvalidTensor(format!(
+            "global Gemma 4 {label} tensor has no axis {axis}"
+        ))
+    })?;
+    if value == 0 || value > global {
+        return Err(ParallelPlanError::InvalidTensor(format!(
+            "local Gemma 4 {label} width {value} is invalid for global width {global}"
+        )));
+    }
     i32::try_from(value)
         .map_err(|_| ParallelPlanError::InvalidTensor(format!("local Gemma 4 {label} exceeds i32")))
 }
@@ -132,25 +474,22 @@ pub fn static_parameter_groups(
         let combined = per_layer
             .checked_mul(args.num_hidden_layers())
             .ok_or_else(|| invalid("Gemma per-layer embedding width overflow"))?;
-        groups.push(ParameterGroupSpec::partitioned(
-            "model.language_model.per_layer_embedding_channels",
-            ParameterRole::Channels,
-            combined,
-            [
-                member(
-                    "model.language_model.embed_tokens_per_layer.weight",
-                    vec![
-                        dim(args.vocab_size_per_layer_input.unwrap_or(args.vocab_size))?,
-                        combined,
-                    ],
-                    MemberSharding::Partitioned { axis: 1 },
-                ),
-                member(
-                    "model.language_model.per_layer_model_projection.weight",
-                    vec![combined, hidden],
-                    MemberSharding::Partitioned { axis: 0 },
-                ),
-            ],
+        groups.push(replicated(
+            "model.language_model.per_layer_embedding",
+            [(
+                "model.language_model.embed_tokens_per_layer.weight".into(),
+                vec![
+                    dim(args.vocab_size_per_layer_input.unwrap_or(args.vocab_size))?,
+                    combined,
+                ],
+            )],
+        )?);
+        groups.push(replicated(
+            "model.language_model.per_layer_projection",
+            [(
+                "model.language_model.per_layer_model_projection.weight".into(),
+                vec![combined, hidden],
+            )],
         )?);
         groups.push(replicated(
             "model.language_model.per_layer_projection_norm",
@@ -175,7 +514,7 @@ pub fn static_parameter_groups(
             )],
         )?);
     }
-    Ok(groups)
+    expand_linear_format_parameter_groups(groups, |name| args.linear_format_for(name))
 }
 
 /// Declares one decoder layer's head, MLP, expert, media, and replicated groups.
@@ -393,7 +732,7 @@ pub fn layer_parameter_groups(
         format!("{root}.replicated"),
         replicated_members,
     )?);
-    Ok(groups)
+    expand_linear_format_parameter_groups(groups, |name| args.linear_format_for(name))
 }
 
 fn group(
@@ -444,6 +783,7 @@ fn invalid(message: impl Into<String>) -> ParallelPlanError {
 
 #[cfg(test)]
 mod tests {
+    use eredu_checkpoint::AffineQuantization;
     use eredu_runtime::{LocalModelLayout, LocalTensorLayout, TensorPlacement};
 
     use super::*;
@@ -477,6 +817,28 @@ mod tests {
             .any(|group| group.logical_name().ends_with("key_value_heads")));
     }
 
+    #[test]
+    fn affine_layer_plan_publishes_weight_companions() {
+        let mut args = args();
+        args.weight_quantization = Some(AffineQuantization::new(16, 4).unwrap().into());
+        args.quantized_weights = Some(std::collections::HashSet::from([
+            "model.language_model.layers.0.self_attn.q_proj.weight".to_owned(),
+            "model.language_model.layers.0.experts.switch_glu.gate_up_proj".to_owned(),
+        ]));
+        let targets = layer_parameter_groups(&args, 0)
+            .unwrap()
+            .into_iter()
+            .flat_map(|group| group.members().to_vec())
+            .map(|member| member.target().to_owned())
+            .collect::<Vec<_>>();
+        assert!(targets
+            .iter()
+            .any(|name| name == "model.language_model.layers.0.self_attn.q_proj.scales"));
+        assert!(targets.iter().any(|name| {
+            name == "model.language_model.layers.0.experts.switch_glu.gate_up_proj_scales"
+        }));
+    }
+
     fn local_tensor(shape: Vec<usize>) -> LocalTensorLayout {
         LocalTensorLayout::new(
             "test",
@@ -488,6 +850,126 @@ mod tests {
             None,
             false,
         )
+    }
+
+    fn family() -> FamilyConfig {
+        FamilyConfig::from_hf_json(
+            br#"{
+              "model_type":"gemma4_unified","tie_word_embeddings":false,
+              "image_token_id":60,"audio_token_id":61,
+              "text_config":{
+                "hidden_size":16,"num_hidden_layers":2,"intermediate_size":32,
+                "num_attention_heads":2,"num_key_value_heads":2,"head_dim":8,
+                "rms_norm_eps":0.000001,"vocab_size":64,"max_position_embeddings":128,
+                "hidden_size_per_layer_input":4,"vocab_size_per_layer_input":64,
+                "layer_types":["full_attention","full_attention"]
+              },
+              "vision_config":{
+                "hidden_size":16,"intermediate_size":32,"num_hidden_layers":1,
+                "num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,
+                "patch_size":4,"pooling_kernel_size":2,"position_embedding_size":16,
+                "rms_norm_eps":0.000001
+              },
+              "audio_config":{
+                "hidden_size":16,"num_hidden_layers":1,"num_attention_heads":2,
+                "output_proj_dims":8,"conv_kernel_size":3,"attention_chunk_size":4,
+                "attention_context_left":5,"attention_context_right":0,
+                "attention_invalid_logits_value":-1000000000.0,"attention_logit_cap":50.0,
+                "residual_weight":0.5,"rms_norm_eps":0.000001,
+                "subsampling_conv_channels":[4,8]
+              }
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn insert(
+        layout: &mut LocalModelLayout,
+        target: &str,
+        logical: &str,
+        global: Vec<usize>,
+        local: Vec<usize>,
+        placement: TensorPlacement,
+    ) {
+        layout.insert(
+            target.into(),
+            LocalTensorLayout::new(
+                logical,
+                ParameterRole::Replicated,
+                global,
+                local,
+                placement,
+                None,
+                None,
+                false,
+            ),
+        );
+    }
+
+    fn family_layout() -> LocalModelLayout {
+        let mut layout = LocalModelLayout::default();
+        for (target, logical) in [
+            (
+                "model.language_model.embed_tokens.weight",
+                "model.language_model.embed_tokens",
+            ),
+            ("lm_head.weight", "lm_head"),
+        ] {
+            insert(
+                &mut layout,
+                target,
+                logical,
+                vec![64, 16],
+                vec![32, 16],
+                TensorPlacement::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 32,
+                },
+            );
+        }
+        for layer in 0..2 {
+            let root = format!("model.language_model.layers.{layer}");
+            for suffix in ["self_attn.q_proj.weight", "self_attn.k_proj.weight"] {
+                insert(
+                    &mut layout,
+                    &format!("{root}.{suffix}"),
+                    &format!("{root}.heads"),
+                    vec![16, 16],
+                    vec![8, 16],
+                    TensorPlacement::Range {
+                        axis: 0,
+                        start: 0,
+                        end: 8,
+                    },
+                );
+            }
+            insert(
+                &mut layout,
+                &format!("{root}.mlp.gate_proj.weight"),
+                &format!("{root}.mlp.intermediate"),
+                vec![32, 16],
+                vec![16, 16],
+                TensorPlacement::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 16,
+                },
+            );
+            insert(
+                &mut layout,
+                &format!("{root}.per_layer_input_gate.weight"),
+                &format!("{root}.media_channels"),
+                vec![4, 16],
+                vec![2, 16],
+                TensorPlacement::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 2,
+                },
+            );
+        }
+        layout
     }
 
     #[test]
@@ -516,5 +998,73 @@ mod tests {
         assert_eq!(policy.num_key_value_heads.get(), 1);
         assert_eq!(policy.intermediate_size.get(), 16);
         assert_eq!(local.moe_intermediate_size, Some(4));
+    }
+
+    #[test]
+    fn family_geometry_owns_text_vocab_state_and_replicated_towers() {
+        let family = family();
+        let geometry = local_geometry(&family, &family_layout()).unwrap();
+        assert_eq!(geometry.text_blocks().len(), 2);
+        assert_eq!(geometry.text_block(0).unwrap().num_attention_heads, 1);
+        assert_eq!(
+            geometry
+                .text_block(0)
+                .unwrap()
+                .layer_policy(0)
+                .unwrap()
+                .num_key_value_heads
+                .get(),
+            1
+        );
+        assert_eq!(geometry.embedding_range().local, 0..32);
+        assert_eq!(geometry.output_range().unwrap().local, 0..32);
+        assert_eq!(geometry.vision_layers(), 1);
+        assert_eq!(geometry.audio_layers(), 1);
+        assert_eq!(geometry.per_layer_range(), &(0..2));
+        assert_ne!(
+            geometry.state_layout(),
+            &state_layout(&family.text).unwrap()
+        );
+        geometry.validate_for(&family).unwrap();
+    }
+
+    #[test]
+    fn family_geometry_rejects_head_and_vocabulary_selection_drift() {
+        let family = family();
+        let mut layout = family_layout();
+        insert(
+            &mut layout,
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.heads",
+            vec![16, 16],
+            vec![7, 16],
+            TensorPlacement::Range {
+                axis: 0,
+                start: 0,
+                end: 7,
+            },
+        );
+        assert!(local_geometry(&family, &layout)
+            .unwrap_err()
+            .to_string()
+            .contains("splits head dimension"));
+
+        let mut layout = family_layout();
+        insert(
+            &mut layout,
+            "lm_head.scales",
+            "lm_head",
+            vec![64, 1],
+            vec![32, 1],
+            TensorPlacement::Range {
+                axis: 0,
+                start: 32,
+                end: 64,
+            },
+        );
+        assert!(local_geometry(&family, &layout)
+            .unwrap_err()
+            .to_string()
+            .contains("inconsistent selections"));
     }
 }

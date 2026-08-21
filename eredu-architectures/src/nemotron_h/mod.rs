@@ -20,11 +20,11 @@ pub use config::{
 };
 pub use mamba::Mamba2;
 pub use mlp::{DenseMlp, SparseMoe};
-pub use model::{ForwardContext, LayeredModel, Unit};
+pub use model::{ForwardContext, LayeredModel, TargetBoundary, TargetPartitionInput, Unit};
 pub use mtp::{EmbeddedInput, ForwardMode, PredictionUnit, RetainedValues};
 pub use parallel::{
-    layer_parallel_parameter_groups, local_block_geometry, local_state_geometry,
-    static_parallel_parameter_groups, unit_parallel_parameter_groups,
+    layer_parallel_parameter_groups, local_block_geometry, local_geometry, local_state_geometry,
+    static_parallel_parameter_groups, unit_parallel_parameter_groups, LocalGeometry,
 };
 
 /// Declares cache identity independently of its backend realization.

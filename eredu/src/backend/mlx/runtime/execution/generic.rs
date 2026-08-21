@@ -12,7 +12,10 @@ use std::{
 };
 
 use eredu_nn::{ParameterMetadata, ParameterVisitorMut, Parameterized};
-use eredu_runtime::{LayerwisePolicy, OffloadUnit, WeightBinding};
+use eredu_runtime::LayerwiseAcquireError;
+use eredu_runtime::{
+    LayeredArchitecture, LayerwisePolicy, OffloadUnit, RuntimeState, WeightBinding,
+};
 use safemlx::{transforms::async_eval_with_event, Array, Event, Stream};
 
 use crate::backend::mlx::{
@@ -61,13 +64,13 @@ impl<U> std::ops::DerefMut for MlxUnitLease<U> {
 }
 
 /// Exact-completion MLX policy over generic parameterized execution units.
-pub(crate) struct MlxLayerwisePolicy<U, F> {
+pub(crate) struct MlxLayerwisePolicy<U, P = ()> {
     residency: ResidencyManager,
     store: SharedCheckpointSource,
     unit_ids: Vec<OffloadUnitId>,
     layout: ExecutionUnitLayout,
     window_depth: usize,
-    build: F,
+    populator: P,
     _static_leases: Vec<ResidentUnitLease>,
     pending: VecDeque<(Event, MlxUnitLease<U>)>,
     dense: Option<MlxDenseExecution>,
@@ -114,16 +117,14 @@ impl<U> std::ops::DerefMut for MlxResidentUnit<U> {
     }
 }
 
-/// Statically dispatched unloaded-unit construction used by the MLX policy.
-pub(crate) trait MlxUnitFactory<U> {
-    fn build(&mut self, index: usize, stream: &Stream) -> Result<U, Error>;
-
+/// Statically dispatched parameter population used by the MLX policy.
+pub(crate) trait MlxUnitPopulator<U> {
     /// Populates the parameters owned by the execution-unit residency policy.
     ///
     /// Most units own every materialized parameter. Architectures with an
     /// independently managed parameter class (for example, an expert cache)
     /// override this method with the same exclusion used while binding the
-    /// unit. Keeping the ownership decision on the factory makes resident,
+    /// unit. Keeping the ownership decision on the populator makes resident,
     /// bounded, and dense-stream execution follow one contract.
     fn populate(&mut self, unit: &mut MlxModule<U>, lease: &ResidentUnitLease) -> Result<(), Error>
     where
@@ -134,16 +135,33 @@ pub(crate) trait MlxUnitFactory<U> {
     }
 }
 
-impl<U, F> MlxUnitFactory<U> for F
+impl<U> MlxUnitPopulator<U> for () {}
+
+/// Builds one unloaded unit through the neutral architecture's declared flat layout.
+pub(crate) fn construct_architecture_unit<A, S>(
+    architecture: &A,
+    layout: &ExecutionUnitLayout,
+    ordinal: usize,
+    stream: &Stream,
+    _state: std::marker::PhantomData<S>,
+) -> Result<A::Unit, Error>
 where
-    F: FnMut(usize, &Stream) -> Result<U, Error>,
+    A: LayeredArchitecture<MlxBackend, S>,
+    S: RuntimeState<MlxBackend>,
+    A::Error: std::fmt::Display,
 {
-    fn build(&mut self, index: usize, stream: &Stream) -> Result<U, Error> {
-        self(index, stream)
-    }
+    let address = layout.address(ordinal).ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!(
+            "architecture unit ordinal {ordinal} is outside 0..{}",
+            layout.len()
+        ))
+    })?;
+    architecture
+        .build_unit(address.group(), address.index(), stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
-impl<U, F> MlxLayerwisePolicy<U, F> {
+impl<U, P> MlxLayerwisePolicy<U, P> {
     /// Creates a bounded policy over validated ordered residency units.
     pub(crate) fn new(
         residency: ResidencyManager,
@@ -151,7 +169,7 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
         unit_ids: Vec<OffloadUnitId>,
         layout: ExecutionUnitLayout,
         window_depth: usize,
-        build: F,
+        populator: P,
         static_leases: Vec<ResidentUnitLease>,
         dense: Option<Arc<DenseStreamController>>,
         sample_mlx_memory: bool,
@@ -173,7 +191,7 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
             unit_ids,
             layout: layout.clone(),
             window_depth,
-            build,
+            populator,
             _static_leases: static_leases,
             pending: VecDeque::new(),
             dense: dense.map(|controller| MlxDenseExecution {
@@ -310,10 +328,18 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
 
     /// Populates every unit once and converts the bounded loader into a
     /// permanently resident policy without changing the architecture loop.
-    pub(crate) fn into_resident(mut self, stream: &Stream) -> Result<MlxResidentPolicy<U>, Error>
+    pub(crate) fn into_resident<A, S>(
+        mut self,
+        architecture: &A,
+        stream: &Stream,
+        _state: std::marker::PhantomData<S>,
+    ) -> Result<MlxResidentPolicy<U>, Error>
     where
         U: Parameterized<Array>,
-        F: MlxUnitFactory<U>,
+        P: MlxUnitPopulator<U>,
+        A: LayeredArchitecture<MlxBackend, S, Unit = U>,
+        S: RuntimeState<MlxBackend>,
+        A::Error: std::fmt::Display,
     {
         self.drain()?;
         let requests = self
@@ -328,8 +354,16 @@ impl<U, F> MlxLayerwisePolicy<U, F> {
         transfer.order_after(stream)?;
         let mut units = Vec::with_capacity(self.unit_ids.len());
         for (index, lease) in transfer.leases().iter().enumerate() {
-            let mut unit = MlxModule::new(self.build.build(index, stream)?);
-            self.build.populate(&mut unit, lease)?;
+            let address = self
+                .layout
+                .address(index)
+                .expect("validated layout covers every resident unit");
+            let mut unit = MlxModule::new(
+                architecture
+                    .build_unit(address.group(), address.index(), stream)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            );
+            self.populator.populate(&mut unit, lease)?;
             units.push(Some(unit));
         }
         Ok(MlxResidentPolicy {
@@ -398,21 +432,27 @@ impl<U> LayerwisePolicy<MlxBackend, U> for MlxResidentPolicy<U> {
         Ok(())
     }
 
-    fn acquire(
+    fn acquire<E, BF>(
         &mut self,
         index: usize,
         _address: eredu_runtime::ExecutionUnitAddress,
+        _build: BF,
         _stream: &Stream,
-    ) -> Result<Self::Lease, Self::Error> {
+    ) -> Result<Self::Lease, LayerwiseAcquireError<E, Self::Error>>
+    where
+        BF: FnOnce(&Stream) -> Result<U, E>,
+    {
         let count = self.units.len();
         let unit = self
             .units
             .get_mut(index)
             .ok_or_else(|| {
                 Error::Parallel(format!("resident unit {index} is outside {count} units"))
-            })?
+            })
+            .map_err(LayerwiseAcquireError::Policy)?
             .take()
-            .ok_or_else(|| Error::Parallel(format!("resident unit {index} is already acquired")))?;
+            .ok_or_else(|| Error::Parallel(format!("resident unit {index} is already acquired")))
+            .map_err(LayerwiseAcquireError::Policy)?;
         Ok(MlxResidentUnit { index, unit })
     }
 
@@ -528,26 +568,30 @@ fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error>
 
 /// Builds a generic MLX layerwise policy from neutral parameter topologies.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_layerwise_policy<SM, U, F, I>(
+pub(crate) fn prepare_layerwise_policy<A, S, P, I>(
     store: SharedCheckpointSource,
-    static_modules: &mut SM,
-    build: F,
+    architecture: &mut A,
+    populator: P,
+    state: std::marker::PhantomData<S>,
     layout: ExecutionUnitLayout,
     options: LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
     ignored: I,
-) -> Result<(MlxLayerwisePolicy<U, F>, LayerwiseModelMetadata), Error>
+) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
 where
-    SM: Clone + Parameterized<Array>,
-    U: Parameterized<Array>,
-    F: MlxUnitFactory<U>,
+    A: LayeredArchitecture<MlxBackend, S>,
+    S: RuntimeState<MlxBackend>,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+    P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
 {
     prepare_layerwise_policy_with_bindings(
         store,
-        static_modules,
-        build,
+        architecture,
+        populator,
+        state,
         layout,
         options,
         stream,
@@ -568,10 +612,11 @@ where
 /// selections while retaining the same residency, overlap, and completion
 /// algorithm used by replicated execution.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_layerwise_policy_with_bindings<SM, U, F, I, SB, UB>(
+pub(crate) fn prepare_layerwise_policy_with_bindings<A, S, P, I, SB, UB>(
     store: SharedCheckpointSource,
-    static_modules: &mut SM,
-    mut build: F,
+    architecture: &mut A,
+    populator: P,
+    _state: std::marker::PhantomData<S>,
     layout: ExecutionUnitLayout,
     options: LayerWeightResidency,
     stream: &Stream,
@@ -579,19 +624,20 @@ pub(crate) fn prepare_layerwise_policy_with_bindings<SM, U, F, I, SB, UB>(
     ignored: I,
     static_bindings: SB,
     mut unit_bindings: UB,
-) -> Result<(MlxLayerwisePolicy<U, F>, LayerwiseModelMetadata), Error>
+) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
 where
-    SM: Parameterized<Array>,
-    U: Parameterized<Array>,
-    F: MlxUnitFactory<U>,
+    A: LayeredArchitecture<MlxBackend, S>,
+    S: RuntimeState<MlxBackend>,
+    A::Error: std::fmt::Display,
+    P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
     SB: FnOnce(
-        &SM,
+        &A::StaticModules,
         &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error>,
     UB: FnMut(
         usize,
-        U,
+        A::Unit,
         &dyn eredu_checkpoint::store::CheckpointSource,
         &Stream,
     ) -> Result<Vec<WeightBinding>, Error>,
@@ -611,7 +657,7 @@ where
     let mut consumed = BTreeSet::new();
 
     let static_id = OffloadUnitId::new("model.static")?;
-    let static_bindings = static_bindings(static_modules, store.as_ref())?;
+    let static_bindings = static_bindings(architecture.static_modules(), store.as_ref())?;
     let static_bytes = binding_bytes(&static_bindings)?;
     consumed.extend(
         static_bindings
@@ -632,7 +678,12 @@ where
     let mut total_host_bytes = 0u64;
     let mut maximum_host_bytes = 0u64;
     for index in 0..unit_count {
-        let unit = build.build(index, stream)?;
+        let address = layout
+            .address(index)
+            .expect("validated layout covers every flat unit");
+        let unit = architecture
+            .build_unit(address.group(), address.index(), stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let bindings = unit_bindings(index, unit, store.as_ref(), stream)?;
         let bytes = binding_bytes(&bindings)?;
         layer_parameter_bytes = layer_parameter_bytes
@@ -720,7 +771,7 @@ where
     )?;
     residency.initialize()?;
     let static_lease = residency.acquire(&static_id, MemoryTier::Device)?;
-    populate_parameterized(static_modules, &static_lease)?;
+    populate_parameterized(architecture.static_modules_mut(), &static_lease)?;
     let metadata = LayerwiseModelMetadata::new(
         "generic",
         None,
@@ -762,7 +813,7 @@ where
         unit_ids,
         layout,
         depth,
-        build,
+        populator,
         vec![static_lease],
         dense_controller,
         options.sample_backend_memory(),
@@ -771,10 +822,10 @@ where
     Ok((policy, metadata))
 }
 
-impl<U, F> LayerwisePolicy<MlxBackend, U> for MlxLayerwisePolicy<U, F>
+impl<U, P> LayerwisePolicy<MlxBackend, U> for MlxLayerwisePolicy<U, P>
 where
     U: Parameterized<Array>,
-    F: MlxUnitFactory<U>,
+    P: MlxUnitPopulator<U>,
 {
     type Lease = MlxUnitLease<U>;
     type Error = Error;
@@ -798,20 +849,26 @@ where
         Ok(())
     }
 
-    fn acquire(
+    fn acquire<E, BF>(
         &mut self,
         index: usize,
         address: ExecutionUnitAddress,
+        build: BF,
         stream: &Stream,
-    ) -> Result<Self::Lease, Self::Error> {
+    ) -> Result<Self::Lease, LayerwiseAcquireError<E, Self::Error>>
+    where
+        BF: FnOnce(&Stream) -> Result<U, E>,
+    {
+        let mut unloaded = Some(build(stream).map_err(LayerwiseAcquireError::Architecture)?);
         if self.layout.address(index) != Some(address) {
-            return Err(Error::Parallel(format!(
+            return Err(LayerwiseAcquireError::Policy(Error::Parallel(format!(
                 "execution unit {index} does not match group {} unit {}",
                 address.group(),
                 address.index()
-            )));
+            ))));
         }
-        self.reap_completed()?;
+        self.reap_completed()
+            .map_err(LayerwiseAcquireError::Policy)?;
         if self.dense.is_some() {
             let group = address.group();
             let group_id = self
@@ -828,13 +885,18 @@ where
                 dense.groups[group] = Some(dense.controller.group_guard(&self.residency, group_id));
             }
             if dense.windows[group].is_none() {
-                dense.windows[group] = Some(dense.controller.transfer_window(
-                    &self.residency,
-                    group_id,
-                    &self.unit_ids,
-                    range,
-                    dense.prefill,
-                )?);
+                dense.windows[group] = Some(
+                    dense
+                        .controller
+                        .transfer_window(
+                            &self.residency,
+                            group_id,
+                            &self.unit_ids,
+                            range,
+                            dense.prefill,
+                        )
+                        .map_err(LayerwiseAcquireError::Policy)?,
+                );
             }
             loop {
                 let refill = self
@@ -845,8 +907,10 @@ where
                     .refill();
                 match refill {
                     Ok(()) => break,
-                    Err(_) if !self.pending.is_empty() => self.drain_one()?,
-                    Err(error) => return Err(error),
+                    Err(_) if !self.pending.is_empty() => {
+                        self.drain_one().map_err(LayerwiseAcquireError::Policy)?
+                    }
+                    Err(error) => return Err(LayerwiseAcquireError::Policy(error)),
                 }
             }
             let transfer = self
@@ -854,15 +918,18 @@ where
                 .as_mut()
                 .and_then(|dense| dense.windows[group].as_mut())
                 .expect("dense forward begins before acquisition")
-                .next(stream)?;
+                .next(stream)
+                .map_err(LayerwiseAcquireError::Policy)?;
             if transfer.index() != index {
-                return Err(Error::Parallel(format!(
+                return Err(LayerwiseAcquireError::Policy(Error::Parallel(format!(
                     "dense transfer returned unit {}, expected {index}",
                     transfer.index()
-                )));
+                ))));
             }
-            let mut unit = MlxModule::new(self.build.build(index, stream)?);
-            self.build.populate(&mut unit, transfer.lease())?;
+            let mut unit = MlxModule::new(unloaded.take().expect("unloaded unit is consumed once"));
+            self.populator
+                .populate(&mut unit, transfer.lease())
+                .map_err(LayerwiseAcquireError::Policy)?;
             return Ok(MlxUnitLease {
                 unit,
                 _transfer: MlxUnitTransfer::Dense {
@@ -875,8 +942,9 @@ where
         // window before requesting the overlapping next window; otherwise an
         // overlapping in-flight unit would wait for the very transfer guard
         // retained by `pending` on this thread.
-        self.drain_one()?;
-        self.trim_device_window(index, address)?;
+        self.drain_one().map_err(LayerwiseAcquireError::Policy)?;
+        self.trim_device_window(index, address)
+            .map_err(LayerwiseAcquireError::Policy)?;
         let group_range = self
             .layout
             .group_range(address.group())
@@ -893,13 +961,20 @@ where
                 .acquire_many_with_transfer(&requests, MemoryTier::Device)
             {
                 Ok(transfer) => break transfer,
-                Err(_) if !self.pending.is_empty() => self.drain_one()?,
-                Err(error) => return Err(error.into()),
+                Err(_) if !self.pending.is_empty() => {
+                    self.drain_one().map_err(LayerwiseAcquireError::Policy)?
+                }
+                Err(error) => return Err(LayerwiseAcquireError::Policy(error.into())),
             }
         };
-        transfer.order_after(stream)?;
-        let mut unit = MlxModule::new(self.build.build(index, stream)?);
-        self.build.populate(&mut unit, &transfer.leases()[0])?;
+        transfer
+            .order_after(stream)
+            .map_err(Error::from)
+            .map_err(LayerwiseAcquireError::Policy)?;
+        let mut unit = MlxModule::new(unloaded.take().expect("unloaded unit is consumed once"));
+        self.populator
+            .populate(&mut unit, &transfer.leases()[0])
+            .map_err(LayerwiseAcquireError::Policy)?;
         Ok(MlxUnitLease {
             unit,
             _transfer: MlxUnitTransfer::Ordinary {
@@ -956,7 +1031,7 @@ where
     }
 }
 
-impl<U, F> Drop for MlxLayerwisePolicy<U, F> {
+impl<U, P> Drop for MlxLayerwisePolicy<U, P> {
     fn drop(&mut self) {
         for (event, _) in &self.pending {
             let _ = event.synchronize();

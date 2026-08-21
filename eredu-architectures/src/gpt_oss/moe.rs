@@ -51,6 +51,39 @@ pub struct RoutedMlp<B: RoutedNeuralBackend> {
     pub experts: B::GatedProductExpertBank,
 }
 
+impl<B: RoutedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for RoutedMlp<B> {
+    fn forward_with_provider<P>(
+        &mut self,
+        _layer: usize,
+        input: &B::Tensor,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        RoutedMlp::forward_with_provider(self, input, pass, provider, context)
+    }
+
+    fn forward_parallel_with_provider<P>(
+        &mut self,
+        _layer: usize,
+        input: &B::Tensor,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        RoutedMlp::forward_parallel_with_provider(self, input, pass, parallel, provider, context)
+    }
+}
+
 impl<B: RoutedNeuralBackend> RoutedMlp<B> {
     /// Builds one unloaded GPT-OSS routed feed-forward operator.
     pub fn new(

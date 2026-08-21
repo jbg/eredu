@@ -2,11 +2,164 @@
 
 use std::collections::BTreeMap;
 
+use eredu_nn::{NeuralBackend, VocabularyParallelRange};
 use eredu_runtime::{
+    expand_linear_format_parameter_groups, module_parameter_group, LocalModelLayout,
     MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+    StateLayout, TensorPlacement,
 };
 
 use super::{FeedForwardPolicy, ModelArgs};
+
+/// Complete planner-derived construction and state geometry for one Inkling rank.
+#[derive(Debug, Clone)]
+pub struct LocalGeometry {
+    text_layers: Vec<super::TextArgs>,
+    embedding_range: VocabularyParallelRange,
+    output_range: VocabularyParallelRange,
+    state_layout: StateLayout,
+    vision_layers: usize,
+    architecture_fingerprint: String,
+}
+
+impl LocalGeometry {
+    /// Returns one rank-local text-layer configuration.
+    pub fn text_layer(&self, layer: usize) -> Option<&super::TextArgs> {
+        self.text_layers.get(layer)
+    }
+
+    /// Returns all rank-local text-layer configurations.
+    pub fn text_layers(&self) -> &[super::TextArgs] {
+        &self.text_layers
+    }
+
+    /// Returns input-embedding vocabulary ownership.
+    pub const fn embedding_range(&self) -> &VocabularyParallelRange {
+        &self.embedding_range
+    }
+
+    /// Returns output-head vocabulary ownership.
+    pub const fn output_range(&self) -> &VocabularyParallelRange {
+        &self.output_range
+    }
+
+    /// Returns the authoritative rank-local decoder state layout.
+    pub const fn state_layout(&self) -> &StateLayout {
+        &self.state_layout
+    }
+
+    /// Returns the number of neutral vision units owned by this realization.
+    pub const fn vision_layers(&self) -> usize {
+        self.vision_layers
+    }
+
+    pub(super) fn validate_for(&self, args: &ModelArgs) -> Result<(), ParallelPlanError> {
+        let text_layers = usize::try_from(args.text_config.num_hidden_layers)
+            .map_err(|_| invalid("Inkling text-layer count exceeds usize"))?;
+        let vision_layers = args
+            .vision_config
+            .as_ref()
+            .map_or(0, |vision| vision.num_hidden_layers as usize);
+        if self.architecture_fingerprint != args.architecture_fingerprint()
+            || self.text_layers.len() != text_layers
+            || self.vision_layers != vision_layers
+        {
+            return Err(invalid(
+                "rank-local Inkling geometry belongs to a different model configuration",
+            ));
+        }
+        self.embedding_range
+            .validate_global_rows(args.text_config.vocab_size)
+            .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
+        self.output_range
+            .validate_global_rows(args.text_config.vocab_size)
+            .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
+        let expected = super::parallel_state_layout(args, &self.text_layers)
+            .map_err(|error| invalid(error.to_string()))?;
+        if expected != self.state_layout {
+            return Err(invalid(
+                "rank-local Inkling state layout drifted from text geometry",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Derives all rank-local Inkling construction geometry from one typed plan.
+pub fn local_geometry(
+    args: &ModelArgs,
+    layout: &LocalModelLayout,
+) -> Result<LocalGeometry, ParallelPlanError> {
+    let text_layers = (0..args.text_config.num_hidden_layers as usize)
+        .map(|layer| local_text_args(&args.text_config, layer, layout))
+        .collect::<Result<Vec<_>, _>>()?;
+    let state_layout = super::parallel_state_layout(args, &text_layers)
+        .map_err(|error| invalid(error.to_string()))?;
+    let vocabulary = dim(args.text_config.vocab_size)?;
+    let geometry = LocalGeometry {
+        text_layers,
+        embedding_range: vocabulary_range(layout, "model.embed_tokens", vocabulary)?,
+        output_range: vocabulary_range(layout, "lm_head", vocabulary)?,
+        state_layout,
+        vision_layers: args
+            .vision_config
+            .as_ref()
+            .map_or(0, |vision| vision.num_hidden_layers as usize),
+        architecture_fingerprint: args.architecture_fingerprint(),
+    };
+    geometry.validate_for(args)?;
+    Ok(geometry)
+}
+
+fn vocabulary_range(
+    layout: &LocalModelLayout,
+    logical_name: &str,
+    vocabulary: usize,
+) -> Result<VocabularyParallelRange, ParallelPlanError> {
+    let mut selected = None;
+    for (target, tensor) in layout
+        .tensors()
+        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
+    {
+        if tensor.global_shape().first().copied() != Some(vocabulary) {
+            return Err(ParallelPlanError::InvalidTensor(format!(
+                "Inkling vocabulary member {target} has global shape {:?}, expected {vocabulary} rows",
+                tensor.global_shape()
+            )));
+        }
+        let range = match tensor.placement() {
+            TensorPlacement::Range {
+                axis: 0,
+                start,
+                end,
+            } => *start..*end,
+            TensorPlacement::Replicated => 0..vocabulary,
+            placement => {
+                return Err(ParallelPlanError::InvalidTensor(format!(
+                    "Inkling vocabulary member {target} has non-row placement {placement:?}"
+                )))
+            }
+        };
+        if selected.as_ref().is_some_and(|current| current != &range) {
+            return Err(ParallelPlanError::InvalidTensor(format!(
+                "Inkling vocabulary group {logical_name} has inconsistent selections"
+            )));
+        }
+        selected = Some(range);
+    }
+    let range = VocabularyParallelRange {
+        global_vocabulary: vocabulary,
+        local: selected.ok_or_else(|| {
+            ParallelPlanError::InvalidTensor(format!(
+                "missing local Inkling vocabulary layout for {logical_name}"
+            ))
+        })?,
+    };
+    range
+        .validate()
+        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
+    Ok(range)
+}
 
 /// Derives the construction geometry for one rank-local Inkling decoder layer.
 ///
@@ -82,6 +235,16 @@ fn local_axis(
     let value = *tensor.local_shape().get(axis).ok_or_else(|| {
         ParallelPlanError::InvalidTensor(format!("local Inkling {label} tensor has no axis {axis}"))
     })?;
+    let global = *tensor.global_shape().get(axis).ok_or_else(|| {
+        ParallelPlanError::InvalidTensor(format!(
+            "global Inkling {label} tensor has no axis {axis}"
+        ))
+    })?;
+    if value == 0 || value > global {
+        return Err(ParallelPlanError::InvalidTensor(format!(
+            "local Inkling {label} width {value} is invalid for global width {global}"
+        )));
+    }
     i32::try_from(value)
         .map_err(|_| ParallelPlanError::InvalidTensor(format!("local Inkling {label} exceeds i32")))
 }
@@ -103,12 +266,10 @@ pub fn static_parameter_groups(
             )],
         )?,
         replicated(
-            "model.text_norms",
-            [
-                ("model.embed_norm.weight", vec![hidden]),
-                ("model.norm.weight", vec![hidden]),
-            ],
+            "model.embed_norm",
+            [("model.embed_norm.weight", vec![hidden])],
         )?,
+        replicated("model.norm", [("model.norm.weight", vec![hidden])])?,
         group(
             "lm_head",
             ParameterRole::Vocabulary,
@@ -136,14 +297,11 @@ pub fn static_parameter_groups(
     if let Some(vision) = &args.vision_config {
         for (layer, (input, output, _, _)) in vision.layer_specs().into_iter().enumerate() {
             let output = dim(output)?;
-            groups.push(ParameterGroupSpec::partitioned(
+            groups.push(replicated(
                 format!("visual.layers.{layer}.channels"),
-                ParameterRole::Channels,
-                output,
-                [member(
+                [(
                     format!("visual.layers.{layer}.projection.weight"),
                     vec![output, dim(input)?],
-                    partitioned(0),
                 )],
             )?);
             if layer + 1 != vision.layer_specs().len() {
@@ -161,7 +319,30 @@ pub fn static_parameter_groups(
             [("visual.final_norm.weight", vec![hidden])],
         )?);
     }
-    Ok(groups)
+    expand_linear_format_parameter_groups(groups, |name| {
+        if name.starts_with("visual.") {
+            args.vision_config
+                .as_ref()
+                .map_or(eredu_checkpoint::LinearFormat::Dense, |config| {
+                    config.linear_format_for(name)
+                })
+        } else {
+            args.text_config.linear_format_for(name)
+        }
+    })
+}
+
+/// Declares one replicated Inkling vision execution unit.
+pub fn vision_layer_parameter_groups<B: NeuralBackend>(
+    layer: &impl eredu_nn::Parameterized<B::Tensor>,
+    index: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    Ok(vec![module_parameter_group::<B::Tensor, _>(
+        format!("visual.layers.{index}"),
+        ParameterRole::Replicated,
+        layer,
+        |_, _| Ok(MemberSharding::Replicated),
+    )?])
 }
 
 /// Declares checkpoint-embedded prediction modules as replicated TP state.
@@ -222,7 +403,9 @@ pub fn mtp_parameter_groups(
             "Inkling checkpoint declares MTP depths but no MTP parameters",
         ));
     }
-    Ok(vec![replicated("model.mtp", members)?])
+    expand_linear_format_parameter_groups(vec![replicated("model.mtp", members)?], |name| {
+        args.text_config.linear_format_for(name)
+    })
 }
 
 /// Declares one decoder layer's head, convolution, dense/expert, and replicated
@@ -413,7 +596,7 @@ pub fn layer_parameter_groups(
         format!("{root}.replicated"),
         replicated_members,
     )?);
-    Ok(groups)
+    expand_linear_format_parameter_groups(groups, |name| args.text_config.linear_format_for(name))
 }
 
 fn group(
@@ -472,6 +655,7 @@ fn invalid(message: impl Into<String>) -> ParallelPlanError {
 
 #[cfg(test)]
 mod tests {
+    use eredu_checkpoint::AffineQuantization;
     use eredu_runtime::{LocalModelLayout, LocalTensorLayout, ParameterRole, TensorPlacement};
 
     use super::*;
@@ -532,6 +716,28 @@ mod tests {
             .any(|group| group.logical_name().ends_with("key_value_heads")));
     }
 
+    #[test]
+    fn affine_layer_plan_publishes_weight_companions() {
+        let mut args = args();
+        let format = AffineQuantization::new(16, 4).unwrap().into();
+        args.text_config.quantized_weight_configs = Some(std::collections::HashMap::from([
+            ("model.layers.1.self_attn.q_proj.weight".to_owned(), format),
+            ("model.layers.1.moe.experts.gate_up_proj".to_owned(), format),
+        ]));
+        let targets = layer_parameter_groups(&args, 1)
+            .unwrap()
+            .into_iter()
+            .flat_map(|group| group.members().to_vec())
+            .map(|member| member.target().to_owned())
+            .collect::<Vec<_>>();
+        assert!(targets
+            .iter()
+            .any(|name| name == "model.layers.1.self_attn.q_proj.scales"));
+        assert!(targets
+            .iter()
+            .any(|name| name == "model.layers.1.moe.experts.gate_up_proj_scales"));
+    }
+
     fn local_tensor(shape: Vec<usize>) -> LocalTensorLayout {
         LocalTensorLayout::new(
             "test",
@@ -543,6 +749,61 @@ mod tests {
             None,
             false,
         )
+    }
+
+    fn vocabulary_tensor(
+        logical: &str,
+        global: usize,
+        local: std::ops::Range<usize>,
+    ) -> LocalTensorLayout {
+        LocalTensorLayout::new(
+            logical,
+            ParameterRole::Vocabulary,
+            vec![global, 16],
+            vec![local.end - local.start, 16],
+            TensorPlacement::Range {
+                axis: 0,
+                start: local.start,
+                end: local.end,
+            },
+            None,
+            None,
+            false,
+        )
+    }
+
+    fn local_geometry_layout() -> LocalModelLayout {
+        let mut layout = LocalModelLayout::default();
+        layout.insert(
+            "model.embed_tokens.weight".into(),
+            vocabulary_tensor("model.embed_tokens", 64, 0..31),
+        );
+        layout.insert(
+            "lm_head.weight".into(),
+            vocabulary_tensor("lm_head", 64, 0..31),
+        );
+        for (layer, local) in [(0, false), (1, true)] {
+            layout.insert(
+                format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                local_tensor(vec![8, 16]),
+            );
+            layout.insert(
+                format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                local_tensor(vec![4, 16]),
+            );
+            if local {
+                layout.insert(
+                    format!("model.layers.{layer}.moe.experts.gate_up_proj"),
+                    local_tensor(vec![4, 6, 16]),
+                );
+            } else {
+                layout.insert(
+                    format!("model.layers.{layer}.dense.gate_proj.weight"),
+                    local_tensor(vec![6, 16]),
+                );
+            }
+        }
+        layout
     }
 
     #[test]
@@ -583,6 +844,54 @@ mod tests {
         assert_eq!(local.swa_num_attention_heads, Some(2));
         assert_eq!(local.swa_num_key_value_heads, Some(1));
         assert_eq!(local.moe_intermediate_size(), 3);
+    }
+
+    #[test]
+    fn aggregate_geometry_owns_vocabulary_text_and_state_together() {
+        let args = args();
+        let geometry = local_geometry(&args, &local_geometry_layout()).unwrap();
+        assert_eq!(geometry.embedding_range().local, 0..31);
+        assert_eq!(geometry.output_range().local, 0..31);
+        assert_eq!(geometry.text_layers().len(), 2);
+        assert_eq!(geometry.text_layer(0).unwrap().num_attention_heads, 2);
+        assert_eq!(
+            geometry.text_layer(1).unwrap().swa_num_key_value_heads,
+            Some(1)
+        );
+        assert_eq!(geometry.state_layout().len(), 2);
+    }
+
+    #[test]
+    fn aggregate_geometry_rejects_vocabulary_companion_drift() {
+        let args = args();
+        let mut layout = local_geometry_layout();
+        layout.insert(
+            "model.embed_tokens.weight.scale".into(),
+            vocabulary_tensor("model.embed_tokens", 64, 31..64),
+        );
+        assert!(local_geometry(&args, &layout).is_err());
+    }
+
+    #[test]
+    fn local_state_identity_preserves_global_offsets_and_bounds() {
+        let args = args();
+        let geometry = local_geometry(&args, &local_geometry_layout()).unwrap();
+        let identity = super::super::state_identity(
+            &args,
+            geometry.state_layout(),
+            0,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap();
+        assert_eq!(identity.global_layer_start, 0);
+        assert_eq!(identity.layer_count, 2);
+        assert!(super::super::state_identity(
+            &args,
+            geometry.state_layout(),
+            1,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .is_err());
     }
 
     #[test]

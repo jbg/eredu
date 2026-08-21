@@ -430,19 +430,10 @@ fn packed_weight_companion_dtypes(module: &impl ModuleParameters) -> BTreeMap<St
         .map(|(name, _)| {
             let canonical =
                 crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(name);
-            let scales = canonical
-                .strip_suffix(".weight")
-                .map(|prefix| format!("{prefix}.scales"))
-                .unwrap_or_else(|| format!("{canonical}_scales"));
-            let dtype = parameters
-                .get(scales.as_str())
-                .map(|parameter| {
-                    crate::backend::mlx::runtime::checkpoint::recipe::recipe_dtype_from_mlx(
-                        parameter.dtype(),
-                    )
-                })
-                .unwrap_or(RecipeDtype::F32);
-            (canonical, dtype)
+            // Affine packed constructors publish F32 companions by contract.
+            // The physical companion names come from the typed quantization
+            // target; do not rediscover them by parsing flattened names here.
+            (canonical, RecipeDtype::F32)
         })
         .collect()
 }
@@ -706,6 +697,10 @@ pub(crate) struct PipelineStageQuantizationSelection<'a> {
 }
 
 impl<'a> PipelineStageQuantizationSelection<'a> {
+    pub(crate) fn static_roles(&self) -> &'a [&'a str] {
+        self.static_roles
+    }
+
     pub(crate) fn new(
         static_roles: &'a [&'a str],
         layer_group: usize,
@@ -806,13 +801,6 @@ where
         };
 
     for unit in source_static_units(store.as_ref())? {
-        if !selection
-            .static_roles
-            .iter()
-            .any(|role| unit.id().as_str().ends_with(&format!(".static.{role}")))
-        {
-            continue;
-        }
         let selected = unit
             .bindings()
             .iter()
@@ -959,13 +947,6 @@ fn bounded_quantization_working_set(
     Ok(output_bytes.max(minimum_tile_bytes))
 }
 
-/// Builds a generalized layerwise model from an already cataloged checkpoint.
-fn packed_semantic_weight_name(name: &str) -> Option<String> {
-    name.strip_suffix(".scales")
-        .or_else(|| name.strip_suffix(".biases"))
-        .map(|prefix| format!("{prefix}.weight"))
-}
-
 fn stored_tensor_selection(
     tensor: &eredu_runtime::LocalTensorLayout,
     stored_shape: &[usize],
@@ -1077,23 +1058,6 @@ pub(crate) fn shard_layer_bindings(
                         || canonical_target == canonical_name)
                         .then_some(tensor)
                 })
-            })
-            .or_else(|| {
-                [
-                    logical_target.clone(),
-                    Some(binding.checkpoint_key().to_string()),
-                    Some(canonical_name.clone()),
-                ]
-                .into_iter()
-                .flatten()
-                .filter_map(|name| packed_semantic_weight_name(&name))
-                .find_map(|weight| {
-                    layout.tensor(&weight).or_else(|| {
-                        let canonical =
-                            crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(&weight);
-                        layout.tensor(&canonical)
-                    })
-                })
             });
         let Some(tensor) = tensor else {
             output.push(binding);
@@ -1196,20 +1160,7 @@ fn build_parallel_module_bindings(
         let metadata = store.source_metadata(&checkpoint_key)?;
         let tensor = layout
             .tensor(&checkpoint_key)
-            .or_else(|| layout.tensor(&canonical))
-            .or_else(|| {
-                packed_semantic_weight_name(&checkpoint_key)
-                    .or_else(|| packed_semantic_weight_name(&canonical))
-                    .and_then(|weight| {
-                        layout.tensor(&weight).or_else(|| {
-                            let canonical =
-                                crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(
-                                    &weight,
-                                );
-                            layout.tensor(&canonical)
-                        })
-                    })
-            });
+            .or_else(|| layout.tensor(&canonical));
         let (selection, expected_bytes) = if let Some(tensor) = tensor {
             let local_shape = parameter
                 .shape()

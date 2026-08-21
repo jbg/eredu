@@ -135,6 +135,9 @@ impl Config for ModelArgs {
     fn model_identity(&self) -> &str {
         &self.model_type
     }
+    fn architecture_fingerprint(&self) -> String {
+        prompt_cache_architecture_fingerprint(self)
+    }
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
         self.validate().map_err(eredu_nn::Error::backend)
     }

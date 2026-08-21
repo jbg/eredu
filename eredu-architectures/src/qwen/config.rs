@@ -180,6 +180,9 @@ impl Config for ModelArgs {
     fn model_identity(&self) -> &str {
         &self.model_type
     }
+    fn architecture_fingerprint(&self) -> String {
+        prompt_cache_architecture_fingerprint(self)
+    }
     fn parameter_root(&self) -> &str {
         &self.parameter_root
     }
@@ -519,18 +522,58 @@ pub fn model_args_from_gguf_catalog_with_context(
 
 /// Returns the stable cache-compatibility fingerprint for normalized Qwen policy.
 pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    let rope_scaling = args.rope_scaling.as_ref().map_or_else(
+        || "none".to_string(),
+        |config| {
+            let mut entries = config.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| key.as_str());
+            entries
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value:?}"))
+                .collect::<Vec<_>>()
+                .join(";")
+        },
+    );
+    let mut quantized_weights = args
+        .quantized_weights
+        .as_ref()
+        .map(|weights| weights.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    quantized_weights.sort_unstable();
+    let mut quantized_weight_configs = args
+        .quantized_weight_configs
+        .as_ref()
+        .map(|configs| {
+            configs
+                .iter()
+                .map(|(name, config)| format!("{name}={config:?}"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    quantized_weight_configs.sort_unstable();
     derive_prompt_cache_architecture_fingerprint(
         "qwen",
         [
+            ("variant", format!("{:?}", args.variant)),
             ("model_type", args.model_type.clone()),
+            ("parameter_root", args.parameter_root.clone()),
             ("hidden_size", args.hidden_size.to_string()),
             ("num_hidden_layers", args.num_hidden_layers.to_string()),
             ("intermediate_size", args.intermediate_size.to_string()),
             ("num_attention_heads", args.num_attention_heads.to_string()),
             ("num_key_value_heads", args.num_key_value_heads.to_string()),
             ("head_dim", args.head_dim.to_string()),
+            (
+                "rms_norm_eps",
+                format!("{:08x}", args.rms_norm_eps.to_bits()),
+            ),
             ("vocab_size", args.vocab_size.to_string()),
+            (
+                "max_position_embeddings",
+                args.max_position_embeddings.to_string(),
+            ),
             ("rope_theta", format!("{:08x}", args.rope_theta.to_bits())),
+            ("rope_scaling", rope_scaling),
             (
                 "attention_schedule",
                 args.attention_schedule.fingerprint_component(),
@@ -543,6 +586,12 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
             ("num_experts_per_tok", args.num_experts_per_tok.to_string()),
             ("norm_topk_prob", args.norm_topk_prob.to_string()),
             ("tie_word_embeddings", args.tie_word_embeddings.to_string()),
+            ("quantization", format!("{:?}", args.weight_quantization())),
+            ("quantized_weights", quantized_weights.join(";")),
+            (
+                "quantized_weight_configs",
+                quantized_weight_configs.join(";"),
+            ),
         ],
     )
 }

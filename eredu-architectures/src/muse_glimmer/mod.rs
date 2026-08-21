@@ -21,9 +21,13 @@ pub use config::{
     ConfigError, DecoderConfig, VisionAttentionPolicy, VisionConfig, WeightConvention,
 };
 pub use graph::{component_graph, state_layout};
-pub use model::{DecoderInputPart, ForwardContext, LayeredModel, ModelInput, Unit};
+pub use model::{
+    DecoderInputPart, ForwardContext, LayeredModel, ModelInput, TextPartitionInput, Unit,
+};
 pub use parallel::{
-    layer_parameter_groups, local_decoder_config, static_parameter_groups, vision_parameter_groups,
+    layer_parameter_groups, local_decoder_config, local_geometry, static_parameter_groups,
+    vision_layer_parameter_groups, vision_parameter_groups, vision_static_parameter_groups,
+    LocalGeometry,
 };
 pub use text::{
     Attention, CenteredRmsNorm, FeedForward, Mlp, SparseMoe, StaticModules, TransformerBlock,

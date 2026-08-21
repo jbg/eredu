@@ -1,11 +1,17 @@
 //! Thin DeepSeek-V3/R1 architecture policy.
 
+use std::sync::Arc;
+
 use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
 use eredu_nn::{
-    BlockwiseAttentionBackend, CompressedAttentionCache, EmbeddingOperator, Error, LinearOperator,
-    NormalizationOperator, Parameterized, RoutedNeuralBackend, Tensor,
+    BlockwiseAttentionBackend, CompressedAttentionCache, EmbeddingLookupPolicy, EmbeddingOperator,
+    Error, LinearOperator, NormalizationOperator, Parameterized, RoutedNeuralBackend, Tensor,
 };
-use eredu_runtime::{LayerRuntimeState, LayeredArchitecture, LayeredForwardState, StateLayout};
+use eredu_runtime::{
+    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, ParallelLayeredArchitecture,
+    ParallelRoutedLayeredArchitecture, RoutedExpertProvider, RoutedLayeredArchitecture,
+    RuntimeStateComponents, StateLayout,
+};
 
 use crate::decoder::{SequentialPredictionGroups, StaticModuleSpec, StaticModules};
 
@@ -26,6 +32,63 @@ pub enum Unit<B: RoutedNeuralBackend + BlockwiseAttentionBackend> {
     Prediction(V3PredictionLayer<B>),
 }
 
+impl<B, S> RoutedLayeredArchitecture<B, S> for Model<B>
+where
+    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: CompressedAttentionCache<B::Tensor>,
+{
+    fn forward_unit_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        Model::forward_unit_with_provider(
+            self, group, index, unit, hidden, state, forward, pass, provider, context,
+        )
+    }
+}
+
+impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for Model<B>
+where
+    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: CompressedAttentionCache<B::Tensor>,
+{
+    fn forward_unit_parallel_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        Model::forward_unit_parallel_with_provider(
+            self, group, index, unit, hidden, state, forward, pass, parallel, provider, context,
+        )
+    }
+}
+
 /// V3 values retained for one target-model forward.
 pub struct ForwardContext<T> {
     tokens: T,
@@ -38,6 +101,11 @@ pub struct ForwardContext<T> {
 }
 
 impl<T> ForwardContext<T> {
+    /// Borrows the architecture-prepared target mask.
+    pub const fn mask(&self) -> Option<&T> {
+        self.mask.as_ref()
+    }
+
     /// Borrows the final target hidden state when this was a target pass.
     pub const fn target_capture(&self) -> Option<&T> {
         self.target_capture.as_ref()
@@ -54,52 +122,124 @@ impl<T> ForwardContext<T> {
     }
 }
 
+/// Immutable target-pass values transported across pipeline partitions.
+#[derive(Debug, Clone)]
+pub struct TargetBoundary<T> {
+    tokens: T,
+    embedded: T,
+}
+
+impl<T> TargetBoundary<T> {
+    /// Creates the typed target boundary in canonical wire order.
+    pub const fn new(tokens: T, embedded: T) -> Self {
+        Self { tokens, embedded }
+    }
+
+    /// Borrows original target token ids.
+    pub const fn tokens(&self) -> &T {
+        &self.tokens
+    }
+
+    /// Borrows the input-rank embeddings retained for prediction groups.
+    pub const fn embedded(&self) -> &T {
+        &self.embedded
+    }
+
+    /// Decomposes the boundary without cloning backend tensors.
+    pub fn into_parts(self) -> (T, T) {
+        (self.tokens, self.embedded)
+    }
+}
+
+impl<T> eredu_runtime::ArchitectureBoundary<T> for TargetBoundary<T> {
+    const IDENTITY: &'static str = "deepseek_v3.target";
+
+    fn tensor_roles() -> &'static [&'static str] {
+        &["tokens", "embedded"]
+    }
+
+    fn encode(self) -> Vec<T> {
+        vec![self.tokens, self.embedded]
+    }
+
+    fn decode(tensors: Vec<T>) -> Result<Self, eredu_runtime::ArchitectureBoundaryError> {
+        eredu_runtime::validate_boundary_tensor_count::<Self, _>(&tensors)?;
+        let mut tensors = tensors.into_iter();
+        Ok(Self {
+            tokens: tensors.next().expect("validated target tokens"),
+            embedded: tensors.next().expect("validated target embeddings"),
+        })
+    }
+}
+
+/// Target input owned by either the first or a downstream pipeline rank.
+pub enum TargetPartitionInput<'a, T> {
+    /// Token ids embedded by the input-owning partition.
+    Tokens(&'a T),
+    /// Hidden state plus immutable input-rank context on later partitions.
+    Hidden {
+        /// Upstream decoder activation.
+        hidden: T,
+        /// Original token ids and embeddings.
+        boundary: TargetBoundary<T>,
+    },
+}
+
 /// Thin target-model architecture over the shared V3 block and generic
 /// resident/layerwise execution lifecycle.
 pub struct Model<B: RoutedNeuralBackend + BlockwiseAttentionBackend> {
     args: V3Args,
     static_modules: StaticModules<B>,
     groups: SequentialPredictionGroups,
+    parallel_geometry: Option<Arc<super::parallel::V3LocalGeometry>>,
 }
 
 impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
     /// Builds the unloaded pinned V3 modules.
     pub fn new(args: V3Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         args.validate().map_err(Error::backend)?;
-        let static_modules = StaticModules::from_spec(
-            StaticModuleSpec {
-                embedding_weight: "model.embed_tokens.weight".into(),
-                normalization_weight: "model.norm.weight".into(),
-                head_weight: "lm_head.weight".into(),
-                vocabulary: args.vocab_size,
-                hidden_size: args.hidden_size,
-                normalization_epsilon: args.rms_norm_eps,
-                normalization_offset: 0.0,
-                embedding_quantization: None,
-                // Published V3/R1 checkpoints keep the output head dense,
-                // including otherwise block-FP8 models.
-                head_format: eredu_checkpoint::LinearFormat::Dense,
-                tied_head: false,
-            },
+        let static_modules = StaticModules::from_spec(static_spec(&args), context)?;
+        Ok(Self {
+            groups: prediction_groups(&args)?,
+            args,
+            static_modules,
+            parallel_geometry: None,
+        })
+    }
+
+    /// Builds unloaded V3 modules using one authoritative rank-local plan.
+    pub fn new_parallel(
+        args: V3Args,
+        geometry: super::parallel::V3LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        args.validate().map_err(Error::backend)?;
+        geometry.validate_for(&args).map_err(Error::backend)?;
+        let static_modules = StaticModules::from_parallel_spec(
+            static_spec(&args),
+            geometry.embedding_range().clone(),
+            Some(geometry.output_range().clone()),
             context,
         )?;
         Ok(Self {
-            groups: SequentialPredictionGroups::new(
-                "model.layers",
-                usize::try_from(args.num_hidden_layers).map_err(Error::backend)?,
-                (0..usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?).map(
-                    |depth| {
-                        format!(
-                            "model.layers.{}",
-                            usize::try_from(args.num_hidden_layers).expect("validated layer count")
-                                + depth
-                        )
-                    },
-                ),
-            )?,
+            groups: prediction_groups(&args)?,
             args,
             static_modules,
+            parallel_geometry: Some(Arc::new(geometry)),
         })
+    }
+
+    /// Returns the state layout matching the modules this instance builds.
+    pub fn runtime_state_layout(&self) -> Result<StateLayout, Error> {
+        match &self.parallel_geometry {
+            Some(geometry) => Ok(geometry.state_layout().clone()),
+            None => state_layout(&self.args),
+        }
+    }
+
+    /// Borrows the shared rank-local geometry used by unit factories.
+    pub fn shared_parallel_geometry(&self) -> Option<Arc<super::parallel::V3LocalGeometry>> {
+        self.parallel_geometry.clone()
     }
 
     /// Returns the normalized V3 arguments.
@@ -123,60 +263,181 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
         self.static_modules = static_modules;
     }
 
-    /// Embeds tokens at the ingress of a pipeline-partitioned target pass.
-    pub fn pipeline_embed(
-        &mut self,
-        tokens: &B::Tensor,
+    /// Constructs one target or prediction unit from this model's authoritative
+    /// global or rank-local geometry.
+    pub fn construct_unit(
+        &self,
+        group: usize,
+        index: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        self.static_modules.embeddings.forward(tokens, context)
-    }
-
-    /// Executes one target block inside a pipeline-owned layer range.
-    pub fn pipeline_forward_target<C>(
-        &mut self,
-        unit: &mut Unit<B>,
-        hidden: &B::Tensor,
-        mask: Option<&B::Tensor>,
-        cache: &mut C,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
-    where
-        C: CompressedAttentionCache<B::Tensor>,
-    {
-        match unit {
-            Unit::Target(block) => block.forward(hidden, mask, Some(cache), context),
-            Unit::Prediction(_) => Err(Error::backend(
-                "a V3 prediction unit cannot execute in the target pipeline range",
-            )),
+    ) -> Result<Unit<B>, Error> {
+        self.groups.unit_count(group)?;
+        let args = self
+            .parallel_geometry
+            .as_ref()
+            .map_or(&self.args, |geometry| geometry.args());
+        if group == 0 {
+            Ok(Unit::Target(V3Block::new(args, index, context)?))
+        } else {
+            Ok(Unit::Prediction(V3PredictionLayer::new(
+                args,
+                group - 1,
+                context,
+            )?))
         }
     }
 
-    /// Executes one pipeline target block with runtime-supplied routed experts.
+    /// Starts a replicated target partition and returns its typed immutable
+    /// cross-partition boundary.
     #[allow(clippy::too_many_arguments)]
-    pub fn pipeline_forward_target_with_provider<C, P>(
+    pub fn begin_partition_target<S>(
         &mut self,
-        unit: &mut Unit<B>,
-        hidden: &B::Tensor,
-        mask: Option<&B::Tensor>,
-        cache: &mut C,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
+        input: TargetPartitionInput<'_, B::Tensor>,
+        supplied_mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error>
+    ) -> Result<
+        (
+            LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>,
+            TargetBoundary<B::Tensor>,
+        ),
+        Error,
+    >
     where
-        C: CompressedAttentionCache<B::Tensor>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
-        P::Error: std::fmt::Display,
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
     {
-        match unit {
-            Unit::Target(block) => {
-                block.forward_with_provider(hidden, mask, Some(cache), pass, provider, context)
+        let (tokens, embedded, hidden) = match input {
+            TargetPartitionInput::Tokens(tokens) => {
+                let embedded = self.static_modules.embeddings.forward(tokens, context)?;
+                (tokens.clone(), embedded.clone(), embedded)
             }
-            Unit::Prediction(_) => Err(Error::backend(
-                "a V3 prediction unit cannot execute in the target pipeline range",
-            )),
+            TargetPartitionInput::Hidden { hidden, boundary } => {
+                let (tokens, embedded) = boundary.into_parts();
+                (tokens, embedded, hidden)
+            }
+        };
+        self.begin_partition_target_embedded(
+            tokens,
+            embedded,
+            hidden,
+            supplied_mask,
+            state,
+            expected,
+            first_state_ordinal,
+            context,
+        )
+    }
+
+    /// Starts a tensor-parallel target partition with input-rank vocabulary
+    /// lookup and no downstream re-embedding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_partition_target_parallel<S>(
+        &mut self,
+        input: TargetPartitionInput<'_, B::Tensor>,
+        supplied_mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<
+        (
+            LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>,
+            TargetBoundary<B::Tensor>,
+        ),
+        Error,
+    >
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        let (tokens, embedded, hidden) = match input {
+            TargetPartitionInput::Tokens(tokens) => {
+                let embedded = B::vocabulary_parallel_lookup(
+                    &mut self.static_modules.embeddings,
+                    tokens,
+                    EmbeddingLookupPolicy::Strict,
+                    parallel,
+                    context,
+                )?;
+                (tokens.clone(), embedded.clone(), embedded)
+            }
+            TargetPartitionInput::Hidden { hidden, boundary } => {
+                let (tokens, embedded) = boundary.into_parts();
+                (tokens, embedded, hidden)
+            }
+        };
+        self.begin_partition_target_embedded(
+            tokens,
+            embedded,
+            hidden,
+            supplied_mask,
+            state,
+            expected,
+            first_state_ordinal,
+            context,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_partition_target_embedded<S>(
+        &self,
+        tokens: B::Tensor,
+        embedded: B::Tensor,
+        hidden: B::Tensor,
+        supplied_mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<
+        (
+            LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>,
+            TargetBoundary<B::Tensor>,
+        ),
+        Error,
+    >
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        if state.layout() != expected {
+            return Err(Error::backend(format!(
+                "V3 partition state layout {:?} does not match architecture partition layout {expected:?}",
+                state.layout()
+            )));
         }
+        let sequence = embedded.dim(1);
+        let mask = if let Some(mask) = supplied_mask {
+            Some(mask.clone())
+        } else if sequence > 1 {
+            let offset = state
+                .layer(first_state_ordinal)
+                .map_err(Error::backend)?
+                .position();
+            Some(B::causal_mask(sequence, offset, None, context)?)
+        } else {
+            None
+        };
+        let boundary = TargetBoundary::new(tokens.clone(), embedded.clone());
+        Ok((
+            LayeredForwardState {
+                hidden,
+                context: ForwardContext {
+                    tokens,
+                    embedded,
+                    mask,
+                    mode: ForwardMode::Target,
+                    target_capture: None,
+                    draft_logits: None,
+                    draft_hidden: None,
+                },
+            },
+            boundary,
+        ))
     }
 
     /// Applies the shared target norm and vocabulary head on the final stage.
@@ -203,64 +464,42 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
         self.static_modules.norm.forward(hidden, context)
     }
 
-    /// Executes one tensor-partitioned target block with a composition-owned
-    /// reduction of partial output projections.
-    pub fn pipeline_forward_target_parallel<C, F>(
+    /// Applies rank-local normalization and complete vocabulary projection.
+    pub fn pipeline_finish_parallel(
         &mut self,
-        unit: &mut Unit<B>,
         hidden: &B::Tensor,
-        mask: Option<&B::Tensor>,
-        cache: &mut C,
+        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-        reduce: F,
-    ) -> Result<B::Tensor, Error>
-    where
-        C: CompressedAttentionCache<B::Tensor>,
-        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
-    {
-        match unit {
-            Unit::Target(block) => {
-                block.forward_parallel(hidden, mask, Some(cache), context, reduce)
-            }
-            Unit::Prediction(_) => Err(Error::backend(
-                "a V3 prediction unit cannot execute in the target pipeline range",
-            )),
-        }
+    ) -> Result<B::Tensor, Error> {
+        let hidden = self.pipeline_finish_hidden(hidden, context)?;
+        B::vocabulary_parallel_project(
+            self.static_modules
+                .lm_head
+                .as_mut()
+                .expect("validated V3 models have an untied output head"),
+            &hidden,
+            parallel,
+            context,
+        )
     }
 
-    /// Tensor-partitioned target execution with runtime-supplied experts.
-    #[allow(clippy::too_many_arguments)]
-    pub fn pipeline_forward_target_parallel_with_provider<C, P, F>(
+    /// Finishes the serial target partition through the architecture output boundary.
+    pub fn finish_partition_target(
         &mut self,
-        unit: &mut Unit<B>,
         hidden: &B::Tensor,
-        mask: Option<&B::Tensor>,
-        cache: &mut C,
-        pass: eredu_runtime::ExpertPass,
-        provider: &mut P,
         context: &<B::Tensor as Tensor>::Context,
-        reduce: F,
-    ) -> Result<B::Tensor, Error>
-    where
-        C: CompressedAttentionCache<B::Tensor>,
-        P: eredu_runtime::RoutedExpertProvider<B>,
-        P::Error: std::fmt::Display,
-        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
-    {
-        match unit {
-            Unit::Target(block) => block.forward_parallel_with_provider(
-                hidden,
-                mask,
-                Some(cache),
-                pass,
-                provider,
-                context,
-                reduce,
-            ),
-            Unit::Prediction(_) => Err(Error::backend(
-                "a V3 prediction unit cannot execute in the target pipeline range",
-            )),
-        }
+    ) -> Result<B::Tensor, Error> {
+        self.pipeline_finish(hidden, context)
+    }
+
+    /// Finishes the tensor-parallel target partition through the architecture output boundary.
+    pub fn finish_partition_target_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.pipeline_finish_parallel(hidden, parallel, context)
     }
 
     /// Executes one sequential embedded-prediction unit owned by the final
@@ -313,56 +552,78 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
         }
     }
 
-    /// Executes a tensor-partitioned embedded predictor using an embedding
-    /// already reduced by the distributed composition.
-    #[allow(clippy::too_many_arguments)]
-    pub fn pipeline_forward_prediction_parallel<C, F>(
+    /// Executes a tensor-parallel predictor with architecture-owned embedding
+    /// and collective semantics.
+    pub fn pipeline_forward_prediction_neutral_parallel<C>(
         &mut self,
         unit: &mut Unit<B>,
         hidden: &B::Tensor,
-        embedded: &B::Tensor,
         tokens: &B::Tensor,
         cache: &mut C,
+        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-        reduce: F,
     ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error>
     where
         C: CompressedAttentionCache<B::Tensor>,
-        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
+        let embedded = B::vocabulary_parallel_lookup(
+            &mut self.static_modules.embeddings,
+            tokens,
+            eredu_nn::EmbeddingLookupPolicy::Strict,
+            parallel,
+            context,
+        )?;
         match unit {
-            Unit::Prediction(unit) => {
-                unit.forward_parallel(hidden, embedded, tokens, cache, context, reduce)
-            }
+            Unit::Prediction(unit) => unit.forward_parallel(
+                hidden,
+                &embedded,
+                tokens,
+                cache,
+                context,
+                |value, context| B::sum_parallel(value, parallel, context),
+            ),
             Unit::Target(_) => Err(Error::backend(
                 "a V3 target unit cannot execute as an embedded predictor",
             )),
         }
     }
 
-    /// Tensor-partitioned embedded predictor with supplied routed experts.
+    /// Executes a tensor-parallel predictor with architecture-owned embedding,
+    /// collectives, and runtime-supplied routed experts.
     #[allow(clippy::too_many_arguments)]
-    pub fn pipeline_forward_prediction_parallel_with_provider<C, P, F>(
+    pub fn pipeline_forward_prediction_neutral_parallel_with_provider<C, P>(
         &mut self,
         unit: &mut Unit<B>,
         hidden: &B::Tensor,
-        embedded: &B::Tensor,
         tokens: &B::Tensor,
         cache: &mut C,
         pass: eredu_runtime::ExpertPass,
         provider: &mut P,
+        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
-        reduce: F,
     ) -> Result<super::mtp::PredictionOutput<B::Tensor>, Error>
     where
         C: CompressedAttentionCache<B::Tensor>,
         P: eredu_runtime::RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
-        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
     {
+        let embedded = B::vocabulary_parallel_lookup(
+            &mut self.static_modules.embeddings,
+            tokens,
+            eredu_nn::EmbeddingLookupPolicy::Strict,
+            parallel,
+            context,
+        )?;
         match unit {
             Unit::Prediction(unit) => unit.forward_parallel_with_provider(
-                hidden, embedded, tokens, cache, pass, provider, context, reduce,
+                hidden,
+                &embedded,
+                tokens,
+                cache,
+                pass,
+                provider,
+                context,
+                |value, context| B::sum_parallel(value, parallel, context),
             ),
             Unit::Target(_) => Err(Error::backend(
                 "a V3 target unit cannot execute as an embedded predictor",
@@ -418,6 +679,64 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
             }
             _ => Err(Error::backend(format!(
                 "V3 execution unit does not match group {group}"
+            ))),
+        }
+    }
+
+    /// Executes one tensor-partitioned target or prediction unit with
+    /// runtime-supplied experts. All row-parallel partials are reduced on the
+    /// supplied tensor-parallel context, while routed expert execution stays
+    /// delegated to `provider` (and may therefore use a distinct EP group).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_unit_parallel_with_provider<S, P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Unit<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        pass: eredu_runtime::ExpertPass,
+        parallel: &B::ParallelContext,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: CompressedAttentionCache<B::Tensor>,
+        P: eredu_runtime::RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.groups.unit_count(group)?;
+        match unit {
+            Unit::Target(unit) if group == 0 => unit.forward_parallel_with_provider(
+                hidden,
+                forward.mask.as_ref(),
+                Some(state.layer(index).map_err(Error::backend)?),
+                pass,
+                provider,
+                context,
+                |value, context| B::sum_parallel(value, parallel, context),
+            ),
+            Unit::Prediction(unit) if group > 0 => {
+                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                    + group
+                    - 1;
+                let output = unit.forward_parallel_with_provider(
+                    hidden,
+                    &forward.embedded,
+                    &forward.tokens,
+                    state.layer(layer).map_err(Error::backend)?,
+                    pass,
+                    provider,
+                    context,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                )?;
+                forward.draft_logits = Some(output.logits);
+                Ok(output.hidden)
+            }
+            _ => Err(Error::backend(format!(
+                "V3 parallel execution unit does not match group {group}"
             ))),
         }
     }
@@ -528,6 +847,33 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
     }
 }
 
+fn static_spec(args: &V3Args) -> StaticModuleSpec {
+    StaticModuleSpec {
+        embedding_weight: "model.embed_tokens.weight".into(),
+        normalization_weight: "model.norm.weight".into(),
+        head_weight: "lm_head.weight".into(),
+        vocabulary: args.vocab_size,
+        hidden_size: args.hidden_size,
+        normalization_epsilon: args.rms_norm_eps,
+        normalization_offset: 0.0,
+        embedding_quantization: None,
+        // Published V3/R1 checkpoints keep the output head dense, including
+        // otherwise block-FP8 models.
+        head_format: eredu_checkpoint::LinearFormat::Dense,
+        tied_head: false,
+    }
+}
+
+fn prediction_groups(args: &V3Args) -> Result<SequentialPredictionGroups, Error> {
+    let targets = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    SequentialPredictionGroups::new(
+        "model.layers",
+        targets,
+        (0..usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?)
+            .map(|depth| format!("model.layers.{}", targets + depth)),
+    )
+}
+
 impl<B, S> LayeredArchitecture<B, S> for Model<B>
 where
     B: RoutedNeuralBackend + BlockwiseAttentionBackend,
@@ -543,6 +889,18 @@ where
     where
         B::Tensor: 'a;
     type Error = Error;
+
+    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+        if group == 0 {
+            eredu_runtime::ArchitectureGroupTransport::decoder()
+        } else {
+            let mut transport = eredu_runtime::ArchitectureGroupTransport::prediction();
+            if group == 1 {
+                transport.first_owner_static_roles.push("mtp".into());
+            }
+            transport
+        }
+    }
 
     fn model_identity(&self) -> &str {
         &self.args.model_type
@@ -574,16 +932,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error> {
-        self.groups.unit_count(group)?;
-        if group == 0 {
-            Ok(Unit::Target(V3Block::new(&self.args, index, context)?))
-        } else {
-            Ok(Unit::Prediction(V3PredictionLayer::new(
-                &self.args,
-                group - 1,
-                context,
-            )?))
-        }
+        self.construct_unit(group, index, context)
     }
 
     fn begin_forward<'a>(
@@ -592,7 +941,7 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let expected = state_layout(&self.args)?;
+        let expected = self.runtime_state_layout()?;
         if state.layout() != &expected {
             return Err(Error::backend(format!(
                 "V3 runtime state layout {:?} does not match architecture layout {expected:?}",
@@ -757,6 +1106,156 @@ where
             forward.draft_logits.as_ref(),
             forward.draft_hidden.as_ref(),
         ])
+    }
+}
+
+impl<B, S> ParallelLayeredArchitecture<B, S> for Model<B>
+where
+    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: CompressedAttentionCache<B::Tensor>,
+{
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self
+            .parallel_geometry
+            .as_ref()
+            .ok_or_else(|| Error::backend("V3 model was not built with local geometry"))?
+            .state_layout()
+            .clone();
+        if state.layout() != &expected {
+            return Err(Error::backend(format!(
+                "V3 runtime state layout {:?} does not match architecture layout {expected:?}",
+                state.layout()
+            )));
+        }
+        let (tokens, supplied_hidden, supplied_mask, mode) = match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, None, mask, ForwardMode::Target),
+            EmbeddedInput::Draft {
+                tokens,
+                hidden,
+                depth,
+            } => {
+                if depth >= self.groups.prediction_count() {
+                    return Err(Error::backend(format!(
+                        "V3 prediction depth {depth} is outside {} groups",
+                        self.groups.prediction_count()
+                    )));
+                }
+                (tokens, Some(hidden), None, ForwardMode::Draft(depth))
+            }
+            EmbeddedInput::DsparkContext { .. } | EmbeddedInput::DsparkProposal { .. } => {
+                return Err(Error::backend(
+                    "DSpark input is only supported by DeepSeek-V4",
+                ));
+            }
+        };
+        let embedded = B::vocabulary_parallel_lookup(
+            &mut self.static_modules.embeddings,
+            tokens,
+            EmbeddingLookupPolicy::Strict,
+            parallel,
+            context,
+        )?;
+        let hidden = supplied_hidden.cloned().unwrap_or_else(|| embedded.clone());
+        let sequence = embedded.dim(1);
+        let mask = if let Some(mask) = supplied_mask {
+            Some(mask.clone())
+        } else if matches!(mode, ForwardMode::Target) && sequence > 1 {
+            let offset = state.layer(0).map_err(Error::backend)?.offset();
+            Some(B::causal_mask(sequence, offset, None, context)?)
+        } else {
+            None
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                tokens: tokens.clone(),
+                embedded,
+                mask,
+                mode,
+                target_capture: None,
+                draft_logits: None,
+                draft_hidden: None,
+            },
+        })
+    }
+
+    fn forward_unit_parallel(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.groups.unit_count(group)?;
+        match unit {
+            Unit::Target(unit) if group == 0 => unit.forward_parallel(
+                hidden,
+                forward.mask.as_ref(),
+                Some(state.layer(index).map_err(Error::backend)?),
+                context,
+                |value, context| B::sum_parallel(value, parallel, context),
+            ),
+            Unit::Prediction(unit) if group > 0 => {
+                let layer = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?
+                    + group
+                    - 1;
+                let output = unit.forward_parallel(
+                    hidden,
+                    &forward.embedded,
+                    &forward.tokens,
+                    state.layer(layer).map_err(Error::backend)?,
+                    context,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                )?;
+                forward.draft_logits = Some(output.logits);
+                Ok(output.hidden)
+            }
+            _ => Err(Error::backend(format!(
+                "V3 parallel execution unit does not match group {group}"
+            ))),
+        }
+    }
+
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        match forward.mode {
+            ForwardMode::Target => {
+                let hidden = self.static_modules.norm.forward(hidden, context)?;
+                B::vocabulary_parallel_project(
+                    self.static_modules
+                        .lm_head
+                        .as_mut()
+                        .expect("validated V3 models have an untied output head"),
+                    &hidden,
+                    parallel,
+                    context,
+                )
+            }
+            ForwardMode::Draft(_) => forward
+                .draft_logits
+                .clone()
+                .ok_or_else(|| Error::backend("V3 draft group produced no logits")),
+            ForwardMode::DsparkContext | ForwardMode::DsparkProposal => {
+                Err(Error::backend("DSpark mode reached the V3 output path"))
+            }
+        }
     }
 }
 

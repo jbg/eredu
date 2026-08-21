@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     num::NonZeroU32,
+    ops::Range,
 };
 
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
@@ -280,6 +281,86 @@ impl ModelArgs {
     /// Number of decoder layers.
     pub fn num_hidden_layers(&self) -> usize {
         self.layer_schedule.len()
+    }
+
+    /// Balances decoder layers across pipeline stages without separating a
+    /// shared-KV consumer from the layer that publishes its attention state.
+    pub fn pipeline_layer_ranges(&self, stages: usize) -> Result<Vec<Range<usize>>, ConfigError> {
+        let layers = self.num_hidden_layers();
+        if stages == 0 || layers == 0 {
+            return Err(invalid(
+                "Gemma 4 pipeline planning requires positive layer and stage counts",
+            ));
+        }
+        let mut can_split_after = vec![true; layers.saturating_sub(1)];
+        let mut publishers = HashMap::new();
+        for (layer, policy) in self.layer_schedule.iter().copied().enumerate() {
+            match policy.key_value {
+                AttentionStateSource::Publish { .. } => {
+                    publishers.insert(policy.attention, layer);
+                }
+                AttentionStateSource::Shared => {
+                    let publisher =
+                        publishers.get(&policy.attention).copied().ok_or_else(|| {
+                            invalid(format!(
+                            "Gemma 4 layer {layer} consumes {:?} shared KV before any publisher",
+                            policy.attention
+                        ))
+                        })?;
+                    for boundary in can_split_after.iter_mut().take(layer).skip(publisher) {
+                        *boundary = false;
+                    }
+                }
+                AttentionStateSource::Local { .. } => {}
+            }
+        }
+
+        let mut units = Vec::new();
+        let mut start = 0;
+        for (boundary, can_split) in can_split_after.iter().copied().enumerate() {
+            if can_split {
+                units.push(start..boundary + 1);
+                start = boundary + 1;
+            }
+        }
+        units.push(start..layers);
+        if units.len() < stages {
+            return Err(invalid(format!(
+                "{stages} pipeline stages cannot be assigned to {} dependency-safe Gemma 4 decoder units; reduce pipeline_parallel_size",
+                units.len()
+            )));
+        }
+
+        let count = units.len();
+        let mut prefix = vec![0usize; count + 1];
+        for (index, unit) in units.iter().enumerate() {
+            prefix[index + 1] = prefix[index] + unit.len();
+        }
+        let mut cost = vec![vec![usize::MAX; count + 1]; stages + 1];
+        let mut split = vec![vec![0usize; count + 1]; stages + 1];
+        cost[0][0] = 0;
+        for groups in 1..=stages {
+            for end in groups..=count {
+                for previous in groups - 1..end {
+                    let candidate = cost[groups - 1][previous].max(prefix[end] - prefix[previous]);
+                    if candidate < cost[groups][end] {
+                        cost[groups][end] = candidate;
+                        split[groups][end] = previous;
+                    }
+                }
+            }
+        }
+        let mut cuts = vec![count];
+        let mut end = count;
+        for groups in (1..=stages).rev() {
+            end = split[groups][end];
+            cuts.push(end);
+        }
+        cuts.reverse();
+        Ok(cuts
+            .windows(2)
+            .map(|cut| units[cut[0]].start..units[cut[1] - 1].end)
+            .collect())
     }
 
     /// Returns one complete layer policy without fallback.

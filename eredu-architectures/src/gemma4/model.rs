@@ -4,18 +4,97 @@ use std::collections::HashMap;
 
 use eredu_nn::{
     multimodal::{assemble_ordered_inputs, OrderedInputPart},
-    AttentionCache, EmbeddingOperator, Error, Index, LinearOperator, NormalizationOperator,
-    Parameterized, RotaryPosition, RoutedNeuralBackend, Tensor,
+    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, Index, LinearOperator,
+    NormalizationOperator, Parameterized, RotaryPosition, RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{
-    ExecutionGraph, ExecutionGroupSpec, ExpertPass, LayerRuntimeState, LayeredArchitecture,
-    LayeredForwardState, RoutedExpertProvider,
+    ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
+    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
+    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelPlanError,
+    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, RoutedExpertProvider,
+    RoutedLayeredArchitecture, StateLayout,
 };
 
 use super::{
-    state_layout, AudioInput, AudioLayer, AudioStatic, BlockInput, DenseBlock, FamilyConfig,
-    ModalityProjector, SharedAttentionStates, VisionInput, VisionLayer, VisionState, VisionStatic,
+    audio_layer_parameter_groups, audio_static_parameter_groups, layer_parameter_groups,
+    modality_projection_parameter_groups, state_layout, static_parameter_groups,
+    vision_layer_parameter_groups, vision_static_parameter_groups, AudioInput, AudioLayer,
+    AudioStatic, BlockInput, DenseBlock, FamilyConfig, LocalGeometry, ModalityProjector,
+    SharedAttentionStates, VisionInput, VisionLayer, VisionState, VisionStatic,
 };
+
+fn text_static_parameter_ownership(
+    args: &super::ModelArgs,
+) -> Result<Vec<OwnedParameterGroupSpec>, ParallelPlanError> {
+    let text_static = static_parameter_groups(args)?;
+    let mut text_roles = vec!["embedding"];
+    if args.hidden_size_per_layer_input > 0 {
+        text_roles.extend([
+            "per_layer_embedding",
+            "per_layer_projection",
+            "per_layer_norm",
+        ]);
+    }
+    text_roles.push("norm");
+    if !args.tie_word_embeddings {
+        text_roles.push("output");
+    }
+    if text_static.len() != text_roles.len() {
+        return Err(ParallelPlanError::InvalidGroup(format!(
+            "Gemma text static ownership declared {} groups for {} roles",
+            text_static.len(),
+            text_roles.len()
+        )));
+    }
+    Ok(text_static
+        .into_iter()
+        .zip(text_roles)
+        .map(|(group, role)| {
+            let owner = if role == "embedding" && args.tie_word_embeddings {
+                ParameterGroupOwner::static_any_of(["embedding", "output"])
+            } else {
+                ParameterGroupOwner::static_role(role)
+            };
+            OwnedParameterGroupSpec::new(owner, group)
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn per_layer_projection_has_independent_static_owner() {
+        let args = super::super::ModelArgs::from_hf_json(
+            br#"{
+              "model_type":"gemma4","hidden_size":16,"num_hidden_layers":2,
+              "intermediate_size":32,"num_attention_heads":4,"num_key_value_heads":2,
+              "head_dim":4,"rms_norm_eps":0.000001,"vocab_size":64,
+              "max_position_embeddings":128,"layer_types":["full_attention","full_attention"],
+              "hidden_size_per_layer_input":4,"vocab_size_per_layer_input":64
+            }"#,
+        )
+        .unwrap();
+        let authority = text_static_parameter_ownership(&args).unwrap();
+        let projection = authority
+            .iter()
+            .find(|owned| {
+                owned.group().members().iter().any(|member| {
+                    member.target() == "model.language_model.per_layer_model_projection.weight"
+                })
+            })
+            .expect("projection ownership");
+        assert_eq!(
+            projection.owner(),
+            &ParameterGroupOwner::static_role("per_layer_projection")
+        );
+        assert_eq!(projection.group().members().len(), 1);
+        assert!(!projection.group().members().iter().any(|member| {
+            member.target() == "model.language_model.embed_tokens_per_layer.weight"
+        }));
+    }
+}
 
 /// Pinned text and native media modules.
 #[derive(Debug, Clone, Parameterized)]
@@ -84,6 +163,73 @@ pub enum Unit<B: RoutedNeuralBackend> {
     Text(DenseBlock<B>),
 }
 
+impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    fn forward_unit_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        match (group, unit) {
+            (2, Unit::Text(unit)) => self.forward_text_unit_with_provider(
+                index, unit, hidden, state, forward, pass, provider, context,
+            ),
+            (_, unit) => <Self as LayeredArchitecture<B, S>>::forward_unit(
+                self, group, index, unit, hidden, state, forward, context,
+            ),
+        }
+    }
+}
+
+impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    fn forward_unit_parallel_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        match (group, unit) {
+            (2, Unit::Text(unit)) => self.forward_text_unit_parallel_with_provider(
+                index, unit, hidden, state, forward, pass, provider, parallel, context,
+            ),
+            (_, unit) => <Self as ParallelLayeredArchitecture<B, S>>::forward_unit_parallel(
+                self, group, index, unit, hidden, state, forward, parallel, context,
+            ),
+        }
+    }
+}
+
 /// Values retained across one complete multimodal decoder pass.
 pub struct ForwardContext<T> {
     mask: Option<T>,
@@ -119,19 +265,185 @@ impl<T> ForwardContext<T> {
     }
 }
 
+/// Family-owned schema for decoder-wide per-layer input transport.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TextBoundarySchema {
+    carries_per_layer_input: bool,
+}
+
+impl TextBoundarySchema {
+    /// Creates the schema for one concrete text configuration.
+    pub const fn new(carries_per_layer_input: bool) -> Self {
+        Self {
+            carries_per_layer_input,
+        }
+    }
+
+    /// Decodes the optional per-layer input without positional guessing.
+    pub fn decode<T>(
+        self,
+        tensors: Vec<T>,
+    ) -> Result<TextBoundary<T>, eredu_runtime::ArchitectureBoundaryError> {
+        let expected = usize::from(self.carries_per_layer_input);
+        if tensors.len() != expected {
+            return Err(eredu_runtime::ArchitectureBoundaryError::TensorCount {
+                boundary: "gemma4.text",
+                expected,
+                actual: tensors.len(),
+            });
+        }
+        Ok(TextBoundary {
+            per_layer_input: tensors.into_iter().next(),
+        })
+    }
+
+    /// Encodes the optional per-layer input after validating the family schema.
+    pub fn encode<T>(
+        self,
+        boundary: TextBoundary<T>,
+    ) -> Result<Vec<T>, eredu_runtime::ArchitectureBoundaryError> {
+        let actual = usize::from(boundary.per_layer_input.is_some());
+        let expected = usize::from(self.carries_per_layer_input);
+        if actual != expected {
+            return Err(eredu_runtime::ArchitectureBoundaryError::TensorCount {
+                boundary: "gemma4.text",
+                expected,
+                actual,
+            });
+        }
+        Ok(boundary.per_layer_input.into_iter().collect())
+    }
+}
+
+/// Typed Gemma text context transported alongside decoder activations.
+pub struct TextBoundary<T> {
+    /// Decoder-wide per-layer input, when configured by the checkpoint.
+    pub per_layer_input: Option<T>,
+}
+
+impl<T> TextBoundary<T> {
+    /// Creates a typed text boundary.
+    pub const fn new(per_layer_input: Option<T>) -> Self {
+        Self { per_layer_input }
+    }
+}
+
 /// One Gemma architecture used by resident, layerwise, and streamed runtimes.
 pub struct LayeredModel<B: RoutedNeuralBackend> {
     args: FamilyConfig,
     static_modules: StaticModules<B>,
+    parallel_geometry: Option<LocalGeometry>,
 }
 
 impl<B: RoutedNeuralBackend> LayeredModel<B> {
+    /// Executes one media unit for a continuation request whose primary
+    /// layered forward context lives on another pipeline owner.
+    pub fn forward_partition_media_continuation(
+        &self,
+        unit: &mut Unit<B>,
+        hidden: &B::Tensor,
+        vision_state: Option<&VisionState<B::Tensor>>,
+        audio_valid: Option<&[i32]>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        match unit {
+            Unit::Vision(layer) => self
+                .static_modules
+                .vision
+                .as_ref()
+                .ok_or_else(|| Error::backend("Gemma 4 vision static is missing"))?
+                .forward_layer(
+                    layer,
+                    hidden,
+                    vision_state.ok_or_else(|| {
+                        Error::backend("Gemma 4 vision continuation state is missing")
+                    })?,
+                    context,
+                ),
+            Unit::Audio(layer) => layer.forward(
+                hidden,
+                audio_valid
+                    .ok_or_else(|| Error::backend("Gemma 4 audio continuation state is missing"))?,
+                context,
+            ),
+            Unit::Text(_) => Err(Error::backend(
+                "Gemma 4 text unit cannot execute in a media continuation",
+            )),
+        }
+    }
+
+    /// Completes optional media groups and assembles the decoder activation
+    /// and per-layer conditioning at the family boundary.
+    pub fn finish_partition_media_ingress<S>(
+        &mut self,
+        mut forward: LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>,
+        state: &mut S,
+        vision_hidden: Option<B::Tensor>,
+        audio_hidden: Option<B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(B::Tensor, Option<B::Tensor>), Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        for (group, hidden) in [(0, vision_hidden), (1, audio_hidden)] {
+            let Some(hidden) = hidden else { continue };
+            match parallel {
+                Some(parallel) => {
+                    <Self as ParallelLayeredArchitecture<B, S>>::complete_execution_group_parallel(
+                        self,
+                        group,
+                        &hidden,
+                        state,
+                        &mut forward.context,
+                        parallel,
+                        context,
+                    )?
+                }
+                None => <Self as LayeredArchitecture<B, S>>::complete_execution_group(
+                    self,
+                    group,
+                    &hidden,
+                    state,
+                    &mut forward.context,
+                    context,
+                )?,
+            };
+        }
+        let (hidden, tokens) = self.assemble_pipeline_text(&forward.context, context)?;
+        let per_layer = self.pipeline_per_layer_inputs(&tokens, &hidden, context)?;
+        Self::set_pipeline_per_layer_inputs(&mut forward.context, per_layer.clone());
+        Ok((hidden, per_layer))
+    }
+
     /// Builds unloaded pinned text and configured media modules.
     pub fn new(
         args: FamilyConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let text = model_text::StaticTextModules::new(&args.text, context)?;
+        Self::with_text(args, text, None, context)
+    }
+
+    /// Builds the same multimodal graph with planner-derived text geometry.
+    pub fn new_parallel(
+        args: FamilyConfig,
+        geometry: LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        args.validate().map_err(Error::backend)?;
+        geometry.validate_for(&args).map_err(Error::backend)?;
+        let text = model_text::StaticTextModules::new_parallel(&args.text, &geometry, context)?;
+        Self::with_text(args, text, Some(geometry), context)
+    }
+
+    fn with_text(
+        args: FamilyConfig,
+        text: model_text::StaticTextModules<B>,
+        parallel_geometry: Option<LocalGeometry>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
         let vision = args
             .vision
             .as_ref()
@@ -177,6 +489,7 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                 audio,
                 audio_projection,
             },
+            parallel_geometry,
         })
     }
 
@@ -199,6 +512,123 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
     /// Returns the normalized composite family configuration.
     pub const fn args(&self) -> &FamilyConfig {
         &self.args
+    }
+
+    /// Describes every pinned/media/text parameter with explicit canonical
+    /// execution ownership.
+    pub fn parameter_description(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ArchitectureParameterDescription, Error> {
+        let graph = ExecutionGraph::new(
+            vec![
+                ExecutionGroupSpec::root("vision"),
+                ExecutionGroupSpec::root("audio"),
+                ExecutionGroupSpec::with_dependencies("text_decoder", ["vision", "audio"]),
+            ],
+            "text_decoder",
+        )
+        .map_err(Error::backend)?;
+        let counts = [
+            self.args
+                .vision
+                .as_ref()
+                .map_or(0, |config| config.num_hidden_layers as usize),
+            self.args
+                .audio
+                .as_ref()
+                .map_or(0, |config| config.num_hidden_layers as usize),
+            self.args.text.num_hidden_layers(),
+        ];
+        let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
+        let mut owned = text_static_parameter_ownership(&self.args.text).map_err(Error::backend)?;
+        let mut expected = owned
+            .iter()
+            .map(|owned| owned.group().clone())
+            .collect::<Vec<_>>();
+        let mut add_static = |role: &'static str, groups: Vec<_>| {
+            expected.extend(groups.iter().cloned());
+            owned.extend(groups.into_iter().map(|group| {
+                OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role(role), group)
+            }));
+        };
+        if let Some(vision) = &self.static_modules.vision {
+            add_static(
+                "vision",
+                vision_static_parameter_groups(vision).map_err(Error::backend)?,
+            );
+        }
+        if let Some(projector) = &self.static_modules.vision_projection {
+            add_static(
+                "vision_projection",
+                modality_projection_parameter_groups("model.vision_projector", projector)
+                    .map_err(Error::backend)?,
+            );
+        }
+        if let Some(audio) = &self.static_modules.audio {
+            add_static(
+                "audio",
+                audio_static_parameter_groups(audio).map_err(Error::backend)?,
+            );
+        }
+        if let Some(projector) = &self.static_modules.audio_projection {
+            add_static(
+                "audio_projection",
+                modality_projection_parameter_groups("model.audio_projector", projector)
+                    .map_err(Error::backend)?,
+            );
+        }
+        drop(add_static);
+        for group_index in 0..3 {
+            let owner_group = layout
+                .group_id(group_index)
+                .expect("Gemma layout group")
+                .clone();
+            for index in 0..counts[group_index] {
+                let groups = match group_index {
+                    0 => vision_layer_parameter_groups(
+                        &VisionLayer::<B>::new(
+                            self.args.vision.as_ref().expect("vision group configured"),
+                            index,
+                            context,
+                        )?,
+                        index,
+                    ),
+                    1 => audio_layer_parameter_groups(
+                        &AudioLayer::<B>::new(
+                            self.args.audio.as_ref().expect("audio group configured"),
+                            index,
+                            context,
+                        )?,
+                        index,
+                    ),
+                    _ => layer_parameter_groups(&self.args.text, index),
+                }
+                .map_err(Error::backend)?;
+                expected.extend(groups.iter().cloned());
+                owned.extend(groups.into_iter().map(|group| {
+                    OwnedParameterGroupSpec::new(
+                        ParameterGroupOwner::execution_unit(owner_group.clone(), index),
+                        group,
+                    )
+                }));
+            }
+        }
+        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
+            .map_err(Error::backend)
+    }
+
+    /// Returns the replicated or rank-local mutable-state layout.
+    pub fn runtime_state_layout(&self) -> Result<StateLayout, Error> {
+        self.parallel_geometry
+            .as_ref()
+            .map(|geometry| geometry.state_layout().clone())
+            .map_or_else(|| state_layout(&self.args.text).map_err(Error::backend), Ok)
+    }
+
+    /// Returns planner-derived geometry for a rank-local realization.
+    pub const fn parallel_geometry(&self) -> Option<&LocalGeometry> {
+        self.parallel_geometry.as_ref()
     }
 
     /// Starts a text-only pass from a rank-local vocabulary embedding shard.
@@ -501,13 +931,28 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         } else {
             None
         };
+        let per_layer_input = forward
+            .per_layer_inputs
+            .as_ref()
+            .map(|inputs| {
+                inputs.index(
+                    &[
+                        Index::Full,
+                        Index::Full,
+                        Index::At(index as i32),
+                        Index::Full,
+                    ],
+                    context,
+                )
+            })
+            .transpose()?;
         unit.forward_parallel(
             BlockInput {
                 hidden,
                 mask: forward.mask.as_ref().or(generated_mask.as_ref()),
                 cache: Some(state.layer(index).map_err(Error::backend)?),
                 shared: &mut forward.shared,
-                per_layer_input: None,
+                per_layer_input: per_layer_input.as_ref(),
                 rotary_position: Some(RotaryPosition::Offset(forward.position_offset)),
             },
             parallel,
@@ -793,6 +1238,58 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             .collect()
     }
 
+    fn prepare_parts_parallel(
+        &mut self,
+        parts: &[DecoderInputPart<'_, B::Tensor>],
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Vec<PreparedPart<B::Tensor>>, Error> {
+        if parts.is_empty() {
+            return Err(Error::backend("Gemma 4 input has no ordered parts"));
+        }
+        let scale = (self.args.text.hidden_size as f32).sqrt();
+        parts
+            .iter()
+            .map(|part| match part {
+                DecoderInputPart::Text(tokens) => Ok(PreparedPart::Text {
+                    tokens: (*tokens).clone(),
+                    embeddings: B::vocabulary_parallel_lookup(
+                        &mut self.static_modules.text.embeddings,
+                        tokens,
+                        EmbeddingLookupPolicy::Strict,
+                        parallel,
+                        context,
+                    )?
+                    .multiply_scalar(scale, context)?,
+                }),
+                DecoderInputPart::Image(tokens) | DecoderInputPart::Video(tokens) => {
+                    Ok(PreparedPart::Vision {
+                        tokens: (*tokens).clone(),
+                    })
+                }
+                DecoderInputPart::Audio(tokens) => Ok(PreparedPart::Audio {
+                    tokens: (*tokens).clone(),
+                }),
+                DecoderInputPart::Projected { tokens, embeddings } => {
+                    if embeddings.shape()
+                        != [tokens.dim(0), tokens.dim(1), self.args.text.hidden_size]
+                    {
+                        return Err(Error::backend(format!(
+                            "Gemma 4 projected input shape {:?} does not match tokens {:?} and hidden width {}",
+                            embeddings.shape(),
+                            tokens.shape(),
+                            self.args.text.hidden_size
+                        )));
+                    }
+                    Ok(PreparedPart::Text {
+                        tokens: (*tokens).clone(),
+                        embeddings: (*embeddings).clone(),
+                    })
+                }
+            })
+            .collect()
+    }
+
     fn assemble(
         &self,
         parts: &[PreparedPart<B::Tensor>],
@@ -875,10 +1372,26 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             .multiply_scalar((self.args.text.hidden_size as f32).sqrt().recip(), context)?
             .reshape(&[batch, sequence, layers, width], context)?;
         let projected = norm.forward(&projected, context)?;
-        projected
+        let inputs = projected
             .add(&token_identity, context)?
-            .multiply_scalar(2.0_f32.powf(-0.5), context)
-            .map(Some)
+            .multiply_scalar(2.0_f32.powf(-0.5), context)?;
+        match self.parallel_geometry.as_ref() {
+            Some(geometry) if geometry.per_layer_range() != &(0..width) => inputs
+                .index(
+                    &[
+                        Index::Full,
+                        Index::Full,
+                        Index::Full,
+                        Index::Range(
+                            geometry.per_layer_range().start,
+                            geometry.per_layer_range().end,
+                        ),
+                    ],
+                    context,
+                )
+                .map(Some),
+            _ => Ok(Some(inputs)),
+        }
     }
 }
 
@@ -897,6 +1410,47 @@ where
     where
         B::Tensor: 'a;
     type Error = Error;
+
+    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+        match group {
+            0 => eredu_runtime::ArchitectureGroupTransport {
+                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
+                kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+                first_owner_static_roles: vec!["vision".into(), "vision_projection".into()],
+                last_owner_static_roles: Vec::new(),
+                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
+                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
+                request_optional: true,
+            },
+            1 => eredu_runtime::ArchitectureGroupTransport {
+                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
+                kind: eredu_runtime::ArchitectureGroupKind::AudioEncoder,
+                first_owner_static_roles: vec!["audio".into(), "audio_projection".into()],
+                last_owner_static_roles: Vec::new(),
+                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
+                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
+                request_optional: true,
+            },
+            _ => eredu_runtime::ArchitectureGroupTransport {
+                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
+                kind: eredu_runtime::ArchitectureGroupKind::Decoder,
+                first_owner_static_roles: vec![
+                    "embedding".into(),
+                    "per_layer_embedding".into(),
+                    "per_layer_projection".into(),
+                    "per_layer_norm".into(),
+                ],
+                last_owner_static_roles: if self.args.text.tie_word_embeddings {
+                    vec!["norm".into(), "embedding".into()]
+                } else {
+                    vec!["norm".into(), "output".into()]
+                },
+                merge_destination: eredu_runtime::ArchitectureMergeDestination::LastOwner,
+                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::Decoder),
+                request_optional: false,
+            },
+        }
+    }
 
     fn model_identity(&self) -> &str {
         &self.args.model_type
@@ -957,6 +1511,18 @@ where
         }
     }
 
+    fn retained_state_ordinals(
+        &self,
+        group: usize,
+        index: usize,
+        _ordinal: usize,
+    ) -> std::ops::Range<usize> {
+        match group {
+            2 => index..index + 1,
+            _ => 0..0,
+        }
+    }
+
     fn static_modules(&self) -> &Self::StaticModules {
         &self.static_modules
     }
@@ -971,6 +1537,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error> {
+        <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
         match group {
             0 => Ok(Unit::Vision(VisionLayer::new(
                 self.args
@@ -988,11 +1555,15 @@ where
                 index,
                 context,
             )?)),
-            2 => Ok(Unit::Text(DenseBlock::new(
-                &self.args.text,
-                index,
-                context,
-            )?)),
+            2 => {
+                let args = match &self.parallel_geometry {
+                    Some(geometry) => geometry.text_block(index).ok_or_else(|| {
+                        Error::backend(format!("missing rank-local Gemma 4 text geometry {index}"))
+                    })?,
+                    None => &self.args.text,
+                };
+                Ok(Unit::Text(DenseBlock::new(args, index, context)?))
+            }
             _ => Err(Error::backend("Gemma 4 has three execution groups")),
         }
     }
@@ -1296,6 +1867,162 @@ where
     }
 }
 
+impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>,
+{
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self
+            .parallel_geometry
+            .as_ref()
+            .ok_or_else(|| Error::backend("Gemma 4 model was not built with local geometry"))?
+            .state_layout();
+        if state.layout() != expected {
+            return Err(Error::backend("Gemma 4 rank-local state layout mismatch"));
+        }
+        let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
+        let (vision_initial, vision_state) = match input.vision {
+            Some(vision) => {
+                let (hidden, state) = self
+                    .static_modules
+                    .vision
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("Gemma 4 has no vision tower"))?
+                    .begin(vision, context)?;
+                (Some(hidden), Some(state))
+            }
+            None => (None, None),
+        };
+        let (audio_initial, audio_valid) = match input.audio {
+            Some(audio) => {
+                let (hidden, valid) = self
+                    .static_modules
+                    .audio
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("Gemma 4 has no audio tower"))?
+                    .begin(audio, context)?;
+                (Some(hidden), Some(valid))
+            }
+            None => (None, None),
+        };
+        let assembled = self.assemble(&parts, None, None, context);
+        let hidden = vision_initial
+            .as_ref()
+            .or(audio_initial.as_ref())
+            .cloned()
+            .or_else(|| {
+                assembled
+                    .as_ref()
+                    .ok()
+                    .map(|assembled| assembled.embeddings.clone())
+            })
+            .ok_or_else(|| {
+                assembled
+                    .err()
+                    .unwrap_or_else(|| Error::backend("empty Gemma input"))
+            })?;
+        let mut position_offset = 0;
+        for (layer, policy) in self.args.text.layer_schedule.iter().enumerate() {
+            if policy.key_value.owns_state() {
+                position_offset = position_offset.max(AttentionCache::<B::Tensor>::offset(
+                    state.layer(layer).map_err(Error::backend)?,
+                ));
+            }
+        }
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                mask: input.mask.cloned(),
+                position_offset,
+                parts,
+                per_layer_token_override: input.per_layer_tokens.cloned(),
+                per_layer_inputs: None,
+                shared: HashMap::new(),
+                vision_state,
+                vision_initial,
+                vision_output: None,
+                audio_valid,
+                audio_initial,
+                audio_output: None,
+            },
+        })
+    }
+
+    fn forward_unit_parallel(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        match (group, unit) {
+            (0, Unit::Vision(unit)) => self
+                .static_modules
+                .vision
+                .as_ref()
+                .ok_or_else(|| Error::backend("Gemma 4 vision static modules are missing"))?
+                .forward_layer(
+                    unit,
+                    hidden,
+                    forward
+                        .vision_state
+                        .as_ref()
+                        .ok_or_else(|| Error::backend("Gemma 4 vision state is missing"))?,
+                    context,
+                ),
+            (1, Unit::Audio(unit)) => unit.forward(
+                hidden,
+                forward
+                    .audio_valid
+                    .as_deref()
+                    .ok_or_else(|| Error::backend("Gemma 4 audio extent is missing"))?,
+                context,
+            ),
+            (2, Unit::Text(unit)) => self
+                .forward_text_unit_parallel(index, unit, hidden, state, forward, parallel, context),
+            _ => Err(Error::backend("Gemma 4 parallel unit/group mismatch")),
+        }
+    }
+
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Gemma 4 model was not built with local geometry",
+            ));
+        }
+        let hidden = self.static_modules.text.norm.forward(hidden, context)?;
+        let logits = match &mut self.static_modules.text.head {
+            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context)?,
+            None => B::vocabulary_parallel_embedding_project(
+                &mut self.static_modules.text.embeddings,
+                &hidden,
+                parallel,
+                context,
+            )?,
+        };
+        model_text::args_cap::<B>(logits, self.args.text.final_logit_softcapping, context)
+    }
+}
+
 fn token_count<T: Tensor>(
     parts: &[PreparedPart<T>],
     select: impl Fn(&PreparedPart<T>) -> bool,
@@ -1466,6 +2193,107 @@ pub(crate) mod model_text {
                         )
                     })
                     .transpose()?,
+            })
+        }
+
+        pub(super) fn new_parallel(
+            args: &ModelArgs,
+            geometry: &super::super::LocalGeometry,
+            context: &<B::Tensor as Tensor>::Context,
+        ) -> Result<Self, Error> {
+            let embedding = "model.language_model.embed_tokens.weight";
+            let per_layer_width = args.hidden_size_per_layer_input;
+            let combined_width = per_layer_width
+                .checked_mul(args.num_hidden_layers() as i32)
+                .ok_or_else(|| Error::backend("Gemma 4 per-layer width overflowed"))?;
+            let per_layer_embedding = "model.language_model.embed_tokens_per_layer.weight";
+            let per_layer_projection = "model.language_model.per_layer_model_projection.weight";
+            let head = "lm_head.weight";
+            Ok(Self {
+                embeddings: B::vocabulary_parallel_embedding(
+                    EmbeddingSpec {
+                        vocabulary: args.vocab_size,
+                        dimensions: args.hidden_size,
+                        weight: ParameterSpec::trainable(embedding).map_err(Error::backend)?,
+                        quantization: args.linear_format_for(embedding).weight_quantization(),
+                    },
+                    geometry.embedding_range().clone(),
+                    context,
+                )?,
+                per_layer_embeddings: (per_layer_width > 0)
+                    .then(|| {
+                        B::embedding(
+                            EmbeddingSpec {
+                                vocabulary: args
+                                    .vocab_size_per_layer_input
+                                    .unwrap_or(args.vocab_size),
+                                dimensions: combined_width,
+                                weight: ParameterSpec::trainable(per_layer_embedding)
+                                    .map_err(Error::backend)?,
+                                quantization: args
+                                    .linear_format_for(per_layer_embedding)
+                                    .weight_quantization(),
+                            },
+                            context,
+                        )
+                    })
+                    .transpose()?,
+                per_layer_projection: (per_layer_width > 0)
+                    .then(|| {
+                        B::linear(
+                            LinearSpec {
+                                input: args.hidden_size,
+                                output: combined_width,
+                                weight: ParameterSpec::trainable(per_layer_projection)
+                                    .map_err(Error::backend)?,
+                                bias: None,
+                                format: args.linear_format_for(per_layer_projection),
+                            },
+                            context,
+                        )
+                    })
+                    .transpose()?,
+                per_layer_norm: (per_layer_width > 0)
+                    .then(|| {
+                        B::rms_norm(
+                            NormalizationSpec {
+                                dimensions: per_layer_width,
+                                epsilon: args.rms_norm_eps,
+                                weight: ParameterSpec::trainable(
+                                    "model.language_model.per_layer_projection_norm.weight",
+                                )
+                                .map_err(Error::backend)?,
+                            },
+                            context,
+                        )
+                    })
+                    .transpose()?,
+                norm: B::rms_norm(
+                    NormalizationSpec {
+                        dimensions: args.hidden_size,
+                        epsilon: args.rms_norm_eps,
+                        weight: ParameterSpec::trainable("model.language_model.norm.weight")
+                            .map_err(Error::backend)?,
+                    },
+                    context,
+                )?,
+                head: if args.tie_word_embeddings {
+                    None
+                } else {
+                    Some(B::vocabulary_parallel_linear(
+                        LinearSpec {
+                            input: args.hidden_size,
+                            output: args.vocab_size,
+                            weight: ParameterSpec::trainable(head).map_err(Error::backend)?,
+                            bias: None,
+                            format: args.linear_format_for(head),
+                        },
+                        geometry.output_range().cloned().ok_or_else(|| {
+                            Error::backend("untied Gemma 4 output has no local range")
+                        })?,
+                        context,
+                    )?)
+                },
             })
         }
 

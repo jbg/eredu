@@ -76,6 +76,7 @@ impl<'a> ExpertRouteBatch<'a> {
 }
 
 /// One atomic expert definition supplied by an architecture adapter.
+#[derive(Clone)]
 pub struct ExpertCatalogEntry {
     identity: ExpertIdentity,
     unit: OffloadUnit,

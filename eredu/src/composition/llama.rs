@@ -6,14 +6,12 @@ pub(crate) mod checkpoint;
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
     CausalModel, ExecutionGraph, ExecutionResidency, ExecutionUnitLayout, LayerWeightResidency,
-    LayeredArchitecture, LayeredForwardState, LayerwiseRuntime, ParallelLayeredArchitecture,
-    RuntimeState, WeightResidency,
+    LayerwiseRuntime, RuntimeState, WeightResidency,
 };
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use eredu_architectures::llama::ModelArgs;
-use eredu_nn::{ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized};
 use safemlx::{
     error::Exception,
     ops::indexing::TryIndexOp,
@@ -28,8 +26,7 @@ use crate::core::cache::{
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::nn::parallel::{VocabParallelEmbedding, VocabParallelLmHead},
-    backend::mlx::nn::shared::{MlxBackend, MlxModule, MlxNamedModule},
+    backend::mlx::nn::shared::{MlxBackend, MlxModule},
     backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
     backend::mlx::runtime::cache::state::MlxKeyValueState,
     backend::mlx::runtime::checkpoint::binding::{
@@ -40,7 +37,7 @@ use crate::{
     },
     backend::mlx::runtime::execution::generic::{
         prepare_layerwise_policy, prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy,
-        MlxResidentPolicy, MlxUnitFactory,
+        MlxResidentPolicy,
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
@@ -56,36 +53,6 @@ use eredu_runtime::{ResidencyReport, WeightBinding};
 
 type NeutralBlock = eredu_architectures::llama::TransformerBlock<MlxBackend>;
 
-#[derive(Clone)]
-struct LlamaUnitFactory {
-    args: ModelArgs,
-}
-
-impl MlxUnitFactory<NeutralBlock> for LlamaUnitFactory {
-    fn build(&mut self, index: usize, stream: &Stream) -> Result<NeutralBlock, Error> {
-        NeutralBlock::new(&self.args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-}
-
-#[derive(Clone)]
-struct LlamaParallelUnitFactory {
-    local_args: Arc<Vec<ModelArgs>>,
-}
-
-impl MlxUnitFactory<NeutralBlock> for LlamaParallelUnitFactory {
-    fn build(&mut self, index: usize, stream: &Stream) -> Result<NeutralBlock, Error> {
-        let args = self.local_args.get(index).ok_or_else(|| {
-            Error::Parallel(format!(
-                "parallel Llama unit {index} is outside {} local layouts",
-                self.local_args.len()
-            ))
-        })?;
-        NeutralBlock::new(args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-}
-
 type NeutralArchitecture = eredu_architectures::llama::LayeredModel<MlxBackend>;
 type NeutralResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
@@ -97,20 +64,20 @@ type NeutralLayerwiseRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxBackend,
     MlxKeyValueState,
-    MlxLayerwisePolicy<NeutralBlock, LlamaUnitFactory>,
+    MlxLayerwisePolicy<NeutralBlock>,
 >;
 
 type NeutralParallelResidentRuntime = LayerwiseRuntime<
-    LlamaParallelComposition,
+    NeutralArchitecture,
     MlxBackend,
     MlxKeyValueState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type NeutralParallelLayerwiseRuntime = LayerwiseRuntime<
-    LlamaParallelComposition,
+    NeutralArchitecture,
     MlxBackend,
     MlxKeyValueState,
-    MlxLayerwisePolicy<NeutralBlock, LlamaParallelUnitFactory>,
+    MlxLayerwisePolicy<NeutralBlock>,
 >;
 
 enum LlamaExecution {
@@ -169,12 +136,12 @@ fn load_neutral_llama(
         .map_err(|_| Error::UnsupportedArchitecture("invalid Llama layer count".into()))?;
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let factory = LlamaUnitFactory { args: args.clone() };
     let unit_layout = decoder_unit_layout(layer_count)?;
     let (policy, mut metadata) = prepare_layerwise_policy(
         store,
-        architecture.static_modules_mut(),
-        factory,
+        &mut architecture,
+        (),
+        std::marker::PhantomData::<MlxKeyValueState>,
         unit_layout,
         options,
         stream,
@@ -185,9 +152,13 @@ fn load_neutral_llama(
     metadata.set_quantization(args.weight_quantization());
     metadata.set_materialization(materialization);
     let execution = if options.is_fully_resident() {
-        LlamaExecution::Resident(LayerwiseRuntime::new(
+        LlamaExecution::Resident(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(
+                &architecture,
+                stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
+            )?,
             architecture,
-            policy.into_resident(stream)?,
         ))
     } else {
         LlamaExecution::Layerwise(LayerwiseRuntime::new(architecture, policy))
@@ -713,9 +684,10 @@ fn load_neutral_llama_parallel(
 ) -> Result<LlamaModel, Error> {
     let layer_count = usize::try_from(args.num_hidden_layers)
         .map_err(|_| Error::UnsupportedArchitecture("invalid Llama layer count".into()))?;
-    let mut composition = LlamaParallelComposition::new(args.clone(), stream)?;
+    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut planner = build.planner();
-    let static_modules = composition.architecture.static_modules();
+    let static_modules = global_architecture.static_modules();
     for group in eredu_architectures::llama::static_parallel_parameter_groups::<MlxBackend>(
         &static_modules.embeddings,
         &static_modules.norm,
@@ -739,12 +711,15 @@ fn load_neutral_llama_parallel(
             "Llama declared no tensor-parallel parameters".into(),
         ));
     }
-    composition.configure_parallel(build, &layout, stream)?;
-    let state_layout = composition.local_state_layout()?;
-    let factory = composition.unit_factory()?;
-
+    let geometry = eredu_architectures::llama::local_geometry(&args, &layout)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let state_layout = architecture
+        .runtime_state_layout()
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let global_static_bindings = build_module_bindings(
-        &MlxModule::new(composition.architecture.static_modules().clone()),
+        &MlxModule::new(global_architecture.static_modules().clone()),
         "",
         store.as_ref(),
     )?;
@@ -763,20 +738,23 @@ fn load_neutral_llama_parallel(
     }
 
     let binding_args = args.clone();
+    let global_static_modules = global_architecture.static_modules().clone();
+    let binding_layout = layout.clone();
     let unit_layout = decoder_unit_layout(layer_count)?;
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
-        &mut composition,
-        factory,
+        &mut architecture,
+        (),
+        std::marker::PhantomData::<MlxKeyValueState>,
         unit_layout,
         options,
         stream,
         weights_stream,
         |key| key.starts_with("rope_freqs.") || key.ends_with(".rotary_emb.inv_freq"),
-        |modules, store| {
-            let global = MlxModule::new(modules.architecture.static_modules().clone());
+        move |_modules, store| {
+            let global = MlxModule::new(global_static_modules.clone());
             let bindings = build_module_bindings(&global, "", store)?;
-            shard_layer_bindings(bindings, "", store, &layout)
+            shard_layer_bindings(bindings, "", store, &binding_layout)
         },
         |index, _local, store, stream| {
             let global = NeutralBlock::new(&binding_args, index, stream)
@@ -814,13 +792,17 @@ fn load_neutral_llama_parallel(
     let parallel_rank =
         crate::backend::mlx::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
     let execution = if options.is_fully_resident() {
-        LlamaExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new(
-            composition,
-            policy.into_resident(stream)?,
+        LlamaExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(
+                &architecture,
+                stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
+            )?,
+            architecture,
         )))
     } else {
         LlamaExecution::TensorParallelLayerwise(Box::new(LayerwiseRuntime::new(
-            composition,
+            architecture,
             policy,
         )))
     };
@@ -938,91 +920,26 @@ pub(crate) fn load_llama_gguf_model(
 }
 
 /// Llama implementation of the generic layerwise model-family contract.
-pub struct LlamaParallelComposition {
-    architecture: NeutralArchitecture,
-    parallel_embedding: Option<MlxNamedModule<VocabParallelEmbedding>>,
-    parallel_lm_head: Option<MlxNamedModule<VocabParallelLmHead>>,
-    parallel_kv_heads: Option<Vec<i32>>,
-    local_args: Option<Arc<Vec<ModelArgs>>>,
-    topology: Option<crate::backend::mlx::MlxParallelContext>,
-}
+pub(crate) struct LlamaPipelineBindings;
 
-impl LlamaParallelComposition {
-    /// Creates metadata-only static modules for a normalized Llama configuration.
-    pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
-        let architecture = NeutralArchitecture::new(args, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        Ok(Self {
-            architecture,
-            parallel_embedding: None,
-            parallel_lm_head: None,
-            parallel_kv_heads: None,
-            local_args: None,
-            topology: None,
-        })
-    }
-
-    /// Returns normalized Llama arguments.
-    pub const fn args(&self) -> &ModelArgs {
-        self.architecture.args()
-    }
-
-    pub(crate) fn register_parallel_parameters(
-        &self,
-        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let static_modules = self.architecture.static_modules();
-        for group in eredu_architectures::llama::static_parallel_parameter_groups::<MlxBackend>(
-            &static_modules.embeddings,
-            &static_modules.norm,
-            static_modules.lm_head.as_ref(),
-            "model",
-        )? {
-            planner.register(group)?;
-        }
-        for index in 0..self.args().num_hidden_layers as usize {
-            let unit = NeutralBlock::new(self.args(), index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-            for group in eredu_architectures::llama::layer_parallel_parameter_groups::<MlxBackend>(
-                &unit,
-                self.args(),
-                index,
-            )? {
-                planner.register(group)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn new_cartesian_layer(
-        &self,
-        index: usize,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        stream: &Stream,
-    ) -> Result<MlxModule<NeutralBlock>, Error> {
-        let local;
-        let args = match layout {
-            Some(layout) => {
-                local = eredu_architectures::llama::local_block_args(self.args(), index, layout)
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-                &local
-            }
-            None => self.args(),
-        };
-        NeutralBlock::new(args, index, stream)
-            .map(MlxModule::new)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+impl LlamaPipelineBindings {
+    /// Creates a stateless checkpoint-binding adapter.
+    pub const fn new() -> Self {
+        Self
     }
 
     pub(crate) fn cartesian_layer_bindings(
         &self,
+        architecture: &NeutralArchitecture,
         index: usize,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let global = self.new_cartesian_layer(index, None, stream)?;
+        let global = architecture
+            .construct_unit(index, stream)
+            .map(MlxModule::new)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let bindings = build_module_bindings(&global, "", store)?;
         match layout {
             Some(layout) => {
@@ -1034,11 +951,12 @@ impl LlamaParallelComposition {
 
     pub(crate) fn selected_static_units(
         &self,
+        architecture: &NeutralArchitecture,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         roles: &[&str],
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let selected = |role: &str| roles.contains(&role);
-        let static_modules = self.architecture.static_modules();
+        let static_modules = architecture.static_modules();
         let mut units = Vec::new();
         if selected("embedding") {
             units.push(StaticUnitBindings::new(
@@ -1074,358 +992,5 @@ impl LlamaParallelComposition {
             }
         }
         Ok(units)
-    }
-}
-
-impl LlamaParallelComposition {
-    fn configure_parallel(
-        &mut self,
-        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &eredu_runtime::LocalModelLayout,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        self.parallel_kv_heads = Some(
-            eredu_architectures::llama::local_key_value_heads(self.args(), layout)
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-        );
-        self.parallel_embedding = Some(MlxNamedModule::new(
-            VocabParallelEmbedding::unloaded(
-                self.args().vocab_size as usize,
-                self.args().hidden_size,
-                self.args()
-                    .weight_quantization_for("model.embed_tokens.weight"),
-                context,
-                stream,
-            )?,
-            ParameterSpec::trainable("model.embed_tokens.weight")
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-            None,
-        )?);
-        if self.architecture.static_modules().lm_head.is_some() {
-            self.parallel_lm_head = Some(MlxNamedModule::new(
-                VocabParallelLmHead::unloaded(
-                    self.args().hidden_size,
-                    self.args().vocab_size as usize,
-                    self.args().weight_quantization_for("lm_head.weight"),
-                    context,
-                    stream,
-                )?,
-                ParameterSpec::trainable("lm_head.weight")
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                None,
-            )?);
-        }
-        self.local_args = Some(Arc::new(
-            (0..self.args().num_hidden_layers as usize)
-                .map(|index| {
-                    eredu_architectures::llama::local_block_args(self.args(), index, layout)
-                        .map_err(|error| Error::Parallel(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ));
-        self.topology = Some(context.topology());
-        Ok(())
-    }
-
-    fn unit_factory(&self) -> Result<LlamaParallelUnitFactory, Error> {
-        Ok(LlamaParallelUnitFactory {
-            local_args: Arc::clone(self.local_args.as_ref().ok_or_else(|| {
-                Error::Parallel("parallel Llama unit layout is not configured".into())
-            })?),
-        })
-    }
-
-    fn local_state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
-        let layout = eredu_architectures::llama::cache_layout_with_key_value_heads(
-            self.args(),
-            self.parallel_kv_heads.clone().ok_or_else(|| {
-                Error::Parallel("parallel Llama cache layout is not configured".into())
-            })?,
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        eredu_runtime::StateLayout::new(layout).map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    fn execution_context<'a>(
-        &self,
-        group: &'a safemlx::distributed::Group,
-        stream: &'a Stream,
-    ) -> Result<
-        crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'a>,
-        Error,
-    > {
-        let topology = self
-            .topology
-            .ok_or_else(|| Error::Parallel("parallel Llama topology is not configured".into()))?;
-        crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
-            topology, group, stream,
-        )
-    }
-}
-
-impl Parameterized<Array> for LlamaParallelComposition {
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, Array>,
-    {
-        if let Some(embedding) = &self.parallel_embedding {
-            embedding.visit_parameters(visitor);
-        }
-        self.architecture
-            .static_modules()
-            .norm
-            .visit_parameters(visitor);
-        if let Some(head) = &self.parallel_lm_head {
-            head.visit_parameters(visitor);
-        }
-    }
-
-    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
-    where
-        V: ParameterVisitorMut<'a, Array>,
-    {
-        if let Some(embedding) = &mut self.parallel_embedding {
-            embedding.visit_parameters_mut(visitor);
-        }
-        self.architecture
-            .static_modules_mut()
-            .norm
-            .visit_parameters_mut(visitor);
-        if let Some(head) = &mut self.parallel_lm_head {
-            head.visit_parameters_mut(visitor);
-        }
-    }
-
-    fn set_trainable(&mut self, trainable: bool) {
-        if let Some(embedding) = &mut self.parallel_embedding {
-            embedding.set_trainable(trainable);
-        }
-        self.architecture
-            .static_modules_mut()
-            .norm
-            .set_trainable(trainable);
-        if let Some(head) = &mut self.parallel_lm_head {
-            head.set_trainable(trainable);
-        }
-    }
-}
-
-impl LayeredArchitecture<MlxBackend, MlxKeyValueState> for LlamaParallelComposition {
-    type Input<'a> = eredu_architectures::llama::LayeredInput<'a, Array>;
-    type StaticModules = Self;
-    type Unit = NeutralBlock;
-    type ForwardContext = eredu_architectures::llama::ForwardContext<Array>;
-    type RetainedContextValues<'a> = std::option::Iter<'a, Array>;
-    type Error = Error;
-
-    fn model_identity(&self) -> &str {
-        &self.args().model_type
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
-    }
-
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        if group != 0 {
-            return Err(Error::Parallel(format!(
-                "parallel Llama execution group {group} is outside the decoder"
-            )));
-        }
-        usize::try_from(self.args().num_hidden_layers).map_err(|_| {
-            LlamaModelError::InvalidLayerCount {
-                count: self.args().num_hidden_layers,
-            }
-            .into()
-        })
-    }
-
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        if index >= self.group_unit_count(group)? {
-            return Err(Error::Parallel(format!(
-                "parallel Llama unit {index} is outside the decoder"
-            )));
-        }
-        Ok(format!("model.layers.{index}"))
-    }
-
-    fn static_modules(&self) -> &Self::StaticModules {
-        self
-    }
-
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        self
-    }
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        stream: &Stream,
-    ) -> Result<Self::Unit, Self::Error> {
-        if group != 0 {
-            return Err(Error::Parallel(format!(
-                "parallel Llama execution group {group} is outside the decoder"
-            )));
-        }
-        let args = self
-            .local_args
-            .as_ref()
-            .and_then(|args| args.get(index))
-            .ok_or_else(|| {
-                Error::Parallel(format!("parallel Llama unit {index} is not configured"))
-            })?;
-        NeutralBlock::new(args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        _input: Self::Input<'a>,
-        _state: &mut MlxKeyValueState,
-        _stream: &Stream,
-    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Self::Error> {
-        Err(Error::Parallel(
-            "parallel Llama composition requires a collective context".into(),
-        ))
-    }
-
-    fn forward_unit(
-        &mut self,
-        _group: usize,
-        _index: usize,
-        _unit: &mut Self::Unit,
-        _hidden: &Array,
-        _state: &mut MlxKeyValueState,
-        _forward: &mut Self::ForwardContext,
-        _stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        Err(Error::Parallel(
-            "parallel Llama composition requires a collective context".into(),
-        ))
-    }
-
-    fn begin_execution_group(
-        &mut self,
-        group: usize,
-        initial: &Array,
-        dependencies: &[&Array],
-        _state: &mut MlxKeyValueState,
-        _forward: &mut Self::ForwardContext,
-        _stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        if group != 0 || !dependencies.is_empty() {
-            return Err(Error::Parallel(format!(
-                "parallel Llama decoder group {group} received {} dependencies",
-                dependencies.len()
-            )));
-        }
-        Ok(initial.clone())
-    }
-
-    fn finish_forward(
-        &mut self,
-        _hidden: &Array,
-        _state: &mut MlxKeyValueState,
-        _forward: &Self::ForwardContext,
-        _stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        Err(Error::Parallel(
-            "parallel Llama composition requires a collective context".into(),
-        ))
-    }
-
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        group: usize,
-        index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::retained_context_values(
-            &self.architecture,
-            forward,
-            group,
-            index,
-        )
-    }
-}
-
-impl ParallelLayeredArchitecture<MlxBackend, MlxKeyValueState> for LlamaParallelComposition {
-    fn begin_forward_parallel<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Self::Error> {
-        let execution = self.execution_context(group, stream)?;
-        let hidden = self
-            .parallel_embedding
-            .as_mut()
-            .ok_or_else(|| Error::Parallel("parallel Llama embedding is not configured".into()))?
-            .forward(input.tokens, &execution)?;
-        let expected = self.local_state_layout()?;
-        self.architecture
-            .begin_embedded_with_layout(hidden, input.mask, state, &expected, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-
-    fn forward_unit_parallel(
-        &mut self,
-        _group_index: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &Array,
-        state: &mut MlxKeyValueState,
-        forward: &mut Self::ForwardContext,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        self.architecture
-            .forward_block_parallel(index, unit, hidden, state, forward, group, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &Array,
-        _state: &mut MlxKeyValueState,
-        _forward: &Self::ForwardContext,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        let execution = self.execution_context(group, stream)?;
-        let hidden = self
-            .architecture
-            .static_modules_mut()
-            .norm
-            .forward(hidden, stream)?;
-        let logits = match &mut self.parallel_lm_head {
-            Some(head) => head.forward(&hidden, &execution)?,
-            None => self
-                .parallel_embedding
-                .as_mut()
-                .ok_or_else(|| {
-                    Error::Parallel("parallel Llama embedding is not configured".into())
-                })?
-                .project_logits(&hidden, &execution)?,
-        };
-        logits.all_gather(&execution)
-    }
-}
-/// Structured failures at the unified Llama model boundary.
-#[derive(Debug, thiserror::Error)]
-pub enum LlamaModelError {
-    /// The normalized decoder count cannot be represented by this runtime.
-    #[error("invalid Llama decoder layer count {count}")]
-    InvalidLayerCount {
-        /// Invalid configured count.
-        count: i32,
-    },
-}
-
-impl From<LlamaModelError> for crate::backend::mlx::error::Error {
-    fn from(error: LlamaModelError) -> Self {
-        Self::ArchitectureModel(error.to_string())
     }
 }

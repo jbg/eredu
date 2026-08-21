@@ -2375,7 +2375,7 @@ pub trait BlockwiseAttentionBackend: NeuralBackend {
 ///
 /// Checkpoints are cheap backend snapshots used by speculative fork/rollback.
 /// `finalize` seals mutable state before runtime prompt-cache persistence.
-pub trait CompressedAttentionCache<T: Tensor>: Clone + Debug {
+pub trait CompressedAttentionCache<T: Tensor>: Debug {
     /// Backend snapshot preserving paging and residency identity.
     type Checkpoint: Clone + Debug;
 
@@ -2436,7 +2436,7 @@ pub struct PoolingOverlap<T> {
 /// Stream ordinals are architecture-owned. Implementations preserve pending,
 /// pooled, and overlap components through checkpoint, rollback, prompt-cache,
 /// resident, and paged realizations without exposing storage classes here.
-pub trait PoolingAttentionCache<T: Tensor>: Clone + Debug {
+pub trait PoolingAttentionCache<T: Tensor>: Debug {
     /// Backend snapshot preserving all local and pooling state.
     type Checkpoint: Clone + Debug;
 
@@ -2557,6 +2557,21 @@ pub trait NeuralBackend: Sized + 'static {
     ) -> Result<Self::Tensor, Error> {
         Err(Error::backend(
             "backend does not implement vocabulary-parallel projection",
+        ))
+    }
+    /// Projects through a rank-local vocabulary embedding and gathers complete logits.
+    ///
+    /// This is the tied-output counterpart of [`Self::vocabulary_parallel_project`]:
+    /// it preserves the embedding operator and its physical parameter storage while
+    /// using the same vocabulary ownership established at construction time.
+    fn vocabulary_parallel_embedding_project(
+        _embedding: &mut Self::Embedding,
+        _input: &Self::Tensor,
+        _parallel: &Self::ParallelContext,
+        _context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        Err(Error::backend(
+            "backend does not implement tied vocabulary-parallel projection",
         ))
     }
     /// Builds one RMS normalization operator.

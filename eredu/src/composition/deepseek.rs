@@ -13,13 +13,16 @@ use eredu_runtime::{
     LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, RuntimeState, WeightResidency,
 };
 use safemlx::{
+    distributed::Group,
     error::Exception,
     ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     Array, Stream,
 };
 
 use crate::backend::mlx::runtime::{
-    execution::layerwise::open_safetensors_weight_store, media::input,
+    distributed::parallel::ParallelBuildContext,
+    execution::layerwise::{open_safetensors_weight_store, shard_layer_bindings},
+    media::input,
 };
 use crate::backend::mlx::{
     error::Error,
@@ -40,7 +43,7 @@ use crate::backend::mlx::{
         checkpoint::store::open_gguf_checkpoint_source,
         execution::generic::{
             prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
-            MlxUnitFactory,
+            MlxUnitPopulator,
         },
         execution::layerwise::quantize_module_store_with_bindings,
         residency::expert_cache::{ExpertCache, ExpertCacheReport},
@@ -60,7 +63,7 @@ type V3Layerwise = LayerwiseRuntime<
     V3Architecture,
     MlxBackend,
     V3State,
-    MlxLayerwisePolicy<V3Unit, V3UnitFactory>,
+    MlxLayerwisePolicy<V3Unit, V3UnitPopulator>,
 >;
 
 type V4Architecture = deepseek::v4::Model<MlxBackend>;
@@ -71,8 +74,44 @@ type V4Layerwise = LayerwiseRuntime<
     V4Architecture,
     MlxBackend,
     V4State,
-    MlxLayerwisePolicy<V4Unit, V4UnitFactory>,
+    MlxLayerwisePolicy<V4Unit, V4UnitPopulator>,
 >;
+
+fn construct_v3_unit(
+    architecture: &V3Architecture,
+    ordinal: usize,
+    stream: &Stream,
+) -> Result<V3Unit, Error> {
+    let layout = execution_layout::<V3Architecture, V3State>(architecture)?;
+    let address = layout
+        .address(ordinal)
+        .ok_or_else(|| unsupported(format!("V3 unit ordinal {ordinal} is out of range")))?;
+    <V3Architecture as LayeredArchitecture<MlxBackend, V3State>>::build_unit(
+        architecture,
+        address.group(),
+        address.index(),
+        stream,
+    )
+    .map_err(neutral_error)
+}
+
+fn construct_v4_unit(
+    architecture: &V4Architecture,
+    ordinal: usize,
+    stream: &Stream,
+) -> Result<V4Unit, Error> {
+    let layout = execution_layout::<V4Architecture, V4State>(architecture)?;
+    let address = layout
+        .address(ordinal)
+        .ok_or_else(|| unsupported(format!("V4 unit ordinal {ordinal} is out of range")))?;
+    <V4Architecture as LayeredArchitecture<MlxBackend, V4State>>::build_unit(
+        architecture,
+        address.group(),
+        address.index(),
+        stream,
+    )
+    .map_err(neutral_error)
+}
 
 struct NeutralDeepSeekObserver<'a> {
     inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
@@ -102,28 +141,11 @@ impl eredu_runtime::ActivationObserver<Array, eredu_nn::Error> for NeutralDeepSe
 }
 
 #[derive(Clone)]
-struct V3UnitFactory {
-    args: V3Args,
+struct V3UnitPopulator {
     external_experts: bool,
 }
 
-impl MlxUnitFactory<V3Unit> for V3UnitFactory {
-    fn build(&mut self, ordinal: usize, stream: &Stream) -> Result<V3Unit, Error> {
-        let target = usize::try_from(self.args.num_hidden_layers)
-            .map_err(|_| unsupported("invalid V3 target layer count"))?;
-        if ordinal < target {
-            Ok(V3Unit::Target(
-                deepseek::block::V3Block::new(&self.args, ordinal, stream)
-                    .map_err(neutral_error)?,
-            ))
-        } else {
-            Ok(V3Unit::Prediction(
-                deepseek::mtp::V3PredictionLayer::new(&self.args, ordinal - target, stream)
-                    .map_err(neutral_error)?,
-            ))
-        }
-    }
-
+impl MlxUnitPopulator<V3Unit> for V3UnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<V3Unit>,
@@ -137,35 +159,11 @@ impl MlxUnitFactory<V3Unit> for V3UnitFactory {
 }
 
 #[derive(Clone)]
-struct V4UnitFactory {
-    args: V4Args,
+struct V4UnitPopulator {
     external_experts: bool,
 }
 
-impl MlxUnitFactory<V4Unit> for V4UnitFactory {
-    fn build(&mut self, ordinal: usize, stream: &Stream) -> Result<V4Unit, Error> {
-        let target = usize::try_from(self.args.num_hidden_layers)
-            .map_err(|_| unsupported("invalid V4 target layer count"))?;
-        if ordinal < target {
-            return Ok(V4Unit::Target(
-                deepseek::block::V4Block::new(&self.args, ordinal, stream)
-                    .map_err(neutral_error)?,
-            ));
-        }
-        let depth = ordinal - target;
-        if self.args.dspark.is_some() {
-            Ok(V4Unit::Dspark(
-                deepseek::block::V4Block::new_dspark(&self.args, ordinal, depth, stream)
-                    .map_err(neutral_error)?,
-            ))
-        } else {
-            Ok(V4Unit::Prediction(
-                deepseek::mtp::V4PredictionLayer::new(&self.args, depth, stream)
-                    .map_err(neutral_error)?,
-            ))
-        }
-    }
-
+impl MlxUnitPopulator<V4Unit> for V4UnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<V4Unit>,
@@ -201,6 +199,7 @@ enum DeepSeekModelInner {
         execution: V3Execution,
         expert_cache: Option<ExpertCache>,
         materialization: Option<eredu_runtime::WeightMaterializationReport>,
+        tensor_parallel: bool,
     },
     /// DeepSeek-V4 target and MTP/DSpark graph.
     V4 {
@@ -209,6 +208,7 @@ enum DeepSeekModelInner {
         execution: V4Execution,
         expert_cache: Option<ExpertCache>,
         materialization: Option<eredu_runtime::WeightMaterializationReport>,
+        tensor_parallel: bool,
     },
 }
 
@@ -345,14 +345,12 @@ impl DeepSeekModel {
         let mut architecture = V3Architecture::new(args.clone(), stream).map_err(neutral_error)?;
         let layout = execution_layout::<V3Architecture, V3State>(&architecture)?;
         let binding_args = args.clone();
-        let factory = V3UnitFactory {
-            args: args.clone(),
-            external_experts,
-        };
+        let factory = V3UnitPopulator { external_experts };
         let (policy, _metadata) = prepare_layerwise_policy_with_bindings(
             store,
-            architecture.static_modules_mut(),
+            &mut architecture,
             factory,
+            std::marker::PhantomData::<V3State>,
             layout,
             options,
             stream,
@@ -379,9 +377,9 @@ impl DeepSeekModel {
             },
         )?;
         let execution = if options.is_fully_resident() {
-            V3Execution::Resident(Box::new(LayerwiseRuntime::new(
+            V3Execution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
+                policy.into_resident(&architecture, stream, std::marker::PhantomData::<V3State>)?,
                 architecture,
-                policy.into_resident(stream)?,
             )))
         } else {
             V3Execution::Layerwise(Box::new(LayerwiseRuntime::new(architecture, policy)))
@@ -392,6 +390,7 @@ impl DeepSeekModel {
                 execution,
                 expert_cache: None,
                 materialization: None,
+                tensor_parallel: false,
             },
         })
     }
@@ -408,14 +407,12 @@ impl DeepSeekModel {
         let mut architecture = V4Architecture::new(args.clone(), stream).map_err(neutral_error)?;
         let layout = execution_layout::<V4Architecture, V4State>(&architecture)?;
         let binding_args = args.clone();
-        let factory = V4UnitFactory {
-            args: args.clone(),
-            external_experts,
-        };
+        let factory = V4UnitPopulator { external_experts };
         let (policy, _metadata) = prepare_layerwise_policy_with_bindings(
             store,
-            architecture.static_modules_mut(),
+            &mut architecture,
             factory,
+            std::marker::PhantomData::<V4State>,
             layout,
             options,
             stream,
@@ -448,9 +445,9 @@ impl DeepSeekModel {
             },
         )?;
         let execution = if options.is_fully_resident() {
-            V4Execution::Resident(Box::new(LayerwiseRuntime::new(
+            V4Execution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
+                policy.into_resident(&architecture, stream, std::marker::PhantomData::<V4State>)?,
                 architecture,
-                policy.into_resident(stream)?,
             )))
         } else {
             V4Execution::Layerwise(Box::new(LayerwiseRuntime::new(architecture, policy)))
@@ -461,37 +458,190 @@ impl DeepSeekModel {
                 execution,
                 expert_cache: None,
                 materialization: None,
+                tensor_parallel: false,
+            },
+        })
+    }
+
+    /// Loads tensor-partitioned V3 nonexpert weights while leaving routed
+    /// experts to an external EP provider.
+    pub(crate) fn load_v3_external_expert_parallel(
+        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        args: V3Args,
+        options: LayerWeightResidency,
+        build: ParallelBuildContext,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> Result<Self, Error> {
+        let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
+            .map_err(|_| unsupported("invalid V3 unit count"))?;
+        let mut planner = build.planner();
+        for group in deepseek::parallel::v3_static_parameter_groups(&args)? {
+            planner.register(group)?;
+        }
+        for layer in 0..total {
+            for group in deepseek::parallel::v3_layer_parameter_groups(&args, layer)? {
+                planner.register(group)?;
+            }
+        }
+        let (_, layout) = planner.finish()?;
+        let geometry = deepseek::parallel::v3_local_geometry(&args, &layout)?;
+        let global = V3Architecture::new(args.clone(), stream).map_err(neutral_error)?;
+        let global_static = global.static_modules().clone();
+        let mut architecture =
+            V3Architecture::new_parallel(args.clone(), geometry, stream).map_err(neutral_error)?;
+        let factory = V3UnitPopulator {
+            external_experts: true,
+        };
+        let static_layout = Arc::new(layout);
+        let unit_layout = Arc::clone(&static_layout);
+        let binding_args = args.clone();
+        let runtime_layout = execution_layout::<V3Architecture, V3State>(&architecture)?;
+        let (policy, _metadata) = prepare_layerwise_policy_with_bindings(
+            store,
+            &mut architecture,
+            factory,
+            std::marker::PhantomData::<V3State>,
+            runtime_layout,
+            options,
+            stream,
+            weights_stream,
+            |key| {
+                key.starts_with("rope_freqs.")
+                    || key.ends_with("rotary_emb.inv_freq")
+                    || key.contains(".mlp.experts.")
+            },
+            move |_modules, store| {
+                let bindings =
+                    build_module_bindings(&MlxModule::new(global_static.clone()), "", store)?;
+                shard_layer_bindings(bindings, "", store, &static_layout)
+            },
+            move |ordinal, _unit, store, stream| {
+                let probe = new_v3_unit(&binding_args, ordinal, true, stream)?;
+                let bindings = v3_unit_bindings(&binding_args, ordinal, &probe, store, true)?;
+                shard_layer_bindings(bindings, "", store, &unit_layout)
+            },
+        )?;
+        let execution = if options.is_fully_resident() {
+            V3Execution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
+                policy.into_resident(&architecture, stream, std::marker::PhantomData::<V3State>)?,
+                architecture,
+            )))
+        } else {
+            V3Execution::Layerwise(Box::new(LayerwiseRuntime::new(architecture, policy)))
+        };
+        Ok(Self {
+            inner: DeepSeekModelInner::V3 {
+                args,
+                execution,
+                expert_cache: None,
+                materialization: None,
+                tensor_parallel: true,
+            },
+        })
+    }
+
+    /// Loads tensor-partitioned V4 nonexpert weights while leaving routed
+    /// experts to an external EP provider.
+    pub(crate) fn load_v4_external_expert_parallel(
+        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        args: V4Args,
+        options: LayerWeightResidency,
+        build: ParallelBuildContext,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> Result<Self, Error> {
+        let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
+            .map_err(|_| unsupported("invalid V4 unit count"))?;
+        let mut planner = build.planner();
+        for group in deepseek::parallel::v4_static_parameter_groups(&args)? {
+            planner.register(group)?;
+        }
+        for layer in 0..total {
+            for group in deepseek::parallel::v4_layer_parameter_groups(&args, layer)? {
+                planner.register(group)?;
+            }
+        }
+        let (_, layout) = planner.finish()?;
+        let geometry = deepseek::parallel::v4_local_geometry(&args, &layout)?;
+        let global = V4Architecture::new(args.clone(), stream).map_err(neutral_error)?;
+        let global_static = global.static_modules().clone();
+        let mut architecture =
+            V4Architecture::new_parallel(args.clone(), geometry, stream).map_err(neutral_error)?;
+        let factory = V4UnitPopulator {
+            external_experts: true,
+        };
+        let static_layout = Arc::new(layout);
+        let unit_layout = Arc::clone(&static_layout);
+        let binding_args = args.clone();
+        let runtime_layout = execution_layout::<V4Architecture, V4State>(&architecture)?;
+        let (policy, _metadata) = prepare_layerwise_policy_with_bindings(
+            store,
+            &mut architecture,
+            factory,
+            std::marker::PhantomData::<V4State>,
+            runtime_layout,
+            options,
+            stream,
+            weights_stream,
+            |key| {
+                key.ends_with("rotary_emb.inv_freq")
+                    || key.contains(".switch_mlp.")
+                    || key.contains(".expert_banks.")
+                    || key.contains(".ffn.experts.")
+            },
+            move |_modules, store| {
+                let bindings =
+                    build_module_bindings(&MlxModule::new(global_static.clone()), "", store)?;
+                shard_layer_bindings(bindings, "", store, &static_layout)
+            },
+            move |ordinal, _unit, store, stream| {
+                let probe = new_v4_unit(&binding_args, ordinal, true, stream)?;
+                let bindings = v4_unit_bindings(&binding_args, ordinal, &probe, store, true)?;
+                shard_layer_bindings(bindings, "", store, &unit_layout)
+            },
+        )?;
+        let execution = if options.is_fully_resident() {
+            V4Execution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
+                policy.into_resident(&architecture, stream, std::marker::PhantomData::<V4State>)?,
+                architecture,
+            )))
+        } else {
+            V4Execution::Layerwise(Box::new(LayerwiseRuntime::new(architecture, policy)))
+        };
+        Ok(Self {
+            inner: DeepSeekModelInner::V4 {
+                args,
+                execution,
+                expert_cache: None,
+                materialization: None,
+                tensor_parallel: true,
             },
         })
     }
 
     /// Allocates resident state directly from the architecture layout.
     pub fn new_state(&self) -> Result<DeepSeekState, Error> {
+        let layout = self.state_layout()?;
         match &self.inner {
             DeepSeekModelInner::V3 { args, .. } => Ok(DeepSeekState {
-                inner: DeepSeekStateInner::V3(DeviceState::create(
-                    deepseek::v3::state_layout(args).map_err(neutral_error)?,
-                    |_, _| Ok::<_, Error>(CompressedLatentCache::new()),
-                )?),
+                inner: DeepSeekStateInner::V3(DeviceState::create(layout, |_, _| {
+                    Ok::<_, Error>(CompressedLatentCache::new())
+                })?),
                 target_layers: args.num_hidden_layers as usize,
             }),
             DeepSeekModelInner::V4 { args, .. } => {
                 let state_args = args.clone();
                 Ok(DeepSeekState {
-                    inner: DeepSeekStateInner::V4(DeviceState::create(
-                        deepseek::v4::state_layout(args).map_err(neutral_error)?,
-                        move |layer, _| {
-                            let ratio = match state_args.attention_policy(layer) {
-                                Some(V4AttentionPolicy::Local) => 0,
-                                Some(V4AttentionPolicy::Compressed { ratio }) => ratio,
-                                None => {
-                                    return Err(unsupported("missing V4 state attention policy"))
-                                }
-                            };
-                            MlxPoolingAttentionCache::resident(ratio, state_args.sliding_window)
-                                .map_err(Into::into)
-                        },
-                    )?),
+                    inner: DeepSeekStateInner::V4(DeviceState::create(layout, move |layer, _| {
+                        let ratio = match state_args.attention_policy(layer) {
+                            Some(V4AttentionPolicy::Local) => 0,
+                            Some(V4AttentionPolicy::Compressed { ratio }) => ratio,
+                            None => return Err(unsupported("missing V4 state attention policy")),
+                        };
+                        MlxPoolingAttentionCache::resident(ratio, state_args.sliding_window)
+                            .map_err(Into::into)
+                    })?),
                     target_layers: args.num_hidden_layers as usize,
                 })
             }
@@ -518,41 +668,34 @@ impl DeepSeekModel {
         prefix_tokens: i32,
         rank: Option<crate::core::cache::CacheRankIdentity>,
     ) -> Result<DeepSeekState, Error> {
+        let layout = self.state_layout()?;
         match &self.inner {
             DeepSeekModelInner::V3 { args, .. } => Ok(DeepSeekState {
-                inner: DeepSeekStateInner::V3(DeviceState::create(
-                    deepseek::v3::state_layout(args).map_err(neutral_error)?,
-                    |layer, _| {
-                        CompressedLatentCache::new_paged(manager.clone(), layer, rank)
-                            .map_err(Error::from)
-                    },
-                )?),
+                inner: DeepSeekStateInner::V3(DeviceState::create(layout, |layer, _| {
+                    CompressedLatentCache::new_paged(manager.clone(), layer, rank)
+                        .map_err(Error::from)
+                })?),
                 target_layers: args.num_hidden_layers as usize,
             }),
             DeepSeekModelInner::V4 { args, .. } => {
                 let state_args = args.clone();
                 Ok(DeepSeekState {
-                    inner: DeepSeekStateInner::V4(DeviceState::create(
-                        deepseek::v4::state_layout(args).map_err(neutral_error)?,
-                        move |layer, _| {
-                            let ratio = match state_args.attention_policy(layer) {
-                                Some(V4AttentionPolicy::Local) => 0,
-                                Some(V4AttentionPolicy::Compressed { ratio }) => ratio,
-                                None => {
-                                    return Err(unsupported("missing V4 state attention policy"))
-                                }
-                            };
-                            MlxPoolingAttentionCache::paged(
-                                ratio,
-                                state_args.sliding_window,
-                                manager.clone(),
-                                layer,
-                                prefix_tokens,
-                                rank,
-                            )
-                            .map_err(Error::from)
-                        },
-                    )?),
+                    inner: DeepSeekStateInner::V4(DeviceState::create(layout, move |layer, _| {
+                        let ratio = match state_args.attention_policy(layer) {
+                            Some(V4AttentionPolicy::Local) => 0,
+                            Some(V4AttentionPolicy::Compressed { ratio }) => ratio,
+                            None => return Err(unsupported("missing V4 state attention policy")),
+                        };
+                        MlxPoolingAttentionCache::paged(
+                            ratio,
+                            state_args.sliding_window,
+                            manager.clone(),
+                            layer,
+                            prefix_tokens,
+                            rank,
+                        )
+                        .map_err(Error::from)
+                    })?),
                     target_layers: args.num_hidden_layers as usize,
                 })
             }
@@ -833,6 +976,124 @@ impl DeepSeekModel {
         }
     }
 
+    fn run_v3_parallel_with_provider<'a, P>(
+        execution: &mut V3Execution,
+        input: deepseek::mtp::EmbeddedInput<'a, Array>,
+        state: &mut V3State,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        group: &Group,
+        stream: &Stream,
+    ) -> Result<(Array, deepseek::v3::ForwardContext<Array>), Error>
+    where
+        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P::Error: std::fmt::Display,
+    {
+        let hook = |architecture: &mut V3Architecture,
+                    group_index,
+                    index,
+                    unit: &mut V3Unit,
+                    hidden: &Array,
+                    state: &mut V3State,
+                    forward: &mut deepseek::v3::ForwardContext<Array>,
+                    parallel: &Group,
+                    context: &Stream| {
+            architecture.forward_unit_parallel_with_provider(
+                group_index,
+                index,
+                unit,
+                hidden,
+                state,
+                forward,
+                pass,
+                parallel,
+                provider,
+                context,
+            )
+        };
+        match execution {
+            V3Execution::Resident(runtime) => runtime
+                .forward_parallel_with_unit_executor_and_context_hook(
+                    input,
+                    state,
+                    group,
+                    stream,
+                    hook,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(runtime_error),
+            V3Execution::Layerwise(runtime) => runtime
+                .forward_parallel_with_unit_executor_and_context_hook(
+                    input,
+                    state,
+                    group,
+                    stream,
+                    hook,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(runtime_error),
+        }
+    }
+
+    fn run_v4_parallel_with_provider<'a, P>(
+        execution: &mut V4Execution,
+        input: deepseek::mtp::EmbeddedInput<'a, Array>,
+        state: &mut V4State,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        group: &Group,
+        stream: &Stream,
+    ) -> Result<(Array, deepseek::v4::ForwardContext<Array>), Error>
+    where
+        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P::Error: std::fmt::Display,
+    {
+        let hook = |architecture: &mut V4Architecture,
+                    group_index,
+                    index,
+                    unit: &mut V4Unit,
+                    hidden: &Array,
+                    state: &mut V4State,
+                    forward: &mut deepseek::v4::ForwardContext<Array>,
+                    parallel: &Group,
+                    context: &Stream| {
+            architecture.forward_unit_parallel_with_provider(
+                group_index,
+                index,
+                unit,
+                hidden,
+                state,
+                forward,
+                pass,
+                parallel,
+                provider,
+                context,
+            )
+        };
+        match execution {
+            V4Execution::Resident(runtime) => runtime
+                .forward_parallel_with_unit_executor_and_context_hook(
+                    input,
+                    state,
+                    group,
+                    stream,
+                    hook,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(runtime_error),
+            V4Execution::Layerwise(runtime) => runtime
+                .forward_parallel_with_unit_executor_and_context_hook(
+                    input,
+                    state,
+                    group,
+                    stream,
+                    hook,
+                    |_, _, _| Ok(()),
+                )
+                .map_err(runtime_error),
+        }
+    }
+
     pub(crate) fn forward_with_expert_executor<F>(
         &mut self,
         tokens: &Array,
@@ -877,6 +1138,67 @@ impl DeepSeekModel {
             }
             _ => Err(unsupported(
                 "DeepSeek model and state families do not match",
+            )),
+        }
+    }
+
+    pub(crate) fn forward_tensor_expert_parallel<F>(
+        &mut self,
+        tokens: &Array,
+        state: &mut DeepSeekState,
+        tensor_group: &Group,
+        execute: &mut F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let pass = if tokens.dim(1) > 1 {
+            eredu_runtime::ExpertPass::Prefill
+        } else {
+            eredu_runtime::ExpertPass::Decode
+        };
+        let mut provider =
+            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
+                execute,
+            );
+        match (&mut self.inner, &mut state.inner) {
+            (
+                DeepSeekModelInner::V3 {
+                    execution,
+                    tensor_parallel: true,
+                    ..
+                },
+                DeepSeekStateInner::V3(state),
+            ) => Self::run_v3_parallel_with_provider(
+                execution,
+                deepseek::mtp::EmbeddedInput::target(tokens, None),
+                state,
+                pass,
+                &mut provider,
+                tensor_group,
+                stream,
+            )
+            .map(|(logits, _)| logits),
+            (
+                DeepSeekModelInner::V4 {
+                    execution,
+                    tensor_parallel: true,
+                    ..
+                },
+                DeepSeekStateInner::V4(state),
+            ) => Self::run_v4_parallel_with_provider(
+                execution,
+                deepseek::mtp::EmbeddedInput::target(tokens, None),
+                state,
+                pass,
+                &mut provider,
+                tensor_group,
+                stream,
+            )
+            .map(|(logits, _)| logits),
+            _ => Err(Error::Parallel(
+                "DeepSeek model/state was not loaded for tensor plus expert parallelism".into(),
             )),
         }
     }
@@ -1370,6 +1692,98 @@ impl DeepSeekModel {
         }
     }
 
+    pub(crate) fn forward_embedded_tensor_expert_parallel<'a, F>(
+        &mut self,
+        input: deepseek::mtp::EmbeddedInput<'a, Array>,
+        state: &mut DeepSeekState,
+        tensor_group: &Group,
+        execute: &mut F,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let pass = match &input {
+            deepseek::mtp::EmbeddedInput::Target { tokens, .. }
+            | deepseek::mtp::EmbeddedInput::Draft { tokens, .. } => {
+                if tokens.dim(1) > 1 {
+                    eredu_runtime::ExpertPass::Prefill
+                } else {
+                    eredu_runtime::ExpertPass::Decode
+                }
+            }
+            deepseek::mtp::EmbeddedInput::DsparkContext { .. } => {
+                eredu_runtime::ExpertPass::Prefill
+            }
+            deepseek::mtp::EmbeddedInput::DsparkProposal { capacity, .. } => {
+                if *capacity > 1 {
+                    eredu_runtime::ExpertPass::Prefill
+                } else {
+                    eredu_runtime::ExpertPass::Decode
+                }
+            }
+        };
+        let mut provider =
+            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
+                execute,
+            );
+        match (&mut self.inner, &mut state.inner) {
+            (
+                DeepSeekModelInner::V3 {
+                    execution,
+                    tensor_parallel: true,
+                    ..
+                },
+                DeepSeekStateInner::V3(state),
+            ) => {
+                let (logits, context) = Self::run_v3_parallel_with_provider(
+                    execution,
+                    input,
+                    state,
+                    pass,
+                    &mut provider,
+                    tensor_group,
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))?;
+                let hidden = context
+                    .target_capture()
+                    .or_else(|| context.draft_hidden())
+                    .cloned()
+                    .unwrap_or_else(|| logits.clone());
+                Ok((logits, hidden))
+            }
+            (
+                DeepSeekModelInner::V4 {
+                    execution,
+                    tensor_parallel: true,
+                    ..
+                },
+                DeepSeekStateInner::V4(state),
+            ) => {
+                let (logits, context) = Self::run_v4_parallel_with_provider(
+                    execution,
+                    input,
+                    state,
+                    pass,
+                    &mut provider,
+                    tensor_group,
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))?;
+                let hidden = context
+                    .target_capture()
+                    .or_else(|| context.draft_hidden())
+                    .cloned()
+                    .unwrap_or_else(|| logits.clone());
+                Ok((logits, hidden))
+            }
+            _ => Err(Exception::custom(
+                "DeepSeek embedded model/state was not loaded for TP+EP",
+            )),
+        }
+    }
+
     /// Returns the normalized family model type.
     pub fn model_type(&self) -> &str {
         match &self.inner {
@@ -1402,12 +1816,16 @@ impl DeepSeekModel {
 
     pub(crate) fn state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
         match &self.inner {
-            DeepSeekModelInner::V3 { args, .. } => {
-                deepseek::v3::state_layout(args).map_err(neutral_error)
+            DeepSeekModelInner::V3 { execution, .. } => match execution {
+                V3Execution::Resident(runtime) => runtime.architecture().runtime_state_layout(),
+                V3Execution::Layerwise(runtime) => runtime.architecture().runtime_state_layout(),
             }
-            DeepSeekModelInner::V4 { args, .. } => {
-                deepseek::v4::state_layout(args).map_err(neutral_error)
+            .map_err(neutral_error),
+            DeepSeekModelInner::V4 { execution, .. } => match execution {
+                V4Execution::Resident(runtime) => runtime.architecture().runtime_state_layout(),
+                V4Execution::Layerwise(runtime) => runtime.architecture().runtime_state_layout(),
             }
+            .map_err(neutral_error),
         }
     }
 
@@ -1889,14 +2307,6 @@ pub(crate) fn quantize_v3_store(
             .ok_or_else(|| unsupported("V3 quantization unit count overflowed"))?,
     )
     .map_err(|_| unsupported("invalid V3 quantization unit count"))?;
-    let mut source_factory = V3UnitFactory {
-        args: source_args.clone(),
-        external_experts: false,
-    };
-    let mut target_factory = V3UnitFactory {
-        args: target_args.clone(),
-        external_experts: false,
-    };
     let binding_args = source_args.clone();
     let source_static = MlxModule::new(source.static_modules().clone());
     let target_static = MlxModule::new(target.static_modules().clone());
@@ -1904,8 +2314,8 @@ pub(crate) fn quantize_v3_store(
         store,
         &source_static,
         &target_static,
-        move |index, stream| source_factory.build(index, stream).map(MlxModule::new),
-        move |index, stream| target_factory.build(index, stream).map(MlxModule::new),
+        move |index, stream| construct_v3_unit(&source, index, stream).map(MlxModule::new),
+        move |index, stream| construct_v3_unit(&target, index, stream).map(MlxModule::new),
         count,
         quantization,
         stream,
@@ -1969,14 +2379,6 @@ pub(crate) fn quantize_v4_store(
         .map_err(|error| unsupported(error.to_string()))?;
     let source = V4Architecture::new(source_args.clone(), stream).map_err(neutral_error)?;
     let target = V4Architecture::new(target_args.clone(), stream).map_err(neutral_error)?;
-    let mut source_factory = V4UnitFactory {
-        args: source_args.clone(),
-        external_experts: false,
-    };
-    let mut target_factory = V4UnitFactory {
-        args: target_args.clone(),
-        external_experts: false,
-    };
     let binding_args = source_args.clone();
     let source_static = MlxModule::new(source.static_modules().clone());
     let target_static = MlxModule::new(target.static_modules().clone());
@@ -1984,8 +2386,8 @@ pub(crate) fn quantize_v4_store(
         store,
         &source_static,
         &target_static,
-        move |index, stream| source_factory.build(index, stream).map(MlxModule::new),
-        move |index, stream| target_factory.build(index, stream).map(MlxModule::new),
+        move |index, stream| construct_v4_unit(&source, index, stream).map(MlxModule::new),
+        move |index, stream| construct_v4_unit(&target, index, stream).map(MlxModule::new),
         total,
         quantization,
         stream,
@@ -2017,6 +2419,7 @@ pub(crate) fn load_safetensors(
         residency,
         quantization,
         false,
+        None,
         stream,
         weights_stream,
     )
@@ -2034,6 +2437,26 @@ pub(crate) fn load_safetensors_external_experts(
         WeightResidency::with_layers(residency),
         quantization,
         true,
+        None,
+        stream,
+        weights_stream,
+    )
+}
+
+pub(crate) fn load_safetensors_external_experts_parallel(
+    model_dir: &Path,
+    residency: LayerWeightResidency,
+    quantization: Option<WeightQuantization>,
+    build: ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<DeepSeekModel, Error> {
+    load_safetensors_internal(
+        model_dir,
+        WeightResidency::with_layers(residency),
+        quantization,
+        true,
+        Some(build),
         stream,
         weights_stream,
     )
@@ -2044,6 +2467,7 @@ fn load_safetensors_internal(
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     force_external_experts: bool,
+    parallel: Option<ParallelBuildContext>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekModel, Error> {
@@ -2065,14 +2489,24 @@ fn load_safetensors_internal(
                 }
                 None => (store, args, None),
             };
-            let mut model = DeepSeekModel::load_v3(
-                store,
-                args,
-                residency.layers(),
-                stream,
-                weights_stream,
-                force_external_experts || expert_options.is_some(),
-            )?;
+            let mut model = match parallel {
+                Some(build) => DeepSeekModel::load_v3_external_expert_parallel(
+                    store,
+                    args,
+                    residency.layers(),
+                    build,
+                    stream,
+                    weights_stream,
+                )?,
+                None => DeepSeekModel::load_v3(
+                    store,
+                    args,
+                    residency.layers(),
+                    stream,
+                    weights_stream,
+                    force_external_experts || expert_options.is_some(),
+                )?,
+            };
             if !force_external_experts {
                 if let Some(options) = expert_options {
                     model.attach_expert_cache(options, stream, weights_stream)?;
@@ -2096,14 +2530,24 @@ fn load_safetensors_internal(
                 }
                 None => (store, args, None),
             };
-            let mut model = DeepSeekModel::load_v4(
-                store,
-                args,
-                residency.layers(),
-                stream,
-                weights_stream,
-                force_external_experts || expert_options.is_some(),
-            )?;
+            let mut model = match parallel {
+                Some(build) => DeepSeekModel::load_v4_external_expert_parallel(
+                    store,
+                    args,
+                    residency.layers(),
+                    build,
+                    stream,
+                    weights_stream,
+                )?,
+                None => DeepSeekModel::load_v4(
+                    store,
+                    args,
+                    residency.layers(),
+                    stream,
+                    weights_stream,
+                    force_external_experts || expert_options.is_some(),
+                )?,
+            };
             if !force_external_experts {
                 if let Some(options) = expert_options {
                     model.attach_expert_cache(options, stream, weights_stream)?;
@@ -2135,6 +2579,7 @@ pub(crate) fn load_gguf(
         family_v4,
         residency,
         false,
+        None,
         stream,
         weights_stream,
     )
@@ -2154,6 +2599,28 @@ pub(crate) fn load_gguf_external_experts(
         family_v4,
         WeightResidency::with_layers(residency),
         true,
+        None,
+        stream,
+        weights_stream,
+    )
+}
+
+pub(crate) fn load_gguf_external_experts_parallel(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    family_v4: bool,
+    residency: LayerWeightResidency,
+    build: ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(DeepSeekModel, Vec<u32>), Error> {
+    load_gguf_internal(
+        checkpoint,
+        metadata,
+        family_v4,
+        WeightResidency::with_layers(residency),
+        true,
+        Some(build),
         stream,
         weights_stream,
     )
@@ -2165,6 +2632,7 @@ fn load_gguf_internal(
     family_v4: bool,
     residency: WeightResidency,
     force_external_experts: bool,
+    parallel: Option<ParallelBuildContext>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(DeepSeekModel, Vec<u32>), Error> {
@@ -2213,14 +2681,24 @@ fn load_gguf_internal(
             deepseek::translate_v4_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
-        DeepSeekModel::load_v4(
-            store,
-            args,
-            options,
-            stream,
-            weights_stream,
-            force_external_experts || expert_options.is_some(),
-        )?
+        match parallel {
+            Some(build) => DeepSeekModel::load_v4_external_expert_parallel(
+                store,
+                args,
+                options,
+                build,
+                stream,
+                weights_stream,
+            )?,
+            None => DeepSeekModel::load_v4(
+                store,
+                args,
+                options,
+                stream,
+                weights_stream,
+                force_external_experts || expert_options.is_some(),
+            )?,
+        }
     } else {
         let catalog = PortableCatalog(checkpoint.catalog());
         let mut args = deepseek::parse_v3_gguf(&catalog, &portable_metadata)
@@ -2248,14 +2726,24 @@ fn load_gguf_internal(
             deepseek::translate_v3_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
-        DeepSeekModel::load_v3(
-            store,
-            args,
-            options,
-            stream,
-            weights_stream,
-            force_external_experts || expert_options.is_some(),
-        )?
+        match parallel {
+            Some(build) => DeepSeekModel::load_v3_external_expert_parallel(
+                store,
+                args,
+                options,
+                build,
+                stream,
+                weights_stream,
+            )?,
+            None => DeepSeekModel::load_v3(
+                store,
+                args,
+                options,
+                stream,
+                weights_stream,
+                force_external_experts || expert_options.is_some(),
+            )?,
+        }
     };
     let mut model = model;
     if !force_external_experts {
@@ -2391,14 +2879,11 @@ fn v4_unit_recipes(
 pub(crate) fn new_v3_unit(
     args: &V3Args,
     ordinal: usize,
-    external_experts: bool,
+    _external_experts: bool,
     stream: &Stream,
 ) -> Result<MlxModule<V3Unit>, Error> {
-    let mut factory = V3UnitFactory {
-        args: args.clone(),
-        external_experts,
-    };
-    factory.build(ordinal, stream).map(MlxModule::new)
+    let architecture = V3Architecture::new(args.clone(), stream).map_err(neutral_error)?;
+    construct_v3_unit(&architecture, ordinal, stream).map(MlxModule::new)
 }
 
 /// Builds exact checkpoint bindings for one neutral V3 execution unit.
@@ -2421,14 +2906,11 @@ pub(crate) fn v3_unit_bindings(
 pub(crate) fn new_v4_unit(
     args: &V4Args,
     ordinal: usize,
-    external_experts: bool,
+    _external_experts: bool,
     stream: &Stream,
 ) -> Result<MlxModule<V4Unit>, Error> {
-    let mut factory = V4UnitFactory {
-        args: args.clone(),
-        external_experts,
-    };
-    factory.build(ordinal, stream).map(MlxModule::new)
+    let architecture = V4Architecture::new(args.clone(), stream).map_err(neutral_error)?;
+    construct_v4_unit(&architecture, ordinal, stream).map(MlxModule::new)
 }
 
 /// Builds exact checkpoint bindings for one neutral V4 execution unit.

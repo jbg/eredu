@@ -1,14 +1,62 @@
 //! Semantic TP/PP/EP placement for neutral GPT-OSS blocks.
 
-use eredu_nn::RoutedNeuralBackend;
+use eredu_nn::{RoutedNeuralBackend, Tensor};
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
+    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, MemberSharding,
+    OwnedParameterGroupSpec, ParallelPlanError, ParameterGroupOwner, ParameterGroupSpec,
+    ParameterRole,
 };
 
 use crate::decoder::{block_common_parallel_parameter_groups, static_parallel_parameter_groups};
 
 use super::{block::TransformerBlock, config::ModelArgs};
+
+/// Describes GPT-OSS pinned parameters and every decoder unit with explicit
+/// architecture-global ownership.
+pub fn parameter_description<B: RoutedNeuralBackend>(
+    model: &super::LayeredModel<B>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
+    let graph = ExecutionGraph::chain(["text_decoder"])
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let count = usize::try_from(model.args().num_hidden_layers)
+        .map_err(|_| ParallelPlanError::InvalidGroup("GPT-OSS layer count exceeds usize".into()))?;
+    let layout = ExecutionUnitLayout::new(&graph, [count])
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+    let static_groups = static_parameter_groups(model.static_modules(), model.args())?;
+    let mut expected = static_groups.clone();
+    let mut owned = static_groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, group)| {
+            OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::static_role(match index {
+                    0 => "embedding",
+                    1 => "norm",
+                    _ => "output",
+                }),
+                group,
+            )
+        })
+        .collect::<Vec<_>>();
+    let owner_group = layout.group_id(0).expect("GPT-OSS decoder group").clone();
+    for index in 0..count {
+        let unit = model
+            .construct_unit(index, context)
+            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        let groups = layer_parallel_parameter_groups(&unit, model.args(), index)?;
+        expected.extend(groups.iter().cloned());
+        owned.extend(groups.into_iter().map(|group| {
+            OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit(owner_group.clone(), index),
+                group,
+            )
+        }));
+    }
+    ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
+        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))
+}
 
 fn expert_member_sharding(
     name: &str,
@@ -105,7 +153,12 @@ pub fn local_block_args(
     })?;
     let head_dim = usize::try_from(args.head_dim)
         .map_err(|_| ParallelPlanError::InvalidTensor("GPT-OSS head width exceeds usize".into()))?;
-    if head_dim == 0 || query_width % head_dim != 0 || key_width % head_dim != 0 {
+    if head_dim == 0
+        || query_width == 0
+        || key_width == 0
+        || query_width % head_dim != 0
+        || key_width % head_dim != 0
+    {
         return Err(ParallelPlanError::InvalidTensor(format!(
             "local GPT-OSS attention widths q={query_width}, k={key_width} split head width {head_dim}"
         )));
@@ -113,7 +166,11 @@ pub fn local_block_args(
 
     let gate_up = tensor(&format!("{prefix}.mlp.experts.gate_up_proj"))?;
     let gate_up_shape = gate_up.local_shape();
-    if gate_up_shape.len() < 2 || gate_up_shape[1] % 2 != 0 {
+    if gate_up_shape.len() < 2
+        || gate_up_shape[0] == 0
+        || gate_up_shape[1] == 0
+        || gate_up_shape[1] % 2 != 0
+    {
         return Err(ParallelPlanError::InvalidTensor(format!(
             "local GPT-OSS gate/up shape {gate_up_shape:?} is not [experts, 2*intermediate, ...]"
         )));
@@ -142,6 +199,17 @@ pub fn local_key_value_heads(
     (0..args.num_hidden_layers as usize)
         .map(|layer| Ok(local_block_args(args, layer, layout)?.num_key_value_heads))
         .collect()
+}
+
+/// Complete rank-local geometry for the canonical neutral GPT-OSS model.
+pub type LocalGeometry = crate::decoder::LocalGeometry<ModelArgs>;
+
+/// Derives GPT-OSS unit, vocabulary, and state geometry from one typed plan.
+pub fn local_geometry(
+    args: &ModelArgs,
+    layout: &eredu_runtime::LocalModelLayout,
+) -> Result<LocalGeometry, ParallelPlanError> {
+    crate::decoder::local_geometry(args, layout, local_block_args)
 }
 
 #[cfg(test)]

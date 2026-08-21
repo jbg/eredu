@@ -18,15 +18,17 @@ use eredu_nn::{
     RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_bindings, CollectiveBackend, CompositeLayeredTraversalHook,
-    DeviceState, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, LayeredArchitecture,
-    LayeredForwardState, LayeredTraversalHook, LayeredTraversalPoint, LayeredUnitAction,
-    LayerwisePolicy, LayerwiseRuntime, ParameterBackend, PenaltyConfig, PredictionDirective,
-    ResettableRuntimeLayerState, ResettableRuntimeState, ResidentRuntime, RuntimeLayerState,
-    Sampler, SamplingBackend, SequentialDecisionBoundary, SequentialDecisionDriver,
-    SequentialDecisionError, SequentialDecisionPlan, SequentialDecisionSource,
-    SequentialDecisionTraversal, StateError, StateLayout, StateSegmentId, StateSegmentLifetime,
-    StateSegmentSpec, SubmissionBackend, TokenDomain, TransferBackend, WeightBinding,
+    bind_materialized_unit, materialize_bindings, ArchitecturePartition,
+    ArchitecturePartitionError, CollectiveBackend, CompositeLayeredTraversalHook, DeviceState,
+    ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
+    LayeredArchitecture, LayeredForwardState, LayeredTraversalHook, LayeredTraversalPoint,
+    LayeredUnitAction, LayerwisePolicy, LayerwiseRuntime, ParameterBackend, PartitionOwnership,
+    PenaltyConfig, PredictionDirective, ResettableRuntimeLayerState, ResettableRuntimeState,
+    ResidentRuntime, RuntimeLayerState, Sampler, SamplingBackend, SequentialDecisionBoundary,
+    SequentialDecisionDriver, SequentialDecisionError, SequentialDecisionPlan,
+    SequentialDecisionSource, SequentialDecisionTraversal, StateError, StateLayout, StateSegmentId,
+    StateSegmentLifetime, StateSegmentSpec, SubmissionBackend, TokenDomain, TransferBackend,
+    WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -809,19 +811,24 @@ impl LayerwisePolicy<FakeBackend, FakeUnit> for RecordingPolicy {
         Ok(())
     }
 
-    fn acquire(
+    fn acquire<E, F>(
         &mut self,
         ordinal: usize,
         address: ExecutionUnitAddress,
+        _: F,
         _: &(),
-    ) -> Result<Self::Lease, Self::Error> {
+    ) -> Result<Self::Lease, eredu_runtime::LayerwiseAcquireError<E, Self::Error>>
+    where
+        F: FnOnce(&()) -> Result<FakeUnit, E>,
+    {
         self.addresses
             .push((ordinal, address.group(), address.index()));
         let unit = self
             .units
             .get_mut(ordinal)
             .and_then(Option::take)
-            .ok_or("invalid fixture acquisition")?;
+            .ok_or("invalid fixture acquisition")
+            .map_err(eredu_runtime::LayerwiseAcquireError::Policy)?;
         Ok(RecordingLease { ordinal, unit })
     }
 
@@ -987,6 +994,53 @@ impl LayeredArchitecture<FakeBackend, DeviceState<FakeBackend, FakeLayerState>> 
     ) -> Self::RetainedContextValues<'a> {
         std::iter::empty()
     }
+}
+
+#[test]
+fn architecture_partition_is_derived_from_and_revalidates_neutral_topology() {
+    type FixtureState = DeviceState<FakeBackend, FakeLayerState>;
+
+    let architecture = GroupedFixture {
+        static_modules: FakeOperator,
+        trace: Vec::new(),
+    };
+    let ownership = PartitionOwnership::new(true, false, ["embedding"]).expect("valid ownership");
+    let partition =
+        ArchitecturePartition::<(), ()>::from_architecture::<FakeBackend, FixtureState, _, _>(
+            &architecture,
+            [("vision", 0..1), ("text", 0..2)],
+            ownership.clone(),
+            None,
+            (),
+            (),
+            std::iter::empty(),
+        )
+        .expect("partition derives its canonical graph");
+    partition
+        .validate_architecture::<FakeBackend, FixtureState, _>(&architecture)
+        .expect("derived partition revalidates");
+
+    // The group names and counts still match, but the dependencies do not.
+    // Name-only validation would incorrectly accept this shadow graph.
+    let shadow_graph = ExecutionGraph::chain(["vision", "audio", "text"]).unwrap();
+    let shadow_layout = ExecutionUnitLayout::new(&shadow_graph, [1, 1, 2]).unwrap();
+    let shadow = ArchitecturePartition::new(
+        shadow_graph,
+        shadow_layout,
+        [("vision", 0..1), ("text", 0..2)],
+        ownership,
+        None,
+        (),
+        (),
+        std::iter::empty(),
+    )
+    .unwrap();
+    assert_eq!(
+        shadow
+            .validate_architecture::<FakeBackend, FixtureState, _>(&architecture)
+            .unwrap_err(),
+        ArchitecturePartitionError::ArchitectureGraphMismatch
+    );
 }
 
 #[test]

@@ -1,10 +1,194 @@
 //! Semantic tensor-parallel placement for Muse-Glimmer text and vision components.
 
+use eredu_core::{cache::LayerCachePolicy, LayerSchedule};
+use eredu_nn::VocabularyParallelRange;
 use eredu_runtime::{
-    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+    expand_linear_format_parameter_groups, LocalModelLayout, MemberSharding, ParallelPlanError,
+    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout, TensorPlacement,
 };
 
 use super::DecoderConfig;
+
+/// Complete planner-derived construction and mutable-state geometry for one rank.
+#[derive(Debug, Clone)]
+pub struct LocalGeometry {
+    text_blocks: Vec<DecoderConfig>,
+    embedding_range: VocabularyParallelRange,
+    output_range: Option<VocabularyParallelRange>,
+    state_layout: StateLayout,
+    vision_layers: usize,
+    architecture_fingerprint: String,
+}
+
+impl LocalGeometry {
+    /// Returns one rank-local text-block configuration.
+    pub fn text_block(&self, layer: usize) -> Option<&DecoderConfig> {
+        self.text_blocks.get(layer)
+    }
+
+    /// Returns all rank-local text-block configurations in execution order.
+    pub fn text_blocks(&self) -> &[DecoderConfig] {
+        &self.text_blocks
+    }
+
+    /// Returns input-embedding vocabulary ownership.
+    pub const fn embedding_range(&self) -> &VocabularyParallelRange {
+        &self.embedding_range
+    }
+
+    /// Returns untied output-head vocabulary ownership.
+    pub const fn output_range(&self) -> Option<&VocabularyParallelRange> {
+        self.output_range.as_ref()
+    }
+
+    /// Returns the authoritative rank-local text state layout.
+    pub const fn state_layout(&self) -> &StateLayout {
+        &self.state_layout
+    }
+
+    /// Returns the replicated media units owned by this rank.
+    pub const fn vision_layers(&self) -> usize {
+        self.vision_layers
+    }
+
+    pub(super) fn validate_for(&self, args: &DecoderConfig) -> Result<(), ParallelPlanError> {
+        if self.architecture_fingerprint != args.architecture_fingerprint()
+            || self.text_blocks.len() != args.num_hidden_layers as usize
+            || self.vision_layers != args.vision_config.layer_count()
+        {
+            return Err(invalid(
+                "rank-local Muse-Glimmer geometry belongs to a different configuration",
+            ));
+        }
+        self.embedding_range
+            .validate_global_rows(args.vocab_size)
+            .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
+        match (args.tie_word_embeddings, &self.output_range) {
+            (true, None) => {}
+            (false, Some(range)) => range
+                .validate_global_rows(args.vocab_size)
+                .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?,
+            (true, Some(_)) => {
+                return Err(invalid(
+                    "tied Muse-Glimmer output has a separate vocabulary range",
+                ))
+            }
+            (false, None) => {
+                return Err(invalid(
+                    "untied Muse-Glimmer output has no vocabulary range",
+                ))
+            }
+        }
+        let expected = local_state_layout(&self.text_blocks)?;
+        if expected != self.state_layout {
+            return Err(invalid(
+                "rank-local Muse-Glimmer state layout drifted from text geometry",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Derives all rank-local Muse-Glimmer construction geometry from one typed layout.
+pub fn local_geometry(
+    args: &DecoderConfig,
+    layout: &LocalModelLayout,
+) -> Result<LocalGeometry, ParallelPlanError> {
+    let text_blocks = (0..args.num_hidden_layers as usize)
+        .map(|layer| local_decoder_config(args, layer, layout))
+        .collect::<Result<Vec<_>, _>>()?;
+    let state_layout = local_state_layout(&text_blocks)?;
+    let vocabulary = dim(args.vocab_size)?;
+    let embedding_range = vocabulary_range(layout, "model.embed_tokens", vocabulary)?;
+    let output_range = if args.tie_word_embeddings {
+        None
+    } else {
+        Some(vocabulary_range(layout, "lm_head", vocabulary)?)
+    };
+    let geometry = LocalGeometry {
+        text_blocks,
+        embedding_range,
+        output_range,
+        state_layout,
+        // Media parameters are deliberately outside the text TP plan and are
+        // replicated on every rank. Keeping their unit ownership here makes
+        // the canonical multimodal graph authoritative for both lifecycles.
+        vision_layers: args.vision_config.layer_count(),
+        architecture_fingerprint: args.architecture_fingerprint(),
+    };
+    geometry.validate_for(args)?;
+    Ok(geometry)
+}
+
+fn local_state_layout(blocks: &[DecoderConfig]) -> Result<StateLayout, ParallelPlanError> {
+    let layers = blocks
+        .iter()
+        .enumerate()
+        .map(|(layer, block)| {
+            let policy = block.attention_schedule.get(layer).ok_or_else(|| {
+                invalid(format!(
+                    "rank-local Muse-Glimmer block {layer} has no attention policy"
+                ))
+            })?;
+            LayerCachePolicy::key_value(*policy, block.num_key_value_heads, block.head_dim)
+                .map_err(|error| invalid(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    StateLayout::new(
+        LayerSchedule::new(layers.len(), layers).map_err(|error| invalid(error.to_string()))?,
+    )
+    .map_err(|error| invalid(error.to_string()))
+}
+
+fn vocabulary_range(
+    layout: &LocalModelLayout,
+    logical_name: &str,
+    vocabulary: usize,
+) -> Result<VocabularyParallelRange, ParallelPlanError> {
+    let mut selected = None;
+    for (target, tensor) in layout
+        .tensors()
+        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
+    {
+        if tensor.global_shape().first().copied() != Some(vocabulary) {
+            return Err(ParallelPlanError::InvalidTensor(format!(
+                "Muse-Glimmer vocabulary member {target} has global shape {:?}, expected {vocabulary} rows",
+                tensor.global_shape()
+            )));
+        }
+        let range = match tensor.placement() {
+            TensorPlacement::Range {
+                axis: 0,
+                start,
+                end,
+            } => *start..*end,
+            TensorPlacement::Replicated | TensorPlacement::Local => 0..vocabulary,
+            placement => {
+                return Err(ParallelPlanError::InvalidTensor(format!(
+                    "Muse-Glimmer vocabulary member {target} has non-row placement {placement:?}"
+                )))
+            }
+        };
+        if selected.as_ref().is_some_and(|current| current != &range) {
+            return Err(ParallelPlanError::InvalidTensor(format!(
+                "Muse-Glimmer vocabulary group {logical_name} has inconsistent selections"
+            )));
+        }
+        selected = Some(range);
+    }
+    let range = VocabularyParallelRange {
+        global_vocabulary: vocabulary,
+        local: selected.ok_or_else(|| {
+            ParallelPlanError::InvalidTensor(format!(
+                "missing local Muse-Glimmer vocabulary layout for {logical_name}"
+            ))
+        })?,
+    };
+    range
+        .validate()
+        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
+    Ok(range)
+}
 
 /// Derives rank-local text construction geometry from the semantic placement.
 pub fn local_decoder_config(
@@ -69,9 +253,14 @@ fn local_axis(
             "local Muse-Glimmer {label} tensor has no axis {axis}"
         ))
     })?;
-    i32::try_from(value).map_err(|_| {
-        ParallelPlanError::InvalidTensor(format!("local Muse-Glimmer {label} exceeds i32"))
-    })
+    i32::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            ParallelPlanError::InvalidTensor(format!(
+                "local Muse-Glimmer {label} must be positive and fit i32"
+            ))
+        })
 }
 
 /// Declares pinned text embeddings, final normalization, and vocabulary output.
@@ -104,7 +293,7 @@ pub fn static_parameter_groups(
             )],
         )?);
     }
-    Ok(groups)
+    expand_linear_format_parameter_groups(groups, |name| args.linear_format_for(name))
 }
 
 /// Declares one decoder block's head, dense/expert, and replicated groups.
@@ -238,7 +427,7 @@ pub fn layer_parameter_groups(
             ),
         ],
     )?);
-    Ok(groups)
+    expand_linear_format_parameter_groups(groups, |name| args.linear_format_for(name))
 }
 
 /// Declares the patch/position roots, vision blocks, merge adapter, and projection.
@@ -394,7 +583,35 @@ pub fn vision_parameter_groups(
             ("model.vision_tower.ln_post.bias", vec![hidden]),
         ],
     )?);
-    Ok(groups)
+    expand_linear_format_parameter_groups(groups, |name| args.vision_config.linear_format_for(name))
+}
+
+/// Declares only the pinned patch/position, merge, projection, and norm groups.
+pub fn vision_static_parameter_groups(
+    args: &DecoderConfig,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    let mut all = vision_parameter_groups(args)?;
+    let layer_groups = args.vision_config.layer_count() * 3;
+    let mut tail = all.split_off(1 + layer_groups);
+    all.truncate(1);
+    all.append(&mut tail);
+    Ok(all)
+}
+
+/// Declares exactly one architecture-global Muse vision execution unit.
+pub fn vision_layer_parameter_groups(
+    args: &DecoderConfig,
+    layer: usize,
+) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
+    let count = args.vision_config.layer_count();
+    if layer >= count {
+        return Err(invalid(format!(
+            "Muse-Glimmer vision layer {layer} is outside {count} layers"
+        )));
+    }
+    let all = vision_parameter_groups(args)?;
+    let start = 1 + layer * 3;
+    Ok(all[start..start + 3].to_vec())
 }
 
 fn group(
@@ -449,6 +666,7 @@ fn invalid(message: impl Into<String>) -> ParallelPlanError {
 
 #[cfg(test)]
 mod tests {
+    use eredu_checkpoint::AffineQuantization;
     use eredu_runtime::{LocalModelLayout, LocalTensorLayout, TensorPlacement};
 
     use super::*;
@@ -490,6 +708,28 @@ mod tests {
             .any(|group| group.logical_name().ends_with("attention_heads")));
     }
 
+    #[test]
+    fn affine_text_plan_publishes_weight_companions() {
+        let mut args = args();
+        args.quantization = Some(AffineQuantization::new(16, 4).unwrap().into());
+        args.quantized_weights = Some(std::collections::HashSet::from([
+            "model.layers.0.self_attn.q_proj.weight".to_owned(),
+            "model.layers.0.mlp.experts.gate_up_proj".to_owned(),
+        ]));
+        let targets = layer_parameter_groups(&args, 0)
+            .unwrap()
+            .into_iter()
+            .flat_map(|group| group.members().to_vec())
+            .map(|member| member.target().to_owned())
+            .collect::<Vec<_>>();
+        assert!(targets
+            .iter()
+            .any(|name| name == "model.layers.0.self_attn.q_proj.scales"));
+        assert!(targets
+            .iter()
+            .any(|name| name == "model.layers.0.mlp.experts.gate_up_proj_scales"));
+    }
+
     fn local_tensor(shape: Vec<usize>) -> LocalTensorLayout {
         LocalTensorLayout::new(
             "test",
@@ -501,6 +741,88 @@ mod tests {
             None,
             false,
         )
+    }
+
+    fn insert(
+        layout: &mut LocalModelLayout,
+        target: &str,
+        logical_name: &str,
+        global_shape: Vec<usize>,
+        local_shape: Vec<usize>,
+        placement: TensorPlacement,
+    ) {
+        layout.insert(
+            target.into(),
+            LocalTensorLayout::new(
+                logical_name,
+                ParameterRole::AttentionHeads,
+                global_shape,
+                local_shape,
+                placement,
+                None,
+                None,
+                false,
+            ),
+        );
+    }
+
+    fn row_range(end: usize) -> TensorPlacement {
+        TensorPlacement::Range {
+            axis: 0,
+            start: 0,
+            end,
+        }
+    }
+
+    fn valid_layout(include_output: bool) -> LocalModelLayout {
+        let mut layout = LocalModelLayout::default();
+        insert(
+            &mut layout,
+            "model.embed_tokens.weight",
+            "model.embed_tokens",
+            vec![24, 16],
+            vec![12, 16],
+            row_range(12),
+        );
+        if include_output {
+            insert(
+                &mut layout,
+                "lm_head.weight",
+                "lm_head",
+                vec![24, 16],
+                vec![12, 16],
+                row_range(12),
+            );
+        }
+        insert(
+            &mut layout,
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.query_heads",
+            vec![16, 16],
+            vec![8, 16],
+            row_range(8),
+        );
+        insert(
+            &mut layout,
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.key_value_heads",
+            vec![8, 16],
+            vec![4, 16],
+            row_range(4),
+        );
+        insert(
+            &mut layout,
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.0.mlp.experts.intermediate",
+            vec![4, 24, 16],
+            vec![4, 12, 16],
+            TensorPlacement::Range {
+                axis: 1,
+                start: 0,
+                end: 12,
+            },
+        );
+        layout
     }
 
     #[test]
@@ -523,5 +845,69 @@ mod tests {
         assert_eq!(local.num_attention_heads, 2);
         assert_eq!(local.num_key_value_heads, 1);
         assert_eq!(local.moe_intermediate_size, 6);
+    }
+
+    #[test]
+    fn local_geometry_owns_text_vocabulary_state_and_media_together() {
+        let args = args();
+        let geometry = local_geometry(&args, &valid_layout(true)).unwrap();
+        assert_eq!(geometry.text_blocks().len(), 1);
+        assert_eq!(geometry.text_block(0).unwrap().num_attention_heads, 2);
+        assert_eq!(geometry.text_block(0).unwrap().num_key_value_heads, 1);
+        assert_eq!(geometry.embedding_range().local, 0..12);
+        assert_eq!(geometry.output_range().unwrap().local, 0..12);
+        assert_eq!(geometry.vision_layers(), 1);
+        assert_ne!(
+            geometry.state_layout(),
+            &crate::muse_glimmer::state_layout(&args).unwrap()
+        );
+        geometry.validate_for(&args).unwrap();
+    }
+
+    #[test]
+    fn local_geometry_distinguishes_tied_and_untied_vocabulary_ownership() {
+        let mut tied = args();
+        tied.tie_word_embeddings = true;
+        let geometry = local_geometry(&tied, &valid_layout(false)).unwrap();
+        assert!(geometry.output_range().is_none());
+
+        let error = local_geometry(&args(), &valid_layout(false)).unwrap_err();
+        assert!(error.to_string().contains("lm_head"));
+    }
+
+    #[test]
+    fn local_geometry_rejects_zero_widths_and_vocabulary_companion_drift() {
+        let args = args();
+        let mut zero = valid_layout(true);
+        insert(
+            &mut zero,
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.key_value_heads",
+            vec![8, 16],
+            vec![0, 16],
+            row_range(0),
+        );
+        assert!(local_geometry(&args, &zero)
+            .unwrap_err()
+            .to_string()
+            .contains("must be positive"));
+
+        let mut drift = valid_layout(true);
+        insert(
+            &mut drift,
+            "model.embed_tokens.scales",
+            "model.embed_tokens",
+            vec![24, 1],
+            vec![12, 1],
+            TensorPlacement::Range {
+                axis: 0,
+                start: 12,
+                end: 24,
+            },
+        );
+        assert!(local_geometry(&args, &drift)
+            .unwrap_err()
+            .to_string()
+            .contains("inconsistent selections"));
     }
 }

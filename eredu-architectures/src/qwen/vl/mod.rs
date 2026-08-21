@@ -3,6 +3,7 @@
 mod checkpoint;
 mod config;
 mod model;
+mod parallel;
 mod positions;
 
 pub use checkpoint::safetensors_plan;
@@ -12,9 +13,10 @@ pub use config::{
     state_layout_with_key_value_heads, ModelArgs, VlConfigError,
 };
 pub use model::{
-    ForwardContext, InputPart, LayeredModel, ModelInput, PipelinePrepared, PipelineVisionState,
-    StaticModules, Unit,
+    ForwardContext, InputPart, LayeredModel, ModelInput, PipelineBoundary, PipelineBoundarySchema,
+    PipelinePartitionInput, PipelinePrepared, PipelineVisionState, StaticModules, Unit,
 };
+pub use parallel::{local_geometry, LocalGeometry};
 pub use positions::{
     mrope_embeddings, mrope_values, multimodal_position_ids, position_ids_tensor, PositionPart,
 };

@@ -40,8 +40,8 @@ use crate::backend::mlx::{
         },
         execution::{
             generic::{
-                prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
-                MlxUnitFactory,
+                construct_architecture_unit, prepare_layerwise_policy_with_bindings,
+                MlxLayerwisePolicy, MlxResidentPolicy, MlxUnitPopulator,
             },
             layerwise::{open_safetensors_weight_store, quantize_parameterized_store},
         },
@@ -52,6 +52,14 @@ use crate::backend::mlx::{
 
 type Architecture = vl::LayeredModel<MlxBackend>;
 type Unit = vl::Unit<MlxBackend>;
+
+fn group_kind(architecture: &Architecture, group: usize) -> eredu_runtime::ArchitectureGroupKind {
+    <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::group_transport(
+        architecture,
+        group,
+    )
+    .kind
+}
 
 #[derive(eredu_nn::Parameterized)]
 #[parameterized(tensor = "Array")]
@@ -72,14 +80,17 @@ impl QwenVlCheckpointTemplate {
                 &architecture,
             )
             .clone();
-        let vision_layers = args.vision.layer_count();
-        let mut factory = UnitFactory {
-            args: args.clone(),
-            vision_layers,
-            external_experts: false,
-        };
-        let units = (0..vision_layers + args.text.num_hidden_layers as usize)
-            .map(|index| factory.build(index, stream))
+        let layout = unit_layout(&architecture)?;
+        let units = (0..layout.len())
+            .map(|index| {
+                construct_architecture_unit(
+                    &architecture,
+                    &layout,
+                    index,
+                    stream,
+                    std::marker::PhantomData::<MlxHybridState>,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             static_modules,
@@ -165,62 +176,43 @@ fn unit_recipes(
 }
 
 #[derive(Clone)]
-struct UnitFactory {
-    args: vl::ModelArgs,
-    vision_layers: usize,
+struct UnitPopulator {
     external_experts: bool,
 }
 
 /// Pipeline and Cartesian-parallel binder for the same neutral Qwen3-VL
 /// architecture used by resident and bounded execution.
-pub(crate) struct QwenVlPipelineAdapter {
-    architecture: Architecture,
-    text: crate::composition::qwen::QwenParallelComposition,
+pub(crate) struct QwenVlPipelineBindings {
     external_experts: bool,
 }
 
-impl QwenVlPipelineAdapter {
-    pub(crate) fn new(args: vl::ModelArgs, stream: &Stream) -> Result<Self, Error> {
-        Ok(Self {
-            architecture: Architecture::new(args.clone(), stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-            text: crate::composition::qwen::QwenParallelComposition::new(args.text, stream)?,
+impl QwenVlPipelineBindings {
+    pub(crate) const fn new() -> Self {
+        Self {
             external_experts: false,
-        })
+        }
     }
 
-    pub(crate) fn new_external_experts(
-        args: vl::ModelArgs,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let mut adapter = Self::new(args, stream)?;
-        adapter.external_experts = true;
-        adapter.text = crate::composition::qwen::QwenParallelComposition::new_external_experts(
-            adapter.architecture.args().text.clone(),
-            stream,
-        )?;
-        Ok(adapter)
+    pub(crate) const fn new_external_experts() -> Self {
+        Self {
+            external_experts: true,
+        }
     }
 
-    pub(crate) fn args(&self) -> &vl::ModelArgs {
-        self.architecture.args()
-    }
-
-    pub(crate) fn model_type(&self) -> &str {
-        &self.args().model_type
-    }
-
-    pub(crate) fn architecture_mut(&mut self) -> &mut Architecture {
-        &mut self.architecture
+    pub(crate) fn model_type<'a>(&self, architecture: &'a Architecture) -> &'a str {
+        &architecture.args().model_type
     }
 
     pub(crate) fn begin_pipeline_ingress(
-        &mut self,
+        &self,
+        architecture: &mut Architecture,
         typed: input::ModelInput<'_>,
         offset: i32,
         delta: Option<&Array>,
+        parallel: Option<&safemlx::distributed::Group>,
         stream: &Stream,
     ) -> Result<vl::PipelineVisionState<Array>, Error> {
+        let args = architecture.args().clone();
         input::validate(typed)?;
         let mut token_storage = Vec::new();
         let mut grids = Vec::new();
@@ -256,7 +248,7 @@ impl QwenVlPipelineAdapter {
                         ))
                     })?;
                     let grid = input::patch_grid_from_array(grid, stream)?;
-                    let merge = self.args().vision.spatial_merge_size;
+                    let merge = args.vision.spatial_merge_size;
                     let merged = grid
                         .iter()
                         .try_fold(0_i32, |total, &(time, height, width)| {
@@ -278,9 +270,9 @@ impl QwenVlPipelineAdapter {
                                 })
                         })?;
                     let token_id = if modality == input::Modality::Image {
-                        self.args().image_token_id
+                        args.image_token_id
                     } else {
-                        self.args().video_token_id
+                        args.video_token_id
                     };
                     token_storage.push(input::token_ids_array(
                         &vec![
@@ -341,99 +333,45 @@ impl QwenVlPipelineAdapter {
         } else {
             Some(concatenate_axis(&pixel_refs, 0, stream)?)
         };
-        self.architecture
-            .begin_pipeline(
-                vl::ModelInput {
-                    parts: &parts,
-                    pixels: pixels.as_ref(),
-                    mask: None,
-                },
-                offset,
-                delta,
-                stream,
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    pub(crate) fn pipeline_ingress_active(&self, state: &vl::PipelineVisionState<Array>) -> bool {
-        Architecture::pipeline_vision_active(state)
-    }
-
-    pub(crate) fn pipeline_ingress_arrays(
-        &self,
-        state: &vl::PipelineVisionState<Array>,
-    ) -> Vec<Array> {
-        Architecture::pipeline_retained_values(state)
-    }
-
-    pub(crate) fn replace_pipeline_ingress_arrays(
-        &self,
-        state: &mut vl::PipelineVisionState<Array>,
-        arrays: Vec<Array>,
-    ) -> Result<(), Error> {
-        Architecture::replace_pipeline_retained_values(state, arrays)
-            .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    pub(crate) fn forward_pipeline_vision_layer(
-        &mut self,
-        index: usize,
-        layer: &mut MlxModule<Unit>,
-        state: &mut vl::PipelineVisionState<Array>,
-        group: Option<&safemlx::distributed::Group>,
-        stream: &Stream,
-    ) -> Result<Vec<Array>, Error> {
-        let Unit::Vision(block) = &mut layer.inner else {
-            return Err(Error::Parallel(format!(
-                "Qwen3-VL vision range contains text unit {index}"
-            )));
+        let input = vl::ModelInput {
+            parts: &parts,
+            pixels: pixels.as_ref(),
+            mask: None,
         };
-        self.architecture
-            .forward_pipeline_vision(index, block, state, group, stream)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(self.pipeline_ingress_arrays(state))
-    }
-
-    pub(crate) fn finish_pipeline_ingress(
-        &mut self,
-        state: vl::PipelineVisionState<Array>,
-        group: Option<&safemlx::distributed::Group>,
-        stream: &Stream,
-    ) -> Result<vl::PipelinePrepared<Array>, Error> {
-        self.architecture
-            .finish_pipeline(state, group, stream)
-            .map_err(|error| Error::Parallel(error.to_string()))
+        match parallel {
+            Some(parallel) => {
+                architecture.begin_pipeline_parallel(input, offset, delta, parallel, stream)
+            }
+            None => architecture.begin_pipeline(input, offset, delta, stream),
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     pub(crate) fn static_units(
         &self,
+        architecture: &Architecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(store, &|_| true)
+        self.selected_static_units(architecture, store, &|_| true)
     }
 
     pub(crate) fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
         true
     }
 
-    pub(crate) fn new_layer(
-        &self,
-        group: usize,
-        index: usize,
-        stream: &Stream,
-    ) -> Result<MlxModule<Unit>, Error> {
-        self.new_cartesian_layer(group, index, None, None, stream)
-    }
-
     pub(crate) fn layer_bindings(
         &self,
+        architecture: &Architecture,
         group: usize,
         index: usize,
         layer: &MlxModule<Unit>,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let recipes = if group == 1 {
-            unit_recipes(store, self.args(), self.args().vision.layer_count() + index)?
+        let recipes = if group_kind(architecture, group)
+            == eredu_runtime::ArchitectureGroupKind::Decoder
+        {
+            let args = architecture.args();
+            unit_recipes(store, args, args.vision.layer_count() + index)?
         } else {
             BTreeMap::new()
         };
@@ -448,13 +386,14 @@ impl QwenVlPipelineAdapter {
 
     pub(crate) fn selected_static_units(
         &self,
+        architecture: &Architecture,
         store: &dyn CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let modules =
-            <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-                &self.architecture,
-            );
+        let modules = <Architecture as LayeredArchitecture<
+            MlxBackend,
+            MlxHybridState,
+        >>::static_modules(architecture);
         let recipes = static_recipes(store);
         let mut units = Vec::new();
         if select("qwen_vl.static.vision") {
@@ -508,158 +447,43 @@ impl QwenVlPipelineAdapter {
 
     pub(crate) fn expert_parallel_assignment(
         &self,
+        architecture: &Architecture,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
     {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
         }
-        if !self.args().text.is_moe() {
+        let args = architecture.args();
+        if !args.text.is_moe() {
             return Err(Error::Parallel(
                 "Qwen3-VL PP+EP requires a routed text checkpoint".into(),
             ));
         }
         Ok(Some(
             crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
-                self.args().text.num_experts as usize,
+                args.text.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
             )?,
         ))
     }
 
-    pub(crate) fn register_parallel_parameters(
-        &self,
-        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let modules =
-            <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-                &self.architecture,
-            );
-        for group in vision::static_parallel_parameter_groups::<MlxBackend>(
-            &modules.vision,
-            &self.args().vision,
-            "model.visual",
-        )? {
-            planner.register(group)?;
-        }
-        for index in 0..self.args().vision.layer_count() {
-            let block = vision::VisionBlock::<MlxBackend>::new_with_root(
-                &self.args().vision,
-                "model.visual",
-                index,
-                stream,
-            )?;
-            for group in vision::block_parallel_parameter_groups(
-                &block,
-                &self.args().vision,
-                "model.visual",
-                index,
-            )? {
-                planner.register(group)?;
-            }
-        }
-        self.text.register_parallel_parameters(planner, stream)
-    }
-
-    pub(crate) fn configure_parallel_static(
-        &mut self,
-        layout: &eredu_runtime::LocalModelLayout,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let widths = vision::local_merger_widths(&self.args().vision, "model.visual", layout)?;
-        let replacement = vision::VisionStatic::<MlxBackend>::new_parallel_with_root(
-            self.args().vision.clone(),
-            vision::VisionMode::DeepStack,
-            "model.visual",
-            &widths,
-            stream,
-        )?;
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules_mut(
-            &mut self.architecture,
-        )
-        .vision = replacement;
-        Ok(())
-    }
-
-    pub(crate) fn local_key_value_heads(
-        &self,
-        layout: &eredu_runtime::LocalModelLayout,
-    ) -> Result<Vec<i32>, Error> {
-        eredu_architectures::qwen::local_key_value_heads(&self.args().text, layout)
-            .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    pub(crate) fn new_cartesian_layer(
-        &self,
-        group: usize,
-        index: usize,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
-        stream: &Stream,
-    ) -> Result<MlxModule<Unit>, Error> {
-        match group {
-            0 => {
-                let block = match layout {
-                    Some(layout) => {
-                        let (heads, intermediate) = vision::local_block_geometry(
-                            &self.args().vision,
-                            "model.visual",
-                            index,
-                            layout,
-                        )?;
-                        vision::VisionBlock::new_parallel_with_root(
-                            &self.args().vision,
-                            "model.visual",
-                            index,
-                            heads,
-                            intermediate,
-                            stream,
-                        )?
-                    }
-                    None => vision::VisionBlock::new_with_root(
-                        &self.args().vision,
-                        "model.visual",
-                        index,
-                        stream,
-                    )?,
-                };
-                Ok(MlxModule::new(Unit::Vision(block)))
-            }
-            1 => {
-                let block = self
-                    .text
-                    .new_cartesian_layer(0, index, layout, assignment, stream)?;
-                Ok(MlxModule::new(Unit::Text(block.inner)))
-            }
-            _ => Err(Error::Parallel(format!(
-                "Qwen3-VL has no execution group {group}"
-            ))),
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn cartesian_layer_bindings(
         &self,
+        architecture: &Architecture,
         group: usize,
         index: usize,
-        layer: &MlxModule<Unit>,
+        global_layer: &MlxModule<Unit>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
         assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
-        stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
-        match &layer.inner {
-            Unit::Vision(block) if group == 0 => {
-                let global = MlxModule::new(Unit::Vision(vision::VisionBlock::new_with_root(
-                    &self.args().vision,
-                    "model.visual",
-                    index,
-                    stream,
-                )?));
+        match (&global_layer.inner, group_kind(architecture, group)) {
+            (Unit::Vision(_), eredu_runtime::ArchitectureGroupKind::VisionEncoder) => {
                 let bindings = build_module_bindings_with_recipes(
-                    if layout.is_some() { &global } else { layer },
+                    global_layer,
                     "",
                     store,
                     BTreeMap::new(),
@@ -669,38 +493,61 @@ impl QwenVlPipelineAdapter {
                         bindings, "", store, layout,
                     )
                 } else {
-                    let _ = block;
                     Ok(bindings)
                 }
             }
-            Unit::Text(block) if group == 1 => self.text.cartesian_layer_bindings(
-                0,
-                index,
-                &MlxModule::new(block.clone()),
-                store,
-                layout,
-                assignment,
-                stream,
-            ),
+            (Unit::Text(_), eredu_runtime::ArchitectureGroupKind::Decoder) => {
+                let args = architecture.args();
+                let recipes = if self.external_experts {
+                    BTreeMap::new()
+                } else {
+                    unit_recipes(store, args, args.vision.layer_count() + index)?
+                };
+                let mut bindings = build_module_bindings_with_recipes_excluding(
+                    global_layer,
+                    "",
+                    store,
+                    recipes,
+                    |name| self.external_experts && name.contains(".experts."),
+                )?;
+                if let Some(assignment) = assignment {
+                    let indices = assignment.local_global_expert_ids().to_vec();
+                    bindings = bindings
+                        .into_iter()
+                        .map(|binding| {
+                            let target = binding.logical_target().unwrap_or_else(|| binding.name());
+                            if target.contains(".experts.") {
+                                binding
+                                    .select_bounded_output(
+                                        store,
+                                        TensorSelection::Indices {
+                                            axis: 0,
+                                            indices: indices.clone(),
+                                        },
+                                    )
+                                    .map_err(Error::from)
+                            } else {
+                                Ok(binding)
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                }
+                match layout {
+                    Some(layout) => crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
+                        bindings,
+                        &format!("model.layers.{index}"),
+                        store,
+                        layout,
+                    ),
+                    None => Ok(bindings),
+                }
+            }
             _ => Err(Error::Parallel("Qwen3-VL unit/group mismatch".into())),
         }
     }
 }
 
-impl MlxUnitFactory<Unit> for UnitFactory {
-    fn build(&mut self, flat: usize, stream: &Stream) -> Result<Unit, Error> {
-        if flat < self.vision_layers {
-            vision::VisionBlock::new_with_root(&self.args.vision, "model.visual", flat, stream)
-                .map(Unit::Vision)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-        } else {
-            let layer = flat - self.vision_layers;
-            qwen::new_block::<MlxBackend>(&self.args.text, layer, stream)
-                .map(Unit::Text)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-        }
-    }
-
+impl MlxUnitPopulator<Unit> for UnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<Unit>,
@@ -718,7 +565,7 @@ type Bounded = LayerwiseRuntime<
     Architecture,
     MlxBackend,
     MlxHybridState,
-    MlxLayerwisePolicy<Unit, UnitFactory>,
+    MlxLayerwisePolicy<Unit, UnitPopulator>,
 >;
 
 enum Execution {
@@ -1216,31 +1063,19 @@ fn quantize_store(
             Error::UnsupportedArchitecture("invalid Qwen3-VL text layer count".into())
         })?)
         .ok_or_else(|| Error::UnsupportedArchitecture("Qwen3-VL unit count overflowed".into()))?;
-    let source_args = source.clone();
-    let target_args = target.clone();
+    let source_layout = unit_layout(&source_architecture)?;
+    let target_layout = unit_layout(&target_architecture)?;
+    let source_static = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(&source_architecture).clone();
+    let target_static = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(&target_architecture).clone();
     let (store, report) = quantize_parameterized_store(
         store,
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-            &source_architecture,
-        ),
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-            &target_architecture,
-        ),
+        &source_static,
+        &target_static,
         move |flat, stream| {
-            let mut factory = UnitFactory {
-                args: source_args.clone(),
-                vision_layers: source_vision,
-                external_experts: false,
-            };
-            factory.build(flat, stream)
+            construct_architecture_unit(&source_architecture, &source_layout, flat, stream, std::marker::PhantomData::<MlxHybridState>)
         },
         move |flat, stream| {
-            let mut factory = UnitFactory {
-                args: target_args.clone(),
-                vision_layers: source_vision,
-                external_experts: false,
-            };
-            factory.build(flat, stream)
+            construct_architecture_unit(&target_architecture, &target_layout, flat, stream, std::marker::PhantomData::<MlxHybridState>)
         },
         total,
         quantization,
@@ -1586,20 +1421,15 @@ fn load_store(
     let mut architecture = Architecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let layout = unit_layout(&architecture)?;
-    let factory = UnitFactory {
-        vision_layers: args.vision.layer_count(),
-        args: args.clone(),
+    let factory = UnitPopulator {
         external_experts,
     };
     let binding_args = args.clone();
-    let static_modules =
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules_mut(
-            &mut architecture,
-        );
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
-        static_modules,
+        &mut architecture,
         factory,
+        std::marker::PhantomData::<MlxHybridState>,
         layout,
         options,
         stream,
@@ -1631,9 +1461,9 @@ fn load_store(
     metadata.set_quantization(args.text.weight_quantization());
     metadata.set_materialization(materialization);
     let execution = if options.is_fully_resident() {
-        Execution::Resident(Box::new(LayerwiseRuntime::new(
+        Execution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(&architecture, stream, std::marker::PhantomData::<MlxHybridState>)?,
             architecture,
-            policy.into_resident(stream)?,
         )))
     } else {
         Execution::Bounded(Box::new(LayerwiseRuntime::new(architecture, policy)))

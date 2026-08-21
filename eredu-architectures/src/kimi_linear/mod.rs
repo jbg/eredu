@@ -26,28 +26,34 @@ pub use kda::KimiDeltaAttention;
 pub use mla::KimiLatentAttention;
 pub use moe::{DenseSwiGlu, FeedForward, SparseMoe};
 pub use parallel::{
-    layer_parallel_parameter_groups, local_block_geometry, local_state_geometry,
-    static_parallel_parameter_groups,
+    layer_parallel_parameter_groups, local_block_geometry, local_geometry, local_state_geometry,
+    static_parallel_parameter_groups, LocalGeometry,
 };
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
-    BlockwiseAttentionBackend, CompressedAttentionCache, EmbeddingOperator, Error,
-    RoutedNeuralBackend, Tensor,
+    BlockwiseAttentionBackend, CompressedAttentionCache, EmbeddingLookupPolicy, EmbeddingOperator,
+    Error, NormalizationOperator, RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, ModelStateIdentity,
-    RuntimeStateComponents, StateLayout,
+    ArchitectureParameterDescription, ExecutionUnitLayout, ExpertPass, LayerRuntimeState,
+    LayeredArchitecture, LayeredForwardState, ModelStateIdentity, OwnedParameterGroupSpec,
+    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, ParameterGroupOwner,
+    RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
-use crate::{
-    decoder::{LayeredInput, StaticModuleSpec, StaticModules},
-    hybrid_decoder::HybridDecoder,
-};
+use crate::decoder::{LayeredInput, SequentialGroup, StaticModuleSpec, StaticModules};
 
 /// Architecture-owned values retained for one Kimi forward pass.
 pub struct ForwardContext<T> {
     mask: Option<T>,
+}
+
+impl<T> ForwardContext<T> {
+    /// Borrows the architecture-prepared attention mask at a partition boundary.
+    pub const fn mask(&self) -> Option<&T> {
+        self.mask.as_ref()
+    }
 }
 
 /// Layered Kimi lifecycle over one heterogeneous physical schedule.
@@ -56,7 +62,9 @@ where
     B: RoutedNeuralBackend + BlockwiseAttentionBackend,
 {
     args: ModelArgs,
-    decoder: HybridDecoder<B>,
+    static_modules: StaticModules<B>,
+    group: SequentialGroup,
+    parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
 impl<B> LayeredModel<B>
@@ -67,25 +75,54 @@ where
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         args.validate().map_err(Error::backend)?;
         let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-        let embedding_name = "model.embed_tokens.weight";
-        let decoder = HybridDecoder::new(
-            StaticModuleSpec {
-                embedding_weight: embedding_name.into(),
-                normalization_weight: "model.norm.weight".into(),
-                head_weight: "lm_head.weight".into(),
-                vocabulary: args.vocab_size,
-                hidden_size: args.hidden_size,
-                normalization_epsilon: args.rms_norm_eps,
-                normalization_offset: 0.0,
-                embedding_quantization: args.weight_quantization_for(embedding_name),
-                head_format: args.weight_quantization_for("lm_head.weight").into(),
-                tied_head: args.tie_word_embeddings,
-            },
-            "model.layers",
-            layers,
+        let static_modules = StaticModules::from_spec(Self::static_spec(&args), context)?;
+        let group = SequentialGroup::new("target", "model.layers", layers)?;
+        Ok(Self {
+            args,
+            static_modules,
+            group,
+            parallel_geometry: None,
+        })
+    }
+
+    /// Builds the same lifecycle with planner-derived rank-local modules.
+    pub fn new_parallel(
+        args: ModelArgs,
+        geometry: LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        args.validate().map_err(Error::backend)?;
+        geometry.validate_for(&args).map_err(Error::backend)?;
+        let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+        let static_modules = StaticModules::from_parallel_spec(
+            Self::static_spec(&args),
+            geometry.embedding_range().clone(),
+            geometry.output_range().cloned(),
             context,
         )?;
-        Ok(Self { args, decoder })
+        let group = SequentialGroup::new("target", "model.layers", layers)?;
+        Ok(Self {
+            args,
+            static_modules,
+            group,
+            parallel_geometry: Some(std::sync::Arc::new(geometry)),
+        })
+    }
+
+    fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
+        let embedding_name = "model.embed_tokens.weight";
+        StaticModuleSpec {
+            embedding_weight: embedding_name.into(),
+            normalization_weight: "model.norm.weight".into(),
+            head_weight: "lm_head.weight".into(),
+            vocabulary: args.vocab_size,
+            hidden_size: args.hidden_size,
+            normalization_epsilon: args.rms_norm_eps,
+            normalization_offset: 0.0,
+            embedding_quantization: args.weight_quantization_for(embedding_name),
+            head_format: args.weight_quantization_for("lm_head.weight").into(),
+            tied_head: args.tie_word_embeddings,
+        }
     }
 
     /// Returns normalized architecture policy.
@@ -93,19 +130,105 @@ where
         &self.args
     }
 
+    /// Describes every static and heterogeneous block parameter with explicit
+    /// canonical unit ownership.
+    pub fn parameter_description(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ArchitectureParameterDescription, Error> {
+        let graph = self.group.execution_graph()?;
+        let count = usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)?;
+        let layout = ExecutionUnitLayout::new(&graph, [count]).map_err(Error::backend)?;
+        let static_groups =
+            static_parallel_parameter_groups(&self.static_modules).map_err(Error::backend)?;
+        let mut expected = static_groups.clone();
+        let mut owned = static_groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, group)| {
+                OwnedParameterGroupSpec::new(
+                    if index == 0 && self.args.tie_word_embeddings {
+                        ParameterGroupOwner::static_any_of(["embedding", "output"])
+                    } else {
+                        ParameterGroupOwner::static_role(match index {
+                            0 => "embedding",
+                            1 => "norm",
+                            _ => "output",
+                        })
+                    },
+                    group,
+                )
+            })
+            .collect::<Vec<_>>();
+        let owner_group = layout.group_id(0).expect("Kimi layout group").clone();
+        for index in 0..count {
+            let unit = self.construct_unit(0, index, context)?;
+            let groups = layer_parallel_parameter_groups(&unit, &self.args, index)
+                .map_err(Error::backend)?;
+            expected.extend(groups.iter().cloned());
+            owned.extend(groups.into_iter().map(|group| {
+                OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::execution_unit(owner_group.clone(), index),
+                    group,
+                )
+            }));
+        }
+        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
+            .map_err(Error::backend)
+    }
+
     /// Borrows embedding, final normalization, and vocabulary modules.
     pub const fn static_modules(&self) -> &StaticModules<B> {
-        self.decoder.static_modules()
+        &self.static_modules
     }
 
     /// Mutably borrows embedding, final normalization, and vocabulary modules.
     pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
-        self.decoder.static_modules_mut()
+        &mut self.static_modules
     }
 
     /// Returns the authoritative heterogeneous state declaration.
     pub fn state_layout(&self) -> Result<StateLayout, Error> {
         state_layout(&self.args).map_err(Error::backend)
+    }
+
+    /// State layout for this model's replicated or rank-local construction.
+    pub fn runtime_state_layout(&self) -> Result<StateLayout, Error> {
+        self.parallel_geometry
+            .as_ref()
+            .map(|geometry| geometry.state_layout().clone())
+            .map_or_else(|| self.state_layout(), Ok)
+    }
+
+    /// Returns planner-derived geometry for a rank-local realization.
+    pub fn parallel_geometry(&self) -> Option<&LocalGeometry> {
+        self.parallel_geometry.as_deref()
+    }
+
+    /// Shares authoritative local geometry with a backend residency policy.
+    pub fn shared_parallel_geometry(&self) -> Option<std::sync::Arc<LocalGeometry>> {
+        self.parallel_geometry.as_ref().map(std::sync::Arc::clone)
+    }
+
+    /// Constructs one canonical execution unit from the model-owned geometry.
+    pub fn construct_unit(
+        &self,
+        group: usize,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Block<B>, Error> {
+        self.group.unit_path(group, index)?;
+        match &self.parallel_geometry {
+            Some(geometry) => Block::new_with_geometry(
+                &self.args,
+                index,
+                *geometry.block(index).ok_or_else(|| {
+                    Error::backend(format!("missing rank-local Kimi block geometry {index}"))
+                })?,
+                context,
+            ),
+            None => Block::new(&self.args, index, context),
+        }
     }
 
     /// Begins execution from a placement-supplied embedding.
@@ -115,6 +238,22 @@ where
         mask: Option<&B::Tensor>,
         state: &mut S,
         expected: &StateLayout,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        self.begin_embedded_with_layout_at(hidden, mask, state, expected, 0, context)
+    }
+
+    fn begin_embedded_with_layout_at<S>(
+        &self,
+        hidden: B::Tensor,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
     where
@@ -137,7 +276,10 @@ where
                 .iter()
                 .any(|policy| policy.attention == AttentionKind::Mla)
         {
-            let position = state.layer(0).map_err(Error::backend)?.position();
+            let position = state
+                .layer(first_state_ordinal)
+                .map_err(Error::backend)?
+                .position();
             Some(B::causal_mask(sequence, position, None, context)?)
         } else {
             None
@@ -146,6 +288,117 @@ where
             hidden,
             context: ForwardContext { mask },
         })
+    }
+
+    /// Starts a replicated graph partition from tokens or an upstream hidden
+    /// tensor while using the partition's authoritative state offset.
+    pub fn begin_partition<S>(
+        &mut self,
+        input: crate::decoder::PartitionInput<'_, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        let hidden = match input {
+            crate::decoder::PartitionInput::Tokens(tokens) => {
+                self.static_modules.embeddings.forward(tokens, context)?
+            }
+            crate::decoder::PartitionInput::Hidden(hidden) => hidden,
+        };
+        self.begin_embedded_with_layout_at(
+            hidden,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            context,
+        )
+    }
+
+    /// Starts a tensor-parallel graph partition through the same neutral
+    /// lifecycle, including rank-local vocabulary lookup on the input rank.
+    pub fn begin_partition_parallel<S>(
+        &mut self,
+        input: crate::decoder::PartitionInput<'_, B::Tensor>,
+        mask: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        first_state_ordinal: usize,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Kimi model was not built with local geometry",
+            ));
+        }
+        let hidden = match input {
+            crate::decoder::PartitionInput::Tokens(tokens) => B::vocabulary_parallel_lookup(
+                &mut self.static_modules.embeddings,
+                tokens,
+                EmbeddingLookupPolicy::Strict,
+                parallel,
+                context,
+            )?,
+            crate::decoder::PartitionInput::Hidden(hidden) => hidden,
+        };
+        self.begin_embedded_with_layout_at(
+            hidden,
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            context,
+        )
+    }
+
+    /// Applies replicated final normalization and vocabulary projection for a
+    /// partition that owns the architecture output boundary.
+    pub fn finish_partition(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let hidden = self.static_modules.norm.forward(hidden, context)?;
+        match &mut self.static_modules.lm_head {
+            Some(head) => eredu_nn::LinearOperator::forward(head, &hidden, context),
+            None => self.static_modules.embeddings.as_linear(&hidden, context),
+        }
+    }
+
+    /// Applies tensor-parallel final normalization and complete vocabulary
+    /// projection for a partition that owns the output boundary.
+    pub fn finish_partition_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Kimi model was not built with local geometry",
+            ));
+        }
+        let hidden = self.static_modules.norm.forward(hidden, context)?;
+        match &mut self.static_modules.lm_head {
+            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
+            None => B::vocabulary_parallel_embedding_project(
+                &mut self.static_modules.embeddings,
+                &hidden,
+                parallel,
+                context,
+            ),
+        }
     }
 
     /// Executes one typed Kimi block.
@@ -162,7 +415,7 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
     {
-        self.decoder.unit_path(0, index)?;
+        self.group.unit_path(0, index)?;
         block.forward(
             hidden,
             forward.mask.as_ref(),
@@ -192,7 +445,7 @@ where
             &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error>,
     {
-        self.decoder.unit_path(0, index)?;
+        self.group.unit_path(0, index)?;
         block.forward_with_feed_forward(
             hidden,
             forward.mask.as_ref(),
@@ -217,7 +470,7 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
     {
-        self.decoder.unit_path(0, index)?;
+        self.group.unit_path(0, index)?;
         block.forward_parallel(
             hidden,
             forward.mask.as_ref(),
@@ -250,7 +503,7 @@ where
             &<B::Tensor as Tensor>::Context,
         ) -> Result<B::Tensor, Error>,
     {
-        self.decoder.unit_path(0, index)?;
+        self.group.unit_path(0, index)?;
         block.forward_parallel_with_feed_forward(
             hidden,
             forward.mask.as_ref(),
@@ -284,23 +537,23 @@ where
     }
 
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        self.decoder.execution_graph()
+        self.group.execution_graph()
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        self.decoder.group_unit_count(group)
+        self.group.unit_count(group)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        self.decoder.unit_path(group, index)
+        self.group.unit_path(group, index)
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
-        self.decoder.static_modules()
+        &self.static_modules
     }
 
     fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        self.decoder.static_modules_mut()
+        &mut self.static_modules
     }
 
     fn build_unit(
@@ -309,8 +562,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error> {
-        self.decoder.unit_path(group, index)?;
-        Block::new(&self.args, index, context)
+        self.construct_unit(group, index, context)
     }
 
     fn begin_forward<'a>(
@@ -320,12 +572,14 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
         let expected = self.state_layout()?;
-        let hidden = self
-            .decoder
-            .static_modules_mut()
-            .embeddings
-            .forward(input.tokens, context)?;
-        self.begin_embedded_with_layout(hidden, input.mask, state, &expected, context)
+        self.begin_partition(
+            crate::decoder::PartitionInput::Tokens(input.tokens),
+            input.mask,
+            state,
+            &expected,
+            0,
+            context,
+        )
     }
 
     fn begin_execution_group(
@@ -337,7 +591,7 @@ where
         _forward: &mut Self::ForwardContext,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.decoder.begin_group(group, initial, dependencies)
+        self.group.begin(group, initial, dependencies)
     }
 
     fn forward_unit(
@@ -350,7 +604,7 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.decoder.unit_path(group, index)?;
+        self.group.unit_path(group, index)?;
         self.forward_block(index, unit, hidden, state, forward, context)
     }
 
@@ -361,7 +615,7 @@ where
         _forward: &Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        self.decoder.finish_logits(hidden, context)
+        self.finish_partition(hidden, context)
     }
 
     fn retained_context_values<'a>(
@@ -371,6 +625,139 @@ where
         _index: usize,
     ) -> Self::RetainedContextValues<'a> {
         forward.mask.iter()
+    }
+}
+
+impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+{
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self
+            .parallel_geometry
+            .as_ref()
+            .ok_or_else(|| Error::backend("Kimi model was not built with local geometry"))?
+            .state_layout()
+            .clone();
+        self.begin_partition_parallel(
+            crate::decoder::PartitionInput::Tokens(input.tokens),
+            input.mask,
+            state,
+            &expected,
+            0,
+            parallel,
+            context,
+        )
+    }
+
+    fn forward_unit_parallel(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.group.unit_path(group, index)?;
+        self.forward_block_parallel(index, unit, hidden, state, forward, parallel, context)
+    }
+
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.finish_partition_parallel(hidden, parallel, context)
+    }
+}
+
+impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+{
+    fn forward_unit_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.group.unit_path(group, index)?;
+        self.forward_block_with_feed_forward(
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            context,
+            |policy, normalized, context| {
+                policy.forward_with_provider(normalized, pass, context, provider)
+            },
+        )
+    }
+}
+
+impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
+{
+    fn forward_unit_parallel_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.group.unit_path(group, index)?;
+        self.forward_block_parallel_with_feed_forward(
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            parallel,
+            context,
+            |policy, normalized, parallel, context| {
+                policy.forward_parallel_with_provider(normalized, pass, parallel, context, provider)
+            },
+        )
     }
 }
 

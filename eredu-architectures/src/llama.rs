@@ -69,13 +69,19 @@ pub fn local_block_args(
     let query = tensor("self_attn.q_proj")?;
     let key = tensor("self_attn.k_proj")?;
     let gate = tensor("mlp.gate_proj")?;
-    let query_width = i32::try_from(query.local_shape()[0]).map_err(|_| {
-        ParallelPlanError::InvalidTensor("local Llama query width exceeds i32".into())
-    })?;
-    let key_width = i32::try_from(key.local_shape()[0]).map_err(|_| {
-        ParallelPlanError::InvalidTensor("local Llama key width exceeds i32".into())
-    })?;
-    if query_width % args.head_dim != 0 || key_width % args.head_dim != 0 {
+    let query_width = i32::try_from(*query.local_shape().first().ok_or_else(|| {
+        ParallelPlanError::InvalidTensor("local Llama query projection is scalar".into())
+    })?)
+    .map_err(|_| ParallelPlanError::InvalidTensor("local Llama query width exceeds i32".into()))?;
+    let key_width = i32::try_from(*key.local_shape().first().ok_or_else(|| {
+        ParallelPlanError::InvalidTensor("local Llama key projection is scalar".into())
+    })?)
+    .map_err(|_| ParallelPlanError::InvalidTensor("local Llama key width exceeds i32".into()))?;
+    if query_width <= 0
+        || key_width <= 0
+        || query_width % args.head_dim != 0
+        || key_width % args.head_dim != 0
+    {
         return Err(ParallelPlanError::InvalidTensor(format!(
             "local Llama attention widths q={query_width}, k={key_width} split head dimension {}",
             args.head_dim
@@ -84,9 +90,15 @@ pub fn local_block_args(
     let mut local = args.clone();
     local.num_attention_heads = query_width / args.head_dim;
     local.num_key_value_heads = key_width / args.head_dim;
-    local.intermediate_size = i32::try_from(gate.local_shape()[0]).map_err(|_| {
-        ParallelPlanError::InvalidTensor("local Llama MLP width exceeds i32".into())
-    })?;
+    local.intermediate_size = i32::try_from(*gate.local_shape().first().ok_or_else(|| {
+        ParallelPlanError::InvalidTensor("local Llama gate projection is scalar".into())
+    })?)
+    .map_err(|_| ParallelPlanError::InvalidTensor("local Llama MLP width exceeds i32".into()))?;
+    if local.intermediate_size <= 0 {
+        return Err(ParallelPlanError::InvalidTensor(
+            "local Llama MLP width must be positive".into(),
+        ));
+    }
     Ok(local)
 }
 
@@ -98,6 +110,17 @@ pub fn local_key_value_heads(
     (0..args.num_hidden_layers as usize)
         .map(|layer| Ok(local_block_args(args, layer, layout)?.num_key_value_heads))
         .collect()
+}
+
+/// Complete rank-local geometry for the canonical neutral Llama model.
+pub type LocalGeometry = crate::decoder::LocalGeometry<ModelArgs>;
+
+/// Derives Llama unit, vocabulary, and state geometry from one typed plan.
+pub fn local_geometry(
+    args: &ModelArgs,
+    layout: &eredu_runtime::LocalModelLayout,
+) -> Result<LocalGeometry, ParallelPlanError> {
+    crate::decoder::local_geometry(args, layout, local_block_args)
 }
 
 /// Declares embedding, final normalization, and output-head placement groups.

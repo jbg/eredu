@@ -11,7 +11,10 @@ use std::{
 };
 
 use crate::backend::mlx::error::Error;
-use eredu_runtime::{ExecutionGraph, ExecutionGroupSpec};
+use eredu_runtime::{
+    ArchitecturePartition, ArchitecturePartitionError, ExecutionGraph, ExecutionGroupSpec,
+    ExecutionUnitLayout, OwnedParameterGroupSpec, PartitionOwnership, PartitionState, StateLayout,
+};
 
 /// Semantic role of one placed execution group.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -134,15 +137,6 @@ pub struct ResidencyBinding {
     pub request_optional: bool,
 }
 
-/// Checkpoint selection attached to a placed group.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct CheckpointBinding {
-    /// Stable architecture binding group.
-    pub group: String,
-    /// Static roles selected on declared owners.
-    pub static_roles: Vec<String>,
-}
-
 /// Complete physical placement of one semantic execution group.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExecutionGroupPlacement {
@@ -168,8 +162,6 @@ pub struct ExecutionGroupPlacement {
     pub merge_destination: usize,
     /// Residency binding.
     pub residency: ResidencyBinding,
-    /// Checkpoint binding.
-    pub checkpoint: CheckpointBinding,
 }
 
 impl ExecutionGroupPlacement {
@@ -239,6 +231,8 @@ pub struct PlacedExecutionDag {
     groups: Vec<ExecutionGroupPlacement>,
     routes: Vec<PlacementRoute>,
     semantic: ExecutionGraph,
+    unit_layout: ExecutionUnitLayout,
+    pp_rank_count: usize,
 }
 
 /// Runtime reason that two graph-ready groups cannot overlap.
@@ -278,11 +272,11 @@ impl PlacedExecutionDag {
     /// Balances non-empty groups over their allowed PP paths and validates all
     /// graph, ownership, schema, static-role, and route invariants.
     pub fn plan(
-        pipeline_stages: usize,
+        pp_rank_count: usize,
         requests: Vec<ExecutionGroupPlacementRequest>,
         output: impl AsRef<str>,
     ) -> Result<Self, Error> {
-        if pipeline_stages == 0 {
+        if pp_rank_count == 0 {
             return Err(Error::Parallel(
                 "placed execution DAG requires at least one PP rank".into(),
             ));
@@ -294,10 +288,15 @@ impl PlacedExecutionDag {
                 .collect(),
             output.as_ref(),
         )?;
+        let unit_layout =
+            ExecutionUnitLayout::new(&semantic, requests.iter().map(|request| request.unit_count))
+                .map_err(|error| {
+                    Error::Parallel(format!("invalid execution-unit placement: {error}"))
+                })?;
         let mut groups = Vec::with_capacity(requests.len());
         for request in requests {
             let id = request.spec.id().to_string();
-            validate_rank_path(&id, pipeline_stages, &request.rank_path)?;
+            validate_rank_path(&id, pp_rank_count, &request.rank_path)?;
             validate_schema(&id, "input", &request.input_schema)?;
             validate_schema(&id, "output", &request.output_schema)?;
             let owners = balanced_ranges(request.unit_count, &request.rank_path);
@@ -306,7 +305,7 @@ impl PlacedExecutionDag {
                 .map_or(request.rank_path[0], |owner| owner.pp_rank);
             let last = owners.last().map_or(first, |owner| owner.pp_rank);
             let merge_destination = request.merge_destination.unwrap_or(last);
-            if merge_destination >= pipeline_stages {
+            if merge_destination >= pp_rank_count {
                 return Err(Error::Parallel(format!(
                     "execution group {id:?} has impossible merge destination PP rank {merge_destination}"
                 )));
@@ -325,13 +324,6 @@ impl PlacedExecutionDag {
                 global_unit_range: 0..request.unit_count,
                 owners,
                 active_subgroup: request.active_subgroup,
-                checkpoint: CheckpointBinding {
-                    group: request.checkpoint_group,
-                    static_roles: static_tensors
-                        .iter()
-                        .map(|owner| owner.role.clone())
-                        .collect(),
-                },
                 static_tensors,
                 input_schema: request.input_schema,
                 output_schema: request.output_schema,
@@ -389,6 +381,8 @@ impl PlacedExecutionDag {
             groups,
             routes,
             semantic,
+            unit_layout,
+            pp_rank_count,
         })
     }
 
@@ -407,6 +401,10 @@ impl PlacedExecutionDag {
     /// Returns the shared semantic DAG used by the ready-set scheduler.
     pub(crate) const fn semantic(&self) -> &ExecutionGraph {
         &self.semantic
+    }
+    /// Returns the canonical complete execution-unit layout.
+    pub const fn unit_layout(&self) -> &ExecutionUnitLayout {
+        &self.unit_layout
     }
     /// Resolves a group by identity.
     pub fn group(&self, id: &str) -> Option<&ExecutionGroupPlacement> {
@@ -463,9 +461,127 @@ impl PlacedExecutionDag {
             .iter()
             .filter_map(move |group| group.local_units(pp_rank).map(|range| (group, range)))
     }
+
+    /// Test-only low-level fixture constructor. Production code realizes
+    /// partitions from a concrete neutral architecture below.
+    #[cfg(test)]
+    fn realize_partition<G, A>(
+        &self,
+        pp_rank: usize,
+        state: Option<(StateLayout, usize)>,
+        local_geometry: G,
+        auxiliary_boundary: A,
+        parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
+    ) -> Result<ArchitecturePartition<G, A>, Error> {
+        if pp_rank >= self.pp_rank_count {
+            return Err(Error::Parallel(format!(
+                "cannot realize PP rank {pp_rank} from {} planned ranks",
+                self.pp_rank_count
+            )));
+        }
+        let group_ranges = self
+            .local_groups(pp_rank)
+            .map(|(group, units)| (group.id.clone(), units))
+            .collect::<Vec<_>>();
+        let static_roles = self
+            .groups
+            .iter()
+            .flat_map(|group| &group.static_tensors)
+            .filter(|owner| owner.pp_rank == pp_rank)
+            .map(|owner| owner.role.clone())
+            .collect::<Vec<_>>();
+        let owns_input = self.groups.iter().enumerate().any(|(index, group)| {
+            self.semantic
+                .dependencies(index)
+                .is_some_and(|dependencies| dependencies.is_empty())
+                && group.first_owner().unwrap_or(group.merge_destination) == pp_rank
+        });
+        let owns_output = self.groups[self.semantic.output()].merge_destination == pp_rank;
+        let ownership = PartitionOwnership::new(owns_input, owns_output, static_roles)
+            .map_err(placement_partition_error)?;
+        let state = state
+            .map(|(layout, offset)| PartitionState::new(layout, offset))
+            .transpose()
+            .map_err(placement_partition_error)?;
+        ArchitecturePartition::new(
+            self.semantic.clone(),
+            self.unit_layout.clone(),
+            group_ranges,
+            ownership,
+            state,
+            local_geometry,
+            auxiliary_boundary,
+            parameter_bindings,
+        )
+        .map_err(placement_partition_error)
+    }
+
+    /// Realizes rank ownership directly from the concrete neutral
+    /// architecture's canonical graph and unit layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn realize_architecture_partition<B, S, M, G, A>(
+        &self,
+        architecture: &M,
+        pp_rank: usize,
+        state: Option<(StateLayout, usize)>,
+        local_geometry: G,
+        auxiliary_boundary: A,
+        parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
+    ) -> Result<ArchitecturePartition<G, A>, Error>
+    where
+        B: eredu_nn::NeuralBackend,
+        S: eredu_runtime::RuntimeState<B>,
+        M: eredu_runtime::LayeredArchitecture<B, S>,
+        M::Error: std::fmt::Display,
+    {
+        if pp_rank >= self.pp_rank_count {
+            return Err(Error::Parallel(format!(
+                "cannot realize PP rank {pp_rank} from {} planned ranks",
+                self.pp_rank_count
+            )));
+        }
+        let group_ranges = self
+            .local_groups(pp_rank)
+            .map(|(group, units)| (group.id.clone(), units))
+            .collect::<Vec<_>>();
+        let static_roles = self
+            .groups
+            .iter()
+            .flat_map(|group| &group.static_tensors)
+            .filter(|owner| owner.pp_rank == pp_rank)
+            .map(|owner| owner.role.clone())
+            .collect::<Vec<_>>();
+        let owns_input = self.groups.iter().enumerate().any(|(index, group)| {
+            self.semantic
+                .dependencies(index)
+                .is_some_and(|dependencies| dependencies.is_empty())
+                && group.first_owner().unwrap_or(group.merge_destination) == pp_rank
+        });
+        let owns_output = self.groups[self.semantic.output()].merge_destination == pp_rank;
+        let ownership = PartitionOwnership::new(owns_input, owns_output, static_roles)
+            .map_err(placement_partition_error)?;
+        let state = state
+            .map(|(layout, offset)| PartitionState::new(layout, offset))
+            .transpose()
+            .map_err(placement_partition_error)?;
+        ArchitecturePartition::from_architecture::<B, S, M, _>(
+            architecture,
+            group_ranges,
+            ownership,
+            state,
+            local_geometry,
+            auxiliary_boundary,
+            parameter_bindings,
+        )
+        .map_err(placement_partition_error)
+    }
 }
 
-fn validate_rank_path(id: &str, stages: usize, ranks: &[usize]) -> Result<(), Error> {
+fn placement_partition_error(error: ArchitecturePartitionError) -> Error {
+    Error::Parallel(format!("invalid architecture partition placement: {error}"))
+}
+
+fn validate_rank_path(id: &str, rank_count: usize, ranks: &[usize]) -> Result<(), Error> {
     if ranks.is_empty() {
         return Err(Error::Parallel(format!(
             "execution group {id:?} has no PP rank path"
@@ -473,7 +589,7 @@ fn validate_rank_path(id: &str, stages: usize, ranks: &[usize]) -> Result<(), Er
     }
     let mut seen = BTreeSet::new();
     for &rank in ranks {
-        if rank >= stages || !seen.insert(rank) {
+        if rank >= rank_count || !seen.insert(rank) {
             return Err(Error::Parallel(format!(
                 "execution group {id:?} has invalid or ambiguous PP owner {rank}"
             )));
@@ -649,6 +765,10 @@ fn add_edge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eredu_runtime::{
+        ExecutionGroupId, MemberSharding, OwnedParameterGroupSpec, ParameterGroupOwner,
+        ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+    };
 
     fn schema(id: &str) -> PayloadSchema {
         PayloadSchema::new(
@@ -694,6 +814,241 @@ mod tests {
             },
             checkpoint_group: id.into(),
         }
+    }
+
+    fn parameter(logical: &str, target: &str) -> ParameterGroupSpec {
+        ParameterGroupSpec::new(
+            logical,
+            ParameterRole::Replicated,
+            [ParameterMemberSpec::new(
+                target,
+                vec![2, 2],
+                MemberSharding::Replicated,
+            )],
+        )
+        .unwrap()
+    }
+
+    fn state_layout(layers: usize) -> StateLayout {
+        StateLayout::new(
+            crate::LayerSchedule::new(layers, vec![crate::LayerCachePolicy::NoState; layers])
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn partition_fixture() -> PlacedExecutionDag {
+        PlacedExecutionDag::plan(
+            2,
+            vec![
+                request(
+                    "vision",
+                    &[],
+                    ExecutionGroupKind::VisionEncoder,
+                    4,
+                    &[0, 1],
+                    "pixels",
+                    "encoded",
+                ),
+                request(
+                    "text",
+                    &["vision"],
+                    ExecutionGroupKind::Decoder,
+                    2,
+                    &[1],
+                    "encoded",
+                    "logits",
+                ),
+            ],
+            "text",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn realizes_neutral_partition_without_absorbing_transport_or_residency() {
+        #[derive(Debug, Clone, Eq, PartialEq)]
+        struct Geometry(&'static str);
+
+        #[derive(Debug, Clone, Eq, PartialEq)]
+        struct Boundary {
+            merge_token: usize,
+        }
+
+        let placed = partition_fixture();
+        let partition = placed
+            .realize_partition(
+                1,
+                Some((state_layout(2), 7)),
+                Geometry("family-local"),
+                Boundary { merge_token: 11 },
+                [OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::execution_unit(ExecutionGroupId::new("text").unwrap(), 0),
+                    parameter("text.layer", "model.layers.0.weight"),
+                )],
+            )
+            .unwrap();
+
+        assert_eq!(
+            partition
+                .graph()
+                .groups()
+                .iter()
+                .map(ExecutionGroupSpec::id)
+                .collect::<Vec<_>>(),
+            ["vision", "text"]
+        );
+        assert_eq!(partition.unit_layout().group_range(0), Some(0..4));
+        assert_eq!(partition.unit_layout().group_range(1), Some(4..6));
+        assert_eq!(partition.groups()[0].group().as_str(), "vision");
+        assert_eq!(partition.groups()[0].global_units(), 2..4);
+        assert_eq!(partition.groups()[1].group().as_str(), "text");
+        assert_eq!(partition.groups()[1].global_units(), 0..2);
+        assert!(!partition.ownership().owns_input());
+        assert!(partition.ownership().owns_output());
+        assert_eq!(
+            partition.ownership().static_roles(),
+            ["vision.output", "text.input", "text.output"]
+        );
+        assert_eq!(partition.state().unwrap().global_layer_offset(), 7);
+        assert_eq!(partition.state().unwrap().global_layers(), 7..9);
+        assert_eq!(partition.local_geometry(), &Geometry("family-local"));
+        assert_eq!(partition.auxiliary_boundary().merge_token, 11);
+        assert_eq!(partition.parameter_bindings().len(), 1);
+        assert_eq!(
+            partition.parameter_bindings()[0].members()[0].target(),
+            "model.layers.0.weight"
+        );
+
+        let ingress = placed
+            .realize_partition(0, None, (), (), std::iter::empty())
+            .unwrap();
+        assert!(ingress.ownership().owns_input());
+        assert!(!ingress.ownership().owns_output());
+        assert_eq!(ingress.ownership().static_roles(), ["vision.input"]);
+
+        assert_eq!(placed.unit_layout().group_range(0), Some(0..4));
+        assert_eq!(
+            placed.group("vision").unwrap().residency.unit_prefix,
+            "vision"
+        );
+        assert!(placed
+            .routes()
+            .iter()
+            .any(|route| route.from_pp_rank == 0 && route.to_pp_rank == 1));
+    }
+
+    #[test]
+    fn output_owned_prediction_selects_untied_shared_embedding_through_mtp_role() {
+        let mut target = request(
+            "target",
+            &[],
+            ExecutionGroupKind::Decoder,
+            4,
+            &[0, 1],
+            "tokens",
+            "hidden",
+        );
+        target.first_owner_static_roles = vec!["embedding".into()];
+        target.last_owner_static_roles = vec!["norm".into(), "output".into()];
+
+        let mut prediction = request(
+            "mtp_0",
+            &["target"],
+            ExecutionGroupKind::Decoder,
+            1,
+            &[1],
+            "hidden",
+            "draft",
+        );
+        prediction.first_owner_static_roles = vec!["mtp".into()];
+        prediction.last_owner_static_roles.clear();
+
+        let placed = PlacedExecutionDag::plan(2, vec![target, prediction], "mtp_0").unwrap();
+        let embedding = OwnedParameterGroupSpec::new(
+            ParameterGroupOwner::static_any_of(["embedding", "mtp"]),
+            parameter("embedding", "model.embed_tokens.weight"),
+        );
+        let output = placed
+            .realize_partition(1, None, (), (), [embedding.clone()])
+            .unwrap();
+        assert!(output.ownership().owns_static_role("mtp"));
+        assert!(output.ownership().owns_static_role("output"));
+        assert!(!output.ownership().owns_static_role("embedding"));
+        assert_eq!(output.parameter_bindings(), [embedding.clone()]);
+
+        let mut target = request(
+            "target",
+            &[],
+            ExecutionGroupKind::Decoder,
+            4,
+            &[0, 1],
+            "tokens",
+            "hidden",
+        );
+        target.first_owner_static_roles = vec!["embedding".into()];
+        target.last_owner_static_roles = vec!["norm".into(), "output".into()];
+        let mut prediction = request(
+            "mtp_0",
+            &["target"],
+            ExecutionGroupKind::Decoder,
+            1,
+            &[1],
+            "hidden",
+            "draft",
+        );
+        prediction.first_owner_static_roles.clear();
+        prediction.last_owner_static_roles.clear();
+        let missing_role = PlacedExecutionDag::plan(2, vec![target, prediction], "mtp_0").unwrap();
+        assert!(matches!(
+            missing_role.realize_partition(1, None, (), (), [embedding]),
+            Err(Error::Parallel(message)) if message.contains("non-local parameter owner")
+        ));
+    }
+
+    #[test]
+    fn translates_neutral_partition_validation_at_the_placement_boundary() {
+        let placed = partition_fixture();
+        let error = placed
+            .realize_partition(
+                1,
+                Some((state_layout(2), usize::MAX)),
+                (),
+                (),
+                std::iter::empty(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Parallel(message)
+                if message.starts_with("invalid architecture partition placement:")
+                    && message.contains("overflowed usize")
+        ));
+
+        let error = placed
+            .realize_partition(
+                1,
+                None,
+                (),
+                (),
+                [
+                    OwnedParameterGroupSpec::new(
+                        ParameterGroupOwner::static_role("text.input"),
+                        parameter("first", "shared.weight"),
+                    ),
+                    OwnedParameterGroupSpec::new(
+                        ParameterGroupOwner::static_role("text.output"),
+                        parameter("second", "shared.weight"),
+                    ),
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Parallel(message)
+                if message.starts_with("invalid architecture partition placement:")
+                    && message.contains("shared.weight")
+        ));
     }
 
     #[test]

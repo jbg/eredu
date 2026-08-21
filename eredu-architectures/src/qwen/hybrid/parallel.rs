@@ -1,14 +1,284 @@
 //! Semantic tensor-parallel placement for shared Qwen hybrid units.
 
-use eredu_nn::RoutedNeuralBackend;
+use eredu_nn::{RoutedNeuralBackend, VocabularyParallelRange};
 use eredu_runtime::{
     aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
+    LocalModelLayout, MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
+    StateLayout, TensorPlacement,
 };
 
 use super::{
-    Block, FeedForward, HybridConfig, HybridLayerPolicy, PredictionUnit, TokenMixer, Unit,
+    prompt_cache_architecture_fingerprint, state_layout_with_geometry, Block, FeedForward,
+    HybridConfig, HybridLayerPolicy, HybridStateGeometry, ParsedHybridConfig, PredictionUnit,
+    TokenMixer, Unit,
 };
+
+use crate::qwen::vision;
+
+/// Complete planner-derived geometry for target, MTP, vocabulary, and state.
+#[derive(Debug, Clone)]
+pub struct LocalGeometry {
+    target: Vec<HybridConfig>,
+    prediction: Vec<HybridConfig>,
+    embedding_range: VocabularyParallelRange,
+    output_range: Option<VocabularyParallelRange>,
+    state_layout: StateLayout,
+    architecture_fingerprint: String,
+}
+
+impl LocalGeometry {
+    /// Returns one target block's rank-local construction policy.
+    pub fn target(&self, layer: usize) -> Option<&HybridConfig> {
+        self.target.get(layer)
+    }
+
+    /// Returns one MTP depth's rank-local construction policy.
+    pub fn prediction(&self, depth: usize) -> Option<&HybridConfig> {
+        self.prediction.get(depth)
+    }
+
+    /// Returns input-vocabulary ownership.
+    pub const fn embedding_range(&self) -> &VocabularyParallelRange {
+        &self.embedding_range
+    }
+
+    /// Returns untied output-vocabulary ownership.
+    pub const fn output_range(&self) -> Option<&VocabularyParallelRange> {
+        self.output_range.as_ref()
+    }
+
+    /// Returns the authoritative heterogeneous rank-local state layout.
+    pub const fn state_layout(&self) -> &StateLayout {
+        &self.state_layout
+    }
+
+    pub(super) fn validate_for(&self, config: &HybridConfig) -> Result<(), ParallelPlanError> {
+        let targets = usize::try_from(config.num_hidden_layers)
+            .map_err(|_| invalid("Qwen hybrid target layer count is negative"))?;
+        let predictions = usize::try_from(config.mtp_num_hidden_layers)
+            .map_err(|_| invalid("Qwen hybrid MTP layer count is negative"))?;
+        if self.architecture_fingerprint != prompt_cache_architecture_fingerprint(config)
+            || self.target.len() != targets
+            || self.prediction.len() != predictions
+        {
+            return Err(invalid(
+                "rank-local Qwen hybrid geometry belongs to another configuration",
+            ));
+        }
+        self.embedding_range
+            .validate_global_rows(config.vocab_size)
+            .map_err(|error| invalid(error.to_string()))?;
+        match (config.tie_word_embeddings, self.output_range.as_ref()) {
+            (true, None) => {}
+            (false, Some(range)) => range
+                .validate_global_rows(config.vocab_size)
+                .map_err(|error| invalid(error.to_string()))?,
+            (true, Some(_)) => return Err(invalid("tied Qwen hybrid output has a separate range")),
+            (false, None) => return Err(invalid("untied Qwen hybrid output has no range")),
+        }
+        let expected = local_state_layout(config, &self.target, &self.prediction)?;
+        if expected != self.state_layout {
+            return Err(invalid("Qwen hybrid local state geometry drifted"));
+        }
+        Ok(())
+    }
+}
+
+/// Derives all target/MTP/vocabulary/state geometry from one typed placement.
+pub fn local_geometry(
+    config: &HybridConfig,
+    layout: &LocalModelLayout,
+) -> Result<LocalGeometry, ParallelPlanError> {
+    let targets = usize::try_from(config.num_hidden_layers)
+        .map_err(|_| invalid("Qwen hybrid target layer count is negative"))?;
+    let predictions = usize::try_from(config.mtp_num_hidden_layers)
+        .map_err(|_| invalid("Qwen hybrid MTP layer count is negative"))?;
+    let target = (0..targets)
+        .map(|layer| local_block_config(config, layer, layout))
+        .collect::<Result<Vec<_>, _>>()?;
+    let prediction = (0..predictions)
+        .map(|depth| local_unit_config(config, depth + 1, 0, layout))
+        .collect::<Result<Vec<_>, _>>()?;
+    let embedding_range = vocabulary_range(layout, "model.embed_tokens", config.vocab_size)?;
+    let output_range = if config.tie_word_embeddings {
+        None
+    } else {
+        Some(vocabulary_range(layout, "lm_head", config.vocab_size)?)
+    };
+    let state_layout = local_state_layout(config, &target, &prediction)?;
+    let geometry = LocalGeometry {
+        target,
+        prediction,
+        embedding_range,
+        output_range,
+        state_layout,
+        architecture_fingerprint: prompt_cache_architecture_fingerprint(config),
+    };
+    geometry.validate_for(config)?;
+    Ok(geometry)
+}
+
+fn local_state_layout(
+    config: &HybridConfig,
+    target: &[HybridConfig],
+    prediction: &[HybridConfig],
+) -> Result<StateLayout, ParallelPlanError> {
+    let mut geometry = target
+        .iter()
+        .enumerate()
+        .map(|(layer, local)| match config.layer_schedule.get(layer) {
+            Some(HybridLayerPolicy::SelfAttention(_)) => HybridStateGeometry::FullAttention {
+                key_value_heads: local.num_key_value_heads,
+            },
+            Some(HybridLayerPolicy::LinearAttention) => HybridStateGeometry::LinearAttention {
+                key_heads: local.linear_num_key_heads,
+                value_heads: local.linear_num_value_heads,
+            },
+            None => HybridStateGeometry::FullAttention { key_value_heads: 0 },
+        })
+        .collect::<Vec<_>>();
+    geometry.extend(
+        prediction
+            .iter()
+            .map(|local| HybridStateGeometry::FullAttention {
+                key_value_heads: local.num_key_value_heads,
+            }),
+    );
+    state_layout_with_geometry(config, &geometry).map_err(|error| invalid(error.to_string()))
+}
+
+fn vocabulary_range(
+    layout: &LocalModelLayout,
+    logical_name: &str,
+    vocabulary: i32,
+) -> Result<VocabularyParallelRange, ParallelPlanError> {
+    let vocabulary =
+        usize::try_from(vocabulary).map_err(|_| invalid("Qwen hybrid vocabulary is negative"))?;
+    let mut selected = None;
+    for (target, tensor) in layout
+        .tensors()
+        .filter(|(_, tensor)| tensor.logical_name() == logical_name)
+    {
+        if tensor.global_shape().first().copied() != Some(vocabulary) {
+            return Err(invalid(format!(
+                "Qwen hybrid vocabulary member {target} has global shape {:?}",
+                tensor.global_shape()
+            )));
+        }
+        let range = match tensor.placement() {
+            TensorPlacement::Range {
+                axis: 0,
+                start,
+                end,
+            } => *start..*end,
+            TensorPlacement::Replicated | TensorPlacement::Local => 0..vocabulary,
+            placement => {
+                return Err(invalid(format!(
+                    "Qwen hybrid vocabulary member {target} has placement {placement:?}"
+                )))
+            }
+        };
+        if selected.as_ref().is_some_and(|current| current != &range) {
+            return Err(invalid(format!(
+                "Qwen hybrid vocabulary group {logical_name} is inconsistent"
+            )));
+        }
+        selected = Some(range);
+    }
+    let range = VocabularyParallelRange {
+        global_vocabulary: vocabulary,
+        local: selected.ok_or_else(|| {
+            invalid(format!(
+                "missing local Qwen hybrid vocabulary layout for {logical_name}"
+            ))
+        })?,
+    };
+    range
+        .validate()
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok(range)
+}
+
+fn invalid(message: impl Into<String>) -> ParallelPlanError {
+    ParallelPlanError::InvalidTensor(message.into())
+}
+
+/// Complete local geometry for the conditional vision + target + MTP graph.
+#[derive(Debug, Clone)]
+pub struct ConditionalLocalGeometry {
+    text: LocalGeometry,
+    vision_blocks: Vec<(i32, i32)>,
+    merger_widths: Vec<i32>,
+}
+
+impl ConditionalLocalGeometry {
+    /// Returns the local target/MTP/vocabulary/state geometry.
+    pub const fn text(&self) -> &LocalGeometry {
+        &self.text
+    }
+
+    /// Returns one vision unit's local `(heads, intermediate)` geometry.
+    pub fn vision_block(&self, layer: usize) -> Option<(i32, i32)> {
+        self.vision_blocks.get(layer).copied()
+    }
+
+    /// Returns local main/deepstack merger widths.
+    pub fn merger_widths(&self) -> &[i32] {
+        &self.merger_widths
+    }
+
+    /// Returns authoritative heterogeneous target and MTP state.
+    pub const fn state_layout(&self) -> &StateLayout {
+        self.text.state_layout()
+    }
+
+    pub(super) fn validate_for(
+        &self,
+        parsed: &ParsedHybridConfig,
+    ) -> Result<(), ParallelPlanError> {
+        self.text.validate_for(&parsed.text)?;
+        let vision = parsed
+            .vision
+            .as_ref()
+            .ok_or_else(|| invalid("conditional Qwen geometry has no vision policy"))?;
+        if self.vision_blocks.len() != vision.layer_count()
+            || self.merger_widths.len() != vision.deepstack_layer_count() + 1
+            || self
+                .vision_blocks
+                .iter()
+                .any(|(heads, width)| *heads <= 0 || *width <= 0)
+            || self.merger_widths.iter().any(|width| *width <= 0)
+        {
+            return Err(invalid(
+                "conditional Qwen local vision geometry is incomplete",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Derives conditional text, MTP, vocabulary, vision, and state geometry.
+pub fn conditional_local_geometry(
+    parsed: &ParsedHybridConfig,
+    layout: &LocalModelLayout,
+) -> Result<ConditionalLocalGeometry, ParallelPlanError> {
+    let vision_config = parsed
+        .vision
+        .as_ref()
+        .ok_or_else(|| invalid("conditional Qwen requires vision geometry"))?;
+    let text = local_geometry(&parsed.text, layout)?;
+    let vision_blocks = (0..vision_config.layer_count())
+        .map(|layer| vision::local_block_geometry(vision_config, "model.visual", layer, layout))
+        .collect::<Result<Vec<_>, _>>()?;
+    let merger_widths = vision::local_merger_widths(vision_config, "model.visual", layout)?;
+    let geometry = ConditionalLocalGeometry {
+        text,
+        vision_blocks,
+        merger_widths,
+    };
+    geometry.validate_for(parsed)?;
+    Ok(geometry)
+}
 
 fn local_width(
     layout: &eredu_runtime::LocalModelLayout,
@@ -79,7 +349,12 @@ fn local_config_at(
             let global_key = config.linear_num_key_heads * config.linear_key_head_dim * 2;
             let global_value = config.linear_num_value_heads * config.linear_value_head_dim;
             let global_total = global_key + global_value;
-            if key * global_key % global_total != 0
+            if key <= 0
+                || value <= 0
+                || global_key <= 0
+                || global_value <= 0
+                || global_total <= 0
+                || key * global_key % global_total != 0
                 || key * global_value % global_total != 0
                 || value % config.linear_value_head_dim != 0
             {
@@ -94,7 +369,12 @@ fn local_config_at(
         HybridLayerPolicy::SelfAttention(_) => {
             let query = local_width(layout, &format!("{root}.self_attn.q_proj.weight"), 0)?;
             let key = local_width(layout, &format!("{root}.self_attn.k_proj.weight"), 0)?;
-            if query % (2 * config.head_dim) != 0 || key % config.head_dim != 0 {
+            if query <= 0
+                || key <= 0
+                || config.head_dim <= 0
+                || query % (2 * config.head_dim) != 0
+                || key % config.head_dim != 0
+            {
                 return Err(ParallelPlanError::InvalidTensor(
                     "rank-local attention projection splits heads".into(),
                 ));
@@ -111,13 +391,28 @@ fn local_config_at(
             ));
         }
         local.moe_intermediate_size = fused / 2;
+        if local.moe_intermediate_size <= 0 {
+            return Err(ParallelPlanError::InvalidTensor(
+                "rank-local expert width must be positive".into(),
+            ));
+        }
         local.shared_expert_intermediate_size = local_width(
             layout,
             &format!("{root}.mlp.shared_expert.gate_proj.weight"),
             0,
         )?;
+        if local.shared_expert_intermediate_size <= 0 {
+            return Err(ParallelPlanError::InvalidTensor(
+                "rank-local shared expert width must be positive".into(),
+            ));
+        }
     } else {
         local.intermediate_size = local_width(layout, &format!("{root}.mlp.gate_proj.weight"), 0)?;
+        if local.intermediate_size <= 0 {
+            return Err(ParallelPlanError::InvalidTensor(
+                "rank-local dense width must be positive".into(),
+            ));
+        }
     }
     Ok(local)
 }

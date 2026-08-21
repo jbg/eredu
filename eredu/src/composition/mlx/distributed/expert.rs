@@ -979,11 +979,6 @@ impl ExpertParallelModel {
                                 .into(),
                         ));
                     }
-                    if tensor_group.is_some() {
-                        return Err(Error::Parallel(
-                            "neutral DeepSeek TP+EP execution is not configured".into(),
-                        ));
-                    }
                     let args = match (model.v3_args(), model.v4_args()) {
                         (Some(args), None) => NeutralDeepSeekArgs::V3(args.clone()),
                         (None, Some(args)) => NeutralDeepSeekArgs::V4(args.clone()),
@@ -1013,7 +1008,21 @@ impl ExpertParallelModel {
                             statistics.accumulate(&returned.statistics);
                             Ok(returned.reduced_output)
                         };
-                    model.forward_with_expert_executor(tokens, cache, &mut execute, stream)?
+                    match tensor_group {
+                        Some(tensor_group) => model.forward_tensor_expert_parallel(
+                            tokens,
+                            cache,
+                            tensor_group,
+                            &mut execute,
+                            stream,
+                        )?,
+                        None => model.forward_with_expert_executor(
+                            tokens,
+                            cache,
+                            &mut execute,
+                            stream,
+                        )?,
+                    }
                 }
                 (ExpertArchitecture::NeutralHybrid(model), ExpertParallelCache::Hybrid(cache)) => {
                     model.forward_expert_parallel(
@@ -1138,11 +1147,6 @@ impl ExpertParallelModel {
         let mut statistics = RoutingStatistics::default();
         let output = match (&mut self.architecture, cache) {
             (ExpertArchitecture::DeepSeek(model), ExpertParallelCache::DeepSeek(cache)) => {
-                if tensor_group.is_some() {
-                    return Err(Exception::custom(
-                        "neutral DeepSeek TP+EP MTP execution is not configured",
-                    ));
-                }
                 let args = match (model.v3_args(), model.v4_args()) {
                     (Some(args), None) => NeutralDeepSeekArgs::V3(args.clone()),
                     (None, Some(args)) => NeutralDeepSeekArgs::V4(args.clone()),
@@ -1172,12 +1176,22 @@ impl ExpertParallelModel {
                         statistics.accumulate(&returned.statistics);
                         Ok(returned.reduced_output)
                     };
-                let (logits, hidden) = model.forward_embedded_with_expert_executor(
-                    eredu_architectures::deepseek::mtp::EmbeddedInput::target(tokens, None),
-                    cache,
-                    &mut execute,
-                    stream,
-                )?;
+                let input = eredu_architectures::deepseek::mtp::EmbeddedInput::target(tokens, None);
+                let (logits, hidden) = match tensor_group {
+                    Some(tensor_group) => model.forward_embedded_tensor_expert_parallel(
+                        input,
+                        cache,
+                        tensor_group,
+                        &mut execute,
+                        stream,
+                    )?,
+                    None => model.forward_embedded_with_expert_executor(
+                        input,
+                        cache,
+                        &mut execute,
+                        stream,
+                    )?,
+                };
                 EmbeddedMtpOutput {
                     logits,
                     hidden,
@@ -1226,11 +1240,6 @@ impl ExpertParallelModel {
         let mut statistics = RoutingStatistics::default();
         let output = match (&mut self.architecture, cache) {
             (ExpertArchitecture::DeepSeek(model), ExpertParallelMtpDraftCache::DeepSeek(cache)) => {
-                if tensor_group.is_some() {
-                    return Err(Exception::custom(
-                        "neutral DeepSeek TP+EP MTP execution is not configured",
-                    ));
-                }
                 let args = match (model.v3_args(), model.v4_args()) {
                     (Some(args), None) => NeutralDeepSeekArgs::V3(args.clone()),
                     (None, Some(args)) => NeutralDeepSeekArgs::V4(args.clone()),
@@ -1260,12 +1269,23 @@ impl ExpertParallelModel {
                         statistics.accumulate(&returned.statistics);
                         Ok(returned.reduced_output)
                     };
-                let (logits, next_hidden) = model.forward_embedded_with_expert_executor(
-                    eredu_architectures::deepseek::mtp::EmbeddedInput::draft(tokens, hidden, depth),
-                    cache,
-                    &mut execute,
-                    stream,
-                )?;
+                let input =
+                    eredu_architectures::deepseek::mtp::EmbeddedInput::draft(tokens, hidden, depth);
+                let (logits, next_hidden) = match tensor_group {
+                    Some(tensor_group) => model.forward_embedded_tensor_expert_parallel(
+                        input,
+                        cache,
+                        tensor_group,
+                        &mut execute,
+                        stream,
+                    )?,
+                    None => model.forward_embedded_with_expert_executor(
+                        input,
+                        cache,
+                        &mut execute,
+                        stream,
+                    )?,
+                };
                 EmbeddedMtpOutput {
                     logits,
                     hidden: next_hidden,
@@ -2259,19 +2279,26 @@ fn load_external_gguf_ep(
             )
         }
         "deepseek4" => {
-            if topology.tensor_parallel_size > 1 {
-                return Err(Error::Parallel(
-                    "neutral DeepSeek GGUF TP+EP loading is not configured".into(),
-                ));
-            }
-            let (model, _) = crate::composition::deepseek::load_gguf_external_experts(
-                checkpoint,
-                metadata,
-                true,
-                non_expert,
-                stream,
-                weights_stream,
-            )?;
+            let (model, _) = if topology.tensor_parallel_size > 1 {
+                crate::composition::deepseek::load_gguf_external_experts_parallel(
+                    checkpoint,
+                    metadata,
+                    true,
+                    non_expert,
+                    ParallelBuildContext::new(topology, ShardingPolicy::Require),
+                    stream,
+                    weights_stream,
+                )?
+            } else {
+                crate::composition::deepseek::load_gguf_external_experts(
+                    checkpoint,
+                    metadata,
+                    true,
+                    non_expert,
+                    stream,
+                    weights_stream,
+                )?
+            };
             let args = model
                 .v4_args()
                 .cloned()
@@ -2282,7 +2309,7 @@ fn load_external_gguf_ep(
                 topology,
             )?;
             let store = model.checkpoint_store_arc();
-            let entries = crate::composition::deepseek_expert::v4_catalog(&args, store.as_ref())?;
+            let entries = deepseek_v4_expert_catalog(&args, store.as_ref(), topology)?;
             let replicated_parameter_bytes =
                 planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
@@ -2299,19 +2326,26 @@ fn load_external_gguf_ep(
             )
         }
         "deepseek2" => {
-            if topology.tensor_parallel_size > 1 {
-                return Err(Error::Parallel(
-                    "neutral DeepSeek GGUF TP+EP loading is not configured".into(),
-                ));
-            }
-            let (model, _) = crate::composition::deepseek::load_gguf_external_experts(
-                checkpoint,
-                metadata,
-                false,
-                non_expert,
-                stream,
-                weights_stream,
-            )?;
+            let (model, _) = if topology.tensor_parallel_size > 1 {
+                crate::composition::deepseek::load_gguf_external_experts_parallel(
+                    checkpoint,
+                    metadata,
+                    false,
+                    non_expert,
+                    ParallelBuildContext::new(topology, ShardingPolicy::Require),
+                    stream,
+                    weights_stream,
+                )?
+            } else {
+                crate::composition::deepseek::load_gguf_external_experts(
+                    checkpoint,
+                    metadata,
+                    false,
+                    non_expert,
+                    stream,
+                    weights_stream,
+                )?
+            };
             let args = model
                 .v3_args()
                 .cloned()
@@ -2322,7 +2356,7 @@ fn load_external_gguf_ep(
                 topology,
             )?;
             let store = model.checkpoint_store_arc();
-            let entries = crate::composition::deepseek_expert::v3_catalog(&args, store.as_ref())?;
+            let entries = deepseek_v3_expert_catalog(&args, store.as_ref(), topology)?;
             let replicated_parameter_bytes =
                 planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
@@ -2670,6 +2704,58 @@ fn load_kimi_linear_external_ep(
     )
 }
 
+fn deepseek_intermediate_range(
+    global: i32,
+    topology: MlxParallelContext,
+) -> Result<std::ops::Range<usize>, Error> {
+    let global = usize::try_from(global)
+        .map_err(|_| Error::Parallel("invalid DeepSeek expert intermediate width".into()))?;
+    if global % topology.tensor_parallel_size != 0 {
+        return Err(Error::Parallel(format!(
+            "DeepSeek expert intermediate width {global} is not divisible by tensor parallel size {}",
+            topology.tensor_parallel_size
+        )));
+    }
+    let width = global / topology.tensor_parallel_size;
+    let start = topology
+        .tensor_parallel_rank
+        .checked_mul(width)
+        .ok_or_else(|| Error::Parallel("DeepSeek expert intermediate range overflowed".into()))?;
+    Ok(start..start + width)
+}
+
+fn deepseek_v3_expert_catalog(
+    args: &eredu_architectures::deepseek::V3Args,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    topology: MlxParallelContext,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    if topology.tensor_parallel_size > 1 {
+        crate::composition::deepseek_expert::v3_parallel_catalog(
+            args,
+            deepseek_intermediate_range(args.moe_intermediate_size, topology)?,
+            store,
+        )
+    } else {
+        crate::composition::deepseek_expert::v3_catalog(args, store)
+    }
+}
+
+fn deepseek_v4_expert_catalog(
+    args: &eredu_architectures::deepseek::V4Args,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    topology: MlxParallelContext,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    if topology.tensor_parallel_size > 1 {
+        crate::composition::deepseek_expert::v4_parallel_catalog(
+            args,
+            deepseek_intermediate_range(args.moe_intermediate_size, topology)?,
+            store,
+        )
+    } else {
+        crate::composition::deepseek_expert::v4_catalog(args, store)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_deepseek_external_ep(
     model_dir: &Path,
@@ -2682,18 +2768,24 @@ fn load_deepseek_external_ep(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
-    if topology.tensor_parallel_size > 1 {
-        return Err(Error::Parallel(
-            "neutral DeepSeek TP+EP loading is not configured".into(),
-        ));
-    }
-    let model = crate::composition::deepseek::load_safetensors_external_experts(
-        model_dir,
-        non_expert,
-        options.quantization,
-        stream,
-        weights_stream,
-    )?;
+    let model = if topology.tensor_parallel_size > 1 {
+        crate::composition::deepseek::load_safetensors_external_experts_parallel(
+            model_dir,
+            non_expert,
+            options.quantization,
+            ParallelBuildContext::new(topology, ShardingPolicy::Require),
+            stream,
+            weights_stream,
+        )?
+    } else {
+        crate::composition::deepseek::load_safetensors_external_experts(
+            model_dir,
+            non_expert,
+            options.quantization,
+            stream,
+            weights_stream,
+        )?
+    };
     let args = model
         .v3_args()
         .cloned()
@@ -2701,7 +2793,7 @@ fn load_deepseek_external_ep(
     let assignment =
         resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
     let store = model.checkpoint_store_arc();
-    let entries = crate::composition::deepseek_expert::v3_catalog(&args, store.as_ref())?;
+    let entries = deepseek_v3_expert_catalog(&args, store.as_ref(), topology)?;
     let replicated_parameter_bytes = planned_replicated_bytes(&model.residency_report()?)?;
     finish_external_ep(
         topology,
@@ -2729,18 +2821,24 @@ fn load_deepseek_v4_external_ep(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
-    if topology.tensor_parallel_size > 1 {
-        return Err(Error::Parallel(
-            "neutral DeepSeek TP+EP loading is not configured".into(),
-        ));
-    }
-    let model = crate::composition::deepseek::load_safetensors_external_experts(
-        model_dir,
-        non_expert,
-        options.quantization,
-        stream,
-        weights_stream,
-    )?;
+    let model = if topology.tensor_parallel_size > 1 {
+        crate::composition::deepseek::load_safetensors_external_experts_parallel(
+            model_dir,
+            non_expert,
+            options.quantization,
+            ParallelBuildContext::new(topology, ShardingPolicy::Require),
+            stream,
+            weights_stream,
+        )?
+    } else {
+        crate::composition::deepseek::load_safetensors_external_experts(
+            model_dir,
+            non_expert,
+            options.quantization,
+            stream,
+            weights_stream,
+        )?
+    };
     let args = model
         .v4_args()
         .cloned()
@@ -2748,7 +2846,7 @@ fn load_deepseek_v4_external_ep(
     let assignment =
         resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
     let store = model.checkpoint_store_arc();
-    let entries = crate::composition::deepseek_expert::v4_catalog(&args, store.as_ref())?;
+    let entries = deepseek_v4_expert_catalog(&args, store.as_ref(), topology)?;
     let replicated_parameter_bytes = planned_replicated_bytes(&model.residency_report()?)?;
     finish_external_ep(
         topology,

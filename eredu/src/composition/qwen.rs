@@ -4,8 +4,7 @@ use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::{
     CausalModel, ExecutionGraph, ExecutionResidency, ExecutionUnitLayout, LayerWeightResidency,
-    LayeredArchitecture, LayeredForwardState, LayerwiseRuntime, ParallelLayeredArchitecture,
-    RuntimeState, WeightResidency,
+    LayerwiseRuntime, RuntimeState, WeightResidency,
 };
 
 use std::{
@@ -17,7 +16,7 @@ use std::{
 use eredu_architectures::qwen::ModelArgs;
 use eredu_nn::{
     ExpertProjectionSpec, GatedProductExpertBankSpec, GatedProductExpertLayout, ParameterSpec,
-    ParameterVisitor, ParameterVisitorMut, Parameterized, RoutedNeuralBackend,
+    RoutedNeuralBackend,
 };
 use safemlx::{
     error::Exception,
@@ -34,21 +33,20 @@ use crate::core::cache::{
 use crate::backend::mlx::runtime::checkpoint::load::gguf_quantization_configs;
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::nn::parallel::{VocabParallelEmbedding, VocabParallelLmHead},
-    backend::mlx::nn::shared::{MlxBackend, MlxModule, MlxNamedModule},
+    backend::mlx::nn::shared::{MlxBackend, MlxModule},
     backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
     backend::mlx::runtime::cache::state::MlxKeyValueState,
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes,
         build_module_binding_plan_with_recipes_excluding, build_module_bindings,
-        build_module_bindings_with_recipes_excluding,
+        build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
+        parameter_role_targets,
     },
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, store::open_gguf_checkpoint_source,
     },
     backend::mlx::runtime::execution::generic::{
         prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
-        MlxUnitFactory,
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
@@ -75,44 +73,29 @@ pub(crate) mod vl {
 }
 use eredu_runtime::{
     CacheResidencyPolicy, DenseDiskStreamReport, LayerwiseModelMetadata, PagedCacheOptions,
-    ParallelModelInfo, StaticUnitBindings,
+    ParallelModelInfo, ParameterRole, StaticUnitBindings,
 };
 
 use eredu_runtime::{ResidencyReport, WeightBinding};
 
 type NeutralBlock = eredu_architectures::qwen::TransformerBlock<MlxBackend>;
 
-#[derive(Clone)]
-struct QwenUnitFactory {
-    args: ModelArgs,
-}
-
-impl MlxUnitFactory<NeutralBlock> for QwenUnitFactory {
-    fn build(&mut self, index: usize, stream: &Stream) -> Result<NeutralBlock, Error> {
-        eredu_architectures::qwen::new_block::<MlxBackend>(&self.args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-}
-
-#[derive(Clone)]
-struct QwenParallelUnitFactory {
-    local_args: Arc<Vec<ModelArgs>>,
-}
-
-impl MlxUnitFactory<NeutralBlock> for QwenParallelUnitFactory {
-    fn build(&mut self, index: usize, stream: &Stream) -> Result<NeutralBlock, Error> {
-        let args = self.local_args.get(index).ok_or_else(|| {
-            Error::Parallel(format!(
-                "parallel Qwen unit {index} is outside {} local layouts",
-                self.local_args.len()
-            ))
-        })?;
-        eredu_architectures::qwen::new_block::<MlxBackend>(args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-}
-
 type NeutralArchitecture = eredu_architectures::qwen::LayeredModel<MlxBackend>;
+
+fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Result<(), Error> {
+    let transport = <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
+        MlxBackend,
+        MlxKeyValueState,
+    >>::group_transport(architecture, group);
+    if transport.kind == eredu_runtime::ArchitectureGroupKind::Decoder {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedArchitecture(format!(
+            "Qwen checkpoint bindings require the decoder execution group, got {group}"
+        )))
+    }
+}
+
 type NeutralResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxBackend,
@@ -123,20 +106,20 @@ type NeutralLayerwiseRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxBackend,
     MlxKeyValueState,
-    MlxLayerwisePolicy<NeutralBlock, QwenUnitFactory>,
+    MlxLayerwisePolicy<NeutralBlock>,
 >;
 
 type NeutralParallelResidentRuntime = LayerwiseRuntime<
-    QwenParallelComposition,
+    NeutralArchitecture,
     MlxBackend,
     MlxKeyValueState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type NeutralParallelLayerwiseRuntime = LayerwiseRuntime<
-    QwenParallelComposition,
+    NeutralArchitecture,
     MlxBackend,
     MlxKeyValueState,
-    MlxLayerwisePolicy<NeutralBlock, QwenParallelUnitFactory>,
+    MlxLayerwisePolicy<NeutralBlock>,
 >;
 
 enum QwenExecution {
@@ -174,62 +157,10 @@ impl eredu_runtime::ActivationObserver<Array, eredu_nn::Error> for NeutralQwenOb
 }
 
 #[allow(clippy::too_many_arguments)]
-fn forward_qwen_external_experts<P>(
-    architecture: &mut NeutralArchitecture,
-    index: usize,
-    block: &mut NeutralBlock,
-    hidden: &Array,
-    state: &mut MlxKeyValueState,
-    forward: &mut eredu_architectures::qwen::ForwardContext<Array>,
-    pass: eredu_runtime::ExpertPass,
-    parallel: Option<&safemlx::distributed::Group>,
-    stream: &Stream,
-    provider: &mut P,
-) -> Result<Array, eredu_nn::Error>
-where
-    P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
-    P::Error: std::fmt::Display,
-{
-    let feed_forward = |policy: &mut eredu_architectures::qwen::FeedForward<MlxBackend>,
-                        normalized: &Array,
-                        context: &Stream| {
-        let shape = normalized.shape().to_vec();
-        let flat = normalized
-            .reshape(&[-1, normalized.dim(-1)], context)
-            .map_err(eredu_nn::Error::backend)?;
-        policy
-            .forward_with_provider(index, pass, &flat, context, provider)?
-            .reshape(&shape, context)
-            .map_err(eredu_nn::Error::backend)
-    };
-    match parallel {
-        Some(group) => architecture.forward_block_parallel_with_feed_forward(
-            index,
-            block,
-            hidden,
-            state,
-            forward,
-            group,
-            stream,
-            feed_forward,
-        ),
-        None => architecture.forward_block_with_feed_forward(
-            index,
-            block,
-            hidden,
-            state,
-            forward,
-            stream,
-            feed_forward,
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn forward_qwen_observed_unit(
     architecture: &mut NeutralArchitecture,
     args: &ModelArgs,
-    group: usize,
+    _group: usize,
     index: usize,
     block: &mut NeutralBlock,
     hidden: &Array,
@@ -238,11 +169,6 @@ fn forward_qwen_observed_unit(
     stream: &Stream,
     observer: &mut NeutralQwenObserver<'_>,
 ) -> Result<Array, eredu_nn::Error> {
-    if group != 0 {
-        return Err(eredu_nn::Error::backend(format!(
-            "Qwen decoder received execution group {group}"
-        )));
-    }
     let path = format!("{}.layers.{index}", args.parameter_root);
     observer.observe(&format!("{path}.input"), hidden)?;
     let mut output = architecture.forward_block_with_feed_forward(
@@ -272,7 +198,7 @@ fn forward_qwen_cached_observed_unit(
     args: &ModelArgs,
     expert_cache: &ExpertCache,
     pass: eredu_runtime::ExpertPass,
-    group: usize,
+    _group: usize,
     index: usize,
     block: &mut NeutralBlock,
     hidden: &Array,
@@ -281,11 +207,6 @@ fn forward_qwen_cached_observed_unit(
     stream: &Stream,
     observer: &mut NeutralQwenObserver<'_>,
 ) -> Result<Array, eredu_nn::Error> {
-    if group != 0 {
-        return Err(eredu_nn::Error::backend(format!(
-            "Qwen decoder received execution group {group}"
-        )));
-    }
     let path = format!("{}.layers.{index}", args.parameter_root);
     let mut provider = expert::cached_provider(expert_cache, args);
     observer.observe(&format!("{path}.input"), hidden)?;
@@ -387,13 +308,13 @@ fn load_neutral_qwen(
         .map_err(|_| Error::UnsupportedArchitecture("invalid Qwen layer count".into()))?;
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let factory = QwenUnitFactory { args: args.clone() };
     let unit_layout = decoder_unit_layout(layer_count)?;
     let binding_args = args.clone();
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
-        architecture.static_modules_mut(),
-        factory,
+        &mut architecture,
+        (),
+        std::marker::PhantomData::<MlxKeyValueState>,
         unit_layout,
         options,
         stream,
@@ -426,9 +347,13 @@ fn load_neutral_qwen(
     metadata.set_quantization(args.weight_quantization());
     metadata.set_materialization(materialization);
     let execution = if options.is_fully_resident() {
-        QwenExecution::Resident(Box::new(LayerwiseRuntime::new(
+        QwenExecution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(
+                &architecture,
+                stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
+            )?,
             architecture,
-            policy.into_resident(stream)?,
         )))
     } else {
         QwenExecution::Layerwise(Box::new(LayerwiseRuntime::new(architecture, policy)))
@@ -949,22 +874,20 @@ impl QwenModel {
                     state: &mut MlxKeyValueState,
                     forward: &mut eredu_architectures::qwen::ForwardContext<Array>,
                     context: &Stream| {
-            if group != 0 {
-                return Err(eredu_nn::Error::backend(format!(
-                    "Qwen decoder received execution group {group}"
-                )));
-            }
-            forward_qwen_external_experts(
+            <NeutralArchitecture as eredu_runtime::RoutedLayeredArchitecture<
+                MlxBackend,
+                MlxKeyValueState,
+            >>::forward_unit_with_provider(
                 architecture,
+                group,
                 index,
                 block,
                 hidden,
                 state,
                 forward,
                 pass,
-                None,
-                context,
                 provider,
+                context,
             )
         };
         let input = eredu_architectures::qwen::LayeredInput {
@@ -1025,7 +948,7 @@ impl QwenModel {
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let hook = |composition: &mut QwenParallelComposition,
+        let hook = |architecture: &mut NeutralArchitecture,
                     execution_group: usize,
                     index: usize,
                     block: &mut NeutralBlock,
@@ -1034,24 +957,22 @@ impl QwenModel {
                     forward: &mut eredu_architectures::qwen::ForwardContext<Array>,
                     parallel: &safemlx::distributed::Group,
                     context: &Stream| {
-            if execution_group != 0 {
-                return Err(Error::Parallel(format!(
-                    "Qwen decoder received execution group {execution_group}"
-                )));
-            }
-            forward_qwen_external_experts(
-                &mut composition.architecture,
+            <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
+                MlxBackend,
+                MlxKeyValueState,
+            >>::forward_unit_parallel_with_provider(
+                architecture,
+                execution_group,
                 index,
                 block,
                 hidden,
                 state,
                 forward,
                 pass,
-                Some(parallel),
-                context,
                 provider,
+                parallel,
+                context,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         };
         let input = eredu_architectures::qwen::LayeredInput {
             tokens: inputs,
@@ -1253,13 +1174,10 @@ fn load_neutral_qwen_parallel(
 ) -> Result<QwenModel, Error> {
     let layer_count = usize::try_from(args.num_hidden_layers)
         .map_err(|_| Error::UnsupportedArchitecture("invalid Qwen layer count".into()))?;
-    let mut composition = if external_experts {
-        QwenParallelComposition::new_external_experts(args.clone(), stream)?
-    } else {
-        QwenParallelComposition::new(args.clone(), stream)?
-    };
+    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut planner = build.planner();
-    let static_modules = composition.architecture.static_modules();
+    let static_modules = global_architecture.static_modules();
     for group in eredu_architectures::qwen::static_parallel_parameter_groups::<MlxBackend>(
         &static_modules.embeddings,
         &static_modules.norm,
@@ -1283,12 +1201,15 @@ fn load_neutral_qwen_parallel(
             "Qwen declared no tensor-parallel parameters".into(),
         ));
     }
-    composition.configure_parallel(build, &layout, stream)?;
-    let state_layout = composition.local_state_layout()?;
-    let factory = composition.unit_factory()?;
-
+    let geometry = eredu_architectures::qwen::local_geometry(&args, &layout)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let state_layout = architecture
+        .runtime_state_layout()
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let global_static_bindings = build_module_bindings(
-        &MlxModule::new(composition.architecture.static_modules().clone()),
+        &MlxModule::new(global_architecture.static_modules().clone()),
         "",
         store.as_ref(),
     )?;
@@ -1314,11 +1235,14 @@ fn load_neutral_qwen_parallel(
     }
 
     let binding_args = args.clone();
+    let global_static_modules = global_architecture.static_modules().clone();
+    let binding_layout = layout.clone();
     let unit_layout = decoder_unit_layout(layer_count)?;
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
-        &mut composition,
-        factory,
+        &mut architecture,
+        (),
+        std::marker::PhantomData::<MlxKeyValueState>,
         unit_layout,
         options,
         stream,
@@ -1328,10 +1252,10 @@ fn load_neutral_qwen_parallel(
                 || key.ends_with(".rotary_emb.inv_freq")
                 || (external_experts && key.contains(".mlp.experts."))
         },
-        |modules, store| {
-            let global = MlxModule::new(modules.architecture.static_modules().clone());
+        move |_modules, store| {
+            let global = MlxModule::new(global_static_modules.clone());
             let bindings = build_module_bindings(&global, "", store)?;
-            shard_layer_bindings(bindings, "", store, &layout)
+            shard_layer_bindings(bindings, "", store, &binding_layout)
         },
         |index, _local, store, stream| {
             let global =
@@ -1386,12 +1310,19 @@ fn load_neutral_qwen_parallel(
     let parallel_rank =
         crate::backend::mlx::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
     let execution = if options.is_fully_resident() {
-        QwenExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new(
-            composition,
-            policy.into_resident(stream)?,
+        QwenExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(
+                &architecture,
+                stream,
+                std::marker::PhantomData::<MlxKeyValueState>,
+            )?,
+            architecture,
         )))
     } else {
-        QwenExecution::TensorParallelLayerwise(Box::new(LayerwiseRuntime::new(composition, policy)))
+        QwenExecution::TensorParallelLayerwise(Box::new(LayerwiseRuntime::new(
+            architecture,
+            policy,
+        )))
     };
     Ok(QwenModel {
         args,
@@ -1615,57 +1546,40 @@ pub(crate) fn load_qwen_gguf_model(
     Ok((model, prepared.eos_token_ids))
 }
 
-/// Qwen implementation of the generic layerwise model-family contract.
-pub struct QwenParallelComposition {
-    architecture: NeutralArchitecture,
-    parallel_embedding: Option<MlxNamedModule<VocabParallelEmbedding>>,
-    parallel_lm_head: Option<MlxNamedModule<VocabParallelLmHead>>,
-    parallel_kv_heads: Option<Vec<i32>>,
-    local_args: Option<Arc<Vec<ModelArgs>>>,
-    topology: Option<crate::backend::mlx::MlxParallelContext>,
+/// Qwen binding and placement helper for pipeline-parallel stages.
+pub struct QwenPipelineBindings {
     external_experts: bool,
 }
 
-impl QwenParallelComposition {
-    /// Creates metadata-only static modules for a normalized Qwen configuration.
-    pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
-        let architecture = NeutralArchitecture::new(args, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        Ok(Self {
-            architecture,
-            parallel_embedding: None,
-            parallel_lm_head: None,
-            parallel_kv_heads: None,
-            local_args: None,
-            topology: None,
+impl QwenPipelineBindings {
+    /// Creates a stateless checkpoint-binding adapter.
+    pub const fn new() -> Self {
+        Self {
             external_experts: false,
-        })
+        }
     }
 
-    pub(crate) fn new_external_experts(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
-        let mut composition = Self::new(args, stream)?;
-        composition.external_experts = true;
-        Ok(composition)
+    pub(crate) const fn new_external_experts() -> Self {
+        Self {
+            external_experts: true,
+        }
     }
 
-    /// Returns normalized Qwen arguments.
-    pub const fn args(&self) -> &ModelArgs {
-        self.architecture.args()
-    }
-
-    pub(crate) fn model_type(&self) -> &str {
-        &self.args().model_type
+    pub(crate) fn model_type<'a>(&self, architecture: &'a NeutralArchitecture) -> &'a str {
+        &architecture.args().model_type
     }
 
     pub(crate) fn static_units(
         &self,
+        architecture: &NeutralArchitecture,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(store, &|_| true)
+        self.selected_static_units(architecture, store, &|_| true)
     }
 
     pub(crate) fn selected_static_units(
         &self,
+        architecture: &NeutralArchitecture,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
@@ -1677,68 +1591,26 @@ impl QwenParallelComposition {
         .into_iter()
         .filter_map(|(role, unit)| select(unit).then_some(role))
         .collect::<Vec<_>>();
-        self.selected_static_units_for_roles(store, &roles)
+        self.selected_static_units_for_roles(architecture, store, &roles)
     }
 
     pub(crate) fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
         true
     }
 
-    pub(crate) fn register_parallel_parameters(
+    /// Applies rank-local expert residency to an architecture-constructed unit.
+    pub(crate) fn prepare_unit_expert_residency(
         &self,
-        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let static_modules = self.architecture.static_modules();
-        for group in eredu_architectures::qwen::static_parallel_parameter_groups::<MlxBackend>(
-            &static_modules.embeddings,
-            &static_modules.norm,
-            static_modules.lm_head.as_ref(),
-            &self.args().parameter_root,
-        )? {
-            planner.register(group)?;
-        }
-        for index in 0..self.args().num_hidden_layers as usize {
-            let unit =
-                eredu_architectures::qwen::new_block::<MlxBackend>(self.args(), index, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-            for group in eredu_architectures::qwen::layer_parallel_parameter_groups::<MlxBackend>(
-                &unit,
-                self.args(),
-                index,
-            )? {
-                planner.register(group)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn new_cartesian_layer(
-        &self,
-        group: usize,
+        architecture: &NeutralArchitecture,
         index: usize,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
+        layer: &mut MlxModule<NeutralBlock>,
+        local_intermediate_size: i32,
         assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
-    ) -> Result<MlxModule<NeutralBlock>, Error> {
-        if group != 0 {
-            return Err(Error::Parallel(format!(
-                "Qwen decoder has no execution group {group}"
-            )));
-        }
-        let local;
-        let args = match layout {
-            Some(layout) => {
-                local = eredu_architectures::qwen::local_block_args(self.args(), index, layout)
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-                &local
-            }
-            None => self.args(),
-        };
-        let mut block = eredu_architectures::qwen::new_block::<MlxBackend>(args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    ) -> Result<(), Error> {
+        let args = architecture.args();
         if let (Some(assignment), eredu_architectures::qwen::FeedForward::Routed(moe)) =
-            (assignment, &mut block.mlp)
+            (assignment, &mut layer.inner.mlp)
         {
             let count = i32::try_from(assignment.local_global_expert_ids().len())
                 .map_err(|_| Error::Parallel("local Qwen expert count exceeds i32".into()))?;
@@ -1750,7 +1622,7 @@ impl QwenParallelComposition {
                     GatedProductExpertBankSpec {
                         expert_count: count,
                         input_dimensions: args.hidden_size,
-                        intermediate_dimensions: args.moe_intermediate_size,
+                        intermediate_dimensions: local_intermediate_size,
                         output_dimensions: args.hidden_size,
                         policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
                         layout: GatedProductExpertLayout::Packed {
@@ -1773,49 +1645,44 @@ impl QwenParallelComposition {
                 .map_err(|error| Error::Parallel(error.to_string()))?;
             }
         }
-        Ok(MlxModule::new(block))
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn cartesian_layer_bindings(
         &self,
+        architecture: &NeutralArchitecture,
         group: usize,
         index: usize,
-        layer: &MlxModule<NeutralBlock>,
+        global_layer: &MlxModule<NeutralBlock>,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
         assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
-        stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
-        if group != 0 {
-            return Err(Error::Parallel(format!(
-                "Qwen decoder has no execution group {group}"
-            )));
-        }
+        require_decoder_group(architecture, group)?;
+        let expert_targets = parameter_role_targets(
+            &eredu_architectures::qwen::layer_parallel_parameter_groups(
+                global_layer,
+                architecture.args(),
+                index,
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))?,
+            ParameterRole::ExpertIntermediate,
+        );
         let recipes = if self.external_experts {
             BTreeMap::new()
         } else {
-            qwen_unit_recipes(store, self.args(), index)?
+            qwen_unit_recipes(store, architecture.args(), index)?
         };
         // Checkpoint recipes describe the global bank. Build their initial
         // bindings against global geometry, then apply EP selection and TP
         // sharding before the result is populated into the local block.
-        let global_layer;
-        let binding_layer = if layout.is_some() || assignment.is_some() {
-            global_layer = MlxModule::new(
-                eredu_architectures::qwen::new_block::<MlxBackend>(self.args(), index, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-            );
-            &global_layer
-        } else {
-            layer
-        };
         let mut bindings = build_module_binding_plan_with_recipes_excluding(
-            binding_layer,
+            global_layer,
             "",
             store,
             recipes,
-            |name| self.external_experts && name.contains(".mlp.experts."),
+            |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
         )?
         .build_bindings(store)?;
         if let Some(assignment) = assignment {
@@ -1824,7 +1691,7 @@ impl QwenParallelComposition {
                 .into_iter()
                 .map(|binding| {
                     let target = binding.logical_target().unwrap_or_else(|| binding.name());
-                    if target.contains(".mlp.experts.") {
+                    if parameter_name_in_targets(target, &expert_targets) {
                         binding
                             .select_bounded_output(
                                 store,
@@ -1850,55 +1717,54 @@ impl QwenParallelComposition {
 
     pub(crate) fn expert_parallel_assignment(
         &self,
+        architecture: &NeutralArchitecture,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
     {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
         }
-        if !self.args().is_moe() {
+        let args = architecture.args();
+        if !args.is_moe() {
             return Err(Error::Parallel(
                 "Qwen has no routed experts for expert-parallel ownership".into(),
             ));
         }
         Ok(Some(
             crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
-                self.args().num_experts as usize,
+                args.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
             )?,
         ))
     }
 
-    pub(crate) fn new_layer(
-        &self,
-        group: usize,
-        index: usize,
-        stream: &Stream,
-    ) -> Result<MlxModule<NeutralBlock>, Error> {
-        self.new_cartesian_layer(group, index, None, None, stream)
-    }
-
     pub(crate) fn layer_bindings(
         &self,
+        architecture: &NeutralArchitecture,
         group: usize,
         index: usize,
         layer: &MlxModule<NeutralBlock>,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
-        if group != 0 {
-            return Err(Error::Parallel(format!(
-                "Qwen decoder has no execution group {group}"
-            )));
-        }
+        require_decoder_group(architecture, group)?;
+        let expert_targets = parameter_role_targets(
+            &eredu_architectures::qwen::layer_parallel_parameter_groups(
+                layer,
+                architecture.args(),
+                index,
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))?,
+            ParameterRole::ExpertIntermediate,
+        );
         let recipes = if self.external_experts {
             BTreeMap::new()
         } else {
-            qwen_unit_recipes(store, self.args(), index)?
+            qwen_unit_recipes(store, architecture.args(), index)?
         };
         Ok(
             build_module_binding_plan_with_recipes_excluding(layer, "", store, recipes, |name| {
-                self.external_experts && name.contains(".mlp.experts.")
+                self.external_experts && parameter_name_in_targets(name, &expert_targets)
             })?
             .build_bindings(store)?,
         )
@@ -1906,18 +1772,20 @@ impl QwenParallelComposition {
 
     fn selected_static_units_for_roles(
         &self,
+        architecture: &NeutralArchitecture,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         roles: &[&str],
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let selected = |role: &str| roles.contains(&role);
-        let static_modules = self.architecture.static_modules();
+        let args = architecture.args();
+        let static_modules = architecture.static_modules();
         let mut units = Vec::new();
         if selected("embedding") {
             units.push(StaticUnitBindings::new(
                 "qwen.static.embedding",
                 build_module_binding_plan_with_recipes(
                     &static_modules.embeddings,
-                    &format!("{}.embed_tokens", self.args().parameter_root),
+                    &format!("{}.embed_tokens", args.parameter_root),
                     store,
                     Default::default(),
                 )?
@@ -1925,7 +1793,7 @@ impl QwenParallelComposition {
             )?);
         }
         if selected("norm") {
-            let norm_root = format!("{}.norm.", self.args().parameter_root);
+            let norm_root = format!("{}.norm.", args.parameter_root);
             let bindings = build_module_binding_plan_with_recipes(
                 &static_modules.norm,
                 "",
@@ -1963,340 +1831,6 @@ impl QwenParallelComposition {
     }
 }
 
-impl QwenParallelComposition {
-    fn configure_parallel(
-        &mut self,
-        context: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &eredu_runtime::LocalModelLayout,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        self.parallel_kv_heads = Some(
-            eredu_architectures::qwen::local_key_value_heads(self.args(), layout)
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-        );
-        self.parallel_embedding = Some(MlxNamedModule::new(
-            VocabParallelEmbedding::unloaded(
-                self.args().vocab_size as usize,
-                self.args().hidden_size,
-                self.args()
-                    .weight_quantization_for("model.embed_tokens.weight"),
-                context,
-                stream,
-            )?,
-            ParameterSpec::trainable("model.embed_tokens.weight")
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-            None,
-        )?);
-        if self.architecture.static_modules().lm_head.is_some() {
-            self.parallel_lm_head = Some(MlxNamedModule::new(
-                VocabParallelLmHead::unloaded(
-                    self.args().hidden_size,
-                    self.args().vocab_size as usize,
-                    self.args().weight_quantization_for("lm_head.weight"),
-                    context,
-                    stream,
-                )?,
-                ParameterSpec::trainable("lm_head.weight")
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                None,
-            )?);
-        }
-        self.local_args = Some(Arc::new(
-            (0..self.args().num_hidden_layers as usize)
-                .map(|index| {
-                    eredu_architectures::qwen::local_block_args(self.args(), index, layout)
-                        .map_err(|error| Error::Parallel(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ));
-        self.topology = Some(context.topology());
-        Ok(())
-    }
-
-    fn unit_factory(&self) -> Result<QwenParallelUnitFactory, Error> {
-        Ok(QwenParallelUnitFactory {
-            local_args: Arc::clone(self.local_args.as_ref().ok_or_else(|| {
-                Error::Parallel("parallel Qwen unit layout is not configured".into())
-            })?),
-        })
-    }
-
-    fn local_state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
-        let layout = eredu_architectures::qwen::cache_layout_with_key_value_heads(
-            self.args(),
-            self.parallel_kv_heads.clone().ok_or_else(|| {
-                Error::Parallel("parallel Qwen cache layout is not configured".into())
-            })?,
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        eredu_runtime::StateLayout::new(layout).map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    fn execution_context<'a>(
-        &self,
-        group: &'a safemlx::distributed::Group,
-        stream: &'a Stream,
-    ) -> Result<
-        crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'a>,
-        Error,
-    > {
-        let topology = self
-            .topology
-            .ok_or_else(|| Error::Parallel("parallel Qwen topology is not configured".into()))?;
-        crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
-            topology, group, stream,
-        )
-    }
-}
-
-impl Parameterized<Array> for QwenParallelComposition {
-    fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
-    where
-        V: ParameterVisitor<'a, Array>,
-    {
-        if let Some(embedding) = &self.parallel_embedding {
-            embedding.visit_parameters(visitor);
-        }
-        self.architecture
-            .static_modules()
-            .norm
-            .visit_parameters(visitor);
-        if let Some(head) = &self.parallel_lm_head {
-            head.visit_parameters(visitor);
-        }
-    }
-
-    fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
-    where
-        V: ParameterVisitorMut<'a, Array>,
-    {
-        if let Some(embedding) = &mut self.parallel_embedding {
-            embedding.visit_parameters_mut(visitor);
-        }
-        self.architecture
-            .static_modules_mut()
-            .norm
-            .visit_parameters_mut(visitor);
-        if let Some(head) = &mut self.parallel_lm_head {
-            head.visit_parameters_mut(visitor);
-        }
-    }
-
-    fn set_trainable(&mut self, trainable: bool) {
-        if let Some(embedding) = &mut self.parallel_embedding {
-            embedding.set_trainable(trainable);
-        }
-        self.architecture
-            .static_modules_mut()
-            .norm
-            .set_trainable(trainable);
-        if let Some(head) = &mut self.parallel_lm_head {
-            head.set_trainable(trainable);
-        }
-    }
-}
-
-impl LayeredArchitecture<MlxBackend, MlxKeyValueState> for QwenParallelComposition {
-    type Input<'a> = eredu_architectures::qwen::LayeredInput<'a, Array>;
-    type StaticModules = Self;
-    type Unit = NeutralBlock;
-    type ForwardContext = eredu_architectures::qwen::ForwardContext<Array>;
-    type RetainedContextValues<'a> = std::option::Iter<'a, Array>;
-    type Error = Error;
-
-    fn model_identity(&self) -> &str {
-        &self.args().model_type
-    }
-
-    fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        eredu_runtime::ExecutionGraph::chain(["text_decoder"]).map_err(Into::into)
-    }
-
-    fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        if group != 0 {
-            return Err(Error::Parallel(format!(
-                "parallel Qwen execution group {group} is outside the decoder"
-            )));
-        }
-        usize::try_from(self.args().num_hidden_layers).map_err(|_| {
-            QwenModelError::InvalidLayerCount {
-                count: self.args().num_hidden_layers,
-            }
-            .into()
-        })
-    }
-
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
-        if index >= self.group_unit_count(group)? {
-            return Err(Error::Parallel(format!(
-                "parallel Qwen unit {index} is outside the decoder"
-            )));
-        }
-        Ok(format!("model.layers.{index}"))
-    }
-
-    fn static_modules(&self) -> &Self::StaticModules {
-        self
-    }
-
-    fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
-        self
-    }
-
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        stream: &Stream,
-    ) -> Result<Self::Unit, Self::Error> {
-        if group != 0 {
-            return Err(Error::Parallel(format!(
-                "parallel Qwen execution group {group} is outside the decoder"
-            )));
-        }
-        let args = self
-            .local_args
-            .as_ref()
-            .and_then(|args| args.get(index))
-            .ok_or_else(|| {
-                Error::Parallel(format!("parallel Qwen unit {index} is not configured"))
-            })?;
-        eredu_architectures::qwen::new_block::<MlxBackend>(args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-
-    fn begin_forward<'a>(
-        &mut self,
-        _input: Self::Input<'a>,
-        _state: &mut MlxKeyValueState,
-        _stream: &Stream,
-    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Self::Error> {
-        Err(Error::Parallel(
-            "parallel Qwen composition requires a collective context".into(),
-        ))
-    }
-
-    fn forward_unit(
-        &mut self,
-        _group: usize,
-        _index: usize,
-        _unit: &mut Self::Unit,
-        _hidden: &Array,
-        _state: &mut MlxKeyValueState,
-        _forward: &mut Self::ForwardContext,
-        _stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        Err(Error::Parallel(
-            "parallel Qwen composition requires a collective context".into(),
-        ))
-    }
-
-    fn begin_execution_group(
-        &mut self,
-        group: usize,
-        initial: &Array,
-        dependencies: &[&Array],
-        _state: &mut MlxKeyValueState,
-        _forward: &mut Self::ForwardContext,
-        _stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        if group != 0 || !dependencies.is_empty() {
-            return Err(Error::Parallel(format!(
-                "parallel Qwen decoder group {group} received {} dependencies",
-                dependencies.len()
-            )));
-        }
-        Ok(initial.clone())
-    }
-
-    fn finish_forward(
-        &mut self,
-        _hidden: &Array,
-        _state: &mut MlxKeyValueState,
-        _forward: &Self::ForwardContext,
-        _stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        Err(Error::Parallel(
-            "parallel Qwen composition requires a collective context".into(),
-        ))
-    }
-
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        group: usize,
-        index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::retained_context_values(
-            &self.architecture,
-            forward,
-            group,
-            index,
-        )
-    }
-}
-
-impl ParallelLayeredArchitecture<MlxBackend, MlxKeyValueState> for QwenParallelComposition {
-    fn begin_forward_parallel<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut MlxKeyValueState,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Self::Error> {
-        let execution = self.execution_context(group, stream)?;
-        let hidden = self
-            .parallel_embedding
-            .as_mut()
-            .ok_or_else(|| Error::Parallel("parallel Qwen embedding is not configured".into()))?
-            .forward(input.tokens, &execution)?;
-        let expected = self.local_state_layout()?;
-        self.architecture
-            .begin_embedded_with_layout(hidden, input.mask, state, &expected, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-
-    fn forward_unit_parallel(
-        &mut self,
-        _group_index: usize,
-        index: usize,
-        unit: &mut Self::Unit,
-        hidden: &Array,
-        state: &mut MlxKeyValueState,
-        forward: &mut Self::ForwardContext,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        self.architecture
-            .forward_block_parallel(index, unit, hidden, state, forward, group, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &Array,
-        _state: &mut MlxKeyValueState,
-        _forward: &Self::ForwardContext,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Self::Error> {
-        let execution = self.execution_context(group, stream)?;
-        let hidden = self
-            .architecture
-            .static_modules_mut()
-            .norm
-            .forward(hidden, stream)?;
-        let logits = match &mut self.parallel_lm_head {
-            Some(head) => head.forward(&hidden, &execution)?,
-            None => self
-                .parallel_embedding
-                .as_mut()
-                .ok_or_else(|| Error::Parallel("parallel Qwen embedding is not configured".into()))?
-                .project_logits(&hidden, &execution)?,
-        };
-        logits.all_gather(&execution)
-    }
-}
 /// Structured failures at the unified Qwen model boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum QwenModelError {

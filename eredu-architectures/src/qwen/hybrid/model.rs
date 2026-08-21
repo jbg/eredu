@@ -2,21 +2,24 @@
 
 use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
-    AttentionCache, EmbeddingOperator, Error, Parameterized, RoutedNeuralBackend, Tensor,
+    AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, LinearOperator,
+    NormalizationOperator, Parameterized, RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, ModelStateIdentity,
-    ResidentExpertProvider, RuntimeStateComponents, StateLayout,
+    ArchitectureParameterDescription, ExecutionUnitLayout, LayerRuntimeState, LayeredArchitecture,
+    LayeredForwardState, ModelStateIdentity, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
+    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, ResidentExpertProvider,
+    RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
 };
 
 use crate::{
-    decoder::{StaticModuleSpec, StaticModules},
+    decoder::{static_parallel_parameter_groups, StaticModuleSpec, StaticModules},
     hybrid_decoder::HybridDecoder,
 };
 
 use super::{
-    prompt_cache_architecture_fingerprint, state_layout, Block, EmbeddedInput, ForwardMode,
-    HybridConfig, PredictionUnit,
+    prompt_cache_architecture_fingerprint, state_layout, unit_parallel_parameter_groups, Block,
+    EmbeddedInput, ForwardMode, HybridConfig, LocalGeometry, PredictionUnit,
 };
 
 /// One target or configured prediction execution unit.
@@ -29,6 +32,63 @@ pub enum Unit<B: RoutedNeuralBackend> {
     Prediction(PredictionUnit<B>),
 }
 
+impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn forward_unit_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        LayeredModel::forward_unit_with_provider(
+            self, group, index, unit, hidden, state, forward, provider, context,
+        )
+    }
+}
+
+impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn forward_unit_parallel_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        _pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        LayeredModel::forward_unit_with_provider_parallel(
+            self, group, index, unit, hidden, state, forward, provider, parallel, context,
+        )
+    }
+}
+
 /// Request-local values retained through one target or prediction pass.
 pub struct ForwardContext<T> {
     tokens: T,
@@ -36,6 +96,14 @@ pub struct ForwardContext<T> {
     mask: Option<T>,
     mode: ForwardMode,
     target_hidden: Option<T>,
+}
+
+/// Typed target input for one pipeline partition.
+pub enum TargetPartitionInput<'a, T> {
+    /// Token identities owned by the first target partition.
+    Tokens(&'a T),
+    /// Embedded activation received from an upstream target partition.
+    Hidden(T),
 }
 
 impl<T> ForwardContext<T> {
@@ -50,12 +118,61 @@ impl<T> ForwardContext<T> {
     }
 }
 
+impl<B: RoutedNeuralBackend> LayeredModel<B> {
+    /// Resumes an already embedded target partition in the canonical layered context.
+    pub fn resume_target_partition(
+        &self,
+        hidden: B::Tensor,
+        mask: Option<B::Tensor>,
+    ) -> LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>> {
+        LayeredForwardState {
+            context: ForwardContext {
+                tokens: hidden.clone(),
+                embedded: hidden.clone(),
+                mask,
+                mode: ForwardMode::Target,
+                target_hidden: None,
+            },
+            hidden,
+        }
+    }
+
+    /// Enters or resumes one routed target partition with architecture-owned
+    /// embedding and causal-mask construction.
+    pub fn begin_routed_target_partition(
+        &mut self,
+        input: TargetPartitionInput<'_, B::Tensor>,
+        explicit_mask: Option<&B::Tensor>,
+        sequence: i32,
+        offset: i32,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error> {
+        let hidden = match input {
+            TargetPartitionInput::Tokens(tokens) => match parallel {
+                Some(parallel) => {
+                    self.begin_partition_embedding_parallel(tokens, parallel, context)?
+                }
+                None => self.begin_partition_embedding(tokens, context)?,
+            },
+            TargetPartitionInput::Hidden(hidden) => hidden,
+        };
+        let mask = match explicit_mask {
+            Some(mask) => Some(mask.clone()),
+            None if sequence > 1 => Some(B::causal_mask(sequence, offset, None, context)?),
+            None => None,
+        };
+        Ok(self.resume_target_partition(hidden, mask))
+    }
+}
+
 /// One neutral layered model for Qwen3-Next and every Qwen3.5 text policy.
 pub struct LayeredModel<B: RoutedNeuralBackend> {
     config: HybridConfig,
     decoder: HybridDecoder<B>,
     target_layers: usize,
     prediction_steps: usize,
+    parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
 impl<B: RoutedNeuralBackend> LayeredModel<B> {
@@ -94,12 +211,205 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             decoder,
             target_layers,
             prediction_steps,
+            parallel_geometry: None,
         })
+    }
+
+    /// Applies the architecture-owned tensor-parallel token embedding boundary.
+    pub fn pipeline_embed_parallel(
+        &mut self,
+        tokens: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        B::vocabulary_parallel_lookup(
+            &mut self.decoder.static_modules_mut().embeddings,
+            tokens,
+            EmbeddingLookupPolicy::Strict,
+            parallel,
+            context,
+        )
+    }
+
+    /// Applies the architecture-owned tensor-parallel output boundary.
+    pub fn pipeline_finish_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        normalize: bool,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let hidden = if normalize {
+            self.decoder
+                .static_modules_mut()
+                .norm
+                .forward(hidden, context)?
+        } else {
+            hidden.clone()
+        };
+        let modules = self.decoder.static_modules_mut();
+        match &mut modules.lm_head {
+            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
+            None => B::vocabulary_parallel_embedding_project(
+                &mut modules.embeddings,
+                &hidden,
+                parallel,
+                context,
+            ),
+        }
+    }
+
+    /// Enters a serial target or prediction partition through token embedding.
+    pub fn begin_partition_embedding(
+        &mut self,
+        tokens: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.decoder
+            .static_modules_mut()
+            .embeddings
+            .forward(tokens, context)
+    }
+
+    /// Enters a tensor-parallel target or prediction partition through token embedding.
+    pub fn begin_partition_embedding_parallel(
+        &mut self,
+        tokens: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.pipeline_embed_parallel(tokens, parallel, context)
+    }
+
+    fn finish_partition_output(
+        &mut self,
+        hidden: &B::Tensor,
+        normalize: bool,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let hidden = if normalize {
+            self.decoder
+                .static_modules_mut()
+                .norm
+                .forward(hidden, context)?
+        } else {
+            hidden.clone()
+        };
+        let modules = self.decoder.static_modules_mut();
+        match &mut modules.lm_head {
+            Some(head) => head.forward(&hidden, context),
+            None => modules.embeddings.as_linear(&hidden, context),
+        }
+    }
+
+    /// Finishes a serial target partition with final normalization.
+    pub fn finish_partition_target(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.finish_partition_output(hidden, true, context)
+    }
+
+    /// Finishes a tensor-parallel target partition with final normalization.
+    pub fn finish_partition_target_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        self.pipeline_finish_parallel(hidden, true, parallel, context)
+    }
+
+    /// Builds the canonical target/MTP graph with planner-derived local modules.
+    pub fn new_parallel(
+        config: HybridConfig,
+        geometry: LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        geometry.validate_for(&config).map_err(Error::backend)?;
+        let mut model = Self::new(config.clone(), context)?;
+        *model.decoder.static_modules_mut() = crate::decoder::StaticModules::from_parallel_spec(
+            static_spec(&config)?,
+            geometry.embedding_range().clone(),
+            geometry.output_range().cloned(),
+            context,
+        )?;
+        model.parallel_geometry = Some(std::sync::Arc::new(geometry));
+        Ok(model)
     }
 
     /// Returns normalized hybrid policy.
     pub const fn config(&self) -> &HybridConfig {
         &self.config
+    }
+
+    /// Describes target and embedded-prediction parameters without deriving
+    /// ownership from checkpoint-name substrings.
+    pub fn parameter_description(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ArchitectureParameterDescription, Error> {
+        let graph = self.decoder.execution_graph()?;
+        let counts = (0..graph.groups().len())
+            .map(|group| self.decoder.group_unit_count(group))
+            .collect::<Result<Vec<_>, _>>()?;
+        let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
+        let static_groups = static_parallel_parameter_groups::<B>(
+            &self.decoder.static_modules().embeddings,
+            &self.decoder.static_modules().norm,
+            self.decoder.static_modules().lm_head.as_ref(),
+            "model",
+        )
+        .map_err(Error::backend)?;
+        let mut expected = static_groups.clone();
+        let mut owned = static_groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, group)| {
+                OwnedParameterGroupSpec::new(
+                    if index == 0 {
+                        let mut roles = vec!["embedding", "mtp"];
+                        if self.config.tie_word_embeddings {
+                            roles.push("output");
+                        }
+                        ParameterGroupOwner::static_any_of(roles)
+                    } else {
+                        ParameterGroupOwner::static_role(match index {
+                            0 => "embedding",
+                            1 => "norm",
+                            _ => "output",
+                        })
+                    },
+                    group,
+                )
+            })
+            .collect::<Vec<_>>();
+        for group_index in 0..graph.groups().len() {
+            let group_id = layout
+                .group_id(group_index)
+                .expect("hybrid layout contains every graph group")
+                .clone();
+            let count = layout
+                .group_range(group_index)
+                .expect("hybrid layout contains every group range")
+                .len();
+            for index in 0..count {
+                let unit = self.construct_unit(group_index, index, context)?;
+                let groups =
+                    unit_parallel_parameter_groups(&unit, &self.config, group_index, index)
+                        .map_err(Error::backend)?;
+                expected.extend(groups.iter().cloned());
+                owned.extend(groups.into_iter().map(|group| {
+                    OwnedParameterGroupSpec::new(
+                        ParameterGroupOwner::execution_unit(group_id.clone(), index),
+                        group,
+                    )
+                }));
+            }
+        }
+        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
+            .map_err(Error::backend)
     }
 
     /// Borrows pinned text modules.
@@ -120,6 +430,49 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
     /// Returns target plus configured prediction state policy.
     pub fn state_layout(&self) -> Result<StateLayout, Error> {
         state_layout(&self.config).map_err(Error::backend)
+    }
+
+    /// Returns replicated or planner-derived mutable state geometry.
+    pub fn runtime_state_layout(&self) -> Result<StateLayout, Error> {
+        self.parallel_geometry
+            .as_ref()
+            .map(|geometry| geometry.state_layout().clone())
+            .map_or_else(|| self.state_layout(), Ok)
+    }
+
+    /// Shares authoritative local geometry with placed residency factories.
+    pub fn shared_parallel_geometry(&self) -> Option<std::sync::Arc<LocalGeometry>> {
+        self.parallel_geometry.as_ref().map(std::sync::Arc::clone)
+    }
+
+    /// Constructs one canonical target or prediction unit using this model's
+    /// replicated or planner-derived local geometry.
+    pub fn construct_unit(
+        &self,
+        group: usize,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Unit<B>, Error> {
+        self.decoder.unit_path(group, index)?;
+        if group == 0 {
+            let config = self
+                .parallel_geometry
+                .as_ref()
+                .and_then(|geometry| geometry.target(index))
+                .unwrap_or(&self.config);
+            Ok(Unit::Target(Block::new(config, index, context)?))
+        } else {
+            let config = self
+                .parallel_geometry
+                .as_ref()
+                .and_then(|geometry| geometry.prediction(group - 1))
+                .unwrap_or(&self.config);
+            Ok(Unit::Prediction(PredictionUnit::new(
+                config,
+                group - 1,
+                context,
+            )?))
+        }
     }
 
     fn state_index(&self, group: usize, index: usize) -> Result<usize, Error> {
@@ -178,6 +531,67 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             ))),
         }
     }
+
+    /// Executes one target or prediction unit with local projections and collectives.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_unit_with_provider_parallel<S, P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Unit<B>,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut ForwardContext<B::Tensor>,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+        P: eredu_runtime::RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        self.decoder.unit_path(group, index)?;
+        let state_index = self.state_index(group, index)?;
+        match unit {
+            Unit::Target(block) if group == 0 => block.forward_parallel(
+                hidden,
+                forward.mask.as_ref(),
+                state.layer(state_index).map_err(Error::backend)?,
+                parallel,
+                context,
+                provider,
+            ),
+            Unit::Prediction(unit) if group > 0 => unit.forward_parallel(
+                hidden,
+                &forward.embedded,
+                forward.mask.as_ref(),
+                state.layer(state_index).map_err(Error::backend)?,
+                parallel,
+                context,
+                provider,
+            ),
+            _ => Err(Error::backend(format!(
+                "Qwen hybrid unit does not match execution group {group}"
+            ))),
+        }
+    }
+}
+
+fn static_spec(config: &HybridConfig) -> Result<StaticModuleSpec, Error> {
+    Ok(StaticModuleSpec {
+        embedding_weight: "model.embed_tokens.weight".into(),
+        normalization_weight: "model.norm.weight".into(),
+        head_weight: "lm_head.weight".into(),
+        vocabulary: config.vocab_size,
+        hidden_size: config.hidden_size,
+        normalization_epsilon: config.rms_norm_eps,
+        normalization_offset: 1.0,
+        embedding_quantization: config.quantization,
+        head_format: config.linear_format("lm_head.weight"),
+        tied_head: config.tie_word_embeddings,
+    })
 }
 
 impl<B, S> LayeredArchitecture<B, S> for LayeredModel<B>
@@ -195,6 +609,14 @@ where
     where
         B::Tensor: 'a;
     type Error = Error;
+
+    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+        if group == 0 {
+            eredu_runtime::ArchitectureGroupTransport::decoder()
+        } else {
+            prediction_group_transport(group)
+        }
+    }
 
     fn model_identity(&self) -> &str {
         &self.config.model_type
@@ -226,16 +648,7 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error> {
-        self.decoder.unit_path(group, index)?;
-        if group == 0 {
-            Ok(Unit::Target(Block::new(&self.config, index, context)?))
-        } else {
-            Ok(Unit::Prediction(PredictionUnit::new(
-                &self.config,
-                group - 1,
-                context,
-            )?))
-        }
+        self.construct_unit(group, index, context)
     }
 
     fn begin_forward<'a>(
@@ -384,6 +797,164 @@ where
             forward.mask.as_ref(),
             forward.target_hidden.as_ref(),
         ])
+    }
+}
+
+fn prediction_group_transport(group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+    let mut transport = eredu_runtime::ArchitectureGroupTransport::prediction();
+    if group == 1 {
+        transport.first_owner_static_roles.push("mtp".into());
+    }
+    transport
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::prediction_group_transport;
+
+    #[test]
+    fn first_prediction_group_owns_shared_mtp_embedding_role_once() {
+        assert_eq!(
+            prediction_group_transport(1).first_owner_static_roles,
+            ["mtp"]
+        );
+        assert!(prediction_group_transport(2)
+            .first_owner_static_roles
+            .is_empty());
+    }
+}
+
+impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+{
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self
+            .parallel_geometry
+            .as_ref()
+            .ok_or_else(|| Error::backend("Qwen hybrid model has no local geometry"))?
+            .state_layout();
+        if state.layout() != expected {
+            return Err(Error::backend(
+                "Qwen hybrid rank-local state layout mismatch",
+            ));
+        }
+        let (tokens, supplied_hidden, supplied_mask, mode) = match input {
+            EmbeddedInput::Target { tokens, mask } => (tokens, None, mask, ForwardMode::Target),
+            EmbeddedInput::Draft {
+                tokens,
+                hidden,
+                depth,
+            } => {
+                if depth >= self.prediction_steps {
+                    return Err(Error::backend(format!(
+                        "Qwen hybrid MTP depth {depth} is outside {} configured groups",
+                        self.prediction_steps
+                    )));
+                }
+                (tokens, Some(hidden), None, ForwardMode::Draft(depth))
+            }
+        };
+        let embedded = B::vocabulary_parallel_lookup(
+            &mut self.decoder.static_modules_mut().embeddings,
+            tokens,
+            EmbeddingLookupPolicy::Strict,
+            parallel,
+            context,
+        )?;
+        let hidden = supplied_hidden.cloned().unwrap_or_else(|| embedded.clone());
+        let position_layer = match mode {
+            ForwardMode::Target => 0,
+            ForwardMode::Draft(depth) => self.target_layers + depth,
+        };
+        let mask = if let Some(mask) = supplied_mask {
+            Some(mask.clone())
+        } else if embedded.dim(1) > 1 {
+            Some(B::causal_mask(
+                embedded.dim(1),
+                state
+                    .layer(position_layer)
+                    .map_err(Error::backend)?
+                    .position(),
+                None,
+                context,
+            )?)
+        } else {
+            None
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                tokens: tokens.clone(),
+                embedded,
+                mask,
+                mode,
+                target_hidden: None,
+            },
+        })
+    }
+
+    fn forward_unit_parallel(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.forward_unit_with_provider_parallel(
+            group,
+            index,
+            unit,
+            hidden,
+            state,
+            forward,
+            &mut ResidentExpertProvider,
+            parallel,
+            context,
+        )
+    }
+
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend("Qwen hybrid model has no local geometry"));
+        }
+        let hidden = match forward.mode {
+            ForwardMode::Target => self
+                .decoder
+                .static_modules_mut()
+                .norm
+                .forward(hidden, context)?,
+            ForwardMode::Draft(_) => hidden.clone(),
+        };
+        let modules = self.decoder.static_modules_mut();
+        match &mut modules.lm_head {
+            Some(head) => B::vocabulary_parallel_project(head, &hidden, parallel, context),
+            None => B::vocabulary_parallel_embedding_project(
+                &mut modules.embeddings,
+                &hidden,
+                parallel,
+                context,
+            ),
+        }
     }
 }
 

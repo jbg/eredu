@@ -338,6 +338,7 @@ impl<B: NeuralBackend> LayeredModel<B> {
     ) -> Result<Self, Error> {
         config.temporal().validate_config()?;
         config.depth_template().validate_config()?;
+        geometry.validate_for(&config).map_err(Error::backend)?;
         let static_modules = StaticModules::new_parallel(&config, &geometry, context)?;
         Ok(Self {
             config,

@@ -15,6 +15,7 @@ pub use checkpoint::{
 };
 pub use conditional::{
     ConditionalForwardContext, ConditionalInput, ConditionalLayeredModel,
+    ConditionalPartitionInput, ConditionalPipelineBoundary, ConditionalPipelineBoundarySchema,
     ConditionalPipelinePrepared, ConditionalPipelineVisionState, ConditionalStaticModules,
     ConditionalUnit,
 };
@@ -26,6 +27,9 @@ pub use config::{
     QwenFp8QuantizationConfig,
 };
 pub use linear_attention::LinearAttention;
-pub use model::{state_identity, ForwardContext, LayeredModel, Unit};
+pub use model::{state_identity, ForwardContext, LayeredModel, TargetPartitionInput, Unit};
 pub use mtp::{EmbeddedInput, ForwardMode, PredictionUnit};
-pub use parallel::{local_block_config, local_unit_config, unit_parallel_parameter_groups};
+pub use parallel::{
+    conditional_local_geometry, local_block_config, local_geometry, local_unit_config,
+    unit_parallel_parameter_groups, ConditionalLocalGeometry, LocalGeometry,
+};

@@ -367,19 +367,20 @@ fn moshi_ring_tp2_collective_order_and_vocab() {
 }
 
 fn run_model_parity_fixture(fixture_variable: &str, profile: &str) {
-    let Some(fixture) = std::env::var_os(fixture_variable) else {
-        eprintln!("skipping {profile} Ring parity: {fixture_variable} is unset");
-        return;
-    };
+    let fixture = std::env::var_os(fixture_variable).unwrap_or_else(|| {
+        panic!(
+            "{profile} Ring parity requires {fixture_variable} to point at a complete fixture when this ignored test is explicitly enabled"
+        )
+    });
     assert!(
         Path::new(&fixture).exists(),
         "{fixture_variable} does not exist: {}",
         Path::new(&fixture).display()
     );
-    if !distributed::is_available(Backend::Ring) {
-        eprintln!("skipping {profile} Ring parity: MLX Ring is unavailable");
-        return;
-    }
+    assert!(
+        distributed::is_available(Backend::Ring),
+        "{profile} Ring parity requires the MLX Ring backend when this ignored test is explicitly enabled"
+    );
 
     let (first_socket, second_socket, first_port, second_port) = reserve_two_ports();
     let ring = tempfile::tempdir().unwrap();

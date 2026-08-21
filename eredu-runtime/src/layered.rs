@@ -5,7 +5,8 @@
 use eredu_nn::{NeuralBackend, Parameterized};
 
 use crate::{
-    ExecutionGraph, ExecutionGroupSchedule, ExecutionUnitLayout, RuntimeState, SubmissionBackend,
+    ExecutionGraph, ExecutionGroupSchedule, ExecutionUnitLayout, ExpertPass, RoutedExpertProvider,
+    RuntimeState, SubmissionBackend,
 };
 
 /// Backend-native activation and architecture-owned forward context.
@@ -14,6 +15,99 @@ pub struct LayeredForwardState<T, C> {
     pub hidden: T,
     /// Masks, positions, or other architecture-owned forward values.
     pub context: C,
+}
+
+/// Architecture-authored semantic kind for one transport-visible execution group.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ArchitectureGroupKind {
+    /// Text target or prediction decoding.
+    Decoder,
+    /// Visual encoding.
+    VisionEncoder,
+    /// Audio encoding.
+    AudioEncoder,
+    /// Learned modality projection.
+    Projector,
+    /// Learned or structural modality merge.
+    Merger,
+    /// Final multimodal assembly.
+    ModalityFinalization,
+}
+
+/// Pipeline ownership policy for one architecture execution group.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ArchitectureGroupPlacement {
+    /// Balance the group across every pipeline owner.
+    Pipeline,
+    /// Place the complete group on the architecture output owner.
+    OutputOwner,
+}
+
+/// Architecture-level merge destination resolved by a concrete pipeline topology.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ArchitectureMergeDestination {
+    /// Use the group's terminal owner.
+    LastOwner,
+    /// Return the result to the first pipeline owner for dependency assembly.
+    FirstPipelineOwner,
+    /// Deliver the result to the architecture output owner.
+    OutputOwner,
+}
+
+/// Cartesian subgroup semantics required while a group executes.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ArchitectureParallelSubgroup {
+    /// Tensor sharding without routed expert exchange.
+    TensorSharded,
+    /// Decoder tensor and routed-expert parallelism.
+    Decoder,
+}
+
+/// Backend-neutral transport and placement semantics for one execution group.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ArchitectureGroupTransport {
+    /// Physical pipeline ownership policy.
+    pub placement: ArchitectureGroupPlacement,
+    /// Semantic compute kind.
+    pub kind: ArchitectureGroupKind,
+    /// Static roles owned by the group's first physical owner.
+    pub first_owner_static_roles: Vec<String>,
+    /// Static roles owned by the group's terminal physical owner.
+    pub last_owner_static_roles: Vec<String>,
+    /// Dependency merge destination.
+    pub merge_destination: ArchitectureMergeDestination,
+    /// Optional active Cartesian subgroup contract.
+    pub parallel_subgroup: Option<ArchitectureParallelSubgroup>,
+    /// Whether request data may omit the group entirely.
+    pub request_optional: bool,
+}
+
+impl ArchitectureGroupTransport {
+    /// Standard pipeline-balanced decoder transport.
+    pub fn decoder() -> Self {
+        Self {
+            placement: ArchitectureGroupPlacement::Pipeline,
+            kind: ArchitectureGroupKind::Decoder,
+            first_owner_static_roles: vec!["embedding".into()],
+            last_owner_static_roles: vec!["norm".into(), "output".into()],
+            merge_destination: ArchitectureMergeDestination::LastOwner,
+            parallel_subgroup: Some(ArchitectureParallelSubgroup::Decoder),
+            request_optional: false,
+        }
+    }
+
+    /// Output-owner prediction transport without additional pinned modules.
+    pub fn prediction() -> Self {
+        Self {
+            placement: ArchitectureGroupPlacement::OutputOwner,
+            kind: ArchitectureGroupKind::Decoder,
+            first_owner_static_roles: Vec::new(),
+            last_owner_static_roles: Vec::new(),
+            merge_destination: ArchitectureMergeDestination::OutputOwner,
+            parallel_subgroup: Some(ArchitectureParallelSubgroup::Decoder),
+            request_optional: false,
+        }
+    }
 }
 
 /// Stable layered traversal boundary exposed to generic runtime drivers.
@@ -241,6 +335,11 @@ where
     /// Concrete architecture or backend failure.
     type Error;
 
+    /// Declares transport and physical placement semantics for one canonical group slot.
+    fn group_transport(&self, _group: usize) -> ArchitectureGroupTransport {
+        ArchitectureGroupTransport::decoder()
+    }
+
     /// Stable architecture compatibility identity.
     fn model_identity(&self) -> &str;
 
@@ -425,6 +524,61 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
+}
+
+/// Provider-aware unit execution for architectures with routed feed-forward work.
+///
+/// Partition drivers retain ownership of expert residency while the neutral
+/// architecture retains attention, residual, routing, and unit semantics.
+pub trait RoutedLayeredArchitecture<B, S>: LayeredArchitecture<B, S>
+where
+    B: eredu_nn::RoutedNeuralBackend,
+    S: RuntimeState<B>,
+{
+    /// Executes one unit through a runtime-supplied routed-expert provider.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unit_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display;
+}
+
+/// Tensor-parallel provider-aware unit execution.
+pub trait ParallelRoutedLayeredArchitecture<B, S>:
+    RoutedLayeredArchitecture<B, S> + ParallelLayeredArchitecture<B, S>
+where
+    B: eredu_nn::RoutedNeuralBackend,
+    S: RuntimeState<B>,
+{
+    /// Executes one tensor-parallel unit through a runtime-supplied provider.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_unit_parallel_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display;
 }
 
 /// Fully resident runtime using the same lifecycle as bounded execution.
@@ -638,12 +792,15 @@ where
     ///
     /// The flat ordinal addresses storage while `address` preserves the
     /// architecture execution group and group-local unit index for scheduling.
-    fn acquire(
+    fn acquire<E, F>(
         &mut self,
         ordinal: usize,
         address: crate::ExecutionUnitAddress,
+        build: F,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<Self::Lease, Self::Error>;
+    ) -> Result<Self::Lease, LayerwiseAcquireError<E, Self::Error>>
+    where
+        F: FnOnce(&<B::Tensor as eredu_nn::Tensor>::Context) -> Result<U, E>;
 
     /// Retains the unit and dependent native values through exact completion.
     fn complete<'a, StateValues, ContextValues>(
@@ -667,6 +824,15 @@ where
         output: &B::Tensor,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<(), Self::Error>;
+}
+
+/// Failure while a layerwise policy acquires or populates one architecture unit.
+#[derive(Debug)]
+pub enum LayerwiseAcquireError<A, P> {
+    /// The neutral architecture could not construct its unloaded unit.
+    Architecture(A),
+    /// The execution policy could not acquire residency or populate the unit.
+    Policy(P),
 }
 
 /// Failure from architecture execution or layerwise residency policy.
@@ -722,6 +888,13 @@ where
             policy,
             backend: std::marker::PhantomData,
         }
+    }
+
+    /// Creates a layerwise runtime while evaluating the policy before moving
+    /// the architecture. This is useful when policy realization needs to
+    /// borrow the architecture's canonical unit constructor first.
+    pub const fn new_policy_first(policy: P, architecture: A) -> Self {
+        Self::new(architecture, policy)
     }
 
     /// Borrows the concrete architecture instance.
@@ -1033,8 +1206,20 @@ where
                         .expect("group-local unit has a stable policy address");
                     let mut lease = self
                         .policy
-                        .acquire(ordinal, address, executor)
-                        .map_err(LayerwiseRuntimeError::Policy)?;
+                        .acquire(
+                            ordinal,
+                            address,
+                            |executor| self.architecture.build_unit(group, index, executor),
+                            executor,
+                        )
+                        .map_err(|error| match error {
+                            LayerwiseAcquireError::Architecture(error) => {
+                                LayerwiseRuntimeError::Architecture(error)
+                            }
+                            LayerwiseAcquireError::Policy(error) => {
+                                LayerwiseRuntimeError::Policy(error)
+                            }
+                        })?;
                     hidden = execute(
                         &mut self.architecture,
                         group,
@@ -1389,8 +1574,20 @@ where
                         .expect("group-local unit has a stable policy address");
                     let mut lease = self
                         .policy
-                        .acquire(ordinal, address, executor)
-                        .map_err(LayerwiseRuntimeError::Policy)?;
+                        .acquire(
+                            ordinal,
+                            address,
+                            |executor| self.architecture.build_unit(group, index, executor),
+                            executor,
+                        )
+                        .map_err(|error| match error {
+                            LayerwiseAcquireError::Architecture(error) => {
+                                LayerwiseRuntimeError::Architecture(error)
+                            }
+                            LayerwiseAcquireError::Policy(error) => {
+                                LayerwiseRuntimeError::Policy(error)
+                            }
+                        })?;
                     hidden = execute(
                         &mut self.architecture,
                         group,
@@ -1591,8 +1788,20 @@ where
                         .map_err(LayerwiseRuntimeError::Architecture)?;
                     let mut lease = self
                         .policy
-                        .acquire(ordinal, address, executor)
-                        .map_err(LayerwiseRuntimeError::Policy)?;
+                        .acquire(
+                            ordinal,
+                            address,
+                            |executor| self.architecture.build_unit(group, index, executor),
+                            executor,
+                        )
+                        .map_err(|error| match error {
+                            LayerwiseAcquireError::Architecture(error) => {
+                                LayerwiseRuntimeError::Architecture(error)
+                            }
+                            LayerwiseAcquireError::Policy(error) => {
+                                LayerwiseRuntimeError::Policy(error)
+                            }
+                        })?;
                     let unit_input = hidden.clone();
                     let output = self
                         .architecture
@@ -1723,19 +1932,25 @@ where
         Ok(())
     }
 
-    fn acquire(
+    fn acquire<E, F>(
         &mut self,
         index: usize,
         _address: crate::ExecutionUnitAddress,
+        _build: F,
         _context: &<B::Tensor as eredu_nn::Tensor>::Context,
-    ) -> Result<Self::Lease, Self::Error> {
+    ) -> Result<Self::Lease, LayerwiseAcquireError<E, Self::Error>>
+    where
+        F: FnOnce(&<B::Tensor as eredu_nn::Tensor>::Context) -> Result<U, E>,
+    {
         let count = self.units.len();
         let unit = self
             .units
             .get_mut(index)
-            .ok_or(ResidentUnitWindowError::UnknownUnit { index, count })?
+            .ok_or(ResidentUnitWindowError::UnknownUnit { index, count })
+            .map_err(LayerwiseAcquireError::Policy)?
             .take()
-            .ok_or(ResidentUnitWindowError::AlreadyAcquired { index })?;
+            .ok_or(ResidentUnitWindowError::AlreadyAcquired { index })
+            .map_err(LayerwiseAcquireError::Policy)?;
         Ok(ResidentUnitLease { index, unit })
     }
 

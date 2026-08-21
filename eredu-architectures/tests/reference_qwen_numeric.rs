@@ -1,11 +1,15 @@
-use std::{cell::Cell, collections::BTreeMap};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    sync::{Arc, Condvar, Mutex},
+};
 
 use eredu_architectures::{
-    decoder, deepseek, gemma4, gpt_oss, inkling, kimi_linear, lfm2, moshi, muse_glimmer,
+    decoder, deepseek, gemma4, gpt_oss, inkling, kimi_linear, lfm2, llama, moshi, muse_glimmer,
     nemotron_h, qwen,
 };
-use eredu_core::cache::{LayerCachePolicy, StateTensorRole};
-use eredu_core::TokenFilter;
+use eredu_core::cache::{LayerCachePolicy, PromptCacheTopology, StateTensorRole};
+use eredu_core::{Completion, LayerSchedule, TokenFilter};
 use eredu_nn::{
     reference_gated_delta_scan, reference_selective_state_space_scan, validate_parameter_topology,
     AttentionCache, AttentionMask, AttentionRequest, BlockwiseAttentionBackend,
@@ -19,22 +23,25 @@ use eredu_nn::{
     HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState, HyperHead,
     HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, Index, IndexedAttentionInput,
     JointExpertRoutingInput, JointExpertRoutingResult, LinearOperator, LinearSpec,
-    LowRankProjection, LowRankProjectionSpec, NeuralBackend, NormalizationOperator,
-    NormalizationSpec, PadMode, ParameterMetadata, ParameterSpec, ParameterVisitor,
-    ParameterVisitorMut, Parameterized, PooledAttentionInput, PooledPositionInput,
-    PoolingAttentionCache, PoolingOverlap, PoolingWindows, RelativeAttentionInput,
-    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
-    RotarySubspace, RoutedNeuralBackend, RoutingOperator, RoutingResult,
-    SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
-    TensorParallelExpertOutput, TopKRouterSpec, TopKRoutingSpec,
+    LowRankProjection, LowRankProjectionSpec, NeuralBackend, NormalizationConstructionSpec,
+    NormalizationOperator, NormalizationScale, NormalizationSpec, PadMode, ParameterMetadata,
+    ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
+    PooledPositionInput, PoolingAttentionCache, PoolingOverlap, PoolingWindows,
+    RelativeAttentionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator,
+    RotaryPosition, RotarySpec, RotarySubspace, RoutedNeuralBackend, RoutingOperator,
+    RoutingResult, SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
+    TensorParallelExpertOutput, TopKRouterSpec, TopKRoutingSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{
-    CompositeLayeredTraversalHook, DeviceState, ExpertPass, LayerRuntimeState,
-    LayeredTraversalHook, PenaltyConfig, PredictionDirective, ResettableRuntimeLayerState,
-    ResidentRuntime, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
-    RuntimeLayerState, RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionDriver,
+    CompositeLayeredTraversalHook, DeviceState, ExecutionUnitAddress, ExpertPass,
+    LayerRuntimeState, LayeredArchitecture, LayeredTraversalHook, LayerwiseAcquireError,
+    LayerwisePolicy, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, MemberSharding,
+    ParameterGroupSpec, ParameterRole, PenaltyConfig, PredictionDirective,
+    ResettableRuntimeLayerState, ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider,
+    RoutedExpertRequest, RoutedExpertTensorParallelOutput, RuntimeLayerState,
+    RuntimeStateComponents, Sampler, SamplingBackend, SequentialDecisionDriver,
     SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
-    TokenDomain,
+    SubmissionBackend, TensorPlacement, TokenDomain,
 };
 
 #[derive(Debug, Clone)]
@@ -853,11 +860,11 @@ impl Tensor for NumericTensor {
 
     fn take_axis(&self, indexes: &Self, selected: i32, _: &NumericContext) -> Result<Self, Error> {
         let selected = axis(selected, self.shape.len(), false)?;
-        if selected != 0 || indexes.shape.len() != 1 {
+        if selected != 0 || indexes.shape.is_empty() {
             return unsupported("take_axis geometry");
         }
         let row_width = self.data.len() / self.shape[0] as usize;
-        let mut shape = vec![indexes.shape[0]];
+        let mut shape = indexes.shape.clone();
         shape.extend_from_slice(&self.shape[1..]);
         let mut output = Self::zeros(shape);
         for (output_row, raw) in indexes.data.iter().copied().enumerate() {
@@ -1120,6 +1127,53 @@ impl Tensor for NumericTensor {
         Ok(output)
     }
 
+    fn conv2d(
+        input: &Self,
+        weight: &Self,
+        stride: (i32, i32),
+        padding: (i32, i32),
+        dilation: (i32, i32),
+        groups: i32,
+        _: &NumericContext,
+    ) -> Result<Self, Error> {
+        if input.shape.len() != 4 || weight.shape.len() != 4 {
+            return unsupported("non-NHWC conv2d geometry");
+        }
+        let input_shape = input
+            .shape
+            .iter()
+            .copied()
+            .map(|dimension| usize::try_from(dimension).map_err(Error::backend))
+            .collect::<Result<Vec<_>, _>>()?;
+        let weight_shape = weight
+            .shape
+            .iter()
+            .copied()
+            .map(|dimension| usize::try_from(dimension).map_err(Error::backend))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (values, shape) = eredu_nn::multimodal::reference_patch_convolution_2d(
+            &input.data,
+            input_shape.try_into().expect("validated conv2d input rank"),
+            &weight.data,
+            weight_shape
+                .try_into()
+                .expect("validated conv2d weight rank"),
+            eredu_nn::multimodal::PatchConvolution2dSpec {
+                stride,
+                padding,
+                dilation,
+                groups,
+            },
+        )?;
+        Ok(Self::new(
+            shape
+                .into_iter()
+                .map(|dimension| i32::try_from(dimension).map_err(Error::backend))
+                .collect::<Result<Vec<_>, _>>()?,
+            values,
+        ))
+    }
+
     fn conv_transpose1d(
         _: &Self,
         _: &Self,
@@ -1207,6 +1261,41 @@ impl Tensor for NumericTensor {
         rotary_offset(input, dimensions, traditional, base, position_offset)
     }
 
+    fn multi_axis_rotary_embeddings(
+        position_ids: &Self,
+        spec: &eredu_nn::multimodal::MultiAxisRotarySpec,
+        _: &NumericContext,
+    ) -> Result<(Self, Self), Error> {
+        if position_ids.shape.len() < 2
+            || position_ids.shape.last().copied()
+                != Some(i32::try_from(spec.axes.len()).map_err(Error::backend)?)
+        {
+            return Err(Error::backend(
+                "numeric multi-axis position geometry mismatch",
+            ));
+        }
+        let rows = position_ids.shape[..position_ids.shape.len() - 1]
+            .iter()
+            .try_fold(1usize, |rows, dimension| {
+                rows.checked_mul(usize::try_from(*dimension).map_err(Error::backend)?)
+                    .ok_or_else(|| Error::backend("numeric multi-axis position count overflow"))
+            })?;
+        let positions = position_ids
+            .data
+            .iter()
+            .map(|value| *value as i32)
+            .collect::<Vec<_>>();
+        let dimensions = spec.dimensions()?;
+        let (cosine, sine) =
+            eredu_nn::multimodal::reference_multi_axis_rotary_embeddings(&positions, rows, spec)?;
+        let mut shape = position_ids.shape[..position_ids.shape.len() - 1].to_vec();
+        shape.push(dimensions);
+        Ok((
+            NumericTensor::new(shape.clone(), cosine),
+            NumericTensor::new(shape, sine),
+        ))
+    }
+
     fn scaled_dot_product_attention(
         queries: &Self,
         keys: &Self,
@@ -1249,6 +1338,230 @@ fn parameter(spec: &ParameterSpec, shape: Vec<i32>, norm: bool) -> NumericTensor
         shape.clone(),
         deterministic_values(spec, elements(&shape), norm),
     )
+}
+
+fn select_parameter(
+    value: &NumericTensor,
+    placement: &TensorPlacement,
+) -> Result<NumericTensor, Error> {
+    match placement {
+        TensorPlacement::Replicated | TensorPlacement::Local => Ok(value.clone()),
+        TensorPlacement::Shard { axis, index, parts } => {
+            let width = usize::try_from(value.shape[*axis]).map_err(Error::backend)?;
+            if *parts == 0 || !width.is_multiple_of(*parts) || *index >= *parts {
+                return Err(Error::backend("invalid numeric equal shard"));
+            }
+            let shard = width / parts;
+            Ok(value.axis_slice(*axis, index * shard, (index + 1) * shard))
+        }
+        TensorPlacement::Range { axis, start, end } => Ok(value.axis_slice(*axis, *start, *end)),
+        TensorPlacement::Indices { axis, indices } => {
+            let width = usize::try_from(value.shape[*axis]).map_err(Error::backend)?;
+            if indices.iter().any(|index| *index >= width) {
+                return Err(Error::backend("numeric parameter index is out of range"));
+            }
+            let mut shape = value.shape.clone();
+            shape[*axis] = i32::try_from(indices.len()).map_err(Error::backend)?;
+            let mut output = NumericTensor::zeros(shape);
+            for output_index in 0..output.data.len() {
+                let mut coordinate = unravel(output_index, &output.shape);
+                coordinate[*axis] = indices[coordinate[*axis]];
+                output.data[output_index] = value.data[offset(&coordinate, &value.shape)];
+            }
+            Ok(output)
+        }
+        TensorPlacement::Omit
+        | TensorPlacement::Rank { .. }
+        | TensorPlacement::PipelineStage { .. } => Err(Error::backend(
+            "numeric parameter layout does not materialize this tensor",
+        )),
+    }
+}
+
+fn local_parameter(
+    spec: &ParameterSpec,
+    shape: Vec<i32>,
+    norm: bool,
+    context: &NumericContext,
+) -> Result<NumericTensor, Error> {
+    let Some(layout) = context.tensor_layout(spec.id.as_str()) else {
+        return Ok(parameter(spec, shape, norm));
+    };
+    let global_shape = layout
+        .global_shape()
+        .iter()
+        .copied()
+        .map(|dimension| i32::try_from(dimension).map_err(Error::backend))
+        .collect::<Result<Vec<_>, _>>()?;
+    if shape == global_shape {
+        return Ok(parameter(spec, global_shape, norm));
+    }
+    let expected_local = layout
+        .local_shape()
+        .iter()
+        .copied()
+        .map(|dimension| i32::try_from(dimension).map_err(Error::backend))
+        .collect::<Result<Vec<_>, _>>()?;
+    if expected_local != shape {
+        return Err(Error::backend(format!(
+            "numeric local parameter {} requested shape {shape:?}, planned {expected_local:?}",
+            spec.id.as_str()
+        )));
+    }
+    let selected = select_parameter(&parameter(spec, global_shape, norm), layout.placement())?;
+    if selected.shape != expected_local {
+        return Err(Error::backend(format!(
+            "numeric local parameter {} selected shape {:?}, planned {expected_local:?}",
+            spec.id.as_str(),
+            selected.shape
+        )));
+    }
+    Ok(selected)
+}
+
+fn balanced_rank_range(units: usize, size: usize, rank: usize) -> std::ops::Range<usize> {
+    assert!(size > 0 && rank < size);
+    let base = units / size;
+    let remainder = units % size;
+    let start = rank * base + rank.min(remainder);
+    let length = base + usize::from(rank < remainder);
+    start..start + length
+}
+
+fn numeric_local_layout(
+    groups: &[ParameterGroupSpec],
+    size: usize,
+    rank: usize,
+) -> Result<LocalModelLayout, Error> {
+    let mut layout = LocalModelLayout::default();
+    for group in groups {
+        let logical_range = group
+            .partition_units()
+            .map(|units| balanced_rank_range(units, size, rank));
+        for member in group.members() {
+            let mut local_shape = member.global_shape().to_vec();
+            let (placement, member_logical_range) = match member.sharding() {
+                MemberSharding::Replicated => (TensorPlacement::Replicated, None),
+                MemberSharding::Equal { axis } => {
+                    let width = member.global_shape()[*axis];
+                    if !width.is_multiple_of(size) {
+                        return Err(Error::backend(format!(
+                            "numeric equal shard {} does not divide {width} by {size}",
+                            member.target()
+                        )));
+                    }
+                    local_shape[*axis] = width / size;
+                    (
+                        TensorPlacement::Shard {
+                            axis: *axis,
+                            index: rank,
+                            parts: size,
+                        },
+                        Some(rank * (width / size)..(rank + 1) * (width / size)),
+                    )
+                }
+                MemberSharding::Balanced { axis } => {
+                    let range = balanced_rank_range(member.global_shape()[*axis], size, rank);
+                    local_shape[*axis] = range.len();
+                    (
+                        TensorPlacement::Range {
+                            axis: *axis,
+                            start: range.start,
+                            end: range.end,
+                        },
+                        Some(range),
+                    )
+                }
+                MemberSharding::Partitioned { axis } => {
+                    let units = group.partition_units().ok_or_else(|| {
+                        Error::backend("numeric partitioned member has no logical units")
+                    })?;
+                    let range = logical_range.as_ref().unwrap();
+                    let width = member.global_shape()[*axis];
+                    if !width.is_multiple_of(units) {
+                        return Err(Error::backend(format!(
+                            "numeric partitioned member {} width {width} does not divide by {units}",
+                            member.target()
+                        )));
+                    }
+                    let width_per_unit = width / units;
+                    let start = range.start * width_per_unit;
+                    let end = range.end * width_per_unit;
+                    local_shape[*axis] = end - start;
+                    (
+                        TensorPlacement::Range {
+                            axis: *axis,
+                            start,
+                            end,
+                        },
+                        Some(range.clone()),
+                    )
+                }
+                MemberSharding::PartitionedSegments { axis, segments } => {
+                    let units = group.partition_units().ok_or_else(|| {
+                        Error::backend("numeric segmented member has no logical units")
+                    })?;
+                    let range = logical_range.as_ref().unwrap();
+                    let mut indices = Vec::new();
+                    for segment in segments {
+                        if !segment.len().is_multiple_of(units) {
+                            return Err(Error::backend(format!(
+                                "numeric segment in {} does not divide by {units}",
+                                member.target()
+                            )));
+                        }
+                        let width = segment.len() / units;
+                        indices.extend(
+                            segment.start + range.start * width..segment.start + range.end * width,
+                        );
+                    }
+                    local_shape[*axis] = indices.len();
+                    (
+                        TensorPlacement::Indices {
+                            axis: *axis,
+                            indices,
+                        },
+                        Some(range.clone()),
+                    )
+                }
+                MemberSharding::Segmented { axis, segments } => {
+                    let mut indices = Vec::new();
+                    for segment in segments {
+                        let range = balanced_rank_range(segment.len(), size, rank);
+                        indices.extend(segment.start + range.start..segment.start + range.end);
+                    }
+                    local_shape[*axis] = indices.len();
+                    (
+                        TensorPlacement::Indices {
+                            axis: *axis,
+                            indices,
+                        },
+                        None,
+                    )
+                }
+            };
+            if layout.contains(member.target()) {
+                return Err(Error::backend(format!(
+                    "numeric layout repeats {}",
+                    member.target()
+                )));
+            }
+            layout.insert(
+                member.target().to_owned(),
+                LocalTensorLayout::new(
+                    group.logical_name(),
+                    group.role(),
+                    member.global_shape().to_vec(),
+                    local_shape,
+                    placement,
+                    group.partition_units(),
+                    member_logical_range,
+                    false,
+                ),
+            );
+        }
+    }
+    Ok(layout)
 }
 
 fn visit<'a, V>(metadata: &ParameterMetadata, value: &'a NumericTensor, visitor: &mut V)
@@ -1354,6 +1667,7 @@ impl LinearOperator<NumericTensor> for NumericLinear {
 struct NumericEmbedding {
     weight: NumericTensor,
     metadata: ParameterMetadata,
+    vocabulary_range: Option<VocabularyParallelRange>,
 }
 
 impl Parameterized<NumericTensor> for NumericEmbedding {
@@ -1382,7 +1696,12 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
         input: &NumericTensor,
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
-        let vocabulary = self.weight.shape[0] as usize;
+        let vocabulary = self
+            .vocabulary_range
+            .as_ref()
+            .map_or(self.weight.shape[0] as usize, |range| {
+                range.global_vocabulary
+            });
         let dimensions = self.weight.shape[1] as usize;
         let mut shape = input.shape.clone();
         shape.push(dimensions as i32);
@@ -1392,8 +1711,18 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
             if token >= vocabulary || token as f32 != input.data[token_index] {
                 return Err(Error::backend("numeric embedding token is invalid"));
             }
-            output.data[token_index * dimensions..(token_index + 1) * dimensions]
-                .copy_from_slice(&self.weight.data[token * dimensions..(token + 1) * dimensions]);
+            let local = self.vocabulary_range.as_ref().map_or(Some(token), |range| {
+                range
+                    .local
+                    .contains(&token)
+                    .then(|| token - range.local.start)
+            });
+            if let Some(local) = local {
+                output.data[token_index * dimensions..(token_index + 1) * dimensions]
+                    .copy_from_slice(
+                        &self.weight.data[local * dimensions..(local + 1) * dimensions],
+                    );
+            }
         }
         Ok(output)
     }
@@ -1416,7 +1745,12 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
         let EmbeddingLookupPolicy::ZeroSentinel(sentinel) = policy else {
             return self.forward(input, context);
         };
-        let vocabulary = self.weight.shape[0] as usize;
+        let vocabulary = self
+            .vocabulary_range
+            .as_ref()
+            .map_or(self.weight.shape[0] as usize, |range| {
+                range.global_vocabulary
+            });
         let dimensions = self.weight.shape[1] as usize;
         let mut shape = input.shape.clone();
         shape.push(dimensions as i32);
@@ -1429,8 +1763,15 @@ impl EmbeddingOperator<NumericTensor> for NumericEmbedding {
             if token < 0.0 || row >= vocabulary || row as f32 != token {
                 return Err(Error::backend("numeric embedding token is invalid"));
             }
-            output.data[token_index * dimensions..(token_index + 1) * dimensions]
-                .copy_from_slice(&self.weight.data[row * dimensions..(row + 1) * dimensions]);
+            let local = self.vocabulary_range.as_ref().map_or(Some(row), |range| {
+                range.local.contains(&row).then(|| row - range.local.start)
+            });
+            if let Some(local) = local {
+                output.data[token_index * dimensions..(token_index + 1) * dimensions]
+                    .copy_from_slice(
+                        &self.weight.data[local * dimensions..(local + 1) * dimensions],
+                    );
+            }
         }
         Ok(output)
     }
@@ -1575,7 +1916,10 @@ fn rotary_embeddings(
     }
     let sequence = input.shape[input.shape.len() - 2] as usize;
     let half = dimensions as usize / 2;
-    if cosine.shape != [sequence as i32, half as i32] || sine.shape != cosine.shape {
+    if (cosine.shape != [sequence as i32, half as i32]
+        && cosine.shape != [sequence as i32, dimensions])
+        || sine.shape != cosine.shape
+    {
         return Err(Error::backend(
             "numeric explicit rotary embedding shape mismatch",
         ));
@@ -1591,8 +1935,16 @@ fn rotary_embeddings(
             } else {
                 (frequency, frequency + half)
             };
-            let cosine = cosine.data[position * half + frequency];
-            let sine = sine.data[position * half + frequency];
+            let embedding_width = cosine.shape[1] as usize;
+            let embedding_index = if embedding_width == half {
+                frequency
+            } else if traditional {
+                2 * frequency
+            } else {
+                frequency
+            };
+            let cosine = cosine.data[position * embedding_width + embedding_index];
+            let sine = sine.data[position * embedding_width + embedding_index];
             let left_value = input.data[row * dimensions + left];
             let right_value = input.data[row * dimensions + right];
             output.data[row * dimensions + left] = left_value * cosine - right_value * sine;
@@ -1902,12 +2254,242 @@ impl HyperHeadOperator<NumericTensor> for NumericHyperHead {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct NumericContext {
     sliding_attention_calls: Cell<usize>,
+    local_layout: Option<Arc<LocalModelLayout>>,
 }
 
+impl NumericContext {
+    fn with_local_layout(layout: LocalModelLayout) -> Self {
+        Self {
+            sliding_attention_calls: Cell::new(0),
+            local_layout: Some(Arc::new(layout)),
+        }
+    }
+
+    fn tensor_layout(&self, target: &str) -> Option<&LocalTensorLayout> {
+        self.local_layout
+            .as_deref()
+            .and_then(|layout| layout.tensor(target))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum NumericCollectiveKind {
+    Sum,
+    GatherVocabulary,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct NumericCollectiveTrace {
+    sequence: usize,
+    kind: NumericCollectiveKind,
+    input_shape: Vec<i32>,
+    output_shape: Vec<i32>,
+}
+
+#[derive(Default)]
+struct NumericCollectiveSlot {
+    kind: Option<NumericCollectiveKind>,
+    values: Vec<Option<NumericTensor>>,
+    output: Option<NumericTensor>,
+    readers: usize,
+}
+
+struct NumericParallelGroup {
+    size: usize,
+    slots: Mutex<BTreeMap<usize, NumericCollectiveSlot>>,
+    ready: Condvar,
+}
+
+impl NumericParallelGroup {
+    fn new(size: usize) -> Arc<Self> {
+        assert!(size > 0);
+        Arc::new(Self {
+            size,
+            slots: Mutex::new(BTreeMap::new()),
+            ready: Condvar::new(),
+        })
+    }
+}
+
+struct NumericParallelContext {
+    rank: usize,
+    group: Arc<NumericParallelGroup>,
+    next_sequence: Cell<usize>,
+    trace: RefCell<Vec<NumericCollectiveTrace>>,
+}
+
+impl NumericParallelContext {
+    fn new(rank: usize, group: Arc<NumericParallelGroup>) -> Self {
+        assert!(rank < group.size);
+        Self {
+            rank,
+            group,
+            next_sequence: Cell::new(0),
+            trace: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn collective(
+        &self,
+        kind: NumericCollectiveKind,
+        value: NumericTensor,
+    ) -> Result<NumericTensor, Error> {
+        let sequence = self.next_sequence.get();
+        self.next_sequence.set(sequence + 1);
+        let input_shape = value.shape.clone();
+        let mut slots = self
+            .group
+            .slots
+            .lock()
+            .map_err(|_| Error::backend("numeric collective lock poisoned"))?;
+        {
+            let slot = slots.entry(sequence).or_default();
+            if slot.values.is_empty() {
+                slot.values.resize(self.group.size, None);
+                slot.kind = Some(kind);
+            }
+            if slot.kind != Some(kind) {
+                return Err(Error::backend(format!(
+                    "numeric collective {sequence} kind mismatch"
+                )));
+            }
+            if slot.values[self.rank].replace(value).is_some() {
+                return Err(Error::backend(format!(
+                    "numeric collective {sequence} rank {} submitted twice",
+                    self.rank
+                )));
+            }
+            if slot.values.iter().all(Option::is_some) {
+                let values = slot
+                    .values
+                    .iter()
+                    .map(|value| value.as_ref().unwrap())
+                    .collect::<Vec<_>>();
+                let output = match kind {
+                    NumericCollectiveKind::Sum => {
+                        let shape = values[0].shape.clone();
+                        if values.iter().any(|value| value.shape != shape) {
+                            return Err(Error::backend(format!(
+                                "numeric sum collective {sequence} shape mismatch"
+                            )));
+                        }
+                        let mut output = NumericTensor::zeros(shape);
+                        for value in values {
+                            for (output, value) in output.data.iter_mut().zip(&value.data) {
+                                *output += value;
+                            }
+                        }
+                        output
+                    }
+                    NumericCollectiveKind::GatherVocabulary => {
+                        let rank = values[0].shape.len();
+                        if rank == 0 {
+                            return Err(Error::backend(
+                                "numeric vocabulary gather received a scalar",
+                            ));
+                        }
+                        NumericTensor::concatenate(
+                            &values.into_iter().cloned().collect::<Vec<_>>(),
+                            i32::try_from(rank - 1).map_err(Error::backend)?,
+                            &NumericContext::default(),
+                        )?
+                    }
+                };
+                slot.output = Some(output);
+                self.group.ready.notify_all();
+            }
+        }
+        while slots
+            .get(&sequence)
+            .and_then(|slot| slot.output.as_ref())
+            .is_none()
+        {
+            slots = self
+                .group
+                .ready
+                .wait(slots)
+                .map_err(|_| Error::backend("numeric collective lock poisoned"))?;
+        }
+        let (output, remove) = {
+            let slot = slots.get_mut(&sequence).unwrap();
+            let output = slot.output.as_ref().unwrap().clone();
+            slot.readers += 1;
+            (output, slot.readers == self.group.size)
+        };
+        if remove {
+            slots.remove(&sequence);
+        }
+        drop(slots);
+        self.trace.borrow_mut().push(NumericCollectiveTrace {
+            sequence,
+            kind,
+            input_shape,
+            output_shape: output.shape.clone(),
+        });
+        Ok(output)
+    }
+
+    fn trace(&self) -> Vec<NumericCollectiveTrace> {
+        self.trace.borrow().clone()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct NumericBackend;
+
+#[derive(Debug)]
+struct NumericCompletion;
+
+impl Completion for NumericCompletion {
+    type Error = std::convert::Infallible;
+
+    fn is_complete(&self) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    fn wait(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl SubmissionBackend for NumericBackend {
+    type Executor = NumericContext;
+    type OwnedExecutor = NumericContext;
+    type Completion = NumericCompletion;
+
+    fn fork_executors(
+        executor: &Self::Executor,
+        count: usize,
+    ) -> Result<Vec<Self::OwnedExecutor>, std::convert::Infallible> {
+        Ok(vec![executor.clone(); count])
+    }
+
+    fn submit<'a, I>(_: &Self::Executor, _: I) -> Result<Self::Completion, std::convert::Infallible>
+    where
+        Self::Tensor: 'a,
+        I: IntoIterator<Item = &'a Self::Tensor>,
+    {
+        Ok(NumericCompletion)
+    }
+
+    fn order_after(
+        _: &Self::Completion,
+        _: &Self::Executor,
+    ) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+
+    fn retain_until_complete<T: Send + 'static>(
+        _: &Self::Executor,
+        _: &Self::Completion,
+        _: T,
+    ) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+}
 
 struct NumericBlockwiseAttention {
     queries: NumericTensor,
@@ -2085,16 +2667,19 @@ impl NeuralBackend for NumericBackend {
     type Embedding = NumericEmbedding;
     type Normalization = NumericNorm;
     type Rotary = NumericRotary;
-    type ParallelContext = ();
+    type ParallelContext = NumericParallelContext;
 
-    fn linear(spec: LinearSpec, _: &NumericContext) -> Result<Self::Linear, Error> {
-        let weight = parameter(&spec.weight, vec![spec.output, spec.input], false);
+    fn linear(spec: LinearSpec, context: &NumericContext) -> Result<Self::Linear, Error> {
+        let weight = local_parameter(&spec.weight, vec![spec.output, spec.input], false, context)?;
         let weight_metadata = ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable);
-        let bias = spec.bias.map(|bias| {
-            let value = parameter(&bias, vec![spec.output], false);
-            let metadata = ParameterMetadata::from_spec(&bias, bias.trainable);
-            (value, metadata)
-        });
+        let bias = spec
+            .bias
+            .map(|bias| -> Result<_, Error> {
+                let value = local_parameter(&bias, vec![spec.output], false, context)?;
+                let metadata = ParameterMetadata::from_spec(&bias, bias.trainable);
+                Ok((value, metadata))
+            })
+            .transpose()?;
         Ok(NumericLinear {
             weight,
             weight_metadata,
@@ -2102,11 +2687,91 @@ impl NeuralBackend for NumericBackend {
         })
     }
 
-    fn embedding(spec: EmbeddingSpec, _: &NumericContext) -> Result<Self::Embedding, Error> {
+    fn embedding(spec: EmbeddingSpec, context: &NumericContext) -> Result<Self::Embedding, Error> {
         Ok(NumericEmbedding {
-            weight: parameter(&spec.weight, vec![spec.vocabulary, spec.dimensions], false),
+            weight: local_parameter(
+                &spec.weight,
+                vec![spec.vocabulary, spec.dimensions],
+                false,
+                context,
+            )?,
             metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+            vocabulary_range: None,
         })
+    }
+
+    fn vocabulary_parallel_embedding(
+        spec: EmbeddingSpec,
+        range: VocabularyParallelRange,
+        _context: &NumericContext,
+    ) -> Result<Self::Embedding, Error> {
+        range.validate_global_rows(spec.vocabulary)?;
+        let global = parameter(&spec.weight, vec![spec.vocabulary, spec.dimensions], false);
+        Ok(NumericEmbedding {
+            weight: global.axis_slice(0, range.local.start, range.local.end),
+            metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+            vocabulary_range: Some(range),
+        })
+    }
+
+    fn vocabulary_parallel_linear(
+        spec: LinearSpec,
+        range: VocabularyParallelRange,
+        _context: &NumericContext,
+    ) -> Result<Self::Linear, Error> {
+        range.validate_global_rows(spec.output)?;
+        let global = parameter(&spec.weight, vec![spec.output, spec.input], false);
+        let weight = global.axis_slice(0, range.local.start, range.local.end);
+        let bias = spec.bias.map(|bias| {
+            let value = parameter(&bias, vec![spec.output], false).axis_slice(
+                0,
+                range.local.start,
+                range.local.end,
+            );
+            let metadata = ParameterMetadata::from_spec(&bias, bias.trainable);
+            (value, metadata)
+        });
+        Ok(NumericLinear {
+            weight,
+            weight_metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+            bias,
+        })
+    }
+
+    fn vocabulary_parallel_lookup(
+        embedding: &mut Self::Embedding,
+        input: &Self::Tensor,
+        _policy: EmbeddingLookupPolicy,
+        parallel: &Self::ParallelContext,
+        context: &NumericContext,
+    ) -> Result<Self::Tensor, Error> {
+        let local = embedding.lookup(input, _policy, context)?;
+        parallel.collective(NumericCollectiveKind::Sum, local)
+    }
+
+    fn vocabulary_parallel_project(
+        linear: &mut Self::Linear,
+        input: &Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &NumericContext,
+    ) -> Result<Self::Tensor, Error> {
+        let local = linear.forward(input, context)?;
+        parallel.collective(NumericCollectiveKind::GatherVocabulary, local)
+    }
+
+    fn vocabulary_parallel_embedding_project(
+        embedding: &mut Self::Embedding,
+        input: &Self::Tensor,
+        parallel: &Self::ParallelContext,
+        context: &NumericContext,
+    ) -> Result<Self::Tensor, Error> {
+        let mut linear = NumericLinear {
+            weight: embedding.weight.clone(),
+            weight_metadata: embedding.metadata.clone(),
+            bias: None,
+        };
+        let local = linear.forward(input, context)?;
+        parallel.collective(NumericCollectiveKind::GatherVocabulary, local)
     }
 
     fn rms_norm(spec: NormalizationSpec, _: &NumericContext) -> Result<Self::Normalization, Error> {
@@ -2114,6 +2779,41 @@ impl NeuralBackend for NumericBackend {
             weight: parameter(&spec.weight, vec![spec.dimensions], true),
             metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
             epsilon: spec.epsilon,
+        })
+    }
+
+    fn normalization(
+        spec: NormalizationConstructionSpec,
+        context: &NumericContext,
+    ) -> Result<Self::Normalization, Error> {
+        spec.validate()?;
+        let dimensions = spec.dimensions;
+        let epsilon = spec.epsilon;
+        let (weight, metadata) = match spec.scale {
+            NormalizationScale::Learned(weight) => {
+                let value = local_parameter(&weight, vec![dimensions], true, context)?;
+                let metadata = ParameterMetadata::from_spec(&weight, weight.trainable);
+                (value, metadata)
+            }
+            NormalizationScale::LearnedOffset { weight, offset } => {
+                let value = local_parameter(&weight, vec![dimensions], false, context)?
+                    .map(|value| value + offset);
+                let metadata = ParameterMetadata::from_spec(&weight, weight.trainable);
+                (value, metadata)
+            }
+            NormalizationScale::Unit => {
+                let parameter =
+                    ParameterSpec::trainable("numeric.unit_norm.weight").map_err(Error::backend)?;
+                (
+                    NumericTensor::new(vec![dimensions], vec![1.0; dimensions as usize]),
+                    ParameterMetadata::from_spec(&parameter, false),
+                )
+            }
+        };
+        Ok(NumericNorm {
+            weight,
+            metadata,
+            epsilon,
         })
     }
 
@@ -2129,6 +2829,12 @@ impl NeuralBackend for NumericBackend {
         Ok(input.map(|value| value / (1.0 + (-value).exp())))
     }
 
+    fn gelu_approximate(input: Self::Tensor, _: &NumericContext) -> Result<Self::Tensor, Error> {
+        Ok(input.map(|value| {
+            0.5 * value * (1.0 + (0.797_884_6 * (value + 0.044_715 * value.powi(3))).tanh())
+        }))
+    }
+
     fn sigmoid(input: Self::Tensor, _: &NumericContext) -> Result<Self::Tensor, Error> {
         Ok(input.map(|value| 1.0 / (1.0 + (-value).exp())))
     }
@@ -2139,6 +2845,37 @@ impl NeuralBackend for NumericBackend {
 
     fn exp(input: Self::Tensor, _: &NumericContext) -> Result<Self::Tensor, Error> {
         Ok(input.map(f32::exp))
+    }
+
+    fn l2_normalize(
+        input: &Self::Tensor,
+        epsilon: f32,
+        _: &NumericContext,
+    ) -> Result<Self::Tensor, Error> {
+        let width = usize::try_from(
+            *input
+                .shape
+                .last()
+                .ok_or_else(|| Error::backend("numeric L2 normalization requires rank"))?,
+        )
+        .map_err(Error::backend)?;
+        let mut output = input.clone();
+        for (source, target) in input
+            .data
+            .chunks_exact(width)
+            .zip(output.data.chunks_exact_mut(width))
+        {
+            let norm = source
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .max(epsilon)
+                .sqrt();
+            for (target, source) in target.iter_mut().zip(source) {
+                *target = *source / norm;
+            }
+        }
+        Ok(output)
     }
 
     fn gated_group_rms_norm(
@@ -2181,6 +2918,54 @@ impl NeuralBackend for NumericBackend {
             }
         }
         Ok(NumericTensor::new(input.shape.clone(), output))
+    }
+
+    fn silu_gated_group_rms_norm(
+        input: &Self::Tensor,
+        gate: &Self::Tensor,
+        weight: &Self::Tensor,
+        groups: i32,
+        epsilon: f32,
+        _: &NumericContext,
+    ) -> Result<Self::Tensor, Error> {
+        if input.shape != gate.shape {
+            return Err(Error::backend("numeric SiLU-gated RMS geometry mismatch"));
+        }
+        let width = usize::try_from(*input.shape.last().unwrap()).map_err(Error::backend)?;
+        let groups = usize::try_from(groups).map_err(Error::backend)?;
+        if groups == 0 || !width.is_multiple_of(groups) {
+            return Err(Error::backend(
+                "numeric SiLU-gated RMS groups do not divide width",
+            ));
+        }
+        let group_width = width / groups;
+        if weight.shape != [group_width as i32] && weight.shape != [width as i32] {
+            return Err(Error::backend(
+                "numeric SiLU-gated RMS weight geometry mismatch",
+            ));
+        }
+        let mut output = NumericTensor::zeros(input.shape.clone());
+        for row in 0..input.data.len() / width {
+            for group in 0..groups {
+                let start = row * width + group * group_width;
+                let source = &input.data[start..start + group_width];
+                let rms = (source.iter().map(|value| value * value).sum::<f32>()
+                    / group_width as f32
+                    + epsilon)
+                    .sqrt();
+                for dimension in 0..group_width {
+                    let gate = gate.data[start + dimension];
+                    let scale = if weight.data.len() == width {
+                        weight.data[group * group_width + dimension]
+                    } else {
+                        weight.data[dimension]
+                    };
+                    output.data[start + dimension] =
+                        source[dimension] / rms * scale * (gate / (1.0 + (-gate).exp()));
+                }
+            }
+        }
+        Ok(output)
     }
 
     fn gated_delta_scan(
@@ -2651,25 +3436,63 @@ impl NeuralBackend for NumericBackend {
         Ok(mask)
     }
 
+    fn segmented_attention(
+        input: eredu_nn::SegmentedAttentionInput<'_, Self::Tensor>,
+        _: &NumericContext,
+    ) -> Result<Self::Tensor, Error> {
+        input.validate()?;
+        let tokens = usize::try_from(input.queries.shape[0]).map_err(Error::backend)?;
+        let heads = usize::try_from(input.queries.shape[1]).map_err(Error::backend)?;
+        let dimensions = usize::try_from(input.queries.shape[2]).map_err(Error::backend)?;
+        let value_dimensions = usize::try_from(input.values.shape[2]).map_err(Error::backend)?;
+        let output = eredu_nn::reference_segmented_attention(
+            tokens,
+            heads,
+            dimensions,
+            value_dimensions,
+            &input.queries.data,
+            &input.keys.data,
+            &input.values.data,
+            input.segment_lengths,
+            input.scale,
+        )?;
+        Ok(NumericTensor::new(
+            [
+                input.queries.shape[0],
+                input.queries.shape[1],
+                input.values.shape[2],
+            ],
+            output,
+        ))
+    }
+
     fn row_parallel_linear(
         linear: &mut Self::Linear,
         input: &Self::Tensor,
-        _: &(),
+        parallel: &Self::ParallelContext,
         context: &NumericContext,
     ) -> Result<Self::Tensor, Error> {
-        linear.forward(input, context)
+        let bias = linear.bias.take();
+        let local = linear.forward(input, context)?;
+        let reduced = parallel.collective(NumericCollectiveKind::Sum, local)?;
+        let output = match &bias {
+            Some((bias, _)) => reduced.add(bias, context)?,
+            None => reduced,
+        };
+        linear.bias = bias;
+        Ok(output)
     }
 
     fn sum_parallel(
         value: Self::Tensor,
-        _: &(),
+        parallel: &Self::ParallelContext,
         _: &NumericContext,
     ) -> Result<Self::Tensor, Error> {
-        Ok(value)
+        parallel.collective(NumericCollectiveKind::Sum, value)
     }
 
-    fn parallel_size(_: &()) -> usize {
-        2
+    fn parallel_size(parallel: &Self::ParallelContext) -> usize {
+        parallel.group.size
     }
 }
 
@@ -2699,11 +3522,48 @@ fn attention(
     let key_sequence = keys.shape[2] as usize;
     let dimensions = queries.shape[3] as usize;
     let value_dimensions = values.shape[3] as usize;
-    if let Some(mask) = mask {
-        if mask.shape != [query_sequence as i32, key_sequence as i32] {
-            return Err(Error::backend("numeric attention mask shape mismatch"));
+    let mask_value = |mask: &NumericTensor,
+                      batch_index: usize,
+                      query_head: usize,
+                      query_position: usize,
+                      key_position: usize|
+     -> Result<f32, Error> {
+        if mask.shape.len() > 4 {
+            return Err(Error::backend("numeric attention mask rank exceeds four"));
         }
-    }
+        let target = [batch, query_heads, query_sequence, key_sequence];
+        let leading = 4 - mask.shape.len();
+        let full_shape = (0..4)
+            .map(|current| {
+                if current < leading {
+                    1
+                } else {
+                    mask.shape[current - leading] as usize
+                }
+            })
+            .collect::<Vec<_>>();
+        if full_shape
+            .iter()
+            .zip(target)
+            .any(|(actual, expected)| *actual != 1 && *actual != expected)
+        {
+            return Err(Error::backend(format!(
+                "numeric attention mask shape {:?} does not broadcast to {:?}",
+                mask.shape, target
+            )));
+        }
+        let target_coordinate = [batch_index, query_head, query_position, key_position];
+        let coordinate = (leading..4)
+            .map(|current| {
+                if full_shape[current] == 1 {
+                    0
+                } else {
+                    target_coordinate[current]
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(mask.data[offset(&coordinate, &mask.shape)])
+    };
     let key_position_start = query_position_offset + query_sequence as i32 - key_sequence as i32;
     let groups = query_heads / key_heads;
     let mut output = NumericTensor::zeros(vec![
@@ -2737,9 +3597,16 @@ fn attention(
                             })
                             .sum::<f32>()
                             * scale
-                            + mask.map_or(0.0, |mask| {
-                                mask.data[query_position * key_sequence + key_position]
-                            });
+                            + match mask {
+                                Some(mask) => mask_value(
+                                    mask,
+                                    batch_index,
+                                    query_head,
+                                    query_position,
+                                    key_position,
+                                )?,
+                                None => 0.0,
+                            };
                     }
                 }
                 let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -3481,6 +4348,19 @@ impl Relu2ExpertBankOperator<NumericTensor> for NumericRelu2ExpertBank {
         }
         Ok(output)
     }
+
+    fn forward_routed_tensor_parallel(
+        &mut self,
+        input: &NumericTensor,
+        routes: &RoutingResult<NumericTensor>,
+        _: usize,
+        context: &NumericContext,
+    ) -> Result<TensorParallelExpertOutput<NumericTensor>, Error> {
+        Ok(TensorParallelExpertOutput {
+            reducible: self.forward_routed(input, routes, context)?,
+            post_reduce: None,
+        })
+    }
 }
 
 impl Parameterized<NumericTensor> for NumericExpertBank {
@@ -3568,6 +4448,52 @@ impl GatedProductExpertBankOperator<NumericTensor> for NumericExpertBank {
             }
         }
         Ok(output)
+    }
+
+    fn forward_routed_tensor_parallel(
+        &mut self,
+        input: &NumericTensor,
+        routes: &RoutingResult<NumericTensor>,
+        _: usize,
+        context: &NumericContext,
+    ) -> Result<TensorParallelExpertOutput<NumericTensor>, Error> {
+        let mut local = self.clone();
+        let has_down_bias = local
+            .experts
+            .iter()
+            .any(|expert| expert.down_bias.is_some());
+        for expert in &mut local.experts {
+            expert.down_bias = None;
+        }
+        let reducible = local.forward_routed(input, routes, context)?;
+        let post_reduce = if has_down_bias {
+            let hidden = input.shape.last().copied().unwrap() as usize;
+            let tokens = input.data.len() / hidden;
+            let top_k = routes.expert_ids.shape[1] as usize;
+            let mut bias = NumericTensor::zeros(input.shape.clone());
+            for token in 0..tokens {
+                for route in 0..top_k {
+                    let route_index = token * top_k + route;
+                    let expert = routes.expert_ids.data[route_index] as usize;
+                    let down_bias = self
+                        .experts
+                        .get(expert)
+                        .and_then(|expert| expert.down_bias.as_ref())
+                        .ok_or_else(|| Error::backend("numeric expert down-bias mismatch"))?;
+                    let weight = routes.route_weights.data[route_index];
+                    for dimension in 0..hidden {
+                        bias.data[token * hidden + dimension] += weight * down_bias.data[dimension];
+                    }
+                }
+            }
+            Some(bias)
+        } else {
+            None
+        };
+        Ok(TensorParallelExpertOutput {
+            reducible,
+            post_reduce,
+        })
     }
 }
 
@@ -3839,7 +4765,7 @@ impl RoutedNeuralBackend for NumericBackend {
 
     fn gated_product_expert_bank(
         spec: GatedProductExpertBankSpec,
-        _: &NumericContext,
+        context: &NumericContext,
     ) -> Result<Self::GatedProductExpertBank, Error> {
         spec.validate()?;
         let expert_count = spec.expert_count as usize;
@@ -3850,23 +4776,42 @@ impl RoutedNeuralBackend for NumericBackend {
         let mut parameters = Vec::new();
         match spec.layout {
             GatedProductExpertLayout::Packed { gate_up, down } => {
-                let packed_gate_up = parameter(
+                let packed_gate_up = local_parameter(
                     &gate_up.weight,
                     vec![spec.expert_count, 2 * intermediate, hidden],
                     false,
-                );
-                let packed_down = parameter(
+                    context,
+                )?;
+                let packed_down = local_parameter(
                     &down.weight,
                     vec![spec.expert_count, spec.output_dimensions, intermediate],
                     false,
-                );
+                    context,
+                )?;
                 let packed_gate_up_bias = gate_up
                     .bias
                     .as_ref()
-                    .map(|bias| parameter(bias, vec![spec.expert_count, 2 * intermediate], false));
-                let packed_down_bias = down.bias.as_ref().map(|bias| {
-                    parameter(bias, vec![spec.expert_count, spec.output_dimensions], false)
-                });
+                    .map(|bias| {
+                        local_parameter(
+                            bias,
+                            vec![spec.expert_count, 2 * intermediate],
+                            false,
+                            context,
+                        )
+                    })
+                    .transpose()?;
+                let packed_down_bias = down
+                    .bias
+                    .as_ref()
+                    .map(|bias| {
+                        local_parameter(
+                            bias,
+                            vec![spec.expert_count, spec.output_dimensions],
+                            false,
+                            context,
+                        )
+                    })
+                    .transpose()?;
                 let gate_up_per_expert = (2 * intermediate * hidden) as usize;
                 let projection_per_expert = (intermediate * hidden) as usize;
                 let down_per_expert = (spec.output_dimensions * intermediate) as usize;
@@ -3940,29 +4885,44 @@ impl RoutedNeuralBackend for NumericBackend {
             }
             GatedProductExpertLayout::Independent(specs) => {
                 for expert_spec in specs {
-                    let gate =
-                        parameter(&expert_spec.gate.weight, vec![intermediate, hidden], false);
-                    let up = parameter(&expert_spec.up.weight, vec![intermediate, hidden], false);
-                    let down = parameter(
+                    let gate = local_parameter(
+                        &expert_spec.gate.weight,
+                        vec![intermediate, hidden],
+                        false,
+                        context,
+                    )?;
+                    let up = local_parameter(
+                        &expert_spec.up.weight,
+                        vec![intermediate, hidden],
+                        false,
+                        context,
+                    )?;
+                    let down = local_parameter(
                         &expert_spec.down.weight,
                         vec![spec.output_dimensions, intermediate],
                         false,
-                    );
+                        context,
+                    )?;
                     let gate_bias = expert_spec
                         .gate
                         .bias
                         .as_ref()
-                        .map(|bias| parameter(bias, vec![intermediate], false));
+                        .map(|bias| local_parameter(bias, vec![intermediate], false, context))
+                        .transpose()?;
                     let up_bias = expert_spec
                         .up
                         .bias
                         .as_ref()
-                        .map(|bias| parameter(bias, vec![intermediate], false));
+                        .map(|bias| local_parameter(bias, vec![intermediate], false, context))
+                        .transpose()?;
                     let down_bias = expert_spec
                         .down
                         .bias
                         .as_ref()
-                        .map(|bias| parameter(bias, vec![spec.output_dimensions], false));
+                        .map(|bias| {
+                            local_parameter(bias, vec![spec.output_dimensions], false, context)
+                        })
+                        .transpose()?;
                     experts.push(NumericExpert {
                         gate: gate.clone(),
                         gate_bias: gate_bias.clone(),
@@ -4023,10 +4983,10 @@ impl RoutedNeuralBackend for NumericBackend {
 
     fn relu2_expert_bank(
         spec: Relu2ExpertBankSpec,
-        _: &NumericContext,
+        context: &NumericContext,
     ) -> Result<Self::Relu2ExpertBank, Error> {
         spec.validate()?;
-        let up = parameter(
+        let up = local_parameter(
             &spec.up.weight,
             vec![
                 spec.expert_count,
@@ -4034,8 +4994,9 @@ impl RoutedNeuralBackend for NumericBackend {
                 spec.hidden_dimensions,
             ],
             true,
-        );
-        let down = parameter(
+            context,
+        )?;
+        let down = local_parameter(
             &spec.down.weight,
             vec![
                 spec.expert_count,
@@ -4043,7 +5004,8 @@ impl RoutedNeuralBackend for NumericBackend {
                 spec.intermediate_dimensions,
             ],
             true,
-        );
+            context,
+        )?;
         Ok(NumericRelu2ExpertBank {
             expert_count: spec.expert_count as usize,
             hidden: spec.hidden_dimensions as usize,
@@ -4380,6 +5342,108 @@ impl eredu_nn::AuxiliaryConvolutionState<NumericTensor> for NumericHybridLayerSt
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum StreamPolicyEvent {
+    Begin,
+    Acquire(usize, usize, usize),
+    Complete(usize, usize, usize),
+    Finish,
+}
+
+struct RebuiltUnitLease<U>(U);
+
+impl<U> std::ops::Deref for RebuiltUnitLease<U> {
+    type Target = U;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<U> std::ops::DerefMut for RebuiltUnitLease<U> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[derive(Default)]
+struct RebuildingUnitPolicy {
+    events: Vec<StreamPolicyEvent>,
+    fail_acquire: Option<usize>,
+}
+
+impl RebuildingUnitPolicy {
+    fn failing_at(ordinal: usize) -> Self {
+        Self {
+            events: Vec::new(),
+            fail_acquire: Some(ordinal),
+        }
+    }
+}
+
+impl<U> LayerwisePolicy<NumericBackend, U> for RebuildingUnitPolicy {
+    type Lease = RebuiltUnitLease<U>;
+    type Error = &'static str;
+
+    fn begin(&mut self, _: &NumericTensor, _: &NumericContext) -> Result<(), Self::Error> {
+        self.events.push(StreamPolicyEvent::Begin);
+        Ok(())
+    }
+
+    fn acquire<E, F>(
+        &mut self,
+        ordinal: usize,
+        address: ExecutionUnitAddress,
+        build: F,
+        context: &NumericContext,
+    ) -> Result<Self::Lease, LayerwiseAcquireError<E, Self::Error>>
+    where
+        F: FnOnce(&NumericContext) -> Result<U, E>,
+    {
+        self.events.push(StreamPolicyEvent::Acquire(
+            ordinal,
+            address.group(),
+            address.index(),
+        ));
+        if self.fail_acquire == Some(ordinal) {
+            return Err(LayerwiseAcquireError::Policy(
+                "injected dense-stream acquisition failure",
+            ));
+        }
+        build(context)
+            .map(RebuiltUnitLease)
+            .map_err(LayerwiseAcquireError::Architecture)
+    }
+
+    fn complete<'a, StateValues, ContextValues>(
+        &mut self,
+        ordinal: usize,
+        address: ExecutionUnitAddress,
+        _: Self::Lease,
+        _: &'a NumericTensor,
+        _: StateValues,
+        _: ContextValues,
+        _: &NumericContext,
+    ) -> Result<(), Self::Error>
+    where
+        NumericTensor: 'a,
+        StateValues: Iterator<Item = &'a NumericTensor>,
+        ContextValues: Iterator<Item = &'a NumericTensor>,
+    {
+        self.events.push(StreamPolicyEvent::Complete(
+            ordinal,
+            address.group(),
+            address.index(),
+        ));
+        Ok(())
+    }
+
+    fn finish(&mut self, _: &NumericTensor, _: &NumericContext) -> Result<(), Self::Error> {
+        self.events.push(StreamPolicyEvent::Finish);
+        Ok(())
+    }
+}
+
 fn config(model_type: &str, tied: bool) -> serde_json::Value {
     let mut config = serde_json::json!({
         "model_type": model_type,
@@ -4577,6 +5641,7 @@ fn zero_sentinel_and_ordered_multi_table_sum_have_exact_scalar_results() {
     let mut sentinel = NumericEmbedding {
         weight: NumericTensor::new([3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
         metadata: ParameterMetadata::from_spec(&parameter, parameter.trainable),
+        vocabulary_range: None,
     };
     let looked_up = sentinel
         .lookup(
@@ -5526,6 +6591,307 @@ fn numerical_qwen2_qwen3_and_moe_prefill_decode_goldens() {
 }
 
 #[test]
+fn qwen_prompt_snapshot_reopens_with_global_identity_and_continues_exactly() {
+    let mut value = config("qwen3", false);
+    value["num_hidden_layers"] = 2.into();
+    let args = qwen::model_args_from_config_value(&value).unwrap();
+    let context = NumericContext::default();
+    let layout = qwen::state_layout(&args).unwrap();
+    let new_state = || {
+        DeviceState::<NumericBackend, _>::create(layout.clone(), |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .unwrap()
+    };
+    let new_runtime = || {
+        ResidentRuntime::new(
+            qwen::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap(),
+            &context,
+        )
+        .unwrap()
+    };
+
+    let prefix = NumericTensor::token_ids(&[1, 4, 2]);
+    let continuation = NumericTensor::token_ids(&[3]);
+    let all = NumericTensor::token_ids(&[1, 4, 2, 3]);
+    let mut persisted_state = new_state();
+    let mut writer = new_runtime();
+    writer
+        .forward(
+            decoder::LayeredInput {
+                tokens: &prefix,
+                mask: None,
+            },
+            &mut persisted_state,
+            &context,
+        )
+        .unwrap();
+    assert_eq!(persisted_state.layer(0).unwrap().position(), 3);
+    assert_eq!(persisted_state.layer(1).unwrap().position(), 3);
+
+    // A reopened runtime owns a new architecture instance while the restored
+    // state is the exact backend-neutral prompt snapshot.
+    let mut reopened_state = persisted_state.clone();
+    let mut reopened = new_runtime();
+    let reopened_logits = reopened
+        .forward(
+            decoder::LayeredInput {
+                tokens: &continuation,
+                mask: None,
+            },
+            &mut reopened_state,
+            &context,
+        )
+        .unwrap();
+
+    let mut uninterrupted_state = new_state();
+    let mut uninterrupted = new_runtime();
+    let uninterrupted_logits = uninterrupted
+        .forward(
+            decoder::LayeredInput {
+                tokens: &all,
+                mask: None,
+            },
+            &mut uninterrupted_state,
+            &context,
+        )
+        .unwrap()
+        .axis_slice(1, 3, 4);
+    assert_tensor_close(
+        &reopened_logits,
+        &uninterrupted_logits,
+        "reopened Qwen prompt continuation",
+    );
+    assert_eq!(reopened_state.layer(0).unwrap().position(), 4);
+    assert_eq!(reopened_state.layer(1).unwrap().position(), 4);
+
+    // A pipeline rank that owns only the second global layer records global
+    // coordinates and distributed rank identity, never a local zero-based
+    // shadow identity.
+    let local_layout = eredu_runtime::StateLayout::new(
+        LayerSchedule::new(1, vec![layout.layers().get(1).unwrap().clone()]).unwrap(),
+    )
+    .unwrap();
+    let topology = PromptCacheTopology {
+        pipeline: Some((2, 1)),
+        tensor_parallel: Some((2, 0)),
+        ..PromptCacheTopology::default()
+    };
+    let model_identity = qwen::state_identity(&args, &local_layout, 1, topology.clone()).unwrap();
+    let prompt_identity = model_identity.prompt_cache_identity(&local_layout).unwrap();
+    assert_eq!(prompt_identity.global_layer_start, 1);
+    assert_eq!(prompt_identity.global_layer_end, 2);
+    assert_eq!(prompt_identity.topology, topology);
+    assert_eq!(prompt_identity.layer_layout.len(), 1);
+
+    // Identity and input failures are rejected before mutating the restored
+    // state. This is the portable failure-atomicity boundary used before any
+    // persistent tensors are materialized.
+    let mut malformed_identity = model_identity;
+    malformed_identity.layer_prefix_offsets.clear();
+    assert!(malformed_identity
+        .prompt_cache_identity(&local_layout)
+        .is_err());
+    let positions = [
+        reopened_state.layer(0).unwrap().position(),
+        reopened_state.layer(1).unwrap().position(),
+    ];
+    let invalid = NumericTensor::token_ids(&[args.vocab_size as usize]);
+    assert!(reopened
+        .forward(
+            decoder::LayeredInput {
+                tokens: &invalid,
+                mask: None,
+            },
+            &mut reopened_state,
+            &context,
+        )
+        .is_err());
+    assert_eq!(
+        [
+            reopened_state.layer(0).unwrap().position(),
+            reopened_state.layer(1).unwrap().position(),
+        ],
+        positions,
+    );
+}
+
+fn expected_stream_events(addresses: &[(usize, usize)]) -> Vec<StreamPolicyEvent> {
+    let mut events = vec![StreamPolicyEvent::Begin];
+    for (ordinal, &(group, index)) in addresses.iter().enumerate() {
+        events.push(StreamPolicyEvent::Acquire(ordinal, group, index));
+        events.push(StreamPolicyEvent::Complete(ordinal, group, index));
+    }
+    events.push(StreamPolicyEvent::Finish);
+    events
+}
+
+#[test]
+fn real_decoder_and_hybrid_models_match_resident_and_dense_streamed_traversal() {
+    let context = NumericContext::default();
+
+    let mut qwen_value = config("qwen3", false);
+    qwen_value["num_hidden_layers"] = 2.into();
+    let qwen_args = qwen::model_args_from_config_value(&qwen_value).unwrap();
+    let qwen_layout = qwen::state_layout(&qwen_args).unwrap();
+    let qwen_state = || {
+        DeviceState::<NumericBackend, _>::create(qwen_layout.clone(), |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .unwrap()
+    };
+    let mut qwen_resident_state = qwen_state();
+    let mut qwen_streamed_state = qwen_state();
+    let mut qwen_resident = ResidentRuntime::new(
+        qwen::LayeredModel::<NumericBackend>::new(qwen_args.clone(), &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let mut qwen_streamed = LayerwiseRuntime::new(
+        qwen::LayeredModel::<NumericBackend>::new(qwen_args, &context).unwrap(),
+        RebuildingUnitPolicy::default(),
+    );
+    let qwen_tokens = NumericTensor::token_ids(&[1, 4, 2]);
+    let resident_logits = qwen_resident
+        .forward(
+            decoder::LayeredInput {
+                tokens: &qwen_tokens,
+                mask: None,
+            },
+            &mut qwen_resident_state,
+            &context,
+        )
+        .unwrap();
+    let streamed_logits = qwen_streamed
+        .forward(
+            decoder::LayeredInput {
+                tokens: &qwen_tokens,
+                mask: None,
+            },
+            &mut qwen_streamed_state,
+            &context,
+        )
+        .unwrap();
+    assert_tensor_close(
+        &streamed_logits,
+        &resident_logits,
+        "Qwen resident/dense-stream logits",
+    );
+    assert_eq!(
+        qwen_streamed.policy().events,
+        expected_stream_events(&[(0, 0), (0, 1)])
+    );
+    for layer in 0..2 {
+        assert_eq!(
+            qwen_streamed_state.layer(layer).unwrap().position(),
+            qwen_resident_state.layer(layer).unwrap().position()
+        );
+    }
+
+    let lfm_args = lfm2::model_args_from_config_value(&serde_json::json!({
+        "model_type":"lfm2", "vocab_size":17, "hidden_size":8,
+        "intermediate_size":10, "num_hidden_layers":2,
+        "num_attention_heads":4, "num_key_value_heads":2,
+        "max_position_embeddings":32, "layer_types":["conv","full_attention"],
+        "conv_L_cache":3, "block_multiple_of":2,
+        "block_ffn_dim_multiplier":1.0, "block_auto_adjust_ff_dim":true,
+        "tie_word_embeddings":false
+    }))
+    .unwrap();
+    let lfm_layout = lfm2::state_layout(&lfm_args).unwrap();
+    let lfm_state = || {
+        DeviceState::<NumericBackend, _>::create(lfm_layout.clone(), |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .unwrap()
+    };
+    let mut lfm_resident_state = lfm_state();
+    let mut lfm_streamed_state = lfm_state();
+    let mut lfm_resident = ResidentRuntime::new(
+        lfm2::LayeredModel::<NumericBackend>::new(lfm_args.clone(), &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let mut lfm_streamed = LayerwiseRuntime::new(
+        lfm2::LayeredModel::<NumericBackend>::new(lfm_args, &context).unwrap(),
+        RebuildingUnitPolicy::default(),
+    );
+    let lfm_tokens = NumericTensor::token_ids(&[2, 5, 7]);
+    let resident_logits = lfm_resident
+        .forward(
+            decoder::LayeredInput {
+                tokens: &lfm_tokens,
+                mask: None,
+            },
+            &mut lfm_resident_state,
+            &context,
+        )
+        .unwrap();
+    let streamed_logits = lfm_streamed
+        .forward(
+            decoder::LayeredInput {
+                tokens: &lfm_tokens,
+                mask: None,
+            },
+            &mut lfm_streamed_state,
+            &context,
+        )
+        .unwrap();
+    assert_tensor_close(
+        &streamed_logits,
+        &resident_logits,
+        "LFM2 resident/dense-stream logits",
+    );
+    assert_eq!(
+        lfm_streamed.policy().events,
+        expected_stream_events(&[(0, 0), (0, 1)])
+    );
+    for layer in 0..2 {
+        assert_eq!(
+            lfm_streamed_state.layer(layer).unwrap().position(),
+            lfm_resident_state.layer(layer).unwrap().position()
+        );
+    }
+}
+
+#[test]
+fn dense_stream_acquisition_failure_is_atomic_before_first_real_unit() {
+    let mut value = config("qwen3", false);
+    value["num_hidden_layers"] = 2.into();
+    let args = qwen::model_args_from_config_value(&value).unwrap();
+    let context = NumericContext::default();
+    let mut state = DeviceState::<NumericBackend, _>::create(
+        qwen::state_layout(&args).unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut runtime = LayerwiseRuntime::new(
+        qwen::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
+        RebuildingUnitPolicy::failing_at(0),
+    );
+    let tokens = NumericTensor::token_ids(&[1, 2]);
+    assert!(runtime
+        .forward(
+            decoder::LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut state,
+            &context,
+        )
+        .is_err());
+    assert_eq!(state.layer(0).unwrap().position(), 0);
+    assert_eq!(state.layer(1).unwrap().position(), 0);
+    assert_eq!(
+        runtime.policy().events,
+        [
+            StreamPolicyEvent::Begin,
+            StreamPolicyEvent::Acquire(0, 0, 0)
+        ]
+    );
+}
+
+#[test]
 fn neutral_gpt_oss_prefill_decode_is_chunk_invariant() {
     let args = gpt_oss::model_args_from_config_value(&serde_json::json!({
         "model_type": "gpt_oss",
@@ -5731,6 +7097,494 @@ fn gemma4_sparse_shared_kv_prefill_decode_is_chunk_invariant() {
 }
 
 #[test]
+fn gemma4_tp2_text_matches_replicated_composite_graph() {
+    let text = gemma4::ModelArgs::from_hf_json(
+        br#"{
+        "model_type":"gemma4_unified","hidden_size":8,"num_hidden_layers":2,
+        "intermediate_size":10,"num_attention_heads":2,"rms_norm_eps":0.00001,
+        "vocab_size":7,"num_key_value_heads":2,"max_position_embeddings":64,"head_dim":4,
+        "attention_k_eq_v":false,"num_kv_shared_layers":0,
+        "layer_types":["sliding_attention","full_attention"],"sliding_window":4,
+        "enable_moe_block":false,"final_logit_softcapping":7.0
+    }"#,
+    )
+    .unwrap();
+    let family = gemma4::FamilyConfig {
+        model_type: text.model_type.clone(),
+        text,
+        vision: None,
+        image_token_id: None,
+        video_token_id: None,
+        audio: None,
+        audio_token_id: None,
+    };
+    let context = NumericContext::default();
+    let architecture =
+        gemma4::LayeredModel::<NumericBackend>::new(family.clone(), &context).unwrap();
+    let mut groups = gemma4::static_parameter_groups(&family.text).unwrap();
+    for layer in 0..2 {
+        groups.extend(gemma4::layer_parameter_groups(&family.text, layer).unwrap());
+    }
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.runtime_state_layout().unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let tokens = NumericTensor::token_ids(&[0, 4, 6]);
+    let parts = [gemma4::DecoderInputPart::Text(&tokens)];
+    let expected = expected_runtime
+        .forward(
+            gemma4::ModelInput {
+                parts: &parts,
+                vision: None,
+                audio: None,
+                per_layer_tokens: None,
+                mask: None,
+            },
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = gemma4::local_geometry(&family, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = gemma4::LayeredModel::<NumericBackend>::new_parallel(
+        family.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let tp1_units = [(2, 0), (2, 1)]
+        .into_iter()
+        .map(|(group, index)| {
+            <gemma4::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&tp1_architecture, group, index, &tp1_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut tp1_runtime =
+        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(tp1_units));
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_parallel = NumericParallelContext::new(0, NumericParallelGroup::new(1));
+    let tp1_parts = [gemma4::DecoderInputPart::Text(&tokens)];
+    let tp1_logits = tp1_runtime
+        .forward_parallel(
+            gemma4::ModelInput {
+                parts: &tp1_parts,
+                vision: None,
+                audio: None,
+                per_layer_tokens: None,
+                mask: None,
+            },
+            &mut tp1_state,
+            &tp1_parallel,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "Gemma4 TP1 logits");
+    assert_state_exact(&tp1_state, &expected_state, 2, "Gemma4 TP1 state");
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    let collective_group = NumericParallelGroup::new(2);
+    let outputs = std::thread::scope(|scope| {
+        let handles = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, layout)| {
+                let family = family.clone();
+                let tokens = tokens.clone();
+                let collective_group = Arc::clone(&collective_group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let geometry = gemma4::local_geometry(&family, &layout).unwrap();
+                    let state_layout = geometry.state_layout().clone();
+                    let architecture = gemma4::LayeredModel::<NumericBackend>::new_parallel(
+                        family, geometry, &context,
+                    )
+                    .unwrap();
+                    let units = [(2, 0), (2, 1)]
+                        .into_iter()
+                        .map(|(group, index)| {
+                            <gemma4::LayeredModel<NumericBackend> as LayeredArchitecture<
+                                NumericBackend,
+                                DeviceState<NumericBackend, NumericHybridLayerState>,
+                            >>::build_unit(
+                                &architecture, group, index, &context
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                    let mut state =
+                        DeviceState::<NumericBackend, _>::create(state_layout, |_, policy| {
+                            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+                        })
+                        .unwrap();
+                    let parallel = NumericParallelContext::new(rank, collective_group);
+                    let parts = [gemma4::DecoderInputPart::Text(&tokens)];
+                    let logits = runtime
+                        .forward_parallel(
+                            gemma4::ModelInput {
+                                parts: &parts,
+                                vision: None,
+                                audio: None,
+                                per_layer_tokens: None,
+                                mask: None,
+                            },
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .unwrap();
+                    (logits, parallel.trace())
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_tensor_close(&outputs[0].0, &expected, "Gemma4 TP2 rank 0 logits");
+    assert_tensor_close(&outputs[1].0, &expected, "Gemma4 TP2 rank 1 logits");
+    assert_eq!(outputs[0].1.len(), 6);
+    assert_eq!(outputs[1].1.len(), 6);
+}
+
+#[test]
+fn gemma4_tp2_ordered_vision_audio_text_matches_replicated_multimodal_graph() {
+    let family = gemma4::FamilyConfig::from_hf_json(
+        &serde_json::to_vec(&serde_json::json!({
+            "model_type":"gemma4_unified", "tie_word_embeddings":false,
+            "image_token_id":5, "audio_token_id":6,
+            "text_config":{
+                "model_type":"gemma4_text", "hidden_size":8,
+                "num_hidden_layers":2, "intermediate_size":10,
+                "num_attention_heads":2, "num_key_value_heads":2, "head_dim":4,
+                "rms_norm_eps":0.00001, "vocab_size":7,
+                "max_position_embeddings":64, "attention_k_eq_v":false,
+                "num_kv_shared_layers":0,
+                "layer_types":["sliding_attention","full_attention"],
+                "sliding_window":4, "enable_moe_block":false,
+                "final_logit_softcapping":7.0
+            },
+            "vision_config":{
+                "hidden_size":8, "intermediate_size":10,
+                "num_hidden_layers":1, "num_attention_heads":2,
+                "num_key_value_heads":2, "head_dim":4, "patch_size":2,
+                "pooling_kernel_size":2, "position_embedding_size":2,
+                "rms_norm_eps":0.00001
+            },
+            "audio_config":{
+                "hidden_size":8, "num_hidden_layers":1,
+                "num_attention_heads":2, "output_proj_dims":8,
+                "conv_kernel_size":3, "attention_chunk_size":4,
+                "attention_context_left":5, "attention_context_right":0,
+                "attention_invalid_logits_value":-1000000000.0,
+                "attention_logit_cap":50.0, "residual_weight":0.5,
+                "rms_norm_eps":0.00001, "subsampling_conv_channels":[4,8]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let context = NumericContext::default();
+    let architecture =
+        gemma4::LayeredModel::<NumericBackend>::new(family.clone(), &context).unwrap();
+    let groups = architecture
+        .parameter_description(&context)
+        .unwrap()
+        .groups()
+        .iter()
+        .map(|owned| owned.group().clone())
+        .collect::<Vec<_>>();
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.runtime_state_layout().unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let text_before = NumericTensor::token_ids(&[0]);
+    let image_tokens = NumericTensor::token_ids(&[5]);
+    let audio_tokens = NumericTensor::token_ids(&[6]);
+    let text_after = NumericTensor::token_ids(&[4]);
+    let patches = NumericTensor::new(
+        [1, 4, 12],
+        (0..48).map(|index| (index as f32 - 24.0) / 100.0).collect(),
+    );
+    let position_ids = NumericTensor::new([1, 4, 2], vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
+    let position_valid = NumericTensor::new([1, 4, 1], vec![1.0; 4]);
+    let vision_mask = NumericTensor::zeros([1, 1, 1, 4]);
+    let grid_extents = [(2, 2)];
+    let audio_features = NumericTensor::new(
+        [1, 4, 128],
+        (0..512)
+            .map(|index| (index as f32 % 17.0 - 8.0) / 100.0)
+            .collect(),
+    );
+    let audio_input_mask = NumericTensor::new([1, 4, 1], vec![1.0; 4]);
+    let audio_first_mask = NumericTensor::new([1, 2, 1, 1], vec![1.0; 2]);
+    let audio_valid = [1];
+    let parts = [
+        gemma4::DecoderInputPart::Text(&text_before),
+        gemma4::DecoderInputPart::Image(&image_tokens),
+        gemma4::DecoderInputPart::Audio(&audio_tokens),
+        gemma4::DecoderInputPart::Text(&text_after),
+    ];
+    let input = || gemma4::ModelInput {
+        parts: &parts,
+        vision: Some(gemma4::VisionInput {
+            patches: &patches,
+            position_ids: &position_ids,
+            position_valid: &position_valid,
+            key_mask: &vision_mask,
+            grid_extents: &grid_extents,
+        }),
+        audio: Some(gemma4::AudioInput {
+            features: &audio_features,
+            input_mask: &audio_input_mask,
+            first_stage_mask: &audio_first_mask,
+            valid_subsampled_frames: &audio_valid,
+        }),
+        per_layer_tokens: None,
+        mask: None,
+    };
+    let expected = expected_runtime
+        .forward(input(), &mut expected_state, &context)
+        .unwrap();
+    assert_eq!(expected.shape, [1, 4, 7]);
+
+    let addresses = [(0, 0), (1, 0), (2, 0), (2, 1)];
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = gemma4::local_geometry(&family, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = gemma4::LayeredModel::<NumericBackend>::new_parallel(
+        family.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let tp1_units = addresses
+        .into_iter()
+        .map(|(group, index)| {
+            <gemma4::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&tp1_architecture, group, index, &tp1_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut tp1_runtime =
+        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(tp1_units));
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_parallel = NumericParallelContext::new(0, NumericParallelGroup::new(1));
+    let tp1_logits = tp1_runtime
+        .forward_parallel(input(), &mut tp1_state, &tp1_parallel, &tp1_context)
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "Gemma4 multimodal TP1 logits");
+    assert_state_exact(
+        &tp1_state,
+        &expected_state,
+        2,
+        "Gemma4 multimodal TP1 state",
+    );
+
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    let collective_group = NumericParallelGroup::new(2);
+    let outputs = std::thread::scope(|scope| {
+        let handles = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, layout)| {
+                let family = family.clone();
+                let text_before = text_before.clone();
+                let image_tokens = image_tokens.clone();
+                let audio_tokens = audio_tokens.clone();
+                let text_after = text_after.clone();
+                let patches = patches.clone();
+                let position_ids = position_ids.clone();
+                let position_valid = position_valid.clone();
+                let vision_mask = vision_mask.clone();
+                let audio_features = audio_features.clone();
+                let audio_input_mask = audio_input_mask.clone();
+                let audio_first_mask = audio_first_mask.clone();
+                let collective_group = Arc::clone(&collective_group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let geometry = gemma4::local_geometry(&family, &layout).unwrap();
+                    let state_layout = geometry.state_layout().clone();
+                    let architecture = gemma4::LayeredModel::<NumericBackend>::new_parallel(
+                        family, geometry, &context,
+                    )
+                    .unwrap();
+                    let units = addresses
+                        .into_iter()
+                        .map(|(group, index)| {
+                            <gemma4::LayeredModel<NumericBackend> as LayeredArchitecture<
+                                NumericBackend,
+                                DeviceState<NumericBackend, NumericHybridLayerState>,
+                            >>::build_unit(
+                                &architecture, group, index, &context
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                    let mut state =
+                        DeviceState::<NumericBackend, _>::create(state_layout, |_, policy| {
+                            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+                        })
+                        .unwrap();
+                    let parallel = NumericParallelContext::new(rank, collective_group);
+                    let grid_extents = [(2, 2)];
+                    let audio_valid = [1];
+                    let parts = [
+                        gemma4::DecoderInputPart::Text(&text_before),
+                        gemma4::DecoderInputPart::Image(&image_tokens),
+                        gemma4::DecoderInputPart::Audio(&audio_tokens),
+                        gemma4::DecoderInputPart::Text(&text_after),
+                    ];
+                    let logits = runtime
+                        .forward_parallel(
+                            gemma4::ModelInput {
+                                parts: &parts,
+                                vision: Some(gemma4::VisionInput {
+                                    patches: &patches,
+                                    position_ids: &position_ids,
+                                    position_valid: &position_valid,
+                                    key_mask: &vision_mask,
+                                    grid_extents: &grid_extents,
+                                }),
+                                audio: Some(gemma4::AudioInput {
+                                    features: &audio_features,
+                                    input_mask: &audio_input_mask,
+                                    first_stage_mask: &audio_first_mask,
+                                    valid_subsampled_frames: &audio_valid,
+                                }),
+                                per_layer_tokens: None,
+                                mask: None,
+                            },
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .unwrap();
+                    (logits, parallel.trace(), state)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for (rank, (logits, trace, state)) in outputs.iter().enumerate() {
+        assert_tensor_close(
+            logits,
+            &expected,
+            &format!("Gemma4 multimodal TP2 rank {rank} logits"),
+        );
+        assert_eq!(state.as_ref()[0].position(), 4);
+        assert_eq!(state.as_ref()[1].position(), 4);
+        assert_eq!(
+            trace.last().unwrap().kind,
+            NumericCollectiveKind::GatherVocabulary
+        );
+        assert_eq!(trace.last().unwrap().output_shape, [1, 4, 7]);
+    }
+}
+
+#[test]
+fn gemma4_external_assistant_draft_traversal_and_rollback_are_backend_neutral() {
+    let config = gemma4::AssistantConfig::from_json(
+        br#"{
+          "model_type":"gemma4_assistant", "backbone_hidden_size":8,
+          "use_ordered_embeddings":false, "tie_word_embeddings":false,
+          "block_size":4,
+          "text_config":{
+            "model_type":"gemma4_text", "hidden_size":8,
+            "num_hidden_layers":2, "intermediate_size":10,
+            "num_attention_heads":2, "num_key_value_heads":2, "head_dim":4,
+            "rms_norm_eps":0.00001, "vocab_size":7,
+            "max_position_embeddings":64, "tie_word_embeddings":false,
+            "attention_k_eq_v":false,
+            "layer_types":["full_attention","sliding_attention"],
+            "sliding_window":4
+          }
+        }"#,
+    )
+    .unwrap();
+    let context = NumericContext::default();
+    let mut assistant = gemma4::Assistant::<NumericBackend>::new(config, &context).unwrap();
+    assert_eq!(assistant.max_proposals(), 3);
+    let shared = std::collections::HashMap::from([
+        (
+            eredu_core::AttentionPolicy::Full,
+            (
+                NumericTensor::zeros([1, 2, 3, 4]),
+                NumericTensor::zeros([1, 2, 3, 4]),
+            ),
+        ),
+        (
+            eredu_core::AttentionPolicy::Sliding {
+                window: std::num::NonZeroU32::new(4).unwrap(),
+            },
+            (
+                NumericTensor::zeros([1, 2, 3, 4]),
+                NumericTensor::zeros([1, 2, 3, 4]),
+            ),
+        ),
+    ]);
+    let hidden = NumericTensor::new([1, 1, 8], (0..8).map(|value| value as f32 / 8.0).collect());
+    let mut canonical = assistant.begin_round(shared, 2, hidden);
+    let first_embedding = NumericTensor::new(
+        [1, 1, 8],
+        (0..8).map(|value| (value + 1) as f32 / 9.0).collect(),
+    );
+    let first = assistant
+        .draft_step::<NumericHybridLayerState>(&first_embedding, &mut canonical, &context)
+        .unwrap();
+    assert_eq!(first.shape, [1, 1, 7]);
+    assert_eq!(canonical.kv_offset, 3);
+    assert_eq!(canonical.hidden.shape, [1, 1, 8]);
+
+    let checkpoint = canonical.clone();
+    let mut transaction = eredu_runtime::DraftStateTransaction::fork(&checkpoint);
+    let second_embedding = NumericTensor::new(
+        [1, 1, 8],
+        (0..8).map(|value| (value + 2) as f32 / 10.0).collect(),
+    );
+    let second = assistant
+        .draft_step::<NumericHybridLayerState>(&second_embedding, transaction.draft_mut(), &context)
+        .unwrap();
+    assert_eq!(second.shape, [1, 1, 7]);
+    assert_eq!(transaction.draft_mut().kv_offset, 4);
+    transaction.rollback(&mut canonical);
+    assert_eq!(canonical.kv_offset, 3);
+    assert_tensor_exact(
+        &canonical.hidden,
+        &checkpoint.hidden,
+        "Gemma assistant rollback",
+    );
+}
+
+#[test]
 fn inkling_fixed_state_and_sparse_decode_are_chunk_invariant() {
     let args = inkling::ModelArgs::from_hf_json(
         br#"{
@@ -5821,6 +7675,2209 @@ fn inkling_fixed_state_and_sparse_decode_are_chunk_invariant() {
     }
 }
 
+fn assert_llama_compatible_tp2_reconstructs_uneven_tied_vocabulary_and_exact_collectives(
+    model_type: &str,
+) {
+    let args = llama::model_args_from_config_value(&serde_json::json!({
+        "model_type": model_type, "hidden_size": 8, "num_hidden_layers": 2,
+        "intermediate_size": 10, "num_attention_heads": 4,
+        "num_key_value_heads": 2, "head_dim": 2, "vocab_size": 7,
+        "max_position_embeddings": 64, "rms_norm_eps": 0.00001,
+        "rope_theta": 10000.0, "tie_word_embeddings": true
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let architecture = llama::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let mut groups = llama::static_parallel_parameter_groups::<NumericBackend>(
+        &architecture.static_modules().embeddings,
+        &architecture.static_modules().norm,
+        architecture.static_modules().lm_head.as_ref(),
+        "model",
+    )
+    .unwrap();
+    for layer in 0..args.num_hidden_layers as usize {
+        let unit = <llama::LayeredModel<NumericBackend> as LayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::build_unit(&architecture, 0, layer, &context)
+        .unwrap();
+        groups.extend(
+            llama::layer_parallel_parameter_groups::<NumericBackend>(&unit, &args, layer).unwrap(),
+        );
+    }
+
+    let units = (0..args.num_hidden_layers as usize)
+        .map(|layer| {
+            <llama::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&architecture, 0, layer, &context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        llama::state_layout(&args).unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+    let tokens = NumericTensor::token_ids(&[0, 4, 6]);
+    let expected = expected_runtime
+        .forward(
+            decoder::LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = llama::local_geometry(&args, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = llama::LayeredModel::<NumericBackend>::new_parallel(
+        args.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let tp1_units = (0..args.num_hidden_layers as usize)
+        .map(|layer| {
+            <llama::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&tp1_architecture, 0, layer, &tp1_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut tp1_runtime =
+        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(tp1_units));
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_parallel = NumericParallelContext::new(0, NumericParallelGroup::new(1));
+    let tp1_logits = tp1_runtime
+        .forward_parallel(
+            decoder::LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut tp1_state,
+            &tp1_parallel,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "Llama TP1 logits");
+    assert_state_exact(&tp1_state, &expected_state, 2, "Llama TP1 state");
+
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        layouts[0]
+            .tensor("model.embed_tokens.weight")
+            .unwrap()
+            .local_shape(),
+        [4, 8]
+    );
+    assert_eq!(
+        layouts[1]
+            .tensor("model.embed_tokens.weight")
+            .unwrap()
+            .local_shape(),
+        [3, 8]
+    );
+    let group = NumericParallelGroup::new(2);
+    let mut outputs = std::thread::scope(|scope| {
+        let handles = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, layout)| {
+                let args = args.clone();
+                let tokens = tokens.clone();
+                let group = Arc::clone(&group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let geometry = llama::local_geometry(&args, &layout).unwrap();
+                    let state_layout = geometry.state_layout().clone();
+                    let architecture = llama::LayeredModel::<NumericBackend>::new_parallel(
+                        args.clone(),
+                        geometry,
+                        &context,
+                    )
+                    .unwrap();
+                    let units = (0..args.num_hidden_layers as usize)
+                        .map(|layer| {
+                            <llama::LayeredModel<NumericBackend> as LayeredArchitecture<
+                                NumericBackend,
+                                DeviceState<NumericBackend, NumericHybridLayerState>,
+                            >>::build_unit(
+                                &architecture, 0, layer, &context
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                    let mut state =
+                        DeviceState::<NumericBackend, _>::create(state_layout, |_, policy| {
+                            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+                        })
+                        .unwrap();
+                    let parallel = NumericParallelContext::new(rank, group);
+                    let logits = runtime
+                        .forward_parallel(
+                            decoder::LayeredInput {
+                                tokens: &tokens,
+                                mask: None,
+                            },
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .unwrap();
+                    (logits, parallel.trace(), state)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    assert_eq!(outputs[0].0.shape, [1, 3, 7]);
+    assert_tensor_close(&outputs[0].0, &expected, "Llama TP2 rank 0 logits");
+    assert_tensor_close(&outputs[1].0, &expected, "Llama TP2 rank 1 logits");
+    assert_eq!(outputs[0].1.len(), outputs[1].1.len());
+    for (left, right) in outputs[0].1.iter().zip(&outputs[1].1) {
+        assert_eq!(left.sequence, right.sequence);
+        assert_eq!(left.kind, right.kind);
+        assert_eq!(left.output_shape, right.output_shape);
+    }
+    assert_eq!(
+        outputs[0]
+            .1
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        [
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::GatherVocabulary,
+        ]
+    );
+    assert_eq!(outputs[0].1.last().unwrap().input_shape, [1, 3, 4]);
+    assert_eq!(outputs[1].1.last().unwrap().input_shape, [1, 3, 3]);
+    assert_eq!(outputs[0].1.last().unwrap().output_shape, [1, 3, 7]);
+    for (_, _, state) in &mut outputs {
+        assert_eq!(state.layer(0).unwrap().position(), 3);
+        assert_eq!(state.layer(1).unwrap().position(), 3);
+    }
+}
+
+#[test]
+fn llama_and_mistral_tp2_reconstruct_uneven_tied_vocabulary_and_exact_collectives() {
+    assert_llama_compatible_tp2_reconstructs_uneven_tied_vocabulary_and_exact_collectives("llama");
+    assert_llama_compatible_tp2_reconstructs_uneven_tied_vocabulary_and_exact_collectives(
+        "mistral",
+    );
+}
+
+fn assert_shared_qwen_tp2(model_type: &str, tied: bool) {
+    let mut value = config(model_type, tied);
+    value["num_hidden_layers"] = 2.into();
+    value["vocab_size"] = 7.into();
+    value["num_attention_heads"] = 4.into();
+    value["num_key_value_heads"] = 2.into();
+    value["head_dim"] = 2.into();
+    value["intermediate_size"] = 10.into();
+    if model_type == "qwen2" {
+        value["use_sliding_window"] = false.into();
+    } else if model_type == "qwen3_moe" {
+        value["intermediate_size"] = 0.into();
+        value["moe_intermediate_size"] = 6.into();
+    }
+    let args = qwen::model_args_from_config_value(&value).unwrap();
+    let context = NumericContext::default();
+    let architecture = qwen::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let mut groups = qwen::static_parallel_parameter_groups::<NumericBackend>(
+        &architecture.static_modules().embeddings,
+        &architecture.static_modules().norm,
+        architecture.static_modules().lm_head.as_ref(),
+        &args.parameter_root,
+    )
+    .unwrap();
+    for layer in 0..args.num_hidden_layers as usize {
+        let unit = <qwen::LayeredModel<NumericBackend> as LayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::build_unit(&architecture, 0, layer, &context)
+        .unwrap();
+        groups.extend(qwen::layer_parallel_parameter_groups(&unit, &args, layer).unwrap());
+    }
+    let units = (0..args.num_hidden_layers as usize)
+        .map(|layer| {
+            <qwen::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&architecture, 0, layer, &context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        qwen::state_layout(&args).unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+    let tokens = NumericTensor::token_ids(&[0, 4, 6]);
+    let expected = expected_runtime
+        .forward(
+            decoder::LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = qwen::local_geometry(&args, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = qwen::LayeredModel::<NumericBackend>::new_parallel(
+        args.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let tp1_units = (0..args.num_hidden_layers as usize)
+        .map(|layer| {
+            <qwen::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&tp1_architecture, 0, layer, &tp1_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut tp1_runtime =
+        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(tp1_units));
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_parallel = NumericParallelContext::new(0, NumericParallelGroup::new(1));
+    let tp1_logits = tp1_runtime
+        .forward_parallel(
+            decoder::LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut tp1_state,
+            &tp1_parallel,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, &format!("{model_type} TP1 logits"));
+    assert_state_exact(
+        &tp1_state,
+        &expected_state,
+        2,
+        &format!("{model_type} TP1 state"),
+    );
+
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    let vocabulary = if tied {
+        format!("{}.embed_tokens.weight", args.parameter_root)
+    } else {
+        "lm_head.weight".into()
+    };
+    assert_eq!(layouts[0].tensor(&vocabulary).unwrap().local_shape()[0], 4);
+    assert_eq!(layouts[1].tensor(&vocabulary).unwrap().local_shape()[0], 3);
+    let collective_group = NumericParallelGroup::new(2);
+    let mut outputs = std::thread::scope(|scope| {
+        let handles = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, layout)| {
+                let args = args.clone();
+                let tokens = tokens.clone();
+                let collective_group = Arc::clone(&collective_group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let geometry = qwen::local_geometry(&args, &layout).unwrap();
+                    let state_layout = geometry.state_layout().clone();
+                    let architecture = qwen::LayeredModel::<NumericBackend>::new_parallel(
+                        args.clone(),
+                        geometry,
+                        &context,
+                    )
+                    .unwrap();
+                    let units = (0..args.num_hidden_layers as usize)
+                        .map(|layer| {
+                            <qwen::LayeredModel<NumericBackend> as LayeredArchitecture<
+                                NumericBackend,
+                                DeviceState<NumericBackend, NumericHybridLayerState>,
+                            >>::build_unit(
+                                &architecture, 0, layer, &context
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                    let mut state =
+                        DeviceState::<NumericBackend, _>::create(state_layout, |_, policy| {
+                            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+                        })
+                        .unwrap();
+                    let parallel = NumericParallelContext::new(rank, collective_group);
+                    let logits = runtime
+                        .forward_parallel(
+                            decoder::LayeredInput {
+                                tokens: &tokens,
+                                mask: None,
+                            },
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .unwrap();
+                    (logits, parallel.trace(), state)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for (rank, (logits, trace, state)) in outputs.iter_mut().enumerate() {
+        assert_tensor_close(
+            logits,
+            &expected,
+            &format!("{model_type} TP2 rank {rank} logits"),
+        );
+        assert_eq!(state.layer(0).unwrap().position(), 3);
+        assert_eq!(state.layer(1).unwrap().position(), 3);
+        assert_eq!(
+            trace.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::GatherVocabulary,
+            ]
+        );
+        assert_eq!(trace.last().unwrap().input_shape[2], 4 - rank as i32);
+        assert_eq!(trace.last().unwrap().output_shape, [1, 3, 7]);
+    }
+}
+
+#[test]
+fn shared_qwen2_qwen3_and_routed_moe_tp2_match_replicated_with_exact_collectives() {
+    assert_shared_qwen_tp2("qwen2", false);
+    assert_shared_qwen_tp2("qwen3", true);
+    assert_shared_qwen_tp2("qwen3_moe", false);
+}
+
+#[test]
+fn deepseek_v3_dense_tp2_matches_replicated_with_uneven_vocabulary() {
+    let args = deepseek::parse_v3_config(&serde_json::json!({
+        "model_type": "deepseek_v3", "hidden_size": 8,
+        "intermediate_size": 10, "moe_intermediate_size": 4,
+        "num_hidden_layers": 2, "num_attention_heads": 4,
+        "vocab_size": 7, "max_position_embeddings": 64,
+        "q_lora_rank": 2, "kv_lora_rank": 2,
+        "qk_nope_head_dim": 2, "qk_rope_head_dim": 2, "v_head_dim": 2,
+        "first_k_dense_replace": 2, "n_routed_experts": 2,
+        "n_shared_experts": 1, "num_experts_per_tok": 1,
+        "n_group": 1, "topk_group": 1, "tie_word_embeddings": false
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let architecture = deepseek::v3::Model::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let mut groups = deepseek::parallel::v3_static_parameter_groups(&args).unwrap();
+    for layer in 0..args.num_hidden_layers as usize {
+        groups.extend(deepseek::parallel::v3_layer_parameter_groups(&args, layer).unwrap());
+    }
+    let units = (0..args.num_hidden_layers as usize)
+        .map(|layer| {
+            <deepseek::v3::Model<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericCompressedCache>,
+            >>::build_unit(&architecture, 0, layer, &context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.runtime_state_layout().unwrap(),
+        |_, _| Ok::<_, Error>(NumericCompressedCache::resident()),
+    )
+    .unwrap();
+    let mut expected_runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+    let tokens = NumericTensor::token_ids(&[0, 4, 6]);
+    let expected = expected_runtime
+        .forward(
+            deepseek::mtp::EmbeddedInput::target(&tokens, None),
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = deepseek::parallel::v3_local_geometry(&args, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = deepseek::v3::Model::<NumericBackend>::new_parallel(
+        args.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let tp1_units = (0..args.num_hidden_layers as usize)
+        .map(|layer| {
+            <deepseek::v3::Model<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericCompressedCache>,
+            >>::build_unit(&tp1_architecture, 0, layer, &tp1_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut tp1_runtime =
+        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(tp1_units));
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, _| {
+        Ok::<_, Error>(NumericCompressedCache::resident())
+    })
+    .unwrap();
+    let tp1_parallel = NumericParallelContext::new(0, NumericParallelGroup::new(1));
+    let tp1_logits = tp1_runtime
+        .forward_parallel(
+            deepseek::mtp::EmbeddedInput::target(&tokens, None),
+            &mut tp1_state,
+            &tp1_parallel,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "DeepSeek-V3 TP1 logits");
+    assert_retained_state_exact(
+        &tp1_state,
+        &expected_state,
+        args.num_hidden_layers as usize,
+        "DeepSeek-V3 TP1 state",
+    );
+    for layer in 0..args.num_hidden_layers as usize {
+        assert_eq!(
+            tp1_state.as_ref()[layer].offset,
+            expected_state.as_ref()[layer].offset,
+            "DeepSeek-V3 TP1 state layer {layer} offset"
+        );
+    }
+
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        layouts[0]
+            .tensor("model.embed_tokens.weight")
+            .unwrap()
+            .local_shape(),
+        [4, 8]
+    );
+    assert_eq!(
+        layouts[1]
+            .tensor("model.embed_tokens.weight")
+            .unwrap()
+            .local_shape(),
+        [3, 8]
+    );
+    let collective_group = NumericParallelGroup::new(2);
+    let outputs = std::thread::scope(|scope| {
+        let handles = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, layout)| {
+                let args = args.clone();
+                let tokens = tokens.clone();
+                let collective_group = Arc::clone(&collective_group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let geometry = deepseek::parallel::v3_local_geometry(&args, &layout).unwrap();
+                    let state_layout = geometry.state_layout().clone();
+                    let architecture = deepseek::v3::Model::<NumericBackend>::new_parallel(
+                        args.clone(),
+                        geometry,
+                        &context,
+                    )
+                    .unwrap();
+                    let units = (0..args.num_hidden_layers as usize)
+                        .map(|layer| {
+                            <deepseek::v3::Model<NumericBackend> as LayeredArchitecture<
+                                NumericBackend,
+                                DeviceState<NumericBackend, NumericCompressedCache>,
+                            >>::build_unit(
+                                &architecture, 0, layer, &context
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                    let mut state =
+                        DeviceState::<NumericBackend, _>::create(state_layout, |_, _| {
+                            Ok::<_, Error>(NumericCompressedCache::resident())
+                        })
+                        .unwrap();
+                    let parallel = NumericParallelContext::new(rank, collective_group);
+                    let logits = runtime
+                        .forward_parallel(
+                            deepseek::mtp::EmbeddedInput::target(&tokens, None),
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .unwrap();
+                    (logits, parallel.trace(), state)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_tensor_close(&outputs[0].0, &expected, "DeepSeek-V3 TP2 rank 0 logits");
+    assert_tensor_close(&outputs[1].0, &expected, "DeepSeek-V3 TP2 rank 1 logits");
+    for (rank, (_, trace, _)) in outputs.iter().enumerate() {
+        assert_eq!(
+            trace.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::GatherVocabulary,
+            ]
+        );
+        assert_eq!(trace.last().unwrap().input_shape, [1, 3, 4 - rank as i32]);
+        assert_eq!(trace.last().unwrap().output_shape, [1, 3, 7]);
+    }
+}
+
+#[test]
+fn deepseek_v4_tp2_matches_replicated_hyper_and_routed_block() {
+    let args = deepseek::parse_v4_config(&serde_json::json!({
+        "model_type": "deepseek_v4", "hidden_size": 4,
+        "moe_intermediate_size": 4, "num_hidden_layers": 1,
+        "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 4,
+        "qk_rope_head_dim": 2, "q_lora_rank": 2,
+        "o_lora_rank": 2, "o_groups": 2, "vocab_size": 7,
+        "max_position_embeddings": 64, "sliding_window": 4,
+        "compress_ratios": [0], "index_n_heads": 2, "index_head_dim": 4,
+        "index_topk": 1, "hc_mult": 2, "hc_sinkhorn_iters": 2,
+        "n_routed_experts": 2, "n_shared_experts": 1,
+        "num_experts_per_tok": 1, "num_hash_layers": 0,
+        "scoring_func": "sqrtsoftplus", "topk_method": "noaux_tc",
+        "norm_topk_prob": true, "routed_scaling_factor": 1.0, "swiglu_limit": 4.0
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let architecture = deepseek::v4::Model::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let mut groups = deepseek::parallel::v4_static_parameter_groups(&args).unwrap();
+    groups.extend(deepseek::parallel::v4_layer_parameter_groups(&args, 0).unwrap());
+    let unit = <deepseek::v4::Model<NumericBackend> as LayeredArchitecture<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericPoolingCache>,
+    >>::build_unit(&architecture, 0, 0, &context)
+    .unwrap();
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.runtime_state_layout().unwrap(),
+        |_, _| Ok::<_, Error>(NumericPoolingCache::new(args.sliding_window, &[])),
+    )
+    .unwrap();
+    let mut expected_runtime =
+        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(vec![unit]));
+    let tokens = NumericTensor::token_ids(&[0, 4, 6]);
+    let expected = expected_runtime
+        .forward(
+            deepseek::mtp::EmbeddedInput::target(&tokens, None),
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = deepseek::parallel::v4_local_geometry(&args, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = deepseek::v4::Model::<NumericBackend>::new_parallel(
+        args.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let tp1_unit = <deepseek::v4::Model<NumericBackend> as LayeredArchitecture<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericPoolingCache>,
+    >>::build_unit(&tp1_architecture, 0, 0, &tp1_context)
+    .unwrap();
+    let mut tp1_runtime =
+        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(vec![tp1_unit]));
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, _| {
+        Ok::<_, Error>(NumericPoolingCache::new(args.sliding_window, &[]))
+    })
+    .unwrap();
+    let tp1_parallel = NumericParallelContext::new(0, NumericParallelGroup::new(1));
+    let tp1_logits = tp1_runtime
+        .forward_parallel(
+            deepseek::mtp::EmbeddedInput::target(&tokens, None),
+            &mut tp1_state,
+            &tp1_parallel,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "DeepSeek-V4 TP1 logits");
+    assert_retained_state_exact(&tp1_state, &expected_state, 1, "DeepSeek-V4 TP1 state");
+    let tp1_cache = &tp1_state.as_ref()[0];
+    let expected_cache = &expected_state.as_ref()[0];
+    assert_eq!(tp1_cache.offset, expected_cache.offset);
+    assert_eq!(
+        tp1_cache.attention_local_tokens,
+        expected_cache.attention_local_tokens
+    );
+    match (&tp1_cache.local, &expected_cache.local) {
+        (Some(actual), Some(expected)) => {
+            assert_tensor_exact(actual, expected, "DeepSeek-V4 TP1 local state")
+        }
+        (None, None) => {}
+        _ => panic!("DeepSeek-V4 TP1 local state presence mismatch"),
+    }
+
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        layouts[0].tensor("embed.weight").unwrap().local_shape(),
+        [4, 4]
+    );
+    assert_eq!(
+        layouts[1].tensor("embed.weight").unwrap().local_shape(),
+        [3, 4]
+    );
+    assert_eq!(
+        layouts[0]
+            .tensor("layers.0.ffn.switch_mlp.gate_up_proj")
+            .unwrap()
+            .local_shape(),
+        [2, 4, 4]
+    );
+    let collective_group = NumericParallelGroup::new(2);
+    let outputs = std::thread::scope(|scope| {
+        let handles = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, layout)| {
+                let args = args.clone();
+                let tokens = tokens.clone();
+                let collective_group = Arc::clone(&collective_group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let geometry = deepseek::parallel::v4_local_geometry(&args, &layout).unwrap();
+                    let state_layout = geometry.state_layout().clone();
+                    let architecture = deepseek::v4::Model::<NumericBackend>::new_parallel(
+                        args.clone(),
+                        geometry,
+                        &context,
+                    )
+                    .unwrap();
+                    let unit = <deepseek::v4::Model<NumericBackend> as LayeredArchitecture<
+                        NumericBackend,
+                        DeviceState<NumericBackend, NumericPoolingCache>,
+                    >>::build_unit(&architecture, 0, 0, &context)
+                    .unwrap();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(vec![unit]));
+                    let mut state =
+                        DeviceState::<NumericBackend, _>::create(state_layout, |_, _| {
+                            Ok::<_, Error>(NumericPoolingCache::new(args.sliding_window, &[]))
+                        })
+                        .unwrap();
+                    let parallel = NumericParallelContext::new(rank, collective_group);
+                    let logits = runtime
+                        .forward_parallel(
+                            deepseek::mtp::EmbeddedInput::target(&tokens, None),
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .unwrap();
+                    (logits, parallel.trace(), state)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_tensor_close(&outputs[0].0, &expected, "DeepSeek-V4 TP2 rank 0 logits");
+    assert_tensor_close(&outputs[1].0, &expected, "DeepSeek-V4 TP2 rank 1 logits");
+    for (_, trace, _) in &outputs {
+        assert_eq!(
+            trace.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::GatherVocabulary,
+            ]
+        );
+        for (sequence, event) in trace.iter().enumerate() {
+            assert_eq!(event.sequence, sequence);
+            assert_eq!(
+                event.output_shape,
+                if sequence == 3 {
+                    vec![1, 3, 7]
+                } else {
+                    vec![1, 3, 4]
+                }
+            );
+        }
+    }
+    assert_eq!(
+        outputs[0].1.last().unwrap().kind,
+        NumericCollectiveKind::GatherVocabulary
+    );
+    assert_eq!(outputs[0].1.last().unwrap().input_shape, [1, 3, 4]);
+    assert_eq!(outputs[1].1.last().unwrap().input_shape, [1, 3, 3]);
+    assert_eq!(outputs[0].1.last().unwrap().output_shape, [1, 3, 7]);
+}
+
+#[test]
+fn gpt_oss_tp2_matches_replicated_with_biased_packed_experts() {
+    let args = gpt_oss::model_args_from_config_value(&serde_json::json!({
+        "model_type": "gpt_oss", "hidden_size": 32,
+        "intermediate_size": 64, "num_hidden_layers": 1,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+        "vocab_size": 7, "num_local_experts": 2, "num_experts_per_tok": 1,
+        "rms_norm_eps": 0.00001, "sliding_window": 4,
+        "max_position_embeddings": 64, "rope_theta": 150000.0,
+        "layer_types": ["full_attention"],
+        "quantization_config": {"quant_method": "mxfp4"}, "swiglu_limit": 7.0
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let architecture =
+        gpt_oss::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let mut groups =
+        gpt_oss::static_parameter_groups(architecture.static_modules(), &args).unwrap();
+    let unit = <gpt_oss::LayeredModel<NumericBackend> as LayeredArchitecture<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    >>::build_unit(&architecture, 0, 0, &context)
+    .unwrap();
+    groups.extend(gpt_oss::layer_parallel_parameter_groups(&unit, &args, 0).unwrap());
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.runtime_state_layout().unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime =
+        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(vec![unit.clone()]));
+    let tokens = NumericTensor::token_ids(&[0, 4, 6]);
+    let expected = expected_runtime
+        .forward(
+            decoder::LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = gpt_oss::local_geometry(&args, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = gpt_oss::LayeredModel::<NumericBackend>::new_parallel(
+        args.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let mut tp1_runtime = ResidentRuntime::new(tp1_architecture, &tp1_context).unwrap();
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_logits = tp1_runtime
+        .forward(
+            decoder::LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut tp1_state,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "GPT-OSS TP1 logits");
+    assert_state_exact(&tp1_state, &expected_state, 1, "GPT-OSS TP1 state");
+
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        layouts[0]
+            .tensor("model.layers.0.mlp.experts.gate_up_proj")
+            .unwrap()
+            .local_shape(),
+        [2, 64, 32]
+    );
+    assert_eq!(
+        layouts[1]
+            .tensor("model.layers.0.mlp.experts.gate_up_proj")
+            .unwrap()
+            .local_shape(),
+        [2, 64, 32]
+    );
+    let expert_input = NumericTensor::new([1, 32], vec![0.25; 32]);
+    let mut global_expert = unit.mlp.clone();
+    let global_routes = global_expert.router.route(&expert_input, &context).unwrap();
+    let global_expert_output = global_expert
+        .experts
+        .forward_routed(&expert_input, &global_routes, &context)
+        .unwrap();
+    let mut partials = layouts
+        .iter()
+        .map(|layout| {
+            let local_context = NumericContext::with_local_layout(layout.clone());
+            let geometry = gpt_oss::local_geometry(&args, layout).unwrap();
+            let architecture = gpt_oss::LayeredModel::<NumericBackend>::new_parallel(
+                args.clone(),
+                geometry,
+                &local_context,
+            )
+            .unwrap();
+            let mut local = <gpt_oss::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&architecture, 0, 0, &local_context)
+            .unwrap();
+            let routes = local
+                .mlp
+                .router
+                .route(&expert_input, &local_context)
+                .unwrap();
+            local
+                .mlp
+                .experts
+                .forward_routed_tensor_parallel(&expert_input, &routes, 2, &local_context)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let expert_reconstructed = partials
+        .remove(0)
+        .reducible
+        .add(&partials[0].reducible, &context)
+        .unwrap()
+        .add(partials[0].post_reduce.as_ref().unwrap(), &context)
+        .unwrap();
+    assert_tensor_close(
+        &expert_reconstructed,
+        &global_expert_output,
+        "GPT-OSS packed expert TP2",
+    );
+    let collective_group = NumericParallelGroup::new(2);
+    let outputs = std::thread::scope(|scope| {
+        let handles = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, layout)| {
+                let args = args.clone();
+                let tokens = tokens.clone();
+                let collective_group = Arc::clone(&collective_group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let geometry = gpt_oss::local_geometry(&args, &layout).unwrap();
+                    let state_layout = geometry.state_layout().clone();
+                    let architecture = gpt_oss::LayeredModel::<NumericBackend>::new_parallel(
+                        args, geometry, &context,
+                    )
+                    .unwrap();
+                    let unit = <gpt_oss::LayeredModel<NumericBackend> as LayeredArchitecture<
+                        NumericBackend,
+                        DeviceState<NumericBackend, NumericHybridLayerState>,
+                    >>::build_unit(&architecture, 0, 0, &context)
+                    .unwrap();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(vec![unit]));
+                    let mut state =
+                        DeviceState::<NumericBackend, _>::create(state_layout, |_, policy| {
+                            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+                        })
+                        .unwrap();
+                    let parallel = NumericParallelContext::new(rank, collective_group);
+                    let logits = runtime
+                        .forward_parallel(
+                            decoder::LayeredInput {
+                                tokens: &tokens,
+                                mask: None,
+                            },
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .unwrap();
+                    (logits, parallel.trace(), state)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_tensor_close(&outputs[0].0, &outputs[1].0, "GPT-OSS TP2 rank agreement");
+    assert_tensor_close(&outputs[0].0, &expected, "GPT-OSS TP2 rank 0 logits");
+    assert_tensor_close(&outputs[1].0, &expected, "GPT-OSS TP2 rank 1 logits");
+    for (rank, (_, trace, _)) in outputs.iter().enumerate() {
+        assert_eq!(
+            trace.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::GatherVocabulary,
+            ]
+        );
+        assert_eq!(trace.last().unwrap().input_shape, [1, 3, 4 - rank as i32]);
+        assert_eq!(trace.last().unwrap().output_shape, [1, 3, 7]);
+    }
+}
+
+#[test]
+fn qwen3_vl_tp2_runs_full_vision_and_text_lifecycle() {
+    let args = qwen::vl::model_args_from_config_value(&serde_json::json!({
+        "model_type": "qwen3_vl", "image_token_id": 5, "video_token_id": 6,
+        "tie_word_embeddings": false,
+        "text_config": {
+            "model_type": "qwen3_vl_text", "hidden_size": 16,
+            "num_hidden_layers": 1, "intermediate_size": 10,
+            "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 8,
+            "rms_norm_eps": 0.000001, "vocab_size": 7,
+            "max_position_embeddings": 64, "rope_theta": 1000000.0,
+            "rope_scaling": {"mrope_section": [1, 1, 2], "mrope_interleaved": true}
+        },
+        "vision_config": {
+            "depth": 1, "hidden_size": 8, "intermediate_size": 10,
+            "num_heads": 2, "num_position_embeddings": 16,
+            "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+            "temporal_patch_size": 2, "out_hidden_size": 16,
+            "deepstack_visual_indexes": []
+        }
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let architecture =
+        qwen::vl::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let static_modules = <qwen::vl::LayeredModel<NumericBackend> as LayeredArchitecture<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    >>::static_modules(&architecture);
+    let mut groups = qwen::static_parallel_parameter_groups::<NumericBackend>(
+        &static_modules.text.embeddings,
+        &static_modules.text.norm,
+        static_modules.text.lm_head.as_ref(),
+        &args.text.parameter_root,
+    )
+    .unwrap();
+    groups.extend(
+        qwen::vision::static_parallel_parameter_groups(
+            &static_modules.vision,
+            &args.vision,
+            "model.visual",
+        )
+        .unwrap(),
+    );
+    let vision_unit = <qwen::vl::LayeredModel<NumericBackend> as LayeredArchitecture<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    >>::build_unit(&architecture, 0, 0, &context)
+    .unwrap();
+    let qwen::vl::Unit::Vision(vision_block) = &vision_unit else {
+        unreachable!()
+    };
+    groups.extend(
+        qwen::vision::block_parallel_parameter_groups(
+            vision_block,
+            &args.vision,
+            "model.visual",
+            0,
+        )
+        .unwrap(),
+    );
+    let text_unit = <qwen::vl::LayeredModel<NumericBackend> as LayeredArchitecture<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+    >>::build_unit(&architecture, 1, 0, &context)
+    .unwrap();
+    let qwen::vl::Unit::Text(text_block) = &text_unit else {
+        unreachable!()
+    };
+    groups.extend(qwen::layer_parallel_parameter_groups(text_block, &args.text, 0).unwrap());
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.runtime_state_layout().unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime = LayerwiseRuntime::new(
+        architecture,
+        ResidentUnitWindow::new(vec![vision_unit, text_unit]),
+    );
+    let text_tokens = NumericTensor::token_ids(&[1, 2]);
+    let image_tokens = NumericTensor::token_ids(&[5]);
+    let grid = [(1, 2, 2)];
+    let pixels = NumericTensor::new(
+        [4, 24],
+        (0..96).map(|index| (index as f32 - 48.0) / 100.0).collect(),
+    );
+    let parts = [
+        qwen::vl::InputPart::Text(&text_tokens),
+        qwen::vl::InputPart::Image {
+            tokens: &image_tokens,
+            grid: &grid,
+        },
+    ];
+    let expected = expected_runtime
+        .forward(
+            qwen::vl::ModelInput {
+                parts: &parts,
+                pixels: Some(&pixels),
+                mask: None,
+            },
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = qwen::vl::local_geometry(&args, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = qwen::vl::LayeredModel::<NumericBackend>::new_parallel(
+        args.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let mut tp1_runtime = ResidentRuntime::new(tp1_architecture, &tp1_context).unwrap();
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_parts = [
+        qwen::vl::InputPart::Text(&text_tokens),
+        qwen::vl::InputPart::Image {
+            tokens: &image_tokens,
+            grid: &grid,
+        },
+    ];
+    let tp1_logits = tp1_runtime
+        .forward(
+            qwen::vl::ModelInput {
+                parts: &tp1_parts,
+                pixels: Some(&pixels),
+                mask: None,
+            },
+            &mut tp1_state,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "Qwen3-VL TP1 logits");
+    assert_state_exact(&tp1_state, &expected_state, 1, "Qwen3-VL TP1 state");
+
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    let collective_group = NumericParallelGroup::new(2);
+    let outputs = std::thread::scope(|scope| {
+        let handles = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, layout)| {
+                let args = args.clone();
+                let text_tokens = text_tokens.clone();
+                let image_tokens = image_tokens.clone();
+                let pixels = pixels.clone();
+                let collective_group = Arc::clone(&collective_group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let geometry = qwen::vl::local_geometry(&args, &layout).unwrap();
+                    let state_layout = geometry.state_layout().clone();
+                    let architecture = qwen::vl::LayeredModel::<NumericBackend>::new_parallel(
+                        args, geometry, &context,
+                    )
+                    .unwrap();
+                    let units = [(0, 0), (1, 0)]
+                        .into_iter()
+                        .map(|(group, index)| {
+                            <qwen::vl::LayeredModel<NumericBackend> as LayeredArchitecture<
+                                NumericBackend,
+                                DeviceState<NumericBackend, NumericHybridLayerState>,
+                            >>::build_unit(
+                                &architecture, group, index, &context
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                    let mut state =
+                        DeviceState::<NumericBackend, _>::create(state_layout, |_, policy| {
+                            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+                        })
+                        .unwrap();
+                    let parallel = NumericParallelContext::new(rank, collective_group);
+                    let grid = [(1, 2, 2)];
+                    let parts = [
+                        qwen::vl::InputPart::Text(&text_tokens),
+                        qwen::vl::InputPart::Image {
+                            tokens: &image_tokens,
+                            grid: &grid,
+                        },
+                    ];
+                    let logits = runtime
+                        .forward_parallel(
+                            qwen::vl::ModelInput {
+                                parts: &parts,
+                                pixels: Some(&pixels),
+                                mask: None,
+                            },
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .unwrap();
+                    (logits, parallel.trace(), state)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_tensor_close(&outputs[0].0, &expected, "Qwen3-VL TP2 rank 0 logits");
+    assert_tensor_close(&outputs[1].0, &expected, "Qwen3-VL TP2 rank 1 logits");
+    for (rank, (_, trace, _)) in outputs.iter().enumerate() {
+        assert_eq!(
+            trace.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::GatherVocabulary,
+            ]
+        );
+        assert_eq!(
+            trace[..6]
+                .iter()
+                .map(|event| event.input_shape.clone())
+                .collect::<Vec<_>>(),
+            [
+                vec![1, 2, 16],
+                vec![4, 8],
+                vec![4, 8],
+                vec![1, 16],
+                vec![1, 3, 16],
+                vec![3, 16],
+            ]
+        );
+        assert!(trace[..6]
+            .iter()
+            .enumerate()
+            .all(|(sequence, event)| event.sequence == sequence
+                && event.output_shape == event.input_shape));
+        assert_eq!(
+            trace.last().unwrap().kind,
+            NumericCollectiveKind::GatherVocabulary
+        );
+        assert_eq!(trace.last().unwrap().input_shape, [1, 3, 4 - rank as i32]);
+        assert_eq!(trace.last().unwrap().output_shape, [1, 3, 7]);
+    }
+}
+
+#[test]
+fn qwen35_conditional_tp2_runs_full_vision_and_text_lifecycle() {
+    let parsed = qwen::hybrid::model_args_from_config_value(&serde_json::json!({
+        "model_type": "qwen3_5", "image_token_id": 5, "video_token_id": 6,
+        "text_config": {
+            "model_type": "qwen3_5_text", "vocab_size": 7, "hidden_size": 8,
+            "num_hidden_layers": 1, "mtp_num_hidden_layers": 0,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 2,
+            "max_position_embeddings": 64, "linear_conv_kernel_dim": 2,
+            "linear_key_head_dim": 2, "linear_value_head_dim": 2,
+            "linear_num_key_heads": 2, "linear_num_value_heads": 2,
+            "intermediate_size": 10, "moe_intermediate_size": 4,
+            "shared_expert_intermediate_size": 4, "num_experts_per_tok": 1,
+            "num_experts": 2, "layer_types": ["full_attention"],
+            "tie_word_embeddings": false
+        },
+        "vision_config": {
+            "depth": 1, "hidden_size": 8, "intermediate_size": 10,
+            "num_heads": 2, "num_position_embeddings": 16,
+            "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
+            "temporal_patch_size": 2, "out_hidden_size": 8
+        }
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let architecture =
+        qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new(parsed.clone(), &context)
+            .unwrap();
+    let static_modules =
+        <qwen::hybrid::ConditionalLayeredModel<NumericBackend> as LayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::static_modules(&architecture);
+    let mut groups = decoder::static_parallel_parameter_groups::<NumericBackend>(
+        &static_modules.text.embeddings,
+        &static_modules.text.norm,
+        static_modules.text.lm_head.as_ref(),
+        "model",
+    )
+    .unwrap();
+    let vision = parsed.vision.as_ref().unwrap();
+    groups.extend(
+        qwen::vision::static_parallel_parameter_groups(
+            &static_modules.vision,
+            vision,
+            "model.visual",
+        )
+        .unwrap(),
+    );
+    let vision_unit =
+        <qwen::hybrid::ConditionalLayeredModel<NumericBackend> as LayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::build_unit(&architecture, 0, 0, &context)
+        .unwrap();
+    let qwen::hybrid::ConditionalUnit::Vision(vision_block) = &vision_unit else {
+        unreachable!()
+    };
+    groups.extend(
+        qwen::vision::block_parallel_parameter_groups(vision_block, vision, "model.visual", 0)
+            .unwrap(),
+    );
+    let target_unit =
+        <qwen::hybrid::ConditionalLayeredModel<NumericBackend> as LayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::build_unit(&architecture, 1, 0, &context)
+        .unwrap();
+    let qwen::hybrid::ConditionalUnit::Target(target_block) = &target_unit else {
+        unreachable!()
+    };
+    let wrapped = qwen::hybrid::Unit::Target(target_block.clone());
+    groups.extend(
+        qwen::hybrid::unit_parallel_parameter_groups(&wrapped, &parsed.text, 0, 0).unwrap(),
+    );
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.runtime_state_layout().unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime = LayerwiseRuntime::new(
+        architecture,
+        ResidentUnitWindow::new(vec![vision_unit, target_unit]),
+    );
+    let text_tokens = NumericTensor::token_ids(&[1, 2]);
+    let image_tokens = NumericTensor::token_ids(&[5]);
+    let grid = [(1, 2, 2)];
+    let pixels = NumericTensor::new(
+        [4, 24],
+        (0..96).map(|index| (index as f32 - 48.0) / 100.0).collect(),
+    );
+    let parts = [
+        qwen::vl::InputPart::Text(&text_tokens),
+        qwen::vl::InputPart::Image {
+            tokens: &image_tokens,
+            grid: &grid,
+        },
+    ];
+    let expected = expected_runtime
+        .forward(
+            qwen::hybrid::ConditionalInput::Target {
+                parts: &parts,
+                pixels: Some(&pixels),
+                mask: None,
+            },
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = qwen::hybrid::conditional_local_geometry(&parsed, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new_parallel(
+        parsed.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let mut tp1_runtime = ResidentRuntime::new(tp1_architecture, &tp1_context).unwrap();
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_parts = [
+        qwen::vl::InputPart::Text(&text_tokens),
+        qwen::vl::InputPart::Image {
+            tokens: &image_tokens,
+            grid: &grid,
+        },
+    ];
+    let tp1_logits = tp1_runtime
+        .forward(
+            qwen::hybrid::ConditionalInput::Target {
+                parts: &tp1_parts,
+                pixels: Some(&pixels),
+                mask: None,
+            },
+            &mut tp1_state,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "Qwen3.5 conditional TP1 logits");
+    assert_state_exact(
+        &tp1_state,
+        &expected_state,
+        1,
+        "Qwen3.5 conditional TP1 state",
+    );
+
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    let collective_group = NumericParallelGroup::new(2);
+    let outputs = std::thread::scope(|scope| {
+        let handles = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, layout)| {
+                let parsed = parsed.clone();
+                let text_tokens = text_tokens.clone();
+                let image_tokens = image_tokens.clone();
+                let pixels = pixels.clone();
+                let collective_group = Arc::clone(&collective_group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let geometry =
+                        qwen::hybrid::conditional_local_geometry(&parsed, &layout).unwrap();
+                    let state_layout = geometry.state_layout().clone();
+                    let architecture =
+                        qwen::hybrid::ConditionalLayeredModel::<NumericBackend>::new_parallel(
+                            parsed, geometry, &context,
+                        )
+                        .unwrap();
+                    let units = [(0, 0), (1, 0)]
+                        .into_iter()
+                        .map(|(group, index)| {
+                            <qwen::hybrid::ConditionalLayeredModel<NumericBackend> as LayeredArchitecture<
+                                NumericBackend,
+                                DeviceState<NumericBackend, NumericHybridLayerState>,
+                            >>::build_unit(&architecture, group, index, &context)
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                    let mut state =
+                        DeviceState::<NumericBackend, _>::create(state_layout, |_, policy| {
+                            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+                        })
+                        .unwrap();
+                    let parallel = NumericParallelContext::new(rank, collective_group);
+                    let grid = [(1, 2, 2)];
+                    let parts = [
+                        qwen::vl::InputPart::Text(&text_tokens),
+                        qwen::vl::InputPart::Image {
+                            tokens: &image_tokens,
+                            grid: &grid,
+                        },
+                    ];
+                    let logits = runtime
+                        .forward_parallel(
+                            qwen::hybrid::ConditionalInput::Target {
+                                parts: &parts,
+                                pixels: Some(&pixels),
+                                mask: None,
+                            },
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .unwrap();
+                    (logits, parallel.trace(), state)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_tensor_close(
+        &outputs[0].0,
+        &expected,
+        "Qwen3.5 conditional TP2 rank 0 logits",
+    );
+    assert_tensor_close(
+        &outputs[1].0,
+        &expected,
+        "Qwen3.5 conditional TP2 rank 1 logits",
+    );
+    for (rank, (_, trace, _)) in outputs.iter().enumerate() {
+        assert_eq!(
+            trace.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::GatherVocabulary,
+            ]
+        );
+        assert_eq!(
+            trace[..6]
+                .iter()
+                .map(|event| event.input_shape.clone())
+                .collect::<Vec<_>>(),
+            [
+                vec![1, 2, 8],
+                vec![4, 8],
+                vec![4, 8],
+                vec![1, 8],
+                vec![1, 3, 8],
+                vec![1, 3, 8],
+            ]
+        );
+        assert!(trace[..6]
+            .iter()
+            .enumerate()
+            .all(|(sequence, event)| event.sequence == sequence
+                && event.output_shape == event.input_shape));
+        assert_eq!(
+            trace.last().unwrap().kind,
+            NumericCollectiveKind::GatherVocabulary
+        );
+        assert_eq!(trace.last().unwrap().input_shape, [1, 3, 4 - rank as i32]);
+        assert_eq!(trace.last().unwrap().output_shape, [1, 3, 7]);
+    }
+}
+
+#[test]
+fn qwen_hybrid_tp2_reconstructs_uneven_untied_vocabulary_and_exact_collectives() {
+    let config = qwen::hybrid::model_args_from_config_value(&serde_json::json!({
+        "model_type": "qwen3_5_text", "vocab_size": 7, "hidden_size": 8,
+        "num_hidden_layers": 2, "mtp_num_hidden_layers": 0,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 2,
+        "max_position_embeddings": 64, "linear_conv_kernel_dim": 2,
+        "linear_key_head_dim": 2, "linear_value_head_dim": 2,
+        "linear_num_key_heads": 2, "linear_num_value_heads": 2,
+        "intermediate_size": 10, "moe_intermediate_size": 4,
+        "shared_expert_intermediate_size": 4, "num_experts_per_tok": 1,
+        "num_experts": 2, "layer_types": ["linear_attention", "full_attention"],
+        "tie_word_embeddings": false
+    }))
+    .unwrap()
+    .text;
+    let context = NumericContext::default();
+    let architecture =
+        qwen::hybrid::LayeredModel::<NumericBackend>::new(config.clone(), &context).unwrap();
+    let mut groups = decoder::static_parallel_parameter_groups::<NumericBackend>(
+        &architecture.static_modules().embeddings,
+        &architecture.static_modules().norm,
+        architecture.static_modules().lm_head.as_ref(),
+        "model",
+    )
+    .unwrap();
+    for layer in 0..config.num_hidden_layers as usize {
+        let unit = <qwen::hybrid::LayeredModel<NumericBackend> as LayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::build_unit(&architecture, 0, layer, &context)
+        .unwrap();
+        groups.extend(
+            qwen::hybrid::unit_parallel_parameter_groups(&unit, &config, 0, layer).unwrap(),
+        );
+    }
+    let units = (0..config.num_hidden_layers as usize)
+        .map(|layer| {
+            <qwen::hybrid::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&architecture, 0, layer, &context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.runtime_state_layout().unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+    let tokens = NumericTensor::token_ids(&[0, 4, 6]);
+    let expected = expected_runtime
+        .forward(
+            qwen::hybrid::EmbeddedInput::Target {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = qwen::hybrid::local_geometry(&config, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = qwen::hybrid::LayeredModel::<NumericBackend>::new_parallel(
+        config.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let tp1_units = (0..config.num_hidden_layers as usize)
+        .map(|layer| {
+            <qwen::hybrid::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&tp1_architecture, 0, layer, &tp1_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut tp1_runtime =
+        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(tp1_units));
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_parallel = NumericParallelContext::new(0, NumericParallelGroup::new(1));
+    let tp1_logits = tp1_runtime
+        .forward_parallel(
+            qwen::hybrid::EmbeddedInput::Target {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut tp1_state,
+            &tp1_parallel,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "Qwen hybrid TP1 logits");
+    assert_state_exact(&tp1_state, &expected_state, 2, "Qwen hybrid TP1 state");
+
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        layouts[0].tensor("lm_head.weight").unwrap().local_shape(),
+        [4, 8]
+    );
+    assert_eq!(
+        layouts[1].tensor("lm_head.weight").unwrap().local_shape(),
+        [3, 8]
+    );
+    let group = NumericParallelGroup::new(2);
+    let mut outputs = std::thread::scope(|scope| {
+        let handles = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, layout)| {
+                let config = config.clone();
+                let tokens = tokens.clone();
+                let group = Arc::clone(&group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let geometry = qwen::hybrid::local_geometry(&config, &layout).unwrap();
+                    let state_layout = geometry.state_layout().clone();
+                    let architecture = qwen::hybrid::LayeredModel::<NumericBackend>::new_parallel(
+                        config.clone(),
+                        geometry,
+                        &context,
+                    )
+                    .unwrap();
+                    let units =
+                        (0..config.num_hidden_layers as usize)
+                            .map(|layer| {
+                                <qwen::hybrid::LayeredModel<NumericBackend> as LayeredArchitecture<
+                                NumericBackend,
+                                DeviceState<NumericBackend, NumericHybridLayerState>,
+                            >>::build_unit(&architecture, 0, layer, &context)
+                            .unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                    let mut state =
+                        DeviceState::<NumericBackend, _>::create(state_layout, |_, policy| {
+                            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+                        })
+                        .unwrap();
+                    let parallel = NumericParallelContext::new(rank, group);
+                    let logits = runtime
+                        .forward_parallel(
+                            qwen::hybrid::EmbeddedInput::Target {
+                                tokens: &tokens,
+                                mask: None,
+                            },
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .unwrap();
+                    (logits, parallel.trace(), state)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    assert_tensor_close(&outputs[0].0, &expected, "Qwen hybrid TP2 rank 0 logits");
+    assert_tensor_close(&outputs[1].0, &expected, "Qwen hybrid TP2 rank 1 logits");
+    assert_eq!(outputs[0].1.len(), outputs[1].1.len());
+    for (left, right) in outputs[0].1.iter().zip(&outputs[1].1) {
+        assert_eq!((left.sequence, left.kind), (right.sequence, right.kind));
+        assert_eq!(left.output_shape, right.output_shape);
+    }
+    assert_eq!(
+        outputs[0]
+            .1
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        [
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::GatherVocabulary,
+        ]
+    );
+    assert_eq!(outputs[0].1.last().unwrap().input_shape, [1, 3, 4]);
+    assert_eq!(outputs[1].1.last().unwrap().input_shape, [1, 3, 3]);
+    assert_eq!(outputs[0].1.last().unwrap().output_shape, [1, 3, 7]);
+    for (_, _, state) in &mut outputs {
+        assert_eq!(state.layer(0).unwrap().position(), 3);
+        assert_eq!(state.layer(1).unwrap().position(), 3);
+    }
+}
+
+#[test]
+fn inkling_tensor_parallel_size_one_matches_replicated_multimodal_graph() {
+    let args = inkling::ModelArgs::from_hf_json(
+        br#"{
+          "model_type":"inkling_mm_model",
+          "text_config":{
+            "hidden_size":8,"num_hidden_layers":2,"vocab_size":19,
+            "num_attention_heads":2,"num_key_value_heads":1,"head_dim":4,
+            "sliding_window_size":4,
+            "layer_types":["sliding_attention","full_attention"],
+            "mlp_layer_types":["dense","dense"],"sconv_kernel_size":3,
+            "d_rel":2,"rel_extent":8,"intermediate_size":12,
+            "dense_intermediate_size":12,"moe_intermediate_size":6,
+            "n_routed_experts":3,"num_experts_per_tok":2,"n_shared_experts":1,
+            "unpadded_vocab_size":19
+          }
+        }"#,
+    )
+    .unwrap();
+    let context = NumericContext::default();
+    let state_layout = inkling::state_layout(&args).unwrap();
+    let make_state = || {
+        DeviceState::<NumericBackend, _>::create(state_layout.clone(), |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .unwrap()
+    };
+
+    let mut replicated = ResidentRuntime::new(
+        inkling::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let mut replicated_state = make_state();
+
+    let tensor = |logical: &str, role, shape: Vec<usize>| {
+        LocalTensorLayout::new(
+            logical,
+            role,
+            shape.clone(),
+            shape,
+            eredu_runtime::TensorPlacement::Replicated,
+            None,
+            None,
+            false,
+        )
+    };
+    let mut layout = LocalModelLayout::default();
+    layout.insert(
+        "model.embed_tokens.weight".into(),
+        tensor("model.embed_tokens", ParameterRole::Vocabulary, vec![19, 8]),
+    );
+    layout.insert(
+        "lm_head.weight".into(),
+        tensor("lm_head", ParameterRole::Vocabulary, vec![19, 8]),
+    );
+    for layer in 0..2 {
+        layout.insert(
+            format!("model.layers.{layer}.self_attn.q_proj.weight"),
+            tensor("query", ParameterRole::AttentionHeads, vec![8, 8]),
+        );
+        layout.insert(
+            format!("model.layers.{layer}.self_attn.k_proj.weight"),
+            tensor("key", ParameterRole::AttentionHeads, vec![4, 8]),
+        );
+    }
+    layout.insert(
+        "model.layers.0.dense.gate_proj.weight".into(),
+        tensor("dense", ParameterRole::FeedForwardIntermediate, vec![12, 8]),
+    );
+    layout.insert(
+        "model.layers.1.dense.gate_proj.weight".into(),
+        tensor("dense", ParameterRole::FeedForwardIntermediate, vec![12, 8]),
+    );
+    let geometry = Arc::new(inkling::local_geometry(&args, &layout).unwrap());
+    let parallel_architecture =
+        inkling::LayeredModel::<NumericBackend>::new_parallel(args, geometry, &context).unwrap();
+    let units = (0..2)
+        .map(|index| {
+            <inkling::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&parallel_architecture, 1, index, &context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut parallel = LayerwiseRuntime::new(parallel_architecture, ResidentUnitWindow::new(units));
+    let mut parallel_state = make_state();
+
+    let tokens = NumericTensor::token_ids(&[1, 2, 3]);
+    let parts = [inkling::DecoderInputPart::Text(&tokens)];
+    let expected = replicated
+        .forward(
+            inkling::ModelInput {
+                parts: &parts,
+                vision_patches: None,
+                audio: None,
+            },
+            &mut replicated_state,
+            &context,
+        )
+        .unwrap();
+    let actual = parallel
+        .forward_parallel(
+            inkling::ModelInput {
+                parts: &parts,
+                vision_patches: None,
+                audio: None,
+            },
+            &mut parallel_state,
+            &NumericParallelContext::new(0, NumericParallelGroup::new(1)),
+            &context,
+        )
+        .unwrap();
+    assert_tensor_exact(&actual, &expected, "Inkling TP1 logits");
+    assert_state_exact(&parallel_state, &replicated_state, 2, "Inkling TP1 state");
+}
+
+#[test]
+fn inkling_tp1_tp2_ordered_vision_audio_text_match_replicated_multimodal_graph() {
+    let args = inkling::ModelArgs::from_hf_json(
+        &serde_json::to_vec(&serde_json::json!({
+          "model_type":"inkling_mm_model", "image_token_id":5, "audio_token_id":6,
+          "text_config":{
+            "hidden_size":8,"num_hidden_layers":2,"vocab_size":7,
+            "num_attention_heads":2,"num_key_value_heads":2,"head_dim":4,
+            "sliding_window_size":4,
+            "layer_types":["sliding_attention","full_attention"],
+            "mlp_layer_types":["dense","dense"],"sconv_kernel_size":3,
+            "d_rel":2,"rel_extent":8,"intermediate_size":10,
+            "dense_intermediate_size":10,"moe_intermediate_size":4,
+            "n_routed_experts":2,"num_experts_per_tok":1,"n_shared_experts":1,
+            "unpadded_vocab_size":7
+          },
+          "audio_config":{"text_hidden_size":8,"num_codebooks":2,"codebook_size":4},
+          "vision_config":{"text_hidden_size":8,"patch_size":40,"temporal_patch_size":2,
+            "num_channels":3,"num_hidden_layers":4}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let context = NumericContext::default();
+    let architecture =
+        inkling::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let mut groups = inkling::static_parameter_groups(&args).unwrap();
+    for layer in 0..2 {
+        groups.extend(inkling::layer_parameter_groups(&args, layer).unwrap());
+    }
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        inkling::state_layout(&args).unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let text_before = NumericTensor::token_ids(&[1]);
+    let image_tokens = NumericTensor::token_ids(&[5]);
+    let audio_tokens = NumericTensor::token_ids(&[6, 6]);
+    let text_after = NumericTensor::token_ids(&[2]);
+    let parts = [
+        inkling::DecoderInputPart::Text(&text_before),
+        inkling::DecoderInputPart::Image(&image_tokens),
+        inkling::DecoderInputPart::Audio(&audio_tokens),
+        inkling::DecoderInputPart::Text(&text_after),
+    ];
+    let patches = NumericTensor::zeros([1, 2, 40, 40, 3]);
+    let audio_codes = NumericTensor::new([1, 3, 2], vec![0.0, 1.0, 2.0, 3.0, 1.0, 0.0]);
+    let expected = expected_runtime
+        .forward(
+            inkling::ModelInput {
+                parts: &parts,
+                vision_patches: Some(&patches),
+                audio: Some(inkling::AudioInput {
+                    code_ids: &audio_codes,
+                    valid_frames: 2,
+                }),
+            },
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = Arc::new(inkling::local_geometry(&args, &tp1_layout).unwrap());
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = inkling::LayeredModel::<NumericBackend>::new_parallel(
+        args.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let tp1_units = [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)]
+        .into_iter()
+        .map(|(group, index)| {
+            <inkling::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&tp1_architecture, group, index, &tp1_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut tp1_runtime =
+        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(tp1_units));
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_logits = tp1_runtime
+        .forward_parallel(
+            inkling::ModelInput {
+                parts: &parts,
+                vision_patches: Some(&patches),
+                audio: Some(inkling::AudioInput {
+                    code_ids: &audio_codes,
+                    valid_frames: 2,
+                }),
+            },
+            &mut tp1_state,
+            &NumericParallelContext::new(0, NumericParallelGroup::new(1)),
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "Inkling multimodal TP1 logits");
+    assert_state_exact(
+        &tp1_state,
+        &expected_state,
+        2,
+        "Inkling multimodal TP1 state",
+    );
+
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    let collective_group = NumericParallelGroup::new(2);
+    let outputs = std::thread::scope(|scope| {
+        let handles = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, layout)| {
+                let args = args.clone();
+                let text_before = text_before.clone();
+                let image_tokens = image_tokens.clone();
+                let audio_tokens = audio_tokens.clone();
+                let text_after = text_after.clone();
+                let patches = patches.clone();
+                let audio_codes = audio_codes.clone();
+                let collective_group = Arc::clone(&collective_group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let geometry = Arc::new(inkling::local_geometry(&args, &layout).unwrap());
+                    let state_layout = geometry.state_layout().clone();
+                    let architecture = inkling::LayeredModel::<NumericBackend>::new_parallel(
+                        args, geometry, &context,
+                    )
+                    .unwrap();
+                    let addresses = [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)];
+                    let units = addresses
+                        .into_iter()
+                        .map(|(group, index)| {
+                            <inkling::LayeredModel<NumericBackend> as LayeredArchitecture<
+                                NumericBackend,
+                                DeviceState<NumericBackend, NumericHybridLayerState>,
+                            >>::build_unit(
+                                &architecture, group, index, &context
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                    let mut state =
+                        DeviceState::<NumericBackend, _>::create(state_layout, |_, policy| {
+                            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+                        })
+                        .unwrap();
+                    let parallel = NumericParallelContext::new(rank, collective_group);
+                    let parts = [
+                        inkling::DecoderInputPart::Text(&text_before),
+                        inkling::DecoderInputPart::Image(&image_tokens),
+                        inkling::DecoderInputPart::Audio(&audio_tokens),
+                        inkling::DecoderInputPart::Text(&text_after),
+                    ];
+                    let logits = runtime
+                        .forward_parallel(
+                            inkling::ModelInput {
+                                parts: &parts,
+                                vision_patches: Some(&patches),
+                                audio: Some(inkling::AudioInput {
+                                    code_ids: &audio_codes,
+                                    valid_frames: 2,
+                                }),
+                            },
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .unwrap();
+                    (logits, parallel.trace())
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_tensor_close(
+        &outputs[0].0,
+        &expected,
+        "Inkling TP2 rank 0 multimodal logits",
+    );
+    assert_tensor_close(
+        &outputs[1].0,
+        &expected,
+        "Inkling TP2 rank 1 multimodal logits",
+    );
+    assert_eq!(outputs[0].1.len(), 7);
+    assert_eq!(outputs[1].1.len(), 7);
+    assert_eq!(
+        outputs[0]
+            .1
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        [
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::GatherVocabulary,
+        ]
+    );
+    assert_eq!(outputs[0].1.last().unwrap().output_shape, [1, 5, 7]);
+}
+
+#[test]
+fn inkling_embedded_mtp_traversal_and_rollback_are_backend_neutral() {
+    let args = inkling::ModelArgs::from_hf_json(
+        &serde_json::to_vec(&serde_json::json!({
+          "model_type":"inkling_mm_model",
+          "text_config":{
+            "hidden_size":8,"num_hidden_layers":2,"vocab_size":7,
+            "num_attention_heads":2,"num_key_value_heads":2,"head_dim":4,
+            "sliding_window_size":4,
+            "layer_types":["sliding_attention","full_attention"],
+            "mlp_layer_types":["dense","dense"],"sconv_kernel_size":3,
+            "d_rel":2,"rel_extent":8,"intermediate_size":10,
+            "dense_intermediate_size":10,"moe_intermediate_size":4,
+            "n_routed_experts":2,"num_experts_per_tok":1,"n_shared_experts":1,
+            "unpadded_vocab_size":7
+          },
+          "mtp_config":{
+            "num_nextn_predict_layers":2,"local_layer_ids":[1],
+            "chain_hidden_post_norm":true
+          }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let context = NumericContext::default();
+    let layout = inkling::mtp_state_layout(&args)
+        .unwrap()
+        .expect("Inkling MTP state layout");
+    let mut model = inkling::LayeredModel::<NumericBackend>::new(args, &context).unwrap();
+    assert_eq!(model.mtp_len(), 2);
+    assert_eq!(model.mtp_policy(0), Some(eredu_core::AttentionPolicy::Full));
+    assert!(model.mtp_policy(1).unwrap().window().is_some());
+    let mut state = DeviceState::<NumericBackend, _>::create(layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let hidden = NumericTensor::new([1, 1, 8], (0..8).map(|value| value as f32 / 8.0).collect());
+    let first_token = NumericTensor::token_ids(&[2]);
+    let first = model
+        .forward_partition_mtp(&hidden, &first_token, 0, state.as_mut(), None, &context)
+        .unwrap();
+    assert_eq!(first.logits.shape, [1, 1, 7]);
+    assert_eq!(first.hidden.shape, [1, 1, 8]);
+    assert_tensor_exact(&first.tokens, &first_token, "Inkling MTP depth-0 tokens");
+    assert_eq!(state.layer(0).unwrap().position(), 1);
+    assert_eq!(state.layer(1).unwrap().position(), 0);
+
+    let checkpoint = state.clone();
+    let mut transaction = eredu_runtime::DraftStateTransaction::fork(&checkpoint);
+    let second_token = NumericTensor::token_ids(&[3]);
+    let second = model
+        .forward_partition_mtp(
+            &first.hidden,
+            &second_token,
+            3,
+            transaction.draft_mut().as_mut(),
+            None,
+            &context,
+        )
+        .unwrap();
+    assert_eq!(second.logits.shape, [1, 1, 7]);
+    assert_tensor_exact(&second.tokens, &second_token, "Inkling MTP cyclic tokens");
+    assert_eq!(transaction.draft_mut().layer(0).unwrap().position(), 1);
+    assert_eq!(transaction.draft_mut().layer(1).unwrap().position(), 1);
+    let mut canonical = checkpoint.clone();
+    transaction.rollback(&mut canonical);
+    assert_eq!(canonical.layer(0).unwrap().position(), 1);
+    assert_eq!(canonical.layer(1).unwrap().position(), 0);
+}
+
+#[test]
+fn real_multimodal_model_matches_resident_and_dense_streamed_traversal() {
+    let args = inkling::ModelArgs::from_hf_json(
+        &serde_json::to_vec(&serde_json::json!({
+          "model_type":"inkling_mm_model", "image_token_id":5,
+          "text_config":{
+            "hidden_size":8,"num_hidden_layers":1,"vocab_size":7,
+            "num_attention_heads":2,"num_key_value_heads":2,"head_dim":4,
+            "sliding_window_size":4, "layer_types":["full_attention"],
+            "mlp_layer_types":["dense"],"sconv_kernel_size":3,
+            "d_rel":2,"rel_extent":8,"intermediate_size":10,
+            "dense_intermediate_size":10,"moe_intermediate_size":4,
+            "n_routed_experts":2,"num_experts_per_tok":1,"n_shared_experts":1,
+            "unpadded_vocab_size":7
+          },
+          "vision_config":{"text_hidden_size":8,"patch_size":40,"temporal_patch_size":2,
+            "num_channels":3,"num_hidden_layers":4}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let context = NumericContext::default();
+    let layout = inkling::state_layout(&args).unwrap();
+    let make_state = || {
+        DeviceState::<NumericBackend, _>::create(layout.clone(), |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .unwrap()
+    };
+    let mut resident_state = make_state();
+    let mut streamed_state = make_state();
+    let mut resident = ResidentRuntime::new(
+        inkling::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let mut streamed = LayerwiseRuntime::new(
+        inkling::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
+        RebuildingUnitPolicy::default(),
+    );
+    let text_tokens = NumericTensor::token_ids(&[1, 2]);
+    let image_tokens = NumericTensor::token_ids(&[5]);
+    let parts = [
+        inkling::DecoderInputPart::Text(&text_tokens),
+        inkling::DecoderInputPart::Image(&image_tokens),
+    ];
+    let patches = NumericTensor::zeros([1, 2, 40, 40, 3]);
+    let input = || inkling::ModelInput {
+        parts: &parts,
+        vision_patches: Some(&patches),
+        audio: None,
+    };
+    let expected = resident
+        .forward(input(), &mut resident_state, &context)
+        .unwrap();
+    let actual = streamed
+        .forward(input(), &mut streamed_state, &context)
+        .unwrap();
+    assert_tensor_close(
+        &actual,
+        &expected,
+        "Inkling resident/dense-stream multimodal logits",
+    );
+    assert_eq!(
+        streamed.policy().events,
+        expected_stream_events(&[(0, 0), (0, 1), (0, 2), (0, 3), (1, 0)])
+    );
+    assert_eq!(streamed_state.layer(0).unwrap().position(), 3);
+    assert_eq!(resident_state.layer(0).unwrap().position(), 3);
+}
+
 #[test]
 fn muse_text_decode_skips_vision_and_is_chunk_invariant() {
     let value = serde_json::json!({
@@ -5904,6 +9961,207 @@ fn muse_text_decode_skips_vision_and_is_chunk_invariant() {
     let actual = NumericTensor::concatenate(&[prefix, decode], 1, &context).unwrap();
     assert_tensor_close(&actual, &expected, "Muse-Glimmer text logits");
     assert_eq!(actual.shape, [1, 3, 24]);
+}
+
+#[test]
+fn muse_glimmer_tp2_ordered_vision_text_matches_replicated_multimodal_graph() {
+    let args = muse_glimmer::DecoderConfig::from_hf_value(&serde_json::json!({
+        "architectures":["MuseGlimmerForConditionalGeneration"],"model_type":"muse_glimmer",
+        "image_token_id":5,"video_token_id":6,"out_hidden_size":32,"projector_hidden_size":8,
+        "text_config":{"model_type":"muse_glimmer_text","hidden_size":8,"num_hidden_layers":2,
+          "intermediate_size":10,"num_attention_heads":2,"num_key_value_heads":2,"head_dim":4,
+          "rms_norm_eps":0.00001,"post_norm_eps":0.00001,"vocab_size":7,
+          "max_position_embeddings":64,"rope_theta":10000.0,
+          "layer_types":["sliding_attention","full_attention"],
+          "layer_rope_theta":[10000.0,0.0],"sliding_window":4,"tie_word_embeddings":false,
+          "hidden_act":"silu","attention_dropout":0.0,"qk_scale_factor":1.0,
+          "output_multiplier":1.0,"final_logit_softcapping":7.0},
+        "vision_config":{"model_type":"muse_glimmer_vision","hidden_size":8,
+          "intermediate_size":10,"num_attention_heads":2,"num_hidden_layers":1,
+          "patch_size":2,"patch_temporal":1,"merge_size":1,"pos_emb_height":2,
+          "pos_emb_width":2,"max_position_embeddings":4,"layer_norm_eps":0.00001,
+          "hidden_act":"gelu","layer_types":["full_attention"],
+          "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}}
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let architecture =
+        muse_glimmer::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let mut groups = muse_glimmer::static_parameter_groups(&args).unwrap();
+    for layer in 0..2 {
+        groups.extend(muse_glimmer::layer_parameter_groups(&args, layer).unwrap());
+    }
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        muse_glimmer::state_layout(&args).unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let text_before = NumericTensor::token_ids(&[0]);
+    let media_tokens = NumericTensor::token_ids(&[5, 5, 5, 5]);
+    let text_after = NumericTensor::token_ids(&[6]);
+    let pixels = NumericTensor::new(
+        [4, 12],
+        (0..48).map(|index| (index as f32 - 24.0) / 100.0).collect(),
+    );
+    let grid = [(1, 2, 2)];
+    let parts = [
+        muse_glimmer::DecoderInputPart::Text(&text_before),
+        muse_glimmer::DecoderInputPart::Media(&media_tokens),
+        muse_glimmer::DecoderInputPart::Text(&text_after),
+    ];
+    let expected = expected_runtime
+        .forward(
+            muse_glimmer::ModelInput {
+                parts: &parts,
+                vision: Some(muse_glimmer::VisionInput {
+                    pixels: &pixels,
+                    grid: &grid,
+                }),
+                mask: None,
+            },
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = muse_glimmer::local_geometry(&args, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = muse_glimmer::LayeredModel::<NumericBackend>::new_parallel(
+        args.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let tp1_units = [(0, 0), (1, 0), (1, 1)]
+        .into_iter()
+        .map(|(group, index)| {
+            <muse_glimmer::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&tp1_architecture, group, index, &tp1_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut tp1_runtime =
+        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(tp1_units));
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_parts = [
+        muse_glimmer::DecoderInputPart::Text(&text_before),
+        muse_glimmer::DecoderInputPart::Media(&media_tokens),
+        muse_glimmer::DecoderInputPart::Text(&text_after),
+    ];
+    let tp1_parallel = NumericParallelContext::new(0, NumericParallelGroup::new(1));
+    let tp1_logits = tp1_runtime
+        .forward_parallel(
+            muse_glimmer::ModelInput {
+                parts: &tp1_parts,
+                vision: Some(muse_glimmer::VisionInput {
+                    pixels: &pixels,
+                    grid: &grid,
+                }),
+                mask: None,
+            },
+            &mut tp1_state,
+            &tp1_parallel,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "Muse-Glimmer TP1 logits");
+    assert_state_exact(&tp1_state, &expected_state, 2, "Muse-Glimmer TP1 state");
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    let collective_group = NumericParallelGroup::new(2);
+    let outputs =
+        std::thread::scope(|scope| {
+            let handles =
+                layouts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, layout)| {
+                        let args = args.clone();
+                        let text_before = text_before.clone();
+                        let media_tokens = media_tokens.clone();
+                        let text_after = text_after.clone();
+                        let pixels = pixels.clone();
+                        let collective_group = Arc::clone(&collective_group);
+                        scope.spawn(move || {
+                            let context = NumericContext::with_local_layout(layout.clone());
+                            let geometry = muse_glimmer::local_geometry(&args, &layout).unwrap();
+                            let state_layout = geometry.state_layout().clone();
+                            let architecture =
+                                muse_glimmer::LayeredModel::<NumericBackend>::new_parallel(
+                                    args, geometry, &context,
+                                )
+                                .unwrap();
+                            let addresses = [(0, 0), (1, 0), (1, 1)];
+                            let units = addresses.into_iter().map(|(group, index)| {
+                    <muse_glimmer::LayeredModel<NumericBackend> as LayeredArchitecture<
+                        NumericBackend,
+                        DeviceState<NumericBackend, NumericHybridLayerState>,
+                    >>::build_unit(&architecture, group, index, &context).unwrap()
+                }).collect::<Vec<_>>();
+                            let mut runtime =
+                                LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                            let mut state = DeviceState::<NumericBackend, _>::create(
+                                state_layout,
+                                |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+                            )
+                            .unwrap();
+                            let parallel = NumericParallelContext::new(rank, collective_group);
+                            let grid = [(1, 2, 2)];
+                            let parts = [
+                                muse_glimmer::DecoderInputPart::Text(&text_before),
+                                muse_glimmer::DecoderInputPart::Media(&media_tokens),
+                                muse_glimmer::DecoderInputPart::Text(&text_after),
+                            ];
+                            let logits = runtime
+                                .forward_parallel(
+                                    muse_glimmer::ModelInput {
+                                        parts: &parts,
+                                        vision: Some(muse_glimmer::VisionInput {
+                                            pixels: &pixels,
+                                            grid: &grid,
+                                        }),
+                                        mask: None,
+                                    },
+                                    &mut state,
+                                    &parallel,
+                                    &context,
+                                )
+                                .unwrap();
+                            (logits, parallel.trace())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+    assert_tensor_close(&outputs[0].0, &expected, "Muse-Glimmer TP2 rank 0 logits");
+    assert_tensor_close(&outputs[1].0, &expected, "Muse-Glimmer TP2 rank 1 logits");
+    assert_eq!(outputs[0].0.shape, [1, 6, 7]);
+    for (_, trace) in &outputs {
+        assert_eq!(trace.len(), 7);
+        assert_eq!(
+            trace.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::Sum,
+                NumericCollectiveKind::GatherVocabulary,
+            ]
+        );
+    }
 }
 
 #[test]
@@ -6196,6 +10454,114 @@ fn reference_router_and_packed_experts_match_analytical_values() {
         .unwrap();
     assert_close(output.data[0], 2.633_574_2);
     assert_close(output.data[1], -0.215_790_8);
+}
+
+#[derive(Default)]
+struct RecordingNumericExpertProvider {
+    calls: Vec<(usize, ExpertPass, Vec<f32>, Vec<f32>)>,
+}
+
+impl RoutedExpertProvider<NumericBackend> for RecordingNumericExpertProvider {
+    type Error = Error;
+
+    fn forward_routed(
+        &mut self,
+        resident_bank: &mut NumericExpertBank,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Self::Error> {
+        self.calls.push((
+            request.layer,
+            request.pass,
+            request.routes.expert_ids.data.clone(),
+            request.routes.route_weights.data.clone(),
+        ));
+        resident_bank.forward_routed(request.input, request.routes, context)
+    }
+
+    fn forward_relu2_routed(
+        &mut self,
+        resident_bank: &mut NumericRelu2ExpertBank,
+        request: RoutedExpertRequest<'_, NumericTensor>,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Self::Error> {
+        resident_bank.forward_routed(request.input, request.routes, context)
+    }
+}
+
+#[test]
+fn external_expert_provider_preserves_route_order_weights_bias_and_telemetry() {
+    let context = NumericContext::default();
+    let mut bank = NumericExpertBank {
+        experts: vec![
+            NumericExpert {
+                gate: NumericTensor::new(vec![1, 2], vec![1.0, 0.0]),
+                gate_bias: Some(NumericTensor::new(vec![1], vec![0.25])),
+                up: NumericTensor::new(vec![1, 2], vec![0.0, 1.0]),
+                up_bias: Some(NumericTensor::new(vec![1], vec![0.5])),
+                down: NumericTensor::new(vec![2, 1], vec![1.0, -2.0]),
+                down_bias: Some(NumericTensor::new(vec![2], vec![3.0, -4.0])),
+            },
+            NumericExpert {
+                gate: NumericTensor::new(vec![1, 2], vec![0.0, 1.0]),
+                gate_bias: Some(NumericTensor::new(vec![1], vec![-0.5])),
+                up: NumericTensor::new(vec![1, 2], vec![1.0, 0.0]),
+                up_bias: Some(NumericTensor::new(vec![1], vec![-0.25])),
+                down: NumericTensor::new(vec![2, 1], vec![-1.5, 0.75]),
+                down_bias: Some(NumericTensor::new(vec![2], vec![-2.0, 5.0])),
+            },
+        ],
+        parameters: Vec::new(),
+        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+    };
+    let input = NumericTensor::new(vec![2, 2], vec![2.0, 1.0, -1.0, 3.0]);
+    let routes = RoutingResult {
+        // Deliberately reverse the route order for the second token. The
+        // provider receives architecture-selected order rather than sorting
+        // by expert identity for its cache acquisition.
+        expert_ids: NumericTensor::new(vec![2, 2], vec![0.0, 1.0, 1.0, 0.0]),
+        selected_scores: NumericTensor::new(vec![2, 2], vec![0.8, 0.2, 0.6, 0.4]),
+        route_weights: NumericTensor::new(vec![2, 2], vec![0.75, 0.25, 0.6, 0.4]),
+    };
+    let mut direct_bank = bank.clone();
+    let expected = direct_bank
+        .forward_routed(&input, &routes, &context)
+        .unwrap();
+
+    let mut provider = RecordingNumericExpertProvider::default();
+    let actual = provider
+        .forward_routed(
+            &mut bank,
+            RoutedExpertRequest {
+                layer: 7,
+                input: &input,
+                routes: &routes,
+                pass: ExpertPass::Prefill,
+            },
+            &context,
+        )
+        .unwrap();
+    assert_tensor_close(&actual, &expected, "external routed expert output");
+    assert_eq!(
+        provider.calls,
+        [(
+            7,
+            ExpertPass::Prefill,
+            vec![0.0, 1.0, 1.0, 0.0],
+            vec![0.75, 0.25, 0.6, 0.4],
+        )]
+    );
+
+    // Down-projection biases are route-weighted exactly once. Removing them
+    // must change the delegated result even though route IDs and weights are
+    // unchanged.
+    for expert in &mut direct_bank.experts {
+        expert.down_bias = None;
+    }
+    let without_bias = direct_bank
+        .forward_routed(&input, &routes, &context)
+        .unwrap();
+    assert_ne!(actual.data, without_bias.data);
 }
 
 #[test]
@@ -6648,12 +11014,266 @@ fn lfm2_mixed_schedule_advances_attention_and_fixed_state_together() {
     }
 }
 
+fn assert_lfm2_tp2_mixed_state_matches_replicated_and_rolls_back_invalid_tokens(sparse: bool) {
+    let mut config = serde_json::json!({
+        "model_type":"lfm2", "vocab_size":7, "hidden_size":8,
+        "intermediate_size":10, "num_hidden_layers":2,
+        "num_attention_heads":4, "num_key_value_heads":2,
+        "max_position_embeddings":32, "layer_types":["conv","full_attention"],
+        "conv_L_cache":3, "block_multiple_of":2,
+        "block_ffn_dim_multiplier":1.0, "block_auto_adjust_ff_dim":true,
+        "tie_word_embeddings":false
+    });
+    if sparse {
+        config["model_type"] = "lfm2_moe".into();
+        config["num_dense_layers"] = 1.into();
+        config["moe_intermediate_size"] = 6.into();
+        config["num_experts"] = 2.into();
+        config["num_experts_per_tok"] = 1.into();
+    }
+    let args = lfm2::model_args_from_config_value(&config).unwrap();
+    let context = NumericContext::default();
+    let architecture = lfm2::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let mut groups = lfm2::static_parallel_parameter_groups(architecture.static_modules()).unwrap();
+    for layer in 0..2 {
+        let unit = <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::build_unit(&architecture, 0, layer, &context)
+        .unwrap();
+        groups.extend(lfm2::layer_parallel_parameter_groups(&unit, &args, layer).unwrap());
+    }
+    let units = (0..2)
+        .map(|layer| {
+            <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&architecture, 0, layer, &context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.runtime_state_layout().unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+    let tokens = NumericTensor::token_ids(&[0, 4, 6]);
+    let expected = expected_runtime
+        .forward(
+            decoder::LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = lfm2::local_geometry(&args, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = lfm2::LayeredModel::<NumericBackend>::new_parallel(
+        args.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let tp1_units = (0..2)
+        .map(|layer| {
+            <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&tp1_architecture, 0, layer, &tp1_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut tp1_runtime =
+        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(tp1_units));
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_parallel = NumericParallelContext::new(0, NumericParallelGroup::new(1));
+    let tp1_logits = tp1_runtime
+        .forward_parallel(
+            decoder::LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut tp1_state,
+            &tp1_parallel,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "LFM2 TP1 logits");
+    assert_state_exact(&tp1_state, &expected_state, 2, "LFM2 TP1 state");
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    let group = NumericParallelGroup::new(2);
+    let mut outputs = std::thread::scope(|scope| {
+        let handles = layouts
+            .into_iter()
+            .enumerate()
+            .map(|(rank, layout)| {
+                let args = args.clone();
+                let tokens = tokens.clone();
+                let group = Arc::clone(&group);
+                scope.spawn(move || {
+                    let context = NumericContext::with_local_layout(layout.clone());
+                    let geometry = lfm2::local_geometry(&args, &layout).unwrap();
+                    let state_layout = geometry.state_layout().clone();
+                    let architecture = lfm2::LayeredModel::<NumericBackend>::new_parallel(
+                        args, geometry, &context,
+                    )
+                    .unwrap();
+                    let units = (0..2)
+                        .map(|layer| {
+                            <lfm2::LayeredModel<NumericBackend> as LayeredArchitecture<
+                                NumericBackend,
+                                DeviceState<NumericBackend, NumericHybridLayerState>,
+                            >>::build_unit(
+                                &architecture, 0, layer, &context
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut runtime =
+                        LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                    let mut state =
+                        DeviceState::<NumericBackend, _>::create(state_layout, |_, policy| {
+                            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+                        })
+                        .unwrap();
+                    let parallel = NumericParallelContext::new(rank, group);
+                    let logits = runtime
+                        .forward_parallel(
+                            decoder::LayeredInput {
+                                tokens: &tokens,
+                                mask: None,
+                            },
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .unwrap();
+                    let positions = [
+                        state.layer(0).unwrap().position(),
+                        state.layer(1).unwrap().position(),
+                    ];
+                    let bad = NumericTensor::token_ids(&[7]);
+                    assert!(runtime
+                        .forward_parallel(
+                            decoder::LayeredInput {
+                                tokens: &bad,
+                                mask: None
+                            },
+                            &mut state,
+                            &parallel,
+                            &context,
+                        )
+                        .is_err());
+                    assert_eq!(
+                        [
+                            state.layer(0).unwrap().position(),
+                            state.layer(1).unwrap().position()
+                        ],
+                        positions,
+                    );
+                    (logits, parallel.trace(), state)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_tensor_close(&outputs[0].0, &expected, "LFM2 TP2 rank 0 logits");
+    assert_tensor_close(&outputs[1].0, &expected, "LFM2 TP2 rank 1 logits");
+    assert_eq!(outputs[0].1.len(), 6);
+    assert_eq!(outputs[1].1.len(), 6);
+    assert_eq!(outputs[0].1.last().unwrap().output_shape, [1, 3, 7]);
+    for (_, _, state) in &mut outputs {
+        assert_eq!(state.layer(0).unwrap().position(), 3);
+        assert_eq!(state.layer(1).unwrap().position(), 3);
+    }
+}
+
+#[test]
+fn lfm2_and_lfm2_moe_tp2_mixed_state_match_replicated_and_rollback_invalid_tokens() {
+    assert_lfm2_tp2_mixed_state_matches_replicated_and_rolls_back_invalid_tokens(false);
+    assert_lfm2_tp2_mixed_state_matches_replicated_and_rolls_back_invalid_tokens(true);
+}
+
 fn assert_tensor_close(actual: &NumericTensor, expected: &NumericTensor, label: &str) {
     assert_eq!(actual.shape, expected.shape, "{label} shape");
     for (index, (actual, expected)) in actual.data.iter().zip(&expected.data).enumerate() {
         assert!(
             (*actual - *expected).abs() <= 2.0e-4,
             "{label}[{index}]: expected {expected}, got {actual}"
+        );
+    }
+}
+
+fn assert_tensor_exact(actual: &NumericTensor, expected: &NumericTensor, label: &str) {
+    assert_eq!(actual.shape, expected.shape, "{label} shape");
+    assert_eq!(actual.data, expected.data, "{label} values");
+}
+
+fn assert_retained_state_exact<S>(
+    actual: &DeviceState<NumericBackend, S>,
+    expected: &DeviceState<NumericBackend, S>,
+    layers: usize,
+    label: &str,
+) where
+    S: RuntimeLayerState<NumericBackend>,
+{
+    for layer in 0..layers {
+        let actual = actual.as_ref().get(layer).unwrap();
+        let expected = expected.as_ref().get(layer).unwrap();
+        let actual_values = RuntimeLayerState::retained_values(actual).collect::<Vec<_>>();
+        let expected_values = RuntimeLayerState::retained_values(expected).collect::<Vec<_>>();
+        assert_eq!(
+            actual_values.len(),
+            expected_values.len(),
+            "{label} layer {layer} retained tensor count"
+        );
+        for (index, (actual, expected)) in
+            actual_values.into_iter().zip(expected_values).enumerate()
+        {
+            assert_tensor_exact(
+                actual,
+                expected,
+                &format!("{label} layer {layer} retained tensor {index}"),
+            );
+        }
+    }
+}
+
+fn assert_state_exact(
+    actual: &DeviceState<NumericBackend, NumericHybridLayerState>,
+    expected: &DeviceState<NumericBackend, NumericHybridLayerState>,
+    layers: usize,
+    label: &str,
+) {
+    assert_retained_state_exact(actual, expected, layers, label);
+    for layer in 0..layers {
+        let actual = &actual.as_ref()[layer];
+        let expected = &expected.as_ref()[layer];
+        assert_eq!(
+            actual.position(),
+            expected.position(),
+            "{label} layer {layer} position"
+        );
+        assert_eq!(
+            actual.fixed_offset, expected.fixed_offset,
+            "{label} layer {layer} fixed offset"
+        );
+        assert_eq!(
+            actual.resets, expected.resets,
+            "{label} layer {layer} reset count"
         );
     }
 }
@@ -6757,6 +11377,208 @@ fn kimi_linear_mixed_kda_mla_prefill_decode_uses_one_heterogeneous_state() {
     }
 }
 
+#[test]
+fn kimi_tp2_kda_mla_matches_replicated_and_rolls_back_invalid_tokens() {
+    let args = kimi_linear::model_args_from_config_value(&serde_json::json!({
+        "model_type":"kimi_linear", "vocab_size":7, "hidden_size":8,
+        "num_hidden_layers":2, "num_attention_heads":2, "num_key_value_heads":2,
+        "intermediate_size":10, "head_dim":4, "model_max_length":64,
+        "linear_attn_config":{
+            "kda_layers":[1], "full_attn_layers":[2], "num_heads":2,
+            "head_dim":4, "short_conv_kernel_size":3
+        },
+        "num_experts":2, "moe_intermediate_size":6, "kv_lora_rank":4,
+        "qk_nope_head_dim":4, "qk_rope_head_dim":2, "v_head_dim":4,
+        "mla_use_nope":true, "num_experts_per_token":1, "num_shared_experts":1,
+        "routed_scaling_factor":1.0, "first_k_dense_replace":1,
+        "num_expert_group":1, "topk_group":1, "tie_word_embeddings":false
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let architecture =
+        kimi_linear::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let mut groups =
+        kimi_linear::static_parallel_parameter_groups(architecture.static_modules()).unwrap();
+    for layer in 0..2 {
+        let unit = <kimi_linear::LayeredModel<NumericBackend> as LayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::build_unit(&architecture, 0, layer, &context)
+        .unwrap();
+        groups.extend(kimi_linear::layer_parallel_parameter_groups(&unit, &args, layer).unwrap());
+    }
+    let units = (0..2)
+        .map(|layer| {
+            <kimi_linear::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&architecture, 0, layer, &context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.runtime_state_layout().unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+    let tokens = NumericTensor::token_ids(&[0, 4, 6]);
+    let expected = expected_runtime
+        .forward(
+            decoder::LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = kimi_linear::local_geometry(&args, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = kimi_linear::LayeredModel::<NumericBackend>::new_parallel(
+        args.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let tp1_units = (0..2)
+        .map(|layer| {
+            <kimi_linear::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&tp1_architecture, 0, layer, &tp1_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut tp1_runtime =
+        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(tp1_units));
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_parallel = NumericParallelContext::new(0, NumericParallelGroup::new(1));
+    let tp1_logits = tp1_runtime
+        .forward_parallel(
+            decoder::LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut tp1_state,
+            &tp1_parallel,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_logits, &expected, "Kimi TP1 logits");
+    assert_state_exact(&tp1_state, &expected_state, 2, "Kimi TP1 state");
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    let group = NumericParallelGroup::new(2);
+    let mut outputs =
+        std::thread::scope(|scope| {
+            let handles =
+                layouts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, layout)| {
+                        let args = args.clone();
+                        let tokens = tokens.clone();
+                        let group = Arc::clone(&group);
+                        scope.spawn(move || {
+                            let context = NumericContext::with_local_layout(layout.clone());
+                            let geometry = kimi_linear::local_geometry(&args, &layout).unwrap();
+                            let state_layout = geometry.state_layout().clone();
+                            let architecture =
+                                kimi_linear::LayeredModel::<NumericBackend>::new_parallel(
+                                    args, geometry, &context,
+                                )
+                                .unwrap();
+                            let units = (0..2).map(|layer| {
+                    <kimi_linear::LayeredModel<NumericBackend> as LayeredArchitecture<
+                        NumericBackend,
+                        DeviceState<NumericBackend, NumericHybridLayerState>,
+                    >>::build_unit(&architecture, 0, layer, &context).unwrap()
+                }).collect::<Vec<_>>();
+                            let mut runtime =
+                                LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                            let mut state = DeviceState::<NumericBackend, _>::create(
+                                state_layout,
+                                |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+                            )
+                            .unwrap();
+                            let parallel = NumericParallelContext::new(rank, group);
+                            let logits = runtime
+                                .forward_parallel(
+                                    decoder::LayeredInput {
+                                        tokens: &tokens,
+                                        mask: None,
+                                    },
+                                    &mut state,
+                                    &parallel,
+                                    &context,
+                                )
+                                .unwrap();
+                            let positions = [
+                                state.layer(0).unwrap().position(),
+                                state.layer(1).unwrap().position(),
+                            ];
+                            let bad = NumericTensor::token_ids(&[7]);
+                            assert!(runtime
+                                .forward_parallel(
+                                    decoder::LayeredInput {
+                                        tokens: &bad,
+                                        mask: None
+                                    },
+                                    &mut state,
+                                    &parallel,
+                                    &context,
+                                )
+                                .is_err());
+                            assert_eq!(
+                                [
+                                    state.layer(0).unwrap().position(),
+                                    state.layer(1).unwrap().position()
+                                ],
+                                positions,
+                            );
+                            (logits, parallel.trace(), state)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+    assert_tensor_close(&outputs[0].0, &expected, "Kimi TP2 rank 0 logits");
+    assert_tensor_close(&outputs[1].0, &expected, "Kimi TP2 rank 1 logits");
+    assert_eq!(outputs[0].1.len(), 7);
+    assert_eq!(outputs[1].1.len(), 7);
+    assert_eq!(
+        outputs[0]
+            .1
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        [
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::Sum,
+            NumericCollectiveKind::GatherVocabulary,
+        ]
+    );
+    assert_eq!(outputs[0].1.last().unwrap().output_shape, [1, 3, 7]);
+    for (_, _, state) in &mut outputs {
+        assert_eq!(state.layer(0).unwrap().position(), 3);
+        assert_eq!(state.layer(1).unwrap().position(), 3);
+    }
+}
+
 #[derive(Default)]
 struct TypedRelu2ProviderProbe {
     replicated_calls: usize,
@@ -6816,24 +11638,55 @@ fn nemotron_h_relu2_provider_uses_typed_tensor_parallel_results() {
         "n_group":2, "topk_group":1, "tie_word_embeddings":false
     }))
     .unwrap();
-    let context = NumericContext::default();
-    let mut moe = nemotron_h::SparseMoe::<NumericBackend>::new(
-        &args,
-        0,
-        args.moe_intermediate_size,
-        args.moe_shared_expert_intermediate_size,
-        &context,
-    )
-    .unwrap();
     let input = NumericTensor::new([1, args.hidden_size], vec![0.25; args.hidden_size as usize]);
-    let mut provider = TypedRelu2ProviderProbe::default();
-    let output = moe
-        .forward_parallel_with_provider(&input, ExpertPass::Decode, &(), &context, &mut provider)
-        .unwrap();
-
-    assert_eq!(output.shape, input.shape);
-    assert_eq!(provider.replicated_calls, 0);
-    assert_eq!(provider.tensor_parallel_partitions, [2]);
+    let collective_group = NumericParallelGroup::new(2);
+    let outputs = std::thread::scope(|scope| {
+        let handles = (0..2)
+            .map(|rank| {
+                let args = args.clone();
+                let input = input.clone();
+                let collective_group = Arc::clone(&collective_group);
+                scope.spawn(move || {
+                    let context = NumericContext::default();
+                    let mut moe = nemotron_h::SparseMoe::<NumericBackend>::new(
+                        &args,
+                        0,
+                        args.moe_intermediate_size,
+                        args.moe_shared_expert_intermediate_size,
+                        &context,
+                    )
+                    .unwrap();
+                    let mut provider = TypedRelu2ProviderProbe::default();
+                    let parallel = NumericParallelContext::new(rank, collective_group);
+                    let output = moe
+                        .forward_parallel_with_provider(
+                            &input,
+                            ExpertPass::Decode,
+                            &parallel,
+                            &context,
+                            &mut provider,
+                        )
+                        .unwrap();
+                    (output, provider, parallel.trace())
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_tensor_close(&outputs[0].0, &outputs[1].0, "TP+EP provider output");
+    for (output, provider, trace) in outputs {
+        assert_eq!(output.shape, input.shape);
+        assert_eq!(provider.replicated_calls, 0);
+        assert_eq!(provider.tensor_parallel_partitions, [2]);
+        assert_eq!(
+            trace.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [NumericCollectiveKind::Sum, NumericCollectiveKind::Sum]
+        );
+        assert!(trace.iter().all(|event| event.input_shape == input.shape));
+    }
 }
 
 #[test]
@@ -6948,6 +11801,317 @@ fn nemotron_h_chunked_target_and_mtp_transactions_are_backend_neutral() {
             expected_position
         );
     }
+}
+
+#[test]
+fn real_prediction_graph_matches_resident_and_dense_streamed_traversal() {
+    let args = nemotron_h::model_args_from_config_value(&serde_json::json!({
+        "model_type":"nemotron_h", "vocab_size":7, "hidden_size":8,
+        "intermediate_size":10, "num_hidden_layers":1,
+        "hybrid_override_pattern":"*", "num_attention_heads":2,
+        "num_key_value_heads":2, "head_dim":4, "mamba_num_heads":2,
+        "n_groups":2, "mamba_head_dim":4, "ssm_state_size":2,
+        "conv_kernel":3, "chunk_size":2, "n_routed_experts":2,
+        "n_shared_experts":1, "moe_intermediate_size":4,
+        "moe_shared_expert_intermediate_size":4, "num_experts_per_tok":1,
+        "n_group":1, "topk_group":1, "num_nextn_predict_layers":1,
+        "mtp_hybrid_override_pattern":"*", "tie_word_embeddings":false
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let layout = nemotron_h::state_layout(&args).unwrap();
+    let make_state = || {
+        DeviceState::<NumericBackend, _>::create(layout.clone(), |_, policy| {
+            Ok::<_, Error>(NumericHybridLayerState::new(policy))
+        })
+        .unwrap()
+    };
+    let mut resident_state = make_state();
+    let mut streamed_state = make_state();
+    let mut resident = ResidentRuntime::new(
+        nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let mut streamed = LayerwiseRuntime::new(
+        nemotron_h::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
+        RebuildingUnitPolicy::default(),
+    );
+    let target_tokens = NumericTensor::token_ids(&[1, 4, 2]);
+    let (resident_target, resident_forward) = resident
+        .forward_with_context(
+            nemotron_h::EmbeddedInput::target(&target_tokens, None),
+            &mut resident_state,
+            &context,
+        )
+        .unwrap();
+    let (streamed_target, streamed_forward) = streamed
+        .forward_with_context_hook(
+            nemotron_h::EmbeddedInput::target(&target_tokens, None),
+            &mut streamed_state,
+            &context,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+    assert_tensor_close(
+        &streamed_target,
+        &resident_target,
+        "Nemotron target resident/dense-stream logits",
+    );
+    assert_eq!(streamed.policy().events, expected_stream_events(&[(0, 0)]));
+    assert_eq!(resident_state.layer(0).unwrap().position(), 3);
+    assert_eq!(streamed_state.layer(0).unwrap().position(), 3);
+    assert_eq!(resident_state.layer(1).unwrap().position(), 0);
+    assert_eq!(streamed_state.layer(1).unwrap().position(), 0);
+
+    let resident_prior = resident_forward
+        .target_capture()
+        .unwrap()
+        .axis_slice(1, 2, 3);
+    let streamed_prior = streamed_forward
+        .target_capture()
+        .unwrap()
+        .axis_slice(1, 2, 3);
+    assert_tensor_close(
+        &streamed_prior,
+        &resident_prior,
+        "Nemotron target capture resident/dense-stream",
+    );
+    let draft_token = NumericTensor::token_ids(&[3]);
+    let resident_draft = resident
+        .forward(
+            nemotron_h::EmbeddedInput::draft(&draft_token, &resident_prior, 0),
+            &mut resident_state,
+            &context,
+        )
+        .unwrap();
+    let streamed_draft = streamed
+        .forward(
+            nemotron_h::EmbeddedInput::draft(&draft_token, &streamed_prior, 0),
+            &mut streamed_state,
+            &context,
+        )
+        .unwrap();
+    assert_tensor_close(
+        &streamed_draft,
+        &resident_draft,
+        "Nemotron prediction resident/dense-stream logits",
+    );
+    let mut events = expected_stream_events(&[(0, 0)]);
+    events.extend([
+        StreamPolicyEvent::Begin,
+        StreamPolicyEvent::Acquire(1, 1, 0),
+        StreamPolicyEvent::Complete(1, 1, 0),
+        StreamPolicyEvent::Finish,
+    ]);
+    assert_eq!(streamed.policy().events, events);
+    assert_eq!(resident_state.layer(0).unwrap().position(), 3);
+    assert_eq!(streamed_state.layer(0).unwrap().position(), 3);
+    assert_eq!(resident_state.layer(1).unwrap().position(), 1);
+    assert_eq!(streamed_state.layer(1).unwrap().position(), 1);
+}
+
+#[test]
+fn nemotron_tp2_target_mtp_matches_replicated_and_rolls_back_draft_state() {
+    let args = nemotron_h::model_args_from_config_value(&serde_json::json!({
+        "model_type":"nemotron_h", "vocab_size":7, "hidden_size":8,
+        "intermediate_size":10, "num_hidden_layers":3,
+        "hybrid_override_pattern":"M*-", "num_attention_heads":2,
+        "num_key_value_heads":2, "head_dim":4, "mamba_num_heads":2,
+        "n_groups":2, "mamba_head_dim":4, "ssm_state_size":2,
+        "conv_kernel":3, "chunk_size":2, "n_routed_experts":2,
+        "n_shared_experts":1, "moe_intermediate_size":4,
+        "moe_shared_expert_intermediate_size":4, "num_experts_per_tok":1,
+        "n_group":1, "topk_group":1, "num_nextn_predict_layers":1,
+        "mtp_hybrid_override_pattern":"*", "tie_word_embeddings":false
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let architecture =
+        nemotron_h::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap();
+    let mut groups =
+        nemotron_h::static_parallel_parameter_groups(architecture.static_modules()).unwrap();
+    let addresses = [(0, 0), (0, 1), (0, 2), (1, 0)];
+    for (flat, (group, index)) in addresses.iter().copied().enumerate() {
+        let unit = <nemotron_h::LayeredModel<NumericBackend> as LayeredArchitecture<
+            NumericBackend,
+            DeviceState<NumericBackend, NumericHybridLayerState>,
+        >>::build_unit(&architecture, group, index, &context)
+        .unwrap();
+        groups.extend(nemotron_h::unit_parallel_parameter_groups(&unit, &args, flat).unwrap());
+    }
+    let mut expected_state = DeviceState::<NumericBackend, _>::create(
+        architecture.runtime_state_layout().unwrap(),
+        |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+    )
+    .unwrap();
+    let mut expected_runtime = ResidentRuntime::new(architecture, &context).unwrap();
+    let tokens = NumericTensor::token_ids(&[0, 4, 6]);
+    let (expected_target, expected_forward) = expected_runtime
+        .forward_with_context(
+            nemotron_h::EmbeddedInput::target(&tokens, None),
+            &mut expected_state,
+            &context,
+        )
+        .unwrap();
+    let prior = expected_forward
+        .target_capture()
+        .unwrap()
+        .axis_slice(1, 2, 3);
+    let draft_token = NumericTensor::token_ids(&[3]);
+    let mut expected_draft_state = eredu_runtime::DraftStateTransaction::fork(&expected_state);
+    let expected_draft = expected_runtime
+        .forward(
+            nemotron_h::EmbeddedInput::draft(&draft_token, &prior, 0),
+            expected_draft_state.draft_mut(),
+            &context,
+        )
+        .unwrap();
+
+    let tp1_layout = numeric_local_layout(&groups, 1, 0).unwrap();
+    let tp1_context = NumericContext::with_local_layout(tp1_layout.clone());
+    let tp1_geometry = nemotron_h::local_geometry(&args, &tp1_layout).unwrap();
+    let tp1_state_layout = tp1_geometry.state_layout().clone();
+    let tp1_architecture = nemotron_h::LayeredModel::<NumericBackend>::new_parallel(
+        args.clone(),
+        tp1_geometry,
+        &tp1_context,
+    )
+    .unwrap();
+    let tp1_units = addresses
+        .iter()
+        .copied()
+        .map(|(group, index)| {
+            <nemotron_h::LayeredModel<NumericBackend> as LayeredArchitecture<
+                NumericBackend,
+                DeviceState<NumericBackend, NumericHybridLayerState>,
+            >>::build_unit(&tp1_architecture, group, index, &tp1_context)
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut tp1_runtime =
+        LayerwiseRuntime::new(tp1_architecture, ResidentUnitWindow::new(tp1_units));
+    let mut tp1_state = DeviceState::<NumericBackend, _>::create(tp1_state_layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let tp1_parallel = NumericParallelContext::new(0, NumericParallelGroup::new(1));
+    let (tp1_target, tp1_forward) = tp1_runtime
+        .forward_parallel_with_context_hook(
+            nemotron_h::EmbeddedInput::target(&tokens, None),
+            &mut tp1_state,
+            &tp1_parallel,
+            &tp1_context,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_target, &expected_target, "Nemotron TP1 target logits");
+    assert_state_exact(&tp1_state, &expected_state, 4, "Nemotron TP1 target state");
+    let tp1_prior = tp1_forward.target_capture().unwrap().axis_slice(1, 2, 3);
+    let mut tp1_draft_state = eredu_runtime::DraftStateTransaction::fork(&tp1_state);
+    let tp1_draft = tp1_runtime
+        .forward_parallel(
+            nemotron_h::EmbeddedInput::draft(&draft_token, &tp1_prior, 0),
+            tp1_draft_state.draft_mut(),
+            &tp1_parallel,
+            &tp1_context,
+        )
+        .unwrap();
+    assert_tensor_exact(&tp1_draft, &expected_draft, "Nemotron TP1 draft logits");
+    assert_state_exact(
+        tp1_draft_state.draft_mut(),
+        expected_draft_state.draft_mut(),
+        4,
+        "Nemotron TP1 draft state",
+    );
+
+    let layouts = (0..2)
+        .map(|rank| numeric_local_layout(&groups, 2, rank).unwrap())
+        .collect::<Vec<_>>();
+    let collective_group = NumericParallelGroup::new(2);
+    let outputs =
+        std::thread::scope(|scope| {
+            let handles =
+                layouts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, layout)| {
+                        let args = args.clone();
+                        let tokens = tokens.clone();
+                        let draft_token = draft_token.clone();
+                        let collective_group = Arc::clone(&collective_group);
+                        scope.spawn(move || {
+                            let context = NumericContext::with_local_layout(layout.clone());
+                            let geometry = nemotron_h::local_geometry(&args, &layout).unwrap();
+                            let state_layout = geometry.state_layout().clone();
+                            let architecture =
+                                nemotron_h::LayeredModel::<NumericBackend>::new_parallel(
+                                    args, geometry, &context,
+                                )
+                                .unwrap();
+                            let units = addresses.iter().copied().map(|(group, index)| {
+                    <nemotron_h::LayeredModel<NumericBackend> as LayeredArchitecture<
+                        NumericBackend,
+                        DeviceState<NumericBackend, NumericHybridLayerState>,
+                    >>::build_unit(&architecture, group, index, &context).unwrap()
+                }).collect::<Vec<_>>();
+                            let mut runtime =
+                                LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+                            let mut state = DeviceState::<NumericBackend, _>::create(
+                                state_layout,
+                                |_, policy| Ok::<_, Error>(NumericHybridLayerState::new(policy)),
+                            )
+                            .unwrap();
+                            let parallel = NumericParallelContext::new(rank, collective_group);
+                            let (target, forward) = runtime
+                                .forward_parallel_with_context_hook(
+                                    nemotron_h::EmbeddedInput::target(&tokens, None),
+                                    &mut state,
+                                    &parallel,
+                                    &context,
+                                    |_, _, _| Ok(()),
+                                )
+                                .unwrap();
+                            let prior = forward.target_capture().unwrap().axis_slice(1, 2, 3);
+                            let checkpoint = state.clone();
+                            let mut transaction =
+                                eredu_runtime::DraftStateTransaction::fork(&checkpoint);
+                            let draft = runtime
+                                .forward_parallel(
+                                    nemotron_h::EmbeddedInput::draft(&draft_token, &prior, 0),
+                                    transaction.draft_mut(),
+                                    &parallel,
+                                    &context,
+                                )
+                                .unwrap();
+                            assert_eq!(transaction.draft_mut().layer(3).unwrap().position(), 1);
+                            let mut canonical = checkpoint.clone();
+                            transaction.rollback(&mut canonical);
+                            assert_eq!(canonical.layer(3).unwrap().position(), 0);
+                            (target, draft, parallel.trace(), canonical)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+    for (rank, (target, draft, trace, _)) in outputs.iter().enumerate() {
+        assert_tensor_close(
+            target,
+            &expected_target,
+            &format!("Nemotron TP2 rank {rank} target"),
+        );
+        assert_tensor_close(
+            draft,
+            &expected_draft,
+            &format!("Nemotron TP2 rank {rank} draft"),
+        );
+        assert_eq!(trace.last().unwrap().output_shape, [1, 1, 7]);
+    }
+    assert_eq!(outputs[0].2.len(), 8);
+    assert_eq!(outputs[1].2.len(), 8);
 }
 
 #[test]

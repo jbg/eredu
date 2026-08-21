@@ -8,13 +8,11 @@ use std::{
 
 use eredu_architectures::kimi_linear::{Block, LayeredModel, ModelArgs};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, WeightQuantization};
-use eredu_nn::{ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized};
 use eredu_runtime::{
     ActivationObserver, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionGraph,
-    ExecutionUnitLayout, ExpertIdentity, LayerWeightResidency, LayeredArchitecture,
-    LayeredForwardState, LayerwiseModelMetadata, LayerwiseRuntime, OffloadUnit, PagedCacheOptions,
-    ParallelLayeredArchitecture, ParallelModelInfo, ResidencyReport, StaticUnitBindings,
-    WeightBinding, WeightResidency,
+    ExecutionUnitLayout, ExpertIdentity, LayerWeightResidency, LayerwiseModelMetadata,
+    LayerwiseRuntime, OffloadUnit, PagedCacheOptions, ParallelModelInfo, ResidencyReport,
+    StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -25,10 +23,7 @@ use safemlx::{
 use crate::{
     backend::mlx::{
         error::Error,
-        nn::{
-            parallel::{VocabParallelEmbedding, VocabParallelLmHead},
-            shared::{MlxBackend, MlxModule, MlxNamedModule},
-        },
+        nn::shared::{MlxBackend, MlxModule},
         runtime::{
             cache::{
                 residency::{
@@ -50,7 +45,7 @@ use crate::{
             execution::{
                 generic::{
                     prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
-                    MlxUnitFactory,
+                    MlxUnitPopulator,
                 },
                 layerwise::{
                     open_safetensors_weight_store, quantize_parameterized_store,
@@ -84,19 +79,19 @@ type BoundedRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxBackend,
     MlxHybridState,
-    MlxLayerwisePolicy<NeutralBlock, KimiLinearUnitFactory>,
+    MlxLayerwisePolicy<NeutralBlock, KimiLinearUnitPopulator>,
 >;
 type ParallelResidentRuntime = LayerwiseRuntime<
-    KimiLinearParallelComposition,
+    NeutralArchitecture,
     MlxBackend,
     MlxHybridState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type ParallelBoundedRuntime = LayerwiseRuntime<
-    KimiLinearParallelComposition,
+    NeutralArchitecture,
     MlxBackend,
     MlxHybridState,
-    MlxLayerwisePolicy<NeutralBlock, KimiLinearParallelUnitFactory>,
+    MlxLayerwisePolicy<NeutralBlock, KimiLinearParallelUnitPopulator>,
 >;
 
 #[derive(eredu_nn::Parameterized)]
@@ -155,58 +150,54 @@ impl eredu_runtime::ActivationObserver<Array, eredu_nn::Error> for NeutralKimiLi
 }
 
 #[derive(Clone)]
-struct KimiLinearUnitFactory {
-    args: ModelArgs,
+struct KimiLinearUnitPopulator {
     external_experts: bool,
 }
 
 /// Pipeline/loading adapter over the same neutral Kimi Linear blocks used by resident
 /// and bounded execution.
-pub(crate) struct KimiLinearPipelineAdapter {
-    args: ModelArgs,
-    static_modules: eredu_architectures::decoder::StaticModules<MlxBackend>,
+pub(crate) struct KimiLinearBindings {
     external_experts: bool,
 }
 
-impl KimiLinearPipelineAdapter {
-    pub(crate) fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
-        let architecture = NeutralArchitecture::new(args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        Ok(Self {
-            args,
-            static_modules: architecture.static_modules().clone(),
+impl KimiLinearBindings {
+    pub(crate) const fn new() -> Self {
+        Self {
             external_experts: false,
-        })
+        }
     }
 
-    pub(crate) fn new_external_experts(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
-        let mut adapter = Self::new(args, stream)?;
-        adapter.external_experts = true;
-        Ok(adapter)
+    pub(crate) const fn new_external_experts() -> Self {
+        Self {
+            external_experts: true,
+        }
     }
 
-    pub(crate) fn model_type(&self) -> &str {
-        &self.args.model_type
+    pub(crate) fn model_type<'a>(&self, architecture: &'a NeutralArchitecture) -> &'a str {
+        &architecture.args().model_type
     }
 
     pub(crate) fn static_units(
         &self,
+        architecture: &NeutralArchitecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(store, &|_| true)
+        self.selected_static_units(architecture, store, &|_| true)
     }
 
     pub(crate) fn selected_static_units(
         &self,
+        architecture: &NeutralArchitecture,
         store: &dyn CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
+        let static_modules = architecture.static_modules();
         let mut units = Vec::new();
         if select("kimi_linear.static.embedding") {
             units.push(StaticUnitBindings::new(
                 "kimi_linear.static.embedding",
                 build_module_bindings(
-                    &MlxModule::new(self.static_modules.embeddings.clone()),
+                    &MlxModule::new(static_modules.embeddings.clone()),
                     "",
                     store,
                 )?,
@@ -215,15 +206,11 @@ impl KimiLinearPipelineAdapter {
         if select("kimi_linear.static.norm") {
             units.push(StaticUnitBindings::new(
                 "kimi_linear.static.norm",
-                build_module_bindings(
-                    &MlxModule::new(self.static_modules.norm.clone()),
-                    "",
-                    store,
-                )?,
+                build_module_bindings(&MlxModule::new(static_modules.norm.clone()), "", store)?,
             )?);
         }
         if select("kimi_linear.static.output") {
-            if let Some(head) = &self.static_modules.lm_head {
+            if let Some(head) = &static_modules.lm_head {
                 units.push(StaticUnitBindings::new(
                     "kimi_linear.static.output",
                     build_module_bindings(&MlxModule::new(head.clone()), "", store)?,
@@ -233,37 +220,27 @@ impl KimiLinearPipelineAdapter {
         Ok(units)
     }
 
-    pub(crate) fn layer_count(&self, group: usize) -> Result<usize, Error> {
-        if group == 0 {
-            Ok(self.args.num_hidden_layers as usize)
-        } else {
-            Err(Error::Parallel(format!(
-                "Kimi Linear has no execution group {group}"
-            )))
-        }
-    }
-
-    pub(crate) fn new_layer(
+    pub(crate) fn layer_count(
         &self,
+        architecture: &NeutralArchitecture,
         group: usize,
-        index: usize,
-        stream: &Stream,
-    ) -> Result<MlxModule<NeutralBlock>, Error> {
-        self.layer_count(group)?;
-        Ok(MlxModule::new(
-            Block::new(&self.args, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-        ))
+    ) -> Result<usize, Error> {
+        <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
+            MlxBackend,
+            MlxHybridState,
+        >>::group_unit_count(architecture, group)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 
     pub(crate) fn layer_bindings(
         &self,
+        architecture: &NeutralArchitecture,
         _group: usize,
         index: usize,
         layer: &MlxModule<NeutralBlock>,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let recipes = unit_recipes(store, &self.args, index, !self.external_experts)?;
+        let recipes = unit_recipes(store, architecture.args(), index, !self.external_experts)?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
             self.external_experts && name.contains(".mlp.experts.")
         })
@@ -276,85 +253,41 @@ impl KimiLinearPipelineAdapter {
 
     pub(crate) fn expert_parallel_assignment(
         &self,
+        architecture: &NeutralArchitecture,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
     {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
         }
-        if !self.args.has_sparse_moe_layers() {
+        let args = architecture.args();
+        if !args.has_sparse_moe_layers() {
             return Err(Error::Parallel(
                 "Kimi Linear PP+EP requires a sparse-MoE checkpoint".into(),
             ));
         }
         Ok(Some(
             crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
-                self.args.num_experts as usize,
+                args.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
             )?,
         ))
     }
 
-    pub(crate) fn register_parallel_parameters(
-        &self,
-        _build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        for group in eredu_architectures::kimi_linear::static_parallel_parameter_groups::<MlxBackend>(
-            &self.static_modules,
-        )? {
-            planner.register(group)?;
-        }
-        for index in 0..self.args.num_hidden_layers as usize {
-            let block = Block::<MlxBackend>::new(&self.args, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-            for group in eredu_architectures::kimi_linear::layer_parallel_parameter_groups(
-                &block, &self.args, index,
-            )? {
-                planner.register(group)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn new_cartesian_layer(
-        &self,
-        group: usize,
-        index: usize,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
-        stream: &Stream,
-    ) -> Result<MlxModule<NeutralBlock>, Error> {
-        self.layer_count(group)?;
-        let block = match layout {
-            Some(layout) => Block::new_with_geometry(
-                &self.args,
-                index,
-                eredu_architectures::kimi_linear::local_block_geometry(&self.args, index, layout)
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                stream,
-            ),
-            None => Block::new(&self.args, index, stream),
-        }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        Ok(MlxModule::new(block))
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn cartesian_layer_bindings(
         &self,
+        architecture: &NeutralArchitecture,
         group: usize,
         index: usize,
-        _layer: &MlxModule<NeutralBlock>,
+        global_layer: &MlxModule<NeutralBlock>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
         _assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
-        stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let global = self.new_layer(group, index, stream)?;
-        let bindings = self.layer_bindings(group, index, &global, store)?;
+        self.layer_count(architecture, group)?;
+        let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
         match layout {
             Some(layout) => {
                 shard_layer_bindings(bindings, &format!("model.layers.{index}"), store, layout)
@@ -364,12 +297,7 @@ impl KimiLinearPipelineAdapter {
     }
 }
 
-impl MlxUnitFactory<NeutralBlock> for KimiLinearUnitFactory {
-    fn build(&mut self, index: usize, stream: &Stream) -> Result<NeutralBlock, Error> {
-        Block::new(&self.args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-
+impl MlxUnitPopulator<NeutralBlock> for KimiLinearUnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<NeutralBlock>,
@@ -383,27 +311,11 @@ impl MlxUnitFactory<NeutralBlock> for KimiLinearUnitFactory {
 }
 
 #[derive(Clone)]
-struct KimiLinearParallelUnitFactory {
-    args: ModelArgs,
-    geometries: Arc<Vec<eredu_architectures::kimi_linear::BlockGeometry>>,
+struct KimiLinearParallelUnitPopulator {
     external_experts: bool,
 }
 
-impl MlxUnitFactory<NeutralBlock> for KimiLinearParallelUnitFactory {
-    fn build(&mut self, index: usize, stream: &Stream) -> Result<NeutralBlock, Error> {
-        Block::new_with_geometry(
-            &self.args,
-            index,
-            *self.geometries.get(index).ok_or_else(|| {
-                Error::Parallel(format!(
-                    "parallel Kimi Linear unit {index} is not configured"
-                ))
-            })?,
-            stream,
-        )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-
+impl MlxUnitPopulator<NeutralBlock> for KimiLinearParallelUnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<NeutralBlock>,
@@ -413,347 +325,6 @@ impl MlxUnitFactory<NeutralBlock> for KimiLinearParallelUnitFactory {
             self.external_experts && name.contains(".mlp.experts.")
         })?;
         Ok(())
-    }
-}
-
-struct KimiLinearParallelComposition {
-    architecture: NeutralArchitecture,
-    parallel_embedding: Option<MlxNamedModule<VocabParallelEmbedding>>,
-    parallel_lm_head: Option<MlxNamedModule<VocabParallelLmHead>>,
-    geometries: Option<Arc<Vec<eredu_architectures::kimi_linear::BlockGeometry>>>,
-    state_layout: Option<eredu_runtime::StateLayout>,
-    topology: Option<crate::backend::mlx::MlxParallelContext>,
-}
-
-impl KimiLinearParallelComposition {
-    fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
-        Ok(Self {
-            architecture: NeutralArchitecture::new(args, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-            parallel_embedding: None,
-            parallel_lm_head: None,
-            geometries: None,
-            state_layout: None,
-            topology: None,
-        })
-    }
-
-    const fn args(&self) -> &ModelArgs {
-        self.architecture.args()
-    }
-
-    fn configure(
-        &mut self,
-        build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        layout: &eredu_runtime::LocalModelLayout,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let geometries = (0..self.args().num_hidden_layers as usize)
-            .map(|layer| {
-                eredu_architectures::kimi_linear::local_block_geometry(self.args(), layer, layout)
-                    .map_err(|error| Error::Parallel(error.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let state_geometry =
-            eredu_architectures::kimi_linear::local_state_geometry(self.args(), layout)
-                .map_err(|error| Error::Parallel(error.to_string()))?;
-        self.state_layout = Some(
-            eredu_architectures::kimi_linear::state_layout_with_geometry(
-                self.args(),
-                &state_geometry,
-            )
-            .map_err(|error| Error::Parallel(error.to_string()))?,
-        );
-        self.parallel_embedding = Some(MlxNamedModule::new(
-            VocabParallelEmbedding::unloaded(
-                self.args().vocab_size as usize,
-                self.args().hidden_size,
-                self.args()
-                    .weight_quantization_for("model.embed_tokens.weight"),
-                build,
-                stream,
-            )?,
-            ParameterSpec::trainable("model.embed_tokens.weight")
-                .map_err(|error| Error::Parallel(error.to_string()))?,
-            None,
-        )?);
-        if !self.args().tie_word_embeddings {
-            self.parallel_lm_head = Some(MlxNamedModule::new(
-                VocabParallelLmHead::unloaded(
-                    self.args().hidden_size,
-                    self.args().vocab_size as usize,
-                    self.args().weight_quantization_for("lm_head.weight"),
-                    build,
-                    stream,
-                )?,
-                ParameterSpec::trainable("lm_head.weight")
-                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                None,
-            )?);
-        }
-        self.geometries = Some(Arc::new(geometries));
-        self.topology = Some(build.topology());
-        Ok(())
-    }
-
-    fn unit_factory(&self, external_experts: bool) -> Result<KimiLinearParallelUnitFactory, Error> {
-        Ok(KimiLinearParallelUnitFactory {
-            args: self.args().clone(),
-            geometries: Arc::clone(self.geometries.as_ref().ok_or_else(|| {
-                Error::Parallel("parallel Kimi Linear geometry is not configured".into())
-            })?),
-            external_experts,
-        })
-    }
-
-    fn local_state_layout(&self) -> Result<eredu_runtime::StateLayout, Error> {
-        self.state_layout
-            .clone()
-            .ok_or_else(|| Error::Parallel("parallel Kimi Linear state is not configured".into()))
-    }
-
-    fn execution_context<'a>(
-        &self,
-        group: &'a safemlx::distributed::Group,
-        stream: &'a Stream,
-    ) -> Result<
-        crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext<'a>,
-        Error,
-    > {
-        crate::backend::mlx::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
-            self.topology.ok_or_else(|| {
-                Error::Parallel("parallel Kimi Linear topology is not configured".into())
-            })?,
-            group,
-            stream,
-        )
-    }
-}
-
-impl Parameterized<Array> for KimiLinearParallelComposition {
-    fn visit_parameters<'a, V: ParameterVisitor<'a, Array>>(&'a self, visitor: &mut V) {
-        if let Some(embedding) = &self.parallel_embedding {
-            embedding.visit_parameters(visitor);
-        }
-        self.architecture
-            .static_modules()
-            .norm
-            .visit_parameters(visitor);
-        if let Some(head) = &self.parallel_lm_head {
-            head.visit_parameters(visitor);
-        }
-    }
-
-    fn visit_parameters_mut<'a, V: ParameterVisitorMut<'a, Array>>(&'a mut self, visitor: &mut V) {
-        if let Some(embedding) = &mut self.parallel_embedding {
-            embedding.visit_parameters_mut(visitor);
-        }
-        self.architecture
-            .static_modules_mut()
-            .norm
-            .visit_parameters_mut(visitor);
-        if let Some(head) = &mut self.parallel_lm_head {
-            head.visit_parameters_mut(visitor);
-        }
-    }
-
-    fn set_trainable(&mut self, trainable: bool) {
-        if let Some(embedding) = &mut self.parallel_embedding {
-            embedding.set_trainable(trainable);
-        }
-        self.architecture
-            .static_modules_mut()
-            .norm
-            .set_trainable(trainable);
-        if let Some(head) = &mut self.parallel_lm_head {
-            head.set_trainable(trainable);
-        }
-    }
-}
-
-impl LayeredArchitecture<MlxBackend, MlxHybridState> for KimiLinearParallelComposition {
-    type Input<'a> = eredu_architectures::decoder::LayeredInput<'a, Array>;
-    type StaticModules = Self;
-    type Unit = NeutralBlock;
-    type ForwardContext = eredu_architectures::kimi_linear::ForwardContext<Array>;
-    type RetainedContextValues<'a> = std::option::Iter<'a, Array>;
-    type Error = Error;
-
-    fn model_identity(&self) -> &str {
-        &self.args().model_type
-    }
-    fn execution_graph(&self) -> Result<ExecutionGraph, Error> {
-        ExecutionGraph::chain(["target"]).map_err(Into::into)
-    }
-    fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
-        if group == 0 {
-            usize::try_from(self.args().num_hidden_layers)
-                .map_err(|_| Error::Parallel("invalid Kimi Linear layer count".into()))
-        } else {
-            Err(Error::Parallel(format!(
-                "Kimi Linear has no execution group {group}"
-            )))
-        }
-    }
-    fn unit_path(&self, group: usize, index: usize) -> Result<String, Error> {
-        if index >= self.group_unit_count(group)? {
-            return Err(Error::Parallel(format!("Kimi Linear has no unit {index}")));
-        }
-        Ok(format!("model.layers.{index}"))
-    }
-    fn static_modules(&self) -> &Self {
-        self
-    }
-    fn static_modules_mut(&mut self) -> &mut Self {
-        self
-    }
-    fn build_unit(
-        &self,
-        group: usize,
-        index: usize,
-        stream: &Stream,
-    ) -> Result<NeutralBlock, Error> {
-        self.unit_path(group, index)?;
-        Block::new_with_geometry(
-            self.args(),
-            index,
-            *self
-                .geometries
-                .as_ref()
-                .and_then(|values| values.get(index))
-                .ok_or_else(|| {
-                    Error::Parallel(format!(
-                        "parallel Kimi Linear unit {index} is not configured"
-                    ))
-                })?,
-            stream,
-        )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-    fn begin_forward<'a>(
-        &mut self,
-        _: Self::Input<'a>,
-        _: &mut MlxHybridState,
-        _: &Stream,
-    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        Err(Error::Parallel(
-            "parallel Kimi Linear requires collective execution".into(),
-        ))
-    }
-    fn begin_execution_group(
-        &mut self,
-        group: usize,
-        initial: &Array,
-        dependencies: &[&Array],
-        _: &mut MlxHybridState,
-        _: &mut Self::ForwardContext,
-        _: &Stream,
-    ) -> Result<Array, Error> {
-        if group == 0 && dependencies.is_empty() {
-            Ok(initial.clone())
-        } else {
-            Err(Error::Parallel(format!(
-                "Kimi Linear group {group} received {} dependencies",
-                dependencies.len()
-            )))
-        }
-    }
-    fn forward_unit(
-        &mut self,
-        _: usize,
-        _: usize,
-        _: &mut NeutralBlock,
-        _: &Array,
-        _: &mut MlxHybridState,
-        _: &mut Self::ForwardContext,
-        _: &Stream,
-    ) -> Result<Array, Error> {
-        Err(Error::Parallel(
-            "parallel Kimi Linear requires collective execution".into(),
-        ))
-    }
-    fn finish_forward(
-        &mut self,
-        _: &Array,
-        _: &mut MlxHybridState,
-        _: &Self::ForwardContext,
-        _: &Stream,
-    ) -> Result<Array, Error> {
-        Err(Error::Parallel(
-            "parallel Kimi Linear requires collective execution".into(),
-        ))
-    }
-    fn retained_context_values<'a>(
-        &'a self,
-        forward: &'a Self::ForwardContext,
-        group: usize,
-        index: usize,
-    ) -> Self::RetainedContextValues<'a> {
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::retained_context_values(&self.architecture, forward, group, index)
-    }
-}
-
-impl ParallelLayeredArchitecture<MlxBackend, MlxHybridState> for KimiLinearParallelComposition {
-    fn begin_forward_parallel<'a>(
-        &mut self,
-        input: Self::Input<'a>,
-        state: &mut MlxHybridState,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Error> {
-        let execution = self.execution_context(group, stream)?;
-        let hidden = self
-            .parallel_embedding
-            .as_mut()
-            .ok_or_else(|| {
-                Error::Parallel("parallel Kimi Linear embedding is not configured".into())
-            })?
-            .forward(input.tokens, &execution)?;
-        let layout = self.local_state_layout()?;
-        self.architecture
-            .begin_embedded_with_layout(hidden, input.mask, state, &layout, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-    fn forward_unit_parallel(
-        &mut self,
-        _: usize,
-        index: usize,
-        unit: &mut NeutralBlock,
-        hidden: &Array,
-        state: &mut MlxHybridState,
-        forward: &mut Self::ForwardContext,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.architecture
-            .forward_block_parallel(index, unit, hidden, state, forward, group, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    }
-    fn finish_forward_parallel(
-        &mut self,
-        hidden: &Array,
-        _: &mut MlxHybridState,
-        _: &Self::ForwardContext,
-        group: &safemlx::distributed::Group,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        let execution = self.execution_context(group, stream)?;
-        let hidden = self
-            .architecture
-            .static_modules_mut()
-            .norm
-            .forward(hidden, stream)?;
-        let logits = match &mut self.parallel_lm_head {
-            Some(head) => head.forward(&hidden, &execution)?,
-            None => self
-                .parallel_embedding
-                .as_mut()
-                .ok_or_else(|| {
-                    Error::Parallel("parallel Kimi Linear embedding is not configured".into())
-                })?
-                .project_logits(&hidden, &execution)?,
-        };
-        logits.all_gather(&execution)
     }
 }
 
@@ -1188,11 +759,9 @@ fn load_neutral(
     let binding_args = args.clone();
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
-        architecture.static_modules_mut(),
-        KimiLinearUnitFactory {
-            args: args.clone(),
-            external_experts,
-        },
+        &mut architecture,
+        KimiLinearUnitPopulator { external_experts },
+        std::marker::PhantomData::<MlxHybridState>,
         execution_layout(count)?,
         options,
         stream,
@@ -1222,9 +791,13 @@ fn load_neutral(
         .state_layout()
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let execution = if options.is_fully_resident() {
-        KimiLinearExecution::Resident(Box::new(LayerwiseRuntime::new(
+        KimiLinearExecution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(
+                &architecture,
+                stream,
+                std::marker::PhantomData::<MlxHybridState>,
+            )?,
             architecture,
-            policy.into_resident(stream)?,
         )))
     } else {
         KimiLinearExecution::Layerwise(Box::new(LayerwiseRuntime::new(architecture, policy)))
@@ -1251,10 +824,11 @@ fn load_neutral_parallel(
 ) -> Result<KimiLinearModel, Error> {
     let count = usize::try_from(args.num_hidden_layers)
         .map_err(|_| Error::Parallel("invalid Kimi Linear layer count".into()))?;
-    let mut composition = KimiLinearParallelComposition::new(args.clone(), stream)?;
+    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut planner = build.planner();
     for group in eredu_architectures::kimi_linear::static_parallel_parameter_groups::<MlxBackend>(
-        composition.architecture.static_modules(),
+        global_architecture.static_modules(),
     )? {
         planner.register(group)?;
     }
@@ -1273,11 +847,16 @@ fn load_neutral_parallel(
             "Kimi Linear declared no tensor-parallel parameters".into(),
         ));
     }
-    composition.configure(build, &layout, stream)?;
-    let state_layout = composition.local_state_layout()?;
-    let factory = composition.unit_factory(external_experts)?;
+    let geometry = eredu_architectures::kimi_linear::local_geometry(&args, &layout)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let state_layout = architecture
+        .runtime_state_layout()
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let factory = KimiLinearParallelUnitPopulator { external_experts };
 
-    let global_static = MlxModule::new(composition.architecture.static_modules().clone());
+    let global_static = MlxModule::new(global_architecture.static_modules().clone());
     let global_static_bindings = build_module_bindings(&global_static, "", store.as_ref())?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
     for layer in 0..count {
@@ -1301,10 +880,12 @@ fn load_neutral_parallel(
     let static_layout = Arc::clone(&shared_layout);
     let unit_layout = Arc::clone(&shared_layout);
     let binding_args = args.clone();
+    let global_static_modules = global_architecture.static_modules().clone();
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
-        &mut composition,
+        &mut architecture,
         factory,
+        std::marker::PhantomData::<MlxHybridState>,
         execution_layout(count)?,
         options,
         stream,
@@ -1313,8 +894,8 @@ fn load_neutral_parallel(
             key.ends_with(".rotary_emb.inv_freq")
                 || (external_experts && key.contains(".mlp.experts."))
         },
-        move |modules, store| {
-            let global = MlxModule::new(modules.architecture.static_modules().clone());
+        move |_modules, store| {
+            let global = MlxModule::new(global_static_modules.clone());
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, "", store, &static_layout)
         },
@@ -1365,13 +946,17 @@ fn load_neutral_parallel(
     let rank =
         crate::backend::mlx::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
     let execution = if options.is_fully_resident() {
-        KimiLinearExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new(
-            composition,
-            policy.into_resident(stream)?,
+        KimiLinearExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(
+                &architecture,
+                stream,
+                std::marker::PhantomData::<MlxHybridState>,
+            )?,
+            architecture,
         )))
     } else {
         KimiLinearExecution::TensorParallelLayerwise(Box::new(LayerwiseRuntime::new(
-            composition,
+            architecture,
             policy,
         )))
     };
@@ -1721,21 +1306,20 @@ impl KimiLinearModel {
                     state: &mut MlxHybridState,
                     forward: &mut eredu_architectures::kimi_linear::ForwardContext<Array>,
                     context: &Stream| {
-            if group != 0 {
-                return Err(eredu_nn::Error::backend(format!(
-                    "Kimi Linear received execution group {group}"
-                )));
-            }
-            architecture.forward_block_with_feed_forward(
+            <NeutralArchitecture as eredu_runtime::RoutedLayeredArchitecture<
+                MlxBackend,
+                MlxHybridState,
+            >>::forward_unit_with_provider(
+                architecture,
+                group,
                 index,
                 block,
                 hidden,
                 state,
                 forward,
+                pass,
+                provider,
                 context,
-                |policy, normalized, context| {
-                    policy.forward_with_provider(normalized, pass, context, provider)
-                },
             )
         };
         match &mut self.execution {
@@ -1818,18 +1402,13 @@ impl KimiLinearModel {
         let expert_count = self.args.num_experts;
         let input = eredu_architectures::decoder::LayeredInput { tokens, mask };
         let hook = |architecture: &mut NeutralArchitecture,
-                    group: usize,
+                    _group: usize,
                     index: usize,
                     block: &mut NeutralBlock,
                     hidden: &Array,
                     state: &mut MlxHybridState,
                     forward: &mut eredu_architectures::kimi_linear::ForwardContext<Array>,
                     context: &Stream| {
-            if group != 0 {
-                return Err(eredu_nn::Error::backend(format!(
-                    "Kimi Linear received execution group {group}"
-                )));
-            }
             let path = format!("model.layers.{index}");
             observer.observe(&format!("{path}.input"), hidden)?;
             let output = architecture.forward_block_with_feed_forward(
@@ -1908,7 +1487,7 @@ impl KimiLinearModel {
         };
         let input = eredu_architectures::decoder::LayeredInput { tokens, mask };
         let mut provider = ExpertExecutorProvider::new(&mut execute);
-        let hook = |composition: &mut KimiLinearParallelComposition,
+        let hook = |architecture: &mut NeutralArchitecture,
                     group_index: usize,
                     index: usize,
                     block: &mut NeutralBlock,
@@ -1917,34 +1496,22 @@ impl KimiLinearModel {
                     forward: &mut eredu_architectures::kimi_linear::ForwardContext<Array>,
                     parallel: &safemlx::distributed::Group,
                     context: &Stream| {
-            if group_index != 0 {
-                return Err(Error::Parallel(format!(
-                    "Kimi Linear received execution group {group_index}"
-                )));
-            }
-            composition
-                .architecture
-                .forward_block_parallel_with_feed_forward(
-                    index,
-                    block,
-                    hidden,
-                    state,
-                    forward,
-                    parallel,
-                    context,
-                    |policy, normalized, parallel, context| {
-                        policy
-                            .forward_parallel_with_provider(
-                                normalized,
-                                pass,
-                                parallel,
-                                context,
-                                &mut provider,
-                            )
-                            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
-                    },
-                )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
+                MlxBackend,
+                MlxHybridState,
+            >>::forward_unit_parallel_with_provider(
+                architecture,
+                group_index,
+                index,
+                block,
+                hidden,
+                state,
+                forward,
+                pass,
+                &mut provider,
+                parallel,
+                context,
+            )
         };
         match &mut self.execution {
             KimiLinearExecution::TensorParallelResident(runtime) => {

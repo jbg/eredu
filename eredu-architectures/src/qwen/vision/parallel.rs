@@ -36,17 +36,20 @@ pub fn local_block_geometry(
     let fc1 = tensor(layout, &format!("{prefix}.mlp.linear_fc1.weight"))?;
     let qkv_rows = i32::try_from(qkv.local_shape()[0])
         .map_err(|_| ParallelPlanError::InvalidTensor("vision QKV width exceeds i32".into()))?;
-    let head_dim = config.hidden_size / config.num_heads;
-    if qkv_rows % (3 * head_dim) != 0 {
+    let intermediate = i32::try_from(fc1.local_shape()[0])
+        .map_err(|_| ParallelPlanError::InvalidTensor("vision MLP width exceeds i32".into()))?;
+    if config.num_heads <= 0 {
         return Err(ParallelPlanError::InvalidTensor(
-            "local vision QKV splits a head".into(),
+            "vision head count must be positive".into(),
         ));
     }
-    Ok((
-        qkv_rows / (3 * head_dim),
-        i32::try_from(fc1.local_shape()[0])
-            .map_err(|_| ParallelPlanError::InvalidTensor("vision MLP width exceeds i32".into()))?,
-    ))
+    let head_dim = config.hidden_size / config.num_heads;
+    if qkv_rows <= 0 || intermediate <= 0 || head_dim <= 0 || qkv_rows % (3 * head_dim) != 0 {
+        return Err(ParallelPlanError::InvalidTensor(
+            "local vision geometry is zero or QKV splits a head".into(),
+        ));
+    }
+    Ok((qkv_rows / (3 * head_dim), intermediate))
 }
 
 /// Declares one vision block's attention, MLP, and replicated norms.
@@ -192,9 +195,15 @@ pub fn local_merger_widths(
         )
         .map(|prefix| {
             let value = tensor(layout, &format!("{prefix}.linear_fc1.weight"))?;
-            i32::try_from(value.local_shape()[0]).map_err(|_| {
+            let width = i32::try_from(value.local_shape()[0]).map_err(|_| {
                 ParallelPlanError::InvalidTensor("local vision merger width exceeds i32".into())
-            })
+            })?;
+            if width <= 0 {
+                return Err(ParallelPlanError::InvalidTensor(
+                    "local vision merger width must be positive".into(),
+                ));
+            }
+            Ok(width)
         })
         .collect()
 }

@@ -2,6 +2,7 @@ use std::cell::RefCell;
 
 use eredu_architectures::{
     decoder::{self, AttentionProjectionLayout, GatedProjectionLayout, TransformerBlock},
+    gpt_oss,
     llama::{self, LayeredInput, ModelArgs},
     moshi, qwen,
 };
@@ -18,11 +19,12 @@ use eredu_nn::{
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, DeviceState, ExpertPass, LayerRuntimeState,
     LayeredArchitecture, LayerwiseRuntime, LocalModelLayout, LocalTensorLayout, ParameterBackend,
-    PenaltyConfig, PredictionDirective, ResettableRuntimeLayerState, ResidentRuntime,
-    ResidentUnitWindow, RoutedExpertProvider, RoutedExpertRequest, RuntimeLayerState, RuntimeState,
-    Sampler, SamplingBackend, SequentialDecisionDriver, SequentialDecisionMode,
-    SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
-    SubmissionBackend, TensorPlacement, TokenDomain, WeightBinding,
+    ParameterGroupSpec, PenaltyConfig, PredictionDirective, ResettableRuntimeLayerState,
+    ResidentRuntime, ResidentUnitWindow, RoutedExpertProvider, RoutedExpertRequest,
+    RuntimeLayerState, RuntimeState, Sampler, SamplingBackend, SequentialDecisionDriver,
+    SequentialDecisionMode, SequentialDecisionPlan, SequentialDecisionSource,
+    SequentialDecisionTraversal, StateError, SubmissionBackend, TensorPlacement, TokenDomain,
+    WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -508,6 +510,14 @@ impl NeuralBackend for ReferenceBackend {
     ) -> Result<Self::Tensor, Error> {
         linear.forward(input, context)
     }
+    fn vocabulary_parallel_embedding_project(
+        embedding: &mut Self::Embedding,
+        input: &Self::Tensor,
+        _: &(),
+        context: &(),
+    ) -> Result<Self::Tensor, Error> {
+        embedding.as_linear(input, context)
+    }
     fn rms_norm(spec: NormalizationSpec, _: &()) -> Result<Self::Normalization, Error> {
         Ok(ReferenceNorm {
             weight: ReferenceTensor(vec![spec.dimensions]),
@@ -956,6 +966,414 @@ fn tiny_args() -> ModelArgs {
     }
 }
 
+fn llama_parallel_layout(
+    args: &ModelArgs,
+    vocabulary: std::ops::Range<usize>,
+    local_query_heads: i32,
+    local_key_value_heads: i32,
+) -> LocalModelLayout {
+    let architecture = llama::LayeredModel::<ReferenceBackend>::new(args.clone(), &()).unwrap();
+    let static_modules = architecture.static_modules();
+    let mut groups = llama::static_parallel_parameter_groups::<ReferenceBackend>(
+        &static_modules.embeddings,
+        &static_modules.norm,
+        static_modules.lm_head.as_ref(),
+        "model",
+    )
+    .unwrap();
+    for layer in 0..args.num_hidden_layers as usize {
+        let block = TransformerBlock::<ReferenceBackend>::new(args, layer, &()).unwrap();
+        groups.extend(
+            llama::layer_parallel_parameter_groups::<ReferenceBackend>(&block, args, layer)
+                .unwrap(),
+        );
+    }
+
+    let query_width = usize::try_from(local_query_heads * args.head_dim).unwrap();
+    let key_value_width = usize::try_from(local_key_value_heads * args.head_dim).unwrap();
+    let mut layout = LocalModelLayout::default();
+    for group in groups {
+        for member in group.members() {
+            let target = member.target();
+            let mut local_shape = member.global_shape().to_vec();
+            let (placement, logical_range) = if group.role()
+                == eredu_runtime::ParameterRole::Vocabulary
+            {
+                local_shape[0] = vocabulary.len();
+                (
+                    TensorPlacement::Range {
+                        axis: 0,
+                        start: vocabulary.start,
+                        end: vocabulary.end,
+                    },
+                    Some(vocabulary.clone()),
+                )
+            } else if target.contains(".self_attn.q_proj") {
+                local_shape[0] = query_width;
+                (
+                    TensorPlacement::Range {
+                        axis: 0,
+                        start: 0,
+                        end: query_width,
+                    },
+                    Some(0..usize::try_from(local_query_heads).unwrap()),
+                )
+            } else if target.contains(".self_attn.k_proj") || target.contains(".self_attn.v_proj") {
+                local_shape[0] = key_value_width;
+                (
+                    TensorPlacement::Range {
+                        axis: 0,
+                        start: 0,
+                        end: key_value_width,
+                    },
+                    Some(0..usize::try_from(local_key_value_heads).unwrap()),
+                )
+            } else {
+                (
+                    TensorPlacement::Replicated,
+                    group.partition_units().map(|units| 0..units),
+                )
+            };
+            layout.insert(
+                target.to_owned(),
+                LocalTensorLayout::new(
+                    group.logical_name(),
+                    group.role(),
+                    member.global_shape().to_vec(),
+                    local_shape,
+                    placement,
+                    group.partition_units(),
+                    logical_range,
+                    false,
+                ),
+            );
+        }
+    }
+    layout
+}
+
+fn replicated_parallel_layout(groups: &[ParameterGroupSpec]) -> LocalModelLayout {
+    let mut layout = LocalModelLayout::default();
+    for group in groups {
+        for member in group.members() {
+            layout.insert(
+                member.target().to_owned(),
+                LocalTensorLayout::new(
+                    group.logical_name(),
+                    group.role(),
+                    member.global_shape().to_vec(),
+                    member.global_shape().to_vec(),
+                    TensorPlacement::Replicated,
+                    group.partition_units(),
+                    group.partition_units().map(|units| 0..units),
+                    false,
+                ),
+            );
+        }
+    }
+    layout
+}
+
+fn assert_geometry_identity_error<T>(result: Result<T, Error>, family: &str) {
+    match result {
+        Err(error) => assert!(
+            error
+                .to_string()
+                .contains("different normalized configuration"),
+            "unexpected {family} geometry error: {error}"
+        ),
+        Ok(_) => panic!("{family} accepted geometry derived from a different configuration"),
+    }
+}
+
+#[test]
+fn shared_decoder_parallel_geometry_rejects_cross_config_reuse() {
+    let llama_args = tiny_args();
+    let llama_layout = llama_parallel_layout(&llama_args, 0..32, 2, 1);
+    let llama_geometry = llama::local_geometry(&llama_args, &llama_layout).unwrap();
+    let mut changed_llama = llama_args;
+    changed_llama.rope_theta = 20_000.0;
+    assert_geometry_identity_error(
+        llama::LayeredModel::<ReferenceBackend>::new_parallel(changed_llama, llama_geometry, &()),
+        "Llama",
+    );
+
+    let qwen_args = qwen::model_args_from_config_value(&serde_json::json!({
+        "model_type": "qwen3",
+        "hidden_size": 8,
+        "num_hidden_layers": 1,
+        "intermediate_size": 16,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "rms_norm_eps": 0.00001,
+        "vocab_size": 32,
+        "max_position_embeddings": 128,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": false
+    }))
+    .unwrap();
+    let qwen_model = qwen::LayeredModel::<ReferenceBackend>::new(qwen_args.clone(), &()).unwrap();
+    let mut qwen_groups = qwen::static_parallel_parameter_groups::<ReferenceBackend>(
+        &qwen_model.static_modules().embeddings,
+        &qwen_model.static_modules().norm,
+        qwen_model.static_modules().lm_head.as_ref(),
+        &qwen_args.parameter_root,
+    )
+    .unwrap();
+    let qwen_unit = qwen_model.construct_unit(0, &()).unwrap();
+    qwen_groups.extend(qwen::layer_parallel_parameter_groups(&qwen_unit, &qwen_args, 0).unwrap());
+    let qwen_geometry =
+        qwen::local_geometry(&qwen_args, &replicated_parallel_layout(&qwen_groups)).unwrap();
+    let mut changed_qwen = qwen_args;
+    changed_qwen.rms_norm_eps = 0.00002;
+    assert_geometry_identity_error(
+        qwen::LayeredModel::<ReferenceBackend>::new_parallel(changed_qwen, qwen_geometry, &()),
+        "Qwen",
+    );
+
+    let gpt_args = gpt_oss::model_args_from_config_value(&serde_json::json!({
+        "model_type": "gpt_oss",
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "vocab_size": 32,
+        "num_local_experts": 2,
+        "num_experts_per_tok": 1,
+        "rms_norm_eps": 0.00001,
+        "sliding_window": 4,
+        "max_position_embeddings": 64,
+        "rope_theta": 150000.0,
+        "layer_types": ["full_attention"],
+        "quantization_config": {"quant_method": "mxfp4"},
+        "swiglu_limit": 7.0
+    }))
+    .unwrap();
+    let gpt_model = gpt_oss::LayeredModel::<ReferenceBackend>::new(gpt_args.clone(), &()).unwrap();
+    let mut gpt_groups =
+        gpt_oss::static_parameter_groups(gpt_model.static_modules(), &gpt_args).unwrap();
+    let gpt_unit = gpt_model.construct_unit(0, &()).unwrap();
+    gpt_groups.extend(gpt_oss::layer_parallel_parameter_groups(&gpt_unit, &gpt_args, 0).unwrap());
+    let gpt_geometry =
+        gpt_oss::local_geometry(&gpt_args, &replicated_parallel_layout(&gpt_groups)).unwrap();
+    let mut changed_gpt = gpt_args;
+    changed_gpt.rms_norm_eps = 0.00002;
+    assert_geometry_identity_error(
+        gpt_oss::LayeredModel::<ReferenceBackend>::new_parallel(changed_gpt, gpt_geometry, &()),
+        "GPT-OSS",
+    );
+}
+
+#[test]
+fn neutral_llama_parallel_geometry_owns_uneven_tied_and_untied_vocabularies() {
+    let mut tied_args = tiny_args();
+    tied_args.vocab_size = 7;
+    let tied_layout = llama_parallel_layout(&tied_args, 4..7, 2, 1);
+    let tied_geometry = llama::local_geometry(&tied_args, &tied_layout).unwrap();
+    assert_eq!(tied_geometry.embedding_range().global_vocabulary, 7);
+    assert_eq!(tied_geometry.embedding_range().local, 4..7);
+    assert_eq!(tied_geometry.output_range(), None);
+
+    let replicated: llama::LayeredModel<ReferenceBackend> =
+        llama::LayeredModel::new(tied_args.clone(), &()).unwrap();
+    let parallel: llama::LayeredModel<ReferenceBackend> =
+        llama::LayeredModel::new_parallel(tied_args.clone(), tied_geometry, &()).unwrap();
+    assert!(replicated.parallel_geometry().is_none());
+    assert!(parallel.parallel_geometry().is_some());
+    assert_eq!(parallel.static_modules().embeddings.weight.0, [3, 8]);
+    assert!(parallel.static_modules().lm_head.is_none());
+
+    let mut untied_args = tied_args;
+    untied_args.tie_word_embeddings = false;
+    let untied_layout = llama_parallel_layout(&untied_args, 4..7, 2, 1);
+    let untied_geometry = llama::local_geometry(&untied_args, &untied_layout).unwrap();
+    assert_eq!(
+        untied_geometry
+            .output_range()
+            .map(|range| range.local.clone()),
+        Some(4..7)
+    );
+    let untied: llama::LayeredModel<ReferenceBackend> =
+        llama::LayeredModel::new_parallel(untied_args, untied_geometry, &()).unwrap();
+    assert_eq!(untied.static_modules().embeddings.weight.0, [3, 8]);
+    assert_eq!(
+        untied.static_modules().lm_head.as_ref().unwrap().weight.0,
+        [3, 8]
+    );
+}
+
+#[test]
+fn neutral_llama_parallel_geometry_drives_local_gqa_and_cache_shape() {
+    let mut args = tiny_args();
+    args.num_attention_heads = 4;
+    args.num_key_value_heads = 2;
+    args.head_dim = 2;
+    let layout = llama_parallel_layout(&args, 0..16, 2, 1);
+    let geometry = llama::local_geometry(&args, &layout).unwrap();
+
+    assert!(geometry
+        .blocks()
+        .iter()
+        .all(|block| { block.num_attention_heads == 2 && block.num_key_value_heads == 1 }));
+    for layer in 0..args.num_hidden_layers as usize {
+        match geometry.state_layout().layer(layer).unwrap() {
+            eredu_core::cache::LayerCachePolicy::KeyValue {
+                num_key_value_heads,
+                head_dim,
+                ..
+            } => {
+                assert_eq!(num_key_value_heads.get(), 1);
+                assert_eq!(head_dim.get(), 2);
+            }
+            policy => panic!("unexpected local Llama cache policy {policy:?}"),
+        }
+    }
+
+    let architecture =
+        llama::LayeredModel::<ReferenceBackend>::new_parallel(args, geometry, &()).unwrap();
+    let block = <llama::LayeredModel<ReferenceBackend> as LayeredArchitecture<
+        ReferenceBackend,
+        DeviceState<ReferenceBackend, ReferenceCache>,
+    >>::build_unit(&architecture, 0, 0, &())
+    .unwrap();
+    assert_eq!(block.self_attention.query_heads, 2);
+    assert_eq!(block.self_attention.key_value_heads, 1);
+}
+
+#[test]
+fn neutral_llama_tensor_parallel_size_one_matches_replicated_lifecycle() {
+    let args = tiny_args();
+    let state = || {
+        DeviceState::<ReferenceBackend, ReferenceCache>::create(
+            llama::state_layout(&args).unwrap(),
+            |_, policy| {
+                Ok::<_, std::convert::Infallible>(ReferenceCache {
+                    offset: 0,
+                    window: policy
+                        .attention()
+                        .and_then(|attention| attention.window())
+                        .map(|window| window.get() as i32),
+                    resets: 0,
+                })
+            },
+        )
+        .unwrap()
+    };
+
+    let replicated = llama::LayeredModel::<ReferenceBackend>::new(args.clone(), &()).unwrap();
+    let units = (0..args.num_hidden_layers as usize)
+        .map(|index| {
+            <llama::LayeredModel<ReferenceBackend> as LayeredArchitecture<
+                ReferenceBackend,
+                DeviceState<ReferenceBackend, ReferenceCache>,
+            >>::build_unit(&replicated, 0, index, &())
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut replicated = LayerwiseRuntime::new(replicated, ResidentUnitWindow::new(units));
+    let mut replicated_state = state();
+
+    let layout = llama_parallel_layout(
+        &args,
+        0..args.vocab_size as usize,
+        args.num_attention_heads,
+        args.num_key_value_heads,
+    );
+    let geometry = llama::local_geometry(&args, &layout).unwrap();
+    let parallel =
+        llama::LayeredModel::<ReferenceBackend>::new_parallel(args.clone(), geometry, &()).unwrap();
+    let units = (0..parallel.args().num_hidden_layers as usize)
+        .map(|index| {
+            <llama::LayeredModel<ReferenceBackend> as LayeredArchitecture<
+                ReferenceBackend,
+                DeviceState<ReferenceBackend, ReferenceCache>,
+            >>::build_unit(&parallel, 0, index, &())
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut parallel = LayerwiseRuntime::new(parallel, ResidentUnitWindow::new(units));
+    let mut parallel_state = state();
+    let tokens = ReferenceTensor(vec![1, 3]);
+
+    let replicated_logits = replicated
+        .forward(
+            LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut replicated_state,
+            &(),
+        )
+        .unwrap();
+    let parallel_logits = parallel
+        .forward_parallel(
+            LayeredInput {
+                tokens: &tokens,
+                mask: None,
+            },
+            &mut parallel_state,
+            &(),
+            &(),
+        )
+        .unwrap();
+
+    assert_eq!(parallel_logits, replicated_logits);
+    assert_eq!(parallel_state.layer(0).unwrap().offset(), 3);
+    assert_eq!(parallel_state.layer(1).unwrap().offset(), 3);
+}
+
+#[test]
+fn neutral_llama_local_geometry_rejects_bad_vocabulary_companion_selection() {
+    let mut args = tiny_args();
+    args.vocab_size = 7;
+    let mut layout = llama_parallel_layout(&args, 4..7, 2, 1);
+    layout.insert(
+        "model.embed_tokens.scales".into(),
+        LocalTensorLayout::new(
+            "model.embed_tokens",
+            eredu_runtime::ParameterRole::Vocabulary,
+            vec![7, 1],
+            vec![3, 1],
+            TensorPlacement::Range {
+                axis: 0,
+                start: 0,
+                end: 3,
+            },
+            None,
+            Some(0..3),
+            false,
+        ),
+    );
+    let error = llama::local_geometry(&args, &layout).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("inconsistent companion selections"));
+
+    let mut malformed = llama_parallel_layout(&args, 4..7, 2, 1);
+    malformed.insert(
+        "model.embed_tokens.weight".into(),
+        LocalTensorLayout::new(
+            "model.embed_tokens",
+            eredu_runtime::ParameterRole::Vocabulary,
+            vec![7, 8],
+            vec![7, 3],
+            TensorPlacement::Range {
+                axis: 1,
+                start: 0,
+                end: 3,
+            },
+            None,
+            Some(0..3),
+            false,
+        ),
+    );
+    let error = llama::local_geometry(&args, &malformed).unwrap_err();
+    assert!(error.to_string().contains("non-row placement"));
+}
+
 struct ProjectionLayoutConfig {
     args: ModelArgs,
     fused: bool,
@@ -1074,6 +1492,34 @@ impl decoder::Config for ProjectionLayoutConfig {
             scaling: None,
         }
     }
+}
+
+#[test]
+fn tied_vocabulary_parallel_projection_preserves_embedding_storage_and_global_logits() {
+    let spec = EmbeddingSpec {
+        vocabulary: 7,
+        dimensions: 4,
+        weight: eredu_nn::ParameterSpec::trainable("model.embed_tokens.weight").unwrap(),
+        quantization: None,
+    };
+    let mut embedding = ReferenceBackend::vocabulary_parallel_embedding(
+        spec,
+        VocabularyParallelRange {
+            global_vocabulary: 7,
+            local: 0..4,
+        },
+        &(),
+    )
+    .unwrap();
+    assert_eq!(embedding.weight.0, [4, 4]);
+
+    let hidden = ReferenceTensor(vec![1, 2, 4]);
+    let logits =
+        ReferenceBackend::vocabulary_parallel_embedding_project(&mut embedding, &hidden, &(), &())
+            .unwrap();
+
+    assert_eq!(embedding.weight.0, [4, 4]);
+    assert_eq!(logits.0, [1, 2, 7]);
 }
 
 #[test]
@@ -1444,6 +1890,49 @@ fn one_portable_moshi_model_runs_replicated_and_parallel_lifecycles() {
         state.layout(),
         &runtime.architecture().runtime_state_layout().unwrap()
     );
+}
+
+#[test]
+fn moshi_parallel_geometry_rejects_policy_compatible_cross_config_reuse() {
+    let config = minimal_moshi_config();
+    let layout = replicated_moshi_parallel_layout(&config);
+    let geometry = moshi::local_geometry(&config, &layout, std::iter::empty()).unwrap();
+    let changed = moshi::MoshiConfig::from_json(
+        r#"{
+            "model_type": "moshi",
+            "dim": 32,
+            "text_card": 101,
+            "n_q": 2,
+            "dep_q": 1,
+            "generated_audio_codebooks": 1,
+            "card": 64,
+            "num_heads": 4,
+            "num_layers": 1,
+            "dim_feedforward": 48,
+            "causal": true,
+            "context": 7,
+            "max_period": 20000.0,
+            "positional_embedding": "rope",
+            "depformer_dim": 24,
+            "depformer_dim_feedforward": 36,
+            "depformer_num_heads": 4,
+            "depformer_num_layers": 1,
+            "depformer_context": 3,
+            "depformer_max_period": 10000.0,
+            "depformer_pos_emb": "none",
+            "delays": [0, 0, 1]
+        }"#,
+    )
+    .unwrap();
+    match moshi::LayeredModel::<ReferenceBackend>::new_parallel(changed, geometry, &()) {
+        Err(error) => assert!(
+            error
+                .to_string()
+                .contains("different normalized configuration"),
+            "unexpected Moshi geometry error: {error}"
+        ),
+        Ok(_) => panic!("Moshi accepted geometry derived from a different configuration"),
+    }
 }
 
 #[test]

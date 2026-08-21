@@ -1136,37 +1136,6 @@ impl MlxHybridLayerState {
         })
     }
 
-    /// Reconstitutes a layer from stage-local compressed-attention and fixed state.
-    pub(crate) fn from_pipeline_parts(
-        compressed: Option<CompressedLatentCache>,
-        fixed: BTreeMap<StateTensorRole, Option<Array>>,
-        fixed_offset: i32,
-    ) -> Self {
-        Self {
-            attention: compressed.map(MlxHybridAttentionState::Compressed),
-            fixed,
-            fixed_offset,
-        }
-    }
-
-    /// Returns stage-local components after a neutral block has advanced them.
-    pub(crate) fn into_pipeline_parts(
-        self,
-    ) -> (
-        Option<CompressedLatentCache>,
-        BTreeMap<StateTensorRole, Option<Array>>,
-        i32,
-    ) {
-        let compressed = match self.attention {
-            Some(MlxHybridAttentionState::Compressed(cache)) => Some(cache),
-            None => None,
-            Some(MlxHybridAttentionState::KeyValue(_)) => {
-                unreachable!("compressed pipeline state cannot contain key/value attention")
-            }
-        };
-        (compressed, self.fixed, self.fixed_offset)
-    }
-
     fn device(layer: usize, policy: &LayerCachePolicy) -> Result<Self, Exception> {
         let attention = hybrid_attention_policy(layer, policy)?.map(|policy| match policy {
             HybridAttentionPolicy::KeyValue { window, key_only } => {

@@ -9,7 +9,7 @@ use eredu_nn::{
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
 
-use super::{DecoderConfig, WeightConvention};
+use super::{DecoderConfig, LocalGeometry, WeightConvention};
 
 /// RMS normalization whose checkpoint scale may store `(scale - 1)`.
 #[derive(Debug, Clone, Parameterized)]
@@ -847,6 +847,58 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
                             bias: None,
                             format: args.linear_format_for(head),
                         },
+                        context,
+                    )
+                })
+                .transpose()?,
+            embedding_epsilon: args.rms_norm_eps,
+            output_multiplier: args.output_multiplier,
+            logit_cap: args.final_logit_softcapping,
+        })
+    }
+
+    /// Builds pinned vocabulary modules from planner-derived row ownership.
+    pub fn new_parallel(
+        args: &DecoderConfig,
+        geometry: &LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let embedding = "model.embed_tokens.weight";
+        let head = "lm_head.weight";
+        Ok(Self {
+            embeddings: B::vocabulary_parallel_embedding(
+                EmbeddingSpec {
+                    vocabulary: args.vocab_size,
+                    dimensions: args.hidden_size,
+                    weight: ParameterSpec::trainable(embedding).map_err(Error::backend)?,
+                    quantization: args.weight_quantization_for(embedding),
+                },
+                geometry.embedding_range().clone(),
+                context,
+            )?,
+            final_norm: B::rms_norm(
+                NormalizationSpec {
+                    dimensions: args.hidden_size,
+                    epsilon: args.rms_norm_eps,
+                    weight: ParameterSpec::trainable("model.norm.weight")
+                        .map_err(Error::backend)?,
+                },
+                context,
+            )?,
+            head: (!args.tie_word_embeddings)
+                .then(|| {
+                    B::vocabulary_parallel_linear(
+                        LinearSpec {
+                            input: args.hidden_size,
+                            output: args.vocab_size,
+                            weight: ParameterSpec::trainable(head).map_err(Error::backend)?,
+                            bias: None,
+                            format: args.linear_format_for(head),
+                        },
+                        geometry
+                            .output_range()
+                            .cloned()
+                            .ok_or_else(|| Error::backend("missing Muse-Glimmer output range"))?,
                         context,
                     )
                 })

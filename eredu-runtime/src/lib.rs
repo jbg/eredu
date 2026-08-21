@@ -31,6 +31,8 @@ pub mod layered;
 pub mod parallel;
 /// Neutral checkpoint materialization and stable parameter binding.
 pub mod parameter;
+/// Backend-neutral rank-local architecture ownership.
+pub mod partition;
 /// Backend-neutral bounded background weight-prefetch execution.
 pub mod prefetch;
 /// Atomic realtime model, schedule, sampler, and random-state transactions.
@@ -96,21 +98,29 @@ pub use inspection::{
     TargetStateCapture, TargetStateCaptureError, TargetStateTap,
 };
 pub use layered::{
-    CompositeLayeredTraversalHook, LayeredArchitecture, LayeredForwardState, LayeredTraversalHook,
-    LayeredTraversalPoint, LayeredUnitAction, LayerwisePolicy, LayerwiseRuntime,
-    LayerwiseRuntimeError, ParallelLayeredArchitecture, ResidentRuntime, ResidentUnitWindow,
-    ResidentUnitWindowError,
+    ArchitectureGroupKind, ArchitectureGroupPlacement, ArchitectureGroupTransport,
+    ArchitectureMergeDestination, ArchitectureParallelSubgroup, CompositeLayeredTraversalHook,
+    LayeredArchitecture, LayeredForwardState, LayeredTraversalHook, LayeredTraversalPoint,
+    LayeredUnitAction, LayerwiseAcquireError, LayerwisePolicy, LayerwiseRuntime,
+    LayerwiseRuntimeError, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
+    ResidentRuntime, ResidentUnitWindow, ResidentUnitWindowError, RoutedLayeredArchitecture,
 };
 pub use parallel::{
-    aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    partitioned_projection_group, projection_parameter_group, segmented_projection_group,
-    LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelModelInfo, ParallelPlanError,
-    ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ProjectionSharding, ShardingPolicy,
-    TensorPlacement,
+    aligned_partition_units, expand_linear_format_parameter_groups, module_parameter_group,
+    partitioned_module_parameter_group, partitioned_projection_group, projection_parameter_group,
+    segmented_projection_group, LocalModelLayout, LocalTensorLayout, MemberSharding,
+    ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+    ProjectionSharding, ShardingPolicy, TensorPlacement,
 };
 pub use parameter::{
     bind_materialized_unit, bindings_from_recipe_set, materialize_bindings, MaterializedUnit,
     ParameterOrchestrationError, RecipeBindingError,
+};
+pub use partition::{
+    validate_boundary_tensor_count, ArchitectureBoundary, ArchitectureBoundaryError,
+    ArchitectureParameterDescription, ArchitectureParameterError, ArchitecturePartition,
+    ArchitecturePartitionError, NoAuxiliaryBoundary, OwnedParameterGroupSpec, ParameterGroupOwner,
+    PartitionGroup, PartitionOwnership, PartitionState,
 };
 pub use prefetch::{BackgroundPrefetchWorker, BackgroundPrefetchWorkerError};
 pub use realtime::{

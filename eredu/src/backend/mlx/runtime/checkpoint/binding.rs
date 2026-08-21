@@ -8,7 +8,7 @@ use eredu_checkpoint::{
     store::{ReadPolicy, TensorReadRequest},
     WeightQuantization,
 };
-use eredu_runtime::{WeightBinding, WeightBindingPlan};
+use eredu_runtime::{ParameterGroupSpec, ParameterRole, WeightBinding, WeightBindingPlan};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -53,6 +53,27 @@ pub fn canonical_checkpoint_name(parameter_name: &str) -> String {
         "inner.bias" => "bias".into(),
         _ => canonical,
     }
+}
+
+/// Exact local parameter targets owned by one neutral semantic role.
+///
+/// Targets come from the architecture parameter contract, so packed
+/// companions and alias destinations participate atomically with their base
+/// weight rather than being rediscovered from family-specific path syntax.
+pub(crate) fn parameter_role_targets(
+    groups: &[ParameterGroupSpec],
+    role: ParameterRole,
+) -> BTreeSet<String> {
+    groups
+        .iter()
+        .filter(|group| group.role() == role)
+        .flat_map(ParameterGroupSpec::members)
+        .map(|member| member.target().to_owned())
+        .collect()
+}
+
+pub(crate) fn parameter_name_in_targets(name: &str, targets: &BTreeSet<String>) -> bool {
+    targets.contains(name) || targets.contains(&canonical_checkpoint_name(name))
 }
 
 /// Whether a flattened module parameter has checkpoint-backed storage.

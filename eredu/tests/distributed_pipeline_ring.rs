@@ -62,6 +62,7 @@ const OPAQUE_GEMMA4_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_GEMMA4_MEDIA";
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FixtureFamily {
     Llama,
+    Mistral,
     DeepSeek,
     DeepSeekV4,
     DeepSeekGguf,
@@ -98,6 +99,7 @@ impl FixtureFamily {
     const fn name(self) -> &'static str {
         match self {
             Self::Llama => "llama",
+            Self::Mistral => "mistral",
             Self::DeepSeek => "deepseek",
             Self::DeepSeekV4 => "deepseek-v4",
             Self::DeepSeekGguf => "deepseek-gguf",
@@ -134,6 +136,7 @@ impl FixtureFamily {
     fn parse(value: &str) -> Self {
         for family in [
             Self::Llama,
+            Self::Mistral,
             Self::DeepSeek,
             Self::DeepSeekV4,
             Self::DeepSeekGguf,
@@ -175,6 +178,7 @@ impl FixtureFamily {
     fn layer_count(self) -> usize {
         match self {
             Self::Llama
+            | Self::Mistral
             | Self::DeepSeek
             | Self::DeepSeekV4
             | Self::DeepSeekGguf
@@ -231,6 +235,7 @@ impl FixtureFamily {
     fn descriptor_names(self) -> (&'static str, &'static str) {
         match self {
             Self::Llama => ("llama", "llama"),
+            Self::Mistral => ("mistral", "mistral"),
             Self::DeepSeek | Self::DeepSeekGguf => ("deepseek_v3", "deepseek_v3"),
             Self::DeepSeekV4 => ("deepseek_v4", "deepseek_v4"),
             Self::Gemma => ("gemma4", "gemma4"),
@@ -285,7 +290,13 @@ impl FixtureFamily {
     const fn needs_resident_reference(self) -> bool {
         matches!(
             self,
-            Self::DeepSeek
+            Self::Llama
+                | Self::Mistral
+                | Self::Gemma
+                | Self::MuseGlimmer
+                | Self::Qwen2
+                | Self::Qwen3
+                | Self::DeepSeek
                 | Self::DeepSeekV4
                 | Self::DeepSeekGguf
                 | Self::KimiLinear
@@ -309,6 +320,18 @@ impl FixtureFamily {
                 | Self::Inkling
                 | Self::InklingMultimodal
                 | Self::InklingGguf
+        )
+    }
+
+    const fn needs_tp2_opaque_reference(self) -> bool {
+        matches!(
+            self,
+            Self::Llama
+                | Self::Mistral
+                | Self::Gemma
+                | Self::MuseGlimmer
+                | Self::Qwen2
+                | Self::Qwen3
         )
     }
 
@@ -452,6 +475,18 @@ fn pipeline_ring_worker() {
         } else {
             vec![1, 2]
         };
+        let reference_input =
+            PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap();
+        let reference = (tensor_parallel_size == 2
+            && pipeline_parallel_size == 1
+            && expert_parallel_size == 1
+            && family.needs_tp2_opaque_reference())
+        .then(|| resident_reference_for_prepared(&checkpoint, &reference_input, &stream));
+        let reference_tolerance = if image_mode || gemma4_media_mode {
+            5e-4
+        } else {
+            family.comparison_tolerance()
+        };
         if inkling_mtp_mode {
             assert!(session
                 .prompt_cache_layer_prefix_offsets()
@@ -481,6 +516,9 @@ fn pipeline_ring_worker() {
             .unwrap()
             .wait()
             .unwrap();
+        if let (Some(actual), Some((expected, _))) = (output.logits(), &reference) {
+            assert_final_logits_close(actual, expected, reference_tolerance);
+        }
         let config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap())
                 .unwrap();
@@ -493,6 +531,8 @@ fn pipeline_ring_worker() {
         let model_family = match outer_model_type {
             "gemma4" | "gemma4_unified" => "gemma4",
             "gpt_oss" => "gpt_oss",
+            "llama" => "llama",
+            "mistral" => "mistral",
             "muse_glimmer" => "muse_glimmer",
             "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
             _ => "inkling",
@@ -534,15 +574,22 @@ fn pipeline_ring_worker() {
                 &PromptCacheOptions::default(),
             )
             .unwrap();
-        let continuity_token = session
-            .sample_and_synchronize(output.logits(), 1, &mut DefaultSampler, 0.0, None, false)
-            .unwrap()
-            .token;
+        let continuity_token = if reference.is_some() {
+            Array::from_slice(&[0u32], &[1, 1])
+        } else {
+            session
+                .sample_and_synchronize(output.logits(), 1, &mut DefaultSampler, 0.0, None, false)
+                .unwrap()
+                .token
+        };
         let uninterrupted = session
             .decode(&backend, continuity_token.clone())
             .unwrap()
             .wait()
             .unwrap();
+        if let (Some(actual), Some((_, expected))) = (uninterrupted.logits(), &reference) {
+            assert_final_logits_close(actual, expected, reference_tolerance);
+        }
         let uninterrupted_logits = uninterrupted
             .logits()
             .map(|logits| logits.evaluated().unwrap().as_slice::<f32>().to_vec());
@@ -586,7 +633,7 @@ fn pipeline_ring_worker() {
     let execution = MlxBackend::new(&stream, &stream)
         .communication_for_topology(topology, &group)
         .unwrap();
-    let reference = (pipeline_rank == 1
+    let reference = (pipeline_rank + 1 == pipeline_parallel_size
         && (family.needs_resident_reference()
             || matches!(family, FixtureFamily::Lfm2 | FixtureFamily::Lfm2Moe)))
     .then(|| {
@@ -1146,6 +1193,45 @@ fn resident_reference_quantized(
     (prefill, decode)
 }
 
+fn resident_reference_for_prepared(
+    checkpoint: &Path,
+    prepared: &PreparedModelInput,
+    stream: &Stream,
+) -> (Vec<f32>, Vec<f32>) {
+    let backend = MlxBackend::new(stream, stream);
+    let mut model = eredu::load_model(&backend, checkpoint, ModelLoadOptions::default())
+        .unwrap()
+        .into_inner()
+        .into_complete()
+        .unwrap();
+    let mut cache = model.new_cache();
+    let parts = prepared.input_parts();
+    let prefill = model
+        .submit_prefill(
+            eredu::backend::mlx::runtime::media::input::ModelInput::new(&parts),
+            &mut cache,
+            stream,
+        )
+        .unwrap()
+        .wait()
+        .unwrap()
+        .evaluated()
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec();
+    let token = Array::from_slice(&[0u32], &[1, 1]);
+    let decode = model
+        .submit_decode(token, &mut cache, stream)
+        .unwrap()
+        .wait()
+        .unwrap()
+        .evaluated()
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec();
+    (prefill, decode)
+}
+
 fn inkling_multimodal_prepared_input() -> PreparedModelInput {
     use eredu::backend::mlx::runtime::media::input::{
         InputMetadata, InputPart, Modality, ModelInput,
@@ -1401,10 +1487,18 @@ fn write_f32_shard(path: &Path, tensors: &[(&str, Vec<usize>, f32)]) {
 }
 
 fn write_fixture(directory: &Path) {
+    write_llama_compatible_fixture(directory, "llama");
+}
+
+fn write_mistral_fixture(directory: &Path) {
+    write_llama_compatible_fixture(directory, "mistral");
+}
+
+fn write_llama_compatible_fixture(directory: &Path, model_type: &str) {
     std::fs::write(
         directory.join("config.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "model_type": "llama",
+            "model_type": model_type,
             "hidden_size": 4,
             "num_hidden_layers": 2,
             "intermediate_size": 8,
@@ -3372,6 +3466,10 @@ fn write_gemma4_multimodal_tensor_parallel_fixture(directory: &Path) {
     write_gemma4_tensor_parallel_fixture_with_options(directory, false, true);
 }
 
+fn write_gemma4_tied_multimodal_tensor_parallel_fixture(directory: &Path) {
+    write_gemma4_tensor_parallel_fixture_with_options(directory, true, true);
+}
+
 fn write_gemma4_tensor_parallel_fixture_with_options(
     directory: &Path,
     tied: bool,
@@ -4374,6 +4472,44 @@ fn ring_two_process_pipeline() {
     run_ring_pipeline(false, FixtureFamily::Llama);
 }
 
+/// Compares the public Llama TP=2 session's prefill and decode logits with a
+/// fully resident single-rank reference built from the identical checkpoint.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Llama fixture"]
+fn ring_two_process_llama_tensor_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Llama,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Runs the same TP=2 resident-reference oracle through the Mistral
+/// specialization of the shared neutral decoder.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Mistral fixture"]
+fn ring_two_process_mistral_tensor_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_mistral_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Mistral,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
 /// Proves the public generic loader and architecture-erased model session own
 /// pipeline loading, prefill, repeated decode, cache state, and communication.
 #[test]
@@ -4601,6 +4737,44 @@ fn ring_two_process_gemma_pipeline() {
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_qwen2_pipeline() {
     run_ring_pipeline(false, FixtureFamily::Qwen2);
+}
+
+/// Compares Qwen2 TP=2 prefill and decode logits with the fully resident
+/// single-rank public-loader result.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Qwen2 fixture"]
+fn ring_two_process_qwen2_tensor_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_qwen_fixture(checkpoint.path(), "qwen2");
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Qwen2,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
+/// Compares dense Qwen3 TP=2 prefill and decode logits with the fully
+/// resident single-rank public-loader result.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic dense Qwen3 fixture"]
+fn ring_two_process_qwen3_tensor_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_qwen_fixture(checkpoint.path(), "qwen3");
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Qwen3,
+        WorkerMode::OpaqueSession,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
 }
 
 /// Verifies Q/K-normalized Qwen3 execution through streamed local layers.
@@ -5073,12 +5247,57 @@ fn ring_four_process_qwen3_vl_tensor_pipeline() {
     run_ring_cartesian_pipeline(false, FixtureFamily::Qwen3Vl, "tp-pp");
 }
 
+/// Exercises Qwen3-VL's vision unit and decoder layers through bounded
+/// checkpoint streaming under TP=2 x PP=2, with resident-reference logits.
+#[test]
+#[ignore = "requires the MLX Ring backend, four loopback CPU ranks, and the synthetic Qwen3-VL media fixture"]
+fn ring_four_process_qwen3_vl_streamed_tensor_pipeline() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::Qwen3Vl, "tp-pp");
+}
+
+/// Exercises the same Qwen3-VL TP+PP graph with host-resident media/decoder
+/// units and a one-unit device window.
+#[test]
+#[ignore = "requires the MLX Ring backend, four loopback CPU ranks, and the synthetic Qwen3-VL host-layerwise media fixture"]
+fn ring_four_process_qwen3_vl_layerwise_host_tensor_pipeline() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::Qwen3Vl,
+        "tp-pp",
+        WorkerMode::Standard,
+    );
+}
+
 /// Exercises routed Qwen3-VL across TP=2 x PP=2 x EP=2 with the neutral
 /// shared vision tower and stage-local expert ownership.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_eight_process_qwen3_vl_moe_triple_axis() {
     run_ring_cartesian_pipeline(false, FixtureFamily::Qwen3VlMoe, "tp-pp-ep");
+}
+
+/// Combines bounded Qwen3-VL media/decoder streaming with independent cached
+/// routed experts across TP=2 x PP=2 x EP=2.
+#[test]
+#[ignore = "requires the MLX Ring backend, eight loopback CPU ranks, and the synthetic Qwen3-VL-MoE media fixture"]
+fn ring_eight_process_qwen3_vl_moe_streamed_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::Qwen3VlMoe,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Combines host-layerwise Qwen3-VL media/decoder units with independently
+/// cached routed experts across all three parallel axes.
+#[test]
+#[ignore = "requires the MLX Ring backend, eight loopback CPU ranks, and the synthetic Qwen3-VL-MoE host-layerwise media fixture"]
+fn ring_eight_process_qwen3_vl_moe_layerwise_host_triple_axis_expert_cache() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::Qwen3VlMoe,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
 }
 
 /// Verifies multimodal Qwen3.5-MoE across all Cartesian axes with bounded
@@ -5477,7 +5696,7 @@ fn inkling_mtp_prompt_round_trip() {
 /// Exercises the neutral Gemma 4 text binder through the public loader and
 /// opaque session on a pure two-rank tensor-parallel topology.
 #[test]
-#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic untied Gemma 4 text fixture"]
 fn ring_two_process_gemma4_tensor_parallel_opaque_session() {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
@@ -5496,7 +5715,7 @@ fn ring_two_process_gemma4_tensor_parallel_opaque_session() {
 /// Exercises Gemma 4 Unified's neutral image and audio towers, ordered media
 /// assembly, per-layer inputs, TP decoder, and prompt-cache continuation.
 #[test]
-#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic untied Gemma 4 Unified media fixture"]
 fn ring_two_process_gemma4_multimodal_tensor_parallel_opaque_session() {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
@@ -5512,10 +5731,29 @@ fn ring_two_process_gemma4_multimodal_tensor_parallel_opaque_session() {
     );
 }
 
+/// Compares tied Gemma 4 Unified image/audio prefill and decode with the
+/// single-rank resident model while the TP path projects through embeddings.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic tied Gemma 4 Unified media fixture"]
+fn ring_two_process_gemma4_tied_multimodal_tensor_parallel_resident_reference() {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_gemma4_tied_multimodal_tensor_parallel_fixture(checkpoint.path());
+    let checkpoint_path = checkpoint.path().to_path_buf();
+    run_ring_pipeline_processes(
+        WorkerResidency::FullyResident,
+        FixtureFamily::Gemma,
+        WorkerMode::OpaqueGemma4Media,
+        checkpoint,
+        checkpoint_path,
+        Some("tp"),
+    );
+}
+
 /// Verifies that a tied Gemma 4 checkpoint without an `lm_head` is bound and
 /// projected through the rank-local vocabulary embedding by the public path.
 #[test]
-#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic tied Gemma 4 text fixture"]
 fn ring_two_process_gemma4_tied_tensor_parallel_opaque_session() {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
@@ -5534,7 +5772,7 @@ fn ring_two_process_gemma4_tied_tensor_parallel_opaque_session() {
 /// Exercises the neutral Muse-Glimmer text binder through the public loader
 /// and opaque session on a pure two-rank tensor-parallel topology.
 #[test]
-#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Muse-Glimmer text fixture"]
 fn ring_two_process_muse_glimmer_tensor_parallel_opaque_session() {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
@@ -5554,7 +5792,7 @@ fn ring_two_process_muse_glimmer_tensor_parallel_opaque_session() {
 /// the public loader on a pure two-rank tensor-parallel topology, including a
 /// paged prompt-cache save/open/continue round trip.
 #[test]
-#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Muse-Glimmer image fixture"]
 fn ring_two_process_muse_glimmer_image_tensor_parallel_opaque_session() {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
@@ -5991,6 +6229,7 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
     } else {
         match family {
             FixtureFamily::Llama => write_fixture(checkpoint.path()),
+            FixtureFamily::Mistral => write_mistral_fixture(checkpoint.path()),
             FixtureFamily::DeepSeek => write_deepseek_fixture(checkpoint.path(), 2),
             FixtureFamily::DeepSeekV4 => write_deepseek_v4_fixture(checkpoint.path()),
             FixtureFamily::Gemma => write_gemma_fixture(checkpoint.path()),

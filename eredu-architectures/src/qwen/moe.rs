@@ -368,3 +368,38 @@ impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
         }
     }
 }
+
+impl<B: RoutedNeuralBackend> crate::decoder::RoutedFeedForwardOperator<B> for FeedForward<B> {
+    fn forward_with_provider<P>(
+        &mut self,
+        layer: usize,
+        input: &B::Tensor,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        FeedForward::forward_with_provider(self, layer, pass, input, context, provider)
+    }
+
+    fn forward_parallel_with_provider<P>(
+        &mut self,
+        layer: usize,
+        input: &B::Tensor,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        FeedForward::forward_with_provider_parallel(
+            self, layer, pass, input, parallel, context, provider,
+        )
+    }
+}

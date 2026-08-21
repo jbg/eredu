@@ -442,16 +442,6 @@ pub(crate) struct MlxNamedModule<M> {
 }
 
 impl<M: ModuleParameters> MlxNamedModule<M> {
-    /// Attaches one authoritative weight identity and optional bias identity.
-    pub(crate) fn new(
-        inner: M,
-        weight: ParameterSpec,
-        bias: Option<ParameterSpec>,
-    ) -> Result<Self, ComputeError> {
-        let topology = parameter_topology(&inner, weight, bias)?;
-        Ok(Self { inner, topology })
-    }
-
     fn with_exact_topology(
         inner: M,
         specs: impl IntoIterator<Item = (&'static str, ParameterSpec)>,
@@ -1657,6 +1647,34 @@ impl NeuralBackend for MlxBackend {
             .as_ref()
             .ok_or_else(|| ComputeError::backend("projection has no vocabulary ownership"))?;
         let local = compute(linear.module.forward(input, context))?;
+        let widths = (0..parallel.size())
+            .map(|rank| {
+                eredu_core::balanced_contiguous_range(
+                    range.global_vocabulary,
+                    parallel.size(),
+                    rank,
+                    false,
+                )
+                .map(|range| range.len())
+                .map_err(ComputeError::backend)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        compute(safemlx::distributed::all_gather_uneven_axis(
+            &local, -1, &widths, parallel, context,
+        ))
+    }
+
+    fn vocabulary_parallel_embedding_project(
+        embedding: &mut MlxEmbedding,
+        input: &Array,
+        parallel: &Group,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        let range = embedding
+            .vocabulary_range
+            .clone()
+            .ok_or_else(|| ComputeError::backend("embedding has no vocabulary ownership"))?;
+        let local = embedding.as_linear(input, context)?;
         let widths = (0..parallel.size())
             .map(|rank| {
                 eredu_core::balanced_contiguous_range(

@@ -26,8 +26,16 @@ pub use config::{ConfigError, FeedForwardPolicy, GgufTensorCatalog, LayerPolicy,
 pub use family::{FamilyConfig, FamilyConfigError};
 pub use graph::{component_graph, state_layout, ComponentOptions};
 pub use media::ModalityProjector;
-pub use model::{DecoderInputPart, ForwardContext, LayeredModel, ModelInput, StaticModules, Unit};
-pub use parallel::{layer_parameter_groups, local_block_args, static_parameter_groups};
+pub use model::{
+    DecoderInputPart, ForwardContext, LayeredModel, ModelInput, StaticModules, TextBoundary,
+    TextBoundarySchema, Unit,
+};
+pub use parallel::{
+    audio_layer_parameter_groups, audio_static_parameter_groups, layer_parameter_groups,
+    local_block_args, local_geometry, modality_projection_parameter_groups,
+    static_parameter_groups, vision_layer_parameter_groups, vision_static_parameter_groups,
+    LocalGeometry,
+};
 pub use projector::{
     family_from_gguf_metadata, translate_mmproj_weight_name, validate_projector_identity,
 };

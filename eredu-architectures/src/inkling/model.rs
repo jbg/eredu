@@ -1,19 +1,25 @@
 //! One neutral Inkling multimodal model for resident and bounded runtimes.
 
+use std::sync::Arc;
+
+use eredu_core::cache::PromptCacheTopology;
 use eredu_nn::{
     multimodal::{assemble_ordered_inputs, OrderedInputPart},
-    AuxiliaryConvolutionState, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator,
-    LinearSpec, NormalizationOperator, NormalizationSpec, ParameterSpec, Parameterized,
-    RoutedNeuralBackend, Tensor,
+    AuxiliaryConvolutionState, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error,
+    Index, LinearOperator, LinearSpec, NormalizationOperator, NormalizationSpec, ParameterSpec,
+    Parameterized, RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{
-    ExecutionGraph, ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
-    RoutedExpertProvider,
+    ArchitectureParameterDescription, ExecutionGraph, ExecutionUnitLayout, ExpertPass,
+    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, ModelStateIdentity,
+    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
+    ParameterGroupOwner, RoutedExpertProvider, RoutedLayeredArchitecture, StateLayout,
 };
 
 use super::{
-    state_layout, AudioInput, AudioTower, DecoderLayer, ModelArgs, MtpModel, MtpOutput,
-    VisionLayer, VisionStatic,
+    layer_parameter_groups, mtp_parameter_groups, state_layout, static_parameter_groups,
+    vision_layer_parameter_groups, AudioInput, AudioTower, DecoderLayer, LocalGeometry, ModelArgs,
+    MtpModel, MtpOutput, VisionLayer, VisionStatic,
 };
 
 /// Pinned text, audio, and image modules.
@@ -87,6 +93,63 @@ impl<B: RoutedNeuralBackend> StaticModules<B> {
                 .transpose()?,
         })
     }
+
+    fn new_parallel(
+        args: &ModelArgs,
+        geometry: &LocalGeometry,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let text = &args.text_config;
+        let norm = |name: &str| {
+            B::rms_norm(
+                NormalizationSpec {
+                    dimensions: text.hidden_size,
+                    epsilon: text.rms_norm_eps,
+                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
+                },
+                context,
+            )
+        };
+        Ok(Self {
+            embeddings: B::vocabulary_parallel_embedding(
+                EmbeddingSpec {
+                    vocabulary: text.vocab_size,
+                    dimensions: text.hidden_size,
+                    weight: ParameterSpec::trainable("model.embed_tokens.weight")
+                        .map_err(Error::backend)?,
+                    quantization: text
+                        .linear_format_for("model.embed_tokens.weight")
+                        .weight_quantization(),
+                },
+                geometry.embedding_range().clone(),
+                context,
+            )?,
+            embedding_norm: norm("model.embed_norm.weight")?,
+            final_norm: norm("model.norm.weight")?,
+            output: B::vocabulary_parallel_linear(
+                LinearSpec {
+                    input: text.hidden_size,
+                    output: text.vocab_size,
+                    weight: ParameterSpec::trainable("lm_head.weight").map_err(Error::backend)?,
+                    bias: None,
+                    format: text.linear_format_for("lm_head.weight"),
+                },
+                geometry.output_range().clone(),
+                context,
+            )?,
+            mtp: MtpModel::new(args, context)?,
+            audio: args
+                .audio_config
+                .as_ref()
+                .map(|audio| AudioTower::new(audio, context))
+                .transpose()?,
+            vision: args
+                .vision_config
+                .as_ref()
+                .map(|vision| VisionStatic::new(vision, context))
+                .transpose()?,
+        })
+    }
 }
 
 /// One ordered decoder-ingress segment.
@@ -116,6 +179,24 @@ pub struct ModelInput<'a, T> {
     pub audio: Option<AudioInput<'a, T>>,
 }
 
+/// Typed text-decoder input for one pipeline partition.
+pub enum TextPartitionInput<'a, T> {
+    /// Token identities owned by the first decoder partition.
+    Tokens(&'a T),
+    /// Decoder activation received from an upstream partition.
+    Hidden(T),
+}
+
+/// Completed architecture-owned embedded prediction partition.
+pub struct PartitionMtpOutput<T> {
+    /// Complete vocabulary logits.
+    pub logits: T,
+    /// Prediction-space hidden state.
+    pub hidden: T,
+    /// Token identity associated with the prediction.
+    pub tokens: T,
+}
+
 enum PreparedPart<T> {
     Text { tokens: T, embeddings: T },
     Image { tokens: T },
@@ -133,6 +214,73 @@ pub enum Unit<B: RoutedNeuralBackend> {
     Text(DecoderLayer<B>),
 }
 
+impl<B, S> RoutedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
+{
+    fn forward_unit_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        match (group, unit) {
+            (1, Unit::Text(unit)) => self.forward_text_unit_with_provider(
+                index, unit, hidden, state, pass, provider, context,
+            ),
+            (_, unit) => <Self as LayeredArchitecture<B, S>>::forward_unit(
+                self, group, index, unit, hidden, state, forward, context,
+            ),
+        }
+    }
+}
+
+impl<B, S> ParallelRoutedLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
+{
+    fn forward_unit_parallel_with_provider<P>(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        pass: ExpertPass,
+        provider: &mut P,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        match (group, unit) {
+            (1, Unit::Text(unit)) => self.forward_text_unit_parallel_with_provider(
+                index, unit, hidden, state, pass, provider, parallel, context,
+            ),
+            (_, unit) => <Self as ParallelLayeredArchitecture<B, S>>::forward_unit_parallel(
+                self, group, index, unit, hidden, state, forward, parallel, context,
+            ),
+        }
+    }
+}
+
 /// Transient values retained across component groups.
 pub struct ForwardContext<T> {
     parts: Vec<PreparedPart<T>>,
@@ -146,21 +294,166 @@ pub struct ForwardContext<T> {
 pub struct LayeredModel<B: RoutedNeuralBackend> {
     args: ModelArgs,
     static_modules: StaticModules<B>,
+    parallel_geometry: Option<Arc<LocalGeometry>>,
 }
 
 impl<B: RoutedNeuralBackend> LayeredModel<B> {
+    /// Enters or resumes a routed text partition through the family embedding
+    /// boundary.
+    pub fn begin_routed_text_partition(
+        &mut self,
+        input: TextPartitionInput<'_, B::Tensor>,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error> {
+        let hidden = match input {
+            TextPartitionInput::Tokens(tokens) => match parallel {
+                Some(parallel) => self.mtp_token_embeddings_parallel(tokens, parallel, context)?,
+                None => self.mtp_token_embeddings(tokens, context)?,
+            },
+            TextPartitionInput::Hidden(hidden) => hidden,
+        };
+        Ok(self.resume_partition_text(hidden))
+    }
+
+    /// Resumes an already assembled text partition in the canonical layered context.
+    pub fn resume_partition_text(
+        &self,
+        hidden: B::Tensor,
+    ) -> LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>> {
+        LayeredForwardState {
+            context: ForwardContext {
+                tokens: hidden.clone(),
+                parts: Vec::new(),
+                audio: None,
+                has_vision: false,
+                target_hidden: None,
+            },
+            hidden,
+        }
+    }
+
     /// Builds unloaded pinned modules from normalized family configuration.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         let static_modules = StaticModules::new(&args, context)?;
         Ok(Self {
             args,
             static_modules,
+            parallel_geometry: None,
+        })
+    }
+
+    /// Builds one planner-derived rank-local realization of the canonical graph.
+    pub fn new_parallel(
+        args: ModelArgs,
+        geometry: Arc<LocalGeometry>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        geometry.validate_for(&args).map_err(Error::backend)?;
+        let static_modules = StaticModules::new_parallel(&args, &geometry, context)?;
+        Ok(Self {
+            args,
+            static_modules,
+            parallel_geometry: Some(geometry),
         })
     }
 
     /// Returns normalized family configuration.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
+    }
+
+    /// Describes pinned media/text modules and every graph unit with explicit
+    /// architecture ownership.
+    pub fn parameter_description(
+        &self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<ArchitectureParameterDescription, Error> {
+        let graph = ExecutionGraph::chain(["vision", "text_decoder"]).map_err(Error::backend)?;
+        let counts = [
+            self.args
+                .vision_config
+                .as_ref()
+                .map_or(0, |vision| vision.num_hidden_layers as usize),
+            self.args.text_config.num_hidden_layers as usize,
+        ];
+        let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
+        let static_groups = static_parameter_groups(&self.args).map_err(Error::backend)?;
+        let mut static_roles = vec!["embedding", "embedding_norm", "norm", "output"];
+        if self.args.audio_config.is_some() {
+            static_roles.extend(["audio", "audio"]);
+        }
+        if self.args.vision_config.is_some() {
+            static_roles.extend(std::iter::repeat_n(
+                "vision",
+                static_groups.len() - static_roles.len(),
+            ));
+        }
+        debug_assert_eq!(static_groups.len(), static_roles.len());
+        let mtp_groups = mtp_parameter_groups(&self.args).map_err(Error::backend)?;
+        let mut expected = static_groups
+            .iter()
+            .chain(&mtp_groups)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut owned = static_groups
+            .into_iter()
+            .zip(static_roles)
+            .map(|(group, role)| {
+                let owner = if role == "embedding" {
+                    ParameterGroupOwner::static_any_of(["embedding", "mtp"])
+                } else {
+                    ParameterGroupOwner::static_role(role)
+                };
+                OwnedParameterGroupSpec::new(owner, group)
+            })
+            .chain(mtp_groups.into_iter().map(|group| {
+                OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role("mtp"), group)
+            }))
+            .collect::<Vec<_>>();
+        for group_index in 0..2 {
+            let owner_group = layout
+                .group_id(group_index)
+                .expect("Inkling layout group")
+                .clone();
+            for index in 0..counts[group_index] {
+                let groups = if group_index == 0 {
+                    let vision = self
+                        .args
+                        .vision_config
+                        .as_ref()
+                        .expect("vision group configured");
+                    let layer =
+                        VisionLayer::<B>::new(vision, index, vision.layer_specs()[index], context)?;
+                    vision_layer_parameter_groups::<B>(&layer, index)
+                } else {
+                    layer_parameter_groups(&self.args, index)
+                }
+                .map_err(Error::backend)?;
+                expected.extend(groups.iter().cloned());
+                owned.extend(groups.into_iter().map(|group| {
+                    OwnedParameterGroupSpec::new(
+                        ParameterGroupOwner::execution_unit(owner_group.clone(), index),
+                        group,
+                    )
+                }));
+            }
+        }
+        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
+            .map_err(Error::backend)
+    }
+
+    /// Returns the state layout authoritative for this realization.
+    pub fn runtime_state_layout(&self) -> Result<StateLayout, Error> {
+        match &self.parallel_geometry {
+            Some(geometry) => Ok(geometry.state_layout().clone()),
+            None => state_layout(&self.args).map_err(Error::backend),
+        }
+    }
+
+    /// Shares validated planner-derived geometry with backend residency policy.
+    pub fn shared_parallel_geometry(&self) -> Option<Arc<LocalGeometry>> {
+        self.parallel_geometry.clone()
     }
 
     /// Starts a text-only pass from an embedding produced by a backend-owned
@@ -382,6 +675,30 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             .forward(&embeddings, context)
     }
 
+    /// Embeds predictor token identities through the rank-local shared ingress.
+    pub fn mtp_token_embeddings_parallel(
+        &mut self,
+        tokens: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Inkling model was not built with local geometry",
+            ));
+        }
+        let embeddings = B::vocabulary_parallel_lookup(
+            &mut self.static_modules.embeddings,
+            tokens,
+            EmbeddingLookupPolicy::Strict,
+            parallel,
+            context,
+        )?;
+        self.static_modules
+            .embedding_norm
+            .forward(&embeddings, context)
+    }
+
     /// Normalizes predictor embeddings supplied by a backend-owned sharded
     /// vocabulary table.
     pub fn normalize_mtp_embeddings(
@@ -426,6 +743,38 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             .forward_step(hidden, embeddings, tokens, depth, state, context)
     }
 
+    /// Executes one complete embedded-prediction partition, including shared
+    /// embedding, predictor recurrence, and vocabulary projection.
+    pub fn forward_partition_mtp<S>(
+        &mut self,
+        hidden: &B::Tensor,
+        tokens: &B::Tensor,
+        depth: usize,
+        state: &mut [S],
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<PartitionMtpOutput<B::Tensor>, Error>
+    where
+        S: eredu_nn::AttentionCache<B::Tensor> + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
+    {
+        let embeddings = match parallel {
+            Some(parallel) => self.mtp_token_embeddings_parallel(tokens, parallel, context)?,
+            None => self.mtp_token_embeddings(tokens, context)?,
+        };
+        let output = self.forward_mtp_step(hidden, &embeddings, tokens, depth, state, context)?;
+        let logits = match parallel {
+            Some(parallel) => {
+                self.project_mtp_logits_parallel(&output.hidden, parallel, context)?
+            }
+            None => self.project_mtp_logits(&output.hidden, context)?,
+        };
+        Ok(PartitionMtpOutput {
+            logits,
+            hidden: output.hidden,
+            tokens: output.tokens,
+        })
+    }
+
     /// Applies the target-owned muP-scaled vocabulary projection to MTP hidden state.
     pub fn project_mtp_logits(
         &mut self,
@@ -445,6 +794,70 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         let mut indexes = vec![Index::Full; logits.shape().len()];
         *indexes.last_mut().expect("logits have vocabulary axis") = Index::Range(0, vocabulary);
         logits.index(&indexes, context)
+    }
+
+    /// Applies the rank-local output projection to one MTP hidden state.
+    pub fn project_mtp_logits_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Inkling model was not built with local geometry",
+            ));
+        }
+        let hidden = self.final_mtp_parallel_hidden(hidden, context)?;
+        let logits = B::vocabulary_parallel_project(
+            &mut self.static_modules.output,
+            &hidden,
+            parallel,
+            context,
+        )?;
+        self.trim_logits(logits, context)
+    }
+
+    /// Applies final target normalization and the rank-local output projection.
+    pub fn project_target_logits_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Inkling model was not built with local geometry",
+            ));
+        }
+        let hidden = self.static_modules.final_norm.forward(hidden, context)?;
+        let hidden = hidden.multiply_scalar(
+            self.args.text_config.logits_mup_width_multiplier.recip(),
+            context,
+        )?;
+        let logits = B::vocabulary_parallel_project(
+            &mut self.static_modules.output,
+            &hidden,
+            parallel,
+            context,
+        )?;
+        self.trim_logits(logits, context)
+    }
+
+    /// Applies final target normalization, released logit scaling, output
+    /// projection, and vocabulary trimming for a serial partition.
+    pub fn project_target_logits(
+        &mut self,
+        hidden: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let hidden = self.static_modules.final_norm.forward(hidden, context)?;
+        let hidden = hidden.multiply_scalar(
+            self.args.text_config.logits_mup_width_multiplier.recip(),
+            context,
+        )?;
+        let logits = self.static_modules.output.forward(&hidden, context)?;
+        self.trim_logits(logits, context)
     }
 
     /// Executes one text unit while delegating routed and shared banks to runtime residency.
@@ -500,6 +913,60 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                 }),
             })
             .collect()
+    }
+
+    fn prepare_parts_parallel(
+        &mut self,
+        parts: &[DecoderInputPart<'_, B::Tensor>],
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Vec<PreparedPart<B::Tensor>>, Error> {
+        if parts.is_empty() {
+            return Err(Error::backend("Inkling input has no ordered parts"));
+        }
+        parts
+            .iter()
+            .map(|part| match part {
+                DecoderInputPart::Text(tokens) => Ok(PreparedPart::Text {
+                    tokens: (*tokens).clone(),
+                    embeddings: B::vocabulary_parallel_lookup(
+                        &mut self.static_modules.embeddings,
+                        tokens,
+                        EmbeddingLookupPolicy::Strict,
+                        parallel,
+                        context,
+                    )?,
+                }),
+                DecoderInputPart::Image(tokens) => Ok(PreparedPart::Image {
+                    tokens: (*tokens).clone(),
+                }),
+                DecoderInputPart::Audio(tokens) => Ok(PreparedPart::Audio {
+                    tokens: (*tokens).clone(),
+                }),
+                DecoderInputPart::Projected { tokens, embeddings } => Ok(PreparedPart::Projected {
+                    tokens: (*tokens).clone(),
+                    embeddings: (*embeddings).clone(),
+                }),
+            })
+            .collect()
+    }
+
+    fn trim_logits(
+        &self,
+        logits: B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let vocabulary = self
+            .args
+            .text_config
+            .unpadded_vocab_size
+            .unwrap_or(self.args.text_config.vocab_size);
+        if vocabulary == self.args.text_config.vocab_size {
+            return Ok(logits);
+        }
+        let mut indexes = vec![Index::Full; logits.shape().len()];
+        *indexes.last_mut().expect("logits have vocabulary axis") = Index::Range(0, vocabulary);
+        logits.index(&indexes, context)
     }
 
     fn assemble(
@@ -593,6 +1060,34 @@ where
         B::Tensor: 'a;
     type Error = Error;
 
+    fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
+        if group == 0 {
+            eredu_runtime::ArchitectureGroupTransport {
+                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
+                kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
+                first_owner_static_roles: vec!["vision".into()],
+                last_owner_static_roles: Vec::new(),
+                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
+                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
+                request_optional: true,
+            }
+        } else {
+            eredu_runtime::ArchitectureGroupTransport {
+                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
+                kind: eredu_runtime::ArchitectureGroupKind::Decoder,
+                first_owner_static_roles: vec![
+                    "embedding".into(),
+                    "embedding_norm".into(),
+                    "audio".into(),
+                ],
+                last_owner_static_roles: vec!["norm".into(), "output".into(), "mtp".into()],
+                merge_destination: eredu_runtime::ArchitectureMergeDestination::LastOwner,
+                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::Decoder),
+                request_optional: false,
+            }
+        }
+    }
+
     fn model_identity(&self) -> &str {
         &self.args.model_type
     }
@@ -661,12 +1156,37 @@ where
                     context,
                 )?))
             }
-            1 => Ok(Unit::Text(DecoderLayer::new(
-                &self.args.text_config,
-                index,
-                context,
-            )?)),
+            1 => {
+                let text = match &self.parallel_geometry {
+                    Some(geometry) => geometry.text_layer(index).ok_or_else(|| {
+                        Error::backend("missing rank-local Inkling text geometry")
+                    })?,
+                    None => &self.args.text_config,
+                };
+                Ok(Unit::Text(DecoderLayer::new(text, index, context)?))
+            }
             _ => Err(Error::backend("Inkling has two execution groups")),
+        }
+    }
+
+    fn state_ordinal(&self, group: usize, index: usize, _ordinal: usize) -> usize {
+        match group {
+            0 => 0,
+            1 => index,
+            _ => index,
+        }
+    }
+
+    fn retained_state_ordinals(
+        &self,
+        group: usize,
+        index: usize,
+        _ordinal: usize,
+    ) -> std::ops::Range<usize> {
+        match group {
+            0 => 0..0,
+            1 => index..index + 1,
+            _ => 0..0,
         }
     }
 
@@ -796,17 +1316,7 @@ where
             context,
         )?;
         let logits = self.static_modules.output.forward(&hidden, context)?;
-        let vocabulary = self
-            .args
-            .text_config
-            .unpadded_vocab_size
-            .unwrap_or(self.args.text_config.vocab_size);
-        if vocabulary == self.args.text_config.vocab_size {
-            return Ok(logits);
-        }
-        let mut indexes = vec![Index::Full; logits.shape().len()];
-        *indexes.last_mut().expect("logits have vocabulary axis") = Index::Range(0, vocabulary);
-        logits.index(&indexes, context)
+        self.trim_logits(logits, context)
     }
 
     fn retained_context_values<'a>(
@@ -833,6 +1343,105 @@ where
     }
 }
 
+impl<B, S> ParallelLayeredArchitecture<B, S> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AuxiliaryConvolutionState<B::Tensor>,
+{
+    fn begin_forward_parallel<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
+        let expected = self
+            .parallel_geometry
+            .as_ref()
+            .ok_or_else(|| Error::backend("Inkling model was not built with local geometry"))?
+            .state_layout();
+        if state.layout() != expected {
+            return Err(Error::backend("Inkling rank-local state layout mismatch"));
+        }
+        let parts = self.prepare_parts_parallel(input.parts, parallel, context)?;
+        let tokens = ordered_tokens(&parts, context)?;
+        let audio = match input.audio {
+            Some(audio) => Some(
+                self.static_modules
+                    .audio
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("Inkling has no audio tower"))?
+                    .forward(audio, context)?,
+            ),
+            None => None,
+        };
+        let has_vision = input.vision_patches.is_some();
+        let hidden = match input.vision_patches {
+            Some(patches) => {
+                if patches.shape().len() != 5 || patches.shape()[1..] != [2, 40, 40, 3] {
+                    return Err(Error::backend("invalid Inkling hMLP patch geometry"));
+                }
+                patches.clone()
+            }
+            None => self.assemble(&parts, None, audio.as_ref(), context)?,
+        };
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                parts,
+                tokens,
+                audio,
+                has_vision,
+                target_hidden: None,
+            },
+        })
+    }
+
+    fn forward_unit_parallel(
+        &mut self,
+        group: usize,
+        index: usize,
+        unit: &mut Self::Unit,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        let output = match (group, unit) {
+            (0, Unit::Vision(unit)) => unit.forward(hidden, context),
+            (1, Unit::Text(unit)) => unit.forward_parallel(
+                hidden,
+                Some(state.layer(index).map_err(Error::backend)?),
+                parallel,
+                context,
+            ),
+            _ => Err(Error::backend("Inkling unit/group mismatch")),
+        }?;
+        if group == 1 && index + 1 == self.args.text_config.num_hidden_layers as usize {
+            forward.capture_target_hidden(output.clone());
+        }
+        Ok(output)
+    }
+
+    fn finish_forward_parallel(
+        &mut self,
+        hidden: &B::Tensor,
+        _state: &mut S,
+        _forward: &Self::ForwardContext,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if self.parallel_geometry.is_none() {
+            return Err(Error::backend(
+                "Inkling model was not built with local geometry",
+            ));
+        }
+        self.project_target_logits_parallel(hidden, parallel, context)
+    }
+}
+
 impl<T> ForwardContext<T> {
     /// Returns complete ordered token identity after text/media placeholder assembly.
     pub const fn tokens(&self) -> &T {
@@ -848,6 +1457,35 @@ impl<T> ForwardContext<T> {
     pub const fn target_hidden(&self) -> Option<&T> {
         self.target_hidden.as_ref()
     }
+}
+
+/// Declares prompt-cache identity from the exact local state geometry and global offset.
+pub fn state_identity(
+    args: &ModelArgs,
+    layout: &StateLayout,
+    global_layer_start: usize,
+    topology: PromptCacheTopology,
+) -> Result<ModelStateIdentity, Error> {
+    let layer_count =
+        usize::try_from(args.text_config.num_hidden_layers).map_err(Error::backend)?;
+    let global_layer_end = global_layer_start
+        .checked_add(layout.len())
+        .ok_or_else(|| Error::backend("Inkling owned layer range overflowed"))?;
+    if global_layer_end > layer_count {
+        return Err(Error::backend(format!(
+            "Inkling owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
+        )));
+    }
+    Ok(ModelStateIdentity {
+        model_family: "inkling".into(),
+        effective_model_type: args.model_type.clone(),
+        architecture_fingerprint: args.architecture_fingerprint(),
+        layer_count,
+        global_layer_start,
+        sink_tokens: 0,
+        layer_prefix_offsets: vec![0; layout.len()],
+        topology,
+    })
 }
 
 fn ordered_tokens<T: Tensor>(parts: &[PreparedPart<T>], context: &T::Context) -> Result<T, Error> {

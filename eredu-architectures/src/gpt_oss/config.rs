@@ -165,6 +165,10 @@ impl Config for ModelArgs {
         &self.model_type
     }
 
+    fn architecture_fingerprint(&self) -> String {
+        prompt_cache_architecture_fingerprint(self)
+    }
+
     fn parameter_root(&self) -> &str {
         &self.parameter_root
     }
@@ -416,6 +420,17 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
         },
     );
     let policy = args.gated_product_policy;
+    let mut quantized_weight_configs = args
+        .quantized_weight_configs
+        .as_ref()
+        .map(|configs| {
+            configs
+                .iter()
+                .map(|(name, config)| format!("{name}={config:?}"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    quantized_weight_configs.sort_unstable();
     derive_prompt_cache_architecture_fingerprint(
         "gpt_oss",
         [
@@ -443,6 +458,10 @@ pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
                 args.quantization_config.quant_method.clone(),
             ),
             ("dense_quantization", format!("{:?}", args.quantization)),
+            (
+                "quantized_weight_configs",
+                quantized_weight_configs.join(";"),
+            ),
             (
                 "gate_bound",
                 policy

@@ -21,10 +21,14 @@ pub use config::{
     VisionConfig,
 };
 pub use graph::{component_graph, mtp_state_layout, parallel_state_layout, state_layout};
-pub use model::{DecoderInputPart, ForwardContext, LayeredModel, ModelInput, StaticModules, Unit};
+pub use model::{
+    state_identity, DecoderInputPart, ForwardContext, LayeredModel, ModelInput, PartitionMtpOutput,
+    StaticModules, TextPartitionInput, Unit,
+};
 pub use mtp::{MtpDepth, MtpModel, MtpOutput};
 pub use parallel::{
-    layer_parameter_groups, local_text_args, mtp_parameter_groups, static_parameter_groups,
+    layer_parameter_groups, local_geometry, local_text_args, mtp_parameter_groups,
+    static_parameter_groups, vision_layer_parameter_groups, LocalGeometry,
 };
 pub use text::{
     convolution_history_shape, Attention, ConvolutionState, DecoderLayer, FeedForward, LayerState,

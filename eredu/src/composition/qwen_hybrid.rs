@@ -47,8 +47,8 @@ use crate::backend::mlx::{
             store::open_gguf_checkpoint_source,
         },
         execution::generic::{
-            prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
-            MlxUnitFactory,
+            construct_architecture_unit, prepare_layerwise_policy_with_bindings,
+            MlxLayerwisePolicy, MlxResidentPolicy, MlxUnitPopulator,
         },
         execution::layerwise::{
             open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
@@ -78,9 +78,19 @@ impl QwenHybridCheckpointTemplate {
     pub fn new(config: HybridConfig, stream: &Stream) -> Result<Self, Error> {
         let architecture = Architecture::new(config.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let total = config.num_hidden_layers as usize + config.mtp_num_hidden_layers as usize;
+        let target_units = config.num_hidden_layers as usize;
+        let total = target_units + config.mtp_num_hidden_layers as usize;
         let units = (0..total)
-            .map(|index| build_unit(&config, index, stream))
+            .map(|flat| {
+                let (group, index) = if flat < target_units {
+                    (0, flat)
+                } else {
+                    (flat - target_units + 1, 0)
+                };
+                architecture
+                    .construct_unit(group, index, stream)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             static_modules: architecture.into_static_modules(),
@@ -137,48 +147,16 @@ impl QwenConditionalCheckpointTemplate {
 }
 
 #[derive(Clone)]
-struct UnitFactory {
-    config: HybridConfig,
-    target_layers: usize,
+struct UnitPopulator {
     external_experts: bool,
 }
 
 #[derive(Clone)]
-struct ConditionalUnitFactory {
-    parsed: ParsedHybridConfig,
-    vision_layers: usize,
-    target_layers: usize,
+struct ConditionalUnitPopulator {
     external_experts: bool,
 }
 
-impl MlxUnitFactory<ConditionalUnit<MlxBackend>> for ConditionalUnitFactory {
-    fn build(
-        &mut self,
-        flat: usize,
-        stream: &Stream,
-    ) -> Result<ConditionalUnit<MlxBackend>, Error> {
-        if flat < self.vision_layers {
-            return vision::VisionBlock::new_with_root(
-                self.parsed.vision.as_ref().expect("validated vision"),
-                "model.visual",
-                flat,
-                stream,
-            )
-            .map(ConditionalUnit::Vision)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()));
-        }
-        let text = flat - self.vision_layers;
-        if text < self.target_layers {
-            hybrid::Block::new(&self.parsed.text, text, stream)
-                .map(ConditionalUnit::Target)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-        } else {
-            hybrid::PredictionUnit::new(&self.parsed.text, text - self.target_layers, stream)
-                .map(ConditionalUnit::Prediction)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-        }
-    }
-
+impl MlxUnitPopulator<ConditionalUnit<MlxBackend>> for ConditionalUnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<ConditionalUnit<MlxBackend>>,
@@ -192,60 +170,49 @@ impl MlxUnitFactory<ConditionalUnit<MlxBackend>> for ConditionalUnitFactory {
 }
 
 /// Pipeline/loading adapter over the neutral Qwen hybrid units.
-pub(crate) struct QwenHybridPipelineAdapter {
-    config: HybridConfig,
-    static_modules: eredu_architectures::decoder::StaticModules<MlxBackend>,
+pub(crate) struct QwenHybridPipelineBindings {
     external_experts: bool,
 }
 
 /// Pipeline/loading adapter over the neutral conditional Qwen3.5 graph.
-pub(crate) struct QwenConditionalPipelineAdapter {
-    parsed: ParsedHybridConfig,
-    architecture: ConditionalArchitecture,
+pub(crate) struct QwenConditionalPipelineBindings {
     external_experts: bool,
 }
 
-impl QwenConditionalPipelineAdapter {
-    pub(crate) fn new(parsed: ParsedHybridConfig, stream: &Stream) -> Result<Self, Error> {
-        let architecture = ConditionalArchitecture::new(parsed.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        Ok(Self {
-            parsed,
-            architecture,
+impl QwenConditionalPipelineBindings {
+    pub(crate) const fn new() -> Self {
+        Self {
             external_experts: false,
-        })
+        }
     }
 
-    pub(crate) fn new_external_experts(
-        parsed: ParsedHybridConfig,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let mut adapter = Self::new(parsed, stream)?;
-        adapter.external_experts = true;
-        Ok(adapter)
+    pub(crate) const fn new_external_experts() -> Self {
+        Self {
+            external_experts: true,
+        }
     }
 
-    pub(crate) fn model_type(&self) -> &str {
-        &self.parsed.text.model_type
+    pub(crate) fn model_type<'a>(&self, architecture: &'a ConditionalArchitecture) -> &'a str {
+        &architecture.parsed().text.model_type
     }
 
     pub(crate) fn static_units(
         &self,
+        architecture: &ConditionalArchitecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(store, &|_| true)
-    }
-
-    pub(crate) fn architecture_mut(&mut self) -> &mut ConditionalArchitecture {
-        &mut self.architecture
+        self.selected_static_units(architecture, store, &|_| true)
     }
 
     pub(crate) fn begin_pipeline_ingress(
-        &mut self,
+        &self,
+        architecture: &mut ConditionalArchitecture,
         typed: input::ModelInput<'_>,
         offset: i32,
+        parallel: Option<&safemlx::distributed::Group>,
         stream: &Stream,
     ) -> Result<hybrid::ConditionalPipelineVisionState<Array>, Error> {
+        let parsed = architecture.parsed().clone();
         input::validate(typed)?;
         let mut token_storage = Vec::new();
         let mut grids = Vec::new();
@@ -281,8 +248,7 @@ impl QwenConditionalPipelineAdapter {
                         ))
                     })?;
                     let grid = input::patch_grid_from_array(grid, stream)?;
-                    let merge = self
-                        .parsed
+                    let merge = parsed
                         .vision
                         .as_ref()
                         .expect("validated conditional vision")
@@ -308,9 +274,9 @@ impl QwenConditionalPipelineAdapter {
                                 })
                         })?;
                     let token_id = if modality == input::Modality::Image {
-                        self.parsed.image_token_id
+                        parsed.image_token_id
                     } else {
-                        self.parsed.video_token_id
+                        parsed.video_token_id
                     }
                     .ok_or_else(|| Error::Parallel("Qwen3.5 media token ID is absent".into()))?;
                     token_storage.push(input::token_ids_array(
@@ -382,72 +348,32 @@ impl QwenConditionalPipelineAdapter {
         } else {
             Some(safemlx::ops::concatenate_axis(&pixel_refs, 0, stream)?)
         };
-        self.architecture
-            .begin_pipeline_target(&parts, pixels.as_ref(), None, offset, stream)
-            .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    pub(crate) fn pipeline_ingress_active(
-        &self,
-        state: &hybrid::ConditionalPipelineVisionState<Array>,
-    ) -> bool {
-        ConditionalArchitecture::pipeline_vision_active(state)
-    }
-
-    pub(crate) fn pipeline_ingress_arrays(
-        &self,
-        state: &hybrid::ConditionalPipelineVisionState<Array>,
-    ) -> Vec<Array> {
-        ConditionalArchitecture::pipeline_retained_values(state)
-    }
-
-    pub(crate) fn replace_pipeline_ingress_arrays(
-        &self,
-        state: &mut hybrid::ConditionalPipelineVisionState<Array>,
-        arrays: Vec<Array>,
-    ) -> Result<(), Error> {
-        ConditionalArchitecture::replace_pipeline_retained_values(state, arrays)
-            .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    pub(crate) fn forward_pipeline_vision_layer(
-        &mut self,
-        index: usize,
-        layer: &mut MlxModule<ConditionalUnit<MlxBackend>>,
-        state: &mut hybrid::ConditionalPipelineVisionState<Array>,
-        group: Option<&safemlx::distributed::Group>,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let ConditionalUnit::Vision(block) = &mut layer.inner else {
-            return Err(Error::Parallel(format!(
-                "conditional Qwen3.5 vision range contains text unit {index}"
-            )));
-        };
-        self.architecture
-            .forward_pipeline_vision(index, block, state, group, stream)
-            .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    pub(crate) fn finish_pipeline_ingress(
-        &mut self,
-        state: hybrid::ConditionalPipelineVisionState<Array>,
-        group: Option<&safemlx::distributed::Group>,
-        stream: &Stream,
-    ) -> Result<hybrid::ConditionalPipelinePrepared<Array>, Error> {
-        self.architecture
-            .finish_pipeline_target(state, group, stream)
-            .map_err(|error| Error::Parallel(error.to_string()))
+        match parallel {
+            Some(parallel) => architecture.begin_pipeline_target_parallel(
+                &parts,
+                pixels.as_ref(),
+                None,
+                offset,
+                parallel,
+                stream,
+            ),
+            None => {
+                architecture.begin_pipeline_target(&parts, pixels.as_ref(), None, offset, stream)
+            }
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     pub(crate) fn selected_static_units(
         &self,
+        architecture: &ConditionalArchitecture,
         store: &dyn CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
         let modules = <ConditionalArchitecture as LayeredArchitecture<
             MlxBackend,
             MlxHybridState,
-        >>::static_modules(&self.architecture);
+        >>::static_modules(architecture);
         let recipes = static_transform_recipes(store)?;
         let mut units = Vec::new();
         for (role, module) in [("vision", MlxModule::new(modules.vision.clone()))] {
@@ -496,31 +422,45 @@ impl QwenConditionalPipelineAdapter {
         true
     }
 
-    pub(crate) fn new_layer(
-        &self,
-        group: usize,
-        index: usize,
-        stream: &Stream,
-    ) -> Result<MlxModule<ConditionalUnit<MlxBackend>>, Error> {
-        self.new_cartesian_layer(group, index, None, stream)
-    }
-
     pub(crate) fn layer_bindings(
         &self,
+        architecture: &ConditionalArchitecture,
         group: usize,
         index: usize,
         layer: &MlxModule<ConditionalUnit<MlxBackend>>,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let recipes = if group == 0 {
+        let is_vision = <ConditionalArchitecture as LayeredArchitecture<
+            MlxBackend,
+            MlxHybridState,
+        >>::group_transport(architecture, group)
+        .kind
+            == eredu_runtime::ArchitectureGroupKind::VisionEncoder;
+        let recipes = if is_vision {
             BTreeMap::new()
         } else {
-            let flat = if group == 1 {
-                index
-            } else {
-                self.parsed.text.num_hidden_layers as usize + group - 2
-            };
-            unit_recipes(store, &self.parsed.text, flat)?
+            let layout = conditional_unit_layout(architecture)?;
+            let ordinal = layout.ordinal(group, index).ok_or_else(|| {
+                Error::Parallel(format!(
+                    "conditional Qwen has no unit {index} in group {group}"
+                ))
+            })?;
+            let vision_units = (0..layout.group_count())
+                .filter(|&slot| {
+                    <ConditionalArchitecture as LayeredArchitecture<
+                        MlxBackend,
+                        MlxHybridState,
+                    >>::group_transport(architecture, slot)
+                    .kind
+                        == eredu_runtime::ArchitectureGroupKind::VisionEncoder
+                })
+                .filter_map(|slot| layout.group_range(slot))
+                .map(|range| range.len())
+                .sum::<usize>();
+            let flat = ordinal.checked_sub(vision_units).ok_or_else(|| {
+                Error::Parallel("conditional Qwen text unit precedes its vision graph".into())
+            })?;
+            unit_recipes(store, &architecture.parsed().text, flat)?
         };
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
             self.external_experts && name.contains(".experts.")
@@ -528,297 +468,132 @@ impl QwenConditionalPipelineAdapter {
         .map_err(Into::into)
     }
 
-    pub(crate) fn register_parallel_parameters(
-        &self,
-        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let modules = <ConditionalArchitecture as LayeredArchitecture<
-            MlxBackend,
-            MlxHybridState,
-        >>::static_modules(&self.architecture);
-        for group in eredu_architectures::decoder::static_parallel_parameter_groups::<MlxBackend>(
-            &modules.text.embeddings,
-            &modules.text.norm,
-            modules.text.lm_head.as_ref(),
-            "model",
-        )? {
-            planner.register(group)?;
-        }
-        for group in vision::static_parallel_parameter_groups::<MlxBackend>(
-            &modules.vision,
-            self.parsed.vision.as_ref().expect("validated vision"),
-            "model.visual",
-        )? {
-            planner.register(group)?;
-        }
-        for index in 0..self
-            .parsed
-            .vision
-            .as_ref()
-            .expect("validated vision")
-            .layer_count()
-        {
-            let unit = self.new_cartesian_layer(0, index, None, stream)?;
-            let ConditionalUnit::Vision(block) = &unit.inner else {
-                unreachable!()
-            };
-            for group in vision::block_parallel_parameter_groups(
-                block,
-                self.parsed.vision.as_ref().expect("validated vision"),
-                "model.visual",
-                index,
-            )? {
-                planner.register(group)?;
-            }
-        }
-        for index in 0..self.parsed.text.num_hidden_layers as usize {
-            let unit = hybrid::Block::<MlxBackend>::new(&self.parsed.text, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-            for group in hybrid::unit_parallel_parameter_groups(
-                &hybrid::Unit::Target(unit),
-                &self.parsed.text,
-                0,
-                index,
-            )? {
-                planner.register(group)?;
-            }
-        }
-        for depth in 0..self.parsed.text.mtp_num_hidden_layers.max(0) as usize {
-            let unit = hybrid::PredictionUnit::<MlxBackend>::new(&self.parsed.text, depth, stream)
-                .map(hybrid::Unit::Prediction)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-            for group in
-                hybrid::unit_parallel_parameter_groups(&unit, &self.parsed.text, depth + 1, 0)?
-            {
-                planner.register(group)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn configure_parallel_static(
-        &mut self,
-        layout: &eredu_runtime::LocalModelLayout,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let config = self.parsed.vision.as_ref().expect("validated vision");
-        let widths = vision::local_merger_widths(config, "model.visual", layout)?;
-        let replacement = vision::VisionStatic::<MlxBackend>::new_parallel_with_root(
-            config.clone(),
-            vision::VisionMode::WindowScheduled,
-            "model.visual",
-            &widths,
-            stream,
-        )?;
-        <ConditionalArchitecture as LayeredArchitecture<
-            MlxBackend,
-            MlxHybridState,
-        >>::static_modules_mut(&mut self.architecture)
-        .vision = replacement;
-        Ok(())
-    }
-
-    pub(crate) fn new_cartesian_layer(
-        &self,
-        group: usize,
-        index: usize,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        stream: &Stream,
-    ) -> Result<MlxModule<ConditionalUnit<MlxBackend>>, Error> {
-        let unit = match group {
-            0 => {
-                let config = self.parsed.vision.as_ref().expect("validated vision");
-                match layout {
-                    Some(layout) => {
-                        let (heads, intermediate) =
-                            vision::local_block_geometry(config, "model.visual", index, layout)?;
-                        vision::VisionBlock::new_parallel_with_root(
-                            config,
-                            "model.visual",
-                            index,
-                            heads,
-                            intermediate,
-                            stream,
-                        )
-                    }
-                    None => {
-                        vision::VisionBlock::new_with_root(config, "model.visual", index, stream)
-                    }
-                }
-                .map(ConditionalUnit::Vision)
-            }
-            1 => {
-                let config = match layout {
-                    Some(layout) => hybrid::local_unit_config(&self.parsed.text, 0, index, layout)?,
-                    None => self.parsed.text.clone(),
-                };
-                hybrid::Block::new(&config, index, stream).map(ConditionalUnit::Target)
-            }
-            _ => {
-                let config = match layout {
-                    Some(layout) => {
-                        hybrid::local_unit_config(&self.parsed.text, group - 1, 0, layout)?
-                    }
-                    None => self.parsed.text.clone(),
-                };
-                hybrid::PredictionUnit::new(&config, group - 2, stream)
-                    .map(ConditionalUnit::Prediction)
-            }
-        }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        Ok(MlxModule::new(unit))
-    }
-
     pub(crate) fn cartesian_layer_bindings(
         &self,
+        architecture: &ConditionalArchitecture,
         group: usize,
         index: usize,
-        layer: &MlxModule<ConditionalUnit<MlxBackend>>,
+        global_layer: &MlxModule<ConditionalUnit<MlxBackend>>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let recipes = if group == 0 {
+        let is_vision = <ConditionalArchitecture as LayeredArchitecture<
+            MlxBackend,
+            MlxHybridState,
+        >>::group_transport(architecture, group)
+        .kind
+            == eredu_runtime::ArchitectureGroupKind::VisionEncoder;
+        let recipes = if is_vision {
             BTreeMap::new()
         } else {
-            let flat = if group == 1 {
-                index
-            } else {
-                self.parsed.text.num_hidden_layers as usize + group - 2
-            };
-            unit_recipes(store, &self.parsed.text, flat)?
+            let layout = conditional_unit_layout(architecture)?;
+            let ordinal = layout.ordinal(group, index).ok_or_else(|| {
+                Error::Parallel(format!(
+                    "conditional Qwen has no unit {index} in group {group}"
+                ))
+            })?;
+            let vision_units = (0..layout.group_count())
+                .filter(|&slot| {
+                    <ConditionalArchitecture as LayeredArchitecture<
+                        MlxBackend,
+                        MlxHybridState,
+                    >>::group_transport(architecture, slot)
+                    .kind
+                        == eredu_runtime::ArchitectureGroupKind::VisionEncoder
+                })
+                .filter_map(|slot| layout.group_range(slot))
+                .map(|range| range.len())
+                .sum::<usize>();
+            let flat = ordinal.checked_sub(vision_units).ok_or_else(|| {
+                Error::Parallel("conditional Qwen text unit precedes its vision graph".into())
+            })?;
+            unit_recipes(store, &architecture.parsed().text, flat)?
         };
-        let global = self.new_cartesian_layer(group, index, None, stream)?;
         let bindings =
-            build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |name| {
+            build_module_bindings_with_recipes_excluding(global_layer, "", store, recipes, |name| {
                 self.external_experts && name.contains(".experts.")
             })?;
         match layout {
             Some(layout) => {
-                let root = match group {
-                    0 => format!("model.visual.blocks.{index}"),
-                    1 => format!("model.layers.{index}"),
-                    _ => format!("mtp.layers.{}", group - 2),
-                };
+                let root = <ConditionalArchitecture as LayeredArchitecture<
+                    MlxBackend,
+                    MlxHybridState,
+                >>::unit_path(architecture, group, index)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
                 shard_layer_bindings(bindings, &root, store, layout)
             }
-            None => {
-                let _ = layer;
-                Ok(bindings)
-            }
+            None => Ok(bindings),
         }
     }
 
     pub(crate) fn expert_parallel_assignment(
         &self,
+        architecture: &ConditionalArchitecture,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
     {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
         }
-        if !self.parsed.text.is_moe() {
+        let parsed = architecture.parsed();
+        if !parsed.text.is_moe() {
             return Err(Error::Parallel(
                 "conditional Qwen3.5 PP+EP requires a routed text checkpoint".into(),
             ));
         }
         Ok(Some(
             crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
-                self.parsed.text.num_experts as usize,
+                parsed.text.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
             )?,
         ))
     }
-
-    pub(crate) fn local_state_geometry(
-        &self,
-        layout: &eredu_runtime::LocalModelLayout,
-    ) -> Result<Vec<hybrid::HybridStateGeometry>, Error> {
-        let config = &self.parsed.text;
-        let total = config.num_hidden_layers as usize + config.mtp_num_hidden_layers as usize;
-        let mut geometry = Vec::with_capacity(total);
-        for flat in 0..total {
-            let (group, index, policy) = if flat < config.num_hidden_layers as usize {
-                (
-                    0,
-                    flat,
-                    *config.layer_schedule.get(flat).ok_or_else(|| {
-                        Error::Parallel(format!("Qwen hybrid has no layer {flat}"))
-                    })?,
-                )
-            } else {
-                (
-                    flat - config.num_hidden_layers as usize + 1,
-                    0,
-                    HybridLayerPolicy::SelfAttention(eredu_core::attention::AttentionPolicy::Full),
-                )
-            };
-            let local = hybrid::local_unit_config(config, group, index, layout)?;
-            geometry.push(match policy {
-                HybridLayerPolicy::LinearAttention => {
-                    hybrid::HybridStateGeometry::LinearAttention {
-                        key_heads: local.linear_num_key_heads,
-                        value_heads: local.linear_num_value_heads,
-                    }
-                }
-                HybridLayerPolicy::SelfAttention(_) => hybrid::HybridStateGeometry::FullAttention {
-                    key_value_heads: local.num_key_value_heads,
-                },
-            });
-        }
-        Ok(geometry)
-    }
 }
 
-impl QwenHybridPipelineAdapter {
-    pub(crate) fn new(config: HybridConfig, stream: &Stream) -> Result<Self, Error> {
-        let architecture = Architecture::new(config.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        Ok(Self {
-            config,
-            static_modules: architecture.static_modules().clone(),
+impl QwenHybridPipelineBindings {
+    pub(crate) const fn new() -> Self {
+        Self {
             external_experts: false,
-        })
+        }
     }
 
-    pub(crate) fn new_external_experts(
-        config: HybridConfig,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let mut adapter = Self::new(config, stream)?;
-        adapter.external_experts = true;
-        Ok(adapter)
+    pub(crate) const fn new_external_experts() -> Self {
+        Self {
+            external_experts: true,
+        }
     }
 
-    pub(crate) fn model_type(&self) -> &str {
-        &self.config.model_type
+    pub(crate) fn model_type<'a>(&self, architecture: &'a Architecture) -> &'a str {
+        &architecture.config().model_type
     }
 
-    pub(crate) fn embedded_mtp_len(&self) -> usize {
-        self.config.mtp_num_hidden_layers.max(0) as usize
+    pub(crate) fn embedded_mtp_len(&self, architecture: &Architecture) -> usize {
+        architecture.config().mtp_num_hidden_layers.max(0) as usize
     }
 
     pub(crate) fn static_units(
         &self,
+        architecture: &Architecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(store, &|_| true)
+        self.selected_static_units(architecture, store, &|_| true)
     }
 
     pub(crate) fn selected_static_units(
         &self,
+        architecture: &Architecture,
         store: &dyn CheckpointSource,
         select: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
+        let modules = architecture.static_modules();
         let recipes = static_transform_recipes(store)?;
         let mut units = Vec::new();
         if select("qwen_hybrid.static.embedding") {
             units.push(StaticUnitBindings::new(
                 "qwen_hybrid.static.embedding",
                 build_module_bindings_with_recipes(
-                    &MlxModule::new(self.static_modules.embeddings.clone()),
+                    &MlxModule::new(modules.embeddings.clone()),
                     "",
                     store,
                     recipes.clone(),
@@ -829,7 +604,7 @@ impl QwenHybridPipelineAdapter {
             units.push(StaticUnitBindings::new(
                 "qwen_hybrid.static.norm",
                 build_module_bindings_with_recipes(
-                    &MlxModule::new(self.static_modules.norm.clone()),
+                    &MlxModule::new(modules.norm.clone()),
                     "",
                     store,
                     recipes,
@@ -837,7 +612,7 @@ impl QwenHybridPipelineAdapter {
             )?);
         }
         if select("qwen_hybrid.static.output") {
-            if let Some(head) = &self.static_modules.lm_head {
+            if let Some(head) = &modules.lm_head {
                 units.push(StaticUnitBindings::new(
                     "qwen_hybrid.static.output",
                     build_module_bindings(&MlxModule::new(head.clone()), "", store)?,
@@ -847,49 +622,34 @@ impl QwenHybridPipelineAdapter {
         Ok(units)
     }
 
-    pub(crate) fn layer_count(&self, group: usize) -> Result<usize, Error> {
-        if group == 0 {
-            Ok(self.config.num_hidden_layers.max(0) as usize)
-        } else if group <= self.embedded_mtp_len() {
-            Ok(1)
-        } else {
-            Err(Error::Parallel(format!(
-                "Qwen hybrid has no execution group {group}"
-            )))
-        }
+    pub(crate) fn layer_count(&self, architecture: &Architecture, group: usize) -> Result<usize, Error> {
+        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::group_unit_count(
+            architecture,
+            group,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 
-    fn flat_index(&self, group: usize, index: usize) -> Result<usize, Error> {
-        if index >= self.layer_count(group)? {
+    fn flat_index(&self, architecture: &Architecture, group: usize, index: usize) -> Result<usize, Error> {
+        if index >= self.layer_count(architecture, group)? {
             return Err(Error::Parallel(format!(
                 "Qwen hybrid has no unit {index} in group {group}"
             )));
         }
-        Ok(if group == 0 {
-            index
-        } else {
-            self.config.num_hidden_layers as usize + group - 1
-        })
-    }
-
-    pub(crate) fn new_layer(
-        &self,
-        group: usize,
-        index: usize,
-        stream: &Stream,
-    ) -> Result<MlxModule<Block>, Error> {
-        let flat = self.flat_index(group, index)?;
-        build_unit(&self.config, flat, stream).map(MlxModule::new)
+        unit_layout(architecture)?
+            .ordinal(group, index)
+            .ok_or_else(|| Error::Parallel(format!("Qwen hybrid has no unit {index} in group {group}")))
     }
 
     pub(crate) fn layer_bindings(
         &self,
+        architecture: &Architecture,
         group: usize,
         index: usize,
         layer: &MlxModule<Block>,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let recipes = unit_recipes(store, &self.config, self.flat_index(group, index)?)?;
+        let recipes = unit_recipes(store, architecture.config(), self.flat_index(architecture, group, index)?)?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
             self.external_experts && name.contains(".experts.")
         })
@@ -902,150 +662,51 @@ impl QwenHybridPipelineAdapter {
 
     pub(crate) fn expert_parallel_assignment(
         &self,
+        architecture: &Architecture,
         topology: crate::backend::mlx::MlxParallelContext,
     ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
     {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
         }
-        if !self.config.is_moe() {
+        let config = architecture.config();
+        if !config.is_moe() {
             return Err(Error::Parallel(
                 "Qwen hybrid PP+EP requires a sparse-MoE checkpoint".into(),
             ));
         }
         Ok(Some(
             crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
-                self.config.num_experts as usize,
+                config.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
             )?,
         ))
     }
 
-    pub(crate) fn register_parallel_parameters(
-        &self,
-        _build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-        planner: &mut crate::backend::mlx::runtime::distributed::parallel::ParallelPlanBuilder,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        for group in eredu_architectures::decoder::static_parallel_parameter_groups::<MlxBackend>(
-            &self.static_modules.embeddings,
-            &self.static_modules.norm,
-            self.static_modules.lm_head.as_ref(),
-            "model",
-        )? {
-            planner.register(group)?;
-        }
-        for group in 0..=self.embedded_mtp_len() {
-            for index in 0..self.layer_count(group)? {
-                let unit = self.new_layer(group, index, stream)?;
-                for parameters in
-                    hybrid::unit_parallel_parameter_groups(&unit, &self.config, group, index)?
-                {
-                    planner.register(parameters)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn local_state_geometry(
-        &self,
-        layout: &eredu_runtime::LocalModelLayout,
-    ) -> Result<Vec<hybrid::HybridStateGeometry>, Error> {
-        let mut geometry =
-            Vec::with_capacity(self.config.num_hidden_layers as usize + self.embedded_mtp_len());
-        for group in 0..=self.embedded_mtp_len() {
-            for index in 0..self.layer_count(group)? {
-                let local = hybrid::local_unit_config(&self.config, group, index, layout)?;
-                let policy = if group == 0 {
-                    self.config
-                        .layer_schedule
-                        .get(index)
-                        .copied()
-                        .ok_or_else(|| {
-                            Error::Parallel(format!("Qwen hybrid has no layer {index}"))
-                        })?
-                } else {
-                    HybridLayerPolicy::SelfAttention(eredu_core::attention::AttentionPolicy::Full)
-                };
-                geometry.push(match policy {
-                    HybridLayerPolicy::LinearAttention => {
-                        hybrid::HybridStateGeometry::LinearAttention {
-                            key_heads: local.linear_num_key_heads,
-                            value_heads: local.linear_num_value_heads,
-                        }
-                    }
-                    HybridLayerPolicy::SelfAttention(_) => {
-                        hybrid::HybridStateGeometry::FullAttention {
-                            key_value_heads: local.num_key_value_heads,
-                        }
-                    }
-                });
-            }
-        }
-        Ok(geometry)
-    }
-
-    pub(crate) fn new_cartesian_layer(
-        &self,
-        group: usize,
-        index: usize,
-        layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
-        stream: &Stream,
-    ) -> Result<MlxModule<Block>, Error> {
-        let Some(layout) = layout else {
-            return self.new_layer(group, index, stream);
-        };
-        self.flat_index(group, index)?;
-        let local = hybrid::local_unit_config(&self.config, group, index, layout)?;
-        let unit = if group == 0 {
-            hybrid::Block::new(&local, index, stream).map(Block::Target)
-        } else {
-            hybrid::PredictionUnit::new(&local, group - 1, stream).map(Block::Prediction)
-        }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        Ok(MlxModule::new(unit))
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn cartesian_layer_bindings(
         &self,
+        architecture: &Architecture,
         group: usize,
         index: usize,
-        _layer: &MlxModule<Block>,
+        global_layer: &MlxModule<Block>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
         _assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
-        stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let global = self.new_layer(group, index, stream)?;
-        let bindings = self.layer_bindings(group, index, &global, store)?;
+        let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
         match layout {
             Some(layout) => {
-                let root = if group == 0 {
-                    format!("model.layers.{index}")
-                } else {
-                    format!("mtp.layers.{}", group - 1)
-                };
+                let root = <Architecture as LayeredArchitecture<
+                    MlxBackend,
+                    MlxHybridState,
+                >>::unit_path(architecture, group, index)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
                 shard_layer_bindings(bindings, &root, store, layout)
             }
             None => Ok(bindings),
         }
-    }
-}
-
-fn build_unit(config: &HybridConfig, flat: usize, stream: &Stream) -> Result<Block, Error> {
-    let target = config.num_hidden_layers as usize;
-    if flat < target {
-        hybrid::Block::new(config, flat, stream)
-            .map(Block::Target)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-    } else {
-        hybrid::PredictionUnit::new(config, flat - target, stream)
-            .map(Block::Prediction)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 }
 
@@ -1475,22 +1136,13 @@ pub fn load_gguf(
     if let Some(expert_options) = expert_options {
         attach_expert_cache(&mut model, expert_options, stream, weights_stream)?;
     }
-    Ok((model, crate::composition::mlx::gguf_eos_token_ids(metadata)?))
+    Ok((
+        model,
+        crate::composition::mlx::gguf_eos_token_ids(metadata)?,
+    ))
 }
 
-impl MlxUnitFactory<Block> for UnitFactory {
-    fn build(&mut self, index: usize, stream: &Stream) -> Result<Block, Error> {
-        if index < self.target_layers {
-            hybrid::Block::new(&self.config, index, stream)
-                .map(Block::Target)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-        } else {
-            hybrid::PredictionUnit::new(&self.config, index - self.target_layers, stream)
-                .map(Block::Prediction)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-        }
-    }
-
+impl MlxUnitPopulator<Block> for UnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<Block>,
@@ -1509,7 +1161,7 @@ type Bounded = LayerwiseRuntime<
     Architecture,
     MlxBackend,
     MlxHybridState,
-    MlxLayerwisePolicy<Block, UnitFactory>,
+    MlxLayerwisePolicy<Block, UnitPopulator>,
 >;
 type ConditionalArchitecture = ConditionalLayeredModel<MlxBackend>;
 type ConditionalResident = LayerwiseRuntime<
@@ -1522,7 +1174,7 @@ type ConditionalBounded = LayerwiseRuntime<
     ConditionalArchitecture,
     MlxBackend,
     MlxHybridState,
-    MlxLayerwisePolicy<ConditionalUnit<MlxBackend>, ConditionalUnitFactory>,
+    MlxLayerwisePolicy<ConditionalUnit<MlxBackend>, ConditionalUnitPopulator>,
 >;
 
 enum Execution {
@@ -1787,25 +1439,9 @@ impl QwenHybridModel {
                         state: &mut MlxHybridState,
                         forward: &mut hybrid::ConditionalForwardContext<Array>,
                         context: &Stream| {
-                if group == 0 {
-                    <ConditionalArchitecture as LayeredArchitecture<
-                        MlxBackend,
-                        MlxHybridState,
-                    >>::forward_unit(
-                        architecture,
-                        group,
-                        index,
-                        unit,
-                        hidden,
-                        state,
-                        forward,
-                        context,
-                    )
-                } else {
-                    architecture.forward_unit_with_provider(
-                        group, index, unit, hidden, state, forward, provider, context,
-                    )
-                }
+                architecture.forward_unit_with_provider(
+                    group, index, unit, hidden, state, forward, provider, context,
+                )
             };
             return match &mut self.execution {
                 Execution::ConditionalResident(runtime) => runtime
@@ -2256,25 +1892,9 @@ impl QwenHybridModel {
                                 state: &mut MlxHybridState,
                                 forward: &mut hybrid::ConditionalForwardContext<Array>,
                                 context: &Stream| {
-                        if group == 0 {
-                            <ConditionalArchitecture as LayeredArchitecture<
-                                MlxBackend,
-                                MlxHybridState,
-                            >>::forward_unit(
-                                architecture,
-                                group,
-                                index,
-                                unit,
-                                hidden,
-                                state,
-                                forward,
-                                context,
-                            )
-                        } else {
-                            architecture.forward_unit_with_provider(
-                                group, index, unit, hidden, state, forward, provider, context,
-                            )
-                        }
+                        architecture.forward_unit_with_provider(
+                            group, index, unit, hidden, state, forward, provider, context,
+                        )
                     };
                     match &mut self.execution {
                         Execution::ConditionalResident(runtime) => runtime
@@ -2566,6 +2186,27 @@ fn unit_layout(architecture: &Architecture) -> Result<ExecutionUnitLayout, Error
                 architecture,
                 group,
             )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ExecutionUnitLayout::new(&graph, counts)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
+fn conditional_unit_layout(
+    architecture: &ConditionalArchitecture,
+) -> Result<ExecutionUnitLayout, Error> {
+    let graph = <ConditionalArchitecture as LayeredArchitecture<
+        MlxBackend,
+        MlxHybridState,
+    >>::execution_graph(architecture)
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let counts = (0..graph.groups().len())
+        .map(|group| {
+            <ConditionalArchitecture as LayeredArchitecture<
+                MlxBackend,
+                MlxHybridState,
+            >>::group_unit_count(architecture, group)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2944,31 +2585,19 @@ fn quantize_store(
         .ok_or_else(|| {
             Error::UnsupportedArchitecture("Qwen hybrid layer count overflowed".into())
         })?;
-    let source_config = source.clone();
-    let target_config = target.clone();
+    let source_layout = unit_layout(&source_architecture)?;
+    let target_layout = unit_layout(&target_architecture)?;
+    let source_static = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(&source_architecture).clone();
+    let target_static = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(&target_architecture).clone();
     let (store, report) = quantize_parameterized_store(
         store,
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-            &source_architecture,
-        ),
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-            &target_architecture,
-        ),
+        &source_static,
+        &target_static,
         move |flat, stream| {
-            let mut factory = UnitFactory {
-                config: source_config.clone(),
-                target_layers,
-                external_experts: false,
-            };
-            factory.build(flat, stream)
+            construct_architecture_unit(&source_architecture, &source_layout, flat, stream, std::marker::PhantomData::<MlxHybridState>)
         },
         move |flat, stream| {
-            let mut factory = UnitFactory {
-                config: target_config.clone(),
-                target_layers,
-                external_experts: false,
-            };
-            factory.build(flat, stream)
+            construct_architecture_unit(&target_architecture, &target_layout, flat, stream, std::marker::PhantomData::<MlxHybridState>)
         },
         total,
         quantization,
@@ -3013,33 +2642,19 @@ fn quantize_conditional_store(
         .ok_or_else(|| {
             Error::UnsupportedArchitecture("conditional unit count overflowed".into())
         })?;
-    let source_parsed = source.clone();
-    let target_parsed = target.clone();
+    let source_layout = conditional_unit_layout(&source_architecture)?;
+    let target_layout = conditional_unit_layout(&target_architecture)?;
+    let source_static = <ConditionalArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(&source_architecture).clone();
+    let target_static = <ConditionalArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(&target_architecture).clone();
     let (store, report) = quantize_parameterized_store(
         store,
-        <ConditionalArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-            &source_architecture,
-        ),
-        <ConditionalArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-            &target_architecture,
-        ),
+        &source_static,
+        &target_static,
         move |flat, stream| {
-            let mut factory = ConditionalUnitFactory {
-                parsed: source_parsed.clone(),
-                vision_layers,
-                target_layers,
-                external_experts: false,
-            };
-            factory.build(flat, stream)
+            construct_architecture_unit(&source_architecture, &source_layout, flat, stream, std::marker::PhantomData::<MlxHybridState>)
         },
         move |flat, stream| {
-            let mut factory = ConditionalUnitFactory {
-                parsed: target_parsed.clone(),
-                vision_layers,
-                target_layers,
-                external_experts: false,
-            };
-            factory.build(flat, stream)
+            construct_architecture_unit(&target_architecture, &target_layout, flat, stream, std::marker::PhantomData::<MlxHybridState>)
         },
         total,
         quantization,
@@ -3165,21 +2780,15 @@ fn load_conditional_store(
         .as_ref()
         .expect("validated vision")
         .layer_count();
-    let target_layers = parsed.text.num_hidden_layers as usize;
-    let factory = ConditionalUnitFactory {
-        parsed: parsed.clone(),
-        vision_layers,
-        target_layers,
+    let factory = ConditionalUnitPopulator {
         external_experts,
     };
     let binding = parsed.text.clone();
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
-        <ConditionalArchitecture as LayeredArchitecture<
-            MlxBackend,
-            MlxHybridState,
-        >>::static_modules_mut(&mut architecture),
+        &mut architecture,
         factory,
+        std::marker::PhantomData::<MlxHybridState>,
         layout,
         options,
         stream,
@@ -3217,9 +2826,9 @@ fn load_conditional_store(
     metadata.set_quantization(parsed.text.quantization);
     metadata.set_materialization(materialization);
     let execution = if options.is_fully_resident() {
-        Execution::ConditionalResident(Box::new(LayerwiseRuntime::new(
+        Execution::ConditionalResident(Box::new(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(&architecture, stream, std::marker::PhantomData::<MlxHybridState>)?,
             architecture,
-            policy.into_resident(stream)?,
         )))
     } else {
         Execution::ConditionalBounded(Box::new(LayerwiseRuntime::new(architecture, policy)))
@@ -3254,18 +2863,15 @@ fn load_store(
     let mut architecture = Architecture::new(parsed.text.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let layout = unit_layout(&architecture)?;
-    let target_layers = usize::try_from(parsed.text.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Qwen hybrid layer count".into()))?;
-    let factory = UnitFactory {
-        config: parsed.text.clone(),
-        target_layers,
+    let factory = UnitPopulator {
         external_experts,
     };
     let binding_config = parsed.text.clone();
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
-        architecture.static_modules_mut(),
+        &mut architecture,
         factory,
+        std::marker::PhantomData::<MlxHybridState>,
         layout,
         options,
         stream,
@@ -3294,9 +2900,9 @@ fn load_store(
     metadata.set_quantization(parsed.text.quantization);
     metadata.set_materialization(materialization);
     let execution = if options.is_fully_resident() {
-        Execution::Resident(Box::new(LayerwiseRuntime::new(
+        Execution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
+            policy.into_resident(&architecture, stream, std::marker::PhantomData::<MlxHybridState>)?,
             architecture,
-            policy.into_resident(stream)?,
         )))
     } else {
         Execution::Bounded(Box::new(LayerwiseRuntime::new(architecture, policy)))
