@@ -1,3 +1,5 @@
+//! MLX composition conformance for backend-neutral architecture operators.
+
 use eredu_runtime::{LayeredArchitecture, LayeredForwardState};
 use safemlx::{Array, Device, DeviceType, ExecutionContext};
 

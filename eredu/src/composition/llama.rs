@@ -1,5 +1,8 @@
 //! Unified Llama/Mistral loading across weight-residency policies.
 
+#[path = "llama/checkpoint.rs"]
+pub(crate) mod checkpoint;
+
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
     CausalModel, ExecutionGraph, ExecutionResidency, ExecutionUnitLayout, LayerWeightResidency,
@@ -43,7 +46,6 @@ use crate::{
         open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
     },
     backend::mlx::runtime::media::input,
-    composition::llama_mlx as resident,
 };
 use eredu_runtime::{
     CacheResidencyPolicy, DenseDiskStreamReport, LayerwiseModelMetadata, PagedCacheOptions,
@@ -876,7 +878,7 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
         checkpoint, metadata, options,
     )?;
     let prepared =
-        resident::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+        checkpoint::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
     let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
@@ -901,7 +903,7 @@ pub(crate) fn load_llama_gguf_model(
     weights_stream: &Stream,
 ) -> Result<(LlamaModel, Vec<u32>), Error> {
     let prepared =
-        resident::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+        checkpoint::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
     let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =

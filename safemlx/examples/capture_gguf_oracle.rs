@@ -1,4 +1,4 @@
-//! Regenerate Stage 0 fixtures through the pure-Rust streaming integration.
+//! Regenerate GGUF oracle fixtures through the pure-Rust streaming integration.
 use eredu_gguf::{GgmlType, TensorInput, Writer};
 use safemlx::{ops::GgufCheckpoint, Array, Device, DeviceType, Dtype, Stream};
 use std::collections::BTreeMap;

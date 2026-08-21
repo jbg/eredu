@@ -104,7 +104,7 @@ use crate::{
     },
     backend::mlx::MlxParallelContext,
     backend::mlx::ModelLoadOptions,
-    composition::llama_mlx as llama,
+    composition::llama::checkpoint as llama_checkpoint,
     composition::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
@@ -10452,7 +10452,7 @@ pub(crate) fn load_pipeline_model_with_options(
                 )
             }
             crate::core::GgufArchitecture::Llama | crate::core::GgufArchitecture::Mistral => {
-                let prepared = llama::prepare_llama_gguf_checkpoint(
+                let prepared = llama_checkpoint::prepare_llama_gguf_checkpoint(
                     &checkpoint,
                     &metadata,
                     None,

@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires local MLX Metal execution"]
-    fn stage8_mlx_token_domain_validation_is_deferred_to_completion() {
+    fn mlx_token_domain_validation_is_deferred_to_completion() {
         let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = execution.stream();
         let scope = TokenValidationScope::begin().unwrap();

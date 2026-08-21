@@ -21,12 +21,12 @@ use safemlx::{
     Array, Device, DeviceType, Stream,
 };
 
-const WORKER_RANK: &str = "EREDU_MOSHI_STAGE8_RING_WORKER";
-const MODEL_WORKER_RANK: &str = "EREDU_MOSHI_STAGE8_RING_MODEL_WORKER";
-const MODEL_WORKER_FIXTURE: &str = "EREDU_MOSHI_STAGE8_RING_MODEL_FIXTURE";
-const MODEL_WORKER_PROFILE: &str = "EREDU_MOSHI_STAGE8_RING_MODEL_PROFILE";
-const NATIVE_FIXTURE: &str = "EREDU_MOSHI_STAGE8_NATIVE_FIXTURE";
-const PERSONAPLEX_FIXTURE: &str = "EREDU_MOSHI_STAGE8_PERSONAPLEX_FIXTURE";
+const WORKER_RANK: &str = "EREDU_MOSHI_RING_WORKER";
+const MODEL_WORKER_RANK: &str = "EREDU_MOSHI_RING_MODEL_WORKER";
+const MODEL_WORKER_FIXTURE: &str = "EREDU_MOSHI_RING_MODEL_FIXTURE";
+const MODEL_WORKER_PROFILE: &str = "EREDU_MOSHI_RING_MODEL_PROFILE";
+const NATIVE_FIXTURE: &str = "EREDU_MOSHI_NATIVE_FIXTURE";
+const PERSONAPLEX_FIXTURE: &str = "EREDU_MOSHI_PERSONAPLEX_FIXTURE";
 
 fn balanced_widths(total: usize) -> [usize; 2] {
     [total.div_ceil(2), total / 2]
@@ -54,7 +54,7 @@ fn verify_canonical_vocabulary(
 }
 
 #[test]
-fn moshi_stage8_ring_worker() {
+fn moshi_ring_collective_worker() {
     let Some(rank) = std::env::var_os(WORKER_RANK) else {
         return;
     };
@@ -203,7 +203,7 @@ fn assert_sequence_collective_oracle(config: &MoshiConfig) {
 }
 
 #[test]
-fn moshi_stage8_ring_model_worker() {
+fn moshi_ring_model_parity_worker() {
     let Some(rank) = std::env::var_os(MODEL_WORKER_RANK) else {
         return;
     };
@@ -285,7 +285,7 @@ fn reserve_two_ports() -> (TcpListener, TcpListener, u16, u16) {
 
 fn render_failure(rank: usize, output: &Output) -> String {
     format!(
-        "Stage 8 realtime Ring rank {rank} exited with {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        "realtime Ring rank {rank} exited with {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -293,13 +293,13 @@ fn render_failure(rank: usize, output: &Output) -> String {
 }
 
 /// Run with:
-/// `cargo test -p eredu --test distributed_realtime_ring moshi_stage8_ring_tp2_collective_order_and_vocab -- --ignored --exact --nocapture`
+/// `cargo test -p eredu --test distributed_realtime_ring moshi_ring_tp2_collective_order_and_vocab -- --ignored --exact --nocapture`
 #[test]
 #[ignore = "spawns two local Ring ranks and opens loopback sockets; run explicitly"]
-fn moshi_stage8_ring_tp2_collective_order_and_vocab() {
+fn moshi_ring_tp2_collective_order_and_vocab() {
     assert!(
         distributed::is_available(Backend::Ring),
-        "the requested Stage 8 Ring verification requires the MLX Ring backend"
+        "the requested Ring verification requires the MLX Ring backend"
     );
     let (first_socket, second_socket, first_port, second_port) = reserve_two_ports();
     let ring = tempfile::tempdir().unwrap();
@@ -317,7 +317,7 @@ fn moshi_stage8_ring_tp2_collective_order_and_vocab() {
     for rank in 0..2 {
         children.0.push(
             Command::new(&executable)
-                .args(["--exact", "moshi_stage8_ring_worker", "--nocapture"])
+                .args(["--exact", "moshi_ring_collective_worker", "--nocapture"])
                 .env(WORKER_RANK, rank.to_string())
                 .env("MLX_RANK", rank.to_string())
                 .env("MLX_HOSTFILE", &hostfile)
@@ -361,7 +361,7 @@ fn moshi_stage8_ring_tp2_collective_order_and_vocab() {
         .collect::<Vec<_>>();
     assert!(
         failures.is_empty() && !timed_out,
-        "Stage 8 two-rank realtime verification failed (timed_out={timed_out}):\n{}",
+        "two-rank realtime verification failed (timed_out={timed_out}):\n{}",
         failures.join("\n\n")
     );
 }
@@ -397,7 +397,7 @@ fn run_model_parity_fixture(fixture_variable: &str, profile: &str) {
     for rank in 0..2 {
         children.0.push(
             Command::new(&executable)
-                .args(["--exact", "moshi_stage8_ring_model_worker", "--nocapture"])
+                .args(["--exact", "moshi_ring_model_parity_worker", "--nocapture"])
                 .env(MODEL_WORKER_RANK, rank.to_string())
                 .env(MODEL_WORKER_FIXTURE, &fixture)
                 .env(MODEL_WORKER_PROFILE, profile)
@@ -443,26 +443,26 @@ fn run_model_parity_fixture(fixture_variable: &str, profile: &str) {
         .collect::<Vec<_>>();
     assert!(
         failures.is_empty() && !timed_out,
-        "Stage 8 {profile} model Ring parity failed (timed_out={timed_out}):\n{}",
+        "{profile} model Ring parity failed (timed_out={timed_out}):\n{}",
         failures.join("\n\n")
     );
 }
 
-/// Optional production-model gate. Set `EREDU_MOSHI_STAGE8_NATIVE_FIXTURE`
-/// to a released native Moshi model directory and run the ignored Stage 8
+/// Optional production-model gate. Set `EREDU_MOSHI_NATIVE_FIXTURE`
+/// to a released native Moshi model directory and run the ignored Ring
 /// aggregate; it returns before starting workers when the gate is unset.
 #[test]
-#[ignore = "requires EREDU_MOSHI_STAGE8_NATIVE_FIXTURE and two local Ring ranks"]
-fn moshi_stage8_ring_tp2_native_model_parity() {
+#[ignore = "requires EREDU_MOSHI_NATIVE_FIXTURE and two local Ring ranks"]
+fn moshi_ring_tp2_native_model_parity() {
     run_model_parity_fixture(NATIVE_FIXTURE, "moshi");
 }
 
 /// Optional production-model gate. Set
-/// `EREDU_MOSHI_STAGE8_PERSONAPLEX_FIXTURE` to a released PersonaPlex model
+/// `EREDU_MOSHI_PERSONAPLEX_FIXTURE` to a released PersonaPlex model
 /// directory; the ignored aggregate returns before starting workers when the
 /// gate is unset.
 #[test]
-#[ignore = "requires EREDU_MOSHI_STAGE8_PERSONAPLEX_FIXTURE and two local Ring ranks"]
-fn moshi_stage8_ring_tp2_personaplex_model_parity() {
+#[ignore = "requires EREDU_MOSHI_PERSONAPLEX_FIXTURE and two local Ring ranks"]
+fn moshi_ring_tp2_personaplex_model_parity() {
     run_model_parity_fixture(PERSONAPLEX_FIXTURE, "personaplex");
 }

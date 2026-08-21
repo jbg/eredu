@@ -2095,7 +2095,7 @@ mod semantic_transaction_tests {
 
     #[test]
     #[ignore = "requires local MLX execution"]
-    fn stage8_mlx_realtime_transaction_paged_rollback_release_resume() {
+    fn mlx_realtime_transaction_paged_rollback_release_resume() {
         let mut canonical = MlxKeyValueState::paged(layout(None), manager(), None).unwrap();
         let mut branch = canonical.branch().unwrap();
         let manager = match &branch.state.layers[0] {

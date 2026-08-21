@@ -1,17 +1,20 @@
-//! Architecture-owned checkpoint contracts for Llama and Mistral decoders.
+//! MLX checkpoint adaptation for the backend-neutral Llama architecture.
 //!
-//! This module owns physical tensor names, geometry, bias policy, affine
-//! SafeTensors companions, GGUF encodings, and the small RoPE catalog
-//! exclusions accepted by the Llama-compatible loaders. Generic checkpoint
-//! code only evaluates the resulting declarative constraints.
+//! The architecture crate owns tensor geometry, canonical plans, and name
+//! translation. This module applies those contracts to concrete MLX
+//! SafeTensors and GGUF sources during cold-path validation and loading.
 
 use std::collections::{BTreeSet, HashMap};
 
+use eredu_architectures::llama::ModelArgs;
 use eredu_checkpoint::schema::SafetensorsTensorConstraint;
+use eredu_checkpoint::WeightQuantization;
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
+use safemlx::Stream;
 use serde_json::Value;
 
-use super::llama_mlx as model;
+use crate::backend::mlx::error::Error;
+use crate::backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames};
 use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
 use eredu_checkpoint::store::WeightStore;
 use eredu_checkpoint::validation;
@@ -84,7 +87,7 @@ pub(crate) fn validate_gguf(
             metadata_key: None,
         }]);
     }
-    let args = match model::model_args_from_gguf_catalog(checkpoint, metadata) {
+    let args = match model_args_from_gguf_catalog(checkpoint, metadata) {
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
@@ -140,4 +143,74 @@ fn invalid_geometry(detail: String) -> CheckpointValidation {
         tensor_type_code: None,
         metadata_key: None,
     }])
+}
+
+pub(crate) struct PreparedLlamaGguf {
+    pub(crate) args: ModelArgs,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
+pub(crate) fn prepare_llama_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    quantization: Option<WeightQuantization>,
+    _weights_stream: &Stream,
+) -> Result<PreparedLlamaGguf, Error> {
+    let mut args = model_args_from_gguf_catalog(checkpoint, metadata)?;
+    let architecture = args.model_type.clone();
+    let gguf_architecture = crate::core::GgufArchitecture::resolve(&architecture)?;
+    crate::composition::mlx::structural::validate_gguf(
+        gguf_architecture,
+        checkpoint,
+        metadata,
+        crate::backend::mlx::ModelLoadOptions::default(),
+    )
+    .into_loader_result()?;
+
+    checkpoint
+        .catalog()
+        .translated_outputs(eredu_architectures::llama::translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+    let quantized_weight_configs = gguf_quantization_configs(
+        checkpoint,
+        eredu_architectures::llama::translate_gguf_weight_name,
+    )?;
+    if let Some(quantization) = quantization {
+        args.quantized_weights = None;
+        args.quantization = Some(quantization);
+        args.quantized_weight_configs = None;
+    } else {
+        args.quantized_weights = Some(quantized_weight_configs.keys().cloned().collect());
+        args.quantization = None;
+        args.quantized_weight_configs = Some(quantized_weight_configs);
+    }
+
+    let eos_token_ids = crate::composition::mlx::gguf_eos_token_ids(metadata)?;
+    Ok(PreparedLlamaGguf {
+        args,
+        eos_token_ids,
+    })
+}
+
+struct NeutralGgufCatalog<'a, T: ?Sized>(&'a T);
+
+impl<T: GgufTensorNames + ?Sized> eredu_architectures::llama::GgufTensorCatalog
+    for NeutralGgufCatalog<'_, T>
+{
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains_gguf_tensor(name)
+    }
+
+    fn any(&self, predicate: &mut dyn FnMut(&str) -> bool) -> bool {
+        self.0.any_gguf_tensor(predicate)
+    }
+}
+
+/// Parses the GGUF arguments shared by structural preflight and loading.
+pub(crate) fn model_args_from_gguf_catalog(
+    arrays: &(impl GgufTensorNames + ?Sized),
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> Result<ModelArgs, Error> {
+    eredu_architectures::llama::model_args_from_gguf_catalog(&NeutralGgufCatalog(arrays), metadata)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }

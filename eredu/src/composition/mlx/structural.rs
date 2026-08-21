@@ -12,7 +12,7 @@ use eredu_core::{GgufArchitecture, ModelKind};
 use super::ModelLoadOptions;
 use crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames;
 use crate::backend::mlx::{error::Error, runtime::checkpoint::store::SafetensorsWeightStore};
-use crate::composition::llama_checkpoint;
+use crate::composition::llama::checkpoint as llama_checkpoint;
 
 pub(crate) use eredu_checkpoint::validation::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,

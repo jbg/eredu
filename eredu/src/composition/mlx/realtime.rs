@@ -1501,7 +1501,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires local MLX Metal execution"]
-    fn moshi_stage8_mlx_scheduler_transaction_rollback_release_resume() {
+    fn moshi_mlx_scheduler_transaction_rollback_release_resume() {
         let directory = tempfile::tempdir().expect("tiny scheduler artifact directory");
         write_tiny_native_artifact(directory.path(), None);
         let execution =
@@ -1589,30 +1589,32 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "runs the Stage 8 MLX operator, transaction, and tiny native model suite"]
-    fn moshi_stage8_generic_mlx_suite() {
+    #[ignore = "runs the MLX operator, transaction, and tiny native model conformance suite"]
+    fn moshi_mlx_conformance_suite() {
         verify_tiny_native_hardware_matrix();
         const TESTS: &[&str] = &[
-            "backend::mlx::nn::shared::neutral_semantic_operator_tests::stage8_mlx_dense_fused_projection_equivalence",
-            "backend::mlx::nn::shared::neutral_semantic_operator_tests::stage8_mlx_affine_fused_projection_equivalence",
-            "backend::mlx::nn::shared::neutral_semantic_operator_tests::stage8_mlx_mxfp4_fused_projection_equivalence",
-            "backend::mlx::nn::shared::neutral_semantic_operator_tests::stage8_mlx_sentinel_embedding_validation",
-            "backend::mlx::nn::shared::neutral_semantic_operator_tests::stage8_mlx_multi_table_embedding_sum_is_ordered_and_sentinel_safe",
+            "backend::mlx::nn::shared::neutral_semantic_operator_tests::mlx_dense_fused_projection_equivalence",
+            "backend::mlx::nn::shared::neutral_semantic_operator_tests::mlx_affine_fused_projection_equivalence",
+            "backend::mlx::nn::shared::neutral_semantic_operator_tests::mlx_mxfp4_fused_projection_equivalence",
+            "backend::mlx::nn::shared::neutral_semantic_operator_tests::mlx_sentinel_embedding_validation",
+            "backend::mlx::nn::shared::neutral_semantic_operator_tests::mlx_multi_table_embedding_sum_is_ordered_and_sentinel_safe",
             "backend::mlx::runtime::cache::state::semantic_transaction_tests::paged_depth_segment_reset_preserves_temporal_pages_and_later_rollback",
-            "backend::mlx::runtime::cache::state::semantic_transaction_tests::stage8_mlx_realtime_transaction_paged_rollback_release_resume",
+            "backend::mlx::runtime::cache::state::semantic_transaction_tests::mlx_realtime_transaction_paged_rollback_release_resume",
             "backend::mlx::runtime::residency::manager::tests::cross_unit_alias_reacquisition_reuses_one_pinned_owner_read",
-            "backend::mlx::runtime::generation::backend::tests::stage8_mlx_token_domain_validation_is_deferred_to_completion",
-            "composition::mlx::realtime::tests::stage8_mlx_realtime_input_domains_are_deferred_and_strict",
+            "backend::mlx::runtime::generation::backend::tests::mlx_token_domain_validation_is_deferred_to_completion",
+            "composition::mlx::realtime::tests::mlx_realtime_input_domains_are_deferred_and_strict",
         ];
         let executable = std::env::current_exe().expect("current unit-test executable");
         for test in TESTS {
             let output = std::process::Command::new(&executable)
                 .args(["--exact", test, "--ignored", "--nocapture"])
                 .output()
-                .unwrap_or_else(|error| panic!("failed to launch Stage 8 test {test}: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!("failed to launch MLX conformance test {test}: {error}")
+                });
             assert!(
                 output.status.success(),
-                "Stage 8 test {test} failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                "MLX conformance test {test} failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
             );
@@ -1645,7 +1647,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires local MLX Metal execution"]
-    fn stage8_mlx_realtime_input_domains_are_deferred_and_strict() {
+    fn mlx_realtime_input_domains_are_deferred_and_strict() {
         let execution =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = execution.stream();
@@ -2089,32 +2091,32 @@ mod tests {
 
     #[test]
     #[ignore = "requires released native Moshi artifact and teacher-forced fixture"]
-    fn moshi_stage8_native_teacher_forced_fixture_parity() {
+    fn moshi_native_teacher_forced_fixture_parity() {
         run_released_teacher_fixture(
-            "EREDU_MOSHI_STAGE8_FIXTURE",
-            "EREDU_MOSHI_STAGE8_TEACHER_FIXTURE",
+            "EREDU_MOSHI_FIXTURE",
+            "EREDU_MOSHI_TEACHER_FIXTURE",
             RealtimeModelKind::Moshi,
         );
     }
 
     #[test]
     #[ignore = "requires released PersonaPlex artifact and PyTorch teacher fixture"]
-    fn moshi_stage8_personaplex_teacher_forced_fixture_parity() {
+    fn moshi_personaplex_teacher_forced_fixture_parity() {
         run_released_teacher_fixture(
-            "EREDU_PERSONAPLEX_STAGE8_FIXTURE",
-            "EREDU_PERSONAPLEX_STAGE8_TEACHER_FIXTURE",
+            "EREDU_PERSONAPLEX_FIXTURE",
+            "EREDU_PERSONAPLEX_TEACHER_FIXTURE",
             RealtimeModelKind::PersonaPlex,
         );
     }
 
     #[test]
     #[ignore = "requires released PersonaPlex artifact and PyTorch realtime fixture"]
-    fn moshi_stage8_personaplex_prompt_realtime_and_residency_parity() {
-        let Some(model_path) = std::env::var_os("EREDU_PERSONAPLEX_STAGE8_FIXTURE") else {
+    fn moshi_personaplex_prompt_realtime_and_residency_parity() {
+        let Some(model_path) = std::env::var_os("EREDU_PERSONAPLEX_FIXTURE") else {
             return;
         };
-        let fixture_path = std::env::var_os("EREDU_PERSONAPLEX_STAGE8_TEACHER_FIXTURE")
-            .expect("EREDU_PERSONAPLEX_STAGE8_TEACHER_FIXTURE must accompany the model fixture");
+        let fixture_path = std::env::var_os("EREDU_PERSONAPLEX_TEACHER_FIXTURE")
+            .expect("EREDU_PERSONAPLEX_TEACHER_FIXTURE must accompany the model fixture");
         let execution =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let weights = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
@@ -2142,12 +2144,12 @@ mod tests {
 
     #[test]
     #[ignore = "requires released native Moshi artifact and seeded MLX fixture"]
-    fn moshi_stage8_native_multiframe_seeded_realtime_parity() {
-        let Some(model_path) = std::env::var_os("EREDU_MOSHI_STAGE8_FIXTURE") else {
+    fn moshi_native_multiframe_seeded_realtime_parity() {
+        let Some(model_path) = std::env::var_os("EREDU_MOSHI_FIXTURE") else {
             return;
         };
-        let fixture_path = std::env::var_os("EREDU_MOSHI_STAGE8_TEACHER_FIXTURE")
-            .expect("EREDU_MOSHI_STAGE8_TEACHER_FIXTURE must accompany the model fixture");
+        let fixture_path = std::env::var_os("EREDU_MOSHI_TEACHER_FIXTURE")
+            .expect("EREDU_MOSHI_TEACHER_FIXTURE must accompany the model fixture");
         let execution =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let weights = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
@@ -2164,14 +2166,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires EREDU_MOSHI_STAGE8_FIXTURE and an MLX runtime"]
-    fn moshi_stage8_neutral_session_hook() {
-        let Some(fixture) = std::env::var_os("EREDU_MOSHI_STAGE8_FIXTURE") else {
+    #[ignore = "requires EREDU_MOSHI_FIXTURE and an MLX runtime"]
+    fn moshi_neutral_session_hook() {
+        let Some(fixture) = std::env::var_os("EREDU_MOSHI_FIXTURE") else {
             return;
         };
         assert!(
             Path::new(&fixture).exists(),
-            "EREDU_MOSHI_STAGE8_FIXTURE does not exist: {}",
+            "EREDU_MOSHI_FIXTURE does not exist: {}",
             Path::new(&fixture).display()
         );
         let device = safemlx::Device::new(safemlx::DeviceType::Cpu, 0);
@@ -2187,14 +2189,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires EREDU_PERSONAPLEX_STAGE8_FIXTURE and an MLX runtime"]
-    fn moshi_stage8_personaplex_fixture_session_hook() {
-        let Some(fixture) = std::env::var_os("EREDU_PERSONAPLEX_STAGE8_FIXTURE") else {
+    #[ignore = "requires EREDU_PERSONAPLEX_FIXTURE and an MLX runtime"]
+    fn moshi_personaplex_fixture_session_hook() {
+        let Some(fixture) = std::env::var_os("EREDU_PERSONAPLEX_FIXTURE") else {
             return;
         };
         assert!(
             Path::new(&fixture).exists(),
-            "EREDU_PERSONAPLEX_STAGE8_FIXTURE does not exist: {}",
+            "EREDU_PERSONAPLEX_FIXTURE does not exist: {}",
             Path::new(&fixture).display()
         );
         let device = safemlx::Device::new(safemlx::DeviceType::Cpu, 0);

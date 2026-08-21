@@ -763,7 +763,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires EREDU_MOSHI_FIXTURE pointing at a complete released artifact"]
-    fn moshi_stage8_native_fixture_loads_through_neutral_entrypoint() {
+    fn moshi_native_fixture_loads_through_neutral_entrypoint() {
         let Some(fixture) = std::env::var_os("EREDU_MOSHI_FIXTURE") else {
             return;
         };

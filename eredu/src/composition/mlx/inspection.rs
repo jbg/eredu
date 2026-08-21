@@ -72,7 +72,7 @@ fn required_qwen_mmproj(path: &Path, architecture: &str) -> Result<PathBuf, Erro
     })
 }
 
-fn open_stage5_projector(
+fn open_optional_projector(
     model: &Path,
     family: &str,
 ) -> Result<Option<(PathBuf, GgufCheckpoint, HashMap<String, GgufMetadataValue>)>, Error> {
@@ -645,7 +645,7 @@ fn inspect_gguf_projector(
                 Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
             }
         }
-        GgufArchitecture::Inkling => match open_stage5_projector(path, "inkling") {
+        GgufArchitecture::Inkling => match open_optional_projector(path, "inkling") {
             Ok(Some((projector_path, checkpoint, metadata))) => {
                 let validation = structural::validate_inkling_mmproj_gguf(
                     model_checkpoint,
@@ -680,7 +680,7 @@ fn inspect_gguf_projector(
             }
             Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
         },
-        GgufArchitecture::Gemma4 => match open_stage5_projector(path, "gemma4") {
+        GgufArchitecture::Gemma4 => match open_optional_projector(path, "gemma4") {
             Ok(Some((projector_path, checkpoint, metadata))) => {
                 let validation = structural::validate_gemma4_mmproj_gguf(
                     model_checkpoint,
@@ -729,7 +729,7 @@ fn inspect_gguf_projector(
             }
             Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
         },
-        GgufArchitecture::MuseGlimmer => match open_stage5_projector(path, "muse-glimmer") {
+        GgufArchitecture::MuseGlimmer => match open_optional_projector(path, "muse-glimmer") {
             Ok(Some((projector_path, checkpoint, metadata))) => {
                 let validation = structural::validate_muse_glimmer_projector_gguf(
                     model_checkpoint,

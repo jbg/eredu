@@ -3093,13 +3093,13 @@ mod neutral_semantic_operator_tests {
 
     #[test]
     #[ignore = "requires local MLX Metal execution"]
-    fn stage8_mlx_dense_fused_projection_equivalence() {
+    fn mlx_dense_fused_projection_equivalence() {
         assert_fused_split_equivalence(LinearFormat::Dense);
     }
 
     #[test]
     #[ignore = "requires local MLX Metal execution"]
-    fn stage8_mlx_affine_fused_projection_equivalence() {
+    fn mlx_affine_fused_projection_equivalence() {
         assert_fused_split_equivalence(LinearFormat::Affine(
             AffineQuantization::new(32, 4).unwrap(),
         ));
@@ -3107,13 +3107,13 @@ mod neutral_semantic_operator_tests {
 
     #[test]
     #[ignore = "requires local MLX Metal execution"]
-    fn stage8_mlx_mxfp4_fused_projection_equivalence() {
+    fn mlx_mxfp4_fused_projection_equivalence() {
         assert_fused_split_equivalence(LinearFormat::MxFp4);
     }
 
     #[test]
     #[ignore = "requires local MLX Metal execution"]
-    fn stage8_mlx_sentinel_embedding_validation() {
+    fn mlx_sentinel_embedding_validation() {
         let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = execution.stream();
         let dimensions = 32;
@@ -3167,7 +3167,7 @@ mod neutral_semantic_operator_tests {
 
     #[test]
     #[ignore = "requires local MLX Metal execution"]
-    fn stage8_mlx_multi_table_embedding_sum_is_ordered_and_sentinel_safe() {
+    fn mlx_multi_table_embedding_sum_is_ordered_and_sentinel_safe() {
         let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = execution.stream();
         let dimensions = 32;

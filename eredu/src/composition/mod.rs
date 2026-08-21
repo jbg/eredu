@@ -24,10 +24,6 @@ pub(crate) mod lfm2;
 #[cfg(feature = "mlx")]
 pub(crate) mod llama;
 #[cfg(feature = "mlx")]
-pub(crate) mod llama_checkpoint;
-#[cfg(feature = "mlx")]
-pub(crate) mod llama_mlx;
-#[cfg(feature = "mlx")]
 pub mod mlx;
 #[cfg(feature = "mlx")]
 pub mod moshi;
@@ -43,5 +39,7 @@ pub(crate) mod muse_glimmer_processor;
 pub mod nemotron_h;
 #[cfg(feature = "mlx")]
 pub(crate) mod qwen;
+
 #[cfg(all(test, feature = "mlx"))]
-mod stage5_neutral_tests;
+#[path = "tests/mlx_architecture_conformance.rs"]
+mod mlx_architecture_conformance;
