@@ -5,7 +5,10 @@ use std::{
     fs::File,
     ops::Range,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
 };
 
 use memmap2::{Mmap, MmapOptions};
@@ -213,7 +216,7 @@ impl EncodedTensorLease for MemoryLease {
 
     fn encoded_bytes(&self) -> Option<&[u8]> {
         match &self.selected_bytes {
-            Some(bytes) => Some(bytes),
+            Some(bytes) => Some(bytes.as_ref()),
             None => self.tensor.bytes.get(self.span.clone()),
         }
     }
@@ -386,6 +389,141 @@ pub trait CheckpointSource: Send + Sync {
 
 /// Shared ownership of one backend-neutral checkpoint source.
 pub type SharedCheckpointSource = Arc<dyn CheckpointSource>;
+
+/// Disjoint logical union of independently opened checkpoint artifacts.
+///
+/// This is used by split model/projector artifacts while preserving each
+/// source's native leases, bounded-read guarantees, and physical diagnostics.
+pub struct CompositeCheckpointSource {
+    sources: Vec<SharedCheckpointSource>,
+    owners: BTreeMap<String, usize>,
+}
+
+impl CompositeCheckpointSource {
+    /// Creates a deterministic union and rejects ambiguous logical keys.
+    pub fn new(
+        sources: impl IntoIterator<Item = SharedCheckpointSource>,
+    ) -> Result<Self, StoreError> {
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        if sources.is_empty() {
+            return Err(StoreError::Internal(
+                "composite checkpoint source requires at least one artifact".into(),
+            ));
+        }
+        let mut owners = BTreeMap::new();
+        for (owner, source) in sources.iter().enumerate() {
+            for key in source.source_keys() {
+                if let Some(previous) = owners.insert(key.clone(), owner) {
+                    return Err(StoreError::Internal(format!(
+                        "composite checkpoint key {key:?} is owned by sources {previous} and {owner}"
+                    )));
+                }
+            }
+        }
+        Ok(Self { sources, owners })
+    }
+
+    fn source_for(&self, key: &str) -> Result<&dyn CheckpointSource, StoreError> {
+        self.owners
+            .get(key)
+            .and_then(|owner| self.sources.get(*owner))
+            .map(AsRef::as_ref)
+            .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
+    }
+}
+
+impl CheckpointSource for CompositeCheckpointSource {
+    fn source_keys(&self) -> Vec<String> {
+        self.owners.keys().cloned().collect()
+    }
+
+    fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        self.source_for(key)?.source_metadata(key)
+    }
+
+    fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+        self.source_for(&request.key)?.acquire_lease(request)
+    }
+
+    fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+        let diagnostics = self
+            .sources
+            .iter()
+            .map(|source| source.source_diagnostics())
+            .collect::<Result<Vec<_>, _>>()?;
+        let backend = diagnostics[0].backend;
+        if diagnostics.iter().any(|value| value.backend != backend) {
+            return Err(StoreError::Internal(
+                "composite checkpoint sources use different physical backends".into(),
+            ));
+        }
+        let mut touched = diagnostics
+            .iter()
+            .flat_map(|value| value.touched_shard_paths.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        touched.sort();
+        Ok(WeightStoreDiagnostics {
+            backend,
+            mapping_hits: diagnostics.iter().map(|value| value.mapping_hits).sum(),
+            mapping_misses: diagnostics.iter().map(|value| value.mapping_misses).sum(),
+            evictions: diagnostics.iter().map(|value| value.evictions).sum(),
+            currently_mapped_shards: diagnostics
+                .iter()
+                .map(|value| value.currently_mapped_shards)
+                .sum(),
+            touched_shard_paths: touched,
+            physical_reads: diagnostics.iter().map(|value| value.physical_reads).sum(),
+            physical_read_bytes: diagnostics
+                .iter()
+                .map(|value| value.physical_read_bytes)
+                .sum(),
+            coalesced_group_hits: diagnostics
+                .iter()
+                .map(|value| value.coalesced_group_hits)
+                .sum(),
+        })
+    }
+
+    fn materialized_source_keys(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .flat_map(|source| source.materialized_source_keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn materialized_source_shards(&self) -> Vec<PathBuf> {
+        self.sources
+            .iter()
+            .flat_map(|source| source.materialized_source_shards())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .flat_map(|source| source.unclaimed_checkpoint_keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn is_authoritative_materialized_key(&self, key: &str) -> bool {
+        self.source_for(key)
+            .is_ok_and(|source| source.is_authoritative_materialized_key(key))
+    }
+
+    fn is_checkpoint_contract_resolved(&self) -> bool {
+        self.sources
+            .iter()
+            .all(|source| source.is_checkpoint_contract_resolved())
+    }
+}
 
 /// A checkpoint source restricted to one resolved architecture contract.
 ///
@@ -665,6 +803,18 @@ struct CacheState {
     evictions: u64,
 }
 
+#[derive(Debug, Default)]
+struct SafetensorsReadTelemetry {
+    physical_reads: AtomicU64,
+    physical_read_bytes: AtomicU64,
+}
+
+#[derive(Debug)]
+struct SafetensorsReadReceipt {
+    telemetry: Arc<SafetensorsReadTelemetry>,
+    counted: AtomicBool,
+}
+
 #[derive(Debug, Clone)]
 struct CatalogEntry {
     shard: PathBuf,
@@ -681,6 +831,7 @@ pub struct SafetensorsLease {
     shard: Arc<MappedShard>,
     mapped_span: Range<usize>,
     selected_bytes: Option<Arc<[u8]>>,
+    read_receipt: Arc<SafetensorsReadReceipt>,
 }
 
 impl EncodedTensorLease for SafetensorsLease {
@@ -705,10 +856,23 @@ impl EncodedTensorLease for SafetensorsLease {
     }
 
     fn encoded_bytes(&self) -> Option<&[u8]> {
-        match &self.selected_bytes {
-            Some(bytes) => Some(bytes),
+        let bytes = match &self.selected_bytes {
+            Some(bytes) => Some(bytes.as_ref()),
             None => self.shard.mmap.get(self.mapped_span.clone()),
+        };
+        if let Some(bytes) = bytes {
+            if !self.read_receipt.counted.swap(true, Ordering::AcqRel) {
+                self.read_receipt
+                    .telemetry
+                    .physical_reads
+                    .fetch_add(1, Ordering::Relaxed);
+                self.read_receipt
+                    .telemetry
+                    .physical_read_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            }
         }
+        bytes
     }
 }
 
@@ -719,6 +883,7 @@ pub struct SafetensorsWeightStore {
     catalog: BTreeMap<String, CatalogEntry>,
     metadata: Mutex<BTreeMap<String, TensorMetadata>>,
     cache: Mutex<CacheState>,
+    read_telemetry: Arc<SafetensorsReadTelemetry>,
     max_mapped_shards: usize,
 }
 
@@ -782,6 +947,7 @@ impl SafetensorsWeightStore {
                     catalog,
                     metadata: Mutex::new(BTreeMap::new()),
                     cache: Mutex::new(CacheState::default()),
+                    read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
                     max_mapped_shards,
                 });
             }
@@ -823,6 +989,7 @@ impl SafetensorsWeightStore {
             catalog,
             metadata: Mutex::new(discovered),
             cache: Mutex::new(CacheState::default()),
+            read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
             max_mapped_shards,
         })
     }
@@ -1050,6 +1217,10 @@ impl WeightStore for SafetensorsWeightStore {
             shard,
             mapped_span,
             selected_bytes: selected_bytes.map(Arc::from),
+            read_receipt: Arc::new(SafetensorsReadReceipt {
+                telemetry: Arc::clone(&self.read_telemetry),
+                counted: AtomicBool::new(false),
+            }),
         })
     }
 
@@ -1062,8 +1233,11 @@ impl WeightStore for SafetensorsWeightStore {
             evictions: cache.evictions,
             currently_mapped_shards: cache.entries.len(),
             touched_shard_paths: cache.touched.iter().cloned().collect(),
-            physical_reads: 0,
-            physical_read_bytes: 0,
+            physical_reads: self.read_telemetry.physical_reads.load(Ordering::Relaxed),
+            physical_read_bytes: self
+                .read_telemetry
+                .physical_read_bytes
+                .load(Ordering::Relaxed),
             coalesced_group_hits: 0,
         })
     }
@@ -1596,7 +1770,11 @@ mod tests {
             .unwrap();
         assert_eq!(lease.output_shape(), &[1, 2]);
         assert_eq!(lease.encoded_bytes().unwrap(), &left[8..]);
+        assert_eq!(lease.encoded_bytes().unwrap(), &left[8..]);
         assert_eq!(lease.bounded_read_proof().length_bytes, 8);
+        let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 1);
+        assert_eq!(diagnostics.physical_read_bytes, 8);
         assert!(matches!(
             store.acquire(TensorReadRequest {
                 key: "right".into(),
@@ -1655,5 +1833,57 @@ mod tests {
             }),
             Err(StoreError::UnauthorizedTensor { .. })
         ));
+    }
+
+    #[test]
+    fn composite_source_routes_disjoint_leases_and_rejects_collisions() {
+        let left: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([(
+                "text.weight".into(),
+                Dtype::F32,
+                vec![1],
+                f32_bytes(&[1.0]),
+            )])
+            .unwrap(),
+        );
+        let right: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([(
+                "vision.weight".into(),
+                Dtype::F32,
+                vec![1],
+                f32_bytes(&[2.0]),
+            )])
+            .unwrap(),
+        );
+        let source = CompositeCheckpointSource::new([left, right]).unwrap();
+        assert_eq!(source.source_keys(), ["text.weight", "vision.weight"]);
+        let lease = source
+            .acquire_lease(TensorReadRequest {
+                key: "vision.weight".into(),
+                selection: TensorSelection::Full,
+                policy: ReadPolicy::RequireBounded,
+            })
+            .unwrap();
+        assert_eq!(lease.encoded_bytes().unwrap(), f32_bytes(&[2.0]));
+
+        let first: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([(
+                "collision".into(),
+                Dtype::F32,
+                vec![1],
+                f32_bytes(&[1.0]),
+            )])
+            .unwrap(),
+        );
+        let second: SharedCheckpointSource = Arc::new(
+            MemoryWeightStore::from_safetensors([(
+                "collision".into(),
+                Dtype::F32,
+                vec![1],
+                f32_bytes(&[2.0]),
+            )])
+            .unwrap(),
+        );
+        assert!(CompositeCheckpointSource::new([first, second]).is_err());
     }
 }

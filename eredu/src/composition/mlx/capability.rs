@@ -6,7 +6,11 @@ use eredu_architectures::{
     gemma4, kimi_linear, lfm2,
     llama::ModelArgs as LlamaModelArgs,
     nemotron_h,
-    qwen::{ModelArgs as QwenModelArgs, QwenVariant},
+    qwen::{
+        hybrid::{HybridConfig as QwenHybridConfig, HybridLayerPolicy as QwenHybridLayerPolicy},
+        vision::{VisionAttentionPolicy, VisionConfig},
+        ModelArgs as QwenModelArgs, QwenVariant,
+    },
 };
 use eredu_core::{
     estimate_runtime_state, AvailableMemory, CacheStateStrategy, CapabilityError,
@@ -20,10 +24,7 @@ use safemlx::{Array, Stream};
 use super::{MlxBackend, MlxModelInput, MlxModelSession, Model};
 use crate::{
     backend::mlx::runtime::media::input::{self, InputPayload, Modality},
-    composition::mlx_architectures::{
-        gpt_oss::model as gpt_oss,
-        qwen::hybrid::qwen3_5::{self, LayerPolicy as QwenHybridLayerPolicy},
-    },
+    composition::mlx_architectures::gpt_oss::model as gpt_oss,
     core::attention::AttentionPolicy,
     core::residency::MemoryTier,
 };
@@ -184,9 +185,7 @@ impl Model {
             Self::Llama(model) => llama_spec(model.args(), false)?,
             Self::Qwen(model) => qwen_spec(model.args(), false)?,
             Self::MuseGlimmer(model) => muse_glimmer_spec(model.args())?,
-            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
-                qwen_spec(&model.args().text_config, true)?
-            }
+            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => qwen_spec(&model.args().text, true)?,
             Self::GptOss(model) => gpt_oss_spec(model.args())?,
             Self::Gemma4(model) => {
                 let args = model.args();
@@ -966,7 +965,7 @@ fn nemotron_spec(args: &nemotron_h::ModelArgs) -> Result<Spec, CapabilityError> 
     ))
 }
 
-fn qwen_hybrid_spec(args: &qwen3_5::ModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
+fn qwen_hybrid_spec(args: &QwenHybridConfig, multimodal: bool) -> Result<Spec, CapabilityError> {
     let configured = positive(args.max_position_embeddings, "max_position_embeddings")?;
     let original = args
         .rope_scaling
@@ -1268,7 +1267,7 @@ fn gemma_valid_patch_count(positions: &Array, architecture: &str) -> Result<u64,
 }
 
 fn qwen_vision_workspace(
-    config: &crate::composition::mlx_architectures::qwen::vl::vision::VisionConfig,
+    config: &VisionConfig,
     modality: Modality,
     payload: &Array,
     metadata: input::InputMetadata<'_>,
@@ -1329,12 +1328,11 @@ fn qwen_vision_workspace(
             reason: "prepared Qwen media has no grid_thw metadata".into(),
         })
         .and_then(|grid| {
-            crate::composition::mlx_architectures::qwen::vl::vision::grid_thw_from_array(
-                grid, stream,
-            )
-            .map_err(|error| CapabilityError::UnsupportedInput {
-                architecture: architecture.into(),
-                reason: error.to_string(),
+            input::patch_grid_from_array(grid, stream).map_err(|error| {
+                CapabilityError::UnsupportedInput {
+                    architecture: architecture.into(),
+                    reason: error.to_string(),
+                }
             })
         })?;
     let described_patches = grid.iter().try_fold(0u64, |total, (time, height, width)| {
@@ -1367,12 +1365,7 @@ fn qwen_vision_workspace(
         config
             .layer_schedule
             .iter()
-            .filter(|policy| {
-                matches!(
-                    policy.attention,
-                    crate::composition::mlx_architectures::qwen::vl::vision::VisionAttentionPolicy::Full
-                )
-            })
+            .filter(|policy| matches!(policy.attention, VisionAttentionPolicy::Full))
             .count(),
     )
     .map_err(|_| CapabilityError::ArithmeticOverflow {
@@ -1895,7 +1888,7 @@ impl Model {
     ) -> Result<(u64, u64), CapabilityError> {
         match self {
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => qwen_vision_workspace(
-                &model.args().vision_config,
+                &model.args().vision,
                 modality,
                 payload,
                 metadata,
@@ -2704,7 +2697,7 @@ mod tests {
 
     #[test]
     fn qwen_hybrid_runtime_state_uses_the_normalized_schedule() {
-        let args = qwen3_5::model_args_from_config_value(&json!({
+        let args = eredu_architectures::qwen::hybrid::model_args_from_config_value(&json!({
             "model_type": "qwen3_next", "vocab_size": 32, "hidden_size": 16,
             "num_hidden_layers": 4, "num_attention_heads": 2,
             "num_key_value_heads": 1, "head_dim": 8,
@@ -2717,7 +2710,8 @@ mod tests {
                 "linear_attention", "full_attention"
             ]
         }))
-        .unwrap();
+        .unwrap()
+        .text;
         let (_, _, strategy, _, estimate) = qwen_hybrid_spec(&args, false).unwrap();
         assert_eq!(
             strategy,
@@ -3085,18 +3079,16 @@ mod tests {
 
     #[test]
     fn qwen_prepared_grid_bounds_vision_workspace() {
-        let config = crate::composition::mlx_architectures::qwen::vl::vision::VisionConfig {
+        let config = VisionConfig {
             layer_schedule: crate::core::attention::LayerSchedule::new(
                 2,
                 vec![
-                    crate::composition::mlx_architectures::qwen::vl::vision::VisionLayerPolicy {
-                        attention:
-                            crate::composition::mlx_architectures::qwen::vl::vision::VisionAttentionPolicy::Windowed,
+                    eredu_architectures::qwen::vision::VisionLayerPolicy {
+                        attention: VisionAttentionPolicy::Windowed,
                         deepstack_merger: Some(0),
                     },
-                    crate::composition::mlx_architectures::qwen::vl::vision::VisionLayerPolicy {
-                        attention:
-                            crate::composition::mlx_architectures::qwen::vl::vision::VisionAttentionPolicy::Full,
+                    eredu_architectures::qwen::vision::VisionLayerPolicy {
+                        attention: VisionAttentionPolicy::Full,
                         deepstack_merger: None,
                     },
                 ],
@@ -3113,7 +3105,7 @@ mod tests {
             temporal_patch_size: 1,
             window_size: 4,
             out_hidden_size: 8,
-            quantized_weight_configs: Default::default(),
+            linear_formats: Default::default(),
         };
         let payload = Array::from_slice(&[0.0f32; 12], &[4, 3]);
         let grid = Array::from_slice(&[1, 2, 2], &[1, 3]);

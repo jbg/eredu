@@ -94,6 +94,15 @@ where
         true
     }
 
+    /// Maps one execution unit to its architecture-global mutable-state slot.
+    ///
+    /// The default matches a single flattened decoder schedule. Composite
+    /// architectures can keep parameter-only groups outside their state layout
+    /// and remap later groups onto their semantic decoder or predictor layers.
+    fn state_ordinal(&self, _group: usize, _index: usize, ordinal: usize) -> usize {
+        ordinal
+    }
+
     /// Executes one ordered unit against its concrete mutable layer state.
     fn forward_unit(
         &mut self,
@@ -732,8 +741,9 @@ where
                     .map_err(LayerwiseRuntimeError::Architecture)?;
                     hook(group, index, &hidden, &mut forward_context)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
+                    let state_ordinal = self.architecture.state_ordinal(group, index, ordinal);
                     let state_values = state
-                        .retained_values(ordinal, address)
+                        .retained_values(state_ordinal, address.with_index(state_ordinal))
                         .map_err(LayerwiseRuntimeError::State)?;
                     let context_values =
                         self.architecture
@@ -1003,8 +1013,9 @@ where
                     .map_err(LayerwiseRuntimeError::Architecture)?;
                     hook(group, index, &mut forward_context)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
+                    let state_ordinal = self.architecture.state_ordinal(group, index, ordinal);
                     let state_values = state
-                        .retained_values(ordinal, address)
+                        .retained_values(state_ordinal, address.with_index(state_ordinal))
                         .map_err(LayerwiseRuntimeError::State)?;
                     let context_values =
                         self.architecture
@@ -1197,8 +1208,9 @@ where
                     hidden = hook(&path, &unit_input, &output)
                         .map_err(LayerwiseRuntimeError::Architecture)?
                         .unwrap_or(output);
+                    let state_ordinal = self.architecture.state_ordinal(group, index, ordinal);
                     let state_values = state
-                        .retained_values(ordinal, address)
+                        .retained_values(state_ordinal, address.with_index(state_ordinal))
                         .map_err(LayerwiseRuntimeError::State)?;
                     let context_values =
                         self.architecture

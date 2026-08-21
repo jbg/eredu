@@ -123,6 +123,7 @@ where
                 vocabulary: args.vocab_size,
                 hidden_size: args.hidden_size,
                 normalization_epsilon: args.rms_norm_eps,
+                normalization_offset: 0.0,
                 embedding_quantization: None,
                 head_format: args.linear_format_for("head.weight"),
                 tied_head: false,

@@ -147,6 +147,29 @@ impl Tensor for Array {
         backend(Array::take_axis(self, indexes, axis, context))
     }
 
+    fn zeros_like(&self, context: &Self::Context) -> Result<Self, Error> {
+        backend(safemlx::ops::zeros_like(self, context))
+    }
+
+    fn equal_i32(&self, value: i32, context: &Self::Context) -> Result<Self, Error> {
+        backend(self.eq(Array::from_int(value), context))
+    }
+
+    fn logical_or(&self, rhs: &Self, context: &Self::Context) -> Result<Self, Error> {
+        backend(Array::logical_or(self, rhs, context))
+    }
+
+    fn masked_scatter(
+        &self,
+        mask: &Self,
+        source: &Self,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        backend(safemlx::ops::indexing::masked_scatter(
+            self, mask, source, context,
+        ))
+    }
+
     fn rope_with_frequencies(
         &self,
         dimensions: i32,
@@ -384,6 +407,39 @@ impl Tensor for Array {
                 let half = backend(concatenate_axis(&axis_angles, -1, context))?;
                 backend(concatenate_axis(&[half.clone(), half], -1, context))?
             }
+            MultiAxisRotaryLayout::RoundRobinSections => {
+                let half = dimensions / 2;
+                let axis_count = spec.axes.len();
+                let mut selected = Vec::with_capacity(half as usize);
+                for frequency in 0..half {
+                    let candidate = frequency as usize % axis_count;
+                    let section = spec.axes[candidate].dimensions / 2;
+                    let axis = if candidate != 0 && frequency < section * axis_count as i32 {
+                        candidate
+                    } else {
+                        0
+                    };
+                    let positions =
+                        backend(positions.try_index_device((.., axis as i32), context))?;
+                    let positions = backend(
+                        positions.add(Array::from_int(spec.axes[axis].position_offset), context),
+                    )?;
+                    let positions = backend(maximum(
+                        positions,
+                        Array::from_int(spec.minimum_position),
+                        context,
+                    ))?;
+                    selected.push(backend(positions.expand_dims(-1, context))?);
+                }
+                let selected = backend(concatenate_axis(&selected, -1, context))?;
+                let inv = (0..half)
+                    .map(|index| 1.0 / spec.base.powf(2.0 * index as f32 / dimensions as f32))
+                    .collect::<Vec<_>>();
+                let inv = backend(Array::from_slice(&inv, &[1, half]).copy(context))?;
+                let selected = backend(selected.as_dtype(Dtype::Float32, context))?;
+                let half = backend(selected.multiply(inv, context))?;
+                backend(concatenate_axis(&[half.clone(), half], -1, context))?
+            }
         };
         let mut output_shape = position_shape[..position_shape.len() - 1].to_vec();
         output_shape.push(dimensions);
@@ -551,7 +607,7 @@ mod tests {
             ],
             base: 100.0,
             minimum_position: 0,
-            layout: MultiAxisRotaryLayout::SplitHalves,
+            layout: MultiAxisRotaryLayout::RoundRobinSections,
         };
         let (actual_cosine, actual_sine) =
             multi_axis_rotary_embeddings(&positions, &spec, stream).unwrap();

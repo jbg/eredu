@@ -74,6 +74,7 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
                 vocabulary: args.vocab_size,
                 hidden_size: args.hidden_size,
                 normalization_epsilon: args.rms_norm_eps,
+                normalization_offset: 0.0,
                 embedding_quantization: None,
                 // Published V3/R1 checkpoints keep the output head dense,
                 // including otherwise block-FP8 models.

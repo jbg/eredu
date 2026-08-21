@@ -125,10 +125,11 @@ impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for RoutedSwiGlu<B> {
     fn forward_feed_forward_parallel(
         &mut self,
         input: &B::Tensor,
-        _parallel: &B::ParallelContext,
+        parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        self.forward_feed_forward(input, context)
+        let output = self.forward_feed_forward(input, context)?;
+        B::sum_parallel(output, parallel, context)
     }
 }
 
@@ -286,6 +287,30 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
                     expert_count,
                 })?;
                 Ok(output)
+            }
+        }
+    }
+
+    /// Executes the selected feed-forward policy with rank-local parameters
+    /// and exactly one row reduction for tensor-parallel output.
+    pub fn forward_with_provider_parallel<P>(
+        &mut self,
+        layer: usize,
+        pass: ExpertPass,
+        input: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        provider: &mut P,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+    {
+        match self {
+            Self::Dense(mlp) => mlp.forward_feed_forward_parallel(input, parallel, context),
+            Self::Routed(_) => {
+                let output = self.forward_with_provider(layer, pass, input, context, provider)?;
+                B::sum_parallel(output, parallel, context)
             }
         }
     }

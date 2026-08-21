@@ -1,4 +1,4 @@
-//! MLX residency adapter for neutral Qwen routed-expert checkpoint contracts.
+// MLX residency adapter for neutral Qwen routed-expert checkpoint contracts.
 
 use std::collections::BTreeSet;
 
@@ -10,7 +10,7 @@ use safemlx::{Array, Stream};
 
 use crate::backend::mlx::runtime::residency::expert_cache::ExpertCache;
 use crate::backend::mlx::runtime::residency::expert_provider::{
-    execute_cached_swiglu, CachedSwiGluBankSpec, CachedSwiGluExpertProvider,
+    execute_cached_swiglu_dispatched, CachedSwiGluBankSpec, CachedSwiGluExpertProvider,
 };
 use crate::backend::mlx::{
     error::Error,
@@ -47,24 +47,21 @@ fn cached_bank_spec(args: &ModelArgs, layer: usize) -> CachedSwiGluBankSpec {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_cached(
+pub(crate) fn execute_cached_dispatched(
     cache: &ExpertCache,
     args: &ModelArgs,
     layer: usize,
     hidden: &Array,
-    expert_ids: &Array,
-    route_weights: &Array,
+    global_expert_ids: &Array,
     pass: ExpertPass,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    execute_cached_swiglu(
+    execute_cached_swiglu_dispatched(
         cache,
         cached_bank_spec(args, layer),
         layer,
         hidden,
-        expert_ids,
-        route_weights,
+        global_expert_ids,
         pass,
         stream,
     )
@@ -91,6 +88,16 @@ pub(crate) fn expert_catalog_cartesian(
         let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
         let packed_gate_up = format!("{prefix}.gate_up_proj");
         let packed_down = format!("{prefix}.down_proj");
+        let source_key = |base: &str| {
+            keys.contains(base).then(|| base.to_string()).or_else(|| {
+                let weight = format!("{base}.weight");
+                keys.contains(&weight).then_some(weight)
+            })
+        };
+        let packed_gate_up_source = source_key(&packed_gate_up);
+        let packed_down_source = source_key(&packed_down);
+        let split_gate_source = source_key(&format!("{prefix}.gate_proj"));
+        let split_up_source = source_key(&format!("{prefix}.up_proj"));
         for expert in 0..experts {
             let identity = ExpertIdentity::new(layer, expert);
             let selection = TensorSelection::Range {
@@ -99,10 +106,10 @@ pub(crate) fn expert_catalog_cartesian(
                 end: expert + 1,
             };
             let mut bindings = Vec::new();
-            if keys.contains(&packed_gate_up) && keys.contains(&packed_down) {
+            if let (Some(gate_up), Some(down)) = (&packed_gate_up_source, &packed_down_source) {
                 for (name, key) in [
-                    ("gate_up_proj", packed_gate_up.clone()),
-                    ("down_proj", packed_down.clone()),
+                    ("gate_up_proj", gate_up.clone()),
+                    ("down_proj", down.clone()),
                 ] {
                     bindings.push(recipe_binding(
                         name,
@@ -124,30 +131,23 @@ pub(crate) fn expert_catalog_cartesian(
                         )?);
                     }
                 }
-            } else if keys.contains(&format!("{prefix}.gate_proj"))
-                && keys.contains(&format!("{prefix}.up_proj"))
-                && keys.contains(&packed_down)
+            } else if let (Some(gate), Some(up), Some(down)) =
+                (&split_gate_source, &split_up_source, &packed_down_source)
             {
                 bindings.push(recipe_binding(
                     "gate_up_proj",
                     DerivedWeightRecipe::Concatenate {
                         axis: 1,
                         inputs: vec![
-                            DerivedWeightRecipe::source(
-                                format!("{prefix}.gate_proj"),
-                                selection.clone(),
-                            ),
-                            DerivedWeightRecipe::source(
-                                format!("{prefix}.up_proj"),
-                                selection.clone(),
-                            ),
+                            DerivedWeightRecipe::source(gate.clone(), selection.clone()),
+                            DerivedWeightRecipe::source(up.clone(), selection.clone()),
                         ],
                     },
                     store,
                 )?);
                 bindings.push(recipe_binding(
                     "down_proj",
-                    DerivedWeightRecipe::source(packed_down.clone(), selection.clone()),
+                    DerivedWeightRecipe::source(down.clone(), selection.clone()),
                     store,
                 )?);
                 for suffix in ["_scales", "_biases"] {

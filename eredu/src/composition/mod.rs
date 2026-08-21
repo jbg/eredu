@@ -39,7 +39,5 @@ pub(crate) mod muse_glimmer_processor;
 pub mod nemotron_h;
 #[cfg(feature = "mlx")]
 pub(crate) mod qwen;
-#[cfg(feature = "mlx")]
-pub(crate) mod qwen_expert;
 #[cfg(all(test, feature = "mlx"))]
 mod stage5_neutral_tests;

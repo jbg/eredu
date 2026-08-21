@@ -10,9 +10,7 @@ use eredu_runtime::{
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use eredu_architectures::llama::ModelArgs;
-use eredu_nn::{
-    NormalizationOperator, ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized,
-};
+use eredu_nn::{ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized};
 use safemlx::{
     error::Exception,
     ops::indexing::TryIndexOp,

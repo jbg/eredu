@@ -76,6 +76,11 @@ impl<B: NeuralBackend> HybridDecoder<B> {
         &mut self.static_modules
     }
 
+    /// Consumes the graph shell and returns its pinned modules.
+    pub fn into_static_modules(self) -> StaticModules<B> {
+        self.static_modules
+    }
+
     /// Builds the target execution graph.
     pub fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
         match &self.groups {

@@ -3,14 +3,7 @@
 use serde_json::Value;
 
 use crate::backend::mlx::error::Error;
-use crate::composition::mlx_architectures::{
-    gpt_oss::model as gpt_oss,
-    moshi::personaplex,
-    qwen::{
-        hybrid::{qwen3_5, qwen3_next},
-        vl::{model as qwen3_vl, moe as qwen3_vl_moe},
-    },
-};
+use crate::composition::mlx_architectures::{gpt_oss::model as gpt_oss, moshi::personaplex};
 
 /// Canonical resolution of a model configuration supported by MLX.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -114,9 +107,15 @@ fn validate_model_config(kind: eredu_core::ModelKind, config: &Value) -> Result<
                 .map(|_| ())
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         }
-        ModelKind::Qwen3Next => qwen3_next::validate_model_config_value(config),
-        ModelKind::Qwen3Vl => qwen3_vl::validate_model_config_value(config),
-        ModelKind::Qwen3VlMoe => qwen3_vl_moe::validate_model_config_value(config),
-        ModelKind::Qwen35 => qwen3_5::validate_model_config_value(config),
+        ModelKind::Qwen3Next | ModelKind::Qwen35 => {
+            eredu_architectures::qwen::hybrid::model_args_from_config_value(config)
+                .map(|_| ())
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        }
+        ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
+            eredu_architectures::qwen::vl::model_args_from_config_value(config)
+                .map(|_| ())
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        }
     }
 }

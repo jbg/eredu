@@ -1,6 +1,6 @@
 //! Backend-neutral derived-weight recipes and shape inference.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::store::{CheckpointSource, StoreError, TensorMetadata, TensorSelection, WeightStore};
 use crate::StoredDtype;
@@ -141,6 +141,154 @@ pub struct RecipeMetadata {
     pub dtype: RecipeDtype,
     /// Exact encoded or materialized output byte count.
     pub byte_len: u64,
+}
+
+/// A named recipe collection that becomes observable only after every output
+/// has passed metadata inference. This is the atomic unit used for fused
+/// weights and their affine or FP8 companions.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AtomicRecipeSet {
+    outputs: BTreeMap<String, DerivedWeightRecipe>,
+}
+
+impl AtomicRecipeSet {
+    /// Validates all target names, rejects collisions, and infers every recipe
+    /// before returning any bindable output.
+    pub fn new<C: RecipeCatalog + ?Sized>(
+        catalog: &C,
+        outputs: impl IntoIterator<Item = (String, DerivedWeightRecipe)>,
+    ) -> Result<Self, RecipeError> {
+        let mut validated = BTreeMap::new();
+        for (target, recipe) in outputs {
+            if target.trim().is_empty() {
+                return Err(RecipeError::EmptyOutputName);
+            }
+            if validated.insert(target.clone(), recipe).is_some() {
+                return Err(RecipeError::DuplicateOutput { target });
+            }
+        }
+        if validated.is_empty() {
+            return Err(RecipeError::EmptyOutputs);
+        }
+        for recipe in validated.values() {
+            recipe.infer(catalog)?;
+        }
+        Ok(Self { outputs: validated })
+    }
+
+    /// Returns the validated recipe for one canonical output.
+    pub fn get(&self, target: &str) -> Option<&DerivedWeightRecipe> {
+        self.outputs.get(target)
+    }
+
+    /// Iterates canonical outputs in stable sorted order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &DerivedWeightRecipe)> {
+        self.outputs
+            .iter()
+            .map(|(target, recipe)| (target.as_str(), recipe))
+    }
+
+    /// Consumes the validated set for a backend binding plan.
+    pub fn into_outputs(self) -> BTreeMap<String, DerivedWeightRecipe> {
+        self.outputs
+    }
+}
+
+/// One canonical output range cut from a fused source axis.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FusedSplitOutput {
+    /// Canonical target parameter identity.
+    pub target: String,
+    /// Positive width along the split axis.
+    pub width: usize,
+}
+
+/// One physical fused tensor participating in an atomic split family.
+///
+/// Weight, bias, affine companions, and inverse scales are represented by
+/// separate members so each may declare its actual physical axis and widths.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FusedSplitMember {
+    /// Physical source tensor identity.
+    pub source: String,
+    /// Axis partitioned into ordered output ranges.
+    pub axis: usize,
+    /// Canonical targets in physical row order.
+    pub outputs: Vec<FusedSplitOutput>,
+}
+
+/// Builds an atomic grouped split for one or more fused physical members.
+pub fn atomic_fused_split_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    members: impl IntoIterator<Item = FusedSplitMember>,
+) -> Result<AtomicRecipeSet, RecipeError> {
+    let mut recipes = Vec::new();
+    for member in members {
+        if member.source.trim().is_empty() {
+            return Err(RecipeError::EmptySourceKey);
+        }
+        if member.outputs.is_empty()
+            || member
+                .outputs
+                .iter()
+                .any(|output| output.target.trim().is_empty() || output.width == 0)
+        {
+            return Err(RecipeError::InvalidFusedSplit {
+                tensor: member.source,
+            });
+        }
+        let metadata = catalog.tensor_metadata(&member.source)?;
+        let dimension = metadata.logical_shape.get(member.axis).copied().ok_or(
+            RecipeError::InvalidSelectionAxis {
+                axis: member.axis,
+                rank: metadata.logical_shape.len(),
+            },
+        )?;
+        let total = member.outputs.iter().try_fold(0usize, |total, output| {
+            total
+                .checked_add(output.width)
+                .ok_or(RecipeError::ArithmeticOverflow("fused split widths"))
+        })?;
+        if total != dimension {
+            return Err(RecipeError::FusedSplitWidthMismatch {
+                tensor: member.source,
+                axis: member.axis,
+                dimension,
+                outputs: total,
+            });
+        }
+        let mut start = 0usize;
+        for output in member.outputs {
+            let end = start + output.width;
+            recipes.push((
+                output.target,
+                DerivedWeightRecipe::source(
+                    &member.source,
+                    TensorSelection::Range {
+                        axis: member.axis,
+                        start,
+                        end,
+                    },
+                ),
+            ));
+            start = end;
+        }
+    }
+    AtomicRecipeSet::new(catalog, recipes)
+}
+
+/// Creates and validates an ordered gather/permutation along one source axis.
+/// Duplicate indices are intentionally admitted for broadcast-style layouts;
+/// callers that require a permutation must supply unique indices.
+pub fn ordered_axis_selection<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    source: impl Into<String>,
+    axis: usize,
+    indices: Vec<usize>,
+) -> Result<DerivedWeightRecipe, RecipeError> {
+    let recipe = DerivedWeightRecipe::source(source, TensorSelection::Indices { axis, indices });
+    recipe.infer(catalog)?;
+    Ok(recipe)
 }
 
 impl RecipeMetadata {
@@ -1361,6 +1509,23 @@ fn element_count(shape: &[usize], context: &'static str) -> Result<u64, RecipeEr
 pub enum RecipeError {
     #[error("derived-weight source key must not be empty")]
     EmptySourceKey,
+    #[error("derived-weight output name must not be empty")]
+    EmptyOutputName,
+    #[error("derived-weight recipe family requires at least one output")]
+    EmptyOutputs,
+    #[error("derived-weight output {target:?} is declared more than once")]
+    DuplicateOutput { target: String },
+    #[error("fused source {tensor:?} requires positive, named output segments")]
+    InvalidFusedSplit { tensor: String },
+    #[error(
+        "fused source {tensor:?} axis {axis} has dimension {dimension}, but output widths sum to {outputs}"
+    )]
+    FusedSplitWidthMismatch {
+        tensor: String,
+        axis: usize,
+        dimension: usize,
+        outputs: usize,
+    },
     #[error("selection axis {axis} is outside rank {rank}")]
     InvalidSelectionAxis { axis: usize, rank: usize },
     #[error("range {start}..{end} is invalid for axis {axis} dimension {dimension}")]
@@ -1598,5 +1763,98 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn fused_members_and_companions_validate_as_one_atomic_recipe_set() {
+        let split = atomic_fused_split_recipes(
+            &Catalog,
+            [
+                FusedSplitMember {
+                    source: "left".into(),
+                    axis: 1,
+                    outputs: vec![
+                        FusedSplitOutput {
+                            target: "weight.query".into(),
+                            width: 1,
+                        },
+                        FusedSplitOutput {
+                            target: "weight.key_value".into(),
+                            width: 2,
+                        },
+                    ],
+                },
+                FusedSplitMember {
+                    source: "right".into(),
+                    axis: 1,
+                    outputs: vec![
+                        FusedSplitOutput {
+                            target: "scale.query".into(),
+                            width: 1,
+                        },
+                        FusedSplitOutput {
+                            target: "scale.key_value".into(),
+                            width: 2,
+                        },
+                    ],
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(split.iter().count(), 4);
+        assert_eq!(
+            split
+                .get("weight.key_value")
+                .unwrap()
+                .infer(&Catalog)
+                .unwrap()
+                .shape(),
+            &[2, 2]
+        );
+
+        let duplicate = atomic_fused_split_recipes(
+            &Catalog,
+            [FusedSplitMember {
+                source: "left".into(),
+                axis: 1,
+                outputs: vec![
+                    FusedSplitOutput {
+                        target: "same".into(),
+                        width: 1,
+                    },
+                    FusedSplitOutput {
+                        target: "same".into(),
+                        width: 2,
+                    },
+                ],
+            }],
+        );
+        assert!(matches!(
+            duplicate,
+            Err(RecipeError::DuplicateOutput { .. })
+        ));
+
+        let mismatch = atomic_fused_split_recipes(
+            &Catalog,
+            [FusedSplitMember {
+                source: "left".into(),
+                axis: 1,
+                outputs: vec![FusedSplitOutput {
+                    target: "short".into(),
+                    width: 2,
+                }],
+            }],
+        );
+        assert!(matches!(
+            mismatch,
+            Err(RecipeError::FusedSplitWidthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn ordered_axis_selection_validates_value_head_layout_without_payload_reads() {
+        let recipe = ordered_axis_selection(&Catalog, "left", 1, vec![2, 0, 1]).unwrap();
+        assert_eq!(recipe.infer(&Catalog).unwrap().shape(), &[2, 3]);
+        assert!(ordered_axis_selection(&Catalog, "left", 1, vec![3]).is_err());
     }
 }

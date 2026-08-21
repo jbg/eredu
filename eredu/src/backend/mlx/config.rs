@@ -129,9 +129,9 @@ mod tests {
             ));
         options
             .validate_preparation(
-                eredu_core::ModelKind::Qwen3,
+                eredu_core::ModelKind::GptOss,
                 None,
-                eredu_core::ArtifactFormat::SafeTensors,
+                eredu_core::ArtifactFormat::Gguf,
             )
             .unwrap();
     }

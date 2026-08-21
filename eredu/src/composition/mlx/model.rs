@@ -16,13 +16,7 @@ use crate::backend::mlx::error::Error;
 use crate::backend::mlx::runtime::generation::sampler::SpeculativeSampler;
 use crate::backend::mlx::runtime::media::input;
 use crate::composition::mlx::speculative::{MlxDrafter, MtpExecutionStreams};
-use crate::composition::mlx_architectures::{
-    gpt_oss::model as gpt_oss,
-    qwen::{
-        hybrid::{qwen3_5, qwen3_next},
-        vl::{model as qwen3_vl, moe as qwen3_vl_moe},
-    },
-};
+use crate::composition::mlx_architectures::gpt_oss::model as gpt_oss;
 use crate::{LayerCachePolicy, LayerSchedule};
 use eredu_architectures::kimi_linear;
 use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
@@ -52,17 +46,13 @@ pub enum Model {
     /// Neutral Qwen2/Qwen2.5/Qwen3/Qwen3-MoE model.
     Qwen(crate::composition::qwen::QwenModel),
     /// Qwen3-Next model.
-    Qwen3Next(
-        crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel,
-    ),
+    Qwen3Next(crate::composition::qwen::hybrid::QwenHybridModel),
     /// Qwen3-VL multimodal model.
-    Qwen3Vl(crate::composition::mlx_architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel),
+    Qwen3Vl(crate::composition::qwen::vl::QwenVlModel),
     /// Qwen3-VL-MoE multimodal model.
-    Qwen3VlMoe(crate::composition::mlx_architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel),
+    Qwen3VlMoe(crate::composition::qwen::vl::QwenVlModel),
     /// Qwen3.5 dense or MoE model, optionally multimodal.
-    Qwen35(
-        crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel,
-    ),
+    Qwen35(crate::composition::qwen::hybrid::QwenHybridModel),
 }
 
 impl Model {
@@ -274,15 +264,8 @@ impl Model {
             }
             (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35(model), ModelCache::Qwen35(cache)) => {
-                let mut target =
-                    crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridTensorMtpTarget::new(
-                        model,
-                        tensor_group,
-                    );
                 let mut executor =
-                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
-                        &mut target,
-                    );
+                    crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(model);
                 crate::composition::mlx::speculative::scheduler::generate_tokens(
                     &mut executor,
                     cache,
@@ -634,11 +617,11 @@ impl Model {
                 .prompt_cache_architecture_fingerprint()
                 .map_err(|error| Exception::custom(error.to_string())),
             Self::Qwen3Next(model) | Self::Qwen35(model) => {
-                Ok(qwen3_5::prompt_cache_architecture_fingerprint(model.args()))
+                Ok(model.prompt_cache_architecture_fingerprint())
             }
-            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => Ok(
-                qwen3_vl::prompt_cache_architecture_fingerprint(model.args()),
-            ),
+            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
+                Ok(model.prompt_cache_architecture_fingerprint())
+            }
         }
     }
 
@@ -1059,17 +1042,17 @@ pub enum ModelCache {
     /// Runtime-policy-selected Qwen key/value state.
     Qwen(crate::backend::mlx::runtime::cache::state::MlxKeyValueState),
     /// Qwen3-VL key/value cache and multimodal position state.
-    Qwen3Vl(qwen3_vl::Cache),
+    Qwen3Vl(crate::backend::mlx::runtime::cache::state::MlxHybridState),
     /// Qwen3-VL-MoE key/value cache and multimodal position state.
-    Qwen3VlMoe(qwen3_vl_moe::Cache),
+    Qwen3VlMoe(crate::backend::mlx::runtime::cache::state::MlxHybridState),
     /// Architecture-declared heterogeneous append-only and fixed state.
     Hybrid(crate::backend::mlx::runtime::cache::state::MlxHybridState),
     /// Neutral Inkling target and checkpoint-embedded predictor state.
     Inkling(crate::composition::inkling::InklingState),
     /// Heterogeneous Qwen3.5 MoE cache.
-    Qwen35(qwen3_5::Cache),
+    Qwen35(crate::backend::mlx::runtime::cache::state::MlxHybridState),
     /// Heterogeneous Qwen3-Next cache.
-    Qwen3Next(qwen3_next::Cache),
+    Qwen3Next(crate::backend::mlx::runtime::cache::state::MlxHybridState),
 }
 
 impl ModelCache {

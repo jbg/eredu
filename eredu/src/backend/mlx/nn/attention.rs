@@ -285,6 +285,17 @@ pub(crate) fn apply_rotary_embeddings(
     sin: &Array,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    let add_batch_axis = |embedding: &Array| -> Result<Array, Exception> {
+        match embedding.shape().len() {
+            2 => embedding.expand_dims(0, stream),
+            3 => Ok(embedding.clone()),
+            rank => Err(Exception::custom(format!(
+                "explicit rotary embeddings must have rank 2 or 3, got {rank}"
+            ))),
+        }
+    };
+    let cos = add_batch_axis(cos)?;
+    let sin = add_batch_axis(sin)?;
     let cos = cos
         .as_dtype(value.dtype(), stream)?
         .try_index_device((.., NewAxis, .., ..), stream)?;

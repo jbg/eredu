@@ -293,6 +293,10 @@ pub enum MultiAxisRotaryLayout {
     IndependentAxes,
     /// Axis frequencies form one half which is then repeated: `x,y,x,y`.
     SplitHalves,
+    /// Global frequencies select axes round-robin while each axis has an
+    /// explicit section width; exhausted secondary sections fall back to the
+    /// first axis, and the completed half is repeated.
+    RoundRobinSections,
 }
 
 /// Position-encoding choice for one architecture layer.
@@ -618,6 +622,27 @@ pub fn reference_multi_axis_rotary_embeddings(
                 .collect::<Vec<_>>(),
             MultiAxisRotaryLayout::SplitHalves => {
                 let half = axis_angles.into_iter().flatten().collect::<Vec<_>>();
+                half.clone().into_iter().chain(half).collect()
+            }
+            MultiAxisRotaryLayout::RoundRobinSections => {
+                let half_width = dimensions / 2;
+                let mut half = Vec::with_capacity(half_width);
+                for frequency in 0..half_width {
+                    let candidate = frequency % axis_count;
+                    let section = usize::try_from(spec.axes[candidate].dimensions / 2)
+                        .map_err(|_| Error::backend("negative rotary section"))?;
+                    let axis = if candidate != 0 && frequency < section * axis_count {
+                        candidate
+                    } else {
+                        0
+                    };
+                    let position = positions[row * axis_count + axis]
+                        .saturating_add(spec.axes[axis].position_offset)
+                        .max(spec.minimum_position) as f32;
+                    half.push(
+                        position / spec.base.powf(2.0 * frequency as f32 / dimensions as f32),
+                    );
+                }
                 half.clone().into_iter().chain(half).collect()
             }
         };

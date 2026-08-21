@@ -798,10 +798,10 @@ impl RuntimeState<MlxBackend> for MlxKeyValueState {
 
     fn retained_values(
         &self,
-        _ordinal: usize,
-        address: eredu_runtime::ExecutionUnitAddress,
+        ordinal: usize,
+        _address: eredu_runtime::ExecutionUnitAddress,
     ) -> Result<Self::RetainedValues<'_>, StateError> {
-        let layer = address.index();
+        let layer = ordinal;
         self.layers
             .get(layer)
             .map(RuntimeLayerState::retained_values)
@@ -1708,10 +1708,10 @@ impl RuntimeState<MlxBackend> for MlxHybridState {
 
     fn retained_values(
         &self,
-        _ordinal: usize,
-        address: eredu_runtime::ExecutionUnitAddress,
+        ordinal: usize,
+        _address: eredu_runtime::ExecutionUnitAddress,
     ) -> Result<Self::RetainedValues<'_>, StateError> {
-        let layer = address.index();
+        let layer = ordinal;
         self.layers
             .get(layer)
             .map(RuntimeLayerState::retained_values)

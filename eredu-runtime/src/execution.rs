@@ -94,6 +94,14 @@ impl ExecutionUnitAddress {
     pub const fn index(self) -> usize {
         self.index
     }
+
+    /// Returns the same execution-group address with a semantic state index.
+    pub const fn with_index(self, index: usize) -> Self {
+        Self {
+            group: self.group,
+            index,
+        }
+    }
 }
 
 /// Validated mapping between architecture groups and the flat residency-unit order.

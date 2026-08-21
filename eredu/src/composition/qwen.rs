@@ -16,8 +16,8 @@ use std::{
 
 use eredu_architectures::qwen::ModelArgs;
 use eredu_nn::{
-    NormalizationOperator, ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized,
-    RoutedNeuralBackend, SwiGluExpertBankSpec, SwiGluExpertLayout, SwiGluExpertProjection,
+    ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized, RoutedNeuralBackend,
+    SwiGluExpertBankSpec, SwiGluExpertLayout, SwiGluExpertProjection,
 };
 use safemlx::{
     error::Exception,
@@ -56,6 +56,23 @@ use crate::{
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{ExpertCache, ExpertCacheReport},
 };
+
+pub(crate) mod expert {
+    include!("qwen_expert.rs");
+}
+
+pub(crate) mod hybrid {
+    include!("qwen_hybrid.rs");
+}
+
+#[cfg(feature = "mlx-image")]
+pub(crate) mod processor {
+    include!("qwen_processor.rs");
+}
+
+pub(crate) mod vl {
+    include!("qwen_vl.rs");
+}
 use eredu_runtime::{
     CacheResidencyPolicy, DenseDiskStreamReport, LayerwiseModelMetadata, PagedCacheOptions,
     ParallelModelInfo, StaticUnitBindings,
@@ -270,7 +287,7 @@ fn forward_qwen_cached_observed_unit(
         )));
     }
     let path = format!("{}.layers.{index}", args.parameter_root);
-    let mut provider = crate::composition::qwen_expert::cached_provider(expert_cache, args);
+    let mut provider = expert::cached_provider(expert_cache, args);
     observer.observe(&format!("{path}.input"), hidden)?;
     let mut output = architecture.forward_block_with_feed_forward(
         index,
@@ -694,8 +711,7 @@ impl QwenModel {
         if let Some(expert_cache) = self.expert_cache.take() {
             let args = self.args.clone();
             let result = {
-                let mut provider =
-                    crate::composition::qwen_expert::cached_provider(&expert_cache, &args);
+                let mut provider = expert::cached_provider(&expert_cache, &args);
                 self.forward_with_expert_provider(inputs, None, cache, &mut provider, stream)
             };
             self.expert_cache = Some(expert_cache);
@@ -844,8 +860,7 @@ impl QwenModel {
         if let Some(expert_cache) = self.expert_cache.take() {
             let args = self.args.clone();
             let result = {
-                let mut provider =
-                    crate::composition::qwen_expert::cached_provider(&expert_cache, &args);
+                let mut provider = expert::cached_provider(&expert_cache, &args);
                 self.forward_tensor_expert_provider(
                     inputs,
                     None,
@@ -1216,7 +1231,7 @@ fn attach_qwen_expert_cache(
         ));
     }
     let store = model.checkpoint_store_arc();
-    let entries = crate::composition::qwen_expert::expert_catalog(&model.args, store.as_ref())?;
+    let entries = expert::expert_catalog(&model.args, store.as_ref())?;
     model.expert_cache = Some(ExpertCache::new_shared(
         store,
         entries,
@@ -1897,12 +1912,11 @@ impl QwenParallelComposition {
         let static_modules = self.architecture.static_modules();
         let mut units = Vec::new();
         if selected("embedding") {
-            let prefix = format!("{}.embed_tokens", self.args().parameter_root);
             units.push(StaticUnitBindings::new(
                 "qwen.static.embedding",
                 build_module_binding_plan_with_recipes(
                     &static_modules.embeddings,
-                    &prefix,
+                    &format!("{}.embed_tokens", self.args().parameter_root),
                     store,
                     Default::default(),
                 )?
@@ -1910,17 +1924,25 @@ impl QwenParallelComposition {
             )?);
         }
         if selected("norm") {
-            let prefix = format!("{}.norm", self.args().parameter_root);
-            units.push(StaticUnitBindings::new(
-                "qwen.static.norm",
-                build_module_binding_plan_with_recipes(
-                    &static_modules.norm,
-                    &prefix,
-                    store,
-                    Default::default(),
-                )?
-                .build_bindings(store)?,
-            )?);
+            let norm_root = format!("{}.norm.", self.args().parameter_root);
+            let bindings = build_module_binding_plan_with_recipes(
+                &static_modules.norm,
+                "",
+                store,
+                Default::default(),
+            )?
+            .build_bindings(store)?
+            .into_iter()
+            .map(|binding| {
+                let local = binding
+                    .name()
+                    .strip_prefix(&norm_root)
+                    .unwrap_or(binding.name())
+                    .to_owned();
+                binding.with_name(local).map_err(Error::from)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+            units.push(StaticUnitBindings::new("qwen.static.norm", bindings)?);
         }
         if selected("output") {
             if let Some(head) = &static_modules.lm_head {

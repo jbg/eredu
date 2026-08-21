@@ -16,10 +16,7 @@ use crate::{
         resolve_model_config, validate_gguf_quantization_source, Model, ModelLoadOptions,
         ResolvedModelConfig,
     },
-    composition::mlx_architectures::{
-        gpt_oss::model as gpt_oss,
-        qwen::{hybrid::qwen3_5, vl::model as qwen3_vl},
-    },
+    composition::mlx_architectures::gpt_oss::model as gpt_oss,
     core::generation::MtpSchedulerOptions,
     core::{ModelKind, SpeculativeExecutionTopology},
     runtime::chat::constraints::{ConstraintController, ConstraintError},
@@ -221,10 +218,12 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         "tie_word_embeddings": true,
         "layer_types": ["full_attention"]
     });
-    let args = qwen3_5::model_args_from_config_value(&config).unwrap();
-    let qwen = qwen3_5::Model::new(args, None, None, None, stream).unwrap();
+    let parsed = eredu_architectures::qwen::hybrid::model_args_from_config_value(&config).unwrap();
+    let qwen =
+        crate::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(parsed.text, stream)
+            .unwrap();
     let directory = temp_model_dir(&config.to_string());
-    save_zero_checkpoint(&qwen, &directory, stream);
+    save_zero_neutral_checkpoint(&qwen, &directory, stream);
     let Model::Qwen35(qwen) =
         load_test_model(&directory, ModelLoadOptions::default(), stream, stream)
             .unwrap()
@@ -1231,6 +1230,43 @@ fn save_zero_neutral_checkpoint<M: Parameterized<Array>>(
     .unwrap();
 }
 
+fn save_zero_neutral_checkpoint_with_names<M: Parameterized<Array>>(
+    model: &M,
+    dir: &std::path::Path,
+    stream: &Stream,
+    canonical_name: impl Fn(&str) -> String,
+) {
+    struct ZeroCollector<'a, F> {
+        stream: &'a Stream,
+        canonical_name: F,
+        arrays: Vec<(String, Array)>,
+    }
+    impl<'tensor, F: Fn(&str) -> String> ParameterVisitor<'tensor, Array> for ZeroCollector<'_, F> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+            self.arrays.push((
+                (self.canonical_name)(metadata.id.as_str()),
+                zeros_dtype(parameter.shape(), parameter.dtype(), self.stream).unwrap(),
+            ));
+        }
+    }
+
+    let mut collector = ZeroCollector {
+        stream,
+        canonical_name,
+        arrays: Vec::new(),
+    };
+    model.visit_parameters(&mut collector);
+    Array::save_safetensors(
+        collector
+            .arrays
+            .iter()
+            .map(|(name, array)| (name.as_str(), array)),
+        None,
+        dir.join("model.safetensors"),
+    )
+    .unwrap();
+}
+
 fn save_zero_qwen_checkpoint(
     args: &eredu_architectures::qwen::ModelArgs,
     dir: &std::path::Path,
@@ -1695,20 +1731,27 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 save_zero_qwen_checkpoint(&args, &dir, stream);
             }
             "qwen3_5" => {
-                let (args, image_token_id, video_token_id, vision_config) =
-                    qwen3_5::get_qwen3_5_model_args(&dir).unwrap();
-                save_zero_checkpoint(
-                    &qwen3_5::Model::new(
-                        args,
-                        image_token_id,
-                        video_token_id,
-                        vision_config,
+                let parsed = crate::composition::qwen::hybrid::load_parsed_config(&dir).unwrap();
+                if parsed.vision.is_some() {
+                    save_zero_neutral_checkpoint(
+                        &crate::composition::qwen::hybrid::QwenConditionalCheckpointTemplate::new(
+                            parsed, stream,
+                        )
+                        .unwrap(),
+                        &dir,
                         stream,
-                    )
-                    .unwrap(),
-                    &dir,
-                    stream,
-                );
+                    );
+                } else {
+                    save_zero_neutral_checkpoint(
+                        &crate::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
+                            parsed.text,
+                            stream,
+                        )
+                        .unwrap(),
+                        &dir,
+                        stream,
+                    );
+                }
             }
             "gemma4" => {
                 let args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
@@ -1975,10 +2018,8 @@ fn tiny_lfm2_neutral_runtime_executes_convolution_and_attention_layers() {
             }"#,
     );
     let args = crate::composition::lfm2::load_model_args(&dir).unwrap();
-    save_zero_checkpoint(
-        &crate::backend::mlx::nn::MlxModule::new(
-            crate::composition::lfm2::Lfm2CheckpointTemplate::new(args, stream).unwrap(),
-        ),
+    save_zero_neutral_checkpoint(
+        &crate::composition::lfm2::Lfm2CheckpointTemplate::new(args, stream).unwrap(),
         &dir,
         stream,
     );
@@ -2129,19 +2170,17 @@ fn tiny_hybrid_qwen_neutral_runtime_executes_recurrent_and_attention_layers() {
               "tie_word_embeddings":false
             }"#,
     );
-    let args =
-        crate::composition::mlx_architectures::qwen::hybrid::qwen3_next::get_qwen3_next_model_args(
-            &dir,
-        )
-        .unwrap();
-    save_zero_checkpoint(
-        &qwen3_5::Model::new(args, None, None, None, stream).unwrap(),
+    let args = crate::composition::qwen::hybrid::load_parsed_config(&dir)
+        .unwrap()
+        .text;
+    save_zero_neutral_checkpoint(
+        &crate::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(args, stream).unwrap(),
         &dir,
         stream,
     );
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
 
-    let mut resident = crate::composition::mlx_architectures::qwen::hybrid::layerwise::load_qwen3_next_layerwise_model(
+    let mut resident = crate::composition::qwen::hybrid::load_safetensors(
         &dir,
         eredu_runtime::LayerWeightResidency::FullyResident,
         None,
@@ -2156,7 +2195,7 @@ fn tiny_hybrid_qwen_neutral_runtime_executes_recurrent_and_attention_layers() {
     safemlx::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 24]);
 
-    let mut bounded = crate::composition::mlx_architectures::qwen::hybrid::layerwise::load_qwen3_next_layerwise_model(
+    let mut bounded = crate::composition::qwen::hybrid::load_safetensors(
         &dir,
         eredu_runtime::LayerwiseLoadOptions::default(),
         None,
@@ -2684,9 +2723,11 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
               }
             }"#,
     );
-    let args = qwen3_vl::get_qwen3_vl_model_args(&dir).unwrap();
-    save_zero_checkpoint_with_names(
-        &qwen3_vl::Model::new(args, stream).unwrap(),
+    let config: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap()).unwrap();
+    let args = eredu_architectures::qwen::vl::model_args_from_config_value(&config).unwrap();
+    save_zero_neutral_checkpoint_with_names(
+        &crate::composition::qwen::vl::QwenVlCheckpointTemplate::new(args, stream).unwrap(),
         &dir,
         stream,
         |name| {
@@ -2732,15 +2773,14 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
         .unwrap();
     assert_eq!(logits.shape(), &[1, 32]);
 
-    let mut bounded =
-        crate::composition::mlx_architectures::qwen::vl::layerwise::load_qwen3_vl_layerwise_model(
-            &dir,
-            eredu_runtime::LayerwiseLoadOptions::default(),
-            None,
-            stream,
-            weights_stream,
-        )
-        .unwrap();
+    let mut bounded = crate::composition::qwen::vl::load_safetensors(
+        &dir,
+        eredu_runtime::LayerwiseLoadOptions::default(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
     let mut bounded_cache = bounded.new_cache();
     let bounded_logits = bounded
         .prefill(input::ModelInput::new(&parts), &mut bounded_cache, stream)
@@ -2821,13 +2861,19 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
           }
         }"#;
     let dir = temp_model_dir(config);
-    let (args, image_token_id, video_token_id, vision_config) =
-        qwen3_5::get_qwen3_5_model_args(&dir).unwrap();
-    save_zero_checkpoint(
-        &qwen3_5::Model::new(args, image_token_id, video_token_id, vision_config, stream).unwrap(),
+    let args = crate::composition::qwen::hybrid::load_parsed_config(&dir)
+        .unwrap()
+        .text;
+    save_zero_neutral_checkpoint(
+        &crate::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(args, stream).unwrap(),
         &dir,
         stream,
     );
+    let mut artifacts_before = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    artifacts_before.sort();
 
     let mut dense = load_test_model(&dir, ModelLoadOptions::default(), stream, weights_stream)
         .unwrap()
@@ -2850,6 +2896,23 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
     assert_eq!(
         quantized_model.residency_metadata().quantization(),
         Some(WeightQuantization::MxFp4)
+    );
+    let diagnostics = quantized_model
+        .checkpoint_store_arc()
+        .source_diagnostics()
+        .unwrap();
+    assert!(
+        diagnostics.physical_reads > 0,
+        "load-time quantization must report physical checkpoint reads"
+    );
+    let mut artifacts_after = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    artifacts_after.sort();
+    assert_eq!(
+        artifacts_after, artifacts_before,
+        "load-time quantization must not create an implicit disk artifact"
     );
 
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);

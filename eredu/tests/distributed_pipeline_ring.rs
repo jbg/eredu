@@ -16,6 +16,7 @@ use eredu::{
     backend::mlx::runtime::generation::sampler::DefaultSampler,
     backend::mlx::runtime::{
         checkpoint::binding::canonical_checkpoint_name,
+        execution::layerwise::open_safetensors_weight_store,
         media::{input::InputPayload, PreparedModelInput},
     },
     backend::mlx::{
@@ -24,15 +25,14 @@ use eredu::{
     composition::mlx_architectures::distributed::pipeline::{
         load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
     },
-    composition::mlx_architectures::{
-        gpt_oss::model as gpt_oss, qwen::hybrid::qwen3_5 as qwen_hybrid,
-    },
+    composition::mlx_architectures::gpt_oss::model as gpt_oss,
     core::{residency::OffloadConfig, BackendProvider as _, BackendSession as _},
     load_model, DenseDiskStreamLoadOptions, ExpertCacheLoadOptions, LayerwiseLoadOptions,
     MtpCapability, MtpCheckpointKind, MtpConfig, NonExpertWeightResidency, PromptCacheDescriptor,
     PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 use eredu::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_architectures::qwen::hybrid as qwen_hybrid;
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_gguf::{GgmlType, TensorInput, Writer};
 use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized};
@@ -87,6 +87,8 @@ enum FixtureFamily {
     Qwen35Moe,
     Qwen35Multimodal,
     Qwen35MoeMultimodal,
+    Qwen3Vl,
+    Qwen3VlMoe,
     Inkling,
     InklingMultimodal,
     InklingGguf,
@@ -121,6 +123,8 @@ impl FixtureFamily {
             Self::Qwen35Moe => "qwen3.5-moe",
             Self::Qwen35Multimodal => "qwen3.5-multimodal",
             Self::Qwen35MoeMultimodal => "qwen3.5-moe-multimodal",
+            Self::Qwen3Vl => "qwen3-vl",
+            Self::Qwen3VlMoe => "qwen3-vl-moe",
             Self::Inkling => "inkling",
             Self::InklingMultimodal => "inkling-multimodal",
             Self::InklingGguf => "inkling-gguf",
@@ -155,6 +159,8 @@ impl FixtureFamily {
             Self::Qwen35Moe,
             Self::Qwen35Multimodal,
             Self::Qwen35MoeMultimodal,
+            Self::Qwen3Vl,
+            Self::Qwen3VlMoe,
             Self::Inkling,
             Self::InklingMultimodal,
             Self::InklingGguf,
@@ -189,7 +195,7 @@ impl FixtureFamily {
             | Self::Qwen35
             | Self::Qwen35Moe
             | Self::Qwen35Multimodal => 2,
-            Self::Qwen35MoeMultimodal | Self::MuseGlimmer => 2,
+            Self::Qwen35MoeMultimodal | Self::Qwen3Vl | Self::Qwen3VlMoe | Self::MuseGlimmer => 2,
             Self::Gemma | Self::NemotronH | Self::NemotronHGguf => 4,
             Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => 3,
         }
@@ -243,6 +249,8 @@ impl FixtureFamily {
             Self::Qwen35Moe => ("qwen_hybrid", "qwen3_5_moe_text"),
             Self::Qwen35Multimodal => ("qwen_hybrid", "qwen3_5_text"),
             Self::Qwen35MoeMultimodal => ("qwen_hybrid", "qwen3_5_moe_text"),
+            Self::Qwen3Vl => ("qwen3_vl", "qwen3_vl"),
+            Self::Qwen3VlMoe => ("qwen3_vl", "qwen3_vl_moe"),
             Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => {
                 ("inkling", "inkling_mm_model")
             }
@@ -251,7 +259,9 @@ impl FixtureFamily {
 
     const fn layer_prefix(self) -> &'static str {
         match self {
-            Self::Gemma | Self::MuseGlimmer => "model.language_model.layers.",
+            Self::Gemma | Self::MuseGlimmer | Self::Qwen3Vl | Self::Qwen3VlMoe => {
+                "model.language_model.layers."
+            }
             Self::DeepSeekV4 => "layers.",
             Self::NemotronH | Self::NemotronHGguf => "backbone.layers.",
             Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => "model.llm.layers.",
@@ -294,6 +304,8 @@ impl FixtureFamily {
                 | Self::Qwen35Moe
                 | Self::Qwen35Multimodal
                 | Self::Qwen35MoeMultimodal
+                | Self::Qwen3Vl
+                | Self::Qwen3VlMoe
                 | Self::Inkling
                 | Self::InklingMultimodal
                 | Self::InklingGguf
@@ -303,12 +315,19 @@ impl FixtureFamily {
     const fn is_multimodal(self) -> bool {
         matches!(
             self,
-            Self::InklingMultimodal | Self::Qwen35Multimodal | Self::Qwen35MoeMultimodal
+            Self::InklingMultimodal
+                | Self::Qwen35Multimodal
+                | Self::Qwen35MoeMultimodal
+                | Self::Qwen3Vl
+                | Self::Qwen3VlMoe
         )
     }
 
     const fn has_streamed_media_unit(self) -> bool {
-        matches!(self, Self::Qwen35Multimodal | Self::Qwen35MoeMultimodal)
+        matches!(
+            self,
+            Self::Qwen35Multimodal | Self::Qwen35MoeMultimodal | Self::Qwen3Vl | Self::Qwen3VlMoe
+        )
     }
 
     const fn comparison_tolerance(self) -> f32 {
@@ -469,19 +488,22 @@ fn pipeline_ring_worker() {
         let model_family = match outer_model_type {
             "gemma4" | "gemma4_unified" => "gemma4",
             "muse_glimmer" => "muse_glimmer",
+            "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
             _ => "inkling",
         };
         let layer_layout = session.prompt_cache_layer_layout().unwrap();
         let layer_prefix_offsets = session.prompt_cache_layer_prefix_offsets().unwrap();
+        let layer_count = session.prompt_cache_layer_count().unwrap();
+        let global_layer_range = session.prompt_cache_global_layer_range().unwrap();
         let descriptor = PromptCacheDescriptor {
             model_family: model_family.into(),
             effective_model_type: effective_model_type.into(),
             checkpoint_fingerprint: "opaque-ring-fixture".into(),
             prefix_content_fingerprint: format!("tokens:{prefix_tokens:?}"),
             architecture_fingerprint: session.prompt_cache_architecture_fingerprint().unwrap(),
-            layer_count: layer_layout.len(),
-            global_layer_start: 0,
-            global_layer_end: layer_layout.len(),
+            layer_count,
+            global_layer_start: global_layer_range.start,
+            global_layer_end: global_layer_range.end,
             batch_size: 1,
             layer_prefix_offsets,
             layer_layout,
@@ -698,9 +720,12 @@ fn pipeline_ring_worker() {
                             | FixtureFamily::Qwen35Moe
                             | FixtureFamily::Qwen35Multimodal
                             | FixtureFamily::Qwen35MoeMultimodal
+                            | FixtureFamily::Qwen3Vl
+                            | FixtureFamily::Qwen3VlMoe
                     ))
                     && expected_range.contains(&layer),
-                "rank {expected_rank} opened the wrong SafeTensors layer shard {layer} for {family:?}: {opened:?}"
+                "rank {expected_rank} opened the wrong SafeTensors layer shard {layer} for {family:?}: {opened:?}; owned={:?}",
+                info.owned_tensors
             );
         }
     }
@@ -835,6 +860,7 @@ fn pipeline_ring_worker() {
         FixtureFamily::Qwen35Multimodal | FixtureFamily::Qwen35MoeMultimodal => {
             vec![1, 2, 42, 42]
         }
+        FixtureFamily::Qwen3Vl | FixtureFamily::Qwen3VlMoe => vec![1, 2, 42, 42],
         _ => vec![1, 2],
     };
     let prompt_length = prefix_ids.len() as i32;
@@ -869,6 +895,10 @@ fn pipeline_ring_worker() {
     }
     assert_family_cache(family, pipeline_rank, &cache, prompt_length);
     let (model_family, effective_model_type) = family.descriptor_names();
+    let layer_layout = model.prompt_cache_layer_layout().unwrap();
+    let target_layer_count = family.stage_range(pipeline_rank).len();
+    let mut layer_prefix_offsets = vec![0; layer_layout.len()];
+    layer_prefix_offsets[target_layer_count..].fill(-1);
     let descriptor = PromptCacheDescriptor {
         model_family: model_family.into(),
         effective_model_type: effective_model_type.into(),
@@ -877,10 +907,10 @@ fn pipeline_ring_worker() {
         architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
         layer_count: family.layer_count(),
         global_layer_start: family.stage_range(pipeline_rank).start,
-        global_layer_end: family.stage_range(pipeline_rank).end,
+        global_layer_end: family.stage_range(pipeline_rank).start + layer_layout.len(),
         batch_size: 1,
-        layer_prefix_offsets: vec![0; family.stage_range(pipeline_rank).len()],
-        layer_layout: model.prompt_cache_layer_layout().unwrap(),
+        layer_prefix_offsets,
+        layer_layout,
         sink_tokens: 0,
         topology: PromptCacheTopology {
             pipeline: Some((2, pipeline_rank)),
@@ -1144,12 +1174,26 @@ fn qwen35_multimodal_prepared_input() -> PreparedModelInput {
     PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
 }
 
+fn qwen3_vl_prepared_input() -> PreparedModelInput {
+    use eredu::backend::mlx::runtime::media::input::{InputMetadata, InputPart, ModelInput};
+
+    let text = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
+    let pixels = Array::from_slice(&[0.01f32; 96], &[8, 12]);
+    let parts = [
+        InputPart::text_token_ids(&text),
+        InputPart::image_tensor(&pixels, InputMetadata::patch_grid(&grid)),
+    ];
+    PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
+}
+
 fn multimodal_prepared_input(family: FixtureFamily) -> PreparedModelInput {
     match family {
         FixtureFamily::InklingMultimodal => inkling_multimodal_prepared_input(),
         FixtureFamily::Qwen35Multimodal | FixtureFamily::Qwen35MoeMultimodal => {
             qwen35_multimodal_prepared_input()
         }
+        FixtureFamily::Qwen3Vl | FixtureFamily::Qwen3VlMoe => qwen3_vl_prepared_input(),
         _ => panic!("{family:?} is not a multimodal fixture"),
     }
 }
@@ -2528,6 +2572,18 @@ fn save_indexed_pipeline_fixture(
         .unwrap(),
     )
     .unwrap();
+    let store = open_safetensors_weight_store(directory, 1).unwrap();
+    for layer in 0..layer_count {
+        let prefix = format!("{layer_prefix}{layer}.");
+        for (name, _) in arrays.iter().filter(|(name, _)| name.starts_with(&prefix)) {
+            let backing = store.source_metadata(name).unwrap().backing_shard.unwrap();
+            assert_eq!(
+                backing.file_name().unwrap().to_string_lossy(),
+                format!("layer-{layer}.safetensors"),
+                "fixture tensor {name} was indexed to the wrong shard"
+            );
+        }
+    }
 }
 
 fn kimi_linear_config() -> serde_json::Value {
@@ -2932,8 +2988,11 @@ fn write_qwen_hybrid_fixture(directory: &Path, model_type: &str) {
     let config = qwen_hybrid_config(model_type);
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = qwen_hybrid::model_args_from_config_value(&config).unwrap();
-    let mut model = qwen_hybrid::Model::new(args, None, None, None, stream).unwrap();
+    let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
+    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+        crate::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(parsed.text, stream)
+            .unwrap(),
+    );
     initialize_fixture(&mut model, stream);
     save_parameter_fixture(directory, &config, &model);
 }
@@ -2942,8 +3001,11 @@ fn write_qwen_hybrid_moe_fixture(directory: &Path, model_type: &str) {
     let config = qwen_hybrid_moe_config(model_type);
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = qwen_hybrid::model_args_from_config_value(&config).unwrap();
-    let mut model = qwen_hybrid::Model::new(args, None, None, None, stream).unwrap();
+    let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
+    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+        crate::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(parsed.text, stream)
+            .unwrap(),
+    );
     initialize_fixture(&mut model, stream);
     save_parameter_fixture(directory, &config, &model);
 }
@@ -2985,12 +3047,82 @@ fn write_qwen35_multimodal_fixture(directory: &Path, moe: bool) {
     .unwrap();
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let (args, image_token_id, video_token_id, vision) =
-        qwen_hybrid::get_qwen3_5_model_args(directory).unwrap();
-    let mut model =
-        qwen_hybrid::Model::new(args, image_token_id, video_token_id, vision, stream).unwrap();
+    let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
+    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+        crate::composition::qwen::hybrid::QwenConditionalCheckpointTemplate::new(parsed, stream)
+            .unwrap(),
+    );
     initialize_fixture(&mut model, stream);
     save_parameter_fixture(directory, &config, &model);
+}
+
+fn write_qwen3_vl_fixture(directory: &Path, moe: bool) {
+    let config = serde_json::json!({
+        "architectures": [if moe { "Qwen3VLMoeForConditionalGeneration" } else { "Qwen3VLForConditionalGeneration" }],
+        "model_type": if moe { "qwen3_vl_moe" } else { "qwen3_vl" },
+        "image_token_id": 42,
+        "video_token_id": 43,
+        "tie_word_embeddings": false,
+        "text_config": {
+            "model_type": if moe { "qwen3_vl_moe_text" } else { "qwen3_vl_text" },
+            "vocab_size": 64,
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "intermediate_size": if moe { 0 } else { 32 },
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "max_position_embeddings": 128,
+            "rms_norm_eps": 0.000001,
+            "rope_theta": 10000.0,
+            "moe_intermediate_size": if moe { 8 } else { 0 },
+            "num_experts": if moe { 2 } else { 0 },
+            "num_experts_per_tok": if moe { 1 } else { 0 },
+            "norm_topk_prob": moe,
+            "rope_scaling": { "mrope_section": [2, 1, 1] }
+        },
+        "vision_config": {
+            "depth": 2,
+            "hidden_size": 8,
+            "hidden_act": "gelu_pytorch_tanh",
+            "intermediate_size": 16,
+            "num_heads": 2,
+            "num_position_embeddings": 16,
+            "in_channels": 3,
+            "patch_size": 2,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 1,
+            "out_hidden_size": 16,
+            "deepstack_visual_indexes": [0, 1]
+        }
+    });
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let args = eredu_architectures::qwen::vl::model_args_from_config_value(&config).unwrap();
+    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+        crate::composition::qwen::vl::QwenVlCheckpointTemplate::new(args, stream).unwrap(),
+    );
+    initialize_fixture(&mut model, stream);
+    let arrays = model
+        .parameters()
+        .flatten()
+        .into_iter()
+        .map(|(name, value)| {
+            let canonical = canonical_checkpoint_name(&name);
+            let canonical = canonical
+                .strip_prefix("model.language_model.model.language_model.")
+                .map_or(canonical.clone(), |suffix| {
+                    format!("model.language_model.{suffix}")
+                });
+            (canonical, value.clone())
+        })
+        .collect::<Vec<_>>();
+    save_indexed_pipeline_fixture(directory, &arrays, "model.language_model.layers.", 2);
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
 }
 
 fn inkling_config() -> serde_json::Value {
@@ -4913,6 +5045,22 @@ fn ring_four_process_qwen35_multimodal_tensor_pipeline() {
     run_ring_cartesian_pipeline(false, FixtureFamily::Qwen35Multimodal, "tp-pp");
 }
 
+/// Verifies Qwen3-VL DeepStack vision, mRoPE text, and position-delta state
+/// through tensor- and pipeline-parallel prefill and decode.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen3_vl_tensor_pipeline() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::Qwen3Vl, "tp-pp");
+}
+
+/// Exercises routed Qwen3-VL across TP=2 x PP=2 x EP=2 with the neutral
+/// shared vision tower and stage-local expert ownership.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_qwen3_vl_moe_triple_axis() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::Qwen3VlMoe, "tp-pp-ep");
+}
+
 /// Verifies multimodal Qwen3.5-MoE across all Cartesian axes with bounded
 /// media/decoder reads and independently cached routed experts.
 #[test]
@@ -5670,6 +5818,8 @@ fn run_ring_cartesian_pipeline_mode(
             FixtureFamily::Qwen35MoeMultimodal => {
                 write_qwen35_multimodal_fixture(checkpoint.path(), true)
             }
+            FixtureFamily::Qwen3Vl => write_qwen3_vl_fixture(checkpoint.path(), false),
+            FixtureFamily::Qwen3VlMoe => write_qwen3_vl_fixture(checkpoint.path(), true),
             FixtureFamily::Inkling
                 if matches!(
                     mode,
@@ -5740,6 +5890,8 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
             FixtureFamily::Qwen35MoeMultimodal => {
                 write_qwen35_multimodal_fixture(checkpoint.path(), true)
             }
+            FixtureFamily::Qwen3Vl => write_qwen3_vl_fixture(checkpoint.path(), false),
+            FixtureFamily::Qwen3VlMoe => write_qwen3_vl_fixture(checkpoint.path(), true),
             _ => panic!("host-layerwise Cartesian helper received unsupported {family:?}"),
         }
         checkpoint.path().to_path_buf()
@@ -5846,6 +5998,8 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
             FixtureFamily::Qwen35MoeMultimodal => {
                 write_qwen35_multimodal_fixture(checkpoint.path(), true)
             }
+            FixtureFamily::Qwen3Vl => write_qwen3_vl_fixture(checkpoint.path(), false),
+            FixtureFamily::Qwen3VlMoe => write_qwen3_vl_fixture(checkpoint.path(), true),
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
             FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
             FixtureFamily::DeepSeekGguf

@@ -1,3 +1,5 @@
+// Qwen image/video protocol preprocessing for neutral prepared inputs.
+
 use std::{fs, path::Path};
 
 use safemlx::Array;

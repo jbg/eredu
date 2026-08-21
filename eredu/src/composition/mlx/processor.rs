@@ -9,9 +9,7 @@ use eredu_core::{Media as PortableMedia, TokenizedMultimodalRequest, TokenizedMu
 #[cfg(feature = "mlx-image")]
 use crate::{
     backend::mlx::runtime::media::{RgbImageView, VideoSampling},
-    composition::{
-        mlx_architectures::qwen::vl::processor as qwen, muse_glimmer_processor as muse_glimmer,
-    },
+    composition::{muse_glimmer_processor as muse_glimmer, qwen::processor as qwen},
 };
 use crate::{
     backend::mlx::{

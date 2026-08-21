@@ -7,7 +7,7 @@ use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::cache::LayerCachePolicy;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
-    AttentionCache, EmbeddingOperator, EmbeddingSpec, Error, LinearOperator, LinearSpec,
+    AttentionCache, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator, LinearSpec,
     NeuralBackend, NormalizationOperator, NormalizationSpec, ParameterSpec, RotaryOperator,
     RotaryPosition, RotarySpec, RotarySubspace, SwiGluLimit, Tensor,
 };
@@ -237,12 +237,16 @@ pub struct Attention<B: NeuralBackend> {
     /// Layer-local sliding window.
     #[parameter(skip)]
     pub sliding_window: Option<i32>,
+    /// Whether the query projection's second half gates attended values.
+    #[parameter(skip)]
+    pub query_output_gate: bool,
 }
 
 struct AttentionProjections<T> {
     queries: T,
     keys: T,
     values: T,
+    output_gate: Option<T>,
     batch: i32,
     sequence: i32,
 }
@@ -262,6 +266,69 @@ impl<B: NeuralBackend> Attention<B> {
         key_norm: Option<B::Normalization>,
         rotary: Option<B::Rotary>,
         sliding_window: Option<i32>,
+    ) -> Result<Self, Error> {
+        Self::from_parts_with_query_gate(
+            query_heads,
+            key_value_heads,
+            head_dim,
+            query,
+            key,
+            value,
+            output,
+            query_norm,
+            key_norm,
+            rotary,
+            sliding_window,
+            false,
+        )
+    }
+
+    /// Assembles grouped-query attention whose fused query projection carries
+    /// an equally sized output gate in its second half.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_gated_parts(
+        query_heads: i32,
+        key_value_heads: i32,
+        head_dim: i32,
+        query: B::Linear,
+        key: B::Linear,
+        value: B::Linear,
+        output: B::Linear,
+        query_norm: Option<B::Normalization>,
+        key_norm: Option<B::Normalization>,
+        rotary: Option<B::Rotary>,
+        sliding_window: Option<i32>,
+    ) -> Result<Self, Error> {
+        Self::from_parts_with_query_gate(
+            query_heads,
+            key_value_heads,
+            head_dim,
+            query,
+            key,
+            value,
+            output,
+            query_norm,
+            key_norm,
+            rotary,
+            sliding_window,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts_with_query_gate(
+        query_heads: i32,
+        key_value_heads: i32,
+        head_dim: i32,
+        query: B::Linear,
+        key: B::Linear,
+        value: B::Linear,
+        output: B::Linear,
+        query_norm: Option<B::Normalization>,
+        key_norm: Option<B::Normalization>,
+        rotary: Option<B::Rotary>,
+        sliding_window: Option<i32>,
+        query_output_gate: bool,
     ) -> Result<Self, Error> {
         if query_heads <= 0
             || key_value_heads <= 0
@@ -285,6 +352,7 @@ impl<B: NeuralBackend> Attention<B> {
             key_norm,
             rotary,
             sliding_window,
+            query_output_gate,
         })
     }
 
@@ -383,6 +451,7 @@ impl<B: NeuralBackend> Attention<B> {
                 .map(|window| i32::try_from(window.get()))
                 .transpose()
                 .map_err(Error::backend)?,
+            query_output_gate: false,
         })
     }
 
@@ -398,7 +467,46 @@ impl<B: NeuralBackend> Attention<B> {
                 .reshape(&[batch, sequence, heads, -1], context)?
                 .transpose_axes(&[0, 2, 1, 3], context)
         };
-        let mut queries = reshape(self.query.forward(hidden, context)?, self.query_heads)?;
+        let query = self.query.forward(hidden, context)?.reshape(
+            &[
+                batch,
+                sequence,
+                self.query_heads,
+                if self.query_output_gate { -1 } else { -1 },
+            ],
+            context,
+        )?;
+        let (query, output_gate) = if self.query_output_gate {
+            let projected = query.dim(3);
+            if projected <= 0 || projected % 2 != 0 {
+                return Err(Error::backend(format!(
+                    "gated query projection has invalid final width {projected}"
+                )));
+            }
+            let head = projected / 2;
+            (
+                query.index(
+                    &[Index::Full, Index::Full, Index::Full, Index::Range(0, head)],
+                    context,
+                )?,
+                Some(
+                    query
+                        .index(
+                            &[
+                                Index::Full,
+                                Index::Full,
+                                Index::Full,
+                                Index::Range(head, projected),
+                            ],
+                            context,
+                        )?
+                        .reshape(&[batch, sequence, self.query_heads * head], context)?,
+                ),
+            )
+        } else {
+            (query, None)
+        };
+        let mut queries = query.transpose_axes(&[0, 2, 1, 3], context)?;
         if let Some(norm) = &mut self.query_norm {
             queries = norm.forward(&queries, context)?;
         }
@@ -411,6 +519,7 @@ impl<B: NeuralBackend> Attention<B> {
             queries,
             keys,
             values,
+            output_gate,
             batch,
             sequence,
         })
@@ -429,6 +538,7 @@ impl<B: NeuralBackend> Attention<B> {
             queries,
             keys,
             values,
+            output_gate,
             batch,
             sequence,
         } = self.projections(hidden, context)?;
@@ -460,9 +570,13 @@ impl<B: NeuralBackend> Attention<B> {
         } else {
             B::attention(queries, keys, values, self.scale, mask, context)?
         };
-        attended
+        let attended = attended
             .transpose_axes(&[0, 2, 1, 3], context)?
-            .reshape(&[batch, sequence, -1], context)
+            .reshape(&[batch, sequence, -1], context)?;
+        match output_gate {
+            Some(gate) => attended.multiply(&B::sigmoid(gate, context)?, context),
+            None => Ok(attended),
+        }
     }
 
     /// Executes grouped-query attention and its output projection.
@@ -1247,6 +1361,8 @@ pub struct StaticModuleSpec {
     pub hidden_size: i32,
     /// Final RMS normalization epsilon.
     pub normalization_epsilon: f32,
+    /// Fixed scalar added to the learned final-normalization scale.
+    pub normalization_offset: f32,
     /// Packed embedding format, when supported by the general embedding operator.
     pub embedding_quantization: Option<WeightQuantization>,
     /// Complete output-head physical encoding.
@@ -1271,12 +1387,20 @@ impl<B: NeuralBackend> StaticModules<B> {
             },
             context,
         )?;
-        let norm = B::rms_norm(
-            NormalizationSpec {
+        let normalization_weight =
+            ParameterSpec::trainable(&spec.normalization_weight).map_err(Error::backend)?;
+        let norm = B::normalization(
+            eredu_nn::NormalizationConstructionSpec {
                 dimensions: spec.hidden_size,
                 epsilon: spec.normalization_epsilon,
-                weight: ParameterSpec::trainable(&spec.normalization_weight)
-                    .map_err(Error::backend)?,
+                scale: if spec.normalization_offset == 0.0 {
+                    eredu_nn::NormalizationScale::Learned(normalization_weight)
+                } else {
+                    eredu_nn::NormalizationScale::LearnedOffset {
+                        weight: normalization_weight,
+                        offset: spec.normalization_offset,
+                    }
+                },
             },
             context,
         )?;
@@ -1316,6 +1440,7 @@ impl<B: NeuralBackend> StaticModules<B> {
                 vocabulary: config.vocabulary_size(),
                 hidden_size: config.hidden_size(),
                 normalization_epsilon: config.rms_norm_epsilon(),
+                normalization_offset: 0.0,
                 embedding_quantization: config.weight_quantization(&embedding_name),
                 head_format: config.weight_quantization("lm_head.weight").into(),
                 tied_head: config.tie_word_embeddings(),

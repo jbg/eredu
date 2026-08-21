@@ -1,6 +1,5 @@
 use std::{path::PathBuf, time::Instant};
 
-use eredu::composition::mlx_architectures::qwen::hybrid::qwen3_5;
 use eredu::{
     api::LoadedModel, backend::mlx::ModelLoadOptions, GenerationConfigOverrides,
     TextGenerationConfig, TokenOutput,
@@ -35,15 +34,10 @@ fn main() -> anyhow::Result<()> {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_DECODE_TOKENS);
     let case_filter = args.get(2).map(String::as_str);
-    let profile_components = args
-        .get(3)
-        .is_some_and(|value| matches!(value.as_str(), "profile" | "true" | "1"))
-        || std::env::var_os("QWEN35_MOE_BENCH_PROFILE").is_some();
     let print_ids = std::env::var_os("QWEN35_MOE_BENCH_IDS").is_some();
 
     println!("model_dir={}", model_dir.display());
     println!("decode_tokens={decode_tokens}");
-    println!("profile_components={profile_components}");
     println!("quantize_on_load={quantize_on_load}");
 
     let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
@@ -77,24 +71,18 @@ fn main() -> anyhow::Result<()> {
 
     let warmup_start = Instant::now();
     let warmup_prompt = prompt_near_token_count(&mut model, 16)?;
-    let _ = run_case(&mut model, &warmup_prompt, 2, false)?;
+    let _ = run_case(&mut model, &warmup_prompt, 2)?;
     println!("warmup_s={:.3}", warmup_start.elapsed().as_secs_f64());
 
     println!(
         "case,prompt_tokens,prefill_s,generated_tokens,decode_s,decode_tok_s,first_id,last_id"
     );
-    if profile_components {
-        println!(
-            "profile,case,phase,total_s,component_total_s,other_s,embed_s,full_attention_s,linear_attention_s,moe_router_s,moe_shared_s,moe_routed_s,moe_combine_s,final_norm_s,lm_head_s,prefill_state_dependency_s"
-        );
-    }
-
     for (name, target_tokens) in CASES {
         if case_filter.is_some_and(|filter| filter != *name) {
             continue;
         }
         let prompt = prompt_near_token_count(&mut model, *target_tokens)?;
-        let result = run_case(&mut model, &prompt, decode_tokens, profile_components)?;
+        let result = run_case(&mut model, &prompt, decode_tokens)?;
         println!(
             "{},{},{:.6},{},{:.6},{:.3},{},{}",
             name,
@@ -117,14 +105,7 @@ fn main() -> anyhow::Result<()> {
                     .join(",")
             );
         }
-        if let Some(stats) = &result.prefill_profile {
-            print_profile(name, "prefill", result.prefill_s, stats);
-        }
-        if let Some(stats) = &result.decode_profile {
-            print_profile(name, "decode", result.decode_s, stats);
-        }
     }
-    qwen3_5::set_perf_profiling(false);
 
     Ok(())
 }
@@ -138,15 +119,12 @@ struct BenchResult {
     first_id: u32,
     last_id: u32,
     ids: Vec<u32>,
-    prefill_profile: Option<qwen3_5::PerfStats>,
-    decode_profile: Option<qwen3_5::PerfStats>,
 }
 
 fn run_case(
     model: &mut LoadedModel<eredu::backend::mlx::MlxBackend<'static>>,
     prompt: &str,
     decode_tokens: usize,
-    profile_components: bool,
 ) -> anyhow::Result<BenchResult> {
     let prompt_ids = model.encode(prompt, false)?;
     let prompt_tokens = prompt_ids.len();
@@ -158,18 +136,14 @@ fn run_case(
     let mut generator = model.generate_tokens(prompt_ids, TextGenerationConfig::new(resolved))?;
     let mut ids = Vec::with_capacity(decode_tokens);
 
-    qwen3_5::set_perf_profiling(profile_components);
-    qwen3_5::reset_perf_stats();
     let prefill_start = Instant::now();
     let Some(first) = generator.next() else {
         anyhow::bail!("generator produced no tokens");
     };
     let first = first?;
     let prefill_s = prefill_start.elapsed().as_secs_f64();
-    let prefill_profile = profile_components.then(qwen3_5::perf_stats).flatten();
     ids.push(first.token_id()?);
 
-    qwen3_5::reset_perf_stats();
     let decode_start = Instant::now();
     for _ in 1..decode_tokens {
         let Some(token) = generator.next() else {
@@ -178,9 +152,6 @@ fn run_case(
         ids.push(token?.token_id()?);
     }
     let decode_s = decode_start.elapsed().as_secs_f64();
-    let decode_profile = profile_components.then(qwen3_5::perf_stats).flatten();
-    qwen3_5::set_perf_profiling(false);
-
     let decode_count = ids.len().saturating_sub(1);
     let decode_tok_s = if decode_count == 0 {
         0.0
@@ -199,27 +170,7 @@ fn run_case(
         first_id,
         last_id,
         ids,
-        prefill_profile,
-        decode_profile,
     })
-}
-
-fn print_profile(case: &str, phase: &str, total_s: f64, stats: &qwen3_5::PerfStats) {
-    let component_total_s = stats.component_total_s();
-    println!(
-        "profile,{case},{phase},{total_s:.6},{component_total_s:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
-        total_s - component_total_s,
-        stats.embed_s,
-        stats.full_attention_s,
-        stats.linear_attention_s,
-        stats.moe_router_s,
-        stats.moe_shared_s,
-        stats.moe_routed_s,
-        stats.moe_combine_s,
-        stats.final_norm_s,
-        stats.lm_head_s,
-        stats.prefill_state_dependency_s,
-    );
 }
 
 fn prompt_near_token_count(

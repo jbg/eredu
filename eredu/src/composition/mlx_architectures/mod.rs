@@ -8,6 +8,3 @@ pub mod gpt_oss;
 /// Moonshot Kimi Linear hybrid KDA/MLA implementations.
 /// Moshi and PersonaPlex realtime-token implementations.
 pub mod moshi;
-/// Meta Muse-Glimmer dense multimodal implementations.
-/// Qwen-family implementations.
-pub mod qwen;

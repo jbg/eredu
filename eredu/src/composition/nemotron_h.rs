@@ -8,9 +8,7 @@ use std::{
 
 use eredu_architectures::nemotron_h::{Block, LayeredModel, ModelArgs, PredictionUnit, Unit};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, WeightQuantization};
-use eredu_nn::{
-    NormalizationOperator, ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized,
-};
+use eredu_nn::{ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized};
 use eredu_runtime::{
     ActivationObserver, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionGraph,
     ExecutionUnitLayout, ExpertIdentity, LayerWeightResidency, LayeredArchitecture,

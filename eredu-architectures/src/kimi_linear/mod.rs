@@ -76,6 +76,7 @@ where
                 vocabulary: args.vocab_size,
                 hidden_size: args.hidden_size,
                 normalization_epsilon: args.rms_norm_eps,
+                normalization_offset: 0.0,
                 embedding_quantization: args.weight_quantization_for(embedding_name),
                 head_format: args.weight_quantization_for("lm_head.weight").into(),
                 tied_head: args.tie_word_embeddings,

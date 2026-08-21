@@ -391,6 +391,43 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
+    /// Returns the global decoder-layer count used by prompt-cache identity.
+    pub fn prompt_cache_layer_count(&self) -> Result<usize, Error> {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model
+                .prompt_cache_layer_layout()
+                .map(|layout| layout.len())
+                .map_err(Into::into),
+            MlxSessionKind::Pipeline(model, _) => {
+                Ok(model.prompt_cache_model_identity()?.layer_count)
+            }
+            MlxSessionKind::Expert(model, _) => {
+                Ok(model.prompt_cache_model_identity()?.layer_count)
+            }
+        }
+    }
+
+    /// Returns the rank-local global decoder-layer range used by prompt-cache identity.
+    pub fn prompt_cache_global_layer_range(&self) -> Result<std::ops::Range<usize>, Error> {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => {
+                let count = model
+                    .prompt_cache_layer_layout()
+                    .map(|layout| layout.len())
+                    .map_err(Error::from)?;
+                Ok(0..count)
+            }
+            MlxSessionKind::Pipeline(model, _) => {
+                let identity = model.prompt_cache_model_identity()?;
+                Ok(identity.global_layer_start..identity.global_layer_end)
+            }
+            MlxSessionKind::Expert(model, _) => {
+                let identity = model.prompt_cache_model_identity()?;
+                Ok(identity.global_layer_start..identity.global_layer_end)
+            }
+        }
+    }
+
     /// Returns each owned layer's processed-token delta from the persisted prefix.
     pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
         match &self.inner {

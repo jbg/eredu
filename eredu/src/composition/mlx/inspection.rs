@@ -17,10 +17,7 @@ use safemlx::ops::GgufCheckpoint;
 use serde_json::Value;
 
 use super::*;
-use crate::{
-    backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
-    composition::mlx_architectures::qwen::vl::model as qwen3_vl,
-};
+use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
 
 /// Options applied while inspecting a model artifact.
 #[derive(Debug, Clone, Default)]
@@ -64,6 +61,15 @@ fn is_gguf_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+}
+
+fn required_qwen_mmproj(path: &Path, architecture: &str) -> Result<PathBuf, Error> {
+    crate::composition::mlx::artifact::find_sibling_mmproj(path, architecture)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!(
+            "{architecture} GGUF requires a nearby mmproj file relative to {}",
+            path.display()
+        ))
+    })
 }
 
 fn open_stage5_projector(
@@ -539,7 +545,7 @@ fn inspect_gguf_projector(
 ) {
     match architecture {
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-            match qwen3_vl::find_qwen3_vl_mmproj(path) {
+            match required_qwen_mmproj(path, "qwen3vl") {
                 Ok(projector) => match GgufCheckpoint::open(&projector) {
                     Ok(checkpoint) => {
                         let metadata =
@@ -582,45 +588,45 @@ fn inspect_gguf_projector(
             }
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => {
-            match crate::composition::mlx_architectures::qwen::hybrid::qwen3_5::open_sibling_mmproj(
-                path,
-            ) {
-                Ok(Some(mmproj)) => {
-                    let projector_path =
-                        crate::composition::mlx::artifact::find_sibling_mmproj(path, "qwen35")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| path.to_path_buf());
-                    let validation = structural::validate_qwen35_projector_gguf(
-                        model_checkpoint,
-                        model_metadata,
-                        &mmproj.checkpoint,
-                        &mmproj.metadata,
-                    );
-                    let exact = matches!(validation, structural::StructuralValidation::Exact);
-                    apply_structural_validation(report, validation, &projector_path);
-                    report.multimodal = if !exact {
-                        InspectionReadiness::Invalid
-                    } else if cfg!(feature = "mlx-image") {
-                        InspectionReadiness::Ready
-                    } else {
-                        InspectionReadiness::Unsupported
-                    };
-                    report.requirements.push(InspectionRequirement {
-                        code: InspectionIssueCode::MissingMediaProjector,
-                        readiness: if exact {
+            match crate::composition::mlx::artifact::find_sibling_mmproj(path, "qwen35") {
+                Ok(Some(projector_path)) => match GgufCheckpoint::open(&projector_path) {
+                    Ok(checkpoint) => {
+                        let metadata =
+                            crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
+                                &checkpoint,
+                            );
+                        let validation = structural::validate_qwen35_projector_gguf(
+                            model_checkpoint,
+                            model_metadata,
+                            &checkpoint,
+                            &metadata,
+                        );
+                        let exact = matches!(validation, structural::StructuralValidation::Exact);
+                        apply_structural_validation(report, validation, &projector_path);
+                        report.multimodal = if !exact {
+                            InspectionReadiness::Invalid
+                        } else if cfg!(feature = "mlx-image") {
                             InspectionReadiness::Ready
                         } else {
-                            InspectionReadiness::Invalid
-                        },
-                        detail: if exact {
-                            "validated Qwen3.5 vision projector".into()
-                        } else {
-                            "Qwen3.5 vision projector is structurally incompatible".into()
-                        },
-                        path: Some(projector_path),
-                    });
-                }
+                            InspectionReadiness::Unsupported
+                        };
+                        report.requirements.push(InspectionRequirement {
+                            code: InspectionIssueCode::MissingMediaProjector,
+                            readiness: if exact {
+                                InspectionReadiness::Ready
+                            } else {
+                                InspectionReadiness::Invalid
+                            },
+                            detail: if exact {
+                                "validated Qwen3.5 vision projector".into()
+                            } else {
+                                "Qwen3.5 vision projector is structurally incompatible".into()
+                            },
+                            path: Some(projector_path),
+                        });
+                    }
+                    Err(error) => reject_projector(report, projector_path, error.to_string(), true),
+                },
                 Ok(None) => {
                     report.multimodal = InspectionReadiness::Missing;
                     report.requirements.push(InspectionRequirement {

@@ -16,11 +16,12 @@ use eredu_nn::{
     GatedDeltaScanOutput, HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState,
     HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, IndexedAttentionInput,
     JointExpertRoutingInput, JointExpertRoutingResult, LinearFormat, LinearOperator, LinearSpec,
-    NeuralBackend, NormalizationOperator, NormalizationSpec, ParameterMetadata, ParameterSpec,
-    ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
-    PooledPositionInput, RelativeAttentionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec,
-    RopeValue, RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend, RoutingOperator,
-    RoutingResult, RoutingScoring, SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput,
+    NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, NormalizationScale,
+    NormalizationSpec, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
+    Parameterized, PooledAttentionInput, PooledPositionInput, RelativeAttentionInput,
+    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RopeValue, RotaryOperator, RotaryPosition,
+    RotarySpec, RoutedNeuralBackend, RoutingOperator, RoutingResult, RoutingScoring,
+    SegmentedAttentionInput, SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput,
     SwiGluExpertBankOperator, SwiGluExpertBankSpec, SwiGluExpertLayout, SwiGluLimit, Tensor,
     TopKRouterSpec,
 };
@@ -297,9 +298,9 @@ pub(crate) fn neutral_parameter_states<M: Parameterized<Array>>(module: &M) -> V
 
 /// SafeMLX module view over any backend-neutral parameterized value.
 ///
-/// This is a reusable backend capability: architecture types retain their
-/// neutral parameter identities while legacy SafeMLX loading utilities can
-/// traverse the same native slots without rebuilding a parameter tree.
+/// Architecture types retain their neutral parameter identities while MLX
+/// loading utilities traverse the same native slots without rebuilding a
+/// parameter tree.
 #[derive(Debug, Clone)]
 pub struct MlxModule<M> {
     /// Backend-neutral module specialized to MLX operators.
@@ -726,29 +727,53 @@ impl Parameterized<Array> for MlxEmbedding {
     }
 }
 
-/// MLX fused RMS normalization.
+/// MLX RMS normalization with backend-native learned, learned-offset, or unit
+/// scale construction.
 #[derive(Debug, Clone)]
 pub struct MlxRmsNorm {
-    module: nn::RmsNorm,
+    module: Option<nn::RmsNorm>,
     topology: BTreeMap<String, ParameterSpec>,
+    offset: Option<f32>,
+    dimensions: i32,
+    epsilon: f32,
 }
 
-impl Deref for MlxRmsNorm {
-    type Target = nn::RmsNorm;
-    fn deref(&self) -> &Self::Target {
-        &self.module
+impl MlxRmsNorm {
+    /// Applies the configured normalization through the neutral operator
+    /// contract.
+    pub fn forward(
+        &mut self,
+        input: &Array,
+        context: &Stream,
+    ) -> Result<Array, safemlx::error::Exception> {
+        <Self as NormalizationOperator<Array>>::forward(self, input, context)
+            .map_err(|error| safemlx::error::Exception::custom(error.to_string()))
     }
 }
-impl DerefMut for MlxRmsNorm {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.module
-    }
-}
-delegate_parameters!(MlxRmsNorm, module);
 
 impl NormalizationOperator<Array> for MlxRmsNorm {
     fn forward(&mut self, input: &Array, context: &Stream) -> Result<Array, ComputeError> {
-        compute(self.module.forward(input, context))
+        if input.shape().last().copied() != Some(self.dimensions) {
+            return Err(ComputeError::backend(format!(
+                "RMS normalization expects final width {}, got {:?}",
+                self.dimensions,
+                input.shape()
+            )));
+        }
+        match (&mut self.module, self.offset) {
+            (Some(module), None) => compute(module.forward(input, context)),
+            (Some(module), Some(offset)) => {
+                let scale = compute(module.weight.as_ref().add(Array::from_f32(offset), context))?;
+                compute(safemlx::fast::rms_norm(
+                    input,
+                    &scale,
+                    self.epsilon,
+                    context,
+                ))
+            }
+            (None, None) => mlx_weightless_rms_norm(input, self.epsilon, context),
+            (None, Some(_)) => unreachable!("validated normalization construction"),
+        }
     }
 }
 
@@ -757,17 +782,74 @@ impl Parameterized<Array> for MlxRmsNorm {
     where
         V: ParameterVisitor<'a, Array>,
     {
-        visit_module_parameters(&self.module, &self.topology, visitor);
+        if let Some(module) = &self.module {
+            visit_module_parameters(module, &self.topology, visitor);
+        }
     }
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, Array>,
     {
-        visit_module_parameters_mut(&mut self.module, &self.topology, visitor);
+        if let Some(module) = &mut self.module {
+            visit_module_parameters_mut(module, &self.topology, visitor);
+        }
     }
     fn set_trainable(&mut self, trainable: bool) {
-        set_module_trainable(&mut self.module, trainable);
+        if let Some(module) = &mut self.module {
+            set_module_trainable(module, trainable);
+        }
     }
+}
+
+impl ModuleParameters for MlxRmsNorm {
+    fn num_parameters(&self) -> usize {
+        neutral_parameter_refs(self, false).entries.len()
+    }
+
+    fn parameters(&self) -> ModuleParamRef<'_> {
+        neutral_parameter_refs(self, false)
+    }
+
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
+        neutral_parameter_refs_mut(self)
+    }
+
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        neutral_parameter_refs(self, true)
+    }
+
+    fn freeze_parameters(&mut self, _recursive: bool) {
+        self.set_trainable(false);
+    }
+
+    fn unfreeze_parameters(&mut self, _recursive: bool) {
+        self.set_trainable(true);
+    }
+
+    fn all_frozen(&self) -> Option<bool> {
+        let states = neutral_parameter_states(self);
+        (!states.is_empty()).then(|| states.iter().all(|trainable| !trainable))
+    }
+
+    fn any_frozen(&self) -> Option<bool> {
+        let states = neutral_parameter_states(self);
+        (!states.is_empty()).then(|| states.iter().any(|trainable| !trainable))
+    }
+}
+
+fn mlx_weightless_rms_norm(
+    input: &Array,
+    epsilon: f32,
+    context: &Stream,
+) -> Result<Array, ComputeError> {
+    let dtype = input.dtype();
+    let variance = compute(input.square(context))?;
+    let variance = compute(variance.mean_axis(-1, true, context))?;
+    let denominator = compute(variance.add(Array::from_f32(epsilon), context))?;
+    let denominator = compute(denominator.rsqrt(context))?;
+    compute(input.multiply(denominator, context))?
+        .as_dtype(dtype, context)
+        .map_err(ComputeError::backend)
 }
 
 /// MLX RoPE variant selected from model metadata.
@@ -1339,14 +1421,39 @@ impl NeuralBackend for MlxBackend {
     }
 
     fn rms_norm(spec: NormalizationSpec, context: &Stream) -> Result<MlxRmsNorm, ComputeError> {
-        let module = compute(nn::RmsNorm::unloaded(
-            spec.dimensions,
-            spec.epsilon,
-            Dtype::Float32,
-            context,
-        ))?;
-        let topology = parameter_topology(&module, spec.weight, None)?;
-        Ok(MlxRmsNorm { module, topology })
+        Self::normalization(spec.into(), context)
+    }
+
+    fn normalization(
+        spec: NormalizationConstructionSpec,
+        context: &Stream,
+    ) -> Result<MlxRmsNorm, ComputeError> {
+        spec.validate()?;
+        let (weight, offset) = match spec.scale {
+            NormalizationScale::Learned(weight) => (Some(weight), None),
+            NormalizationScale::LearnedOffset { weight, offset } => (Some(weight), Some(offset)),
+            NormalizationScale::Unit => (None, None),
+        };
+        let (module, topology) = match weight {
+            Some(weight) => {
+                let module = compute(nn::RmsNorm::unloaded(
+                    spec.dimensions,
+                    spec.epsilon,
+                    Dtype::Float32,
+                    context,
+                ))?;
+                let topology = parameter_topology(&module, weight, None)?;
+                (Some(module), topology)
+            }
+            None => (None, BTreeMap::new()),
+        };
+        Ok(MlxRmsNorm {
+            module,
+            topology,
+            offset,
+            dimensions: spec.dimensions,
+            epsilon: spec.epsilon,
+        })
     }
 
     fn rotary(spec: RotarySpec<'_>, context: &Stream) -> Result<MlxRotary, ComputeError> {
@@ -1376,6 +1483,10 @@ impl NeuralBackend for MlxBackend {
 
     fn silu(input: Array, context: &Stream) -> Result<Array, ComputeError> {
         compute(common::layers::silu(input, context))
+    }
+
+    fn gelu_approximate(input: Array, context: &Stream) -> Result<Array, ComputeError> {
+        compute(nn::gelu_approximate(input, context))
     }
 
     fn sigmoid(input: Array, context: &Stream) -> Result<Array, ComputeError> {
@@ -1429,6 +1540,99 @@ impl NeuralBackend for MlxBackend {
         let normalized = compute(normalized.reshape(&shape, context))?;
         let normalized = compute(normalized.as_dtype(dtype, context))?;
         compute(normalized.multiply(weight, context))
+    }
+
+    fn l2_normalize(input: &Array, epsilon: f32, context: &Stream) -> Result<Array, ComputeError> {
+        if input.shape().last().is_none() || !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(ComputeError::backend("invalid L2 normalization geometry"));
+        }
+        let squared = compute(input.square(context))?;
+        let sum = compute(safemlx::ops::sum_axis(&squared, -1, true, context))?;
+        let denominator = compute(sum.add(Array::from_f32(epsilon), context))?;
+        compute(input.multiply(compute(denominator.rsqrt(context))?, context))
+    }
+
+    fn silu_gated_group_rms_norm(
+        input: &Array,
+        gate: &Array,
+        weight: &Array,
+        groups: i32,
+        epsilon: f32,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        let dtype = input.dtype();
+        let shape = input.shape().to_vec();
+        let width = *shape
+            .last()
+            .ok_or_else(|| ComputeError::backend("gated RMS input has no feature axis"))?;
+        if groups <= 0
+            || width % groups != 0
+            || gate.shape() != shape
+            || weight.shape() != [width]
+            || !epsilon.is_finite()
+            || epsilon <= 0.0
+        {
+            return Err(ComputeError::backend(
+                "invalid SiLU-gated grouped RMS normalization geometry",
+            ));
+        }
+        let input = compute(input.as_dtype(Dtype::Float32, context))?;
+        let grouped = compute(input.reshape(&[-1, groups, width / groups], context))?;
+        let variance = compute(safemlx::ops::mean_axis(
+            compute(grouped.square(context))?,
+            -1,
+            true,
+            context,
+        ))?;
+        let scale = compute(safemlx::ops::rsqrt(
+            compute(variance.add(Array::from_f32(epsilon), context))?,
+            context,
+        ))?;
+        let normalized = compute(grouped.multiply(&scale, context))?;
+        let normalized = compute(normalized.reshape(&shape, context))?;
+        let normalized = compute(normalized.multiply(weight, context))?;
+        let gate = compute(gate.as_dtype(Dtype::Float32, context))?;
+        let gate =
+            compute(gate.multiply(compute(safemlx::ops::sigmoid(&gate, context))?, context))?;
+        compute(normalized.multiply(&gate, context))?
+            .as_dtype(dtype, context)
+            .map_err(ComputeError::backend)
+    }
+
+    fn segmented_attention(
+        input: SegmentedAttentionInput<'_, Array>,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        input.validate()?;
+        let heads = input.queries.dim(1);
+        let query_dimensions = input.queries.dim(2);
+        let value_dimensions = input.values.dim(2);
+        let mut outputs = Vec::with_capacity(input.segment_lengths.len());
+        let mut start = 0i32;
+        for &length in input.segment_lengths {
+            let end = start + length;
+            let prepare = |value: &Array, dimensions: i32| -> Result<Array, ComputeError> {
+                let value = compute(value.try_index_device((start..end, .., ..), context))?;
+                let value = compute(value.transpose_axes(&[1, 0, 2], context))?;
+                compute(value.reshape(&[1, heads, length, dimensions], context))
+            };
+            let queries = prepare(input.queries, query_dimensions)?;
+            let keys = prepare(input.keys, query_dimensions)?;
+            let values = prepare(input.values, value_dimensions)?;
+            let output = compute(safemlx::fast::scaled_dot_product_attention(
+                &queries,
+                &keys,
+                &values,
+                input.scale,
+                Option::<ScaledDotProductAttentionMask<'_>>::None,
+                Option::<&Array>::None,
+                context,
+            ))?;
+            let output = compute(output.reshape(&[heads, length, value_dimensions], context))?;
+            outputs.push(compute(output.transpose_axes(&[1, 0, 2], context))?);
+            start = end;
+        }
+        compute(concatenate_axis(&outputs, 0, context))
     }
 
     fn add_residual(
@@ -1898,14 +2102,7 @@ impl NeuralBackend for MlxBackend {
         epsilon: f32,
         context: &Stream,
     ) -> Result<Array, ComputeError> {
-        let dtype = input.dtype();
-        let variance = compute(input.square(context))?;
-        let variance = compute(variance.mean_axis(-1, true, context))?;
-        let denominator = compute(variance.add(Array::from_f32(epsilon), context))?;
-        let denominator = compute(denominator.rsqrt(context))?;
-        compute(input.multiply(denominator, context))?
-            .as_dtype(dtype, context)
-            .map_err(ComputeError::backend)
+        mlx_weightless_rms_norm(input, epsilon, context)
     }
 
     fn grouped_linear(
@@ -2290,10 +2487,24 @@ impl eredu_nn::AuxiliaryConvolutionState<Array>
 
 #[cfg(test)]
 mod neutral_semantic_operator_tests {
-    use eredu_nn::{JointExpertRoutingInput, NeuralBackend, RelativeAttentionInput};
+    use eredu_nn::{
+        reference_expand_heads, reference_segmented_attention, HeadExpansion,
+        JointExpertRoutingInput, NeuralBackend, NormalizationConstructionSpec, NormalizationScale,
+        RelativeAttentionInput, SegmentedAttentionInput,
+    };
     use safemlx::{Array, Device, DeviceType, ExecutionContext};
 
     use super::MlxBackend;
+
+    fn close(actual: &Array, expected: &[f32], tolerance: f32) {
+        let actual = actual.evaluated().unwrap();
+        assert_eq!(actual.as_slice::<f32>().len(), expected.len());
+        assert!(actual
+            .as_slice::<f32>()
+            .iter()
+            .zip(expected)
+            .all(|(left, right)| (left - right).abs() <= tolerance));
+    }
 
     #[test]
     fn relative_attention_gathers_causal_distance_profiles() {
@@ -2351,5 +2562,123 @@ mod neutral_semantic_operator_tests {
         let expected = 0.5 / (0.5 + 1.0 / (1.0 + (-2.0_f32).exp()));
         assert!((routed.as_slice::<f32>()[0] - expected).abs() < 1e-5);
         assert!((routed.as_slice::<f32>()[0] + shared.as_slice::<f32>()[0] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    #[ignore = "explicit MLX normalization parity; run outside the sandbox"]
+    fn mlx_general_normalization_matches_scalar_references() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let values = [1.0_f32, -2.0, 3.0, -4.0];
+        let input = Array::from_slice(&values, &[1, 4]);
+        let epsilon = 1e-5;
+
+        let mut normalization = <MlxBackend as NeuralBackend>::normalization(
+            NormalizationConstructionSpec {
+                dimensions: 4,
+                epsilon,
+                scale: NormalizationScale::Unit,
+            },
+            stream,
+        )
+        .unwrap();
+        let rms = (values.iter().map(|value| value * value).sum::<f32>() / 4.0 + epsilon).sqrt();
+        let expected_rms = values.map(|value| value / rms);
+        close(
+            &normalization.forward(&input, stream).unwrap(),
+            &expected_rms,
+            1e-5,
+        );
+
+        let l2 = (values.iter().map(|value| value * value).sum::<f32>() + epsilon).sqrt();
+        let expected_l2 = values.map(|value| value / l2);
+        close(
+            &<MlxBackend as NeuralBackend>::l2_normalize(&input, epsilon, stream).unwrap(),
+            &expected_l2,
+            1e-5,
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit MLX grouped-normalization parity; run outside the sandbox"]
+    fn mlx_silu_gated_group_norm_matches_scalar_reference() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let values = [1.0_f32, -2.0, 3.0, -4.0];
+        let gates = [0.5_f32, -1.0, 1.5, -0.25];
+        let weights = [1.0_f32, 2.0, 0.5, -1.0];
+        let epsilon = 1e-5;
+        let input = Array::from_slice(&values, &[1, 4]);
+        let gate = Array::from_slice(&gates, &[1, 4]);
+        let weight = Array::from_slice(&weights, &[4]);
+        let mut expected = [0.0_f32; 4];
+        for group in 0..2 {
+            let start = group * 2;
+            let variance =
+                (values[start] * values[start] + values[start + 1] * values[start + 1]) / 2.0;
+            let scale = (variance + epsilon).sqrt().recip();
+            for index in start..start + 2 {
+                let silu_gate = gates[index] / (1.0 + (-gates[index]).exp());
+                expected[index] = values[index] * scale * weights[index] * silu_gate;
+            }
+        }
+        let actual = <MlxBackend as NeuralBackend>::silu_gated_group_rms_norm(
+            &input, &gate, &weight, 2, epsilon, stream,
+        )
+        .unwrap();
+        close(&actual, &expected, 1e-5);
+    }
+
+    #[test]
+    #[ignore = "explicit MLX head-expansion parity; run outside the sandbox"]
+    fn mlx_head_expansion_matches_scalar_reference() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let values = [1.0_f32, 2.0, 3.0, 4.0];
+        let input = Array::from_slice(&values, &[1, 2, 2]);
+        let expansion = HeadExpansion {
+            axis: 1,
+            source_heads: 2,
+            target_heads: 4,
+        };
+        let actual =
+            <MlxBackend as NeuralBackend>::expand_heads(&input, expansion, stream).unwrap();
+        let (expected, shape) = reference_expand_heads(&values, &[1, 2, 2], 1, 4).unwrap();
+        let shape = shape
+            .into_iter()
+            .map(|dimension| i32::try_from(dimension).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual.shape(), shape.as_slice());
+        close(&actual, &expected, 1e-5);
+    }
+
+    #[test]
+    #[ignore = "explicit MLX segmented-attention parity; run outside the sandbox"]
+    fn mlx_segmented_attention_matches_scalar_reference() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let queries = [1.0_f32, 0.0, 0.0, 1.0, 1.0, 1.0, -1.0, 1.0];
+        let keys = [1.0_f32, 0.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0];
+        let values = [1.0_f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
+        let query = Array::from_slice(&queries, &[4, 1, 2]);
+        let key = Array::from_slice(&keys, &[4, 1, 2]);
+        let value = Array::from_slice(&values, &[4, 1, 2]);
+        let segments = [2, 2];
+        let scale = 2.0_f32.sqrt().recip();
+        let actual = <MlxBackend as NeuralBackend>::segmented_attention(
+            SegmentedAttentionInput {
+                queries: &query,
+                keys: &key,
+                values: &value,
+                segment_lengths: &segments,
+                scale,
+            },
+            stream,
+        )
+        .unwrap();
+        let expected =
+            reference_segmented_attention(4, 1, 2, 2, &queries, &keys, &values, &segments, scale)
+                .unwrap();
+        close(&actual, &expected, 2e-5);
     }
 }

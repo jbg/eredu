@@ -14,13 +14,7 @@ use crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames;
 use crate::backend::mlx::{error::Error, runtime::checkpoint::store::SafetensorsWeightStore};
 use crate::composition::{
     llama_checkpoint,
-    mlx_architectures::{
-        gpt_oss::checkpoint as gpt_oss_checkpoint,
-        moshi::personaplex_checkpoint,
-        qwen::{
-            hybrid::checkpoint as qwen_hybrid_checkpoint, vl::checkpoint as qwen_vl_checkpoint,
-        },
-    },
+    mlx_architectures::{gpt_oss::checkpoint as gpt_oss_checkpoint, moshi::personaplex_checkpoint},
 };
 
 pub(crate) use eredu_checkpoint::validation::{
@@ -174,22 +168,12 @@ pub(crate) fn validate_safetensors(
             ModelKind::NemotronH => validate_neutral_nemotron_safetensors(config, store),
             ModelKind::PersonaPlex => personaplex_checkpoint::validate_safetensors(config, store),
             ModelKind::Qwen2 | ModelKind::Qwen3 => validate_neutral_qwen_safetensors(config, store),
-            ModelKind::Qwen3Next => qwen_hybrid_checkpoint::validate_qwen3_next_safetensors(
-                config,
-                store,
-                options.weight_residency.expert_cache().is_some(),
-            ),
-            ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => qwen_vl_checkpoint::validate_safetensors(
-                kind == ModelKind::Qwen3VlMoe,
-                config,
-                store,
-                !options.weight_residency.is_fully_resident(),
-            ),
-            ModelKind::Qwen35 => qwen_hybrid_checkpoint::validate_qwen35_safetensors(
-                config,
-                store,
-                options.weight_residency.expert_cache().is_some(),
-            ),
+            ModelKind::Qwen3Next | ModelKind::Qwen35 => {
+                validate_neutral_qwen_hybrid_safetensors(config, store)
+            }
+            ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
+                validate_neutral_qwen_vl_safetensors(kind, config, store)
+            }
         },
         StructuralValidationPolicy::Unverified => unverified(kind.model_type_name()),
     };
@@ -258,30 +242,14 @@ pub(crate) fn validate_gguf(
                 if let Err(error) = architecture.validate_load_policy(options) {
                     invalid_geometry(error.to_string())
                 } else {
-                    let variant = match architecture {
-                        GgufArchitecture::Qwen3Vl => qwen_vl_checkpoint::GgufVariant::Dense,
-                        GgufArchitecture::Qwen3VlMoe => qwen_vl_checkpoint::GgufVariant::Moe,
-                        _ => unreachable!("covered by the outer architecture match"),
-                    };
-                    qwen_vl_checkpoint::validate_gguf(variant, checkpoint, metadata)
+                    validate_neutral_qwen_vl_gguf(architecture, checkpoint, metadata)
                 }
             }
             GgufArchitecture::KimiLinear => validate_neutral_kimi_gguf(checkpoint, metadata),
             GgufArchitecture::Qwen35
             | GgufArchitecture::Qwen35Moe
             | GgufArchitecture::Qwen3Next => {
-                let variant = match architecture {
-                    GgufArchitecture::Qwen35 => qwen_hybrid_checkpoint::GgufVariant::Qwen35,
-                    GgufArchitecture::Qwen35Moe => qwen_hybrid_checkpoint::GgufVariant::Qwen35Moe,
-                    GgufArchitecture::Qwen3Next => qwen_hybrid_checkpoint::GgufVariant::Qwen3Next,
-                    _ => unreachable!("covered by the outer architecture match"),
-                };
-                qwen_hybrid_checkpoint::validate_gguf(
-                    variant,
-                    checkpoint,
-                    metadata,
-                    options.weight_residency.expert_cache().is_some(),
-                )
+                validate_neutral_qwen_hybrid_gguf(checkpoint, metadata)
             }
         },
         StructuralValidationPolicy::Unverified => unverified(architecture.metadata_name()),
@@ -687,6 +655,106 @@ fn validate_neutral_qwen_gguf(
     eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
 }
 
+fn validate_neutral_qwen_hybrid_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let parsed = match eredu_architectures::qwen::hybrid::model_args_from_config_value(config) {
+        Ok(parsed) => parsed,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::qwen::hybrid::safetensors_plan(&parsed.text) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+fn validate_neutral_qwen_vl_safetensors(
+    kind: ModelKind,
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let args = match eredu_architectures::qwen::vl::model_args_from_config_value(config) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    if args.text.is_moe() != (kind == ModelKind::Qwen3VlMoe) {
+        return invalid_geometry(format!(
+            "Qwen3-VL dispatch selected {}, but the nested text configuration is {}",
+            if kind == ModelKind::Qwen3VlMoe {
+                "MoE"
+            } else {
+                "dense"
+            },
+            if args.text.is_moe() { "MoE" } else { "dense" }
+        ));
+    }
+    let plan = match eredu_architectures::qwen::vl::safetensors_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
+fn validate_neutral_qwen_hybrid_gguf(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    let parsed = match eredu_architectures::qwen::hybrid::model_args_from_gguf_catalog(
+        &NeutralQwenGgufCatalog(checkpoint),
+        metadata,
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    if let Err(error) = checkpoint
+        .catalog()
+        .translated_outputs(eredu_architectures::qwen::hybrid::translate_gguf_weight_name)
+    {
+        return invalid_geometry(error.to_string());
+    }
+    let plan = match eredu_architectures::qwen::hybrid::gguf_plan(&parsed.text) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
+}
+
+fn validate_neutral_qwen_vl_gguf(
+    architecture: GgufArchitecture,
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    let is_moe = architecture == GgufArchitecture::Qwen3VlMoe;
+    let context = if is_moe {
+        eredu_architectures::qwen::TextConfigContext::Qwen3VlMoe
+    } else {
+        eredu_architectures::qwen::TextConfigContext::Qwen3Vl
+    };
+    let args = match eredu_architectures::qwen::model_args_from_gguf_catalog_with_context(
+        &NeutralQwenGgufCatalog(checkpoint),
+        metadata,
+        context,
+    ) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    if args.is_moe() != is_moe {
+        return invalid_geometry("Qwen3-VL GGUF architecture and expert geometry disagree".into());
+    }
+    if let Err(error) = checkpoint.catalog().translated_outputs(|name| {
+        eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe)
+    }) {
+        return invalid_geometry(error.to_string());
+    }
+    let plan = match eredu_architectures::qwen::gguf_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
+}
+
 fn unverified(architecture: &str) -> StructuralValidation {
     StructuralValidation::Unverified(StructuralIssue {
         kind: StructuralIssueKind::ValidationUnavailable,
@@ -816,12 +884,28 @@ pub(crate) fn validate_qwen3_vl_projector_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    qwen_vl_checkpoint::validate_projector_gguf(
-        model_checkpoint,
+    let context = match model_metadata.get("general.architecture") {
+        Some(GgufMetadataValue::String(value)) if value == "qwen3vl" => {
+            eredu_architectures::qwen::TextConfigContext::Qwen3Vl
+        }
+        Some(GgufMetadataValue::String(value)) if value == "qwen3vlmoe" => {
+            eredu_architectures::qwen::TextConfigContext::Qwen3VlMoe
+        }
+        other => {
+            return invalid_geometry(format!(
+                "Qwen3-VL projector requires qwen3vl text metadata, got {other:?}"
+            ))
+        }
+    };
+    let text = match eredu_architectures::qwen::model_args_from_gguf_catalog_with_context(
+        &NeutralQwenGgufCatalog(model_checkpoint),
         model_metadata,
-        checkpoint,
-        metadata,
-    )
+        context,
+    ) {
+        Ok(text) => text,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    validate_neutral_qwen_projector(checkpoint, metadata, text.hidden_size, true)
 }
 
 pub(crate) fn validate_qwen35_projector_gguf(
@@ -830,12 +914,71 @@ pub(crate) fn validate_qwen35_projector_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    qwen_hybrid_checkpoint::validate_projector_gguf(
-        model_checkpoint,
+    let text = match eredu_architectures::qwen::hybrid::model_args_from_gguf_catalog(
+        &NeutralQwenGgufCatalog(model_checkpoint),
         model_metadata,
-        checkpoint,
+    ) {
+        Ok(parsed) => parsed.text,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    validate_neutral_qwen_projector(checkpoint, metadata, text.hidden_size, false)
+}
+
+struct NeutralQwenVisionGgufCatalog<'a>(&'a GgufCheckpoint);
+
+impl eredu_architectures::qwen::vision::VisionGgufCatalog for NeutralQwenVisionGgufCatalog<'_> {
+    fn shape(&self, name: &str) -> Option<Vec<usize>> {
+        self.0
+            .catalog()
+            .tensors()
+            .find(|tensor| tensor.descriptor().name == name)
+            .map(|tensor| tensor.descriptor().mlx_shape())
+            .and_then(|shape| {
+                shape
+                    .into_iter()
+                    .map(usize::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()
+            })
+    }
+}
+
+fn validate_neutral_qwen_projector(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    text_hidden: i32,
+    allow_deepstack: bool,
+) -> StructuralValidation {
+    let vision = match eredu_architectures::qwen::vision::config_from_gguf_catalog(
+        &NeutralQwenVisionGgufCatalog(checkpoint),
         metadata,
-    )
+    ) {
+        Ok(vision) => vision,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    if vision.out_hidden_size != text_hidden {
+        return invalid_geometry(format!(
+            "Qwen projector output {} does not match language hidden size {text_hidden}",
+            vision.out_hidden_size
+        ));
+    }
+    if !allow_deepstack && vision.deepstack_layer_count() != 0 {
+        return invalid_geometry(format!(
+            "Qwen3.5 projector declares {} unsupported DeepStack outputs",
+            vision.deepstack_layer_count()
+        ));
+    }
+    let deepstack = vision.deepstack_layers();
+    if let Err(error) = checkpoint.catalog().translated_outputs(|name| {
+        eredu_architectures::qwen::vision::translate_gguf_weight_name(name, &deepstack)
+    }) {
+        return invalid_geometry(error.to_string());
+    }
+    let plan = match eredu_architectures::qwen::vision::gguf_plan(&vision, text_hidden) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
 }
 fn invalid_geometry(detail: String) -> StructuralValidation {
     StructuralValidation::Invalid(vec![StructuralIssue {

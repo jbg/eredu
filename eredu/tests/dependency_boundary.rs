@@ -422,14 +422,53 @@ fn mlx_backend_contains_no_llama_knowledge() {
 fn qwen_neutral_cutover_has_no_legacy_or_backend_model_knowledge() {
     let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace = crate_root.parent().expect("workspace root");
-    for deleted in [
-        "eredu/src/composition/mlx_architectures/qwen/dense.rs",
-        "eredu/src/composition/mlx_architectures/qwen/dense",
+    let deleted = "eredu/src/composition/mlx_architectures/qwen";
+    assert!(
+        !workspace.join(deleted).exists(),
+        "legacy Qwen implementation still exists at {deleted}"
+    );
+    let composition_modules =
+        std::fs::read_to_string(workspace.join("eredu/src/composition/mod.rs"))
+            .expect("composition module must be readable");
+    for split in [
+        "mod qwen_hybrid;",
+        "mod qwen_vl;",
+        "mod qwen_processor;",
+        "mod qwen_expert;",
     ] {
         assert!(
-            !workspace.join(deleted).exists(),
-            "legacy Qwen implementation still exists at {deleted}"
+            !composition_modules.contains(split),
+            "Qwen composition retained a split top-level loader {split:?}"
         );
+    }
+    let qwen_binder = std::fs::read_to_string(workspace.join("eredu/src/composition/qwen.rs"))
+        .expect("Qwen composition binder must be readable");
+    for component in ["mod hybrid", "mod vl", "mod expert"] {
+        assert!(
+            qwen_binder.contains(component),
+            "Qwen binder is missing consolidated component {component:?}"
+        );
+    }
+
+    let neutral_qwen = workspace.join("eredu-architectures/src/qwen");
+    assert!(
+        neutral_qwen.is_dir(),
+        "neutral Qwen architecture is missing"
+    );
+    let mut neutral_sources = Vec::new();
+    rust_sources(&neutral_qwen, &mut neutral_sources);
+    assert!(
+        !neutral_sources.is_empty(),
+        "neutral Qwen architecture is empty"
+    );
+    for source in neutral_sources {
+        let text = std::fs::read_to_string(&source).expect("neutral source must be readable");
+        for forbidden in ["safemlx", "backend::mlx", "MlxBackend"] {
+            assert!(
+                !text.contains(forbidden),
+                "backend dependency {forbidden:?} leaked into neutral Qwen source {source:?}"
+            );
+        }
     }
 
     let mut sources = Vec::new();
@@ -437,9 +476,11 @@ fn qwen_neutral_cutover_has_no_legacy_or_backend_model_knowledge() {
     for source in sources {
         let text = std::fs::read_to_string(&source).expect("Rust source must be readable");
         for forbidden in [
-            concat!("mlx_architectures::qwen", "::dense"),
-            concat!("qwen", "::dense"),
-            concat!("Dense", "Qwen", "Layerwise", "Adapter"),
+            "mlx_architectures::qwen",
+            "QwenHybridLayerwiseAdapter",
+            "Qwen3VlLayerwiseAdapter",
+            "struct QwenHybridStage",
+            "struct Qwen3VlStage",
         ] {
             assert!(
                 !text.contains(forbidden),
@@ -448,13 +489,19 @@ fn qwen_neutral_cutover_has_no_legacy_or_backend_model_knowledge() {
         }
     }
 
-    for relative in [
-        "src/backend/mlx/nn",
-        "src/backend/mlx/runtime/checkpoint",
-        "src/backend/mlx/runtime/execution",
-        "src/backend/mlx/runtime/distributed",
-        "src/backend/mlx/runtime/residency",
-    ] {
+    for relative in ["eredu-nn/src", "eredu-runtime/src", "eredu-checkpoint/src"] {
+        let mut shared_sources = Vec::new();
+        rust_sources(&workspace.join(relative), &mut shared_sources);
+        for source in shared_sources {
+            let text = std::fs::read_to_string(&source).expect("shared source must be readable");
+            assert!(
+                !text.to_ascii_lowercase().contains("qwen"),
+                "Qwen-specific knowledge leaked into shared source {source:?}"
+            );
+        }
+    }
+
+    for relative in ["src/backend/mlx"] {
         let mut backend_sources = Vec::new();
         rust_sources(&crate_root.join(relative), &mut backend_sources);
         for source in backend_sources {
@@ -472,10 +519,24 @@ fn qwen_neutral_cutover_has_no_legacy_or_backend_model_knowledge() {
     .expect("distributed pipeline source must be readable");
     assert!(!pipeline.contains("struct QwenStage"));
     assert!(pipeline.contains("type QwenStage = NeutralDecoderStage"));
+    assert!(pipeline.contains("type NeutralQwenHybridStage = NeutralHybridPipelineStage"));
+    assert!(pipeline.contains("struct NeutralQwenVlStage"));
+    assert!(pipeline.contains("struct NeutralQwenConditionalStage"));
+    for forbidden in ["std::any::Any", "dyn Any", "downcast_ref", "downcast_mut"] {
+        assert!(
+            !pipeline.contains(forbidden),
+            "pipeline ingress retained type-erased state through {forbidden:?}"
+        );
+    }
+    assert!(
+        !pipeline.contains("distributed::all_sum(&forwarded"),
+        "composition retained a Qwen row-parallel reduction"
+    );
 
     for relative in [
         "src/composition/qwen.rs",
-        "src/composition/mlx_architectures/qwen/vl/layerwise.rs",
+        "src/composition/qwen_hybrid.rs",
+        "src/composition/qwen_vl.rs",
         "src/composition/mlx_architectures/distributed/pipeline.rs",
     ] {
         let source = std::fs::read_to_string(crate_root.join(relative))
@@ -500,6 +561,22 @@ fn qwen_neutral_cutover_has_no_legacy_or_backend_model_knowledge() {
         );
     }
     assert!(expert_composition.contains("CachedSwiGluExpertProvider"));
+
+    let distributed_expert = std::fs::read_to_string(
+        crate_root.join("src/composition/mlx_architectures/distributed/expert.rs"),
+    )
+    .expect("distributed expert source must be readable");
+    for legacy in [
+        "QwenHybridLayerwise",
+        "Qwen3VlLayerwise",
+        "execute_cached_qwen_hybrid",
+        "mlx_architectures::qwen",
+    ] {
+        assert!(
+            !distributed_expert.contains(legacy),
+            "legacy Qwen expert branch {legacy:?} remains"
+        );
+    }
 
     let inspection =
         std::fs::read_to_string(crate_root.join("src/backend/mlx/runtime/execution/inspection.rs"))

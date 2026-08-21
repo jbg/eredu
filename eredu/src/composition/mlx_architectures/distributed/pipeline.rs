@@ -29,7 +29,6 @@ pub use placement::{
 };
 
 use std::{
-    any::Any,
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::Range,
     path::{Path, PathBuf},
@@ -47,7 +46,6 @@ use safemlx::{
     nn,
     ops::{GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
-    transforms::eval,
     Array, Dtype, Stream,
 };
 
@@ -56,7 +54,7 @@ use crate::backend::mlx::runtime::checkpoint::quantization::quantize_tensor;
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::shared::{
-        MlxBackend, MlxEmbedding, MlxLinear, MlxModule, MlxNamedModule, MlxRmsNorm,
+        MlxBackend, MlxEmbedding, MlxLinear, MlxModule, MlxModuleRef, MlxNamedModule, MlxRmsNorm,
     },
     backend::mlx::nn::{linear, linear::project_logits_maybe_quantized},
     backend::mlx::nn::{
@@ -110,17 +108,7 @@ use crate::{
     composition::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
-    composition::mlx_architectures::{
-        gpt_oss::model as gpt_oss,
-        qwen::{
-            hybrid::{
-                layerwise::{QwenHybridLayer, QwenHybridLayerwiseAdapter},
-                qwen3_5 as qwen_hybrid,
-            },
-            vl::layerwise::{Qwen3VlLayer, Qwen3VlLayerwiseAdapter, Qwen3VlPipelinePrepared},
-            vl::model as qwen3_vl,
-        },
-    },
+    composition::mlx_architectures::gpt_oss::model as gpt_oss,
     composition::{
         gemma4::{Gemma4PipelineAdapter, Gemma4PipelineIngressState, Gemma4PipelineUnit},
         inkling::{InklingPipelineAdapter, InklingPipelineIngressState, InklingPipelineUnit},
@@ -130,6 +118,10 @@ use crate::{
             MuseGlimmerPipelineAdapter, MuseGlimmerPipelineIngressState, MuseGlimmerPipelineUnit,
         },
         nemotron_h::NemotronHPipelineAdapter,
+        qwen::{
+            hybrid::{QwenConditionalPipelineAdapter, QwenHybridPipelineAdapter},
+            vl::QwenVlPipelineAdapter,
+        },
     },
     core::cache::{CacheRankIdentity, StateTensorOwner, StateTensorPolicy, StateTensorRole},
     core::generation::MtpConfig,
@@ -257,8 +249,18 @@ impl_pipeline_quantization_adapter!(
     KimiLinearPipelineAdapter,
     MlxModule<eredu_architectures::kimi_linear::Block<MlxBackend>>
 );
-impl_pipeline_quantization_adapter!(QwenHybridLayerwiseAdapter, QwenHybridLayer);
-impl_pipeline_quantization_adapter!(Qwen3VlLayerwiseAdapter, Qwen3VlLayer);
+impl_pipeline_quantization_adapter!(
+    QwenHybridPipelineAdapter,
+    MlxModule<eredu_architectures::qwen::hybrid::Unit<MlxBackend>>
+);
+impl_pipeline_quantization_adapter!(
+    QwenConditionalPipelineAdapter,
+    MlxModule<eredu_architectures::qwen::hybrid::ConditionalUnit<MlxBackend>>
+);
+impl_pipeline_quantization_adapter!(
+    QwenVlPipelineAdapter,
+    MlxModule<eredu_architectures::qwen::vl::Unit<MlxBackend>>
+);
 impl_pipeline_quantization_adapter!(
     crate::composition::qwen::QwenParallelComposition,
     MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>
@@ -962,7 +964,6 @@ enum PipelineMtpCache {
     DeepSeek(Vec<CompressedLatentCache>),
     NeutralDeepSeekV4(Vec<MlxPoolingAttentionCache>),
     Hybrid(MlxHybridState),
-    QwenHybrid(Vec<qwen_hybrid::LayerCache>),
 }
 
 impl PipelineCache {
@@ -1444,12 +1445,6 @@ struct NeutralGemma4Stage {
     routing_statistics: RoutingStatistics,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PipelineMediaUnit {
-    group: usize,
-    index: usize,
-}
-
 struct MuseGlimmerStage {
     args: muse_glimmer::DecoderConfig,
     layer_adapter: MuseGlimmerPipelineAdapter,
@@ -1464,17 +1459,49 @@ struct MuseGlimmerStage {
     routing_statistics: RoutingStatistics,
 }
 
-struct Qwen3VlStage {
-    args: qwen3_vl::ModelArgs,
-    layer_adapter: Qwen3VlLayerwiseAdapter,
+struct NeutralQwenVlStage {
+    args: eredu_architectures::qwen::vl::ModelArgs,
+    adapter: QwenVlPipelineAdapter,
     range: Range<usize>,
     vision_range: Range<usize>,
-    vision_layers: Vec<Qwen3VlLayer>,
-    layers: Vec<Qwen3VlLayer>,
+    vision_layers: Vec<MlxModule<eredu_architectures::qwen::vl::Unit<MlxBackend>>>,
+    layers: Vec<MlxModule<eredu_architectures::qwen::vl::Unit<MlxBackend>>>,
     dense_layers: Option<PipelineLayerStorage>,
-    output_embedding: Option<MaybeQuantized<nn::Embedding>>,
-    parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
+    parallel_embedding: Option<
+        MlxModule<MlxNamedModule<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>>,
+    >,
+    parallel_output_embedding: Option<
+        MlxModule<MlxNamedModule<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>>,
+    >,
+    parallel_lm_head:
+        Option<MlxModule<MlxNamedModule<crate::backend::mlx::nn::parallel::VocabParallelLmHead>>>,
     parallel_layout: Option<eredu_runtime::LocalModelLayout>,
+    parallel_kv_heads: Option<Vec<i32>>,
+    expert_assignment: Option<ExpertAssignment>,
+    expert_storage: PipelineExpertStorage,
+    routing_statistics: RoutingStatistics,
+}
+
+struct NeutralQwenConditionalStage {
+    parsed: eredu_architectures::qwen::hybrid::ParsedHybridConfig,
+    adapter: QwenConditionalPipelineAdapter,
+    range: Range<usize>,
+    vision_range: Range<usize>,
+    vision_layers: Vec<MlxModule<eredu_architectures::qwen::hybrid::ConditionalUnit<MlxBackend>>>,
+    layers: Vec<MlxModule<eredu_architectures::qwen::hybrid::ConditionalUnit<MlxBackend>>>,
+    prediction_layers:
+        Vec<Vec<MlxModule<eredu_architectures::qwen::hybrid::ConditionalUnit<MlxBackend>>>>,
+    dense_layers: Option<PipelineLayerStorage>,
+    parallel_embedding: Option<
+        MlxModule<MlxNamedModule<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>>,
+    >,
+    parallel_output_embedding: Option<
+        MlxModule<MlxNamedModule<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>>,
+    >,
+    parallel_lm_head:
+        Option<MlxModule<MlxNamedModule<crate::backend::mlx::nn::parallel::VocabParallelLmHead>>>,
+    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
+    parallel_geometry: Option<Vec<eredu_architectures::qwen::hybrid::HybridStateGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
@@ -1561,29 +1588,12 @@ type NemotronHStage = NeutralHybridPipelineStage<
     eredu_architectures::nemotron_h::LayerGeometry,
 >;
 
-struct QwenHybridStage {
-    args: qwen_hybrid::ModelArgs,
-    layer_adapter: QwenHybridLayerwiseAdapter,
-    range: Range<usize>,
-    has_multimodal_ingress: bool,
-    media_units: Vec<PipelineMediaUnit>,
-    media_layers: Vec<QwenHybridLayer>,
-    media_layer_count: usize,
-    embedding: Option<MaybeQuantized<nn::Embedding>>,
-    output_embedding: Option<MaybeQuantized<nn::Embedding>>,
-    layers: Vec<qwen_hybrid::TransformerBlock>,
-    dense_layers: Option<PipelineLayerStorage>,
-    norm: Option<qwen_hybrid::Qwen3NextRmsNorm>,
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
-    parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
-    parallel_output_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
-    parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
-    parallel_geometry: Option<Vec<qwen_hybrid::ParallelLayerGeometry>>,
-    expert_assignment: Option<ExpertAssignment>,
-    expert_storage: PipelineExpertStorage,
-    routing_statistics: RoutingStatistics,
-}
+type NeutralQwenHybridStage = NeutralHybridPipelineStage<
+    eredu_architectures::qwen::hybrid::HybridConfig,
+    QwenHybridPipelineAdapter,
+    eredu_architectures::qwen::hybrid::Unit<MlxBackend>,
+    eredu_architectures::qwen::hybrid::HybridStateGeometry,
+>;
 
 type KimiLinearStage = NeutralHybridPipelineStage<
     eredu_architectures::kimi_linear::ModelArgs,
@@ -1632,6 +1642,16 @@ struct NeutralInklingStage {
     routing_statistics: RoutingStatistics,
 }
 
+/// Closed set of request-scoped ingress states transported by the shared
+/// pipeline runtime.
+enum PipelineIngressState {
+    Gemma4(Gemma4PipelineIngressState),
+    MuseGlimmer(MuseGlimmerPipelineIngressState),
+    Inkling(InklingPipelineIngressState),
+    QwenVl(eredu_architectures::qwen::vl::PipelineVisionState<Array>),
+    QwenConditional(eredu_architectures::qwen::hybrid::ConditionalPipelineVisionState<Array>),
+}
+
 /// Architecture-owned behavior needed by the shared pipeline runtime.
 ///
 /// Implementations contain only decoder math, immutable payload declarations,
@@ -1656,37 +1676,45 @@ trait PipelineStageAdapter {
         input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error>;
+    ) -> Result<Option<PipelineIngressState>, Error>;
     fn begin_placed_ingress_continuation(
         &mut self,
         input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error>;
-    fn placed_ingress_active(&self, group: &str, state: &dyn Any) -> Result<bool, Error>;
-    fn placed_ingress_arrays(&self, group: &str, state: &dyn Any) -> Result<Vec<Array>, Error>;
+    ) -> Result<Option<PipelineIngressState>, Error>;
+    fn placed_ingress_active(
+        &self,
+        group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<bool, Error>;
+    fn placed_ingress_arrays(
+        &self,
+        group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<Vec<Array>, Error>;
     fn replace_placed_ingress_arrays(
         &self,
         group: &str,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error>;
     fn merge_placed_ingress_arrays(
         &self,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error>;
     fn execute_placed_ingress(
         &mut self,
         group: &str,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error>;
     fn finish_placed_ingress(
         &mut self,
-        state: Box<dyn Any>,
+        state: PipelineIngressState,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<PipelinePayload, Error>;
@@ -1788,7 +1816,7 @@ trait PipelineStageSemantics {
         _input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         _stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
+    ) -> Result<Option<PipelineIngressState>, Error> {
         Ok(None)
     }
     fn begin_placed_ingress_continuation(
@@ -1796,19 +1824,27 @@ trait PipelineStageSemantics {
         input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
+    ) -> Result<Option<PipelineIngressState>, Error> {
         self.begin_placed_ingress(input, execution, stream)
     }
-    fn placed_ingress_active(&self, _group: &str, _state: &dyn Any) -> Result<bool, Error> {
+    fn placed_ingress_active(
+        &self,
+        _group: &str,
+        _state: &PipelineIngressState,
+    ) -> Result<bool, Error> {
         Ok(false)
     }
-    fn placed_ingress_arrays(&self, _group: &str, _state: &dyn Any) -> Result<Vec<Array>, Error> {
+    fn placed_ingress_arrays(
+        &self,
+        _group: &str,
+        _state: &PipelineIngressState,
+    ) -> Result<Vec<Array>, Error> {
         Ok(Vec::new())
     }
     fn replace_placed_ingress_arrays(
         &self,
         _group: &str,
-        _state: &mut dyn Any,
+        _state: &mut PipelineIngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
         if arrays.is_empty() {
@@ -1821,7 +1857,7 @@ trait PipelineStageSemantics {
     }
     fn merge_placed_ingress_arrays(
         &self,
-        _state: &mut dyn Any,
+        _state: &mut PipelineIngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
         if arrays.is_empty() {
@@ -1835,7 +1871,7 @@ trait PipelineStageSemantics {
     fn execute_placed_ingress(
         &mut self,
         _group: &str,
-        _state: &mut dyn Any,
+        _state: &mut PipelineIngressState,
         _step: PipelineStep,
         _execution: Option<&ParallelExecutionContext<'_>>,
         _stream: &Stream,
@@ -1844,7 +1880,7 @@ trait PipelineStageSemantics {
     }
     fn finish_placed_ingress(
         &mut self,
-        _state: Box<dyn Any>,
+        _state: PipelineIngressState,
         _execution: Option<&ParallelExecutionContext<'_>>,
         _stream: &Stream,
     ) -> Result<PipelinePayload, Error> {
@@ -2023,7 +2059,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
         input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
+    ) -> Result<Option<PipelineIngressState>, Error> {
         self.0.begin_placed_ingress(input, execution, stream)
     }
 
@@ -2032,23 +2068,31 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
         input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
+    ) -> Result<Option<PipelineIngressState>, Error> {
         self.0
             .begin_placed_ingress_continuation(input, execution, stream)
     }
 
-    fn placed_ingress_active(&self, group: &str, state: &dyn Any) -> Result<bool, Error> {
+    fn placed_ingress_active(
+        &self,
+        group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<bool, Error> {
         self.0.placed_ingress_active(group, state)
     }
 
-    fn placed_ingress_arrays(&self, group: &str, state: &dyn Any) -> Result<Vec<Array>, Error> {
+    fn placed_ingress_arrays(
+        &self,
+        group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<Vec<Array>, Error> {
         self.0.placed_ingress_arrays(group, state)
     }
 
     fn replace_placed_ingress_arrays(
         &self,
         group: &str,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
         self.0.replace_placed_ingress_arrays(group, state, arrays)
@@ -2056,7 +2100,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
 
     fn merge_placed_ingress_arrays(
         &self,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
         self.0.merge_placed_ingress_arrays(state, arrays)
@@ -2065,7 +2109,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
     fn execute_placed_ingress(
         &mut self,
         group: &str,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
@@ -2076,7 +2120,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
 
     fn finish_placed_ingress(
         &mut self,
-        state: Box<dyn Any>,
+        state: PipelineIngressState,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<PipelinePayload, Error> {
@@ -4175,10 +4219,10 @@ impl PipelineStageSemantics for NeutralGemma4Stage {
         input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
+    ) -> Result<Option<PipelineIngressState>, Error> {
         self.layer_adapter
             .begin_pipeline_ingress(input, stream)
-            .map(|state| Some(Box::new(state) as Box<dyn Any>))
+            .map(|state| Some(PipelineIngressState::Gemma4(state)))
     }
 
     fn begin_placed_ingress_continuation(
@@ -4186,47 +4230,63 @@ impl PipelineStageSemantics for NeutralGemma4Stage {
         input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
+    ) -> Result<Option<PipelineIngressState>, Error> {
         self.layer_adapter
             .begin_pipeline_continuation(input, stream)
-            .map(|state| Some(Box::new(state) as Box<dyn Any>))
+            .map(|state| Some(PipelineIngressState::Gemma4(state)))
     }
 
-    fn placed_ingress_active(&self, group: &str, state: &dyn Any) -> Result<bool, Error> {
-        let state = state
-            .downcast_ref::<Gemma4PipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Gemma 4 placed ingress state mismatch".into()))?;
+    fn placed_ingress_active(
+        &self,
+        group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<bool, Error> {
+        let PipelineIngressState::Gemma4(state) = state else {
+            return Err(Error::Parallel(
+                "Gemma 4 placed ingress state mismatch".into(),
+            ));
+        };
         self.layer_adapter.pipeline_ingress_active(group, state)
     }
 
-    fn placed_ingress_arrays(&self, group: &str, state: &dyn Any) -> Result<Vec<Array>, Error> {
-        let state = state
-            .downcast_ref::<Gemma4PipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Gemma 4 placed ingress state mismatch".into()))?;
+    fn placed_ingress_arrays(
+        &self,
+        group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<Vec<Array>, Error> {
+        let PipelineIngressState::Gemma4(state) = state else {
+            return Err(Error::Parallel(
+                "Gemma 4 placed ingress state mismatch".into(),
+            ));
+        };
         self.layer_adapter.pipeline_ingress_arrays(group, state)
     }
 
     fn replace_placed_ingress_arrays(
         &self,
         group: &str,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<Gemma4PipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Gemma 4 placed ingress state mismatch".into()))?;
+        let PipelineIngressState::Gemma4(state) = state else {
+            return Err(Error::Parallel(
+                "Gemma 4 placed ingress state mismatch".into(),
+            ));
+        };
         self.layer_adapter
             .replace_pipeline_ingress_arrays(group, state, arrays)
     }
 
     fn merge_placed_ingress_arrays(
         &self,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<Gemma4PipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Gemma 4 placed ingress state mismatch".into()))?;
+        let PipelineIngressState::Gemma4(state) = state else {
+            return Err(Error::Parallel(
+                "Gemma 4 placed ingress state mismatch".into(),
+            ));
+        };
         self.layer_adapter
             .merge_pipeline_ingress_arrays(state, arrays)
     }
@@ -4234,27 +4294,31 @@ impl PipelineStageSemantics for NeutralGemma4Stage {
     fn execute_placed_ingress(
         &mut self,
         group: &str,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         _step: PipelineStep,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<Gemma4PipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Gemma 4 placed ingress state mismatch".into()))?;
+        let PipelineIngressState::Gemma4(state) = state else {
+            return Err(Error::Parallel(
+                "Gemma 4 placed ingress state mismatch".into(),
+            ));
+        };
         self.execute_placed_media(group, state, stream)
     }
 
     fn finish_placed_ingress(
         &mut self,
-        state: Box<dyn Any>,
+        state: PipelineIngressState,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<PipelinePayload, Error> {
-        let state = state
-            .downcast::<Gemma4PipelineIngressState>()
-            .map_err(|_| Error::Parallel("Gemma 4 placed ingress state mismatch".into()))?;
-        let prepared = self.layer_adapter.finish_pipeline_ingress(*state, stream)?;
+        let PipelineIngressState::Gemma4(state) = state else {
+            return Err(Error::Parallel(
+                "Gemma 4 placed ingress state mismatch".into(),
+            ));
+        };
+        let prepared = self.layer_adapter.finish_pipeline_ingress(state, stream)?;
         Ok(PipelinePayload {
             hidden: prepared.hidden,
             auxiliary: PipelineAuxiliaryState::new(prepared.per_layer_inputs.into_iter().collect()),
@@ -4491,10 +4555,10 @@ impl PipelineStageSemantics for MuseGlimmerStage {
         input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
+    ) -> Result<Option<PipelineIngressState>, Error> {
         self.layer_adapter
             .begin_pipeline_ingress(input, execution, stream)
-            .map(|state| Some(Box::new(state) as Box<dyn Any>))
+            .map(|state| Some(PipelineIngressState::MuseGlimmer(state)))
     }
 
     fn begin_placed_ingress_continuation(
@@ -4502,55 +4566,63 @@ impl PipelineStageSemantics for MuseGlimmerStage {
         input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
+    ) -> Result<Option<PipelineIngressState>, Error> {
         self.layer_adapter
             .begin_pipeline_continuation(input, stream)
-            .map(|state| Some(Box::new(state) as Box<dyn Any>))
+            .map(|state| Some(PipelineIngressState::MuseGlimmer(state)))
     }
 
-    fn placed_ingress_active(&self, _group: &str, state: &dyn Any) -> Result<bool, Error> {
-        let state = state
-            .downcast_ref::<MuseGlimmerPipelineIngressState>()
-            .ok_or_else(|| {
-                Error::Parallel("Muse-Glimmer placed ingress state type mismatch".into())
-            })?;
+    fn placed_ingress_active(
+        &self,
+        _group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<bool, Error> {
+        let PipelineIngressState::MuseGlimmer(state) = state else {
+            return Err(Error::Parallel(
+                "Muse-Glimmer placed ingress state type mismatch".into(),
+            ));
+        };
         Ok(self.layer_adapter.pipeline_ingress_active(state))
     }
 
-    fn placed_ingress_arrays(&self, _group: &str, state: &dyn Any) -> Result<Vec<Array>, Error> {
-        let state = state
-            .downcast_ref::<MuseGlimmerPipelineIngressState>()
-            .ok_or_else(|| {
-                Error::Parallel("Muse-Glimmer placed ingress state type mismatch".into())
-            })?;
+    fn placed_ingress_arrays(
+        &self,
+        _group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<Vec<Array>, Error> {
+        let PipelineIngressState::MuseGlimmer(state) = state else {
+            return Err(Error::Parallel(
+                "Muse-Glimmer placed ingress state type mismatch".into(),
+            ));
+        };
         Ok(self.layer_adapter.pipeline_ingress_arrays(state))
     }
 
     fn replace_placed_ingress_arrays(
         &self,
         _group: &str,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<MuseGlimmerPipelineIngressState>()
-            .ok_or_else(|| {
-                Error::Parallel("Muse-Glimmer placed ingress state type mismatch".into())
-            })?;
+        let PipelineIngressState::MuseGlimmer(state) = state else {
+            return Err(Error::Parallel(
+                "Muse-Glimmer placed ingress state type mismatch".into(),
+            ));
+        };
         self.layer_adapter
             .replace_pipeline_ingress_arrays(state, arrays)
     }
 
     fn merge_placed_ingress_arrays(
         &self,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<MuseGlimmerPipelineIngressState>()
-            .ok_or_else(|| {
-                Error::Parallel("Muse-Glimmer placed ingress state type mismatch".into())
-            })?;
+        let PipelineIngressState::MuseGlimmer(state) = state else {
+            return Err(Error::Parallel(
+                "Muse-Glimmer placed ingress state type mismatch".into(),
+            ));
+        };
         self.layer_adapter
             .replace_pipeline_ingress_arrays(state, arrays)
     }
@@ -4558,31 +4630,31 @@ impl PipelineStageSemantics for MuseGlimmerStage {
     fn execute_placed_ingress(
         &mut self,
         _group: &str,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         _step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<MuseGlimmerPipelineIngressState>()
-            .ok_or_else(|| {
-                Error::Parallel("Muse-Glimmer placed ingress state type mismatch".into())
-            })?;
+        let PipelineIngressState::MuseGlimmer(state) = state else {
+            return Err(Error::Parallel(
+                "Muse-Glimmer placed ingress state type mismatch".into(),
+            ));
+        };
         self.execute_placed_vision(state, execution, stream)
     }
 
     fn finish_placed_ingress(
         &mut self,
-        state: Box<dyn Any>,
+        state: PipelineIngressState,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<PipelinePayload, Error> {
-        let state = state
-            .downcast::<MuseGlimmerPipelineIngressState>()
-            .map_err(|_| {
-                Error::Parallel("Muse-Glimmer placed ingress state type mismatch".into())
-            })?;
-        let hidden = self.layer_adapter.finish_pipeline_ingress(*state, stream)?;
+        let PipelineIngressState::MuseGlimmer(state) = state else {
+            return Err(Error::Parallel(
+                "Muse-Glimmer placed ingress state type mismatch".into(),
+            ));
+        };
+        let hidden = self.layer_adapter.finish_pipeline_ingress(state, stream)?;
         Ok(PipelinePayload {
             hidden,
             auxiliary: PipelineAuxiliaryState::default(),
@@ -4696,42 +4768,56 @@ impl PipelineStageSemantics for NeutralInklingStage {
         input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
+    ) -> Result<Option<PipelineIngressState>, Error> {
         self.layer_adapter
             .begin_pipeline_ingress(input, stream)
-            .map(|state| Some(Box::new(state) as Box<dyn Any>))
+            .map(|state| Some(PipelineIngressState::Inkling(state)))
     }
 
-    fn placed_ingress_active(&self, _group: &str, state: &dyn Any) -> Result<bool, Error> {
-        let state = state
-            .downcast_ref::<InklingPipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Inkling placed ingress state mismatch".into()))?;
+    fn placed_ingress_active(
+        &self,
+        _group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<bool, Error> {
+        let PipelineIngressState::Inkling(state) = state else {
+            return Err(Error::Parallel(
+                "Inkling placed ingress state mismatch".into(),
+            ));
+        };
         Ok(self.layer_adapter.pipeline_ingress_active(state))
     }
 
-    fn placed_ingress_arrays(&self, _group: &str, state: &dyn Any) -> Result<Vec<Array>, Error> {
-        let state = state
-            .downcast_ref::<InklingPipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Inkling placed ingress state mismatch".into()))?;
+    fn placed_ingress_arrays(
+        &self,
+        _group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<Vec<Array>, Error> {
+        let PipelineIngressState::Inkling(state) = state else {
+            return Err(Error::Parallel(
+                "Inkling placed ingress state mismatch".into(),
+            ));
+        };
         Ok(self.layer_adapter.pipeline_ingress_arrays(state))
     }
 
     fn replace_placed_ingress_arrays(
         &self,
         _group: &str,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<InklingPipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Inkling placed ingress state mismatch".into()))?;
+        let PipelineIngressState::Inkling(state) = state else {
+            return Err(Error::Parallel(
+                "Inkling placed ingress state mismatch".into(),
+            ));
+        };
         self.layer_adapter
             .replace_pipeline_ingress_arrays(state, arrays)
     }
 
     fn merge_placed_ingress_arrays(
         &self,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
         self.replace_placed_ingress_arrays("vision_encoder", state, arrays)
@@ -4740,7 +4826,7 @@ impl PipelineStageSemantics for NeutralInklingStage {
     fn execute_placed_ingress(
         &mut self,
         group: &str,
-        state: &mut dyn Any,
+        state: &mut PipelineIngressState,
         _step: PipelineStep,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
@@ -4748,23 +4834,27 @@ impl PipelineStageSemantics for NeutralInklingStage {
         if group != "vision_encoder" {
             return Ok(());
         }
-        let state = state
-            .downcast_mut::<InklingPipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Inkling placed ingress state mismatch".into()))?;
+        let PipelineIngressState::Inkling(state) = state else {
+            return Err(Error::Parallel(
+                "Inkling placed ingress state mismatch".into(),
+            ));
+        };
         self.execute_placed_vision(state, stream)
     }
 
     fn finish_placed_ingress(
         &mut self,
-        state: Box<dyn Any>,
+        state: PipelineIngressState,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<PipelinePayload, Error> {
-        let state = state
-            .downcast::<InklingPipelineIngressState>()
-            .map_err(|_| Error::Parallel("Inkling placed ingress state mismatch".into()))?;
+        let PipelineIngressState::Inkling(state) = state else {
+            return Err(Error::Parallel(
+                "Inkling placed ingress state mismatch".into(),
+            ));
+        };
         Ok(PipelinePayload {
-            hidden: self.layer_adapter.finish_pipeline_ingress(*state, stream)?,
+            hidden: self.layer_adapter.finish_pipeline_ingress(state, stream)?,
             auxiliary: PipelineAuxiliaryState::default(),
         })
     }
@@ -4916,537 +5006,6 @@ impl PipelineStageSemantics for NeutralInklingStage {
     }
 }
 
-impl PipelineStageSemantics for Qwen3VlStage {
-    fn model_kind(&self) -> ModelKind {
-        if self.args.text_config.is_moe() {
-            ModelKind::Qwen3VlMoe
-        } else {
-            ModelKind::Qwen3Vl
-        }
-    }
-
-    fn begin_placed_ingress(
-        &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
-        execution: Option<&ParallelExecutionContext<'_>>,
-        stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
-        self.layer_adapter
-            .begin_pipeline_ingress(input, execution, stream)
-            .map(|state| Some(Box::new(state) as Box<dyn Any>))
-    }
-
-    fn begin_placed_ingress_continuation(
-        &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
-        _execution: Option<&ParallelExecutionContext<'_>>,
-        stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
-        self.layer_adapter
-            .begin_pipeline_continuation(input, stream)
-            .map(|state| Some(Box::new(state) as Box<dyn Any>))
-    }
-
-    fn placed_ingress_active(&self, _group: &str, state: &dyn Any) -> Result<bool, Error> {
-        let state = state
-            .downcast_ref::<crate::composition::mlx_architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>(
-            )
-            .ok_or_else(|| Error::Parallel("Qwen3-VL placed ingress state type mismatch".into()))?;
-        Ok(self.layer_adapter.pipeline_ingress_active(state))
-    }
-
-    fn placed_ingress_arrays(&self, _group: &str, state: &dyn Any) -> Result<Vec<Array>, Error> {
-        let state = state
-            .downcast_ref::<crate::composition::mlx_architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>(
-            )
-            .ok_or_else(|| Error::Parallel("Qwen3-VL placed ingress state type mismatch".into()))?;
-        Ok(self.layer_adapter.pipeline_ingress_arrays(state))
-    }
-
-    fn replace_placed_ingress_arrays(
-        &self,
-        _group: &str,
-        state: &mut dyn Any,
-        arrays: Vec<Array>,
-    ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<crate::composition::mlx_architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>(
-            )
-            .ok_or_else(|| Error::Parallel("Qwen3-VL placed ingress state type mismatch".into()))?;
-        self.layer_adapter
-            .replace_pipeline_ingress_arrays(state, arrays)
-    }
-
-    fn merge_placed_ingress_arrays(
-        &self,
-        state: &mut dyn Any,
-        arrays: Vec<Array>,
-    ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<crate::composition::mlx_architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>(
-            )
-            .ok_or_else(|| Error::Parallel("Qwen3-VL placed ingress state type mismatch".into()))?;
-        self.layer_adapter
-            .replace_pipeline_ingress_arrays(state, arrays)
-    }
-
-    fn execute_placed_ingress(
-        &mut self,
-        _group: &str,
-        state: &mut dyn Any,
-        _step: PipelineStep,
-        execution: Option<&ParallelExecutionContext<'_>>,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<crate::composition::mlx_architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>(
-            )
-            .ok_or_else(|| Error::Parallel("Qwen3-VL placed ingress state type mismatch".into()))?;
-        if let Some(storage) = self.dense_layers.as_ref() {
-            let prefill = true;
-            let forward_guard = match &storage.controller {
-                PipelineLayerController::LayerwiseHost(_) => None,
-                PipelineLayerController::DenseDiskStream(controller) => {
-                    Some(controller.forward_guard(prefill, &storage.residency)?)
-                }
-            };
-            let group_guard = match &storage.controller {
-                PipelineLayerController::LayerwiseHost(_) => None,
-                PipelineLayerController::DenseDiskStream(controller) => {
-                    Some(controller.group_guard(&storage.residency, "pipeline_stage"))
-                }
-            };
-            let mut window = storage.transfer_window(0..self.vision_range.len(), prefill)?;
-            for (ordinal, index) in self.vision_range.clone().enumerate() {
-                let transfer = window
-                    .as_mut()
-                    .map(|window| window.next(stream))
-                    .transpose()?;
-                let lease = transfer
-                    .is_none()
-                    .then(|| storage.prepare_layerwise_absolute(ordinal))
-                    .transpose()?;
-                let mut layer = self.layer_adapter.new_cartesian_layer(
-                    0,
-                    index,
-                    self.parallel_layout.as_ref(),
-                    None,
-                    stream,
-                )?;
-                populate_module_from_lease(
-                    &mut layer,
-                    transfer
-                        .as_ref()
-                        .map(|transfer| transfer.lease())
-                        .or(lease.as_ref())
-                        .expect("Qwen3-VL placed vision residency lease"),
-                )?;
-                let retained = self
-                    .layer_adapter
-                    .forward_pipeline_vision_layer(index, &mut layer, state, execution, stream)?;
-                synchronize_outputs(retained.iter())?;
-                drop(transfer);
-                drop(lease);
-                if let Some(window) = &mut window {
-                    window.refill()?;
-                } else {
-                    storage.trim_after_absolute(ordinal)?;
-                }
-            }
-            storage.complete_forward()?;
-            if let Some(guard) = group_guard {
-                guard.complete()?;
-            }
-            if let Some(guard) = forward_guard {
-                guard.complete()?;
-            }
-        } else {
-            for (index, layer) in self.vision_range.clone().zip(&mut self.vision_layers) {
-                self.layer_adapter
-                    .forward_pipeline_vision_layer(index, layer, state, execution, stream)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn finish_placed_ingress(
-        &mut self,
-        state: Box<dyn Any>,
-        execution: Option<&ParallelExecutionContext<'_>>,
-        stream: &Stream,
-    ) -> Result<PipelinePayload, Error> {
-        let state = state
-            .downcast::<crate::composition::mlx_architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>()
-            .map_err(|_| Error::Parallel("Qwen3-VL placed ingress state type mismatch".into()))?;
-        let prepared = self
-            .layer_adapter
-            .finish_pipeline_ingress(*state, execution, stream)?;
-        let activation_dtype = prepared.hidden.dtype();
-        Ok(PipelinePayload {
-            hidden: prepared.hidden,
-            auxiliary: PipelineAuxiliaryState::new(
-                std::iter::once(prepared.cos.as_dtype(activation_dtype, stream)?)
-                    .chain(std::iter::once(
-                        prepared.sin.as_dtype(activation_dtype, stream)?,
-                    ))
-                    .chain(std::iter::once(
-                        Array::from_slice(&[prepared.rope_delta as f32], &[1])
-                            .as_dtype(activation_dtype, stream)?,
-                    ))
-                    .chain(prepared.deepstack_features)
-                    .collect(),
-            ),
-        })
-    }
-
-    fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>> {
-        let mut shapes = vec![
-            vec![1, step.sequence_length, self.args.text_config.head_dim],
-            vec![1, step.sequence_length, self.args.text_config.head_dim],
-            vec![1],
-        ];
-        shapes.extend(
-            (0..self.args.vision_config.deepstack_layer_count()).map(|_| {
-                vec![
-                    step.batch_size,
-                    step.sequence_length,
-                    self.args.text_config.hidden_size,
-                ]
-            }),
-        );
-        shapes
-    }
-
-    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
-        self.dense_layers.as_ref()
-    }
-
-    fn expert_cache(&self) -> Option<&ExpertCache> {
-        self.expert_storage.cache()
-    }
-
-    fn prompt_cache_model_identity(
-        &self,
-        topology: MlxParallelContext,
-    ) -> Result<PromptCacheModelIdentity, Error> {
-        let complete = self
-            .layer_adapter
-            .prompt_cache_model_identity((topology.tensor_parallel_size > 1).then_some(topology))?;
-        let layout = crate::LayerSchedule::new(
-            self.range.len(),
-            complete
-                .layer_layout
-                .iter()
-                .skip(self.range.start)
-                .take(self.range.len())
-                .cloned()
-                .collect(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "qwen3_vl",
-            &complete.effective_model_type,
-            complete.architecture_fingerprint,
-            self.args.text_config.num_hidden_layers as usize,
-            self.range.clone(),
-            layout,
-        ))
-    }
-
-    fn forward(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut [PipelineLayerCache],
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        self.forward_decoder(Some(input), None, step, mask, cache, None, None, stream)
-    }
-
-    fn prefill(
-        &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut [PipelineLayerCache],
-        execution: Option<&ParallelExecutionContext<'_>>,
-        expert_group: Option<&Group>,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        self.forward_decoder(
-            None,
-            Some(input),
-            step,
-            mask,
-            cache,
-            execution,
-            expert_group,
-            stream,
-        )
-    }
-
-    fn forward_with_execution(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut [PipelineLayerCache],
-        execution: Option<&ParallelExecutionContext<'_>>,
-        expert_group: Option<&Group>,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        self.forward_decoder(
-            Some(input),
-            None,
-            step,
-            mask,
-            cache,
-            execution,
-            expert_group,
-            stream,
-        )
-    }
-}
-
-impl Qwen3VlStage {
-    #[allow(clippy::too_many_arguments)]
-    fn forward_decoder(
-        &mut self,
-        input: Option<PipelineStageInput<'_>>,
-        typed: Option<crate::backend::mlx::runtime::media::input::ModelInput<'_>>,
-        step: PipelineStep,
-        explicit_mask: Option<&Array>,
-        caches: &mut [PipelineLayerCache],
-        execution: Option<&ParallelExecutionContext<'_>>,
-        expert_group: Option<&Group>,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        if caches.len() != self.range.len() {
-            return Err(Error::Parallel(format!(
-                "Qwen3-VL stage cache has {} entries, expected {}",
-                caches.len(),
-                self.range.len()
-            )));
-        }
-        let offset = pipeline_kv_offset(caches);
-        let prepared = if let Some(typed) = typed {
-            if offset != 0 {
-                return Err(Error::Parallel(format!(
-                    "Qwen3-VL multimodal prefill requires an empty stage cache, found offset {offset}"
-                )));
-            }
-            self.layer_adapter.prepare_pipeline_prefill(
-                typed,
-                &mut self.vision_layers,
-                execution,
-                stream,
-            )?
-        } else {
-            match input.expect("non-typed Qwen3-VL pipeline input") {
-                PipelineStageInput::Tokens(tokens) => {
-                    let rope_delta = qwen3_vl_pipeline_rope_delta(caches, stream)?;
-                    self.layer_adapter
-                        .prepare_pipeline_tokens(tokens, offset, rope_delta, execution, stream)?
-                }
-                PipelineStageInput::Hidden(payload) => {
-                    let tensors = payload.auxiliary.tensors();
-                    if tensors.len() < 3 {
-                        return Err(Error::Parallel(format!(
-                            "Qwen3-VL stage requires at least three MRoPE auxiliary tensors, got {}",
-                            tensors.len()
-                        )));
-                    }
-                    Qwen3VlPipelinePrepared {
-                        hidden: payload.hidden.clone(),
-                        cos: tensors[0].clone(),
-                        sin: tensors[1].clone(),
-                        rope_delta: tensors[2].clone().try_item::<f32>(stream)? as i32,
-                        deepstack_features: tensors[3..].to_vec(),
-                    }
-                }
-            }
-        };
-        if prepared.hidden.shape() != step.activation_shape(self.args.text_config.hidden_size) {
-            return Err(Error::Parallel(format!(
-                "Qwen3-VL ingress assembled hidden activations shaped {:?}, expected {:?}",
-                prepared.hidden.shape(),
-                step.activation_shape(self.args.text_config.hidden_size)
-            )));
-        }
-        let activation_dtype = prepared.hidden.dtype();
-        let auxiliary = PipelineAuxiliaryState::new(
-            std::iter::once(prepared.cos.as_dtype(activation_dtype, stream)?)
-                .chain(std::iter::once(
-                    prepared.sin.as_dtype(activation_dtype, stream)?,
-                ))
-                .chain(std::iter::once(
-                    Array::from_slice(&[prepared.rope_delta as f32], &[1])
-                        .as_dtype(activation_dtype, stream)?,
-                ))
-                .chain(prepared.deepstack_features.iter().cloned())
-                .collect(),
-        );
-        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
-            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
-            .transpose()?;
-        let mask = explicit_mask.or(generated_mask.as_ref());
-        let cos = &auxiliary.tensors()[0];
-        let sin = &auxiliary.tensors()[1];
-        let deepstack = &auxiliary.tensors()[3..];
-        let pass = if step.sequence_length > 1 {
-            ExpertPass::Prefill
-        } else {
-            ExpertPass::Decode
-        };
-        self.routing_statistics = RoutingStatistics::default();
-        let layout = self.parallel_layout.clone();
-        let assignment = self.expert_assignment.clone();
-        let expert_cache = self.expert_storage.cache();
-        match assignment.as_ref() {
-            Some(assignment) => validate_pipeline_expert_dispatch(
-                assignment,
-                expert_group,
-                self.expert_storage.is_external(),
-            )?,
-            None if expert_group.is_some() || self.expert_storage.is_external() => {
-                return Err(Error::Parallel(
-                    "Qwen3-VL Cartesian stage has expert execution without an ownership assignment"
-                        .into(),
-                ));
-            }
-            None => {}
-        }
-        let adapter = &self.layer_adapter;
-        let mut hidden = execute_pipeline_layer_range(
-            PipelineLayerExecution {
-                range: self.range.clone(),
-                resident_layers: &mut self.layers,
-                dense_layers: self.dense_layers.as_ref(),
-                step,
-                caches,
-                hidden: prepared.hidden,
-                stream,
-            },
-            |global_layer, stream| {
-                adapter.new_cartesian_layer(
-                    1,
-                    global_layer,
-                    layout.as_ref(),
-                    assignment.as_ref(),
-                    stream,
-                )
-            },
-            |global_layer, layer, hidden, cache, stream| {
-                let Qwen3VlLayer::Text(block) = layer else {
-                    return Err(Error::Parallel(format!(
-                        "Qwen3-VL pipeline text range contains a vision unit at layer {global_layer}"
-                    )));
-                };
-                let forwarded = match cache {
-                    PipelineLayerCache::KeyValue {
-                        global_layer: cached_layer,
-                        cache: PipelineKeyValueCache::Standard(cache),
-                        ..
-                    } if *cached_layer == global_layer => qwen3_vl_forward_pipeline_block(
-                        block,
-                        hidden,
-                        mask,
-                        cache,
-                        cos,
-                        sin,
-                        execution,
-                        expert_group,
-                        assignment.as_ref(),
-                        expert_cache,
-                        &self.args.text_config,
-                        layout.as_ref(),
-                        pass,
-                        &mut self.routing_statistics,
-                        global_layer,
-                        stream,
-                    )?,
-                    PipelineLayerCache::KeyValue {
-                        global_layer: cached_layer,
-                        cache: PipelineKeyValueCache::Paged(cache),
-                        ..
-                    } if *cached_layer == global_layer => qwen3_vl_forward_pipeline_block(
-                        block,
-                        hidden,
-                        mask,
-                        cache,
-                        cos,
-                        sin,
-                        execution,
-                        expert_group,
-                        assignment.as_ref(),
-                        expert_cache,
-                        &self.args.text_config,
-                        layout.as_ref(),
-                        pass,
-                        &mut self.routing_statistics,
-                        global_layer,
-                        stream,
-                    )?,
-                    _ => {
-                        return Err(Error::Parallel(format!(
-                            "Qwen3-VL pipeline cache does not match global layer {global_layer}"
-                        )))
-                    }
-                };
-                let forwarded = if let Some(features) = deepstack.get(global_layer) {
-                    forwarded.add(features, stream)?
-                } else {
-                    forwarded
-                };
-                synchronize_outputs([&forwarded])?;
-                Ok(forwarded)
-            },
-        )?;
-        qwen3_vl_set_pipeline_rope_delta(caches, prepared.rope_delta)?;
-        if self.range.end == self.args.text_config.num_hidden_layers as usize {
-            hidden = self.layer_adapter.norm_mut().forward(&hidden, stream)?;
-            let logits = if let Some(execution) =
-                execution.filter(|execution| execution.is_tensor_parallel())
-            {
-                let sharded = match self.layer_adapter.parallel_lm_head_mut() {
-                    Some(head) => head.forward(&hidden, execution)?,
-                    None => self
-                        .parallel_output_embedding
-                        .as_mut()
-                        .ok_or_else(|| {
-                            Error::Parallel(
-                                "last tied Qwen3-VL TP+PP stage has no output embedding shard"
-                                    .into(),
-                            )
-                        })?
-                        .project_logits(&hidden, execution)?,
-                };
-                sharded.all_gather(execution)?
-            } else if let Some(head) = self.layer_adapter.lm_head_mut() {
-                head.forward(&hidden, stream)?
-            } else {
-                let mut no_head = None;
-                project_logits_maybe_quantized(
-                    &mut no_head,
-                    self.output_embedding
-                        .as_mut()
-                        .expect("last tied Qwen3-VL output embedding"),
-                    &hidden,
-                    stream,
-                )?
-            };
-            Ok(PipelineStageOutput::Logits(logits))
-        } else {
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden,
-                auxiliary,
-            }))
-        }
-    }
-}
-
 fn forward_qwen_pipeline_block<C>(
     block: &mut MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>,
     hidden: &Array,
@@ -5502,8 +5061,12 @@ where
         let flat = normalized
             .reshape(&[-1, normalized.dim(-1)], context)
             .map_err(eredu_nn::Error::backend)?;
-        policy
-            .forward_with_provider(layer, pass, &flat, context, provider)?
+        let forwarded = match tensor_group {
+            Some(group) => policy
+                .forward_with_provider_parallel(layer, pass, &flat, group, context, provider)?,
+            None => policy.forward_with_provider(layer, pass, &flat, context, provider)?,
+        };
+        forwarded
             .reshape(&shape, context)
             .map_err(eredu_nn::Error::backend)
     };
@@ -5614,161 +5177,26 @@ where
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn qwen3_vl_forward_pipeline_block<C>(
-    block: &mut MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>,
-    hidden: &Array,
-    mask: Option<&Array>,
-    cache: &mut C,
-    cos: &Array,
-    sin: &Array,
-    execution: Option<&ParallelExecutionContext<'_>>,
-    expert_group: Option<&Group>,
-    assignment: Option<&ExpertAssignment>,
-    expert_cache: Option<&ExpertCache>,
-    args: &eredu_architectures::qwen::ModelArgs,
-    layout: Option<&eredu_runtime::LocalModelLayout>,
-    pass: ExpertPass,
-    statistics: &mut RoutingStatistics,
-    global_layer: usize,
-    stream: &Stream,
-) -> Result<Array, Error>
-where
-    C: KeyValueCache + eredu_nn::AttentionCache<Array>,
-{
-    let tensor_group = execution
-        .filter(|execution| execution.is_tensor_parallel())
-        .map(|execution| {
-            execution.group().ok_or_else(|| {
-                Error::Parallel("Qwen3-VL tensor-sharded stage has no TP communicator".into())
-            })
-        })
-        .transpose()?;
-    if let Some(expert_cache) = expert_cache {
-        let assignment = assignment.ok_or_else(|| {
-            Error::Parallel("cached Qwen3-VL experts have no ownership assignment".into())
-        })?;
-        let expert_args = qwen_pipeline_local_expert_args(args, layout, global_layer)?;
-        let mut execute =
-            |_layer: usize, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                execute_pipeline_cached_qwen3(
-                    &expert_args,
-                    global_layer,
-                    hidden,
-                    ids,
-                    weights,
-                    pass,
-                    expert_cache,
-                    assignment,
-                    expert_group,
-                    tensor_group,
-                    statistics,
-                    stream,
-                )
-                .map_err(|error| Exception::custom(error.to_string()))
-            };
-        let mut provider =
-            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
-                &mut execute,
-            );
-        return crate::composition::mlx_architectures::qwen::vl::layerwise::forward_qwen3_vl_text_external_experts(
-            block, hidden, mask, Some(cache), cos, sin, global_layer, pass, tensor_group, stream, &mut provider,
-        );
-    }
-    if let (Some(tensor_group), Some(assignment), Some(expert_group)) =
-        (tensor_group, assignment, expert_group)
-    {
-        let mut execute = |bank: &mut _,
-                           routed_hidden: &Array,
-                           ids: &Array,
-                           weights: &Array,
-                           route_stream: &Stream| {
-            let returned = dispatch_replicated(
-                routed_hidden,
-                ids,
-                weights,
-                assignment,
-                bank,
-                expert_group,
-                route_stream,
-            )
-            .map_err(|error| Exception::custom(error.to_string()))?;
-            statistics.accumulate(&returned.statistics);
-            Ok(returned.reduced_output)
-        };
-        let mut provider =
-            crate::backend::mlx::runtime::residency::expert_provider::ResidentExpertExecutorProvider::new(&mut execute);
-        return crate::composition::mlx_architectures::qwen::vl::layerwise::forward_qwen3_vl_text_external_experts(
-            block, hidden, mask, Some(cache), cos, sin, global_layer, pass, Some(tensor_group), stream, &mut provider,
-        );
-    }
-    if let (Some(assignment), Some(expert_group)) = (assignment, expert_group) {
-        let mut execute = |bank: &mut _,
-                           routed_hidden: &Array,
-                           ids: &Array,
-                           weights: &Array,
-                           route_stream: &Stream| {
-            let returned = dispatch_replicated(
-                routed_hidden,
-                ids,
-                weights,
-                assignment,
-                bank,
-                expert_group,
-                route_stream,
-            )
-            .map_err(|error| Exception::custom(error.to_string()))?;
-            statistics.accumulate(&returned.statistics);
-            Ok(returned.reduced_output)
-        };
-        let mut provider =
-            crate::backend::mlx::runtime::residency::expert_provider::ResidentExpertExecutorProvider::new(&mut execute);
-        return crate::composition::mlx_architectures::qwen::vl::layerwise::forward_qwen3_vl_text_external_experts(
-            block, hidden, mask, Some(cache), cos, sin, global_layer, pass, None, stream, &mut provider,
-        );
-    }
-    crate::composition::mlx_architectures::qwen::vl::layerwise::forward_qwen3_vl_text(
-        block,
-        hidden,
-        mask,
-        Some(cache),
-        cos,
-        sin,
-        tensor_group,
-        stream,
-    )
-}
-
-fn qwen3_vl_pipeline_rope_delta(
-    caches: &[PipelineLayerCache],
-    stream: &Stream,
-) -> Result<i32, Error> {
-    for cache in caches {
+fn qwen_vl_pipeline_delta(caches: &[PipelineLayerCache]) -> Option<Array> {
+    caches.iter().find_map(|cache| {
         let slots = match cache {
             PipelineLayerCache::StateSlots { slots, .. }
             | PipelineLayerCache::KeyValue { slots, .. }
             | PipelineLayerCache::CompressedLatent { slots, .. } => slots,
-            PipelineLayerCache::PoolingAttention { .. } => continue,
+            PipelineLayerCache::PoolingAttention { .. } => return None,
         };
-        if let Some(slot) = slots
+        slots
             .iter()
             .find(|slot| slot.policy.role == StateTensorRole::PositionDelta)
-        {
-            return slot
-                .value
-                .as_ref()
-                .map(|value| value.clone().try_item::<i32>(stream).map_err(Error::from))
-                .unwrap_or(Ok(0));
-        }
-    }
-    Ok(0)
+            .and_then(|slot| slot.value.clone())
+    })
 }
 
-fn qwen3_vl_set_pipeline_rope_delta(
+fn set_qwen_vl_pipeline_delta(
     caches: &mut [PipelineLayerCache],
-    rope_delta: i32,
+    delta: Array,
+    offset: i32,
 ) -> Result<(), Error> {
-    let offset = pipeline_kv_offset(caches);
     for cache in caches {
         let slots = match cache {
             PipelineLayerCache::StateSlots { slots, .. }
@@ -5780,13 +5208,1529 @@ fn qwen3_vl_set_pipeline_rope_delta(
             .iter_mut()
             .find(|slot| slot.policy.role == StateTensorRole::PositionDelta)
         {
-            slot.value = Some(Array::from_slice(&[rope_delta], &[1]));
+            slot.value = Some(delta);
             slot.offset = offset;
             synchronize_outputs(slot.value.iter())?;
             break;
         }
     }
     Ok(())
+}
+
+impl NeutralQwenVlStage {
+    fn new(
+        args: eredu_architectures::qwen::vl::ModelArgs,
+        range: Range<usize>,
+        info: &PipelineStageInfo,
+        external_experts: bool,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let adapter = if external_experts {
+            QwenVlPipelineAdapter::new_external_experts(args.clone(), stream)?
+        } else {
+            QwenVlPipelineAdapter::new(args.clone(), stream)?
+        };
+        Ok(Self {
+            args,
+            adapter,
+            range,
+            vision_range: info
+                .placement
+                .group("vision_encoder")
+                .and_then(|group| group.local_units(info.pipeline_stage))
+                .unwrap_or(0..0),
+            vision_layers: Vec::new(),
+            layers: Vec::new(),
+            dense_layers: None,
+            parallel_embedding: None,
+            parallel_output_embedding: None,
+            parallel_lm_head: None,
+            parallel_layout: None,
+            parallel_kv_heads: None,
+            expert_assignment: None,
+            expert_storage: if external_experts {
+                PipelineExpertStorage::ExternalEmpty
+            } else {
+                PipelineExpertStorage::LayerLocal
+            },
+            routing_statistics: RoutingStatistics::default(),
+        })
+    }
+
+    fn begin_ingress(
+        &mut self,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        offset: i32,
+        delta: Option<&Array>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<eredu_architectures::qwen::vl::PipelineVisionState<Array>, Error> {
+        let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) else {
+            return self
+                .adapter
+                .begin_pipeline_ingress(input, offset, delta, stream);
+        };
+        let embedding = self
+            .parallel_embedding
+            .as_mut()
+            .or(self.parallel_output_embedding.as_mut())
+            .ok_or_else(|| Error::Parallel("Qwen3-VL TP ingress has no embedding shard".into()))?;
+        let mut projected = Vec::new();
+        let mut projection_index = Vec::with_capacity(input.parts.len());
+        for part in input.parts {
+            match (part.modality, part.payload) {
+                (
+                    crate::backend::mlx::runtime::media::input::Modality::Text,
+                    crate::backend::mlx::runtime::media::input::InputPayload::TokenIds(tokens),
+                ) => {
+                    projected.push(embedding.forward(tokens, execution)?);
+                    projection_index.push(Some(projected.len() - 1));
+                }
+                _ => projection_index.push(None),
+            }
+        }
+        let parts = input
+            .parts
+            .iter()
+            .zip(projection_index)
+            .map(|(part, projected_index)| match projected_index {
+                Some(index) => crate::backend::mlx::runtime::media::input::InputPart {
+                    modality: part.modality,
+                    payload: crate::backend::mlx::runtime::media::input::InputPayload::Embeddings(
+                        &projected[index],
+                    ),
+                    metadata: part.metadata,
+                },
+                None => *part,
+            })
+            .collect::<Vec<_>>();
+        self.adapter.begin_pipeline_ingress(
+            crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
+            offset,
+            delta,
+            stream,
+        )
+    }
+
+    fn execute_vision_state(
+        &mut self,
+        state: &mut eredu_architectures::qwen::vl::PipelineVisionState<Array>,
+        tensor_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        if let Some(storage) = self.dense_layers.as_ref() {
+            let forward_guard = match &storage.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.forward_guard(true, &storage.residency)?)
+                }
+            };
+            let group_guard = match &storage.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.group_guard(&storage.residency, "pipeline_stage"))
+                }
+            };
+            let mut window = storage.transfer_window(0..self.vision_range.len(), true)?;
+            for (ordinal, index) in self.vision_range.clone().enumerate() {
+                let transfer = window
+                    .as_mut()
+                    .map(|window| window.next(stream))
+                    .transpose()?;
+                let lease = transfer
+                    .is_none()
+                    .then(|| storage.prepare_layerwise_absolute(ordinal))
+                    .transpose()?;
+                let mut layer = self.adapter.new_cartesian_layer(
+                    0,
+                    index,
+                    self.parallel_layout.as_ref(),
+                    None,
+                    stream,
+                )?;
+                populate_module_from_lease(
+                    &mut layer,
+                    transfer
+                        .as_ref()
+                        .map(|transfer| transfer.lease())
+                        .or(lease.as_ref())
+                        .expect("Qwen3-VL placed vision residency lease"),
+                )?;
+                self.adapter.forward_pipeline_vision_layer(
+                    index,
+                    &mut layer,
+                    state,
+                    tensor_group,
+                    stream,
+                )?;
+                synchronize_outputs(self.adapter.pipeline_ingress_arrays(state).iter())?;
+                drop(transfer);
+                drop(lease);
+                if let Some(window) = &mut window {
+                    window.refill()?;
+                } else {
+                    storage.trim_after_absolute(ordinal)?;
+                }
+            }
+            storage.complete_forward()?;
+            if let Some(guard) = group_guard {
+                guard.complete()?;
+            }
+            if let Some(guard) = forward_guard {
+                guard.complete()?;
+            }
+        } else {
+            for (index, layer) in self.vision_range.clone().zip(&mut self.vision_layers) {
+                self.adapter.forward_pipeline_vision_layer(
+                    index,
+                    layer,
+                    state,
+                    tensor_group,
+                    stream,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_decoder(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        explicit_mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if caches.len() != self.range.len() {
+            return Err(Error::Parallel(format!(
+                "Qwen3-VL stage cache has {} entries, expected {}",
+                caches.len(),
+                self.range.len()
+            )));
+        }
+        let offset = pipeline_kv_offset(caches);
+        let tensor_group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .and_then(ParallelExecutionContext::group);
+        let mut prepared = match input {
+            PipelineStageInput::Tokens(tokens) => {
+                let parts = [
+                    crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(tokens),
+                ];
+                let typed = crate::backend::mlx::runtime::media::input::ModelInput::new(&parts);
+                let state = self.begin_ingress(
+                    typed,
+                    offset,
+                    qwen_vl_pipeline_delta(caches).as_ref(),
+                    execution,
+                    stream,
+                )?;
+                self.adapter
+                    .finish_pipeline_ingress(state, tensor_group, stream)?
+            }
+            PipelineStageInput::Hidden(payload) => {
+                let tensors = payload.auxiliary.tensors();
+                let expected = 3 + self.args.vision.deepstack_layer_count();
+                if tensors.len() != expected {
+                    return Err(Error::Parallel(format!(
+                        "Qwen3-VL pipeline payload has {} auxiliary tensors, expected {expected}",
+                        tensors.len()
+                    )));
+                }
+                eredu_architectures::qwen::vl::PipelinePrepared {
+                    hidden: payload.hidden.clone(),
+                    cosine: tensors[0].clone(),
+                    sine: tensors[1].clone(),
+                    position_delta: tensors[2].clone(),
+                    mask: None,
+                    deepstack: tensors[3..].to_vec(),
+                    visual_mask: None,
+                }
+            }
+        };
+        let deepstack_count = self.args.vision.deepstack_layer_count();
+        if prepared.deepstack.is_empty() {
+            let zero = safemlx::ops::zeros_like(&prepared.hidden, stream)?;
+            prepared.deepstack = vec![zero; deepstack_count];
+        } else if prepared.deepstack.len() != deepstack_count {
+            return Err(Error::Parallel(format!(
+                "Qwen3-VL prepared {} DeepStack tensors, expected {deepstack_count}",
+                prepared.deepstack.len()
+            )));
+        }
+        if prepared.hidden.shape() != step.activation_shape(self.args.text.hidden_size) {
+            return Err(Error::Parallel(format!(
+                "Qwen3-VL decoder input is shaped {:?}, expected {:?}",
+                prepared.hidden.shape(),
+                step.activation_shape(self.args.text.hidden_size)
+            )));
+        }
+        if prepared.mask.is_none() && step.sequence_length > 1 {
+            prepared.mask = Some(create_causal_mask(
+                step.sequence_length,
+                Some(offset),
+                None,
+                None,
+                stream,
+            )?);
+        }
+        if explicit_mask.is_some() {
+            prepared.mask = explicit_mask.cloned();
+        }
+        let assignment = self.expert_assignment.clone();
+        if let Some(assignment) = assignment.as_ref() {
+            validate_pipeline_expert_dispatch(
+                assignment,
+                expert_group,
+                self.expert_storage.is_external(),
+            )?;
+        }
+        self.routing_statistics = RoutingStatistics::default();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.text.clone();
+        let cache = self.expert_storage.cache();
+        let layout = self.parallel_layout.clone();
+        let factory_args = self.args.clone();
+        let external_experts = self.expert_storage.is_external();
+        let mut hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden: prepared.hidden.clone(),
+                stream,
+            },
+            |global_layer, stream| {
+                let adapter = if external_experts {
+                    QwenVlPipelineAdapter::new_external_experts(factory_args.clone(), stream)?
+                } else {
+                    QwenVlPipelineAdapter::new(factory_args.clone(), stream)?
+                };
+                adapter.new_cartesian_layer(
+                    1,
+                    global_layer,
+                    layout.as_ref(),
+                    assignment.as_ref(),
+                    stream,
+                )
+            },
+            |global_layer, layer, hidden, cache_state, stream| {
+                let eredu_architectures::qwen::vl::Unit::Text(block) = &mut layer.inner else {
+                    return Err(Error::Parallel(format!(
+                        "Qwen3-VL decoder range contains a vision unit at {global_layer}"
+                    )));
+                };
+                let mut layer_state = PipelineHybridLayerState(cache_state);
+                let expert_args =
+                    qwen_pipeline_local_expert_args(&args, layout.as_ref(), global_layer)?;
+                let mut execute = |layer: usize,
+                                   hidden: &Array,
+                                   ids: &Array,
+                                   weights: &Array,
+                                   stream: &Stream| {
+                    let expert_cache = cache.ok_or_else(|| {
+                        Exception::custom("Qwen3-VL external expert cache is unavailable")
+                    })?;
+                    let assignment = assignment.as_ref().ok_or_else(|| {
+                        Exception::custom("Qwen3-VL external experts have no assignment")
+                    })?;
+                    execute_pipeline_cached_qwen3(
+                        &expert_args,
+                        layer,
+                        hidden,
+                        ids,
+                        weights,
+                        pass,
+                        expert_cache,
+                        assignment,
+                        expert_group,
+                        tensor_group,
+                        &mut self.routing_statistics,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()))
+                };
+                let forwarded = if cache.is_some() {
+                    let mut provider = ExpertExecutorProvider::new(&mut execute);
+                    self.adapter.architecture_mut().forward_pipeline_text(
+                        global_layer,
+                        block,
+                        hidden,
+                        &mut layer_state,
+                        &prepared,
+                        tensor_group,
+                        &mut provider,
+                        stream,
+                    )
+                } else {
+                    self.adapter.architecture_mut().forward_pipeline_text(
+                        global_layer,
+                        block,
+                        hidden,
+                        &mut layer_state,
+                        &prepared,
+                        tensor_group,
+                        &mut eredu_runtime::ResidentExpertProvider,
+                        stream,
+                    )
+                }
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+                synchronize_outputs([&forwarded])?;
+                Ok(forwarded)
+            },
+        )?;
+        let completed_offset = pipeline_kv_offset(caches);
+        set_qwen_vl_pipeline_delta(caches, prepared.position_delta.clone(), completed_offset)?;
+        let auxiliary = PipelineAuxiliaryState::new(
+            std::iter::once(prepared.cosine)
+                .chain(std::iter::once(prepared.sine))
+                .chain(std::iter::once(prepared.position_delta))
+                .chain(prepared.deepstack)
+                .collect(),
+        );
+        if self.range.end == self.args.text.num_hidden_layers as usize {
+            if let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) {
+                let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
+                    MlxBackend,
+                    MlxHybridState,
+                >>::static_modules_mut(self.adapter.architecture_mut());
+                hidden = NormalizationOperator::forward(&mut modules.text.norm, &hidden, stream)?;
+                let sharded = if let Some(head) = &mut self.parallel_lm_head {
+                    head.forward(&hidden, execution)?
+                } else {
+                    self.parallel_output_embedding
+                        .as_mut()
+                        .or(self.parallel_embedding.as_mut())
+                        .ok_or_else(|| {
+                            Error::Parallel("Qwen3-VL last TP stage has no output shard".into())
+                        })?
+                        .project_logits(&hidden, execution)?
+                };
+                Ok(PipelineStageOutput::Logits(sharded.all_gather(execution)?))
+            } else {
+                let logits = self
+                    .adapter
+                    .architecture_mut()
+                    .finish_pipeline_logits(&hidden, stream)
+                    .map_err(|error| Error::Parallel(error.to_string()))?;
+                Ok(PipelineStageOutput::Logits(logits))
+            }
+        } else {
+            Ok(PipelineStageOutput::Hidden(PipelinePayload {
+                hidden,
+                auxiliary,
+            }))
+        }
+    }
+}
+
+impl PipelineStageSemantics for NeutralQwenVlStage {
+    fn model_kind(&self) -> ModelKind {
+        if self.args.text.is_moe() {
+            ModelKind::Qwen3VlMoe
+        } else {
+            ModelKind::Qwen3Vl
+        }
+    }
+
+    fn begin_placed_ingress(
+        &mut self,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<PipelineIngressState>, Error> {
+        self.begin_ingress(input, 0, None, execution, stream)
+            .map(|state| Some(PipelineIngressState::QwenVl(state)))
+    }
+
+    fn begin_placed_ingress_continuation(
+        &mut self,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<PipelineIngressState>, Error> {
+        self.begin_ingress(input, 0, None, execution, stream)
+            .map(|state| Some(PipelineIngressState::QwenVl(state)))
+    }
+
+    fn placed_ingress_active(
+        &self,
+        _group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<bool, Error> {
+        let PipelineIngressState::QwenVl(state) = state else {
+            return Err(Error::Parallel(
+                "Qwen3-VL neutral ingress state mismatch".into(),
+            ));
+        };
+        Ok(self.adapter.pipeline_ingress_active(state))
+    }
+
+    fn placed_ingress_arrays(
+        &self,
+        _group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<Vec<Array>, Error> {
+        let PipelineIngressState::QwenVl(state) = state else {
+            return Err(Error::Parallel(
+                "Qwen3-VL neutral ingress state mismatch".into(),
+            ));
+        };
+        Ok(self.adapter.pipeline_ingress_arrays(state))
+    }
+
+    fn replace_placed_ingress_arrays(
+        &self,
+        _group: &str,
+        state: &mut PipelineIngressState,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let PipelineIngressState::QwenVl(state) = state else {
+            return Err(Error::Parallel(
+                "Qwen3-VL neutral ingress state mismatch".into(),
+            ));
+        };
+        self.adapter.replace_pipeline_ingress_arrays(state, arrays)
+    }
+
+    fn merge_placed_ingress_arrays(
+        &self,
+        state: &mut PipelineIngressState,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        self.replace_placed_ingress_arrays("vision_encoder", state, arrays)
+    }
+
+    fn execute_placed_ingress(
+        &mut self,
+        _group: &str,
+        state: &mut PipelineIngressState,
+        _step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let PipelineIngressState::QwenVl(state) = state else {
+            return Err(Error::Parallel(
+                "Qwen3-VL neutral ingress state mismatch".into(),
+            ));
+        };
+        let tensor_group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .and_then(ParallelExecutionContext::group);
+        self.execute_vision_state(state, tensor_group, stream)
+    }
+
+    fn finish_placed_ingress(
+        &mut self,
+        state: PipelineIngressState,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<PipelinePayload, Error> {
+        let PipelineIngressState::QwenVl(state) = state else {
+            return Err(Error::Parallel(
+                "Qwen3-VL neutral ingress state mismatch".into(),
+            ));
+        };
+        let prepared = self.adapter.finish_pipeline_ingress(
+            state,
+            execution
+                .filter(|execution| execution.is_tensor_parallel())
+                .and_then(ParallelExecutionContext::group),
+            stream,
+        )?;
+        Ok(PipelinePayload {
+            hidden: prepared.hidden,
+            auxiliary: PipelineAuxiliaryState::new(
+                std::iter::once(prepared.cosine)
+                    .chain(std::iter::once(prepared.sine))
+                    .chain(std::iter::once(prepared.position_delta))
+                    .chain(prepared.deepstack)
+                    .collect(),
+            ),
+        })
+    }
+
+    fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>> {
+        let mut shapes = vec![
+            vec![1, step.sequence_length, self.args.text.head_dim],
+            vec![1, step.sequence_length, self.args.text.head_dim],
+            vec![1],
+        ];
+        shapes.extend(
+            (0..self.args.vision.deepstack_layer_count())
+                .map(|_| step.activation_shape(self.args.text.hidden_size).to_vec()),
+        );
+        shapes
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
+        self.dense_layers.as_ref()
+    }
+
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_storage.cache()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: MlxParallelContext,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let layout = match &self.parallel_kv_heads {
+            Some(heads) => {
+                eredu_architectures::qwen::vl::state_layout_with_key_value_heads(&self.args, heads)
+            }
+            None => eredu_architectures::qwen::vl::state_layout(&self.args),
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let policies = layout
+            .layers()
+            .iter()
+            .skip(self.range.start)
+            .take(self.range.len())
+            .cloned()
+            .collect::<Vec<_>>();
+        let local = crate::LayerSchedule::new(policies.len(), policies)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "qwen3_vl",
+            &self.args.model_type,
+            eredu_architectures::qwen::vl::prompt_cache_architecture_fingerprint(&self.args),
+            self.args.text.num_hidden_layers as usize,
+            self.range.clone(),
+            local,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.forward_decoder(input, step, mask, cache, None, None, stream)
+    }
+
+    fn prefill(
+        &mut self,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        let mut state = self.begin_ingress(input, 0, None, execution, stream)?;
+        let group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .and_then(ParallelExecutionContext::group);
+        if self.adapter.pipeline_ingress_active(&state) {
+            self.execute_vision_state(&mut state, group, stream)?;
+        }
+        let prepared = self.adapter.finish_pipeline_ingress(state, group, stream)?;
+        let payload = PipelinePayload {
+            hidden: prepared.hidden,
+            auxiliary: PipelineAuxiliaryState::new(
+                std::iter::once(prepared.cosine)
+                    .chain(std::iter::once(prepared.sine))
+                    .chain(std::iter::once(prepared.position_delta))
+                    .chain(prepared.deepstack)
+                    .collect(),
+            ),
+        };
+        self.forward_decoder(
+            PipelineStageInput::Hidden(&payload),
+            step,
+            mask,
+            cache,
+            execution,
+            expert_group,
+            stream,
+        )
+    }
+
+    fn forward_with_execution(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.forward_decoder(input, step, mask, cache, execution, expert_group, stream)
+    }
+}
+
+impl NeutralQwenConditionalStage {
+    fn new(
+        parsed: eredu_architectures::qwen::hybrid::ParsedHybridConfig,
+        range: Range<usize>,
+        info: &PipelineStageInfo,
+        external_experts: bool,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let adapter = if external_experts {
+            QwenConditionalPipelineAdapter::new_external_experts(parsed.clone(), stream)?
+        } else {
+            QwenConditionalPipelineAdapter::new(parsed.clone(), stream)?
+        };
+        Ok(Self {
+            parsed,
+            adapter,
+            range,
+            vision_range: info
+                .placement
+                .group("vision_encoder")
+                .and_then(|group| group.local_units(info.pipeline_stage))
+                .unwrap_or(0..0),
+            vision_layers: Vec::new(),
+            layers: Vec::new(),
+            prediction_layers: Vec::new(),
+            dense_layers: None,
+            parallel_embedding: None,
+            parallel_output_embedding: None,
+            parallel_lm_head: None,
+            parallel_layout: None,
+            parallel_geometry: None,
+            expert_assignment: None,
+            expert_storage: if external_experts {
+                PipelineExpertStorage::ExternalEmpty
+            } else {
+                PipelineExpertStorage::LayerLocal
+            },
+            routing_statistics: RoutingStatistics::default(),
+        })
+    }
+
+    fn begin_ingress(
+        &mut self,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        offset: i32,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<eredu_architectures::qwen::hybrid::ConditionalPipelineVisionState<Array>, Error>
+    {
+        let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) else {
+            return self.adapter.begin_pipeline_ingress(input, offset, stream);
+        };
+        let embedding = self
+            .parallel_embedding
+            .as_mut()
+            .or(self.parallel_output_embedding.as_mut())
+            .ok_or_else(|| {
+                Error::Parallel("conditional Qwen3.5 TP ingress has no embedding shard".into())
+            })?;
+        let mut projected = Vec::new();
+        let mut projection_index = Vec::with_capacity(input.parts.len());
+        for part in input.parts {
+            match (part.modality, part.payload) {
+                (
+                    crate::backend::mlx::runtime::media::input::Modality::Text,
+                    crate::backend::mlx::runtime::media::input::InputPayload::TokenIds(tokens),
+                ) => {
+                    projected.push(embedding.forward(tokens, execution)?);
+                    projection_index.push(Some(projected.len() - 1));
+                }
+                _ => projection_index.push(None),
+            }
+        }
+        let parts = input
+            .parts
+            .iter()
+            .zip(projection_index)
+            .map(|(part, projected_index)| match projected_index {
+                Some(index) => crate::backend::mlx::runtime::media::input::InputPart {
+                    modality: part.modality,
+                    payload: crate::backend::mlx::runtime::media::input::InputPayload::Embeddings(
+                        &projected[index],
+                    ),
+                    metadata: part.metadata,
+                },
+                None => *part,
+            })
+            .collect::<Vec<_>>();
+        self.adapter.begin_pipeline_ingress(
+            crate::backend::mlx::runtime::media::input::ModelInput::new(&parts),
+            offset,
+            stream,
+        )
+    }
+
+    fn execute_vision_state(
+        &mut self,
+        state: &mut eredu_architectures::qwen::hybrid::ConditionalPipelineVisionState<Array>,
+        tensor_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        if let Some(storage) = self.dense_layers.as_ref() {
+            let forward_guard = match &storage.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.forward_guard(true, &storage.residency)?)
+                }
+            };
+            let group_guard = match &storage.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.group_guard(&storage.residency, "pipeline_stage"))
+                }
+            };
+            let mut window = storage.transfer_window(0..self.vision_range.len(), true)?;
+            for (ordinal, index) in self.vision_range.clone().enumerate() {
+                let transfer = window
+                    .as_mut()
+                    .map(|window| window.next(stream))
+                    .transpose()?;
+                let lease = transfer
+                    .is_none()
+                    .then(|| storage.prepare_layerwise_absolute(ordinal))
+                    .transpose()?;
+                let mut layer = self.adapter.new_cartesian_layer(
+                    0,
+                    index,
+                    self.parallel_layout.as_ref(),
+                    stream,
+                )?;
+                populate_module_from_lease(
+                    &mut layer,
+                    transfer
+                        .as_ref()
+                        .map(|transfer| transfer.lease())
+                        .or(lease.as_ref())
+                        .expect("conditional Qwen3.5 vision residency lease"),
+                )?;
+                self.adapter.forward_pipeline_vision_layer(
+                    index,
+                    &mut layer,
+                    state,
+                    tensor_group,
+                    stream,
+                )?;
+                synchronize_outputs(self.adapter.pipeline_ingress_arrays(state).iter())?;
+                drop(transfer);
+                drop(lease);
+                if let Some(window) = &mut window {
+                    window.refill()?;
+                } else {
+                    storage.trim_after_absolute(ordinal)?;
+                }
+            }
+            storage.complete_forward()?;
+            if let Some(guard) = group_guard {
+                guard.complete()?;
+            }
+            if let Some(guard) = forward_guard {
+                guard.complete()?;
+            }
+        } else {
+            for (index, layer) in self.vision_range.clone().zip(&mut self.vision_layers) {
+                self.adapter.forward_pipeline_vision_layer(
+                    index,
+                    layer,
+                    state,
+                    tensor_group,
+                    stream,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_decoder(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        explicit_mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if caches.len() != self.range.len() {
+            return Err(Error::Parallel(format!(
+                "conditional Qwen3.5 stage cache has {} entries, expected {}",
+                caches.len(),
+                self.range.len()
+            )));
+        }
+        let offset = pipeline_kv_offset(caches);
+        let tensor_group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .and_then(ParallelExecutionContext::group);
+        let mut prepared = match input {
+            PipelineStageInput::Tokens(tokens) => {
+                let parts = [
+                    crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(tokens),
+                ];
+                let typed = crate::backend::mlx::runtime::media::input::ModelInput::new(&parts);
+                let state = self.begin_ingress(typed, offset, execution, stream)?;
+                self.adapter
+                    .finish_pipeline_ingress(state, tensor_group, stream)?
+            }
+            PipelineStageInput::Hidden(payload) => {
+                let expected = self
+                    .parsed
+                    .vision
+                    .as_ref()
+                    .expect("validated vision")
+                    .deepstack_layer_count();
+                if payload.auxiliary.tensors().len() != expected {
+                    return Err(Error::Parallel(format!(
+                        "conditional Qwen3.5 pipeline payload has {} DeepStack tensors, expected {expected}",
+                        payload.auxiliary.tensors().len()
+                    )));
+                }
+                eredu_architectures::qwen::hybrid::ConditionalPipelinePrepared {
+                    hidden: payload.hidden.clone(),
+                    mask: None,
+                    deepstack: payload.auxiliary.tensors().to_vec(),
+                }
+            }
+        };
+        if prepared.hidden.shape() != step.activation_shape(self.parsed.text.hidden_size) {
+            return Err(Error::Parallel(format!(
+                "conditional Qwen3.5 decoder input is shaped {:?}, expected {:?}",
+                prepared.hidden.shape(),
+                step.activation_shape(self.parsed.text.hidden_size)
+            )));
+        }
+        prepared.mask = match explicit_mask {
+            Some(mask) => Some(mask.clone()),
+            None if step.sequence_length > 1 => Some(create_causal_mask(
+                step.sequence_length,
+                Some(offset),
+                None,
+                None,
+                stream,
+            )?),
+            None => None,
+        };
+        let assignment = self.expert_assignment.clone();
+        if let Some(assignment) = assignment.as_ref() {
+            validate_pipeline_expert_dispatch(
+                assignment,
+                expert_group,
+                self.expert_storage.is_external(),
+            )?;
+        }
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        self.routing_statistics = RoutingStatistics::default();
+        let expert_cache = self.expert_storage.cache();
+        let args = self.parsed.text.clone();
+        let factory = self.parsed.clone();
+        let layout = self.parallel_layout.clone();
+        let external = self.expert_storage.is_external();
+        let mut hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden: prepared.hidden.clone(),
+                stream,
+            },
+            |global_layer, stream| {
+                let adapter = if external {
+                    QwenConditionalPipelineAdapter::new_external_experts(factory.clone(), stream)?
+                } else {
+                    QwenConditionalPipelineAdapter::new(factory.clone(), stream)?
+                };
+                adapter.new_cartesian_layer(1, global_layer, layout.as_ref(), stream)
+            },
+            |global_layer, layer, hidden, cache_state, stream| {
+                let eredu_architectures::qwen::hybrid::ConditionalUnit::Target(block) =
+                    &mut layer.inner
+                else {
+                    return Err(Error::Parallel(format!(
+                        "conditional Qwen3.5 text range contains a vision unit at {global_layer}"
+                    )));
+                };
+                validate_pipeline_hybrid_cache_layer(cache_state, global_layer)?;
+                let mut state = PipelineHybridLayerState(cache_state);
+                let forwarded = if let Some(expert_cache) = expert_cache {
+                    let expert_args = match layout.as_ref() {
+                        Some(layout) => eredu_architectures::qwen::hybrid::local_block_config(
+                            &args,
+                            global_layer,
+                            layout,
+                        )
+                        .map_err(|error| Error::Parallel(error.to_string()))?,
+                        None => args.clone(),
+                    };
+                    let assignment = assignment.as_ref().ok_or_else(|| {
+                        Error::Parallel(
+                            "conditional Qwen3.5 external experts have no assignment".into(),
+                        )
+                    })?;
+                    let mut execute = |layer: usize,
+                                       routed: &Array,
+                                       ids: &Array,
+                                       weights: &Array,
+                                       stream: &Stream| {
+                        execute_pipeline_cached_neutral_qwen_hybrid(
+                            &expert_args,
+                            layer,
+                            routed,
+                            ids,
+                            weights,
+                            pass,
+                            expert_cache,
+                            assignment,
+                            expert_group,
+                            &mut self.routing_statistics,
+                            stream,
+                        )
+                        .map_err(|error| Exception::custom(error.to_string()))
+                    };
+                    let mut provider = ExpertExecutorProvider::new(&mut execute);
+                    self.adapter.architecture_mut().forward_pipeline_target(
+                        global_layer,
+                        block,
+                        hidden,
+                        &mut state,
+                        &prepared,
+                        tensor_group,
+                        &mut provider,
+                        stream,
+                    )
+                } else {
+                    self.adapter.architecture_mut().forward_pipeline_target(
+                        global_layer,
+                        block,
+                        hidden,
+                        &mut state,
+                        &prepared,
+                        tensor_group,
+                        &mut eredu_runtime::ResidentExpertProvider,
+                        stream,
+                    )
+                }
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+                synchronize_outputs([&forwarded])?;
+                Ok(forwarded)
+            },
+        )?;
+        if self.range.end == self.parsed.text.num_hidden_layers as usize {
+            let mtp_hidden = hidden.clone();
+            let logits = if let Some(execution) =
+                execution.filter(|execution| execution.is_tensor_parallel())
+            {
+                let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
+                    MlxBackend,
+                    MlxHybridState,
+                >>::static_modules_mut(self.adapter.architecture_mut());
+                hidden = NormalizationOperator::forward(&mut modules.text.norm, &hidden, stream)?;
+                let shard = if let Some(head) = &mut self.parallel_lm_head {
+                    head.forward(&hidden, execution)?
+                } else {
+                    self.parallel_output_embedding
+                        .as_mut()
+                        .or(self.parallel_embedding.as_mut())
+                        .ok_or_else(|| {
+                            Error::Parallel(
+                                "conditional Qwen3.5 last TP stage has no output shard".into(),
+                            )
+                        })?
+                        .project_logits(&hidden, execution)?
+                };
+                shard.all_gather(execution)?
+            } else {
+                self.adapter
+                    .architecture_mut()
+                    .finish_pipeline_logits(&hidden, stream)
+                    .map_err(|error| Error::Parallel(error.to_string()))?
+            };
+            Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                logits,
+                hidden: mtp_hidden,
+            })
+        } else {
+            Ok(PipelineStageOutput::Hidden(PipelinePayload {
+                hidden,
+                auxiliary: PipelineAuxiliaryState::new(prepared.deepstack),
+            }))
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn forward_mtp_draft_neutral(
+        &mut self,
+        prior: &Array,
+        tokens: &Array,
+        depth: usize,
+        state: &mut MlxHybridState,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Error> {
+        let layer = self
+            .prediction_layers
+            .get_mut(depth)
+            .and_then(|layers| layers.first_mut())
+            .ok_or_else(|| {
+                Error::Parallel(format!("conditional Qwen3.5 has no MTP depth {depth}"))
+            })?;
+        let tensor = execution.filter(|execution| execution.is_tensor_parallel());
+        let embedded = match tensor {
+            Some(execution) => self
+                .parallel_output_embedding
+                .as_mut()
+                .or(self.parallel_embedding.as_mut())
+                .ok_or_else(|| {
+                    Error::Parallel("conditional Qwen3.5 MTP has no embedding shard".into())
+                })?
+                .forward(tokens, execution)?,
+            None => {
+                let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<
+                    MlxBackend,
+                > as eredu_runtime::LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules_mut(
+                    self.adapter.architecture_mut(),
+                );
+                EmbeddingOperator::forward(&mut modules.text.embeddings, tokens, stream)?
+            }
+        };
+        let state_index = self.parsed.text.num_hidden_layers as usize + depth;
+        let layer_state = state
+            .layer(state_index)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let offset = RuntimeStateComponents::<MlxBackend>::position(layer_state);
+        let mask = (tokens.dim(1) > 1)
+            .then(|| create_causal_mask(tokens.dim(1), Some(offset), None, None, stream))
+            .transpose()?;
+        let expert_args = match self.parallel_layout.as_ref() {
+            Some(layout) => eredu_architectures::qwen::hybrid::local_unit_config(
+                &self.parsed.text,
+                depth + 1,
+                0,
+                layout,
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))?,
+            None => self.parsed.text.clone(),
+        };
+        let eredu_architectures::qwen::hybrid::ConditionalUnit::Prediction(unit) = &mut layer.inner
+        else {
+            return Err(Error::Parallel(format!(
+                "conditional Qwen3.5 MTP depth {depth} contains a non-prediction unit"
+            )));
+        };
+        let mut execute =
+            |layer: usize, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                let cache = self.expert_storage.cache().ok_or_else(|| {
+                    Exception::custom(
+                        "conditional Qwen3.5 MTP external expert cache is unavailable",
+                    )
+                })?;
+                let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+                    Exception::custom("conditional Qwen3.5 MTP external experts have no assignment")
+                })?;
+                execute_pipeline_cached_neutral_qwen_hybrid(
+                    &expert_args,
+                    layer,
+                    hidden,
+                    ids,
+                    weights,
+                    ExpertPass::Decode,
+                    cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+        let hidden = if self.expert_storage.cache().is_some() {
+            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            match tensor.and_then(ParallelExecutionContext::group) {
+                Some(group) => unit.forward_parallel(
+                    prior,
+                    &embedded,
+                    mask.as_ref(),
+                    layer_state,
+                    group,
+                    stream,
+                    &mut provider,
+                ),
+                None => unit.forward_with_provider(
+                    prior,
+                    &embedded,
+                    mask.as_ref(),
+                    layer_state,
+                    stream,
+                    &mut provider,
+                ),
+            }
+        } else {
+            match tensor.and_then(ParallelExecutionContext::group) {
+                Some(group) => unit.forward_parallel(
+                    prior,
+                    &embedded,
+                    mask.as_ref(),
+                    layer_state,
+                    group,
+                    stream,
+                    &mut eredu_runtime::ResidentExpertProvider,
+                ),
+                None => unit.forward(prior, &embedded, mask.as_ref(), layer_state, stream),
+            }
+        }
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let logits = match tensor {
+            Some(execution) => {
+                let sharded = if let Some(head) = &mut self.parallel_lm_head {
+                    head.forward(&hidden, execution)?
+                } else {
+                    self.parallel_output_embedding
+                        .as_mut()
+                        .or(self.parallel_embedding.as_mut())
+                        .ok_or_else(|| {
+                            Error::Parallel("conditional Qwen3.5 MTP has no output shard".into())
+                        })?
+                        .project_logits(&hidden, execution)?
+                };
+                sharded.all_gather(execution)?
+            }
+            None => {
+                let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<
+                    MlxBackend,
+                > as eredu_runtime::LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules_mut(
+                    self.adapter.architecture_mut(),
+                );
+                match &mut modules.text.lm_head {
+                    Some(head) => LinearOperator::forward(head, &hidden, stream)?,
+                    None => {
+                        EmbeddingOperator::as_linear(&mut modules.text.embeddings, &hidden, stream)?
+                    }
+                }
+            }
+        };
+        Ok(EmbeddedMtpOutput {
+            logits,
+            hidden,
+            tokens: tokens.clone(),
+        })
+    }
+}
+
+impl PipelineStageSemantics for NeutralQwenConditionalStage {
+    fn model_kind(&self) -> ModelKind {
+        ModelKind::Qwen35
+    }
+
+    fn begin_placed_ingress(
+        &mut self,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<PipelineIngressState>, Error> {
+        self.begin_ingress(input, 0, execution, stream)
+            .map(|state| Some(PipelineIngressState::QwenConditional(state)))
+    }
+
+    fn begin_placed_ingress_continuation(
+        &mut self,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Option<PipelineIngressState>, Error> {
+        self.begin_placed_ingress(input, execution, stream)
+    }
+
+    fn placed_ingress_active(
+        &self,
+        _group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<bool, Error> {
+        let PipelineIngressState::QwenConditional(state) = state else {
+            return Err(Error::Parallel(
+                "conditional Qwen3.5 ingress state mismatch".into(),
+            ));
+        };
+        Ok(self.adapter.pipeline_ingress_active(state))
+    }
+
+    fn placed_ingress_arrays(
+        &self,
+        _group: &str,
+        state: &PipelineIngressState,
+    ) -> Result<Vec<Array>, Error> {
+        let PipelineIngressState::QwenConditional(state) = state else {
+            return Err(Error::Parallel(
+                "conditional Qwen3.5 ingress state mismatch".into(),
+            ));
+        };
+        Ok(self.adapter.pipeline_ingress_arrays(state))
+    }
+
+    fn replace_placed_ingress_arrays(
+        &self,
+        _group: &str,
+        state: &mut PipelineIngressState,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let PipelineIngressState::QwenConditional(state) = state else {
+            return Err(Error::Parallel(
+                "conditional Qwen3.5 ingress state mismatch".into(),
+            ));
+        };
+        self.adapter.replace_pipeline_ingress_arrays(state, arrays)
+    }
+
+    fn merge_placed_ingress_arrays(
+        &self,
+        state: &mut PipelineIngressState,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        self.replace_placed_ingress_arrays("vision_encoder", state, arrays)
+    }
+
+    fn execute_placed_ingress(
+        &mut self,
+        _group: &str,
+        state: &mut PipelineIngressState,
+        _step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let PipelineIngressState::QwenConditional(state) = state else {
+            return Err(Error::Parallel(
+                "conditional Qwen3.5 ingress state mismatch".into(),
+            ));
+        };
+        let group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .and_then(ParallelExecutionContext::group);
+        self.execute_vision_state(state, group, stream)
+    }
+
+    fn finish_placed_ingress(
+        &mut self,
+        state: PipelineIngressState,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<PipelinePayload, Error> {
+        let PipelineIngressState::QwenConditional(state) = state else {
+            return Err(Error::Parallel(
+                "conditional Qwen3.5 ingress state mismatch".into(),
+            ));
+        };
+        let group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .and_then(ParallelExecutionContext::group);
+        let prepared = self.adapter.finish_pipeline_ingress(state, group, stream)?;
+        Ok(PipelinePayload {
+            hidden: prepared.hidden,
+            auxiliary: PipelineAuxiliaryState::new(prepared.deepstack),
+        })
+    }
+
+    fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>> {
+        (0..self
+            .parsed
+            .vision
+            .as_ref()
+            .expect("validated vision")
+            .deepstack_layer_count())
+            .map(|_| step.activation_shape(self.parsed.text.hidden_size).to_vec())
+            .collect()
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
+        self.dense_layers.as_ref()
+    }
+
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_storage.cache()
+    }
+
+    fn embedded_mtp_len(&self) -> usize {
+        self.parsed.text.mtp_num_hidden_layers.max(0) as usize
+    }
+
+    fn embedded_mtp_state_start(&self) -> Option<usize> {
+        Some(self.parsed.text.num_hidden_layers as usize)
+    }
+
+    fn new_embedded_mtp_cache(
+        &self,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<PipelineMtpCache, Error> {
+        let layout = match &self.parallel_geometry {
+            Some(geometry) => eredu_architectures::qwen::hybrid::state_layout_with_geometry(
+                &self.parsed.text,
+                geometry,
+            ),
+            None => eredu_architectures::qwen::hybrid::state_layout(&self.parsed.text),
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let state = match paged {
+            Some((manager, rank)) => MlxHybridState::paged(layout, manager, rank)?,
+            None => MlxHybridState::device(layout)?,
+        };
+        Ok(PipelineMtpCache::Hybrid(state))
+    }
+
+    fn new_cache_layers(
+        &self,
+        identity: &PromptCacheModelIdentity,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<Vec<PipelineLayerCache>, Error> {
+        let target_owned = self.range.len();
+        let mut target_identity = identity.clone();
+        target_identity.global_layer_end = target_identity.global_layer_start + target_owned;
+        target_identity.layer_layout = crate::LayerSchedule::new(
+            target_owned,
+            identity
+                .layer_layout
+                .iter()
+                .take(target_owned)
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        target_identity.layer_prefix_offsets = identity
+            .layer_prefix_offsets
+            .iter()
+            .take(target_owned)
+            .copied()
+            .collect();
+        materialize_pipeline_cache_layers(&target_identity, paged)
+    }
+
+    fn forward_embedded_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut PipelineMtpCache,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Error> {
+        let PipelineMtpCache::Hybrid(cache) = cache else {
+            return Err(Error::Parallel(
+                "conditional Qwen3.5 pipeline MTP cache mismatch".into(),
+            ));
+        };
+        self.forward_mtp_draft_neutral(
+            hidden,
+            tokens,
+            depth,
+            cache,
+            execution,
+            expert_group,
+            stream,
+        )
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: MlxParallelContext,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let layout = match &self.parallel_geometry {
+            Some(geometry) => eredu_architectures::qwen::hybrid::state_layout_with_geometry(
+                &self.parsed.text,
+                geometry,
+            ),
+            None => eredu_architectures::qwen::hybrid::state_layout(&self.parsed.text),
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let policies = layout
+            .layers()
+            .iter()
+            .skip(self.range.start)
+            .take(self.range.len())
+            .cloned()
+            .collect::<Vec<_>>();
+        let local = crate::LayerSchedule::new(policies.len(), policies)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "qwen_hybrid",
+            &self.parsed.text.model_type,
+            eredu_architectures::qwen::hybrid::prompt_cache_architecture_fingerprint(
+                &self.parsed.text,
+            ),
+            self.parsed.text.num_hidden_layers as usize,
+            self.range.clone(),
+            local,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.forward_decoder(input, step, mask, cache, None, None, stream)
+    }
+
+    fn prefill(
+        &mut self,
+        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        let mut state = self.begin_ingress(input, 0, execution, stream)?;
+        let group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .and_then(ParallelExecutionContext::group);
+        if self.adapter.pipeline_ingress_active(&state) {
+            self.execute_vision_state(&mut state, group, stream)?;
+        }
+        let prepared = self.adapter.finish_pipeline_ingress(state, group, stream)?;
+        let payload = PipelinePayload {
+            hidden: prepared.hidden,
+            auxiliary: PipelineAuxiliaryState::new(prepared.deepstack),
+        };
+        self.forward_decoder(
+            PipelineStageInput::Hidden(&payload),
+            step,
+            mask,
+            cache,
+            execution,
+            expert_group,
+            stream,
+        )
+    }
+
+    fn forward_with_execution(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.forward_decoder(input, step, mask, cache, execution, expert_group, stream)
+    }
 }
 
 impl PipelineStageSemantics for GptOssStage {
@@ -6226,318 +7170,6 @@ impl PipelineStageSemantics for NemotronHStage {
         } else {
             NemotronHStage::forward(self, input, step, mask, cache, stream)
         }
-    }
-
-    fn forward_with_execution(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut [PipelineLayerCache],
-        execution: Option<&ParallelExecutionContext<'_>>,
-        expert_group: Option<&Group>,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        if let Some(group) = expert_group {
-            if let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) {
-                return self.forward_tensor_parallel(
-                    input,
-                    step,
-                    mask,
-                    cache,
-                    execution,
-                    Some(group),
-                );
-            }
-            return self.forward_expert_parallel(input, step, mask, cache, Some(group), stream);
-        }
-        match execution {
-            Some(execution) if execution.is_tensor_parallel() => {
-                self.forward_tensor_parallel(input, step, mask, cache, execution, None)
-            }
-            _ if self.expert_storage.is_external() => {
-                self.forward_expert_parallel(input, step, mask, cache, None, stream)
-            }
-            _ => self.forward(input, step, mask, cache, stream),
-        }
-    }
-}
-
-impl PipelineStageSemantics for QwenHybridStage {
-    fn model_kind(&self) -> ModelKind {
-        if self.args.model_type == "qwen3_next" {
-            ModelKind::Qwen3Next
-        } else {
-            ModelKind::Qwen35
-        }
-    }
-
-    fn begin_placed_ingress(
-        &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
-        execution: Option<&ParallelExecutionContext<'_>>,
-        stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
-        self.has_multimodal_ingress
-            .then(|| {
-                self.layer_adapter
-                    .begin_pipeline_ingress(input, execution, stream)
-                    .map(|state| Box::new(state) as Box<dyn Any>)
-            })
-            .transpose()
-    }
-
-    fn begin_placed_ingress_continuation(
-        &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
-        _execution: Option<&ParallelExecutionContext<'_>>,
-        stream: &Stream,
-    ) -> Result<Option<Box<dyn Any>>, Error> {
-        self.has_multimodal_ingress
-            .then(|| {
-                self.layer_adapter
-                    .begin_pipeline_continuation(input, stream)
-                    .map(|state| Box::new(state) as Box<dyn Any>)
-            })
-            .transpose()
-    }
-
-    fn placed_ingress_active(&self, _group: &str, state: &dyn Any) -> Result<bool, Error> {
-        let state = state
-            .downcast_ref::<crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
-        Ok(self
-            .layer_adapter
-            .pipeline_media_groups()
-            .into_iter()
-            .any(|(group, _)| {
-                self.layer_adapter
-                    .should_execute_pipeline_group(group, state)
-            }))
-    }
-
-    fn placed_ingress_arrays(&self, _group: &str, state: &dyn Any) -> Result<Vec<Array>, Error> {
-        let state = state
-            .downcast_ref::<crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
-        Ok(self.layer_adapter.pipeline_ingress_arrays(state))
-    }
-
-    fn replace_placed_ingress_arrays(
-        &self,
-        _group: &str,
-        state: &mut dyn Any,
-        arrays: Vec<Array>,
-    ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
-        self.layer_adapter
-            .replace_pipeline_ingress_arrays(state, arrays)
-    }
-
-    fn merge_placed_ingress_arrays(
-        &self,
-        state: &mut dyn Any,
-        arrays: Vec<Array>,
-    ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
-        self.layer_adapter
-            .replace_pipeline_ingress_arrays(state, arrays)
-    }
-
-    fn execute_placed_ingress(
-        &mut self,
-        _group: &str,
-        state: &mut dyn Any,
-        step: PipelineStep,
-        execution: Option<&ParallelExecutionContext<'_>>,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let state = state
-            .downcast_mut::<crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
-            .ok_or_else(|| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
-        self.execute_multimodal_ingress_state(state, step, execution, stream)
-    }
-
-    fn finish_placed_ingress(
-        &mut self,
-        state: Box<dyn Any>,
-        execution: Option<&ParallelExecutionContext<'_>>,
-        stream: &Stream,
-    ) -> Result<PipelinePayload, Error> {
-        let state = state
-            .downcast::<crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
-            .map_err(|_| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
-        Ok(PipelinePayload {
-            hidden: self
-                .layer_adapter
-                .finish_pipeline_ingress(*state, execution, stream)?,
-            auxiliary: PipelineAuxiliaryState::default(),
-        })
-    }
-
-    fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
-        Vec::new()
-    }
-
-    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
-        self.dense_layers.as_ref()
-    }
-
-    fn expert_cache(&self) -> Option<&ExpertCache> {
-        self.expert_storage.cache()
-    }
-
-    fn embedded_mtp_len(&self) -> usize {
-        self.layer_adapter.embedded_mtp_len()
-    }
-
-    fn new_embedded_mtp_cache(
-        &self,
-        _paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
-    ) -> Result<PipelineMtpCache, Error> {
-        Ok(PipelineMtpCache::QwenHybrid(
-            self.layer_adapter.embedded_mtp_cache(),
-        ))
-    }
-
-    fn forward_embedded_mtp_draft(
-        &mut self,
-        hidden: &Array,
-        tokens: &Array,
-        _depth: usize,
-        cache: &mut PipelineMtpCache,
-        execution: Option<&ParallelExecutionContext<'_>>,
-        expert_group: Option<&Group>,
-        stream: &Stream,
-    ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
-        let PipelineMtpCache::QwenHybrid(cache) = cache else {
-            return Err(Error::Parallel("Qwen pipeline MTP cache mismatch".into()));
-        };
-        let output = if let Some(expert_cache) = self.expert_storage.cache() {
-            let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
-                Error::Parallel("Qwen pipeline MTP expert cache has no assignment".into())
-            })?;
-            let args = self.args.clone();
-            let mut execute =
-                |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                    execute_pipeline_cached_qwen_hybrid(
-                        &args,
-                        layer,
-                        hidden,
-                        ids,
-                        weights,
-                        ExpertPass::Decode,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        &mut self.routing_statistics,
-                        stream,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))
-                };
-            self.layer_adapter.forward_pipeline_mtp(
-                hidden,
-                tokens,
-                cache,
-                execution,
-                Some(&mut execute),
-                stream,
-            )
-        } else {
-            self.layer_adapter.forward_pipeline_mtp::<
-                fn(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
-            >(hidden, tokens, cache, execution, None, stream)
-        }
-        .map_err(Error::from)?;
-        Ok(
-            crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
-                logits: output.logits,
-                hidden: output.hidden,
-                tokens: tokens.clone(),
-            },
-        )
-    }
-
-    fn prompt_cache_model_identity(
-        &self,
-        topology: MlxParallelContext,
-    ) -> Result<PromptCacheModelIdentity, Error> {
-        let complete = if topology.tensor_parallel_size > 1 {
-            let geometry = self.parallel_geometry.as_deref().ok_or_else(|| {
-                Error::Parallel(
-                    "Qwen hybrid TP+PP cache identity requested before local geometry was configured"
-                        .into(),
-                )
-            })?;
-            qwen_hybrid::prompt_cache_layer_layout_with_geometry(&self.args, geometry)?
-        } else {
-            qwen_hybrid::prompt_cache_layer_layout(&self.args)?
-        };
-        let layout = crate::LayerSchedule::new(
-            self.range.len(),
-            complete
-                .iter()
-                .skip(self.range.start)
-                .take(self.range.len())
-                .cloned()
-                .collect(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "qwen_hybrid",
-            &self.args.model_type,
-            qwen_hybrid::prompt_cache_architecture_fingerprint(&self.args),
-            self.args.num_hidden_layers as usize,
-            self.range.clone(),
-            layout,
-        ))
-    }
-
-    fn forward(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut [PipelineLayerCache],
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        QwenHybridStage::forward(self, input, step, mask, cache, stream)
-    }
-
-    fn prefill(
-        &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
-        step: PipelineStep,
-        mask: Option<&Array>,
-        cache: &mut [PipelineLayerCache],
-        execution: Option<&ParallelExecutionContext<'_>>,
-        expert_group: Option<&Group>,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        if pipeline_state_offset("Qwen3.5 multimodal", cache)? != 0 {
-            return Err(Error::Parallel(
-                "Qwen3.5 multimodal pipeline prefill requires an empty stage cache".into(),
-            ));
-        }
-        let hidden = self.prepare_multimodal_ingress(input, step, execution, stream)?;
-        let payload = PipelinePayload {
-            hidden,
-            auxiliary: PipelineAuxiliaryState::default(),
-        };
-        self.forward_with_execution(
-            PipelineStageInput::Hidden(&payload),
-            step,
-            mask,
-            cache,
-            execution,
-            expert_group,
-            stream,
-        )
     }
 
     fn forward_with_execution(
@@ -7473,7 +8105,7 @@ impl PipelineModel {
                 ExecutionGroupKind::VisionEncoder | ExecutionGroupKind::AudioEncoder => {
                     self.stage.placed_ingress_active(
                         &placed.id,
-                        state.as_deref().expect("placed ingress state"),
+                        state.as_ref().expect("placed ingress state"),
                     )?
                 }
                 ExecutionGroupKind::Projector | ExecutionGroupKind::Merger => placement
@@ -7593,14 +8225,14 @@ impl PipelineModel {
                             if active[index] {
                                 self.stage.execute_placed_ingress(
                                     &placed.id,
-                                    state.as_deref_mut().expect("placed ingress state"),
+                                    state.as_mut().expect("placed ingress state"),
                                     step,
                                     tensor,
                                     execution_stream,
                                 )?;
                                 self.stage.placed_ingress_arrays(
                                     &placed.id,
-                                    state.as_deref().expect("placed ingress state"),
+                                    state.as_ref().expect("placed ingress state"),
                                 )?
                             } else {
                                 Vec::new()
@@ -7609,7 +8241,7 @@ impl PipelineModel {
                         ExecutionGroupKind::ModalityFinalization => {
                             let arrays = working.remove(&index).unwrap_or_default();
                             self.stage.merge_placed_ingress_arrays(
-                                state.as_deref_mut().expect("placed ingress state"),
+                                state.as_mut().expect("placed ingress state"),
                                 arrays,
                             )?;
                             self.stage
@@ -7688,7 +8320,7 @@ impl PipelineModel {
                         }
                         self.stage.replace_placed_ingress_arrays(
                             &placed.id,
-                            state.as_deref_mut().expect("placed ingress state"),
+                            state.as_mut().expect("placed ingress state"),
                             arrays.clone(),
                         )?;
                         working.insert(index, arrays);
@@ -9426,6 +10058,22 @@ fn checkpoint_backing_shards<'a>(
     Ok(shards.into_iter().collect())
 }
 
+fn checkpoint_layer_backing_shards(
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    layer_prefix: &str,
+    range: Range<usize>,
+) -> Result<Vec<PathBuf>, Error> {
+    let keys = store.source_keys();
+    checkpoint_backing_shards(
+        store,
+        keys.iter().map(String::as_str).filter(|key| {
+            range
+                .clone()
+                .any(|layer| key.starts_with(&format!("{layer_prefix}{layer}.")))
+        }),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_pipeline_layer_storage<L, F, B>(
     store: SharedCheckpointSource,
@@ -9928,26 +10576,14 @@ pub(crate) fn load_pipeline_model_with_options(
                 )
             }
             crate::core::GgufArchitecture::Qwen3Vl | crate::core::GgufArchitecture::Qwen3VlMoe => {
-                let vision_path = qwen3_vl::find_qwen3_vl_mmproj(model_dir)?;
-                let vision_checkpoint = GgufCheckpoint::open(vision_path)?;
-                let vision_metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
-                    &vision_checkpoint,
-                );
-                let prepared = qwen3_vl::prepare_qwen3_vl_gguf_checkpoint(
+                let (args, store) = crate::composition::qwen::vl::prepare_gguf_pipeline(
+                    model_dir,
                     &checkpoint,
                     &metadata,
-                    &vision_checkpoint,
-                    &vision_metadata,
+                    max_mapped_shards,
                 )?;
-                let store =
-                    crate::composition::mlx_architectures::qwen::vl::layerwise::qwen3_vl_gguf_store(
-                        &checkpoint,
-                        &vision_checkpoint,
-                        &prepared.args,
-                        max_mapped_shards,
-                    )?;
-                load_qwen3_vl_pipeline(
-                    prepared.args,
+                load_neutral_qwen_vl_pipeline(
+                    args,
                     store,
                     topology,
                     options.quantization,
@@ -10032,47 +10668,35 @@ pub(crate) fn load_pipeline_model_with_options(
             crate::core::GgufArchitecture::Qwen35
             | crate::core::GgufArchitecture::Qwen35Moe
             | crate::core::GgufArchitecture::Qwen3Next => {
-                let mmproj = if architecture == crate::core::GgufArchitecture::Qwen3Next {
-                    None
-                } else {
-                    qwen_hybrid::open_sibling_mmproj(model_dir)?
-                };
-                let prepared = qwen_hybrid::prepare_qwen35_gguf_checkpoint(
+                let (parsed, store) = crate::composition::qwen::hybrid::prepare_gguf_pipeline(
+                    model_dir,
                     &checkpoint,
                     &metadata,
-                    mmproj.as_ref(),
-                    weights_stream,
-                )?;
-                let variant = match architecture {
-                    crate::core::GgufArchitecture::Qwen3Next => {
-                        crate::composition::mlx_architectures::qwen::hybrid::checkpoint::GgufVariant::Qwen3Next
-                    }
-                    crate::core::GgufArchitecture::Qwen35Moe => {
-                        crate::composition::mlx_architectures::qwen::hybrid::checkpoint::GgufVariant::Qwen35Moe
-                    }
-                    _ => crate::composition::mlx_architectures::qwen::hybrid::checkpoint::GgufVariant::Qwen35,
-                };
-                let store = crate::composition::mlx_architectures::qwen::hybrid::layerwise::qwen_hybrid_gguf_store(
-                    &checkpoint,
-                    mmproj.as_ref(),
-                    &prepared.args,
-                    variant,
-                    prepared.modalities.vision_config.as_ref(),
                     max_mapped_shards,
                 )?;
-                load_qwen_hybrid_pipeline(
-                    prepared.args,
-                    prepared.modalities.image_token_id,
-                    prepared.modalities.video_token_id,
-                    prepared.modalities.vision_config,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )
+                if parsed.vision.is_some() {
+                    load_neutral_qwen_conditional_pipeline(
+                        parsed,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        expert_cache,
+                        stream,
+                        weights_stream,
+                    )
+                } else {
+                    load_neutral_qwen_hybrid_pipeline(
+                        parsed.text,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        expert_cache,
+                        stream,
+                        weights_stream,
+                    )
+                }
             }
             crate::core::GgufArchitecture::KimiLinear => {
                 let prepared =
@@ -10353,8 +10977,12 @@ pub(crate) fn load_pipeline_model_with_options(
             )
         }
         Some("qwen3_vl" | "qwen3_vl_text" | "qwen3_vl_moe" | "qwen3_vl_moe_text") => {
-            let args = qwen3_vl::get_qwen3_vl_model_args(model_dir)?;
-            load_qwen3_vl_pipeline(
+            let value: serde_json::Value = serde_json::from_reader(std::fs::File::open(
+                model_dir.join("config.json"),
+            )?)?;
+            let args = eredu_architectures::qwen::vl::model_args_from_config_value(&value)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            load_neutral_qwen_vl_pipeline(
                 args,
                 store,
                 topology,
@@ -10402,13 +11030,9 @@ pub(crate) fn load_pipeline_model_with_options(
             )
         }
         Some("qwen3_next") => {
-            load_qwen_hybrid_pipeline(
-                crate::composition::mlx_architectures::qwen::hybrid::qwen3_next::get_qwen3_next_model_args(
-                    model_dir,
-                )?,
-                None,
-                None,
-                None,
+            let parsed = crate::composition::qwen::hybrid::load_parsed_config(model_dir)?;
+            load_neutral_qwen_hybrid_pipeline(
+                parsed.text,
                 store,
                 topology,
                 options.quantization,
@@ -10419,21 +11043,30 @@ pub(crate) fn load_pipeline_model_with_options(
             )
         }
         Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text") => {
-            let (args, image_token, video_token, vision) =
-                qwen_hybrid::get_qwen3_5_model_args(model_dir)?;
-            load_qwen_hybrid_pipeline(
-                args,
-                image_token,
-                video_token,
-                vision,
-                store,
-                topology,
-                options.quantization,
-                dense_stream,
-                expert_cache,
-                stream,
-                weights_stream,
-            )
+            let parsed = crate::composition::qwen::hybrid::load_parsed_config(model_dir)?;
+            if parsed.vision.is_none() {
+                load_neutral_qwen_hybrid_pipeline(
+                    parsed.text,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    expert_cache,
+                    stream,
+                    weights_stream,
+                )
+            } else {
+                load_neutral_qwen_conditional_pipeline(
+                    parsed,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    expert_cache,
+                    stream,
+                    weights_stream,
+                )
+            }
         }
         Some("kimi_linear") => {
             load_kimi_linear_pipeline(
@@ -11460,7 +12093,7 @@ fn load_qwen_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if let Some(options) = expert_cache_options {
-        let entries = crate::composition::qwen_expert::expert_catalog_cartesian(
+        let entries = crate::composition::qwen::expert::expert_catalog_cartesian(
             &source_args,
             store.as_ref(),
             parallel_layout.as_ref(),
@@ -11890,8 +12523,9 @@ fn load_muse_glimmer_pipeline(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_qwen3_vl_pipeline(
-    source_args: qwen3_vl::ModelArgs,
+#[allow(clippy::too_many_arguments)]
+fn load_neutral_qwen_vl_pipeline(
+    source_args: eredu_architectures::qwen::vl::ModelArgs,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -11900,32 +12534,26 @@ fn load_qwen3_vl_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    if expert_cache_options.is_some() && !source_args.text_config.is_moe() {
-        return Err(Error::Parallel(
-            "pipeline independent expert caching requires a Qwen3-VL-MoE checkpoint".into(),
-        ));
-    }
-    let binding_adapter = if expert_cache_options.is_some() {
-        Qwen3VlLayerwiseAdapter::new_external_experts(source_args.clone(), stream)?
+    let expert_cache_options = expert_cache_options
+        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
+    let external_experts = expert_cache_options.is_some();
+    let binding_adapter = if external_experts {
+        QwenVlPipelineAdapter::new_external_experts(source_args.clone(), stream)?
     } else {
-        Qwen3VlLayerwiseAdapter::new(source_args.clone(), stream)?
+        QwenVlPipelineAdapter::new(source_args.clone(), stream)?
     };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
-        Some(source_args.text_config.num_hidden_layers as usize),
+        Some(source_args.text.num_hidden_layers as usize),
         expert_assignment
             .as_ref()
             .map(ExpertAssignment::global_expert_count),
     )?;
-    let source_quantization = source_args
-        .text_config
-        .quantization
-        .or(source_args.text_config.quantization_config);
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Qwen3-VL pipeline",
-                source_quantization,
+                source_args.text.weight_quantization(),
                 requested,
             )
             .map(|required| required.then_some(requested))
@@ -11934,18 +12562,21 @@ fn load_qwen3_vl_pipeline(
         .flatten();
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
-        target_args.text_config.quantization = Some(quantization);
-        target_args.text_config.quantization_config = None;
-        target_args.text_config.quantized_weight_configs = None;
+        target_args.text.quantization = Some(quantization);
+        target_args.text.quantization_config = None;
+        target_args.text.quantized_weights = None;
+        target_args.text.quantized_weight_configs = None;
+        target_args
+            .vision
+            .apply_load_time_quantization(quantization);
     }
-    let expert_quantization = quantize_on_load;
-    let target_binding_adapter = if expert_cache_options.is_some() {
-        Qwen3VlLayerwiseAdapter::new_external_experts(target_args.clone(), stream)?
+    let target_adapter = if external_experts {
+        QwenVlPipelineAdapter::new_external_experts(target_args.clone(), stream)?
     } else {
-        Qwen3VlLayerwiseAdapter::new(target_args.clone(), stream)?
+        QwenVlPipelineAdapter::new(target_args.clone(), stream)?
     };
-    let range = topology.layer_range(source_args.text_config.num_hidden_layers as usize)?;
-    let kind = if source_args.text_config.is_moe() {
+    let range = topology.layer_range(source_args.text.num_hidden_layers as usize)?;
+    let kind = if source_args.text.is_moe() {
         ModelKind::Qwen3VlMoe
     } else {
         ModelKind::Qwen3Vl
@@ -11953,23 +12584,18 @@ fn load_qwen3_vl_pipeline(
     let mut info = base_info(
         topology,
         range.clone(),
-        source_args.text_config.num_hidden_layers as usize,
+        source_args.text.num_hidden_layers as usize,
         kind,
-        source_args.text_config.hidden_size,
+        source_args.text.hidden_size,
     );
     info.placement = Arc::new(multimodal_placement(
         topology.pipeline_parallel_size,
-        source_args.text_config.num_hidden_layers as usize,
-        Some(source_args.vision_config.layer_count()),
+        source_args.text.num_hidden_layers as usize,
+        Some(source_args.vision.layer_count()),
         None,
     )?);
-    let mut stage = Qwen3VlStage::new(
-        target_args.clone(),
-        range,
-        &info,
-        expert_cache_options.is_some(),
-        stream,
-    )?;
+    let mut stage =
+        NeutralQwenVlStage::new(target_args.clone(), range, &info, external_experts, stream)?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -11978,87 +12604,101 @@ fn load_qwen3_vl_pipeline(
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
         let mut planner = build.planner();
-        binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
+        binding_adapter.register_parallel_parameters(&mut planner, stream)?;
         let (_, layout) = planner.finish()?;
-        stage
-            .layer_adapter
-            .configure_parallel_static(build, &layout, stream)?;
-        stage.parallel_output_embedding = (info.is_last
-            && target_args.text_config.tie_word_embeddings)
+        stage.adapter.configure_parallel_static(&layout, stream)?;
+        stage.parallel_kv_heads = Some(binding_adapter.local_key_value_heads(&layout)?);
+        stage.parallel_embedding = (info.is_first || !stage.vision_range.is_empty())
             .then(|| {
                 crate::backend::mlx::nn::parallel::VocabParallelEmbedding::unloaded(
-                    target_args.text_config.vocab_size as usize,
-                    target_args.text_config.hidden_size,
-                    target_args
-                        .text_config
-                        .weight_quantization_for("model.language_model.embed_tokens.weight"),
+                    target_args.text.vocab_size as usize,
+                    target_args.text.hidden_size,
+                    target_args.text.weight_quantization_for(&format!(
+                        "{}.embed_tokens.weight",
+                        target_args.text.parameter_root
+                    )),
                     build,
                     stream,
                 )
+                .and_then(|module| {
+                    named_pipeline_parallel_embedding(
+                        module,
+                        &format!("{}.embed_tokens.weight", target_args.text.parameter_root),
+                    )
+                })
             })
             .transpose()?;
-        stage.output_embedding = None;
+        stage.parallel_output_embedding = (info.is_last
+            && stage.parallel_embedding.is_none()
+            && target_args.text.tie_word_embeddings)
+            .then(|| {
+                crate::backend::mlx::nn::parallel::VocabParallelEmbedding::unloaded(
+                    target_args.text.vocab_size as usize,
+                    target_args.text.hidden_size,
+                    target_args.text.weight_quantization_for(&format!(
+                        "{}.embed_tokens.weight",
+                        target_args.text.parameter_root
+                    )),
+                    build,
+                    stream,
+                )
+                .and_then(|module| {
+                    named_pipeline_parallel_embedding(
+                        module,
+                        &format!("{}.embed_tokens.weight", target_args.text.parameter_root),
+                    )
+                })
+            })
+            .transpose()?;
+        stage.parallel_lm_head = (info.is_last && !target_args.text.tie_word_embeddings)
+            .then(|| {
+                crate::backend::mlx::nn::parallel::VocabParallelLmHead::unloaded(
+                    target_args.text.hidden_size,
+                    target_args.text.vocab_size as usize,
+                    target_args.text.weight_quantization_for("lm_head.weight"),
+                    build,
+                    stream,
+                )
+                .and_then(|module| named_pipeline_parallel_lm_head(module, "lm_head.weight"))
+            })
+            .transpose()?;
         Some(layout)
     } else {
         None
     };
     stage.parallel_layout = parallel_layout.clone();
-    if let Some(local_vision) = info
-        .placement
-        .group("vision_encoder")
-        .and_then(|group| group.local_units(info.pipeline_stage))
-    {
-        stage.vision_layers = local_vision
-            .map(|index| {
-                stage.layer_adapter.new_cartesian_layer(
-                    0,
-                    index,
-                    parallel_layout.as_ref(),
-                    None,
-                    stream,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-    }
+    stage.vision_layers = stage
+        .vision_range
+        .clone()
+        .map(|index| {
+            stage
+                .adapter
+                .new_cartesian_layer(0, index, parallel_layout.as_ref(), None, stream)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     stage.layers = stage
         .range
         .clone()
-        .map(|global_layer| {
-            stage.layer_adapter.new_cartesian_layer(
+        .map(|index| {
+            stage.adapter.new_cartesian_layer(
                 1,
-                global_layer,
+                index,
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
                 stream,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let local_deepstack_mergers = stage
-        .vision_range
-        .clone()
-        .filter_map(|index| {
-            target_args
-                .vision_config
-                .layer_policy(index)
-                .and_then(|policy| policy.deepstack_merger)
-                .map(|index| index as usize)
-        })
-        .collect::<Vec<_>>();
+    let need_vision = !stage.vision_range.is_empty();
+    let need_embedding =
+        info.is_first || need_vision || (info.is_last && target_args.text.tie_word_embeddings);
     let static_roles = selected_pipeline_static_roles([
-        (
-            "vision",
-            info.is_first || !local_deepstack_mergers.is_empty(),
-        ),
-        (
-            "embedding",
-            info.is_first
-                || stage.output_embedding.is_some()
-                || stage.parallel_output_embedding.is_some(),
-        ),
+        ("vision", need_vision),
+        ("embedding", need_embedding),
         ("norm", info.is_last),
         (
             "output",
-            info.is_last && !target_args.text_config.tie_word_embeddings,
+            info.is_last && !target_args.text.tie_word_embeddings,
         ),
     ]);
     let (store, materialization) = match quantize_on_load {
@@ -12066,7 +12706,7 @@ fn load_qwen3_vl_pipeline(
             let (store, report) = quantize_pipeline_stage_store(
                 store,
                 &binding_adapter,
-                &target_binding_adapter,
+                &target_adapter,
                 PipelineStageQuantizationSelection::new(&static_roles, 1, stage.range.clone())
                     .with_layer_group(0, stage.vision_range.clone()),
                 quantization,
@@ -12081,163 +12721,106 @@ fn load_qwen3_vl_pipeline(
         .then_some(quantize_on_load)
         .flatten();
     let binding_adapter = if materialization.is_some() {
-        &target_binding_adapter
+        &target_adapter
     } else {
         &binding_adapter
     };
     info.materialization = materialization;
     let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Qwen3-VL");
-    if info.is_first || !local_deepstack_mergers.is_empty() {
+    if need_vision {
+        let bindings = pipeline_static_bindings(&static_units, "vision")?.to_vec();
         let bindings = if let Some(layout) = parallel_layout.as_ref() {
-            shard_layer_bindings(
-                pipeline_static_bindings(&static_units, "vision")?.to_vec(),
-                "",
-                store.as_ref(),
-                layout,
-            )?
+            shard_layer_bindings(bindings, "", store.as_ref(), layout)?
         } else {
-            pipeline_static_bindings(&static_units, "vision")?.to_vec()
+            bindings
         };
-        if info.is_first {
-            loaded.load(
-                stage.layer_adapter.vision_mut(),
-                store.as_ref(),
-                &bindings,
-                quantize_on_load,
-                weights_stream,
-                stream,
-            )?;
-        } else {
-            let keep = local_deepstack_mergers
-                .iter()
-                .map(|index| format!("deepstack_merger_list.{index}."))
-                .collect::<Vec<_>>();
-            let bindings = bindings
-                .into_iter()
-                .filter(|binding| {
-                    let target = binding.logical_target().unwrap_or_else(|| binding.name());
-                    keep.iter().any(|prefix| target.contains(prefix))
-                })
-                .collect::<Vec<_>>();
-            loaded.load_excluding(
-                stage.layer_adapter.vision_mut(),
-                store.as_ref(),
-                &bindings,
-                quantize_on_load,
-                weights_stream,
-                stream,
-                &|name| !keep.iter().any(|prefix| name.starts_with(prefix)),
-            )?;
-        }
-    }
-    if info.is_first {
-        if let Some(module) = stage.layer_adapter.parallel_embedding_mut() {
-            let bindings = shard_layer_bindings(
-                pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
-                "",
-                store.as_ref(),
-                parallel_layout.as_ref().expect("TP layout"),
-            )?;
-            loaded.load(
-                module.inner_mut(),
-                store.as_ref(),
-                &bindings,
-                quantize_on_load,
-                weights_stream,
-                stream,
-            )?;
-        } else {
-            loaded.load(
-                stage.layer_adapter.embedding_mut(),
-                store.as_ref(),
-                pipeline_static_bindings(&static_units, "embedding")?,
-                quantize_on_load,
-                weights_stream,
-                stream,
-            )?;
-        }
-    }
-    if let Some(module) = &mut stage.parallel_output_embedding {
-        let bindings = shard_layer_bindings(
-            pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
-            "",
-            store.as_ref(),
-            parallel_layout.as_ref().expect("TP layout"),
-        )?;
+        let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
+            MlxBackend,
+            MlxHybridState,
+        >>::static_modules_mut(stage.adapter.architecture_mut());
         loaded.load(
-            module.inner_mut(),
+            &mut MlxModuleRef::new(&mut modules.vision),
             store.as_ref(),
             &bindings,
             quantize_on_load,
             weights_stream,
             stream,
         )?;
-    } else if let Some(module) = &mut stage.output_embedding {
-        loaded.load(
-            module,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "embedding")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
+    }
+    if need_embedding {
+        let bindings = pipeline_static_bindings(&static_units, "embedding")?.to_vec();
+        let bindings = if let Some(layout) = parallel_layout.as_ref() {
+            shard_layer_bindings(bindings, "", store.as_ref(), layout)?
+        } else {
+            bindings
+        };
+        if let Some(module) = &mut stage.parallel_embedding {
+            loaded.load(
+                module,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        } else if let Some(module) = &mut stage.parallel_output_embedding {
+            loaded.load(
+                module,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        } else {
+            let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
+                MlxBackend,
+                MlxHybridState,
+            >>::static_modules_mut(stage.adapter.architecture_mut());
+            loaded.load(
+                &mut modules.text.embeddings,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        }
     }
     if info.is_last {
+        let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
+            MlxBackend,
+            MlxHybridState,
+        >>::static_modules_mut(stage.adapter.architecture_mut());
         loaded.load(
-            stage.layer_adapter.norm_mut(),
+            &mut modules.text.norm,
             store.as_ref(),
             pipeline_static_bindings(&static_units, "norm")?,
             quantize_on_load,
             weights_stream,
             stream,
         )?;
-        if !target_args.text_config.tie_word_embeddings {
-            if let Some(module) = stage.layer_adapter.parallel_lm_head_mut() {
+        if !target_args.text.tie_word_embeddings {
+            let bindings = pipeline_static_bindings(&static_units, "output")?.to_vec();
+            if let Some(module) = &mut stage.parallel_lm_head {
                 let bindings = shard_layer_bindings(
-                    pipeline_static_bindings(&static_units, "output")?.to_vec(),
+                    bindings,
                     "",
                     store.as_ref(),
                     parallel_layout.as_ref().expect("TP layout"),
                 )?;
                 loaded.load(
-                    module.inner_mut(),
-                    store.as_ref(),
-                    &bindings,
-                    quantize_on_load,
-                    weights_stream,
-                    stream,
-                )?;
-            } else if let Some(module) = stage.layer_adapter.lm_head_mut() {
-                loaded.load(
                     module,
                     store.as_ref(),
-                    pipeline_static_bindings(&static_units, "output")?,
+                    &bindings,
                     quantize_on_load,
                     weights_stream,
                     stream,
                 )?;
-            }
-        }
-    }
-    if dense_stream.is_none() {
-        if let Some(local_vision) = info
-            .placement
-            .group("vision_encoder")
-            .and_then(|group| group.local_units(info.pipeline_stage))
-        {
-            for (index, layer) in local_vision.zip(&mut stage.vision_layers) {
-                let bindings = binding_adapter.cartesian_layer_bindings(
-                    0,
-                    index,
-                    layer,
-                    store.as_ref(),
-                    parallel_layout.as_ref(),
-                    None,
-                    stream,
-                )?;
+            } else if let Some(head) = &mut modules.text.lm_head {
                 loaded.load(
-                    layer,
+                    head,
                     store.as_ref(),
                     &bindings,
                     quantize_on_load,
@@ -12248,17 +12831,36 @@ fn load_qwen3_vl_pipeline(
         }
     }
     if dense_stream.is_none() {
-        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
+        for (index, layer) in stage.vision_range.clone().zip(&mut stage.vision_layers) {
+            let bindings = binding_adapter.cartesian_layer_bindings(
+                0,
+                index,
+                layer,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+                None,
+                stream,
+            )?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        }
+        for (index, layer) in stage.range.clone().zip(&mut stage.layers) {
             let bindings = binding_adapter.cartesian_layer_bindings(
                 1,
-                global_layer,
+                index,
                 layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            if expert_cache_options.is_some() {
+            if external_experts {
                 loaded.load_excluding(
                     layer,
                     store.as_ref(),
@@ -12266,7 +12868,7 @@ fn load_qwen3_vl_pipeline(
                     quantize_on_load,
                     weights_stream,
                     stream,
-                    &|name| name.contains("mlp.experts."),
+                    &|name| name.contains(".experts."),
                 )?;
             } else {
                 loaded.load(
@@ -12281,19 +12883,17 @@ fn load_qwen3_vl_pipeline(
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.source_diagnostics()?;
-    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
+    let diagnostics = store.source_diagnostics()?;
     if let Some(options) = dense_stream {
-        let streamed_layout = parallel_layout.clone();
-        let streamed_assignment = stage.expert_assignment.clone();
-        let streamed_adapter = &stage.layer_adapter;
+        let layout = parallel_layout.clone();
+        let assignment = stage.expert_assignment.clone();
         let vision_start = stage.vision_range.start;
         let vision_count = stage.vision_range.len();
         let text_start = stage.range.start;
-        let unit_count = vision_count + stage.range.len();
-        let dense_layers = build_pipeline_layer_storage(
+        let adapter = &stage.adapter;
+        let dense = build_pipeline_layer_storage(
             Arc::clone(&store),
-            0..unit_count,
+            0..vision_count + stage.range.len(),
             options,
             static_bytes,
             info.materialization.clone(),
@@ -12301,63 +12901,62 @@ fn load_qwen3_vl_pipeline(
             weights_stream,
             |ordinal, stream| {
                 if ordinal < vision_count {
-                    streamed_adapter.new_cartesian_layer(
+                    adapter.new_cartesian_layer(
                         0,
                         vision_start + ordinal,
-                        streamed_layout.as_ref(),
+                        layout.as_ref(),
                         None,
                         stream,
                     )
                 } else {
-                    streamed_adapter.new_cartesian_layer(
+                    adapter.new_cartesian_layer(
                         1,
                         text_start + ordinal - vision_count,
-                        streamed_layout.as_ref(),
-                        streamed_assignment.as_ref(),
+                        layout.as_ref(),
+                        assignment.as_ref(),
                         stream,
                     )
                 }
             },
             |ordinal, layer, store| {
                 if ordinal < vision_count {
-                    binding_adapter.cartesian_layer_bindings(
+                    adapter.cartesian_layer_bindings(
                         0,
                         vision_start + ordinal,
                         layer,
                         store,
-                        streamed_layout.as_ref(),
+                        layout.as_ref(),
                         None,
                         stream,
                     )
                 } else {
-                    binding_adapter.cartesian_layer_bindings(
+                    adapter.cartesian_layer_bindings(
                         1,
                         text_start + ordinal - vision_count,
                         layer,
                         store,
-                        streamed_layout.as_ref(),
-                        streamed_assignment.as_ref(),
+                        layout.as_ref(),
+                        assignment.as_ref(),
                         stream,
                     )
                 }
             },
         )?
         .with_execution_offset(vision_count)?;
-        stage.dense_layers = Some(if expert_cache_options.is_some() {
-            dense_layers.with_independent_experts("mlp.experts.")
+        stage.dense_layers = Some(if external_experts {
+            dense.with_independent_experts(".experts.")
         } else {
-            dense_layers
+            dense
         });
-        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_bytes
-            .checked_add(layer_bytes)
-            .ok_or_else(|| Error::Parallel("Qwen3-VL pipeline planned bytes overflowed".into()))?;
+            .checked_add(stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?)
+            .ok_or_else(|| Error::Parallel("Qwen3-VL planned bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if let Some(options) = expert_cache_options {
-        let entries = crate::composition::qwen_expert::expert_catalog_cartesian(
-            &source_args.text_config,
+        let entries = crate::composition::qwen::expert::expert_catalog_cartesian(
+            &source_args.text,
             store.as_ref(),
             parallel_layout.as_ref(),
         )?
@@ -12373,72 +12972,37 @@ fn load_qwen3_vl_pipeline(
             Arc::clone(&store),
             entries,
             Some(options),
-            expert_quantization,
+            quantize_on_load,
             weights_stream,
             stream,
         )?;
-        let owned_expert_bytes = cache.report()?.owned_bytes;
         info.planned_owned_parameter_bytes = info
             .planned_owned_parameter_bytes
-            .checked_add(owned_expert_bytes)
-            .ok_or_else(|| {
-                Error::Parallel("Qwen3-VL pipeline expert byte total overflowed".into())
-            })?;
+            .checked_add(cache.report()?.owned_bytes)
+            .ok_or_else(|| Error::Parallel("Qwen3-VL expert bytes overflowed".into()))?;
         stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
     }
-    info.opened_checkpoint_shards = materialized_shards;
-    info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
-    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
-}
-
-impl Qwen3VlStage {
-    fn new(
-        args: qwen3_vl::ModelArgs,
-        range: Range<usize>,
-        info: &PipelineStageInfo,
-        external_experts: bool,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let output_embedding = (info.is_last && args.text_config.tie_word_embeddings)
-            .then(|| {
-                linear::unloaded_maybe_quantized_embedding(
-                    args.text_config.vocab_size,
-                    args.text_config.hidden_size,
-                    args.text_config
-                        .weight_quantization_for("model.language_model.embed_tokens.weight"),
-                    stream,
-                )
-            })
-            .transpose()?;
-        let layer_adapter = if external_experts {
-            Qwen3VlLayerwiseAdapter::new_external_experts(args.clone(), stream)?
-        } else {
-            Qwen3VlLayerwiseAdapter::new(args.clone(), stream)?
-        };
-        Ok(Self {
-            layer_adapter,
-            args,
-            range,
-            vision_range: info
-                .placement
-                .group("vision_encoder")
-                .and_then(|group| group.local_units(info.pipeline_stage))
-                .unwrap_or(0..0),
-            vision_layers: Vec::new(),
-            layers: Vec::new(),
-            dense_layers: None,
-            output_embedding,
-            parallel_output_embedding: None,
-            parallel_layout: None,
-            expert_assignment: None,
-            expert_storage: if external_experts {
-                PipelineExpertStorage::ExternalEmpty
-            } else {
-                PipelineExpertStorage::LayerLocal
-            },
-            routing_statistics: RoutingStatistics::default(),
-        })
+    let mut materialized_shards = if info.materialization.is_some() {
+        store.materialized_source_shards()
+    } else {
+        Vec::new()
+    };
+    materialized_shards.extend(checkpoint_backing_shards(
+        store.as_ref(),
+        info.owned_tensors.iter().map(String::as_str),
+    )?);
+    if dense_stream.is_some() {
+        materialized_shards.extend(checkpoint_layer_backing_shards(
+            store.as_ref(),
+            "model.language_model.layers.",
+            stage.range.clone(),
+        )?);
     }
+    materialized_shards.sort();
+    materialized_shards.dedup();
+    info.opened_checkpoint_shards = materialized_shards;
+    info.checkpoint_diagnostics = Some(diagnostics);
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
 }
 
 impl QwenStage {
@@ -13846,7 +14410,7 @@ fn execute_pipeline_cached_qwen3(
     cache: &ExpertCache,
     assignment: &ExpertAssignment,
     expert_group: Option<&Group>,
-    tensor_group: Option<&Group>,
+    _tensor_group: Option<&Group>,
     statistics: &mut RoutingStatistics,
     stream: &Stream,
 ) -> Result<Array, Error> {
@@ -13862,14 +14426,7 @@ fn execute_pipeline_cached_qwen3(
         None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
     };
     statistics.accumulate(&returned.statistics);
-    match tensor_group {
-        Some(group) => Ok(distributed::all_sum(
-            &returned.reduced_output,
-            group,
-            stream,
-        )?),
-        None => Ok(returned.reduced_output),
-    }
+    Ok(returned.reduced_output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14062,8 +14619,8 @@ fn execute_pipeline_cached_muse_glimmer(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_pipeline_cached_qwen_hybrid(
-    args: &qwen_hybrid::ModelArgs,
+fn execute_pipeline_cached_neutral_qwen_hybrid(
+    args: &eredu_architectures::qwen::hybrid::HybridConfig,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -14076,9 +14633,18 @@ fn execute_pipeline_cached_qwen_hybrid(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+    let spec = crate::composition::qwen::hybrid::cached_expert_spec(args, global_layer);
     let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        super::expert::execute_cached_qwen_hybrid(args, global_layer, routes, pass, cache, stream)
+        crate::backend::mlx::runtime::residency::expert_provider::execute_cached_swiglu_dispatched(
+            cache,
+            spec,
+            global_layer,
+            &routes.hidden,
+            &routes.global_expert_ids,
+            pass,
+            stream,
+        )
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
@@ -17125,12 +17691,624 @@ impl NemotronHStage {
     }
 }
 
+impl NeutralQwenHybridStage {
+    fn new(
+        args: eredu_architectures::qwen::hybrid::HybridConfig,
+        range: Range<usize>,
+        info: &PipelineStageInfo,
+        external_experts: bool,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let layer_adapter = if external_experts {
+            QwenHybridPipelineAdapter::new_external_experts(args.clone(), stream)?
+        } else {
+            QwenHybridPipelineAdapter::new(args.clone(), stream)?
+        };
+        let architecture = eredu_architectures::qwen::hybrid::LayeredModel::<MlxBackend>::new(
+            args.clone(),
+            stream,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let static_modules = architecture.static_modules().clone();
+        let embeddings = MlxModule::new(static_modules.embeddings);
+        let mut embedding = None;
+        let mut output_embedding = None;
+        if info.is_first {
+            embedding = Some(embeddings);
+        } else if info.is_last && (args.tie_word_embeddings || args.mtp_num_hidden_layers > 0) {
+            output_embedding = Some(embeddings);
+        }
+        let layers = range
+            .clone()
+            .map(|index| layer_adapter.new_layer(0, index, stream))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            args,
+            layer_adapter,
+            range,
+            embedding,
+            output_embedding,
+            layers,
+            prediction_layers: Vec::new(),
+            dense_layers: None,
+            norm: info.is_last.then(|| MlxModule::new(static_modules.norm)),
+            lm_head: info
+                .is_last
+                .then(|| static_modules.lm_head.map(MlxModule::new))
+                .flatten(),
+            parallel_embedding: None,
+            parallel_output_embedding: None,
+            parallel_lm_head: None,
+            parallel_layout: None,
+            parallel_geometry: None,
+            expert_assignment: None,
+            expert_storage: if external_experts {
+                PipelineExpertStorage::ExternalEmpty
+            } else {
+                PipelineExpertStorage::LayerLocal
+            },
+            routing_statistics: RoutingStatistics::default(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_target_layer(
+        args: &eredu_architectures::qwen::hybrid::HybridConfig,
+        layer: &mut MlxModule<eredu_architectures::qwen::hybrid::Unit<MlxBackend>>,
+        global_layer: usize,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: &mut PipelineLayerCache,
+        tensor_group: Option<&Group>,
+        assignment: Option<&ExpertAssignment>,
+        expert_group: Option<&Group>,
+        pass: ExpertPass,
+        expert_cache: Option<&ExpertCache>,
+        statistics: &mut RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        validate_pipeline_hybrid_cache_layer(cache, global_layer)?;
+        let eredu_architectures::qwen::hybrid::Unit::Target(block) = &mut **layer else {
+            return Err(Error::Parallel(format!(
+                "Qwen hybrid target stage contains prediction unit {global_layer}"
+            )));
+        };
+        let mut state = PipelineHybridLayerState(cache);
+        let result = if let Some(expert_cache) = expert_cache {
+            let assignment = assignment.ok_or_else(|| {
+                Error::Parallel("Qwen hybrid external experts have no assignment".into())
+            })?;
+            let mut execute =
+                |layer: usize, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                    execute_pipeline_cached_neutral_qwen_hybrid(
+                        args,
+                        layer,
+                        hidden,
+                        ids,
+                        weights,
+                        pass,
+                        expert_cache,
+                        assignment,
+                        expert_group,
+                        statistics,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()))
+                };
+            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            match tensor_group {
+                Some(group) => {
+                    block.forward_parallel(hidden, mask, &mut state, group, stream, &mut provider)
+                }
+                None => {
+                    block.forward_with_provider(hidden, mask, &mut state, stream, &mut provider)
+                }
+            }
+        } else {
+            if assignment.is_some() && args.is_moe() {
+                return Err(Error::Parallel(
+                    "neutral Qwen hybrid EP requires external expert residency".into(),
+                ));
+            }
+            match tensor_group {
+                Some(group) => block.forward_parallel(
+                    hidden,
+                    mask,
+                    &mut state,
+                    group,
+                    stream,
+                    &mut eredu_runtime::ResidentExpertProvider,
+                ),
+                None => block.forward(hidden, mask, &mut state, stream),
+            }
+        };
+        result.map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+    }
+
+    fn forward_target(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        explicit_mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if caches.len() != self.layers.len() {
+            return Err(Error::Parallel(format!(
+                "Qwen hybrid stage cache has {} entries, expected {}",
+                caches.len(),
+                self.layers.len()
+            )));
+        }
+        let tensor = execution.filter(|execution| execution.is_tensor_parallel());
+        let tensor_group = tensor.and_then(ParallelExecutionContext::group);
+        let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => {
+                let hidden = match tensor {
+                    Some(execution) => self
+                        .parallel_embedding
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::Parallel(
+                                "first Qwen hybrid tensor stage has no embedding shard".into(),
+                            )
+                        })?
+                        .forward(tokens, execution)?,
+                    None => EmbeddingOperator::forward(
+                        &mut **self.embedding.as_mut().ok_or_else(|| {
+                            Error::Parallel("first Qwen hybrid stage has no embedding".into())
+                        })?,
+                        tokens,
+                        stream,
+                    )?,
+                };
+                (hidden, PipelineAuxiliaryState::default())
+            }
+            PipelineStageInput::Hidden(payload) => {
+                (payload.hidden.clone(), payload.auxiliary.clone())
+            }
+        };
+        let offset = pipeline_state_offset("Qwen hybrid", caches)?;
+        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
+            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
+            .transpose()?;
+        let mask = explicit_mask.or(generated_mask.as_ref());
+        if let Some(assignment) = self.expert_assignment.as_ref() {
+            validate_pipeline_expert_dispatch(
+                assignment,
+                expert_group,
+                self.expert_storage.is_external(),
+            )?;
+        }
+        self.routing_statistics = RoutingStatistics::default();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let global_args = self.args.clone();
+        let assignment = self.expert_assignment.clone();
+        let expert_cache = self.expert_storage.cache();
+        let layer_adapter = &self.layer_adapter;
+        let parallel_layout = self.parallel_layout.clone();
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| {
+                layer_adapter.new_cartesian_layer(
+                    0,
+                    global_layer,
+                    parallel_layout.as_ref(),
+                    assignment.as_ref(),
+                    stream,
+                )
+            },
+            |global_layer, layer, hidden, cache, stream| {
+                let local_args = match parallel_layout.as_ref() {
+                    Some(layout) => eredu_architectures::qwen::hybrid::local_block_config(
+                        &global_args,
+                        global_layer,
+                        layout,
+                    )
+                    .map_err(|error| Error::Parallel(error.to_string()))?,
+                    None => global_args.clone(),
+                };
+                let forwarded = Self::forward_target_layer(
+                    &local_args,
+                    layer,
+                    global_layer,
+                    hidden,
+                    mask,
+                    cache,
+                    tensor_group,
+                    assignment.as_ref(),
+                    expert_group,
+                    pass,
+                    expert_cache,
+                    &mut self.routing_statistics,
+                    stream,
+                )?;
+                synchronize_outputs([&forwarded])?;
+                Ok(forwarded)
+            },
+        )?;
+        if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
+            hidden = NormalizationOperator::forward(&mut **norm, &hidden, stream)?;
+            let logits = match tensor {
+                Some(execution) => {
+                    let sharded = if let Some(head) = &mut self.parallel_lm_head {
+                        head.forward(&hidden, execution)?
+                    } else {
+                        self.parallel_output_embedding
+                            .as_mut()
+                            .or(self.parallel_embedding.as_mut())
+                            .ok_or_else(|| {
+                                Error::Parallel(
+                                    "last Qwen hybrid tensor stage has no output shard".into(),
+                                )
+                            })?
+                            .project_logits(&hidden, execution)?
+                    };
+                    sharded.all_gather(execution)?
+                }
+                None => {
+                    if let Some(head) = &mut self.lm_head {
+                        LinearOperator::forward(&mut **head, &hidden, stream)?
+                    } else {
+                        EmbeddingOperator::as_linear(
+                            &mut **self
+                                .output_embedding
+                                .as_mut()
+                                .or(self.embedding.as_mut())
+                                .ok_or_else(|| {
+                                    Error::Parallel(
+                                        "last Qwen hybrid stage has no output embedding".into(),
+                                    )
+                                })?,
+                            &hidden,
+                            stream,
+                        )?
+                    }
+                }
+            };
+            Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                logits,
+                hidden: mtp_hidden,
+            })
+        } else {
+            Ok(PipelineStageOutput::Hidden(PipelinePayload {
+                hidden,
+                auxiliary,
+            }))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_mtp_draft_neutral(
+        &mut self,
+        prior: &Array,
+        tokens: &Array,
+        depth: usize,
+        state: &mut MlxHybridState,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Error> {
+        let layer = self
+            .prediction_layers
+            .get_mut(depth)
+            .and_then(|layers| layers.first_mut())
+            .ok_or_else(|| Error::Parallel(format!("Qwen hybrid has no MTP depth {depth}")))?;
+        let tensor = execution.filter(|execution| execution.is_tensor_parallel());
+        let embedded = match tensor {
+            Some(execution) => self
+                .parallel_output_embedding
+                .as_mut()
+                .or(self.parallel_embedding.as_mut())
+                .ok_or_else(|| Error::Parallel("Qwen hybrid MTP has no embedding shard".into()))?
+                .forward(tokens, execution)?,
+            None => EmbeddingOperator::forward(
+                &mut **self
+                    .output_embedding
+                    .as_mut()
+                    .or(self.embedding.as_mut())
+                    .ok_or_else(|| Error::Parallel("Qwen hybrid MTP has no embedding".into()))?,
+                tokens,
+                stream,
+            )?,
+        };
+        let state_index = self.args.num_hidden_layers as usize + depth;
+        let layer_state = state
+            .layer(state_index)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let offset = RuntimeStateComponents::<MlxBackend>::position(layer_state);
+        let mask = (tokens.dim(1) > 1)
+            .then(|| create_causal_mask(tokens.dim(1), Some(offset), None, None, stream))
+            .transpose()?;
+        let expert_args = match self.parallel_layout.as_ref() {
+            Some(layout) => eredu_architectures::qwen::hybrid::local_unit_config(
+                &self.args,
+                depth + 1,
+                0,
+                layout,
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))?,
+            None => self.args.clone(),
+        };
+        let eredu_architectures::qwen::hybrid::Unit::Prediction(unit) = &mut **layer else {
+            return Err(Error::Parallel(format!(
+                "Qwen hybrid MTP depth {depth} contains a target unit"
+            )));
+        };
+        let mut execute =
+            |layer: usize, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                let cache = self.expert_storage.cache().ok_or_else(|| {
+                    Exception::custom("Qwen hybrid MTP external expert cache is unavailable")
+                })?;
+                let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+                    Exception::custom("Qwen hybrid MTP external experts have no assignment")
+                })?;
+                execute_pipeline_cached_neutral_qwen_hybrid(
+                    &expert_args,
+                    layer,
+                    hidden,
+                    ids,
+                    weights,
+                    ExpertPass::Decode,
+                    cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+        let hidden = if self.expert_storage.cache().is_some() {
+            let mut provider = ExpertExecutorProvider::new(&mut execute);
+            match tensor.and_then(ParallelExecutionContext::group) {
+                Some(group) => unit.forward_parallel(
+                    prior,
+                    &embedded,
+                    mask.as_ref(),
+                    layer_state,
+                    group,
+                    stream,
+                    &mut provider,
+                ),
+                None => unit.forward_with_provider(
+                    prior,
+                    &embedded,
+                    mask.as_ref(),
+                    layer_state,
+                    stream,
+                    &mut provider,
+                ),
+            }
+        } else {
+            match tensor.and_then(ParallelExecutionContext::group) {
+                Some(group) => unit.forward_parallel(
+                    prior,
+                    &embedded,
+                    mask.as_ref(),
+                    layer_state,
+                    group,
+                    stream,
+                    &mut eredu_runtime::ResidentExpertProvider,
+                ),
+                None => unit.forward(prior, &embedded, mask.as_ref(), layer_state, stream),
+            }
+        }
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let logits = match tensor {
+            Some(execution) => {
+                let sharded = if let Some(head) = &mut self.parallel_lm_head {
+                    head.forward(&hidden, execution)?
+                } else {
+                    self.parallel_output_embedding
+                        .as_mut()
+                        .or(self.parallel_embedding.as_mut())
+                        .ok_or_else(|| {
+                            Error::Parallel("Qwen hybrid MTP has no output shard".into())
+                        })?
+                        .project_logits(&hidden, execution)?
+                };
+                sharded.all_gather(execution)?
+            }
+            None => {
+                if let Some(head) = &mut self.lm_head {
+                    LinearOperator::forward(&mut **head, &hidden, stream)?
+                } else {
+                    EmbeddingOperator::as_linear(
+                        &mut **self
+                            .output_embedding
+                            .as_mut()
+                            .or(self.embedding.as_mut())
+                            .ok_or_else(|| {
+                                Error::Parallel("Qwen hybrid MTP has no output embedding".into())
+                            })?,
+                        &hidden,
+                        stream,
+                    )?
+                }
+            }
+        };
+        Ok(EmbeddedMtpOutput {
+            logits,
+            hidden,
+            tokens: tokens.clone(),
+        })
+    }
+}
+
+impl PipelineStageSemantics for NeutralQwenHybridStage {
+    fn model_kind(&self) -> ModelKind {
+        if self.args.variant == eredu_architectures::qwen::hybrid::HybridVariant::Qwen3Next {
+            ModelKind::Qwen3Next
+        } else {
+            ModelKind::Qwen35
+        }
+    }
+
+    fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
+        Vec::new()
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
+        self.dense_layers.as_ref()
+    }
+
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_storage.cache()
+    }
+
+    fn embedded_mtp_len(&self) -> usize {
+        self.args.mtp_num_hidden_layers.max(0) as usize
+    }
+
+    fn embedded_mtp_state_start(&self) -> Option<usize> {
+        Some(self.args.num_hidden_layers as usize)
+    }
+
+    fn new_embedded_mtp_cache(
+        &self,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<PipelineMtpCache, Error> {
+        let layout = match &self.parallel_geometry {
+            Some(geometry) => {
+                eredu_architectures::qwen::hybrid::state_layout_with_geometry(&self.args, geometry)
+            }
+            None => eredu_architectures::qwen::hybrid::state_layout(&self.args),
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let state = match paged {
+            Some((manager, rank)) => MlxHybridState::paged(layout, manager, rank)?,
+            None => MlxHybridState::device(layout)?,
+        };
+        Ok(PipelineMtpCache::Hybrid(state))
+    }
+
+    fn new_cache_layers(
+        &self,
+        identity: &PromptCacheModelIdentity,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<Vec<PipelineLayerCache>, Error> {
+        let target_owned = self.range.len();
+        let mut target_identity = identity.clone();
+        target_identity.global_layer_end = target_identity.global_layer_start + target_owned;
+        target_identity.layer_layout = crate::LayerSchedule::new(
+            target_owned,
+            identity
+                .layer_layout
+                .iter()
+                .take(target_owned)
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        target_identity.layer_prefix_offsets = identity
+            .layer_prefix_offsets
+            .iter()
+            .take(target_owned)
+            .copied()
+            .collect();
+        materialize_pipeline_cache_layers(&target_identity, paged)
+    }
+
+    fn forward_embedded_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut PipelineMtpCache,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Error> {
+        let PipelineMtpCache::Hybrid(cache) = cache else {
+            return Err(Error::Parallel(
+                "Qwen hybrid pipeline MTP cache mismatch".into(),
+            ));
+        };
+        self.forward_mtp_draft_neutral(
+            hidden,
+            tokens,
+            depth,
+            cache,
+            execution,
+            expert_group,
+            stream,
+        )
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: MlxParallelContext,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let complete = match &self.parallel_geometry {
+            Some(geometry) => {
+                eredu_architectures::qwen::hybrid::state_layout_with_geometry(&self.args, geometry)
+            }
+            None => eredu_architectures::qwen::hybrid::state_layout(&self.args),
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let policies = complete
+            .layers()
+            .iter()
+            .skip(self.range.start)
+            .take(self.range.len())
+            .cloned()
+            .collect::<Vec<_>>();
+        let layout = crate::LayerSchedule::new(policies.len(), policies)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "qwen_hybrid",
+            &self.args.model_type,
+            eredu_architectures::qwen::hybrid::prompt_cache_architecture_fingerprint(&self.args),
+            self.args.num_hidden_layers as usize,
+            self.range.clone(),
+            layout,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.forward_target(input, step, mask, cache, None, None, stream)
+    }
+
+    fn forward_with_execution(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.forward_target(input, step, mask, cache, execution, expert_group, stream)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn load_qwen_hybrid_pipeline(
-    source_args: qwen_hybrid::ModelArgs,
-    image_token_id: Option<i32>,
-    video_token_id: Option<i32>,
-    vision_config: Option<crate::composition::mlx_architectures::qwen::vl::vision::VisionConfig>,
+fn load_neutral_qwen_hybrid_pipeline(
+    source_args: eredu_architectures::qwen::hybrid::HybridConfig,
     store: SharedCheckpointSource,
     topology: MlxParallelContext,
     requested_quantization: Option<WeightQuantization>,
@@ -17139,20 +18317,14 @@ fn load_qwen_hybrid_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
-    let binding_adapter = if vision_config.is_some() {
-        QwenHybridLayerwiseAdapter::new_pipeline(
-            source_args.clone(),
-            image_token_id,
-            video_token_id,
-            vision_config.clone(),
-            external_experts,
-            stream,
-        )?
-    } else if external_experts {
-        QwenHybridLayerwiseAdapter::new_text_external_experts(source_args.clone(), stream)?
+    let explicit_expert_cache = expert_cache_options.is_some();
+    let expert_cache_options = expert_cache_options
+        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
+    let external_experts = expert_cache_options.is_some();
+    let binding_adapter = if external_experts {
+        QwenHybridPipelineAdapter::new_external_experts(source_args.clone(), stream)?
     } else {
-        QwenHybridLayerwiseAdapter::new_text(source_args.clone(), stream)?
+        QwenHybridPipelineAdapter::new(source_args.clone(), stream)?
     };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
@@ -17161,7 +18333,7 @@ fn load_qwen_hybrid_pipeline(
             .as_ref()
             .map(ExpertAssignment::global_expert_count),
     )?;
-    if requested_quantization.is_some() && source_args.quantization_config.is_some() {
+    if requested_quantization.is_some() && source_args.fp8.is_some() {
         return Err(Error::Quantization(
             "Qwen hybrid pipeline cannot implicitly transcode checkpoint-native FP8 weights".into(),
         ));
@@ -17180,25 +18352,17 @@ fn load_qwen_hybrid_pipeline(
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.quantization = Some(quantization);
-        target_args.quantization_config = None;
-        target_args.quantized_weight_configs = None;
+        target_args.fp8 = None;
+        target_args.linear_formats.clear();
     }
-    let mut target_binding_adapter = if vision_config.is_some() {
-        QwenHybridLayerwiseAdapter::new_pipeline(
-            target_args.clone(),
-            image_token_id,
-            video_token_id,
-            vision_config.clone(),
-            external_experts,
-            stream,
-        )?
-    } else if external_experts {
-        QwenHybridLayerwiseAdapter::new_text_external_experts(target_args.clone(), stream)?
+    let target_binding_adapter = if external_experts {
+        QwenHybridPipelineAdapter::new_external_experts(target_args.clone(), stream)?
     } else {
-        QwenHybridLayerwiseAdapter::new_text(target_args.clone(), stream)?
+        QwenHybridPipelineAdapter::new(target_args.clone(), stream)?
     };
     let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
-    let kind = if source_args.model_type == "qwen3_next" {
+    let kind = if source_args.variant == eredu_architectures::qwen::hybrid::HybridVariant::Qwen3Next
+    {
         ModelKind::Qwen3Next
     } else {
         ModelKind::Qwen35
@@ -17210,28 +18374,8 @@ fn load_qwen_hybrid_pipeline(
         kind,
         source_args.hidden_size,
     );
-    if vision_config.is_some() {
-        let vision_depth = binding_adapter
-            .pipeline_media_groups()
-            .first()
-            .map(|(_, depth)| *depth);
-        info.placement = Arc::new(multimodal_placement(
-            topology.pipeline_parallel_size,
-            source_args.num_hidden_layers as usize,
-            vision_depth,
-            None,
-        )?);
-    }
-    let mut stage = QwenHybridStage::new(
-        target_args.clone(),
-        image_token_id,
-        video_token_id,
-        vision_config,
-        range,
-        &info,
-        external_experts,
-        stream,
-    )?;
+    let mut stage =
+        NeutralQwenHybridStage::new(target_args.clone(), range, &info, external_experts, stream)?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -17242,43 +18386,54 @@ fn load_qwen_hybrid_pipeline(
         let mut planner = build.planner();
         binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
         let (_, layout) = planner.finish()?;
-        stage
-            .layer_adapter
-            .configure_cartesian_layout(build, &layout, stream)?;
-        target_binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
-        stage.parallel_geometry = stage.layer_adapter.parallel_geometry().map(<[_]>::to_vec);
-        stage.parallel_embedding = (info.is_first && !stage.has_multimodal_ingress)
+        stage.parallel_geometry = Some(binding_adapter.local_state_geometry(&layout)?);
+        stage.parallel_embedding = info
+            .is_first
             .then(|| {
                 crate::backend::mlx::nn::parallel::VocabParallelEmbedding::unloaded(
                     target_args.vocab_size as usize,
                     target_args.hidden_size,
-                    target_args.quantization,
+                    target_args
+                        .linear_format("model.embed_tokens.weight")
+                        .weight_quantization(),
                     build,
                     stream,
                 )
+                .and_then(|module| {
+                    named_pipeline_parallel_embedding(module, "model.embed_tokens.weight")
+                })
             })
             .transpose()?;
-        stage.parallel_output_embedding =
-            (info.is_last && !info.is_first && target_args.tie_word_embeddings)
-                .then(|| {
-                    crate::backend::mlx::nn::parallel::VocabParallelEmbedding::unloaded(
-                        target_args.vocab_size as usize,
-                        target_args.hidden_size,
-                        target_args.quantization,
-                        build,
-                        stream,
-                    )
+        stage.parallel_output_embedding = (info.is_last
+            && !info.is_first
+            && (target_args.tie_word_embeddings || target_args.mtp_num_hidden_layers > 0))
+            .then(|| {
+                crate::backend::mlx::nn::parallel::VocabParallelEmbedding::unloaded(
+                    target_args.vocab_size as usize,
+                    target_args.hidden_size,
+                    target_args
+                        .linear_format("model.embed_tokens.weight")
+                        .weight_quantization(),
+                    build,
+                    stream,
+                )
+                .and_then(|module| {
+                    named_pipeline_parallel_embedding(module, "model.embed_tokens.weight")
                 })
-                .transpose()?;
+            })
+            .transpose()?;
         stage.parallel_lm_head = (info.is_last && !target_args.tie_word_embeddings)
             .then(|| {
                 crate::backend::mlx::nn::parallel::VocabParallelLmHead::unloaded(
                     target_args.hidden_size,
                     target_args.vocab_size as usize,
-                    target_args.quantization,
+                    target_args
+                        .linear_format("lm_head.weight")
+                        .weight_quantization(),
                     build,
                     stream,
                 )
+                .and_then(|module| named_pipeline_parallel_lm_head(module, "lm_head.weight"))
             })
             .transpose()?;
         stage.embedding = None;
@@ -17289,23 +18444,17 @@ fn load_qwen_hybrid_pipeline(
         None
     };
     stage.parallel_layout = parallel_layout.clone();
-    let text_group = stage.layer_adapter.pipeline_text_group();
     stage.layers = stage
         .range
         .clone()
         .map(|global_layer| {
-            match stage.layer_adapter.new_cartesian_layer(
-                text_group,
+            stage.layer_adapter.new_cartesian_layer(
+                0,
                 global_layer,
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
                 stream,
-            )? {
-                QwenHybridLayer::Text(block) => Ok(*block),
-                QwenHybridLayer::Vision(_) => Err(Error::Parallel(
-                    "Qwen hybrid pipeline received a vision execution unit".into(),
-                )),
-            }
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     let owns_mtp = info.is_last && stage.layer_adapter.embedded_mtp_len() > 0;
@@ -17315,38 +18464,42 @@ fn load_qwen_hybrid_pipeline(
     } else {
         0
     };
-    let has_vision_static =
-        info.is_first && stage.layer_adapter.pipeline_static_mut("vision").is_some();
+    if owns_mtp {
+        for group in 1..=stage.layer_adapter.embedded_mtp_len() {
+            stage
+                .prediction_layers
+                .push(vec![stage.layer_adapter.new_cartesian_layer(
+                    group,
+                    0,
+                    parallel_layout.as_ref(),
+                    stage.expert_assignment.as_ref(),
+                    stream,
+                )?]);
+        }
+    }
     let static_roles = selected_pipeline_static_roles([
         (
             "embedding",
             stage.embedding.is_some()
                 || stage.output_embedding.is_some()
                 || stage.parallel_embedding.is_some()
-                || stage.parallel_output_embedding.is_some()
-                || (info.is_first && stage.has_multimodal_ingress)
-                || owns_mtp,
+                || stage.parallel_output_embedding.is_some(),
         ),
         ("norm", stage.norm.is_some()),
         (
             "output",
-            stage.lm_head.is_some() || stage.parallel_lm_head.is_some() || owns_mtp,
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
         ),
-        ("mtp", owns_mtp),
-        ("vision", has_vision_static),
     ]);
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
-            let selection = stage.media_units.iter().fold(
-                PipelineStageQuantizationSelection::new(
-                    &static_roles,
-                    text_group,
-                    stage.range.clone(),
-                ),
-                |selection, unit| {
-                    selection.with_layer_group(unit.group, unit.index..unit.index + 1)
-                },
-            );
+            let mut selection =
+                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone());
+            if owns_mtp {
+                for group in 1..=stage.layer_adapter.embedded_mtp_len() {
+                    selection = selection.with_layer_group(group, 0..1);
+                }
+            }
             let (store, report) = quantize_pipeline_stage_store(
                 store,
                 &binding_adapter,
@@ -17360,7 +18513,7 @@ fn load_qwen_hybrid_pipeline(
         None => (store, None),
     };
     let expert_quantization = quantize_on_load;
-    let quantize_on_load = materialization
+    let requested = materialization
         .is_none()
         .then_some(quantize_on_load)
         .flatten();
@@ -17372,62 +18525,7 @@ fn load_qwen_hybrid_pipeline(
     info.materialization = materialization;
     let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Qwen hybrid");
-    if owns_mtp {
-        for role in ["embedding", "output", "mtp"] {
-            if stage.layer_adapter.pipeline_static_mut(role).is_none() {
-                continue;
-            }
-            let bindings = pipeline_cartesian_static_bindings(
-                &static_units,
-                role,
-                store.as_ref(),
-                parallel_layout.as_ref(),
-            )?;
-            let target = stage
-                .layer_adapter
-                .pipeline_static_mut(role)
-                .expect("selected Qwen MTP static target");
-            if external_experts && role == "mtp" {
-                loaded.load_excluding(
-                    target,
-                    store.as_ref(),
-                    &bindings,
-                    quantize_on_load,
-                    weights_stream,
-                    stream,
-                    &|name| name.contains("mlp.experts."),
-                )?;
-            } else {
-                loaded.load(
-                    target,
-                    store.as_ref(),
-                    &bindings,
-                    quantize_on_load,
-                    weights_stream,
-                    stream,
-                )?;
-            }
-        }
-    }
-    if info.is_first && stage.has_multimodal_ingress {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "embedding",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        loaded.load(
-            stage
-                .layer_adapter
-                .pipeline_static_mut("embedding")
-                .expect("Qwen3.5 multimodal ingress embedding"),
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    } else if let Some(module) = &mut stage.parallel_embedding {
+    if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
             pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
             "",
@@ -17435,10 +18533,10 @@ fn load_qwen_hybrid_pipeline(
             parallel_layout.as_ref().expect("TP layout"),
         )?;
         loaded.load(
-            module.inner_mut(),
+            module,
             store.as_ref(),
             &bindings,
-            quantize_on_load,
+            requested,
             weights_stream,
             stream,
         )?;
@@ -17447,7 +18545,7 @@ fn load_qwen_hybrid_pipeline(
             module,
             store.as_ref(),
             pipeline_static_bindings(&static_units, "embedding")?,
-            quantize_on_load,
+            requested,
             weights_stream,
             stream,
         )?;
@@ -17460,10 +18558,10 @@ fn load_qwen_hybrid_pipeline(
             parallel_layout.as_ref().expect("TP layout"),
         )?;
         loaded.load(
-            module.inner_mut(),
+            module,
             store.as_ref(),
             &bindings,
-            quantize_on_load,
+            requested,
             weights_stream,
             stream,
         )?;
@@ -17472,7 +18570,7 @@ fn load_qwen_hybrid_pipeline(
             module,
             store.as_ref(),
             pipeline_static_bindings(&static_units, "embedding")?,
-            quantize_on_load,
+            requested,
             weights_stream,
             stream,
         )?;
@@ -17482,7 +18580,7 @@ fn load_qwen_hybrid_pipeline(
             module,
             store.as_ref(),
             pipeline_static_bindings(&static_units, "norm")?,
-            quantize_on_load,
+            requested,
             weights_stream,
             stream,
         )?;
@@ -17495,10 +18593,10 @@ fn load_qwen_hybrid_pipeline(
             parallel_layout.as_ref().expect("TP layout"),
         )?;
         loaded.load(
-            module.inner_mut(),
+            module,
             store.as_ref(),
             &bindings,
-            quantize_on_load,
+            requested,
             weights_stream,
             stream,
         )?;
@@ -17507,64 +18605,17 @@ fn load_qwen_hybrid_pipeline(
             module,
             store.as_ref(),
             pipeline_static_bindings(&static_units, "output")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if info.is_first && stage.has_multimodal_ingress {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "vision",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        loaded.load(
-            stage
-                .layer_adapter
-                .pipeline_static_mut("vision")
-                .expect("Qwen3.5 vision static module"),
-            store.as_ref(),
-            &bindings,
-            None,
+            requested,
             weights_stream,
             stream,
         )?;
     }
     if dense_stream.is_none() {
-        for unit in stage.media_units.iter().copied() {
-            let mut layer = stage.layer_adapter.new_cartesian_layer(
-                unit.group,
-                unit.index,
-                parallel_layout.as_ref(),
-                stage.expert_assignment.as_ref(),
-                stream,
-            )?;
-            let bindings = binding_adapter.cartesian_layer_bindings(
-                unit.group,
-                unit.index,
-                &layer,
-                store.as_ref(),
-                parallel_layout.as_ref(),
-                stage.expert_assignment.as_ref(),
-                stream,
-            )?;
-            loaded.load(
-                &mut layer,
-                store.as_ref(),
-                &bindings,
-                None,
-                weights_stream,
-                stream,
-            )?;
-            stage.media_layers.push(layer);
-        }
         for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
-            let descriptor = QwenHybridLayer::Text(Box::new(layer.clone()));
             let bindings = binding_adapter.cartesian_layer_bindings(
-                text_group,
+                0,
                 global_layer,
-                &descriptor,
+                layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
@@ -17575,17 +18626,51 @@ fn load_qwen_hybrid_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
-                    quantize_on_load,
+                    requested,
                     weights_stream,
                     stream,
-                    &|name| name.contains("mlp.experts."),
+                    &|name| name.contains(".experts."),
                 )?;
             } else {
                 loaded.load(
                     layer,
                     store.as_ref(),
                     &bindings,
-                    quantize_on_load,
+                    requested,
+                    weights_stream,
+                    stream,
+                )?;
+            }
+        }
+    }
+    if owns_mtp {
+        for (depth, layers) in stage.prediction_layers.iter_mut().enumerate() {
+            let layer = &mut layers[0];
+            let bindings = binding_adapter.cartesian_layer_bindings(
+                depth + 1,
+                0,
+                layer,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+                stage.expert_assignment.as_ref(),
+                stream,
+            )?;
+            if external_experts {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    requested,
+                    weights_stream,
+                    stream,
+                    &|name| name.contains(".experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    requested,
                     weights_stream,
                     stream,
                 )?;
@@ -17593,97 +18678,606 @@ fn load_qwen_hybrid_pipeline(
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
+    let checkpoint_diagnostics_before_deferred = store.source_diagnostics()?;
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        let media_units = stage.media_units.clone();
-        let media_count = media_units.len();
-        let text_start = stage.range.start;
-        let unit_count = media_count + stage.range.len();
-        stage.dense_layers = Some(
-            build_pipeline_layer_storage::<QwenHybridLayer, _, _>(
-                Arc::clone(&store),
-                0..unit_count,
-                options,
-                static_bytes,
-                info.materialization.clone(),
-                stream,
-                weights_stream,
-                |ordinal, stream| {
-                    if let Some(unit) = media_units.get(ordinal) {
-                        streamed_adapter.new_cartesian_layer(
-                            unit.group,
-                            unit.index,
-                            streamed_layout.as_ref(),
-                            streamed_assignment.as_ref(),
-                            stream,
-                        )
-                    } else {
-                        streamed_adapter.new_cartesian_layer(
-                            text_group,
-                            text_start + (ordinal - media_count),
-                            streamed_layout.as_ref(),
-                            streamed_assignment.as_ref(),
-                            stream,
-                        )
-                    }
-                },
-                |ordinal, layer, store| {
-                    if let Some(unit) = media_units.get(ordinal) {
-                        binding_adapter.cartesian_layer_bindings(
-                            unit.group,
-                            unit.index,
-                            layer,
-                            store,
-                            streamed_layout.as_ref(),
-                            streamed_assignment.as_ref(),
-                            stream,
-                        )
-                    } else {
-                        binding_adapter.cartesian_layer_bindings(
-                            text_group,
-                            text_start + (ordinal - media_count),
-                            layer,
-                            store,
-                            streamed_layout.as_ref(),
-                            streamed_assignment.as_ref(),
-                            stream,
-                        )
-                    }
-                },
-            )?
-            .with_execution_offset(media_count)?,
-        );
+        stage.dense_layers = Some(build_pipeline_layer_storage(
+            Arc::clone(&store),
+            stage.range.clone(),
+            options,
+            static_bytes,
+            info.materialization.clone(),
+            stream,
+            weights_stream,
+            |global_layer, stream| {
+                streamed_adapter.new_cartesian_layer(
+                    0,
+                    global_layer,
+                    streamed_layout.as_ref(),
+                    streamed_assignment.as_ref(),
+                    stream,
+                )
+            },
+            |global_layer, layer, store| {
+                binding_adapter.cartesian_layer_bindings(
+                    0,
+                    global_layer,
+                    layer,
+                    store,
+                    streamed_layout.as_ref(),
+                    streamed_assignment.as_ref(),
+                    stream,
+                )
+            },
+        )?);
         if external_experts {
             stage.dense_layers = stage
                 .dense_layers
                 .take()
-                .map(|storage| storage.with_independent_experts("mlp.experts."));
+                .map(|storage| storage.with_independent_experts(".experts."));
         }
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
-        info.planned_owned_parameter_bytes =
-            static_bytes.checked_add(layer_bytes).ok_or_else(|| {
-                Error::Parallel("Qwen hybrid pipeline planned bytes overflowed".into())
-            })?;
+        info.planned_owned_parameter_bytes = static_bytes
+            .checked_add(layer_bytes)
+            .ok_or_else(|| Error::Parallel("Qwen hybrid pipeline bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if external_experts {
-        let entries =
-            crate::composition::mlx_architectures::qwen::hybrid::layerwise::qwen_hybrid_pipeline_expert_catalog(
-                &source_args,
-                store.as_ref(),
-                stage.range.clone(),
-                info.is_last,
-            )?
-            .into_iter()
-            .filter(|entry| {
-                stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+        let target = source_args.num_hidden_layers as usize;
+        let entries = crate::composition::qwen::hybrid::expert_catalog_selected(
+            &source_args,
+            store.as_ref(),
+            parallel_layout.as_ref(),
+            |layer| stage.range.contains(&layer) || (owns_mtp && layer >= target),
+        )?
+        .into_iter()
+        .filter(|entry| {
+            stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+            })
+        })
+        .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            let cache = build_pipeline_expert_cache(
+                Arc::clone(&store),
+                entries,
+                expert_cache_options,
+                expert_quantization,
+                weights_stream,
+                stream,
+            )?;
+            info.planned_owned_parameter_bytes = info
+                .planned_owned_parameter_bytes
+                .checked_add(cache.report()?.owned_bytes)
+                .ok_or_else(|| Error::Parallel("Qwen hybrid expert bytes overflowed".into()))?;
+            stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
+        }
+    }
+    let checkpoint_diagnostics = if explicit_expert_cache {
+        store.source_diagnostics()?
+    } else {
+        checkpoint_diagnostics_before_deferred
+    };
+    let mut materialized_shards = if info.materialization.is_some() {
+        store.materialized_source_shards()
+    } else {
+        Vec::new()
+    };
+    materialized_shards.extend(checkpoint_backing_shards(
+        store.as_ref(),
+        info.owned_tensors.iter().map(String::as_str),
+    )?);
+    if dense_stream.is_some() {
+        materialized_shards.extend(checkpoint_layer_backing_shards(
+            store.as_ref(),
+            "model.layers.",
+            stage.range.clone(),
+        )?);
+    }
+    materialized_shards.sort();
+    materialized_shards.dedup();
+    info.opened_checkpoint_shards = materialized_shards;
+    info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_neutral_qwen_conditional_pipeline(
+    source: eredu_architectures::qwen::hybrid::ParsedHybridConfig,
+    store: SharedCheckpointSource,
+    topology: MlxParallelContext,
+    requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<PipelineModel, Error> {
+    let explicit_expert_cache = expert_cache_options.is_some();
+    let expert_cache_options = expert_cache_options
+        .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
+    let external_experts = expert_cache_options.is_some();
+    let binding_adapter = if external_experts {
+        QwenConditionalPipelineAdapter::new_external_experts(source.clone(), stream)?
+    } else {
+        QwenConditionalPipelineAdapter::new(source.clone(), stream)?
+    };
+    let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
+    topology.preflight(
+        Some(source.text.num_hidden_layers as usize),
+        expert_assignment
+            .as_ref()
+            .map(ExpertAssignment::global_expert_count),
+    )?;
+    if requested_quantization.is_some() && source.text.fp8.is_some() {
+        return Err(Error::Quantization(
+            "conditional Qwen3.5 pipeline cannot implicitly transcode checkpoint-native FP8 weights"
+                .into(),
+        ));
+    }
+    let quantize_on_load = requested_quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "conditional Qwen3.5 pipeline",
+                source.text.quantization,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    let mut target = source.clone();
+    if let Some(quantization) = quantize_on_load {
+        target.text.quantization = Some(quantization);
+        target.text.fp8 = None;
+        target.text.linear_formats.clear();
+        target
+            .vision
+            .as_mut()
+            .expect("validated conditional vision")
+            .apply_load_time_quantization(quantization);
+    }
+    let target_adapter = if external_experts {
+        QwenConditionalPipelineAdapter::new_external_experts(target.clone(), stream)?
+    } else {
+        QwenConditionalPipelineAdapter::new(target.clone(), stream)?
+    };
+    let range = topology.layer_range(source.text.num_hidden_layers as usize)?;
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        source.text.num_hidden_layers as usize,
+        ModelKind::Qwen35,
+        source.text.hidden_size,
+    );
+    let vision_count = source
+        .vision
+        .as_ref()
+        .expect("validated conditional vision")
+        .layer_count();
+    info.placement = Arc::new(multimodal_placement(
+        topology.pipeline_parallel_size,
+        source.text.num_hidden_layers as usize,
+        Some(vision_count),
+        None,
+    )?);
+    let mut stage =
+        NeutralQwenConditionalStage::new(target.clone(), range, &info, external_experts, stream)?;
+    stage.expert_assignment = expert_assignment;
+    if let Some(assignment) = stage.expert_assignment.as_ref() {
+        info.global_expert_count = Some(assignment.global_expert_count());
+        info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+    }
+    let parallel_layout = if topology.tensor_parallel_size > 1 {
+        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+        let mut planner = build.planner();
+        binding_adapter.register_parallel_parameters(&mut planner, stream)?;
+        let (_, layout) = planner.finish()?;
+        stage.parallel_geometry = Some(binding_adapter.local_state_geometry(&layout)?);
+        stage.adapter.configure_parallel_static(&layout, stream)?;
+        stage.parallel_embedding = (info.is_first || !stage.vision_range.is_empty())
+            .then(|| {
+                crate::backend::mlx::nn::parallel::VocabParallelEmbedding::unloaded(
+                    target.text.vocab_size as usize,
+                    target.text.hidden_size,
+                    target
+                        .text
+                        .linear_format("model.embed_tokens.weight")
+                        .weight_quantization(),
+                    build,
+                    stream,
+                )
+                .and_then(|module| {
+                    named_pipeline_parallel_embedding(module, "model.embed_tokens.weight")
                 })
             })
-            .collect::<Vec<_>>();
+            .transpose()?;
+        stage.parallel_output_embedding = (info.is_last
+            && stage.parallel_embedding.is_none()
+            && (target.text.tie_word_embeddings || target.text.mtp_num_hidden_layers > 0))
+            .then(|| {
+                crate::backend::mlx::nn::parallel::VocabParallelEmbedding::unloaded(
+                    target.text.vocab_size as usize,
+                    target.text.hidden_size,
+                    target
+                        .text
+                        .linear_format("model.embed_tokens.weight")
+                        .weight_quantization(),
+                    build,
+                    stream,
+                )
+                .and_then(|module| {
+                    named_pipeline_parallel_embedding(module, "model.embed_tokens.weight")
+                })
+            })
+            .transpose()?;
+        stage.parallel_lm_head = (info.is_last && !target.text.tie_word_embeddings)
+            .then(|| {
+                crate::backend::mlx::nn::parallel::VocabParallelLmHead::unloaded(
+                    target.text.hidden_size,
+                    target.text.vocab_size as usize,
+                    target
+                        .text
+                        .linear_format("lm_head.weight")
+                        .weight_quantization(),
+                    build,
+                    stream,
+                )
+                .and_then(|module| named_pipeline_parallel_lm_head(module, "lm_head.weight"))
+            })
+            .transpose()?;
+        Some(layout)
+    } else {
+        None
+    };
+    stage.parallel_layout = parallel_layout.clone();
+    stage.vision_layers = stage
+        .vision_range
+        .clone()
+        .map(|index| {
+            stage
+                .adapter
+                .new_cartesian_layer(0, index, parallel_layout.as_ref(), stream)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    stage.layers = stage
+        .range
+        .clone()
+        .map(|index| {
+            stage
+                .adapter
+                .new_cartesian_layer(1, index, parallel_layout.as_ref(), stream)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let owns_mtp = info.is_last && target.text.mtp_num_hidden_layers > 0;
+    info.owns_embedded_mtp = owns_mtp;
+    info.embedded_mtp_layers = if owns_mtp {
+        target.text.mtp_num_hidden_layers as usize
+    } else {
+        0
+    };
+    if owns_mtp {
+        for depth in 0..target.text.mtp_num_hidden_layers as usize {
+            stage
+                .prediction_layers
+                .push(vec![stage.adapter.new_cartesian_layer(
+                    depth + 2,
+                    0,
+                    parallel_layout.as_ref(),
+                    stream,
+                )?]);
+        }
+    }
+    let need_vision = !stage.vision_range.is_empty();
+    let need_embedding = info.is_first
+        || need_vision
+        || (info.is_last
+            && (target.text.tie_word_embeddings || target.text.mtp_num_hidden_layers > 0));
+    let static_roles = selected_pipeline_static_roles([
+        ("vision", need_vision),
+        ("embedding", need_embedding),
+        ("norm", info.is_last),
+        ("output", info.is_last && !target.text.tie_word_embeddings),
+    ]);
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let mut selection =
+                PipelineStageQuantizationSelection::new(&static_roles, 1, stage.range.clone())
+                    .with_layer_group(0, stage.vision_range.clone());
+            if owns_mtp {
+                for depth in 0..target.text.mtp_num_hidden_layers as usize {
+                    selection = selection.with_layer_group(depth + 2, 0..1);
+                }
+            }
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_adapter,
+                selection,
+                quantization,
+                stream,
+            )?;
+            (store, Some(report))
+        }
+        None => (store, None),
+    };
+    let expert_quantization = quantize_on_load;
+    let requested = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &target_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
+    let mut loaded = PipelineLoadAccumulator::new("conditional Qwen3.5");
+    if need_vision {
+        let bindings = pipeline_static_bindings(&static_units, "vision")?.to_vec();
+        let bindings = if let Some(layout) = parallel_layout.as_ref() {
+            shard_layer_bindings(bindings, "", store.as_ref(), layout)?
+        } else {
+            bindings
+        };
+        let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
+            MlxBackend,
+            MlxHybridState,
+        >>::static_modules_mut(stage.adapter.architecture_mut());
+        loaded.load(
+            &mut MlxModuleRef::new(&mut modules.vision),
+            store.as_ref(),
+            &bindings,
+            requested,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if need_embedding {
+        let bindings = pipeline_static_bindings(&static_units, "embedding")?.to_vec();
+        let bindings = if let Some(layout) = parallel_layout.as_ref() {
+            shard_layer_bindings(bindings, "", store.as_ref(), layout)?
+        } else {
+            bindings
+        };
+        if let Some(module) = &mut stage.parallel_embedding {
+            loaded.load(
+                module,
+                store.as_ref(),
+                &bindings,
+                requested,
+                weights_stream,
+                stream,
+            )?;
+        } else if let Some(module) = &mut stage.parallel_output_embedding {
+            loaded.load(
+                module,
+                store.as_ref(),
+                &bindings,
+                requested,
+                weights_stream,
+                stream,
+            )?;
+        } else {
+            let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
+                MlxBackend,
+                MlxHybridState,
+            >>::static_modules_mut(stage.adapter.architecture_mut());
+            loaded.load(
+                &mut modules.text.embeddings,
+                store.as_ref(),
+                &bindings,
+                requested,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+    if info.is_last {
+        let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
+            MlxBackend,
+            MlxHybridState,
+        >>::static_modules_mut(stage.adapter.architecture_mut());
+        loaded.load(
+            &mut modules.text.norm,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "norm")?,
+            requested,
+            weights_stream,
+            stream,
+        )?;
+        if !target.text.tie_word_embeddings {
+            let bindings = pipeline_static_bindings(&static_units, "output")?.to_vec();
+            if let Some(module) = &mut stage.parallel_lm_head {
+                let bindings = shard_layer_bindings(
+                    bindings,
+                    "",
+                    store.as_ref(),
+                    parallel_layout.as_ref().expect("TP layout"),
+                )?;
+                loaded.load(
+                    module,
+                    store.as_ref(),
+                    &bindings,
+                    requested,
+                    weights_stream,
+                    stream,
+                )?;
+            } else if let Some(head) = &mut modules.text.lm_head {
+                loaded.load(
+                    head,
+                    store.as_ref(),
+                    &bindings,
+                    requested,
+                    weights_stream,
+                    stream,
+                )?;
+            }
+        }
+    }
+    if dense_stream.is_none() {
+        for (index, layer) in stage.vision_range.clone().zip(&mut stage.vision_layers) {
+            let bindings = binding_adapter.cartesian_layer_bindings(
+                0,
+                index,
+                layer,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+                stream,
+            )?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                requested,
+                weights_stream,
+                stream,
+            )?;
+        }
+        for (index, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let bindings = binding_adapter.cartesian_layer_bindings(
+                1,
+                index,
+                layer,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+                stream,
+            )?;
+            if external_experts {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    requested,
+                    weights_stream,
+                    stream,
+                    &|name| name.contains(".experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    requested,
+                    weights_stream,
+                    stream,
+                )?;
+            }
+        }
+    }
+    if owns_mtp {
+        for (depth, layers) in stage.prediction_layers.iter_mut().enumerate() {
+            let layer = &mut layers[0];
+            let bindings = binding_adapter.cartesian_layer_bindings(
+                depth + 2,
+                0,
+                layer,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+                stream,
+            )?;
+            if external_experts {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    requested,
+                    weights_stream,
+                    stream,
+                    &|name| name.contains(".experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    requested,
+                    weights_stream,
+                    stream,
+                )?;
+            }
+        }
+    }
+    let static_bytes = loaded.finish(&mut info)?;
+    let diagnostics_before_deferred = store.source_diagnostics()?;
+    if let Some(options) = dense_stream {
+        let layout = parallel_layout.clone();
+        let vision_start = stage.vision_range.start;
+        let vision_count = stage.vision_range.len();
+        let text_start = stage.range.start;
+        let adapter = &stage.adapter;
+        let dense = build_pipeline_layer_storage(
+            Arc::clone(&store),
+            0..vision_count + stage.range.len(),
+            options,
+            static_bytes,
+            info.materialization.clone(),
+            stream,
+            weights_stream,
+            |ordinal, stream| {
+                if ordinal < vision_count {
+                    adapter.new_cartesian_layer(0, vision_start + ordinal, layout.as_ref(), stream)
+                } else {
+                    adapter.new_cartesian_layer(
+                        1,
+                        text_start + ordinal - vision_count,
+                        layout.as_ref(),
+                        stream,
+                    )
+                }
+            },
+            |ordinal, layer, store| {
+                if ordinal < vision_count {
+                    adapter.cartesian_layer_bindings(
+                        0,
+                        vision_start + ordinal,
+                        layer,
+                        store,
+                        layout.as_ref(),
+                        stream,
+                    )
+                } else {
+                    adapter.cartesian_layer_bindings(
+                        1,
+                        text_start + ordinal - vision_count,
+                        layer,
+                        store,
+                        layout.as_ref(),
+                        stream,
+                    )
+                }
+            },
+        )?
+        .with_execution_offset(vision_count)?;
+        stage.dense_layers = Some(if external_experts {
+            dense.with_independent_experts(".experts.")
+        } else {
+            dense
+        });
+        info.planned_owned_parameter_bytes = static_bytes
+            .checked_add(stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?)
+            .ok_or_else(|| Error::Parallel("conditional Qwen3.5 bytes overflowed".into()))?;
+    } else {
+        info.planned_owned_parameter_bytes = static_bytes;
+    }
+    if external_experts {
+        let target_layers = source.text.num_hidden_layers as usize;
+        let entries = crate::composition::qwen::hybrid::expert_catalog_selected(
+            &source.text,
+            store.as_ref(),
+            parallel_layout.as_ref(),
+            |layer| stage.range.contains(&layer) || (owns_mtp && layer >= target_layers),
+        )?
+        .into_iter()
+        .filter(|entry| {
+            stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+            })
+        })
+        .collect::<Vec<_>>();
         if !entries.is_empty() {
             let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
@@ -17697,1005 +19291,39 @@ fn load_qwen_hybrid_pipeline(
                 .planned_owned_parameter_bytes
                 .checked_add(cache.report()?.owned_bytes)
                 .ok_or_else(|| {
-                    Error::Parallel("Qwen hybrid pipeline expert byte total overflowed".into())
+                    Error::Parallel("conditional Qwen3.5 expert bytes overflowed".into())
                 })?;
             stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
         }
     }
-    let checkpoint_diagnostics = store.source_diagnostics()?;
-    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
+    let diagnostics = if explicit_expert_cache {
+        store.source_diagnostics()?
+    } else {
+        diagnostics_before_deferred
+    };
+    let mut materialized_shards = if info.materialization.is_some() {
+        store.materialized_source_shards()
+    } else {
+        Vec::new()
+    };
+    materialized_shards.extend(checkpoint_backing_shards(
+        store.as_ref(),
+        info.owned_tensors.iter().map(String::as_str),
+    )?);
+    if dense_stream.is_some() {
+        materialized_shards.extend(checkpoint_layer_backing_shards(
+            store.as_ref(),
+            "model.layers.",
+            stage.range.clone(),
+        )?);
+    }
+    materialized_shards.sort();
+    materialized_shards.dedup();
     info.opened_checkpoint_shards = materialized_shards;
-    info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
+    info.checkpoint_diagnostics = Some(diagnostics);
     PipelineModel::from_adapter(topology, info, PipelineStage(stage))
 }
 
-fn forward_qwen_hybrid_tensor_layer(
-    layer: &mut qwen_hybrid::TransformerBlock,
-    global_layer: usize,
-    hidden: &Array,
-    mask: Option<&Array>,
-    cache: &mut PipelineLayerCache,
-    group: &Group,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    match (layer.layer_policy, cache) {
-        (
-            qwen_hybrid::LayerPolicy::SelfAttention(crate::AttentionPolicy::Full),
-            PipelineLayerCache::KeyValue {
-                global_layer: cached,
-                cache,
-                slots,
-            },
-        ) if *cached == global_layer && slots.is_empty() => {
-            let cache: &mut dyn KeyValueCache = match cache {
-                PipelineKeyValueCache::Standard(cache) => cache,
-                PipelineKeyValueCache::Paged(cache) => cache,
-            };
-            Ok(layer.forward_tensor_parallel_with_operator_cache(
-                hidden,
-                mask,
-                Some(qwen_hybrid::OperatorCache::FullAttention(cache)),
-                group,
-                stream,
-            )?)
-        }
-        (
-            qwen_hybrid::LayerPolicy::LinearAttention,
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            },
-        ) if *cached == global_layer
-            && slots.len() == 2
-            && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
-            && slots[1].policy.role == StateTensorRole::Recurrent =>
-        {
-            let (conv, recurrent) = slots.split_at_mut(1);
-            if conv[0].offset != recurrent[0].offset {
-                return Err(Error::Parallel(format!(
-                    "Qwen hybrid TP+PP state offsets disagree at global layer {global_layer}"
-                )));
-            }
-            let mut local = qwen_hybrid::LinearAttentionCache {
-                conv_state: conv[0].value.take(),
-                recurrent_state: recurrent[0].value.take(),
-                offset: conv[0].offset,
-            };
-            let output = layer.forward_tensor_parallel_with_operator_cache(
-                hidden,
-                mask,
-                Some(qwen_hybrid::OperatorCache::LinearAttention(&mut local)),
-                group,
-                stream,
-            )?;
-            conv[0].value = local.conv_state;
-            conv[0].offset = local.offset;
-            recurrent[0].value = local.recurrent_state;
-            recurrent[0].offset = local.offset;
-            Ok(output)
-        }
-        _ => Err(Error::Parallel(format!(
-            "Qwen hybrid TP+PP cache does not match global layer {global_layer}"
-        ))),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn forward_qwen_hybrid_expert_layer(
-    layer: &mut qwen_hybrid::TransformerBlock,
-    global_layer: usize,
-    hidden: &Array,
-    mask: Option<&Array>,
-    cache: &mut PipelineLayerCache,
-    assignment: &ExpertAssignment,
-    group: &Group,
-    statistics: &mut RoutingStatistics,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    match (layer.layer_policy, cache) {
-        (
-            qwen_hybrid::LayerPolicy::SelfAttention(crate::AttentionPolicy::Full),
-            PipelineLayerCache::KeyValue {
-                global_layer: cached,
-                cache,
-                slots,
-            },
-        ) if *cached == global_layer && slots.is_empty() => {
-            let cache: &mut dyn KeyValueCache = match cache {
-                PipelineKeyValueCache::Standard(cache) => cache,
-                PipelineKeyValueCache::Paged(cache) => cache,
-            };
-            Ok(layer.forward_expert_parallel_with_operator_cache(
-                hidden,
-                mask,
-                Some(qwen_hybrid::OperatorCache::FullAttention(cache)),
-                assignment,
-                group,
-                statistics,
-                stream,
-            )?)
-        }
-        (
-            qwen_hybrid::LayerPolicy::LinearAttention,
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            },
-        ) if *cached == global_layer
-            && slots.len() == 2
-            && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
-            && slots[1].policy.role == StateTensorRole::Recurrent =>
-        {
-            let (conv, recurrent) = slots.split_at_mut(1);
-            if conv[0].offset != recurrent[0].offset {
-                return Err(Error::Parallel(format!(
-                    "Qwen hybrid PP+EP state offsets disagree at global layer {global_layer}"
-                )));
-            }
-            let mut local = qwen_hybrid::LinearAttentionCache {
-                conv_state: conv[0].value.take(),
-                recurrent_state: recurrent[0].value.take(),
-                offset: conv[0].offset,
-            };
-            let output = layer.forward_expert_parallel_with_operator_cache(
-                hidden,
-                mask,
-                Some(qwen_hybrid::OperatorCache::LinearAttention(&mut local)),
-                assignment,
-                group,
-                statistics,
-                stream,
-            )?;
-            conv[0].value = local.conv_state;
-            conv[0].offset = local.offset;
-            recurrent[0].value = local.recurrent_state;
-            recurrent[0].offset = local.offset;
-            Ok(output)
-        }
-        _ => Err(Error::Parallel(format!(
-            "Qwen hybrid PP+EP cache does not match global layer {global_layer}"
-        ))),
-    }
-}
-
-fn forward_qwen_hybrid_operator_layer<F>(
-    layer: &mut qwen_hybrid::TransformerBlock,
-    global_layer: usize,
-    cache: &mut PipelineLayerCache,
-    mut forward: F,
-) -> Result<Array, Error>
-where
-    F: for<'a> FnMut(
-        &mut qwen_hybrid::TransformerBlock,
-        Option<qwen_hybrid::OperatorCache<'a>>,
-    ) -> Result<Array, Exception>,
-{
-    match (layer.layer_policy, cache) {
-        (
-            qwen_hybrid::LayerPolicy::SelfAttention(crate::AttentionPolicy::Full),
-            PipelineLayerCache::KeyValue {
-                global_layer: cached,
-                cache,
-                slots,
-            },
-        ) if *cached == global_layer && slots.is_empty() => {
-            let cache: &mut dyn KeyValueCache = match cache {
-                PipelineKeyValueCache::Standard(cache) => cache,
-                PipelineKeyValueCache::Paged(cache) => cache,
-            };
-            Ok(forward(
-                layer,
-                Some(qwen_hybrid::OperatorCache::FullAttention(cache)),
-            )?)
-        }
-        (
-            qwen_hybrid::LayerPolicy::LinearAttention,
-            PipelineLayerCache::StateSlots {
-                global_layer: cached,
-                slots,
-            },
-        ) if *cached == global_layer
-            && slots.len() == 2
-            && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
-            && slots[1].policy.role == StateTensorRole::Recurrent =>
-        {
-            let (conv, recurrent) = slots.split_at_mut(1);
-            if conv[0].offset != recurrent[0].offset {
-                return Err(Error::Parallel(format!(
-                    "Qwen hybrid Cartesian state offsets disagree at global layer {global_layer}"
-                )));
-            }
-            let mut local = qwen_hybrid::LinearAttentionCache {
-                conv_state: conv[0].value.take(),
-                recurrent_state: recurrent[0].value.take(),
-                offset: conv[0].offset,
-            };
-            let output = forward(
-                layer,
-                Some(qwen_hybrid::OperatorCache::LinearAttention(&mut local)),
-            )?;
-            conv[0].value = local.conv_state;
-            conv[0].offset = local.offset;
-            recurrent[0].value = local.recurrent_state;
-            recurrent[0].offset = local.offset;
-            Ok(output)
-        }
-        _ => Err(Error::Parallel(format!(
-            "Qwen hybrid Cartesian cache does not match global layer {global_layer}"
-        ))),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn forward_qwen_hybrid_tensor_expert_layer(
-    layer: &mut qwen_hybrid::TransformerBlock,
-    global_layer: usize,
-    hidden: &Array,
-    mask: Option<&Array>,
-    cache: &mut PipelineLayerCache,
-    tensor_group: &Group,
-    assignment: &ExpertAssignment,
-    expert_group: &Group,
-    statistics: &mut RoutingStatistics,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    forward_qwen_hybrid_operator_layer(layer, global_layer, cache, |layer, cache| {
-        layer.forward_tensor_expert_parallel_with_operator_cache(
-            hidden,
-            mask,
-            cache,
-            tensor_group,
-            assignment,
-            expert_group,
-            statistics,
-            stream,
-        )
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn forward_qwen_hybrid_external_expert_layer(
-    args: &qwen_hybrid::ModelArgs,
-    layer: &mut qwen_hybrid::TransformerBlock,
-    global_layer: usize,
-    hidden: &Array,
-    mask: Option<&Array>,
-    cache: &mut PipelineLayerCache,
-    tensor_group: Option<&Group>,
-    assignment: &ExpertAssignment,
-    expert_group: Option<&Group>,
-    pass: ExpertPass,
-    expert_cache: &ExpertCache,
-    statistics: &mut RoutingStatistics,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    forward_qwen_hybrid_operator_layer(layer, global_layer, cache, |layer, cache| {
-        let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-            execute_pipeline_cached_qwen_hybrid(
-                args,
-                global_layer,
-                hidden,
-                ids,
-                weights,
-                pass,
-                expert_cache,
-                assignment,
-                expert_group,
-                statistics,
-                stream,
-            )
-            .map_err(|error| Exception::custom(error.to_string()))
-        };
-        match tensor_group {
-            Some(group) => layer.forward_tensor_with_operator_cache_and_expert_executor(
-                hidden, mask, cache, group, stream, execute,
-            ),
-            None => layer.forward_with_operator_cache_and_expert_executor(
-                hidden, mask, cache, stream, execute,
-            ),
-        }
-    })
-}
-
-impl QwenHybridStage {
-    fn prepare_multimodal_ingress(
-        &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
-        step: PipelineStep,
-        execution: Option<&ParallelExecutionContext<'_>>,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        if !self.has_multimodal_ingress || self.media_layer_count != self.media_units.len() {
-            return Err(Error::UnsupportedArchitecture(
-                "Qwen3.5 pipeline typed ingress requires configured placed vision semantics".into(),
-            ));
-        }
-        let mut state = self
-            .layer_adapter
-            .begin_pipeline_ingress(input, execution, stream)?;
-        self.execute_multimodal_ingress_state(&mut state, step, execution, stream)?;
-        let hidden = self
-            .layer_adapter
-            .finish_pipeline_ingress(state, execution, stream)?;
-        if hidden.dim(0) != step.batch_size || hidden.dim(1) != step.sequence_length {
-            return Err(Error::Parallel(format!(
-                "Qwen3.5 multimodal pipeline ingress produced [{}, {}] batch/sequence geometry, scheduled [{}, {}]",
-                hidden.dim(0),
-                hidden.dim(1),
-                step.batch_size,
-                step.sequence_length
-            )));
-        }
-        Ok(hidden)
-    }
-
-    fn execute_multimodal_ingress_state(
-        &mut self,
-        state: &mut crate::composition::mlx_architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState,
-        step: PipelineStep,
-        execution: Option<&ParallelExecutionContext<'_>>,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        let active_indices = self
-            .media_units
-            .iter()
-            .enumerate()
-            .filter_map(|(ordinal, unit)| {
-                self.layer_adapter
-                    .should_execute_pipeline_group(unit.group, state)
-                    .then_some(ordinal)
-            })
-            .collect::<Vec<_>>();
-        let prefill = step.sequence_length > 1;
-        let forward_guard = self
-            .dense_layers
-            .as_ref()
-            .and_then(|layers| match &layers.controller {
-                PipelineLayerController::LayerwiseHost(_) => None,
-                PipelineLayerController::DenseDiskStream(controller) => {
-                    Some(controller.forward_guard(prefill, &layers.residency))
-                }
-            })
-            .transpose()?;
-        let group_guard = self
-            .dense_layers
-            .as_ref()
-            .and_then(|layers| match &layers.controller {
-                PipelineLayerController::LayerwiseHost(_) => None,
-                PipelineLayerController::DenseDiskStream(controller) => {
-                    Some(controller.group_guard(&layers.residency, "pipeline_stage"))
-                }
-            });
-        let mut transfer_window = self
-            .dense_layers
-            .as_ref()
-            .map(|storage| storage.transfer_window(active_indices.iter().copied(), prefill))
-            .transpose()?
-            .flatten();
-        for ordinal in active_indices {
-            let unit = self.media_units[ordinal];
-            let retained = if let Some(storage) = self.dense_layers.as_ref() {
-                let transfer = transfer_window
-                    .as_mut()
-                    .map(|window| window.next(stream))
-                    .transpose()?;
-                let lease = if transfer.is_none() {
-                    Some(storage.prepare_layerwise_absolute(ordinal)?)
-                } else {
-                    None
-                };
-                let mut layer = self.layer_adapter.new_cartesian_layer(
-                    unit.group,
-                    unit.index,
-                    self.parallel_layout.as_ref(),
-                    self.expert_assignment.as_ref(),
-                    stream,
-                )?;
-                populate_module_from_lease(
-                    &mut layer,
-                    transfer
-                        .as_ref()
-                        .map(|transfer| transfer.lease())
-                        .or(lease.as_ref())
-                        .expect("pipeline storage provides a residency lease"),
-                )?;
-                let retained = self.layer_adapter.forward_pipeline_media_layer(
-                    unit.group, unit.index, &mut layer, state, execution, stream,
-                )?;
-                synchronize_outputs(retained.iter())?;
-                drop(transfer);
-                drop(lease);
-                if let Some(window) = &mut transfer_window {
-                    window.refill()?;
-                } else {
-                    storage.trim_after_absolute(ordinal)?;
-                }
-                retained
-            } else {
-                let layer = self.media_layers.get_mut(ordinal).ok_or_else(|| {
-                    Error::Parallel(format!(
-                        "Qwen3.5 pipeline media unit {ordinal} was not materialized"
-                    ))
-                })?;
-                self.layer_adapter.forward_pipeline_media_layer(
-                    unit.group, unit.index, layer, state, execution, stream,
-                )?
-            };
-            if self.dense_layers.is_none() {
-                eval(retained.iter())?;
-            }
-        }
-        if let Some(storage) = self.dense_layers.as_ref() {
-            storage.complete_forward()?;
-        }
-        if let Some(guard) = group_guard {
-            guard.complete()?;
-        }
-        if let Some(guard) = forward_guard {
-            guard.complete()?;
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        args: qwen_hybrid::ModelArgs,
-        image_token_id: Option<i32>,
-        video_token_id: Option<i32>,
-        vision_config: Option<
-            crate::composition::mlx_architectures::qwen::vl::vision::VisionConfig,
-        >,
-        range: Range<usize>,
-        info: &PipelineStageInfo,
-        external_experts: bool,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let has_multimodal_ingress = vision_config.is_some();
-        let layer_adapter = if has_multimodal_ingress {
-            QwenHybridLayerwiseAdapter::new_pipeline(
-                args.clone(),
-                image_token_id,
-                video_token_id,
-                vision_config,
-                external_experts,
-                stream,
-            )?
-        } else if external_experts {
-            QwenHybridLayerwiseAdapter::new_text_external_experts(args.clone(), stream)?
-        } else {
-            QwenHybridLayerwiseAdapter::new_text(args.clone(), stream)?
-        };
-        let graph = layer_adapter.execution_graph()?;
-        let media_units = layer_adapter
-            .pipeline_media_groups()
-            .into_iter()
-            .flat_map(|(group, _)| {
-                info.placement
-                    .group(graph.groups()[group].id())
-                    .and_then(|placement| placement.local_units(info.pipeline_stage))
-                    .into_iter()
-                    .flatten()
-                    .map(move |index| PipelineMediaUnit { group, index })
-            })
-            .collect::<Vec<_>>();
-        let media_layer_count = media_units.len();
-        let adapter_owns_ingress = info.is_first && has_multimodal_ingress;
-        let complete = qwen_hybrid::Model::new(args.clone(), None, None, None, stream)?;
-        let qwen_hybrid::Model { model, lm_head, .. } = complete;
-        let qwen_hybrid::Qwen35TextModel {
-            embed_tokens,
-            layers,
-            norm,
-            ..
-        } = model;
-        let mut embedding = None;
-        let mut output_embedding = None;
-        if info.is_first && !adapter_owns_ingress {
-            embedding = Some(embed_tokens);
-        } else if info.is_last && args.tie_word_embeddings {
-            output_embedding = Some(embed_tokens);
-        }
-        let layers = layers
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, layer)| range.contains(&index).then_some(layer))
-            .collect();
-        Ok(Self {
-            args,
-            layer_adapter,
-            range,
-            has_multimodal_ingress,
-            media_units,
-            media_layers: Vec::new(),
-            media_layer_count,
-            embedding,
-            output_embedding,
-            layers,
-            dense_layers: None,
-            norm: info.is_last.then_some(norm),
-            lm_head: info.is_last.then_some(lm_head).flatten(),
-            parallel_embedding: None,
-            parallel_output_embedding: None,
-            parallel_lm_head: None,
-            parallel_layout: None,
-            parallel_geometry: None,
-            expert_assignment: None,
-            expert_storage: if external_experts {
-                PipelineExpertStorage::ExternalEmpty
-            } else {
-                PipelineExpertStorage::LayerLocal
-            },
-            routing_statistics: RoutingStatistics::default(),
-        })
-    }
-
-    fn forward_layer(
-        layer: &mut qwen_hybrid::TransformerBlock,
-        global_layer: usize,
-        hidden: &Array,
-        mask: Option<&Array>,
-        cache: &mut PipelineLayerCache,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        match (layer.layer_policy, cache) {
-            (
-                qwen_hybrid::LayerPolicy::SelfAttention(crate::AttentionPolicy::Full),
-                PipelineLayerCache::KeyValue {
-                    global_layer: cached,
-                    cache,
-                    slots,
-                },
-            ) if *cached == global_layer && slots.is_empty() => {
-                let cache: &mut dyn KeyValueCache = match cache {
-                    PipelineKeyValueCache::Standard(cache) => cache,
-                    PipelineKeyValueCache::Paged(cache) => cache,
-                };
-                Ok(layer.forward_with_operator_cache(
-                    hidden,
-                    mask,
-                    Some(qwen_hybrid::OperatorCache::FullAttention(cache)),
-                    stream,
-                )?)
-            }
-            (
-                qwen_hybrid::LayerPolicy::LinearAttention,
-                PipelineLayerCache::StateSlots {
-                    global_layer: cached,
-                    slots,
-                },
-            ) if *cached == global_layer
-                && slots.len() == 2
-                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
-                && slots[1].policy.role == StateTensorRole::Recurrent =>
-            {
-                let (conv, recurrent) = slots.split_at_mut(1);
-                if conv[0].offset != recurrent[0].offset {
-                    return Err(Error::Parallel(format!(
-                        "Qwen hybrid state offsets disagree at global layer {global_layer}"
-                    )));
-                }
-                let mut local = qwen_hybrid::LinearAttentionCache {
-                    conv_state: conv[0].value.take(),
-                    recurrent_state: recurrent[0].value.take(),
-                    offset: conv[0].offset,
-                };
-                let output = layer.forward_with_operator_cache(
-                    hidden,
-                    mask,
-                    Some(qwen_hybrid::OperatorCache::LinearAttention(&mut local)),
-                    stream,
-                )?;
-                conv[0].value = local.conv_state;
-                conv[0].offset = local.offset;
-                recurrent[0].value = local.recurrent_state;
-                recurrent[0].offset = local.offset;
-                Ok(output)
-            }
-            _ => Err(Error::Parallel(format!(
-                "Qwen hybrid pipeline cache does not match global layer {global_layer}"
-            ))),
-        }
-    }
-
-    fn forward(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        explicit_mask: Option<&Array>,
-        caches: &mut [PipelineLayerCache],
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        if caches.len() != self.layers.len() {
-            return Err(Error::Parallel(format!(
-                "Qwen hybrid stage cache has {} entries, expected {}",
-                caches.len(),
-                self.layers.len()
-            )));
-        }
-        let (mut hidden, auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) if self.has_multimodal_ingress => (
-                self.layer_adapter
-                    .embed_pipeline_tokens(tokens, None, stream)?,
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Tokens(tokens) => (
-                self.embedding
-                    .as_mut()
-                    .expect("first Qwen hybrid stage embedding")
-                    .forward(tokens, stream)?,
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Hidden(payload) => {
-                (payload.hidden.clone(), payload.auxiliary.clone())
-            }
-        };
-        let offset = pipeline_state_offset("Qwen hybrid", caches)?;
-        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
-            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
-            .transpose()?;
-        let mask = explicit_mask.or(generated_mask.as_ref());
-        let args = &self.args;
-        hidden = execute_pipeline_layer_range(
-            PipelineLayerExecution {
-                range: self.range.clone(),
-                resident_layers: &mut self.layers,
-                dense_layers: self.dense_layers.as_ref(),
-                step,
-                caches,
-                hidden,
-                stream,
-            },
-            |global_layer, stream| {
-                qwen_hybrid::TransformerBlock::new(args, global_layer, stream).map_err(Into::into)
-            },
-            |global_layer, layer, hidden, cache, stream| {
-                Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)
-            },
-        )?;
-        let output = if let Some(norm) = &mut self.norm {
-            let mtp_hidden = hidden.clone();
-            hidden = norm.forward(&hidden, stream)?;
-            let logits = if let Some(head) = &mut self.lm_head {
-                head.forward(&hidden, stream)?
-            } else {
-                project_logits_maybe_quantized(
-                    &mut self.lm_head,
-                    self.output_embedding
-                        .as_mut()
-                        .or(self.embedding.as_mut())
-                        .expect("last tied Qwen hybrid stage output embedding"),
-                    &hidden,
-                    stream,
-                )?
-            };
-            PipelineStageOutput::EmbeddedMtpLogits {
-                logits,
-                hidden: mtp_hidden,
-            }
-        } else {
-            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
-        };
-        Ok(output)
-    }
-
-    fn forward_tensor_parallel(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        explicit_mask: Option<&Array>,
-        caches: &mut [PipelineLayerCache],
-        execution: &ParallelExecutionContext<'_>,
-        expert_group: Option<&Group>,
-    ) -> Result<PipelineStageOutput, Error> {
-        let group = execution.group().ok_or_else(|| {
-            Error::Parallel("tensor-sharded Qwen hybrid stage has no TP communicator".into())
-        })?;
-        if caches.len() != self.layers.len() {
-            return Err(Error::Parallel(format!(
-                "Qwen hybrid TP+PP stage cache has {} entries, expected {}",
-                caches.len(),
-                self.layers.len()
-            )));
-        }
-        let stream = execution.stream();
-        let (mut hidden, auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) if self.has_multimodal_ingress => (
-                self.layer_adapter
-                    .embed_pipeline_tokens(tokens, Some(execution), stream)?,
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Tokens(tokens) => (
-                self.parallel_embedding
-                    .as_mut()
-                    .ok_or_else(|| {
-                        Error::Parallel(
-                            "first Qwen hybrid TP+PP stage has no embedding shard".into(),
-                        )
-                    })?
-                    .forward(tokens, execution)?,
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Hidden(payload) => {
-                (payload.hidden.clone(), payload.auxiliary.clone())
-            }
-        };
-        let offset = pipeline_state_offset("Qwen hybrid TP+PP", caches)?;
-        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
-            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
-            .transpose()?;
-        let mask = explicit_mask.or(generated_mask.as_ref());
-        let expert_assignment = self.expert_assignment.clone();
-        if let Some(assignment) = expert_assignment.as_ref() {
-            validate_pipeline_expert_dispatch(
-                assignment,
-                expert_group,
-                self.expert_storage.is_external(),
-            )?;
-        }
-        self.routing_statistics = RoutingStatistics::default();
-        let pass = if step.sequence_length > 1 {
-            ExpertPass::Prefill
-        } else {
-            ExpertPass::Decode
-        };
-        let args = self.args.clone();
-        let expert_cache = self.expert_storage.cache();
-        let layer_adapter = &self.layer_adapter;
-        let parallel_layout = self.parallel_layout.clone();
-        hidden = execute_pipeline_layer_range(
-            PipelineLayerExecution {
-                range: self.range.clone(),
-                resident_layers: &mut self.layers,
-                dense_layers: self.dense_layers.as_ref(),
-                step,
-                caches,
-                hidden,
-                stream,
-            },
-            |global_layer, stream| match layer_adapter.new_cartesian_layer(
-                layer_adapter.pipeline_text_group(),
-                global_layer,
-                parallel_layout.as_ref(),
-                expert_assignment.as_ref(),
-                stream,
-            )? {
-                QwenHybridLayer::Text(block) => Ok(*block),
-                QwenHybridLayer::Vision(_) => Err(Error::Parallel(
-                    "Qwen hybrid TP+PP received a vision execution unit".into(),
-                )),
-            },
-            |global_layer, layer, hidden, cache, stream| {
-                let forwarded = match (
-                    expert_assignment.as_ref(),
-                    self.expert_storage.is_external(),
-                    expert_cache,
-                ) {
-                    (Some(assignment), true, Some(expert_cache)) => {
-                        forward_qwen_hybrid_external_expert_layer(
-                            &args,
-                            layer,
-                            global_layer,
-                            hidden,
-                            mask,
-                            cache,
-                            Some(group),
-                            assignment,
-                            expert_group,
-                            pass,
-                            expert_cache,
-                            &mut self.routing_statistics,
-                            stream,
-                        )?
-                    }
-                    (Some(_), true, None) | (None, true, None) => forward_qwen_hybrid_tensor_layer(
-                        layer,
-                        global_layer,
-                        hidden,
-                        mask,
-                        cache,
-                        group,
-                        stream,
-                    )?,
-                    (Some(assignment), false, None) => forward_qwen_hybrid_tensor_expert_layer(
-                        layer,
-                        global_layer,
-                        hidden,
-                        mask,
-                        cache,
-                        group,
-                        assignment,
-                        expert_group.expect("validated resident Qwen hybrid EP group"),
-                        &mut self.routing_statistics,
-                        stream,
-                    )?,
-                    (None, false, _) => forward_qwen_hybrid_tensor_layer(
-                        layer,
-                        global_layer,
-                        hidden,
-                        mask,
-                        cache,
-                        group,
-                        stream,
-                    )?,
-                    (None, true, Some(_)) | (Some(_), false, Some(_)) => unreachable!(
-                        "Qwen hybrid expert storage and assignment are internally coherent"
-                    ),
-                };
-                synchronize_outputs([&forwarded])?;
-                Ok(forwarded)
-            },
-        )?;
-        if let Some(norm) = &mut self.norm {
-            let mtp_hidden = hidden.clone();
-            hidden = norm.forward(&hidden, stream)?;
-            let sharded = if let Some(head) = &mut self.parallel_lm_head {
-                head.forward(&hidden, execution)?
-            } else {
-                self.parallel_output_embedding
-                    .as_mut()
-                    .or(self.parallel_embedding.as_mut())
-                    .ok_or_else(|| {
-                        Error::Parallel(
-                            "last tied Qwen hybrid TP+PP stage has no embedding shard".into(),
-                        )
-                    })?
-                    .project_logits(&hidden, execution)?
-            };
-            Ok(PipelineStageOutput::EmbeddedMtpLogits {
-                logits: sharded.all_gather(execution)?,
-                hidden: mtp_hidden,
-            })
-        } else {
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden,
-                auxiliary,
-            }))
-        }
-    }
-
-    fn forward_expert_parallel(
-        &mut self,
-        input: PipelineStageInput<'_>,
-        step: PipelineStep,
-        explicit_mask: Option<&Array>,
-        caches: &mut [PipelineLayerCache],
-        group: Option<&Group>,
-        stream: &Stream,
-    ) -> Result<PipelineStageOutput, Error> {
-        let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
-            Error::Parallel("Qwen hybrid PP+EP stage has no rank-local expert assignment".into())
-        })?;
-        validate_pipeline_expert_dispatch(assignment, group, self.expert_storage.is_external())?;
-        if caches.len() != self.layers.len() {
-            return Err(Error::Parallel(format!(
-                "Qwen hybrid PP+EP stage cache has {} entries, expected {}",
-                caches.len(),
-                self.layers.len()
-            )));
-        }
-        let (mut hidden, auxiliary) = match input {
-            PipelineStageInput::Tokens(tokens) if self.has_multimodal_ingress => (
-                self.layer_adapter
-                    .embed_pipeline_tokens(tokens, None, stream)?,
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Tokens(tokens) => (
-                self.embedding
-                    .as_mut()
-                    .expect("first Qwen hybrid PP+EP stage embedding")
-                    .forward(tokens, stream)?,
-                PipelineAuxiliaryState::default(),
-            ),
-            PipelineStageInput::Hidden(payload) => {
-                (payload.hidden.clone(), payload.auxiliary.clone())
-            }
-        };
-        let offset = pipeline_state_offset("Qwen hybrid PP+EP", caches)?;
-        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
-            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
-            .transpose()?;
-        let mask = explicit_mask.or(generated_mask.as_ref());
-        self.routing_statistics = RoutingStatistics::default();
-        let layer_adapter = &self.layer_adapter;
-        let expert_assignment = assignment.clone();
-        let expert_cache = self.expert_storage.cache();
-        let pass = if step.sequence_length > 1 {
-            ExpertPass::Prefill
-        } else {
-            ExpertPass::Decode
-        };
-        let args = self.args.clone();
-        hidden = execute_pipeline_layer_range(
-            PipelineLayerExecution {
-                range: self.range.clone(),
-                resident_layers: &mut self.layers,
-                dense_layers: self.dense_layers.as_ref(),
-                step,
-                caches,
-                hidden,
-                stream,
-            },
-            |global_layer, stream| match layer_adapter.new_cartesian_layer(
-                layer_adapter.pipeline_text_group(),
-                global_layer,
-                None,
-                Some(&expert_assignment),
-                stream,
-            )? {
-                QwenHybridLayer::Text(block) => Ok(*block),
-                QwenHybridLayer::Vision(_) => Err(Error::Parallel(
-                    "Qwen hybrid PP+EP received a vision execution unit".into(),
-                )),
-            },
-            |global_layer, layer, hidden, cache, stream| {
-                let forwarded = match (self.expert_storage.is_external(), expert_cache) {
-                    (true, Some(expert_cache)) => forward_qwen_hybrid_external_expert_layer(
-                        &args,
-                        layer,
-                        global_layer,
-                        hidden,
-                        mask,
-                        cache,
-                        None,
-                        &expert_assignment,
-                        group,
-                        pass,
-                        expert_cache,
-                        &mut self.routing_statistics,
-                        stream,
-                    )?,
-                    (true, None) => {
-                        Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)?
-                    }
-                    (false, None) => forward_qwen_hybrid_expert_layer(
-                        layer,
-                        global_layer,
-                        hidden,
-                        mask,
-                        cache,
-                        &expert_assignment,
-                        group.expect("validated resident Qwen hybrid EP group"),
-                        &mut self.routing_statistics,
-                        stream,
-                    )?,
-                    (false, Some(_)) => {
-                        unreachable!("resident Qwen hybrid stage cannot own expert cache")
-                    }
-                };
-                synchronize_outputs([&forwarded])?;
-                Ok(forwarded)
-            },
-        )?;
-        if let Some(norm) = &mut self.norm {
-            let mtp_hidden = hidden.clone();
-            hidden = norm.forward(&hidden, stream)?;
-            let logits = if let Some(head) = &mut self.lm_head {
-                head.forward(&hidden, stream)?
-            } else {
-                project_logits_maybe_quantized(
-                    &mut self.lm_head,
-                    self.output_embedding
-                        .as_mut()
-                        .or(self.embedding.as_mut())
-                        .expect("last tied Qwen hybrid PP+EP stage output embedding"),
-                    &hidden,
-                    stream,
-                )?
-            };
-            Ok(PipelineStageOutput::EmbeddedMtpLogits {
-                logits,
-                hidden: mtp_hidden,
-            })
-        } else {
-            Ok(PipelineStageOutput::Hidden(PipelinePayload {
-                hidden,
-                auxiliary,
-            }))
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn load_kimi_linear_pipeline(
     source_args: eredu_architectures::kimi_linear::ModelArgs,
     store: SharedCheckpointSource,

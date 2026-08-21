@@ -70,6 +70,233 @@ pub enum AttentionMask<'a, T> {
     Tensor(&'a T),
 }
 
+/// Validated expansion from a smaller logical head axis to a repeated head
+/// axis. Repetition preserves grouped order: each source head is repeated
+/// contiguously `target_heads / source_heads` times.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct HeadExpansion {
+    /// Tensor axis containing source heads.
+    pub axis: usize,
+    /// Number of source heads.
+    pub source_heads: i32,
+    /// Number of heads after expansion.
+    pub target_heads: i32,
+}
+
+impl HeadExpansion {
+    /// Validates the head counts and the selected tensor axis.
+    pub fn validate<T: Tensor>(&self, input: &T) -> Result<(), Error> {
+        let shape = input.shape();
+        if self.source_heads <= 0
+            || self.target_heads <= 0
+            || self.target_heads % self.source_heads != 0
+            || shape.get(self.axis).copied() != Some(self.source_heads)
+        {
+            return Err(Error::backend(format!(
+                "invalid head expansion axis={} source={} target={} shape={shape:?}",
+                self.axis, self.source_heads, self.target_heads
+            )));
+        }
+        Ok(())
+    }
+
+    /// Number of adjacent copies of each source head.
+    pub const fn repeats(self) -> i32 {
+        self.target_heads / self.source_heads
+    }
+}
+
+/// One unmasked attention request over validated contiguous sequence segments.
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentedAttentionInput<'a, T> {
+    /// Queries shaped `[tokens, heads, dimensions]`.
+    pub queries: &'a T,
+    /// Keys shaped `[tokens, heads, dimensions]`.
+    pub keys: &'a T,
+    /// Values shaped `[tokens, heads, value_dimensions]`.
+    pub values: &'a T,
+    /// Positive contiguous segment lengths whose sum equals `tokens`.
+    pub segment_lengths: &'a [i32],
+    /// Query/key score multiplier.
+    pub scale: f32,
+}
+
+impl<T: Tensor> SegmentedAttentionInput<'_, T> {
+    /// Validates tensor and segment geometry without inspecting tensor values.
+    pub fn validate(&self) -> Result<(), Error> {
+        let query = self.queries.shape();
+        let key = self.keys.shape();
+        let value = self.values.shape();
+        if query.len() != 3
+            || key.len() != 3
+            || value.len() != 3
+            || query[0] <= 0
+            || query[1] <= 0
+            || query[2] <= 0
+            || query[0] != key[0]
+            || query[0] != value[0]
+            || query[1] != key[1]
+            || query[1] != value[1]
+            || query[2] != key[2]
+            || value[2] <= 0
+            || !self.scale.is_finite()
+            || self.scale <= 0.0
+        {
+            return Err(Error::backend(format!(
+                "invalid segmented attention geometry q={query:?} k={key:?} v={value:?} scale={}",
+                self.scale
+            )));
+        }
+        validate_segment_lengths(query[0], self.segment_lengths)
+    }
+}
+
+/// Validates positive contiguous segment lengths and their exact total.
+pub fn validate_segment_lengths(total: i32, segment_lengths: &[i32]) -> Result<(), Error> {
+    if total <= 0 || segment_lengths.is_empty() {
+        return Err(Error::backend(format!(
+            "segmented attention requires a positive total and at least one segment, got total={total} segments={segment_lengths:?}"
+        )));
+    }
+    let mut sum = 0i32;
+    for &length in segment_lengths {
+        if length <= 0 {
+            return Err(Error::backend(format!(
+                "segmented attention lengths must be positive, got {segment_lengths:?}"
+            )));
+        }
+        sum = sum.checked_add(length).ok_or_else(|| {
+            Error::backend("segmented attention length total overflowed signed 32-bit geometry")
+        })?;
+        if sum > total {
+            return Err(Error::backend(format!(
+                "segmented attention lengths exceed total {total}: {segment_lengths:?}"
+            )));
+        }
+    }
+    if sum != total {
+        return Err(Error::backend(format!(
+            "segmented attention lengths sum to {sum}, expected {total}"
+        )));
+    }
+    Ok(())
+}
+
+/// Deterministic host reference for grouped head repetition.
+pub fn reference_expand_heads(
+    values: &[f32],
+    shape: &[usize],
+    axis: usize,
+    target_heads: usize,
+) -> Result<(Vec<f32>, Vec<usize>), Error> {
+    let source_heads = shape.get(axis).copied().unwrap_or(0);
+    if source_heads == 0 || target_heads == 0 || target_heads % source_heads != 0 {
+        return Err(Error::backend(format!(
+            "invalid reference head expansion axis={axis} target={target_heads} shape={shape:?}"
+        )));
+    }
+    let elements = shape.iter().try_fold(1usize, |total, width| {
+        total
+            .checked_mul(*width)
+            .ok_or_else(|| Error::backend("reference head expansion element count overflowed"))
+    })?;
+    if elements != values.len() {
+        return Err(Error::backend(format!(
+            "reference head expansion expected {elements} values, got {}",
+            values.len()
+        )));
+    }
+    let outer = shape[..axis].iter().product::<usize>();
+    let inner = shape[axis + 1..].iter().product::<usize>();
+    let repeats = target_heads / source_heads;
+    let mut output = Vec::with_capacity(outer * target_heads * inner);
+    for outer_index in 0..outer {
+        for source in 0..source_heads {
+            let start = (outer_index * source_heads + source) * inner;
+            for _ in 0..repeats {
+                output.extend_from_slice(&values[start..start + inner]);
+            }
+        }
+    }
+    let mut output_shape = shape.to_vec();
+    output_shape[axis] = target_heads;
+    Ok((output, output_shape))
+}
+
+/// Deterministic host reference for unmasked segmented scaled-dot-product
+/// attention. Inputs and output use token-major `[tokens, heads, dimensions]`
+/// storage.
+#[allow(clippy::too_many_arguments)]
+pub fn reference_segmented_attention(
+    tokens: usize,
+    heads: usize,
+    dimensions: usize,
+    value_dimensions: usize,
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    segment_lengths: &[i32],
+    scale: f32,
+) -> Result<Vec<f32>, Error> {
+    let tokens_i32 = i32::try_from(tokens)
+        .map_err(|_| Error::backend("reference segmented attention token count exceeds i32"))?;
+    validate_segment_lengths(tokens_i32, segment_lengths)?;
+    if heads == 0
+        || dimensions == 0
+        || value_dimensions == 0
+        || !scale.is_finite()
+        || scale <= 0.0
+        || queries.len() != tokens * heads * dimensions
+        || keys.len() != tokens * heads * dimensions
+        || values.len() != tokens * heads * value_dimensions
+    {
+        return Err(Error::backend(
+            "invalid reference segmented attention geometry",
+        ));
+    }
+    let mut output = vec![0.0f32; tokens * heads * value_dimensions];
+    let mut segment_start = 0usize;
+    for &length in segment_lengths {
+        let length = usize::try_from(length).expect("validated positive segment length");
+        let segment_end = segment_start + length;
+        for query_token in segment_start..segment_end {
+            for head in 0..heads {
+                let mut scores = Vec::with_capacity(length);
+                for key_token in segment_start..segment_end {
+                    let mut score = 0.0f32;
+                    for dimension in 0..dimensions {
+                        let query_index = (query_token * heads + head) * dimensions + dimension;
+                        let key_index = (key_token * heads + head) * dimensions + dimension;
+                        score += queries[query_index] * keys[key_index];
+                    }
+                    scores.push(score * scale);
+                }
+                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let denominator = scores
+                    .iter_mut()
+                    .map(|score| {
+                        *score = (*score - maximum).exp();
+                        *score
+                    })
+                    .sum::<f32>();
+                for value_dimension in 0..value_dimensions {
+                    let mut result = 0.0f32;
+                    for (relative, key_token) in (segment_start..segment_end).enumerate() {
+                        let value_index =
+                            (key_token * heads + head) * value_dimensions + value_dimension;
+                        result += scores[relative] / denominator * values[value_index];
+                    }
+                    let output_index =
+                        (query_token * heads + head) * value_dimensions + value_dimension;
+                    output[output_index] = result;
+                }
+            }
+        }
+        segment_start = segment_end;
+    }
+    Ok(output)
+}
+
 /// Value source for an attention unit that owns key/value state.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum AttentionValueSource {
@@ -136,6 +363,70 @@ mod attention_state_source_tests {
         assert_eq!(publisher.value(), Some(AttentionValueSource::ReuseKey));
         assert!(!AttentionStateSource::Shared.owns_state());
         assert_eq!(AttentionStateSource::Shared.value(), None);
+    }
+}
+
+#[cfg(test)]
+mod recurrent_encoder_contract_tests {
+    use super::{
+        reference_expand_heads, reference_segmented_attention, validate_segment_lengths,
+        NormalizationConstructionSpec, NormalizationScale,
+    };
+
+    #[test]
+    fn normalization_construction_rejects_invalid_geometry_and_scalars() {
+        assert!(NormalizationConstructionSpec {
+            dimensions: 8,
+            epsilon: 1e-6,
+            scale: NormalizationScale::Unit,
+        }
+        .validate()
+        .is_ok());
+        assert!(NormalizationConstructionSpec {
+            dimensions: 0,
+            epsilon: 1e-6,
+            scale: NormalizationScale::Unit,
+        }
+        .validate()
+        .is_err());
+        assert!(NormalizationConstructionSpec {
+            dimensions: 8,
+            epsilon: f32::NAN,
+            scale: NormalizationScale::Unit,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn head_expansion_reference_preserves_grouped_row_order() {
+        let (values, shape) =
+            reference_expand_heads(&[1.0, 2.0, 3.0, 4.0], &[1, 2, 2], 1, 4).unwrap();
+        assert_eq!(shape, vec![1, 4, 2]);
+        assert_eq!(values, vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+        assert!(reference_expand_heads(&[1.0, 2.0], &[1, 2], 1, 3).is_err());
+    }
+
+    #[test]
+    fn segmented_attention_reference_is_independent_per_contiguous_segment() {
+        let output = reference_segmented_attention(
+            3,
+            1,
+            1,
+            1,
+            &[0.0, 0.0, 0.0],
+            &[0.0, 0.0, 0.0],
+            &[2.0, 4.0, 9.0],
+            &[2, 1],
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(output, vec![3.0, 3.0, 9.0]);
+        assert!(validate_segment_lengths(3, &[]).is_err());
+        assert!(validate_segment_lengths(3, &[2, 0, 1]).is_err());
+        assert!(validate_segment_lengths(3, &[2]).is_err());
+        assert!(validate_segment_lengths(3, &[2, 2]).is_err());
+        assert!(validate_segment_lengths(i32::MAX, &[i32::MAX, 1]).is_err());
     }
 }
 
@@ -533,6 +824,68 @@ pub struct NormalizationSpec {
     pub epsilon: f32,
     /// Stable scale parameter slot.
     pub weight: ParameterSpec,
+}
+
+/// Parameterization policy for a reusable RMS normalization operator.
+///
+/// Architectures select the semantic scale form while the backend retains the
+/// tensor implementation. In particular, learned-offset scales are evaluated
+/// as `offset + weight`; the offset is not folded into checkpoint storage.
+#[derive(Debug, Clone)]
+pub enum NormalizationScale {
+    /// Ordinary learned multiplicative scale.
+    Learned(ParameterSpec),
+    /// Learned scale offset by a fixed scalar at execution time.
+    LearnedOffset {
+        /// Stable checkpoint slot containing the learned offset tensor.
+        weight: ParameterSpec,
+        /// Fixed scalar added to every learned scale value.
+        offset: f32,
+    },
+    /// RMS normalization without a learned scale.
+    Unit,
+}
+
+/// Complete construction policy for an RMS normalization operator.
+#[derive(Debug, Clone)]
+pub struct NormalizationConstructionSpec {
+    /// Normalized feature count.
+    pub dimensions: i32,
+    /// Numerical stability epsilon.
+    pub epsilon: f32,
+    /// Learned, learned-offset, or weightless scale policy.
+    pub scale: NormalizationScale,
+}
+
+impl NormalizationConstructionSpec {
+    /// Validates feature geometry and fixed scalar policy.
+    pub fn validate(&self) -> Result<(), Error> {
+        let offset = match &self.scale {
+            NormalizationScale::LearnedOffset { offset, .. } => Some(*offset),
+            NormalizationScale::Learned(_) | NormalizationScale::Unit => None,
+        };
+        if self.dimensions <= 0
+            || !self.epsilon.is_finite()
+            || self.epsilon <= 0.0
+            || offset.is_some_and(|offset| !offset.is_finite())
+        {
+            return Err(Error::backend(format!(
+                "invalid RMS normalization construction: dimensions={} epsilon={} offset={offset:?}",
+                self.dimensions, self.epsilon
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl From<NormalizationSpec> for NormalizationConstructionSpec {
+    fn from(spec: NormalizationSpec) -> Self {
+        Self {
+            dimensions: spec.dimensions,
+            epsilon: spec.epsilon,
+            scale: NormalizationScale::Learned(spec.weight),
+        }
+    }
 }
 
 /// One backend-neutral RoPE configuration value.
@@ -1755,6 +2108,33 @@ pub trait NeuralBackend: Sized + 'static {
         spec: NormalizationSpec,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Normalization, Error>;
+    /// Builds an RMS normalization with an explicit scale policy.
+    ///
+    /// Backends predating the generalized construction surface continue to
+    /// support ordinary learned scales through `rms_norm`; other policies fail
+    /// closed until implemented by that backend.
+    fn normalization(
+        spec: NormalizationConstructionSpec,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Normalization, Error> {
+        spec.validate()?;
+        match spec.scale {
+            NormalizationScale::Learned(weight) => Self::rms_norm(
+                NormalizationSpec {
+                    dimensions: spec.dimensions,
+                    epsilon: spec.epsilon,
+                    weight,
+                },
+                context,
+            ),
+            NormalizationScale::LearnedOffset { .. } => Err(Error::backend(
+                "learned-offset RMS normalization is not implemented by this backend",
+            )),
+            NormalizationScale::Unit => Err(Error::backend(
+                "weightless RMS normalization construction is not implemented by this backend",
+            )),
+        }
+    }
     /// Builds the model's rotary-position operator.
     fn rotary(
         spec: RotarySpec<'_>,
@@ -1765,6 +2145,16 @@ pub trait NeuralBackend: Sized + 'static {
         input: Self::Tensor,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
+    /// Applies the tanh-approximated GELU used by some encoder MLPs.
+    fn gelu_approximate(
+        input: Self::Tensor,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        let _ = (input, context);
+        Err(Error::backend(
+            "approximate GELU is not implemented by this backend",
+        ))
+    }
     /// Applies the logistic sigmoid elementwise.
     fn sigmoid(
         input: Self::Tensor,
@@ -1805,6 +2195,64 @@ pub trait NeuralBackend: Sized + 'static {
         let _ = (input, gate, weight, groups, epsilon, context);
         Err(Error::backend(
             "gated grouped RMS normalization is not implemented by this backend",
+        ))
+    }
+    /// Applies L2 normalization over the final axis.
+    fn l2_normalize(
+        input: &Self::Tensor,
+        epsilon: f32,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        let _ = (input, epsilon, context);
+        Err(Error::backend(
+            "L2 normalization is not implemented by this backend",
+        ))
+    }
+    /// Applies grouped RMS normalization to `input`, multiplies by a learned
+    /// scale, and then modulates the result by `silu(gate)`.
+    fn silu_gated_group_rms_norm(
+        input: &Self::Tensor,
+        gate: &Self::Tensor,
+        weight: &Self::Tensor,
+        groups: i32,
+        epsilon: f32,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        let _ = (input, gate, weight, groups, epsilon, context);
+        Err(Error::backend(
+            "SiLU-gated grouped RMS normalization is not implemented by this backend",
+        ))
+    }
+    /// Repeats a validated head axis using backend-native reshape and
+    /// broadcast operations.
+    fn expand_heads(
+        input: &Self::Tensor,
+        expansion: HeadExpansion,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        expansion.validate(input)?;
+        if expansion.source_heads == expansion.target_heads {
+            return Ok(input.clone());
+        }
+        let mut expanded_shape = input.shape().to_vec();
+        expanded_shape.insert(expansion.axis + 1, 1);
+        let expanded = input.reshape(&expanded_shape, context)?;
+        expanded_shape[expansion.axis + 1] = expansion.repeats();
+        let expanded = expanded.broadcast_to(&expanded_shape, context)?;
+        expanded_shape[expansion.axis] = expansion.target_heads;
+        expanded_shape.remove(expansion.axis + 1);
+        expanded.reshape(&expanded_shape, context)
+    }
+    /// Runs unmasked attention independently over contiguous validated
+    /// segments without exposing backend slicing to architecture code.
+    fn segmented_attention(
+        input: SegmentedAttentionInput<'_, Self::Tensor>,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        input.validate()?;
+        let _ = context;
+        Err(Error::backend(
+            "segmented attention is not implemented by this backend",
         ))
     }
     /// Adds a residual branch, optionally retaining the accumulator in FP32.
@@ -2460,6 +2908,39 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     fn index(&self, indexes: &[Index], context: &Self::Context) -> Result<Self, Error>;
     /// Takes rows along one axis using a backend index tensor.
     fn take_axis(&self, indexes: &Self, axis: i32, context: &Self::Context) -> Result<Self, Error>;
+    /// Creates a zero tensor with the same shape and physical dtype.
+    fn zeros_like(&self, context: &Self::Context) -> Result<Self, Error> {
+        let _ = context;
+        Err(Error::backend(
+            "dtype-preserving zero allocation is not implemented by this tensor backend",
+        ))
+    }
+    /// Compares every element with one signed integer scalar.
+    fn equal_i32(&self, value: i32, context: &Self::Context) -> Result<Self, Error> {
+        let _ = (value, context);
+        Err(Error::backend(
+            "integer scalar comparison is not implemented by this tensor backend",
+        ))
+    }
+    /// Elementwise logical disjunction over two boolean tensors.
+    fn logical_or(&self, rhs: &Self, context: &Self::Context) -> Result<Self, Error> {
+        let _ = (rhs, context);
+        Err(Error::backend(
+            "logical disjunction is not implemented by this tensor backend",
+        ))
+    }
+    /// Scatters source rows into the true entries of a boolean mask.
+    fn masked_scatter(
+        &self,
+        mask: &Self,
+        source: &Self,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let _ = (mask, source, context);
+        Err(Error::backend(
+            "masked scatter is not implemented by this tensor backend",
+        ))
+    }
 
     /// Applies rotary positions using caller-supplied reciprocal frequencies.
     fn rope_with_frequencies(

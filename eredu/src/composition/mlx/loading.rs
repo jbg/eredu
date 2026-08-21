@@ -4,7 +4,6 @@ use eredu_checkpoint::WeightQuantization;
 
 use std::path::Path;
 
-use crate::composition::mlx_architectures::qwen::{hybrid::qwen3_5, vl::model as qwen3_vl};
 use eredu_core::{GgufArchitecture, ModelArtifact, ModelKind, ModelPreparationPlan};
 use safemlx::{
     ops::{GgufCheckpoint, GgufMetadataValue},
@@ -226,51 +225,33 @@ fn materialize_gguf_model(
             (Model::Qwen(loaded), eos_token_ids)
         }
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-            let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
-            let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
-            let vision_metadata =
-                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
-            let (loaded, eos_token_ids) =
-                    crate::composition::mlx_architectures::qwen::vl::layerwise::load_qwen3_vl_gguf_layerwise_model(
-                        checkpoint,
-                        metadata,
-                        &vision_checkpoint,
-                        &vision_metadata,
-                        options.weight_residency,
-                        options.quantization,
-                        stream,
-                        weights_stream,
-                    )?;
-            let model = if gguf_architecture == GgufArchitecture::Qwen3VlMoe {
+            let (loaded, eos_token_ids) = crate::composition::qwen::vl::load_gguf(
+                gguf_file,
+                checkpoint,
+                metadata,
+                options.weight_residency,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
+            let variant = if gguf_architecture == GgufArchitecture::Qwen3VlMoe {
                 Model::Qwen3VlMoe(loaded)
             } else {
                 Model::Qwen3Vl(loaded)
             };
-            (model, eos_token_ids)
+            (variant, eos_token_ids)
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
-            let mmproj = if gguf_architecture == GgufArchitecture::Qwen3Next {
-                None
-            } else {
-                qwen3_5::open_sibling_mmproj(gguf_file)?
-            };
-            #[cfg(feature = "mlx-image")]
-            if mmproj.is_some() {
-                processor = ModelProcessor::load_qwen(
-                    gguf_file.parent().unwrap_or_else(|| Path::new(".")),
-                )?;
-            }
-            let (loaded, eos_token_ids, is_next) =
-                        crate::composition::mlx_architectures::qwen::hybrid::layerwise::load_qwen_hybrid_gguf_layerwise_model(
-                            checkpoint,
-                            metadata,
-                            mmproj.as_ref(),
-                            options.weight_residency,
-                            options.quantization,
-                            stream,
-                            weights_stream,
-                        )?;
-            let model = if is_next {
+            let (loaded, eos_token_ids) = crate::composition::qwen::hybrid::load_gguf(
+                gguf_file,
+                checkpoint,
+                metadata,
+                options.weight_residency,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
+            let model = if gguf_architecture == GgufArchitecture::Qwen3Next {
                 Model::Qwen3Next(loaded)
             } else {
                 Model::Qwen35(loaded)
@@ -310,6 +291,13 @@ pub(crate) fn materialize_model_plan(
                     kind,
                     ModelKind::Gemma4 | ModelKind::MuseGlimmer | ModelKind::Inkling
                 ))
+            || matches!(
+                kind,
+                ModelKind::Qwen3Next
+                    | ModelKind::Qwen35
+                    | ModelKind::Qwen3Vl
+                    | ModelKind::Qwen3VlMoe
+            )
         {
             let model =
                 crate::composition::mlx_architectures::distributed::pipeline::load_pipeline_model_with_options(
@@ -519,38 +507,16 @@ fn materialize_tensor_parallel(
                 weights_stream,
             )?,
         )),
-        ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
-            crate::composition::mlx_architectures::qwen::hybrid::layerwise::load_qwen3_next_tensor_parallel_model(
-                path,
-                execution,
-                build,
-                stream,
-                weights_stream,
-            )?,
+        ModelKind::Qwen3Next => Err(Error::UnsupportedArchitecture(
+            "neutral Qwen hybrid tensor-parallel binding is not initialized".into(),
         )),
         ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
-            let model =
-                crate::composition::mlx_architectures::qwen::vl::layerwise::load_qwen3_vl_tensor_parallel_layerwise_model(
-                    path,
-                    execution,
-                    build,
-                    stream,
-                    weights_stream,
-                )?;
-            Ok(if kind == ModelKind::Qwen3VlMoe {
-                Model::Qwen3VlMoe(model)
-            } else {
-                Model::Qwen3Vl(model)
-            })
+            Err(Error::UnsupportedArchitecture(
+                "neutral Qwen3-VL tensor-parallel binding is not initialized".into(),
+            ))
         }
-        ModelKind::Qwen35 => Ok(Model::Qwen35(
-            crate::composition::mlx_architectures::qwen::hybrid::layerwise::load_qwen35_tensor_parallel_model(
-                path,
-                execution,
-                build,
-                stream,
-                weights_stream,
-            )?,
+        ModelKind::Qwen35 => Err(Error::UnsupportedArchitecture(
+            "neutral Qwen3.5 tensor-parallel binding is not initialized".into(),
         )),
         ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
             "PersonaPlex does not use the text Model tensor-parallel session".into(),
@@ -649,7 +615,8 @@ fn materialize_gguf_artifact(
             }
             #[cfg(feature = "mlx-image")]
             GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe
-                if qwen3_5::open_sibling_mmproj(&path)?.is_some() =>
+                if crate::composition::mlx::artifact::find_sibling_mmproj(&path, "qwen35")?
+                    .is_some() =>
             {
                 ModelProcessor::load_qwen(path.parent().unwrap_or_else(|| Path::new(".")))?
             }
@@ -813,34 +780,13 @@ fn materialize_gguf_tensor_parallel(
             Ok((Model::Qwen(model), eos))
         }
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-            let vision_path = qwen3_vl::find_qwen3_vl_mmproj(gguf_path)?;
-            let vision_checkpoint = GgufCheckpoint::open(vision_path)?;
-            let vision_metadata =
-                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
-            let (model, eos) = crate::composition::mlx_architectures::qwen::vl::layerwise::load_qwen3_vl_gguf_tensor_parallel_model(checkpoint, metadata, (&vision_checkpoint, &vision_metadata), residency, build, stream, weights_stream)?;
-            Ok((
-                if architecture == GgufArchitecture::Qwen3VlMoe {
-                    Model::Qwen3VlMoe(model)
-                } else {
-                    Model::Qwen3Vl(model)
-                },
-                eos,
+            Err(Error::UnsupportedArchitecture(
+                "neutral Qwen3-VL GGUF tensor-parallel binding is not initialized".into(),
             ))
         }
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
-            let mmproj = if architecture == GgufArchitecture::Qwen3Next {
-                None
-            } else {
-                qwen3_5::open_sibling_mmproj(gguf_path)?
-            };
-            let (model, eos, is_next) = crate::composition::mlx_architectures::qwen::hybrid::layerwise::load_qwen_hybrid_gguf_tensor_parallel_model(checkpoint, metadata, mmproj.as_ref(), residency, build, stream, weights_stream)?;
-            Ok((
-                if is_next {
-                    Model::Qwen3Next(model)
-                } else {
-                    Model::Qwen35(model)
-                },
-                eos,
+            Err(Error::UnsupportedArchitecture(
+                "neutral Qwen hybrid GGUF tensor-parallel binding is not initialized".into(),
             ))
         }
     }
@@ -902,7 +848,10 @@ pub(super) fn materialize_safetensors(
             ModelKind::KimiLinear => Ok(Model::KimiLinear(
                 crate::composition::kimi_linear::load_kimi_linear_model(
                     model_dir,
-                    eredu_runtime::WeightResidency::with_expert_cache(non_expert, expert_cache),
+                    eredu_runtime::WeightResidency::with_expert_cache(
+                        non_expert,
+                        expert_cache,
+                    ),
                     options.quantization,
                     stream,
                     weights_stream,
@@ -994,18 +943,39 @@ pub(super) fn materialize_safetensors(
                 )?,
             )),
             ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
-                crate::composition::mlx_architectures::qwen::hybrid::layerwise::load_qwen3_next_expert_cache_model(
-                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
+                crate::composition::qwen::hybrid::load_safetensors_with_residency(
+                    model_dir,
+                    eredu_runtime::WeightResidency::with_expert_cache(
+                        non_expert,
+                        expert_cache,
+                    ),
+                    options.quantization,
+                    stream,
+                    weights_stream,
                 )?,
             )),
             ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
-                crate::composition::mlx_architectures::qwen::vl::layerwise::load_qwen3_vl_expert_cache_model(
-                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
+                crate::composition::qwen::vl::load_safetensors_with_residency(
+                    model_dir,
+                    eredu_runtime::WeightResidency::with_expert_cache(
+                        non_expert,
+                        expert_cache,
+                    ),
+                    options.quantization,
+                    stream,
+                    weights_stream,
                 )?,
             )),
             ModelKind::Qwen35 => Ok(Model::Qwen35(
-                crate::composition::mlx_architectures::qwen::hybrid::layerwise::load_qwen35_expert_cache_model(
-                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
+                crate::composition::qwen::hybrid::load_safetensors_with_residency(
+                    model_dir,
+                    eredu_runtime::WeightResidency::with_expert_cache(
+                        non_expert,
+                        expert_cache,
+                    ),
+                    options.quantization,
+                    stream,
+                    weights_stream,
                 )?,
             )),
             _ => Err(Error::UnsupportedArchitecture(format!(
@@ -1116,7 +1086,7 @@ pub(super) fn materialize_safetensors(
             )?,
         )),
         ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
-            crate::composition::mlx_architectures::qwen::hybrid::layerwise::load_qwen3_next_layerwise_model(
+            crate::composition::qwen::hybrid::load_safetensors(
                 model_dir,
                 execution,
                 options.quantization,
@@ -1125,7 +1095,7 @@ pub(super) fn materialize_safetensors(
             )?,
         )),
         ModelKind::Qwen3Vl => Ok(Model::Qwen3Vl(
-            crate::composition::mlx_architectures::qwen::vl::layerwise::load_qwen3_vl_layerwise_model(
+            crate::composition::qwen::vl::load_safetensors(
                 model_dir,
                 execution,
                 options.quantization,
@@ -1134,7 +1104,7 @@ pub(super) fn materialize_safetensors(
             )?,
         )),
         ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
-            crate::composition::mlx_architectures::qwen::vl::layerwise::load_qwen3_vl_layerwise_model(
+            crate::composition::qwen::vl::load_safetensors(
                 model_dir,
                 execution,
                 options.quantization,
@@ -1143,7 +1113,7 @@ pub(super) fn materialize_safetensors(
             )?,
         )),
         ModelKind::Qwen35 => Ok(Model::Qwen35(
-            crate::composition::mlx_architectures::qwen::hybrid::layerwise::load_qwen35_layerwise_model(
+            crate::composition::qwen::hybrid::load_safetensors(
                 model_dir,
                 execution,
                 options.quantization,

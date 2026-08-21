@@ -19,7 +19,6 @@ use crate::backend::mlx::{
     error::Error,
     runtime::generation::sampler::{ConstrainedSampler, GenerationSampler},
 };
-use crate::composition::mlx_architectures::qwen::hybrid::qwen3_5;
 
 impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
     type Drafter = MlxDrafter;
@@ -238,14 +237,18 @@ fn neutral_inkling_mtp_cache(
     }
 }
 
-fn qwen_next_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5::Cache> {
+fn qwen_next_mtp_cache(
+    cache: &mut ModelCache,
+) -> Option<&mut crate::backend::mlx::runtime::cache::state::MlxHybridState> {
     match cache {
         ModelCache::Qwen3Next(cache) => Some(cache),
         _ => None,
     }
 }
 
-fn qwen35_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5::Cache> {
+fn qwen35_mtp_cache(
+    cache: &mut ModelCache,
+) -> Option<&mut crate::backend::mlx::runtime::cache::state::MlxHybridState> {
     match cache {
         ModelCache::Qwen35(cache) => Some(cache),
         _ => None,

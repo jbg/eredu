@@ -2,8 +2,11 @@
 
 mod checkpoint;
 mod config;
+pub mod hybrid;
 mod moe;
 mod parallel;
+pub mod vision;
+pub mod vl;
 
 pub use checkpoint::{
     expert_recipes, gguf_plan, safetensors_plan, safetensors_plan_with_root,

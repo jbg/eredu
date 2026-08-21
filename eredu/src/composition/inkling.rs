@@ -14,8 +14,8 @@ use eredu_checkpoint::{
     WeightQuantization,
 };
 use eredu_nn::{
-    EmbeddingOperator, LinearOperator, NormalizationOperator, ParameterSpec, ParameterVisitor,
-    ParameterVisitorMut, Parameterized,
+    EmbeddingOperator, LinearOperator, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
+    Parameterized,
 };
 use eredu_runtime::{
     CacheResidencyPolicy, CausalModel, ExecutionGraph, ExecutionUnitLayout, LayerWeightResidency,
