@@ -869,6 +869,7 @@ where
 {
     architecture: A,
     policy: P,
+    executors: Option<Vec<B::OwnedExecutor>>,
     backend: std::marker::PhantomData<fn() -> (B, S)>,
 }
 
@@ -886,6 +887,7 @@ where
         Self {
             architecture,
             policy,
+            executors: None,
             backend: std::marker::PhantomData,
         }
     }
@@ -1107,8 +1109,16 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let layout = ExecutionUnitLayout::new(&graph, counts)?;
-        let executors = B::fork_executors(context, graph.groups().len())
-            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+        if self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
+            self.executors = Some(
+                B::fork_executors(context, graph.groups().len())
+                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
+            );
+        }
+        let executors = self
+            .executors
+            .as_ref()
+            .expect("layered runtime initialized its executor cache");
         let forward = self
             .architecture
             .begin_forward(input, state, context)
@@ -1474,8 +1484,16 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let layout = ExecutionUnitLayout::new(&graph, counts)?;
-        let executors = B::fork_executors(context, graph.groups().len())
-            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+        if self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
+            self.executors = Some(
+                B::fork_executors(context, graph.groups().len())
+                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
+            );
+        }
+        let executors = self
+            .executors
+            .as_ref()
+            .expect("layered runtime initialized its executor cache");
         let forward = self
             .architecture
             .begin_forward_parallel(input, state, parallel, context)
@@ -1699,8 +1717,16 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let layout = ExecutionUnitLayout::new(&graph, counts)?;
-        let executors = B::fork_executors(context, graph.groups().len())
-            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+        if self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
+            self.executors = Some(
+                B::fork_executors(context, graph.groups().len())
+                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
+            );
+        }
+        let executors = self
+            .executors
+            .as_ref()
+            .expect("layered runtime initialized its executor cache");
         let forward = self
             .architecture
             .begin_forward(input, state, context)

@@ -1087,6 +1087,16 @@ fn neutral_layerwise_runtime_executes_dependency_groups_in_stable_order() {
     assert_eq!(FORK_COUNT.get(), 1);
     assert_eq!(SUBMIT_COUNT.get(), 4);
     assert_eq!(ORDER_COUNT.get(), 5);
+
+    let repeated = runtime.forward((), &mut state, &()).unwrap();
+    assert_eq!(repeated, FakeTensor(vec![30, 20, 21]));
+    assert_eq!(
+        FORK_COUNT.get(),
+        1,
+        "one runtime must retain its graph executors across decode steps"
+    );
+    assert_eq!(SUBMIT_COUNT.get(), 8);
+    assert_eq!(ORDER_COUNT.get(), 10);
 }
 
 #[test]

@@ -2588,6 +2588,24 @@ fn muse_atem_recognition_accepts_jinja_conditional_keyword_arguments() {
         direct.generation_runtime_plan().unwrap(),
         " to=user<|message|>direct answer<|eot|>"
     ));
+
+    let low_effort = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(template.into()),
+        "behavior-not-model-id-selects-muse",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            reasoning_effort: Some("low".into()),
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    assert!(low_effort
+        .rendered_prompt()
+        .contains("Reasoning strength: low."));
 }
 
 #[test]

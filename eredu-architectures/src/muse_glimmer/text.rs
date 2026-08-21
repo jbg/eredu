@@ -21,6 +21,8 @@ pub struct CenteredRmsNorm<B: RoutedNeuralBackend> {
     epsilon: f32,
     #[parameter(skip)]
     centered: bool,
+    #[parameter(skip)]
+    effective_scale: Option<B::Tensor>,
 }
 
 impl<B: RoutedNeuralBackend> CenteredRmsNorm<B> {
@@ -39,24 +41,29 @@ impl<B: RoutedNeuralBackend> CenteredRmsNorm<B> {
             )?,
             epsilon,
             centered,
+            effective_scale: None,
         })
     }
 
     fn forward(
-        &self,
+        &mut self,
         input: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let normalized = B::rms_norm_without_weight(input, self.epsilon, context)?;
-        let scale = if self.centered {
-            self.weight.as_ref().add(
+        if self.centered && self.effective_scale.is_none() {
+            self.effective_scale = Some(self.weight.as_ref().add(
                 &B::Tensor::full_f32(1.0, self.weight.as_ref().shape(), context)?,
                 context,
-            )?
+            )?);
+        }
+        let scale = if self.centered {
+            self.effective_scale
+                .as_ref()
+                .expect("centered normalization scale initialized")
         } else {
-            self.weight.as_ref().clone()
+            self.weight.as_ref()
         };
-        normalized.multiply(&scale, context)
+        B::rms_norm_with_weight(input, scale, self.epsilon, context)
     }
 }
 
@@ -77,9 +84,9 @@ pub struct Attention<B: RoutedNeuralBackend> {
     #[parameter(skip)]
     uses_rope: bool,
     #[parameter(skip)]
-    qk_scale_factor: f32,
-    #[parameter(skip)]
     qk_norm_epsilon: f32,
+    #[parameter(skip)]
+    query_scale: Option<B::Tensor>,
     /// Query projection.
     pub query: B::Linear,
     /// Key projection.
@@ -146,8 +153,10 @@ impl<B: RoutedNeuralBackend> Attention<B> {
                 .layer_uses_rope
                 .get(layer)
                 .ok_or_else(|| Error::backend("missing Muse-Glimmer RoPE policy"))?,
-            qk_scale_factor: args.qk_scale_factor,
             qk_norm_epsilon: args.rms_norm_eps,
+            query_scale: (!gguf)
+                .then(|| B::Tensor::full_f32(args.qk_scale_factor, &[args.head_dim], context))
+                .transpose()?,
             query: linear(
                 "q_proj",
                 args.hidden_size,
@@ -208,8 +217,14 @@ impl<B: RoutedNeuralBackend> Attention<B> {
         let values = reshape(self.value.forward(hidden, context)?, self.key_value_heads)?;
         queries = match self.query_norm.as_mut() {
             Some(norm) => norm.forward(&queries, context)?,
-            None => B::rms_norm_without_weight(&queries, self.qk_norm_epsilon, context)?
-                .multiply_scalar(self.qk_scale_factor, context)?,
+            None => B::rms_norm_with_weight(
+                &queries,
+                self.query_scale
+                    .as_ref()
+                    .ok_or_else(|| Error::backend("Muse-Glimmer query scale is missing"))?,
+                self.qk_norm_epsilon,
+                context,
+            )?,
         };
         keys = match self.key_norm.as_mut() {
             Some(norm) => norm.forward(&keys, context)?,

@@ -911,7 +911,7 @@ fn recognize_muse_atem_protocol(
     use crate::runtime::chat::{
         atem::{self, EOM, EOT, MESSAGE, START},
         dialect::GenerationPromptBehavior,
-        ReasoningTemplateControl,
+        ReasoningEffortControl, ReasoningTemplateControl,
     };
 
     let structural_tokens = [START, MESSAGE, EOM, EOT].map(str::to_owned).to_vec();
@@ -984,7 +984,10 @@ fn recognize_muse_atem_protocol(
             enabled: "high",
             disabled: "high",
         },
-        reasoning_effort_control: None,
+        reasoning_effort_control: Some(ReasoningEffortControl {
+            kwarg: "reasoning_strength",
+            supported: &["low", "medium", "high", "xhigh"],
+        }),
         supports_reasoning_parsing: true,
         supports_tool_reasoning: true,
         supports_tool_input_rendering: mapping_tool_arguments,

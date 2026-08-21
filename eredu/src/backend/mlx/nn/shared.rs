@@ -2411,6 +2411,16 @@ impl NeuralBackend for MlxBackend {
         mlx_weightless_rms_norm(input, epsilon, context)
     }
 
+    fn rms_norm_with_weight(
+        input: &Array,
+        weight: &Array,
+        epsilon: f32,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        let output = compute(safemlx::fast::rms_norm(input, weight, epsilon, context))?;
+        compute(output.as_dtype(input.dtype(), context))
+    }
+
     fn grouped_linear(
         linear: &mut MlxLinear,
         input: &Array,
@@ -2866,7 +2876,7 @@ mod neutral_semantic_operator_tests {
         ops::{quantize_with_mode, QuantizationMode},
         quantization::MaybeQuantized,
         transforms::async_eval_with_event,
-        Array, Device, DeviceType, ExecutionContext,
+        Array, Device, DeviceType, Dtype, ExecutionContext,
     };
 
     use crate::backend::mlx::nn::tensor::TokenValidationScope;
@@ -2881,6 +2891,22 @@ mod neutral_semantic_operator_tests {
             .iter()
             .zip(expected)
             .all(|(left, right)| (left - right).abs() <= tolerance));
+    }
+
+    #[test]
+    #[ignore = "explicit MLX dtype regression; run outside the sandbox"]
+    fn mlx_weighted_rms_norm_preserves_bfloat16_input_dtype() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = execution.stream();
+        let input = Array::from_slice(&[1.0_f32, -2.0, 3.0, -4.0], &[1, 4])
+            .as_dtype(Dtype::Bfloat16, stream)
+            .unwrap();
+        let weight = Array::from_slice(&[1.0_f32; 4], &[4]);
+        let output =
+            <MlxBackend as NeuralBackend>::rms_norm_with_weight(&input, &weight, 1e-5, stream)
+                .unwrap();
+        assert_eq!(output.dtype(), Dtype::Bfloat16);
+        output.evaluated().unwrap();
     }
 
     fn parameter(name: &str) -> ParameterSpec {

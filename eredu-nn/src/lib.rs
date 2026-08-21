@@ -2878,6 +2878,19 @@ pub trait NeuralBackend: Sized + 'static {
             "weightless RMS normalization is not implemented by this backend",
         ))
     }
+    /// Applies RMS normalization with a caller-owned learned scale.
+    ///
+    /// The default keeps the operation portable by composing weightless
+    /// normalization and multiplication. Backends may override it with a
+    /// fused kernel when their tensor runtime provides one.
+    fn rms_norm_with_weight(
+        input: &Self::Tensor,
+        weight: &Self::Tensor,
+        epsilon: f32,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        Self::rms_norm_without_weight(input, epsilon, context)?.multiply(weight, context)
+    }
     /// Applies one packed block-diagonal projection independently across an
     /// explicit group axis.
     fn grouped_linear(
