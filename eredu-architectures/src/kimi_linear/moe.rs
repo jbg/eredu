@@ -1,9 +1,9 @@
 //! Kimi dense-prefix and grouped routed-expert feed-forward operators.
 
 use eredu_nn::{
-    Error, LinearOperator, LinearSpec, ParameterSpec, Parameterized, RoutedNeuralBackend,
-    RoutingOperator, RoutingScoring, SwiGluExpertBankOperator, SwiGluExpertBankSpec,
-    SwiGluExpertLayout, SwiGluExpertProjection, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    Error, ExpertProjectionSpec, GatedProductExpertBankOperator, GatedProductExpertBankSpec,
+    GatedProductExpertLayout, LinearOperator, LinearSpec, ParameterSpec, Parameterized,
+    RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest};
 
@@ -57,7 +57,7 @@ impl<B: RoutedNeuralBackend> DenseSwiGlu<B> {
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(input, context)?;
         let up = self.up.forward(input, context)?;
-        B::swiglu(gate, up, None, context)
+        B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)
     }
 
     fn forward(
@@ -78,9 +78,9 @@ pub struct SparseMoe<B: RoutedNeuralBackend> {
     layer: usize,
     /// Grouped sigmoid router with selection correction bias.
     pub router: B::Router,
-    /// Packed routed SwiGLU experts.
-    pub experts: B::SwiGluExpertBank,
-    /// Always-executed shared SwiGLU expert.
+    /// Packed routed gated-product experts.
+    pub experts: B::GatedProductExpertBank,
+    /// Always-executed shared gated-product expert.
     pub shared: DenseSwiGlu<B>,
 }
 
@@ -108,6 +108,7 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
             TopKRouterSpec {
                 input_dimensions: args.hidden_size,
                 weight: ParameterSpec::trainable(&gate_name).map_err(Error::backend)?,
+                bias: None,
                 correction_bias: Some(
                     ParameterSpec::trainable(format!("{prefix}.gate.e_score_correction_bias"))
                         .map_err(Error::backend)?,
@@ -122,21 +123,22 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         let experts_prefix = format!("{prefix}.experts");
         let gate_up_name = format!("{experts_prefix}.gate_up_proj");
         let down_name = format!("{experts_prefix}.down_proj");
-        let experts = B::swiglu_expert_bank(
-            SwiGluExpertBankSpec {
+        let experts = B::gated_product_expert_bank(
+            GatedProductExpertBankSpec {
                 expert_count: args.num_experts,
                 input_dimensions: args.hidden_size,
                 intermediate_dimensions: routed_intermediate,
                 output_dimensions: args.hidden_size,
-                activation: eredu_nn::GatedExpertActivation::Silu,
-                limit: None,
-                layout: SwiGluExpertLayout::Packed {
-                    gate_up: SwiGluExpertProjection {
+                policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+                layout: GatedProductExpertLayout::Packed {
+                    gate_up: ExpertProjectionSpec {
                         weight: ParameterSpec::trainable(&gate_up_name).map_err(Error::backend)?,
+                        bias: None,
                         format: args.weight_quantization_for(&gate_up_name).into(),
                     },
-                    down: SwiGluExpertProjection {
+                    down: ExpertProjectionSpec {
                         weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
+                        bias: None,
                         format: args.weight_quantization_for(&down_name).into(),
                     },
                 },
@@ -266,7 +268,7 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
             Self::Sparse(sparse) => {
                 let routes = sparse.router.route(input, context)?;
                 let routed = provider
-                    .forward_routed(
+                    .forward_routed_tensor_parallel(
                         &mut sparse.experts,
                         RoutedExpertRequest {
                             layer: sparse.layer,
@@ -274,14 +276,13 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
                             routes: &routes,
                             pass,
                         },
+                        B::parallel_size(parallel),
                         context,
                     )
                     .map_err(|error| Error::backend(error.to_string()))?;
-                let routed = if provider.output_is_tensor_parallel_partial() {
-                    B::sum_parallel(routed, parallel, context)?
-                } else {
-                    routed
-                };
+                let routed = eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(
+                    routed, parallel, context,
+                )?;
                 let shared_hidden = sparse.shared.hidden(input, context)?;
                 let shared = B::row_parallel_linear(
                     &mut sparse.shared.down,
@@ -379,8 +380,15 @@ impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
             }
             Self::Sparse(sparse) => {
                 let routes = sparse.router.route(input, context)?;
-                let routed = sparse.experts.forward_routed(input, &routes, context)?;
-                let routed = B::sum_parallel(routed, parallel, context)?;
+                let routed = sparse.experts.forward_routed_tensor_parallel(
+                    input,
+                    &routes,
+                    B::parallel_size(parallel),
+                    context,
+                )?;
+                let routed = eredu_runtime::reduce_tensor_parallel_expert_output::<B>(
+                    routed, parallel, context,
+                )?;
                 let shared_hidden = sparse.shared.hidden(input, context)?;
                 let shared = B::row_parallel_linear(
                     &mut sparse.shared.down,

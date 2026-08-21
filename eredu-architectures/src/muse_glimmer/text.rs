@@ -1,11 +1,11 @@
 //! Backend-neutral Muse-Glimmer decoder equations.
 
 use eredu_nn::{
-    AttentionCache, EmbeddingOperator, EmbeddingSpec, Error, GatedExpertActivation, LinearOperator,
-    LinearSpec, NormalizationOperator, NormalizationSpec, Parameter, ParameterSpec, Parameterized,
-    RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend, RoutingOperator,
-    RoutingScoring, SwiGluExpertBankOperator, SwiGluExpertBankSpec, SwiGluExpertLayout,
-    SwiGluExpertProjection, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    AttentionCache, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
+    ExpertProjectionSpec, GatedProductExpertBankOperator, GatedProductExpertBankSpec,
+    GatedProductExpertLayout, LinearOperator, LinearSpec, NormalizationOperator, NormalizationSpec,
+    Parameter, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition, RotarySpec,
+    RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
 
@@ -237,9 +237,29 @@ impl<B: RoutedNeuralBackend> Attention<B> {
         let attended = match cache {
             Some(cache) => {
                 let (keys, values) = cache.update_for_attention(keys, values, context)?;
-                cache.attention(queries, keys, values, self.scale, mask, context)?
+                cache.attention(
+                    AttentionRequest {
+                        queries,
+                        keys,
+                        values,
+                        scale: self.scale,
+                        mask,
+                        sinks: None,
+                    },
+                    context,
+                )?
             }
-            None => B::attention(queries, keys, values, self.scale, mask, context)?,
+            None => B::attention_with_sinks(
+                AttentionRequest {
+                    queries,
+                    keys,
+                    values,
+                    scale: self.scale,
+                    mask,
+                    sinks: None,
+                },
+                context,
+            )?,
         };
         let attended = attended.transpose_axes(&[0, 2, 1, 3], context)?.reshape(
             &[batch, sequence, self.query_heads * self.head_dimensions],
@@ -321,7 +341,7 @@ impl<B: RoutedNeuralBackend> Mlp<B> {
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(hidden, context)?;
         let up = self.up.forward(hidden, context)?;
-        let hidden = B::swiglu(gate, up, None, context)?;
+        let hidden = B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
         self.down.forward(&hidden, context)
     }
 
@@ -333,19 +353,19 @@ impl<B: RoutedNeuralBackend> Mlp<B> {
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(hidden, context)?;
         let up = self.up.forward(hidden, context)?;
-        let hidden = B::swiglu(gate, up, None, context)?;
+        let hidden = B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
         B::row_parallel_linear(&mut self.down, &hidden, parallel, context)
     }
 }
 
-/// Softmax top-k routed SwiGLU branch used by Muse-Glimmer MoE checkpoints.
+/// Softmax top-k routed gated-product branch used by Muse-Glimmer MoE checkpoints.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct SparseMoe<B: RoutedNeuralBackend> {
     /// Learned softmax router.
     pub router: B::Router,
     /// Packed routed expert bank.
-    pub experts: B::SwiGluExpertBank,
+    pub experts: B::GatedProductExpertBank,
     #[parameter(skip)]
     hidden_size: i32,
 }
@@ -365,6 +385,7 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
                     input_dimensions: args.hidden_size,
                     weight: ParameterSpec::trainable(format!("{prefix}.gate.weight"))
                         .map_err(Error::backend)?,
+                    bias: None,
                     correction_bias: None,
                     input_transform: None,
                     route_scale: None,
@@ -380,21 +401,22 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
                 },
                 context,
             )?,
-            experts: B::swiglu_expert_bank(
-                SwiGluExpertBankSpec {
+            experts: B::gated_product_expert_bank(
+                GatedProductExpertBankSpec {
                     expert_count: args.num_experts,
                     input_dimensions: args.hidden_size,
                     intermediate_dimensions: args.moe_intermediate_size,
                     output_dimensions: args.hidden_size,
-                    activation: GatedExpertActivation::Silu,
-                    limit: None,
-                    layout: SwiGluExpertLayout::Packed {
-                        gate_up: SwiGluExpertProjection {
+                    policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+                    layout: GatedProductExpertLayout::Packed {
+                        gate_up: ExpertProjectionSpec {
                             weight: ParameterSpec::trainable(&gate_up).map_err(Error::backend)?,
+                            bias: None,
                             format: args.linear_format_for(&gate_up),
                         },
-                        down: SwiGluExpertProjection {
+                        down: ExpertProjectionSpec {
                             weight: ParameterSpec::trainable(&down).map_err(Error::backend)?,
+                            bias: None,
                             format: args.linear_format_for(&down),
                         },
                     },
@@ -433,8 +455,13 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         let shape = hidden.shape().to_vec();
         let flat = hidden.reshape(&[-1, self.hidden_size], context)?;
         let routes = self.router.route(&flat, context)?;
-        B::sum_parallel(
-            self.experts.forward_routed(&flat, &routes, context)?,
+        eredu_runtime::reduce_tensor_parallel_expert_output::<B>(
+            self.experts.forward_routed_tensor_parallel(
+                &flat,
+                &routes,
+                B::parallel_size(parallel),
+                context,
+            )?,
             parallel,
             context,
         )?
@@ -494,7 +521,7 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         let flat = hidden.reshape(&[-1, self.hidden_size], context)?;
         let routes = self.router.route(&flat, context)?;
         let output = provider
-            .forward_routed(
+            .forward_routed_tensor_parallel(
                 &mut self.experts,
                 RoutedExpertRequest {
                     layer,
@@ -502,10 +529,13 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
                     routes: &routes,
                     pass,
                 },
+                B::parallel_size(parallel),
                 context,
             )
             .map_err(Error::backend)?;
-        B::sum_parallel(output, parallel, context)?.reshape(&shape, context)
+        let output =
+            eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)?;
+        output.reshape(&shape, context)
     }
 }
 
@@ -515,7 +545,7 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
 pub enum FeedForward<B: RoutedNeuralBackend> {
     /// Dense SwiGLU branch.
     Dense(Mlp<B>),
-    /// Softmax top-k routed SwiGLU branch.
+    /// Softmax top-k routed gated-product branch.
     Sparse(SparseMoe<B>),
 }
 

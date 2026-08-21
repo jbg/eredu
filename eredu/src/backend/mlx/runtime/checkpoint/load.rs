@@ -839,14 +839,14 @@ where
     Ok(())
 }
 
-/// Strict-loads a model directory while streaming and packing split SwiGLU experts.
+/// Strict-loads a model directory while streaming and packing split gated-product experts.
 ///
 /// Public checkpoints commonly store `w1`, `w2`, and `w3` per expert, while the
 /// runtime uses one expert-major gate/up bank plus a down bank. Completed layer
 /// banks are loaded immediately so all expert layers are never resident at once.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
-pub fn load_safetensors_dir_strict_with_split_swiglu_experts<M>(
+pub fn load_safetensors_dir_strict_with_split_gated_product_experts<M>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
     weights_stream: &Stream,
@@ -859,7 +859,7 @@ pub fn load_safetensors_dir_strict_with_split_swiglu_experts<M>(
 where
     M: ModuleParameters,
 {
-    load_safetensors_dir_strict_with_split_swiglu_experts_and_transform(
+    load_safetensors_dir_strict_with_split_gated_product_experts_and_transform(
         model,
         model_dir,
         weights_stream,
@@ -872,13 +872,13 @@ where
     )
 }
 
-/// Strict-loads and packs split SwiGLU experts after applying a streaming key/value transform.
+/// Strict-loads and packs split gated-product experts after applying a streaming key/value transform.
 ///
 /// The transform can split or rewrite architecture-specific tensors before
 /// expert detection and strict parameter matching without buffering a shard.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
-pub fn load_safetensors_dir_strict_with_split_swiglu_experts_and_transform<M, F>(
+pub fn load_safetensors_dir_strict_with_split_gated_product_experts_and_transform<M, F>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
     weights_stream: &Stream,
@@ -896,41 +896,43 @@ where
     if let Some(quantization) = quantization {
         quantization.validate()?;
     }
-    let mut expert_parts: HashMap<(String, SwiGluExpertComponent, i32), SwiGluExpertParts> =
-        HashMap::new();
+    let mut expert_parts: HashMap<
+        (String, GatedProductExpertComponent, i32),
+        GatedProductExpertParts,
+    > = HashMap::new();
     let mut params = model.parameters_mut().flatten();
 
     for file in safetensors_files(model_dir)? {
         for_each_safetensor_array(file, weights_stream, |key, value| {
             for (key, value) in transform(key, value)? {
                 if let Some((prefix, expert, projection, component)) =
-                    parse_split_swiglu_expert_projection_key(&key)
+                    parse_split_gated_product_expert_projection_key(&key)
                 {
                     {
                         let parts = expert_parts
                             .entry((prefix.clone(), component, expert))
                             .or_default();
                         match projection {
-                            SwiGluExpertProjection::Gate => parts.gate = Some(value),
-                            SwiGluExpertProjection::Down => parts.down = Some(value),
-                            SwiGluExpertProjection::Up => parts.up = Some(value),
+                            GatedProductExpertProjection::Gate => parts.gate = Some(value),
+                            GatedProductExpertProjection::Down => parts.down = Some(value),
+                            GatedProductExpertProjection::Up => parts.up = Some(value),
                         }
                     }
-                    if split_swiglu_expert_prefix_complete(
+                    if split_gated_product_expert_prefix_complete(
                         &expert_parts,
                         &prefix,
                         component,
                         num_experts,
                     ) {
-                        for (key, value) in pack_split_swiglu_expert_prefix(
+                        for (key, value) in pack_split_gated_product_expert_prefix(
                             &mut expert_parts,
                             &prefix,
                             component,
                             num_experts,
                             transform_stream,
                         )? {
-                            if let Some(quantization) =
-                                quantization.filter(|_| component == SwiGluExpertComponent::Weight)
+                            if let Some(quantization) = quantization
+                                .filter(|_| component == GatedProductExpertComponent::Weight)
                             {
                                 load_array_quantized_strict(
                                     &mut params,
@@ -965,7 +967,7 @@ where
     }
 
     if let Some((prefix, component, _)) = expert_parts.keys().next().cloned() {
-        pack_split_swiglu_expert_prefix(
+        pack_split_gated_product_expert_prefix(
             &mut expert_parts,
             &prefix,
             component,
@@ -977,8 +979,8 @@ where
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-/// Projection kind in a split SwiGLU expert checkpoint.
-pub enum SwiGluExpertProjection {
+/// Projection kind in a split gated-product expert checkpoint.
+pub enum GatedProductExpertProjection {
     /// Gate projection (`w1`).
     Gate,
     /// Down projection (`w2`).
@@ -989,7 +991,7 @@ pub enum SwiGluExpertProjection {
 
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// Stored component of one split expert projection.
-pub enum SwiGluExpertComponent {
+pub enum GatedProductExpertComponent {
     /// Projection values.
     Weight,
     /// Quantization scales.
@@ -999,7 +1001,7 @@ pub enum SwiGluExpertComponent {
 }
 
 #[cfg(test)]
-impl SwiGluExpertComponent {
+impl GatedProductExpertComponent {
     fn packed_suffix(self) -> &'static str {
         match self {
             Self::Weight => "",
@@ -1011,16 +1013,21 @@ impl SwiGluExpertComponent {
 
 #[derive(Default)]
 #[cfg(test)]
-struct SwiGluExpertParts {
+struct GatedProductExpertParts {
     gate: Option<Array>,
     down: Option<Array>,
     up: Option<Array>,
 }
 
 /// Parses keys like `prefix.experts.17.w1.weight`.
-pub fn parse_split_swiglu_expert_projection_key(
+pub fn parse_split_gated_product_expert_projection_key(
     key: &str,
-) -> Option<(String, i32, SwiGluExpertProjection, SwiGluExpertComponent)> {
+) -> Option<(
+    String,
+    i32,
+    GatedProductExpertProjection,
+    GatedProductExpertComponent,
+)> {
     let (prefix, rest) = if let Some((prefix, rest)) = key.split_once(".experts.") {
         (format!("{prefix}.experts"), rest)
     } else if let Some((prefix, rest)) = key.split_once(".switch_mlp.") {
@@ -1031,15 +1038,15 @@ pub fn parse_split_swiglu_expert_projection_key(
     let mut parts = rest.split('.');
     let expert = parts.next()?.parse().ok()?;
     let projection = match parts.next()? {
-        "w1" | "gate_proj" => SwiGluExpertProjection::Gate,
-        "w2" | "down_proj" => SwiGluExpertProjection::Down,
-        "w3" | "up_proj" => SwiGluExpertProjection::Up,
+        "w1" | "gate_proj" => GatedProductExpertProjection::Gate,
+        "w2" | "down_proj" => GatedProductExpertProjection::Down,
+        "w3" | "up_proj" => GatedProductExpertProjection::Up,
         _ => return None,
     };
     let component = match parts.next()? {
-        "weight" => SwiGluExpertComponent::Weight,
-        "scale" | "scales" => SwiGluExpertComponent::Scales,
-        "bias" | "biases" => SwiGluExpertComponent::Biases,
+        "weight" => GatedProductExpertComponent::Weight,
+        "scale" | "scales" => GatedProductExpertComponent::Scales,
+        "bias" | "biases" => GatedProductExpertComponent::Biases,
         _ => return None,
     };
     if parts.next().is_some() {
@@ -1049,10 +1056,10 @@ pub fn parse_split_swiglu_expert_projection_key(
 }
 
 #[cfg(test)]
-fn split_swiglu_expert_prefix_complete(
-    expert_parts: &HashMap<(String, SwiGluExpertComponent, i32), SwiGluExpertParts>,
+fn split_gated_product_expert_prefix_complete(
+    expert_parts: &HashMap<(String, GatedProductExpertComponent, i32), GatedProductExpertParts>,
     prefix: &str,
-    component: SwiGluExpertComponent,
+    component: GatedProductExpertComponent,
     num_experts: i32,
 ) -> bool {
     (0..num_experts).all(|expert| {
@@ -1063,10 +1070,10 @@ fn split_swiglu_expert_prefix_complete(
 }
 
 #[cfg(test)]
-fn pack_split_swiglu_expert_prefix(
-    expert_parts: &mut HashMap<(String, SwiGluExpertComponent, i32), SwiGluExpertParts>,
+fn pack_split_gated_product_expert_prefix(
+    expert_parts: &mut HashMap<(String, GatedProductExpertComponent, i32), GatedProductExpertParts>,
     prefix: &str,
-    component: SwiGluExpertComponent,
+    component: GatedProductExpertComponent,
     num_experts: i32,
     stream: &Stream,
 ) -> Result<HashMap<String, Array>, Error> {
@@ -1107,27 +1114,29 @@ fn pack_split_swiglu_expert_prefix(
     ]))
 }
 
-/// Packs a map of split SwiGLU experts into local expert-major banks.
+/// Packs a map of split gated-product experts into local expert-major banks.
 ///
 /// Expert ids in `loaded` must already be dense local ids `0..num_experts`.
 #[cfg(test)]
-pub fn transform_split_swiglu_experts(
+pub fn transform_split_gated_product_experts(
     loaded: HashMap<String, Array>,
     num_experts: i32,
     stream: &Stream,
 ) -> Result<HashMap<String, Array>, Error> {
     let mut transformed = HashMap::with_capacity(loaded.len());
-    let mut expert_parts: HashMap<(String, SwiGluExpertComponent, i32), SwiGluExpertParts> =
-        HashMap::new();
+    let mut expert_parts: HashMap<
+        (String, GatedProductExpertComponent, i32),
+        GatedProductExpertParts,
+    > = HashMap::new();
     for (key, value) in loaded {
         if let Some((prefix, expert, projection, component)) =
-            parse_split_swiglu_expert_projection_key(&key)
+            parse_split_gated_product_expert_projection_key(&key)
         {
             let parts = expert_parts.entry((prefix, component, expert)).or_default();
             match projection {
-                SwiGluExpertProjection::Gate => parts.gate = Some(value),
-                SwiGluExpertProjection::Down => parts.down = Some(value),
-                SwiGluExpertProjection::Up => parts.up = Some(value),
+                GatedProductExpertProjection::Gate => parts.gate = Some(value),
+                GatedProductExpertProjection::Down => parts.down = Some(value),
+                GatedProductExpertProjection::Up => parts.up = Some(value),
             }
         } else {
             transformed.insert(key, value);
@@ -1140,7 +1149,7 @@ pub fn transform_split_swiglu_experts(
     prefixes.sort();
     prefixes.dedup();
     for (prefix, component) in prefixes {
-        transformed.extend(pack_split_swiglu_expert_prefix(
+        transformed.extend(pack_split_gated_product_expert_prefix(
             &mut expert_parts,
             &prefix,
             component,
@@ -1298,7 +1307,7 @@ mod tests {
 
     use super::{
         gguf_quantization_configs, load_arrays_quantized_strict, load_safetensors_quantized_strict,
-        parse_split_swiglu_expert_projection_key, StrictLoadConfig, StrictLoadReport,
+        parse_split_gated_product_expert_projection_key, StrictLoadConfig, StrictLoadReport,
     };
 
     #[test]
@@ -1377,22 +1386,23 @@ mod tests {
     }
 
     #[test]
-    fn parses_split_swiglu_expert_names() {
-        let (prefix, expert, projection, component) = parse_split_swiglu_expert_projection_key(
-            "model.layers.3.feed_forward.experts.17.w3.weight",
-        )
-        .unwrap();
+    fn parses_split_gated_product_expert_names() {
+        let (prefix, expert, projection, component) =
+            parse_split_gated_product_expert_projection_key(
+                "model.layers.3.feed_forward.experts.17.w3.weight",
+            )
+            .unwrap();
         assert_eq!(prefix, "model.layers.3.feed_forward.experts");
         assert_eq!(expert, 17);
-        assert_eq!(projection, super::SwiGluExpertProjection::Up);
-        assert_eq!(component, super::SwiGluExpertComponent::Weight);
-        let (_, _, projection, component) = parse_split_swiglu_expert_projection_key(
+        assert_eq!(projection, super::GatedProductExpertProjection::Up);
+        assert_eq!(component, super::GatedProductExpertComponent::Weight);
+        let (_, _, projection, component) = parse_split_gated_product_expert_projection_key(
             "model.layers.3.mlp.experts.17.gate_proj.weight",
         )
         .unwrap();
-        assert_eq!(projection, super::SwiGluExpertProjection::Gate);
-        assert_eq!(component, super::SwiGluExpertComponent::Weight);
-        assert!(parse_split_swiglu_expert_projection_key(
+        assert_eq!(projection, super::GatedProductExpertProjection::Gate);
+        assert_eq!(component, super::GatedProductExpertComponent::Weight);
+        assert!(parse_split_gated_product_expert_projection_key(
             "model.layers.3.feed_forward.experts.17.bias"
         )
         .is_none());

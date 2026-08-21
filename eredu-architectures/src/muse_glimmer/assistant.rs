@@ -615,7 +615,8 @@ impl<B: NeuralBackend> DFlashBlock<B> {
         let normalized = self.post_attention_norm.forward(&hidden, context)?;
         let gate = self.gate.forward(&normalized, context)?;
         let up = self.up.forward(&normalized, context)?;
-        let feed_forward = B::swiglu(gate, up, None, context)?;
+        let feed_forward =
+            B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
         hidden.add(&self.down.forward(&feed_forward, context)?, context)
     }
 }

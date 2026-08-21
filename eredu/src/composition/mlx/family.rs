@@ -3,7 +3,7 @@
 use serde_json::Value;
 
 use crate::backend::mlx::error::Error;
-use crate::composition::mlx_architectures::{gpt_oss::model as gpt_oss, moshi::personaplex};
+use crate::composition::mlx_architectures::moshi::personaplex;
 
 /// Canonical resolution of a model configuration supported by MLX.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -68,7 +68,9 @@ fn validate_model_config(kind: eredu_core::ModelKind, config: &Value) -> Result<
                     .map(|_| ())
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
             }),
-        ModelKind::GptOss => gpt_oss::validate_model_config_value(config),
+        ModelKind::GptOss => eredu_architectures::gpt_oss::model_args_from_config_value(config)
+            .map(|_| ())
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
         ModelKind::Inkling => serde_json::to_vec(config)
             .map_err(Error::from)
             .and_then(|bytes| {

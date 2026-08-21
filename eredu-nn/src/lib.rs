@@ -1159,6 +1159,9 @@ pub struct TopKRouterSpec {
     pub input_dimensions: i32,
     /// Stable router projection parameter identity.
     pub weight: ParameterSpec,
+    /// Optional ordinary projection bias. This contributes to router logits
+    /// before scoring, selection, and selected-route normalization.
+    pub bias: Option<ParameterSpec>,
     /// Optional correction bias used only to choose expert IDs. Gathered
     /// route scores remain unbiased.
     pub correction_bias: Option<ParameterSpec>,
@@ -1200,6 +1203,16 @@ impl TopKRouterSpec {
         {
             return Err(Error::backend(
                 "router input RMS epsilon must be finite and nonnegative",
+            ));
+        }
+        if self
+            .bias
+            .as_ref()
+            .zip(self.correction_bias.as_ref())
+            .is_some_and(|(bias, correction_bias)| bias.id == correction_bias.id)
+        {
+            return Err(Error::backend(
+                "router projection bias and correction bias require distinct parameter identities",
             ));
         }
         Ok(())
@@ -1391,27 +1404,123 @@ pub struct JointExpertRoutingResult<T> {
     pub shared_weights: T,
 }
 
-/// Optional bound applied to the inputs of a SwiGLU product.
-///
-/// The gate branch is capped above before SiLU and the up branch is clamped
-/// symmetrically to the same magnitude.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SwiGluLimit(f32);
+/// Activation applied to the gate branch of a routed gated product.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GatedProductActivation {
+    /// `gate * sigmoid(sigmoid_multiplier * gate)`.
+    Silu,
+    /// Approximate Gaussian error linear unit.
+    GeluApproximate,
+}
 
-impl SwiGluLimit {
-    /// Creates a finite positive SwiGLU bound.
-    pub fn new(limit: f32) -> Result<Self, Error> {
-        if !limit.is_finite() || limit <= 0.0 {
-            return Err(Error::backend(format!(
-                "SwiGLU limit must be finite and positive, got {limit}"
-            )));
-        }
-        Ok(Self(limit))
+/// Validated equation policy for a gated product expert.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GatedProductPolicy {
+    activation: GatedProductActivation,
+    gate_upper_bound: Option<f32>,
+    up_absolute_bound: Option<f32>,
+    sigmoid_multiplier: f32,
+    up_offset: f32,
+}
+
+impl GatedProductPolicy {
+    /// Creates a validated gated-product equation.
+    pub fn new(
+        activation: GatedProductActivation,
+        gate_upper_bound: Option<f32>,
+        up_absolute_bound: Option<f32>,
+        sigmoid_multiplier: f32,
+        up_offset: f32,
+    ) -> Result<Self, Error> {
+        let policy = Self {
+            activation,
+            gate_upper_bound,
+            up_absolute_bound,
+            sigmoid_multiplier,
+            up_offset,
+        };
+        policy.validate()?;
+        Ok(policy)
     }
 
-    /// Returns the gate upper bound and up-branch absolute bound.
-    pub const fn get(self) -> f32 {
-        self.0
+    /// Ordinary unbounded SiLU gating.
+    pub const fn ordinary_silu() -> Self {
+        Self {
+            activation: GatedProductActivation::Silu,
+            gate_upper_bound: None,
+            up_absolute_bound: None,
+            sigmoid_multiplier: 1.0,
+            up_offset: 0.0,
+        }
+    }
+
+    /// Ordinary unbounded approximate-GELU gating.
+    pub const fn ordinary_gelu_approximate() -> Self {
+        Self {
+            activation: GatedProductActivation::GeluApproximate,
+            ..Self::ordinary_silu()
+        }
+    }
+
+    /// Creates ordinary SiLU gating with the same positive gate and up bound.
+    pub fn bounded_silu(bound: f32) -> Result<Self, Error> {
+        Self::new(
+            GatedProductActivation::Silu,
+            Some(bound),
+            Some(bound),
+            1.0,
+            0.0,
+        )
+    }
+
+    /// Validates finite scalars and positive bounds/multiplier.
+    pub fn validate(self) -> Result<(), Error> {
+        if self
+            .gate_upper_bound
+            .is_some_and(|bound| !bound.is_finite() || bound <= 0.0)
+            || self
+                .up_absolute_bound
+                .is_some_and(|bound| !bound.is_finite() || bound <= 0.0)
+            || !self.sigmoid_multiplier.is_finite()
+            || self.sigmoid_multiplier <= 0.0
+            || !self.up_offset.is_finite()
+        {
+            return Err(Error::backend(format!(
+                "invalid gated-product policy: {self:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Gate activation.
+    pub const fn activation(self) -> GatedProductActivation {
+        self.activation
+    }
+
+    /// Optional upper bound applied to the gate branch before activation.
+    pub const fn gate_upper_bound(self) -> Option<f32> {
+        self.gate_upper_bound
+    }
+
+    /// Optional symmetric absolute bound applied to the up branch.
+    pub const fn up_absolute_bound(self) -> Option<f32> {
+        self.up_absolute_bound
+    }
+
+    /// Multiplier inside the sigmoid for SiLU gating.
+    pub const fn sigmoid_multiplier(self) -> f32 {
+        self.sigmoid_multiplier
+    }
+
+    /// Offset added to the up branch after optional clipping.
+    pub const fn up_offset(self) -> f32 {
+        self.up_offset
+    }
+}
+
+impl Default for GatedProductPolicy {
+    fn default() -> Self {
+        Self::ordinary_silu()
     }
 }
 
@@ -1429,43 +1538,46 @@ pub trait RoutingOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
     ) -> Result<RoutingResult<T>, Error>;
 }
 
-/// Parameter identities for one SwiGLU expert or one packed expert axis.
+/// Parameter identities for one gated-product expert or one packed expert axis.
 #[derive(Debug, Clone)]
-pub struct SwiGluExpertParameters {
+pub struct GatedProductExpertParameters {
     /// Gating projection weight.
-    pub gate: SwiGluExpertProjection,
+    pub gate: ExpertProjectionSpec,
     /// Up projection weight.
-    pub up: SwiGluExpertProjection,
+    pub up: ExpertProjectionSpec,
     /// Down projection weight.
-    pub down: SwiGluExpertProjection,
+    pub down: ExpertProjectionSpec,
 }
 
 /// One expert projection identity and optional physical encoding.
 #[derive(Debug, Clone)]
-pub struct SwiGluExpertProjection {
+pub struct ExpertProjectionSpec {
     /// Stable logical parameter identity.
     pub weight: ParameterSpec,
+    /// Optional ordinary per-output projection bias.
+    pub bias: Option<ParameterSpec>,
     /// Complete physical checkpoint encoding.
     pub format: LinearFormat,
 }
 
-/// Logical parameter layout for a SwiGLU expert bank.
+/// Logical parameter layout for a gated-product expert bank.
 #[derive(Debug, Clone)]
-pub enum SwiGluExpertLayout {
-    /// Fused gate/up and down tensors whose leading axis indexes experts.
+pub enum GatedProductExpertLayout {
+    /// Component-major fused gate-then-up and down tensors whose leading axis
+    /// indexes experts.
     Packed {
         /// Concatenated gate/up projection.
-        gate_up: SwiGluExpertProjection,
+        gate_up: ExpertProjectionSpec,
         /// Down projection.
-        down: SwiGluExpertProjection,
+        down: ExpertProjectionSpec,
     },
     /// Independently materialized expert parameter triples in expert-ID order.
-    Independent(Vec<SwiGluExpertParameters>),
+    Independent(Vec<GatedProductExpertParameters>),
 }
 
-/// Complete architecture-owned construction specification for routed SwiGLU experts.
+/// Complete architecture-owned construction specification for routed gated-product experts.
 #[derive(Debug, Clone)]
-pub struct SwiGluExpertBankSpec {
+pub struct GatedProductExpertBankSpec {
     /// Number of routed experts.
     pub expert_count: i32,
     /// Input hidden width.
@@ -1474,24 +1586,13 @@ pub struct SwiGluExpertBankSpec {
     pub intermediate_dimensions: i32,
     /// Output hidden width.
     pub output_dimensions: i32,
-    /// Gate activation applied before multiplying by the up projection.
-    pub activation: GatedExpertActivation,
-    /// Optional pre-activation bound shared by every expert.
-    pub limit: Option<SwiGluLimit>,
+    /// Exact gate activation, bounds, multiplier, and up offset.
+    pub policy: GatedProductPolicy,
     /// Stable logical parameter identities and storage organization.
-    pub layout: SwiGluExpertLayout,
+    pub layout: GatedProductExpertLayout,
 }
 
-/// Activation used by a gated routed-expert bank.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum GatedExpertActivation {
-    /// Sigmoid linear unit.
-    Silu,
-    /// Approximate Gaussian error linear unit.
-    GeluApproximate,
-}
-
-impl SwiGluExpertBankSpec {
+impl GatedProductExpertBankSpec {
     /// Validates positive geometry and exact independent-expert cardinality.
     pub fn validate(&self) -> Result<(), Error> {
         for (name, value) in [
@@ -1502,25 +1603,54 @@ impl SwiGluExpertBankSpec {
         ] {
             if value <= 0 {
                 return Err(Error::backend(format!(
-                    "SwiGLU expert-bank {name} must be positive, got {value}"
+                    "gated-product expert-bank {name} must be positive, got {value}"
                 )));
             }
         }
-        if let SwiGluExpertLayout::Independent(experts) = &self.layout {
+        self.policy.validate()?;
+        if let GatedProductExpertLayout::Independent(experts) = &self.layout {
             let expected = usize::try_from(self.expert_count).map_err(Error::backend)?;
             if experts.len() != expected {
                 return Err(Error::backend(format!(
-                    "independent SwiGLU bank has {} experts, expected {expected}",
+                    "independent gated-product bank has {} experts, expected {expected}",
                     experts.len()
                 )));
+            }
+        }
+        let projections = match &self.layout {
+            GatedProductExpertLayout::Packed { gate_up, down } => vec![gate_up, down],
+            GatedProductExpertLayout::Independent(experts) => experts
+                .iter()
+                .flat_map(|expert| [&expert.gate, &expert.up, &expert.down])
+                .collect(),
+        };
+        let mut identities = std::collections::BTreeSet::new();
+        for projection in projections {
+            for identity in std::iter::once(&projection.weight.id)
+                .chain(projection.bias.as_ref().map(|bias| &bias.id))
+            {
+                if !identities.insert(identity) {
+                    return Err(Error::backend(format!(
+                        "gated-product expert parameter identity {identity} is duplicated"
+                    )));
+                }
             }
         }
         Ok(())
     }
 }
 
-/// Statically dispatched routed SwiGLU expert bank.
-pub trait SwiGluExpertBankOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
+/// Rank-local routed expert output split around the tensor-parallel reduction.
+#[derive(Debug, Clone)]
+pub struct TensorParallelExpertOutput<T> {
+    /// Rank-local projection contribution to all-sum.
+    pub reducible: T,
+    /// Replicated route-weighted down bias added once after all-sum.
+    pub post_reduce: Option<T>,
+}
+
+/// Statically dispatched routed gated-product expert bank.
+pub trait GatedProductExpertBankOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
     /// Executes selected experts and combines their outputs by route weight.
     fn forward_routed(
         &mut self,
@@ -1528,6 +1658,28 @@ pub trait SwiGluExpertBankOperator<T: Tensor>: Clone + Debug + Parameterized<T> 
         routes: &RoutingResult<T>,
         context: &T::Context,
     ) -> Result<T, Error>;
+
+    /// Executes a rank-local tensor-parallel partial and separates replicated
+    /// route-weighted down bias for one literal post-reduction addition.
+    fn forward_routed_tensor_parallel(
+        &mut self,
+        input: &T,
+        routes: &RoutingResult<T>,
+        partitions: usize,
+        context: &T::Context,
+    ) -> Result<TensorParallelExpertOutput<T>, Error> {
+        if partitions == 1 {
+            return self
+                .forward_routed(input, routes, context)
+                .map(|reducible| TensorParallelExpertOutput {
+                    reducible,
+                    post_reduce: None,
+                });
+        }
+        Err(Error::backend(
+            "tensor-parallel gated-product experts are not implemented by this backend",
+        ))
+    }
 }
 
 /// Complete construction specification for packed routed ReLU-squared experts.
@@ -1540,9 +1692,9 @@ pub struct Relu2ExpertBankSpec {
     /// Per-expert intermediate width.
     pub intermediate_dimensions: i32,
     /// Packed up-projection identity and physical format.
-    pub up: SwiGluExpertProjection,
+    pub up: ExpertProjectionSpec,
     /// Packed down-projection identity and physical format.
-    pub down: SwiGluExpertProjection,
+    pub down: ExpertProjectionSpec,
 }
 
 impl Relu2ExpertBankSpec {
@@ -1574,7 +1726,7 @@ pub trait RoutedNeuralBackend: NeuralBackend {
     /// Concrete top-k router.
     type Router: RoutingOperator<Self::Tensor>;
     /// Concrete packed or independently materialized expert bank.
-    type SwiGluExpertBank: SwiGluExpertBankOperator<Self::Tensor>;
+    type GatedProductExpertBank: GatedProductExpertBankOperator<Self::Tensor>;
     /// Concrete packed routed ReLU-squared expert bank.
     type Relu2ExpertBank: Relu2ExpertBankOperator<Self::Tensor>;
 
@@ -1584,11 +1736,11 @@ pub trait RoutedNeuralBackend: NeuralBackend {
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Router, Error>;
 
-    /// Builds a routed SwiGLU expert bank.
-    fn swiglu_expert_bank(
-        spec: SwiGluExpertBankSpec,
+    /// Builds a routed gated-product expert bank.
+    fn gated_product_expert_bank(
+        spec: GatedProductExpertBankSpec,
         context: &<Self::Tensor as Tensor>::Context,
-    ) -> Result<Self::SwiGluExpertBank, Error>;
+    ) -> Result<Self::GatedProductExpertBank, Error>;
 
     /// Builds a routed ReLU-squared expert bank.
     fn relu2_expert_bank(
@@ -1808,6 +1960,67 @@ impl<B: HyperNeuralBackend> HyperHead<B> {
     }
 }
 
+/// One backend-native scaled-dot-product attention request.
+///
+/// Projected queries, keys, and values remain owned backend tensors so cached,
+/// uncached, paged, and sliding implementations can consume the same request
+/// without cloning or host materialization. Masks and learned per-query-head
+/// sink logits are borrowed architecture state.
+#[derive(Debug)]
+pub struct AttentionRequest<'a, T> {
+    /// Queries shaped `[batch, query_heads, query_tokens, head_dimensions]`.
+    pub queries: T,
+    /// Keys shaped `[batch, key_value_heads, key_tokens, head_dimensions]`.
+    pub keys: T,
+    /// Values shaped `[batch, key_value_heads, key_tokens, value_dimensions]`.
+    pub values: T,
+    /// Positive finite score scale.
+    pub scale: f32,
+    /// Optional additive or boolean attention mask.
+    pub mask: Option<&'a T>,
+    /// Optional learned sink logit for every query head.
+    pub sinks: Option<&'a T>,
+}
+
+impl<T: Tensor> AttentionRequest<'_, T> {
+    /// Validates common grouped-query and sink geometry without inspecting values.
+    pub fn validate(&self) -> Result<(), Error> {
+        let queries = self.queries.shape();
+        let keys = self.keys.shape();
+        let values = self.values.shape();
+        if queries.len() != 4
+            || keys.len() != 4
+            || values.len() != 4
+            || queries[0] != keys[0]
+            || keys[..3] != values[..3]
+            || queries[3] != keys[3]
+            || queries[1] <= 0
+            || keys[1] <= 0
+            || queries[1] % keys[1] != 0
+            || queries[2] <= 0
+            || keys[2] <= 0
+            || values[3] <= 0
+            || !self.scale.is_finite()
+            || self.scale <= 0.0
+        {
+            return Err(Error::backend(format!(
+                "invalid attention request geometry queries={queries:?} keys={keys:?} values={values:?} scale={}",
+                self.scale
+            )));
+        }
+        if let Some(sinks) = self.sinks {
+            if sinks.shape() != [queries[1]] {
+                return Err(Error::backend(format!(
+                    "attention sinks require shape [{}], got {:?}",
+                    queries[1],
+                    sinks.shape()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Backend-native key/value cache operations required by attention.
 pub trait AttentionCache<T: Tensor> {
     /// Current absolute sequence offset.
@@ -1822,14 +2035,9 @@ pub trait AttentionCache<T: Tensor> {
         context: &T::Context,
     ) -> Result<(T, T), Error>;
     /// Runs cache-aware attention, including paged or quantized kernels where applicable.
-    #[allow(clippy::too_many_arguments)]
     fn attention(
         &mut self,
-        queries: T,
-        keys: T,
-        values: T,
-        scale: f32,
-        mask: Option<&T>,
+        request: AttentionRequest<'_, T>,
         context: &T::Context,
     ) -> Result<T, Error>;
 }
@@ -2333,22 +2541,47 @@ pub trait NeuralBackend: Sized + 'static {
         ))
     }
     /// Runs dense attention with optional learned per-head sink logits.
-    #[allow(clippy::too_many_arguments)]
     fn attention_with_sinks(
-        queries: Self::Tensor,
-        keys: Self::Tensor,
-        values: Self::Tensor,
-        scale: f32,
-        mask: Option<&Self::Tensor>,
-        sinks: Option<&Self::Tensor>,
+        request: AttentionRequest<'_, Self::Tensor>,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error> {
-        if sinks.is_some() {
+        request.validate()?;
+        if request.sinks.is_some() {
             return Err(Error::backend(
                 "attention sinks are not implemented by this backend",
             ));
         }
-        Self::attention(queries, keys, values, scale, mask, context)
+        Self::attention(
+            request.queries,
+            request.keys,
+            request.values,
+            request.scale,
+            request.mask,
+            context,
+        )
+    }
+    /// Runs causal sliding-window prefill attention with optional learned sinks.
+    fn sliding_window_attention_with_sinks(
+        request: AttentionRequest<'_, Self::Tensor>,
+        window: i32,
+        position_offset: i32,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::Tensor, Error> {
+        request.validate()?;
+        if request.sinks.is_some() {
+            return Err(Error::backend(
+                "sliding-window attention sinks are not implemented by this backend",
+            ));
+        }
+        Self::sliding_window_attention(
+            request.queries,
+            request.keys,
+            request.values,
+            request.scale,
+            window,
+            position_offset,
+            context,
+        )
     }
     /// Runs causal attention with caller-projected learned relative profiles.
     fn relative_attention(
@@ -2396,11 +2629,11 @@ pub trait NeuralBackend: Sized + 'static {
             "grouped linear projection is not implemented by this backend",
         ))
     }
-    /// Applies the shared SwiGLU activation and optional pre-activation bound.
-    fn swiglu(
+    /// Applies a validated gated-product equation.
+    fn gated_product(
         gate: Self::Tensor,
         up: Self::Tensor,
-        limit: Option<SwiGluLimit>,
+        policy: GatedProductPolicy,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
     /// Runs un-cached scaled dot-product attention.
@@ -2450,6 +2683,11 @@ pub trait NeuralBackend: Sized + 'static {
         Err(Error::backend(
             "tensor-parallel sum is not implemented by this backend",
         ))
+    }
+
+    /// Number of participants in a tensor-parallel collective context.
+    fn parallel_size(_parallel: &Self::ParallelContext) -> usize {
+        1
     }
 }
 
@@ -3562,18 +3800,21 @@ impl<B: NeuralBackend> GatedShortConvolution<B> {
 mod routed_contract_tests {
     use super::*;
 
-    fn parameters(prefix: &str) -> SwiGluExpertParameters {
-        SwiGluExpertParameters {
-            gate: SwiGluExpertProjection {
+    fn parameters(prefix: &str) -> GatedProductExpertParameters {
+        GatedProductExpertParameters {
+            gate: ExpertProjectionSpec {
                 weight: ParameterSpec::trainable(format!("{prefix}.gate.weight")).unwrap(),
+                bias: None,
                 format: LinearFormat::Dense,
             },
-            up: SwiGluExpertProjection {
+            up: ExpertProjectionSpec {
                 weight: ParameterSpec::trainable(format!("{prefix}.up.weight")).unwrap(),
+                bias: None,
                 format: LinearFormat::Dense,
             },
-            down: SwiGluExpertProjection {
+            down: ExpertProjectionSpec {
                 weight: ParameterSpec::trainable(format!("{prefix}.down.weight")).unwrap(),
+                bias: None,
                 format: LinearFormat::Dense,
             },
         }
@@ -3587,22 +3828,91 @@ mod routed_contract_tests {
     }
 
     #[test]
+    fn gated_product_policy_rejects_malformed_scalars() {
+        assert!(
+            GatedProductPolicy::new(GatedProductActivation::Silu, Some(0.0), None, 1.0, 0.0,)
+                .is_err()
+        );
+        assert!(GatedProductPolicy::new(
+            GatedProductActivation::Silu,
+            None,
+            Some(f32::NAN),
+            1.0,
+            0.0,
+        )
+        .is_err());
+        assert!(
+            GatedProductPolicy::new(GatedProductActivation::Silu, None, None, 0.0, 0.0,).is_err()
+        );
+        assert!(GatedProductPolicy::new(
+            GatedProductActivation::Silu,
+            None,
+            None,
+            1.0,
+            f32::INFINITY,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn router_projection_and_correction_biases_require_distinct_identities() {
+        let shared_bias = ParameterSpec::trainable("router.bias").unwrap();
+        let spec = TopKRouterSpec {
+            input_dimensions: 4,
+            weight: ParameterSpec::trainable("router.weight").unwrap(),
+            bias: Some(shared_bias.clone()),
+            correction_bias: Some(shared_bias),
+            input_transform: None,
+            route_scale: None,
+            quantization: None,
+            routing: TopKRoutingSpec::new(2, 1, RoutingScoring::SelectedSoftmax, false).unwrap(),
+        };
+
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
     fn independent_expert_layout_requires_exact_cardinality() {
-        let valid = SwiGluExpertBankSpec {
+        let valid = GatedProductExpertBankSpec {
             expert_count: 2,
             input_dimensions: 16,
             intermediate_dimensions: 8,
             output_dimensions: 16,
-            activation: GatedExpertActivation::Silu,
-            limit: None,
-            layout: SwiGluExpertLayout::Independent(vec![parameters("e0"), parameters("e1")]),
+            policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+            layout: GatedProductExpertLayout::Independent(vec![parameters("e0"), parameters("e1")]),
         };
         assert!(valid.validate().is_ok());
-        let invalid = SwiGluExpertBankSpec {
-            layout: SwiGluExpertLayout::Independent(vec![parameters("e0")]),
+        let invalid = GatedProductExpertBankSpec {
+            layout: GatedProductExpertLayout::Independent(vec![parameters("e0")]),
             ..valid
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn gated_product_bank_rejects_reused_projection_bias_identity() {
+        let shared = ParameterSpec::trainable("experts.gate_up").unwrap();
+        let spec = GatedProductExpertBankSpec {
+            expert_count: 1,
+            input_dimensions: 4,
+            intermediate_dimensions: 2,
+            output_dimensions: 4,
+            policy: GatedProductPolicy::ordinary_silu(),
+            layout: GatedProductExpertLayout::Packed {
+                gate_up: ExpertProjectionSpec {
+                    weight: shared.clone(),
+                    bias: Some(shared),
+                    format: LinearFormat::Dense,
+                },
+                down: ExpertProjectionSpec {
+                    weight: ParameterSpec::trainable("experts.down").unwrap(),
+                    bias: None,
+                    format: LinearFormat::Dense,
+                },
+            },
+        };
+
+        assert!(spec.validate().is_err());
     }
 }
 

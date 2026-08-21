@@ -662,7 +662,7 @@ pub struct V4Args {
     pub num_hash_layers: i32,
     pub norm_topk_prob: bool,
     pub routed_scaling_factor: f32,
-    pub swiglu_limit: Option<eredu_nn::SwiGluLimit>,
+    pub swiglu_limit: Option<eredu_nn::GatedProductPolicy>,
     pub num_nextn_predict_layers: i32,
     pub expert_format: ExpertFormat,
     pub linear_format: LinearFormat,
@@ -738,7 +738,7 @@ impl V4Source {
             .transpose()?
             .unwrap_or(LinearFormat::Dense);
         let swiglu_limit = (self.swiglu_limit > 0.0)
-            .then(|| eredu_nn::SwiGluLimit::new(self.swiglu_limit))
+            .then(|| eredu_nn::GatedProductPolicy::bounded_silu(self.swiglu_limit))
             .transpose()
             .map_err(|error| invalid_v4(error.to_string()))?;
         let args = V4Args {
@@ -1448,7 +1448,7 @@ mod tests {
             Some(V4AttentionPolicy::Compressed { ratio: 4 })
         );
         assert_eq!(args.attention_policy(3), Some(V4AttentionPolicy::Local));
-        assert_eq!(args.swiglu_limit.unwrap().get(), 7.0);
+        assert_eq!(args.swiglu_limit.unwrap().gate_upper_bound(), Some(7.0));
     }
 
     #[test]
@@ -1715,6 +1715,6 @@ mod tests {
             Some(V4AttentionPolicy::Compressed { ratio: 4 })
         );
         assert_eq!(args.expert_format, ExpertFormat::MxFp4);
-        assert_eq!(args.swiglu_limit.unwrap().get(), 7.0);
+        assert_eq!(args.swiglu_limit.unwrap().gate_upper_bound(), Some(7.0));
     }
 }

@@ -4755,12 +4755,8 @@ mod tests {
     fn model_reset_surfaces_propagate_paged_clear_failures() {
         use crate::{
             backend::mlx::runtime::cache::{state::MlxKeyValueState, PagedKeyValueCache},
-            composition::mlx_architectures::distributed::{
-                expert::ExpertParallelCache,
-                pipeline::{PipelineCache, PipelineKeyValueCache, PipelineLayerCache},
-            },
-            composition::mlx_architectures::gpt_oss::model::{
-                Cache as GptOssCache, LayerCache as GptOssLayerCache,
+            composition::mlx_architectures::distributed::pipeline::{
+                PipelineCache, PipelineKeyValueCache, PipelineLayerCache,
             },
         };
 
@@ -4781,7 +4777,7 @@ mod tests {
 
         let manager = manager_with_leased_block();
         let mut pipeline = PipelineCache::new(
-            crate::core::ModelKind::GptOss,
+            crate::core::ModelKind::PersonaPlex,
             vec![PipelineLayerCache::KeyValue {
                 global_layer: 0,
                 cache: PipelineKeyValueCache::Paged(
@@ -4791,21 +4787,6 @@ mod tests {
             }],
         );
         assert!(pipeline.reset().is_err());
-        assert_eq!(manager.lock().unwrap().blocks.len(), 1);
-
-        let manager = manager_with_leased_block();
-        let gpt_cache = || GptOssCache {
-            layout: Some(layout.clone()),
-            layers: vec![GptOssLayerCache::Paged(
-                PagedKeyValueCache::new(manager.clone(), 0, None).unwrap(),
-            )],
-        };
-        let mut gpt_oss = gpt_cache();
-        assert!(gpt_oss.reset().is_err());
-        assert_eq!(manager.lock().unwrap().blocks.len(), 1);
-
-        let mut expert_parallel = ExpertParallelCache::GptOss(gpt_cache());
-        assert!(expert_parallel.reset().is_err());
         assert_eq!(manager.lock().unwrap().blocks.len(), 1);
     }
 

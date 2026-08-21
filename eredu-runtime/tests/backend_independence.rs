@@ -2,10 +2,10 @@ use std::{cell::Cell, convert::Infallible};
 
 use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, Completion, LayerSchedule};
 use eredu_nn::{
-    AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator, LinearSpec,
-    NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode, ParameterVisitor,
-    ParameterVisitorMut, Parameterized, RotaryOperator, RotaryPosition, RotarySpec, SwiGluLimit,
-    Tensor,
+    AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, GatedProductPolicy, Index,
+    LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode,
+    ParameterVisitor, ParameterVisitorMut, Parameterized, RotaryOperator, RotaryPosition,
+    RotarySpec, Tensor,
 };
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, CollectiveBackend, DeviceState, ExecutionGraph,
@@ -258,10 +258,10 @@ impl NeuralBackend for FakeBackend {
     fn silu(input: Self::Tensor, _: &()) -> Result<Self::Tensor, Error> {
         Ok(input)
     }
-    fn swiglu(
+    fn gated_product(
         gate: Self::Tensor,
         _: Self::Tensor,
-        _: Option<SwiGluLimit>,
+        _: GatedProductPolicy,
         _: &(),
     ) -> Result<Self::Tensor, Error> {
         Ok(gate)

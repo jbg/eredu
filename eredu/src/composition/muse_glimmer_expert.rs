@@ -14,7 +14,7 @@ use crate::backend::mlx::{
         checkpoint::binding::build_module_bindings_with_recipes_excluding,
         residency::{
             expert_cache::{ExpertCache, ExpertCatalogEntry},
-            expert_provider::{CachedSwiGluBankSpec, CachedSwiGluExpertProvider},
+            expert_provider::{CachedGatedProductBankSpec, CachedGatedProductExpertProvider},
         },
     },
 };
@@ -211,10 +211,10 @@ pub(crate) fn expert_catalog(
 pub(crate) fn cached_provider<'a>(
     cache: &'a ExpertCache,
     args: &'a DecoderConfig,
-) -> CachedSwiGluExpertProvider<'a, impl FnMut(usize) -> CachedSwiGluBankSpec + 'a> {
-    CachedSwiGluExpertProvider::new(cache, move |layer| {
+) -> CachedGatedProductExpertProvider<'a, impl FnMut(usize) -> CachedGatedProductBankSpec + 'a> {
+    CachedGatedProductExpertProvider::new(cache, move |layer| {
         let prefix = format!("model.layers.{layer}.mlp.experts");
-        CachedSwiGluBankSpec {
+        CachedGatedProductBankSpec {
             hidden_dimensions: args.hidden_size,
             intermediate_dimensions: args.moe_intermediate_size,
             gate_up_quantization: args
@@ -223,8 +223,9 @@ pub(crate) fn cached_provider<'a>(
             down_quantization: args
                 .linear_format_for(&format!("{prefix}.down_proj"))
                 .weight_quantization(),
-            activation: eredu_nn::GatedExpertActivation::Silu,
-            limit: None,
+            gate_up_bias: false,
+            down_bias: false,
+            policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
         }
     })
 }

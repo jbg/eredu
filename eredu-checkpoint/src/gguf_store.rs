@@ -557,10 +557,10 @@ fn plan_bounded_selection(
         shape,
     } = selection
     {
-        let offset = u64::try_from(*offset_elements).map_err(|_| StoreError::Overflow {
+        let logical_offset = u64::try_from(*offset_elements).map_err(|_| StoreError::Overflow {
             context: format!("GGUF contiguous offset for tensor {key:?}"),
         })?;
-        let shape = shape
+        let mut physical_shape = shape
             .iter()
             .map(|dimension| {
                 u64::try_from(*dimension).map_err(|_| StoreError::Overflow {
@@ -568,8 +568,63 @@ fn plan_bounded_selection(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let selection =
-            DenseTensorSpan::new(offset, shape).map_err(|error| bounded_error(key, error))?;
+        let logical_units = u64::try_from(entry.logical_last_units_per_block.ok_or_else(|| {
+            bounded_error(key, "scalar GGUF output has no contiguous block mapping")
+        })?)
+        .map_err(|_| StoreError::Overflow {
+            context: format!("GGUF logical block units for tensor {key:?}"),
+        })?;
+        let (block_values, _) = entry
+            .physical_descriptor
+            .ggml_type
+            .block_and_bytes()
+            .map_err(|error| gguf_error(key, error))?;
+        if !block_values.is_multiple_of(logical_units) {
+            return Err(bounded_error(
+                key,
+                format!(
+                    "native block length {block_values} is not divisible by {logical_units} converted units"
+                ),
+            ));
+        }
+        let logical_elements = physical_shape.iter().try_fold(1u64, |count, dimension| {
+            count.checked_mul(*dimension).ok_or(StoreError::Overflow {
+                context: format!("GGUF contiguous element count for tensor {key:?}"),
+            })
+        })?;
+        let logical_end =
+            logical_offset
+                .checked_add(logical_elements)
+                .ok_or(StoreError::Overflow {
+                    context: format!("GGUF contiguous logical end for tensor {key:?}"),
+                })?;
+        if !logical_offset.is_multiple_of(logical_units)
+            || !logical_elements.is_multiple_of(logical_units)
+        {
+            return Err(bounded_error(
+                key,
+                format!(
+                    "contiguous logical span {logical_offset}..{logical_end} must align to {logical_units} converted units per native block"
+                ),
+            ));
+        }
+        let physical_units_per_logical = block_values / logical_units;
+        let physical_last = physical_shape.last_mut().ok_or_else(|| {
+            bounded_error(key, "contiguous GGUF selection has no packed input axis")
+        })?;
+        *physical_last = physical_last
+            .checked_mul(physical_units_per_logical)
+            .ok_or(StoreError::Overflow {
+                context: format!("GGUF contiguous physical shape for tensor {key:?}"),
+            })?;
+        let physical_offset = logical_offset
+            .checked_div(logical_units)
+            .and_then(|blocks| blocks.checked_mul(block_values))
+            .ok_or(StoreError::Overflow {
+                context: format!("GGUF contiguous physical offset for tensor {key:?}"),
+            })?;
+        let selection = DenseTensorSpan::new(physical_offset, physical_shape)
+            .map_err(|error| bounded_error(key, error))?;
         let plan = DenseTensorSpanPlan::new(&entry.physical_descriptor, selection.clone())
             .map_err(|error| bounded_error(key, error))?;
         let physical_offset = plan
@@ -831,6 +886,7 @@ mod tests {
     use eredu_gguf::{ConvertedTensor, GgmlType, TensorInput, Writer};
 
     use super::*;
+    use crate::recipe::DerivedWeightRecipe;
 
     fn write_tensor(path: &Path, name: &str, dimensions: &[u64], ty: GgmlType, data: &[u8]) {
         Writer::default()
@@ -918,5 +974,136 @@ mod tests {
         };
         assert_eq!(native.ggml_type, GgmlType::Q8_0);
         assert_eq!(native.data.len(), 34);
+    }
+
+    #[test]
+    fn mxfp4_expert_selection_pushes_through_component_concatenation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("experts.gguf");
+        let gate = vec![0u8; 2 * 96 * 2 * 17];
+        let up = vec![1u8; 2 * 96 * 2 * 17];
+        let down = vec![2u8; 2 * 64 * 3 * 17];
+        Writer::default()
+            .write(
+                File::create(&path).unwrap(),
+                &BTreeMap::new(),
+                &[
+                    TensorInput {
+                        name: "experts.gate.weight",
+                        dimensions: &[64, 96, 2],
+                        ggml_type: GgmlType::MxFp4,
+                        data: &gate,
+                    },
+                    TensorInput {
+                        name: "experts.up.weight",
+                        dimensions: &[64, 96, 2],
+                        ggml_type: GgmlType::MxFp4,
+                        data: &up,
+                    },
+                    TensorInput {
+                        name: "experts.down.weight",
+                        dimensions: &[96, 64, 2],
+                        ggml_type: GgmlType::MxFp4,
+                        data: &down,
+                    },
+                ],
+            )
+            .unwrap();
+        let checkpoint = Checkpoint::open(&path).unwrap();
+        let resolved = ResolvedCheckpointPlan::for_test(
+            "test",
+            [
+                "experts.gate.weight",
+                "experts.up.weight",
+                "experts.down.weight",
+            ],
+        );
+        let store = GgufWeightStore::builder()
+            .add_resolved_checkpoint(checkpoint, &resolved, str::to_owned)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            store.metadata("experts.gate.weight").unwrap().logical_shape,
+            [2, 96, 8]
+        );
+
+        let fused = DerivedWeightRecipe::Concatenate {
+            axis: 1,
+            inputs: vec![
+                DerivedWeightRecipe::source("experts.gate.weight", TensorSelection::Full),
+                DerivedWeightRecipe::source("experts.up.weight", TensorSelection::Full),
+            ],
+        };
+        let selected = fused
+            .select_bounded(
+                &store,
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 1,
+                    end: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(selected.infer(&store).unwrap().shape(), &[1, 192, 8]);
+        selected.preflight_bounded(&store).unwrap();
+        let rank_zero_gate_up = selected
+            .select_bounded(
+                &store,
+                TensorSelection::Indices {
+                    axis: 1,
+                    indices: (0..64).chain(96..160).collect(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            rank_zero_gate_up.infer(&store).unwrap().shape(),
+            &[1, 128, 8]
+        );
+        rank_zero_gate_up.preflight_bounded(&store).unwrap();
+
+        let down = DerivedWeightRecipe::source("experts.down.weight", TensorSelection::Full)
+            .select_bounded(
+                &store,
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 1,
+                    end: 2,
+                },
+            )
+            .unwrap();
+        for (start, end, expected) in [(0, 8, 8), (8, 12, 4)] {
+            let rank = down
+                .select_bounded(
+                    &store,
+                    TensorSelection::Range {
+                        axis: 2,
+                        start,
+                        end,
+                    },
+                )
+                .unwrap();
+            assert_eq!(rank.infer(&store).unwrap().shape(), &[1, 64, expected]);
+            rank.preflight_bounded(&store).unwrap();
+        }
+        assert_eq!(store.diagnostics().unwrap().physical_reads, 0);
+
+        let lease = store
+            .acquire(TensorReadRequest {
+                key: "experts.gate.weight".into(),
+                selection: TensorSelection::Contiguous {
+                    offset_elements: 96 * 8,
+                    shape: vec![1, 64, 8],
+                },
+                policy: ReadPolicy::RequireBounded,
+            })
+            .unwrap();
+        let converted = lease.materialize_portable().unwrap().into_converted();
+        let ConvertedTensor::MxFp4(selected) = converted else {
+            panic!("expected a native MXFP4 selected tensor")
+        };
+        assert_eq!(selected.weight_shape, [1, 64, 8]);
+        assert_eq!(selected.scale_shape, [1, 64, 2]);
+        assert_eq!(store.diagnostics().unwrap().physical_reads, 1);
     }
 }

@@ -1,9 +1,9 @@
 //! Backend-neutral DeepSeek-V4 local, compressed, and indexed attention.
 
 use eredu_nn::{
-    Error, Index, IndexedAttentionInput, LinearOperator, LinearSpec, LowRankProjection,
-    NeuralBackend, NormalizationOperator, NormalizationSpec, Parameter, ParameterSpec,
-    Parameterized, PooledAttentionInput, PooledPositionInput, PoolingAttentionCache,
+    AttentionRequest, Error, Index, IndexedAttentionInput, LinearOperator, LinearSpec,
+    LowRankProjection, NeuralBackend, NormalizationOperator, NormalizationSpec, Parameter,
+    ParameterSpec, Parameterized, PooledAttentionInput, PooledPositionInput, PoolingAttentionCache,
     PoolingOverlap, PoolingWindows, Tensor,
 };
 
@@ -644,12 +644,14 @@ impl<B: NeuralBackend> Attention<B> {
                     None => None,
                 };
                 B::attention_with_sinks(
-                    query,
-                    keys.clone(),
-                    keys,
-                    self.scale,
-                    mask,
-                    Some(self.sinks.as_ref()),
+                    AttentionRequest {
+                        queries: query,
+                        keys: keys.clone(),
+                        values: keys,
+                        scale: self.scale,
+                        mask,
+                        sinks: Some(self.sinks.as_ref()),
+                    },
                     context,
                 )?
             }
@@ -664,15 +666,20 @@ impl<B: NeuralBackend> Attention<B> {
                     }
                 };
                 match self.policy {
-                    V4AttentionPolicy::Local => B::attention_with_sinks(
-                        query,
-                        local.expand_dims(1, context)?.clone(),
-                        local.expand_dims(1, context)?,
-                        self.scale,
-                        Some(local_mask),
-                        Some(self.sinks.as_ref()),
-                        context,
-                    )?,
+                    V4AttentionPolicy::Local => {
+                        let keys = local.expand_dims(1, context)?;
+                        B::attention_with_sinks(
+                            AttentionRequest {
+                                queries: query,
+                                keys: keys.clone(),
+                                values: keys,
+                                scale: self.scale,
+                                mask: Some(local_mask),
+                                sinks: Some(self.sinks.as_ref()),
+                            },
+                            context,
+                        )?
+                    }
                     V4AttentionPolicy::Compressed { ratio: 4 } => {
                         let pooled = self
                             .compressor

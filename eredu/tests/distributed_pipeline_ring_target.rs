@@ -39,3 +39,9 @@ fn qwen35() {
 fn qwen3_vl() {
     run_library_ring_selection("qwen3_vl");
 }
+
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn gpt_oss() {
+    run_library_ring_selection("gpt_oss");
+}

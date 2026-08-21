@@ -11,19 +11,20 @@ use std::{
 use eredu_checkpoint::WeightQuantization;
 use eredu_core::Completion;
 use eredu_nn::{
-    validate_parameter_topology, AttentionCache, BlockwiseAttentionBackend, BlockwiseAttentionSpec,
-    EmbeddingOperator, EmbeddingSpec, Error as ComputeError, GatedDeltaScanInput,
-    GatedDeltaScanOutput, HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState,
-    HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, IndexedAttentionInput,
-    JointExpertRoutingInput, JointExpertRoutingResult, LinearFormat, LinearOperator, LinearSpec,
-    NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, NormalizationScale,
-    NormalizationSpec, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
-    Parameterized, PooledAttentionInput, PooledPositionInput, RelativeAttentionInput,
-    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RopeValue, RotaryOperator, RotaryPosition,
-    RotarySpec, RoutedNeuralBackend, RoutingOperator, RoutingResult, RoutingScoring,
-    SegmentedAttentionInput, SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput,
-    SwiGluExpertBankOperator, SwiGluExpertBankSpec, SwiGluExpertLayout, SwiGluLimit, Tensor,
-    TopKRouterSpec,
+    validate_parameter_topology, AttentionCache, AttentionRequest, BlockwiseAttentionBackend,
+    BlockwiseAttentionSpec, EmbeddingOperator, EmbeddingSpec, Error as ComputeError,
+    GatedDeltaScanInput, GatedDeltaScanOutput, GatedProductExpertBankOperator,
+    GatedProductExpertBankSpec, GatedProductExpertLayout, GatedProductPolicy,
+    HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState, HyperHeadOperator,
+    HyperHeadSpec, HyperNeuralBackend, IndexedAttentionInput, JointExpertRoutingInput,
+    JointExpertRoutingResult, LinearFormat, LinearOperator, LinearSpec, NeuralBackend,
+    NormalizationConstructionSpec, NormalizationOperator, NormalizationScale, NormalizationSpec,
+    ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized,
+    PooledAttentionInput, PooledPositionInput, RelativeAttentionInput, Relu2ExpertBankOperator,
+    Relu2ExpertBankSpec, RopeValue, RotaryOperator, RotaryPosition, RotarySpec,
+    RoutedNeuralBackend, RoutingOperator, RoutingResult, RoutingScoring, SegmentedAttentionInput,
+    SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
+    TensorParallelExpertOutput, TopKRouterSpec,
 };
 use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
 use safemlx::ops::{
@@ -64,6 +65,16 @@ fn companion_spec(weight: &ParameterSpec, component: &str) -> ParameterSpec {
     ParameterSpec {
         id: eredu_nn::ParameterId::new(format!("{prefix}.{component}"))
             .expect("authoritative weight identity produces a non-empty companion identity"),
+        trainable: weight.trainable,
+        alias_of: None,
+        group: Some(weight.id.as_str().to_owned()),
+    }
+}
+
+fn packed_expert_companion_spec(weight: &ParameterSpec, component: &str) -> ParameterSpec {
+    ParameterSpec {
+        id: eredu_nn::ParameterId::new(format!("{}_{}", weight.id.as_str(), component))
+            .expect("authoritative expert identity produces a non-empty companion identity"),
         trainable: weight.trainable,
         alias_of: None,
         group: Some(weight.id.as_str().to_owned()),
@@ -1062,13 +1073,13 @@ impl RoutingOperator<Array> for MlxTopKRouter {
     }
 }
 
-/// MLX packed execution bank for backend-neutral routed SwiGLU experts.
+/// MLX packed execution bank for backend-neutral routed gated-product experts.
 #[derive(Debug, Clone)]
-pub struct MlxSwiGluExpertBank {
-    module: MlxParameterTree<common::moe::PackedSwiGluExperts>,
+pub struct MlxGatedProductExpertBank {
+    module: MlxNamedModule<common::moe::PackedGatedProductExperts>,
 }
 
-impl Parameterized<Array> for MlxSwiGluExpertBank {
+impl Parameterized<Array> for MlxGatedProductExpertBank {
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, Array>,
@@ -1086,7 +1097,7 @@ impl Parameterized<Array> for MlxSwiGluExpertBank {
     }
 }
 
-impl SwiGluExpertBankOperator<Array> for MlxSwiGluExpertBank {
+impl GatedProductExpertBankOperator<Array> for MlxGatedProductExpertBank {
     fn forward_routed(
         &mut self,
         input: &Array,
@@ -1101,6 +1112,30 @@ impl SwiGluExpertBankOperator<Array> for MlxSwiGluExpertBank {
             context,
         ))?;
         compute(output.reshape(input.shape(), context))
+    }
+
+    fn forward_routed_tensor_parallel(
+        &mut self,
+        input: &Array,
+        routes: &RoutingResult<Array>,
+        partitions: usize,
+        context: &Stream,
+    ) -> Result<TensorParallelExpertOutput<Array>, ComputeError> {
+        let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
+        let output = compute(self.module.forward_tensor_parallel(
+            &flattened,
+            &routes.expert_ids,
+            &routes.route_weights,
+            partitions,
+            context,
+        ))?;
+        Ok(TensorParallelExpertOutput {
+            reducible: compute(output.reducible.reshape(input.shape(), context))?,
+            post_reduce: output
+                .post_reduce
+                .map(|bias| compute(bias.reshape(input.shape(), context)))
+                .transpose()?,
+        })
     }
 }
 
@@ -1166,7 +1201,9 @@ impl crate::backend::mlx::runtime::distributed::expert::LocalExpertBank for MlxR
     }
 }
 
-impl crate::backend::mlx::runtime::distributed::expert::LocalExpertBank for MlxSwiGluExpertBank {
+impl crate::backend::mlx::runtime::distributed::expert::LocalExpertBank
+    for MlxGatedProductExpertBank
+{
     fn execute_local_routes(
         &mut self,
         hidden: &Array,
@@ -1755,21 +1792,36 @@ impl NeuralBackend for MlxBackend {
         Ok(SelectiveStateSpaceScanOutput { state, output })
     }
 
-    fn swiglu(
+    fn gated_product(
         mut gate: Array,
         mut up: Array,
-        limit: Option<SwiGluLimit>,
+        policy: GatedProductPolicy,
         context: &Stream,
     ) -> Result<Array, ComputeError> {
-        if let Some(limit) = limit {
-            gate = compute(safemlx::ops::minimum(
-                gate,
-                Array::from_f32(limit.get()),
-                context,
-            ))?;
-            up = compute(safemlx::ops::clip(up, (-limit.get(), limit.get()), context))?;
+        policy.validate()?;
+        if let Some(bound) = policy.gate_upper_bound() {
+            gate = compute(safemlx::ops::minimum(gate, Array::from_f32(bound), context))?;
         }
-        let gate = compute(common::layers::silu(gate, context))?;
+        if let Some(bound) = policy.up_absolute_bound() {
+            up = compute(safemlx::ops::clip(up, (-bound, bound), context))?;
+        }
+        if policy.up_offset() != 0.0 {
+            up = compute(up.add(Array::from_f32(policy.up_offset()), context))?;
+        }
+        let gate = match policy.activation() {
+            eredu_nn::GatedProductActivation::Silu if policy.sigmoid_multiplier() == 1.0 => {
+                compute(common::layers::silu(gate, context))?
+            }
+            eredu_nn::GatedProductActivation::Silu => {
+                let scaled =
+                    compute(gate.multiply(Array::from_f32(policy.sigmoid_multiplier()), context))?;
+                let probability = compute(sigmoid(scaled, context))?;
+                compute(gate.multiply(probability, context))?
+            }
+            eredu_nn::GatedProductActivation::GeluApproximate => {
+                compute(nn::gelu_approximate(gate, context))?
+            }
+        };
         compute(gate.multiply(up, context))
     }
 
@@ -2078,21 +2130,40 @@ impl NeuralBackend for MlxBackend {
     }
 
     fn attention_with_sinks(
-        queries: Array,
-        keys: Array,
-        values: Array,
-        scale: f32,
-        mask: Option<&Array>,
-        sinks: Option<&Array>,
+        request: AttentionRequest<'_, Array>,
         context: &Stream,
     ) -> Result<Array, ComputeError> {
+        request.validate()?;
         compute(safemlx::fast::scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            scale,
-            mask.map(ScaledDotProductAttentionMask::Array),
-            sinks,
+            request.queries,
+            request.keys,
+            request.values,
+            request.scale,
+            request.mask.map(ScaledDotProductAttentionMask::Array),
+            request.sinks,
+            context,
+        ))
+    }
+
+    fn sliding_window_attention_with_sinks(
+        request: AttentionRequest<'_, Array>,
+        window: i32,
+        position_offset: i32,
+        context: &Stream,
+    ) -> Result<Array, ComputeError> {
+        request.validate()?;
+        let batch = request.queries.dim(0);
+        let sequence = request.queries.dim(2);
+        compute(common::attention::sliding_window_prefill_attention(
+            request.queries,
+            request.keys,
+            request.values,
+            request.scale,
+            window,
+            position_offset,
+            batch,
+            sequence,
+            request.sinks,
             context,
         ))
     }
@@ -2165,6 +2236,7 @@ impl NeuralBackend for MlxBackend {
             position_offset,
             batch,
             sequence,
+            None,
             context,
         ))
     }
@@ -2199,6 +2271,10 @@ impl NeuralBackend for MlxBackend {
         context: &Stream,
     ) -> Result<Array, ComputeError> {
         compute(safemlx::distributed::all_sum(&value, parallel, context))
+    }
+
+    fn parallel_size(parallel: &Group) -> usize {
+        parallel.size()
     }
 }
 
@@ -2252,7 +2328,7 @@ impl HyperNeuralBackend for MlxBackend {
 
 impl RoutedNeuralBackend for MlxBackend {
     type Router = MlxTopKRouter;
-    type SwiGluExpertBank = MlxSwiGluExpertBank;
+    type GatedProductExpertBank = MlxGatedProductExpertBank;
     type Relu2ExpertBank = MlxRelu2ExpertBank;
 
     fn top_k_router(spec: TopKRouterSpec, context: &Stream) -> Result<Self::Router, ComputeError> {
@@ -2276,6 +2352,7 @@ impl RoutedNeuralBackend for MlxBackend {
                 routed_scaling_factor: spec.routing.routed_scaling(),
                 n_group: spec.routing.expert_groups(),
                 topk_group: spec.routing.selected_groups(),
+                projection_bias: spec.bias.is_some(),
                 score_correction_bias: spec.correction_bias.is_some(),
                 input_rms_epsilon: spec
                     .input_transform
@@ -2292,6 +2369,9 @@ impl RoutedNeuralBackend for MlxBackend {
         ))?;
         let weight = spec.weight;
         let mut topology = vec![("weight", weight.clone())];
+        if let Some(bias) = spec.bias {
+            topology.push(("bias", bias));
+        }
         if let Some(quantization) = spec
             .quantization
             .filter(|format| !matches!(format, WeightQuantization::GgufIQuant { .. }))
@@ -2315,17 +2395,18 @@ impl RoutedNeuralBackend for MlxBackend {
         })
     }
 
-    fn swiglu_expert_bank(
-        spec: SwiGluExpertBankSpec,
+    fn gated_product_expert_bank(
+        spec: GatedProductExpertBankSpec,
         context: &Stream,
-    ) -> Result<Self::SwiGluExpertBank, ComputeError> {
+    ) -> Result<Self::GatedProductExpertBank, ComputeError> {
         spec.validate()?;
         if spec.input_dimensions != spec.output_dimensions {
             return Err(ComputeError::backend(
-                "MLX packed SwiGLU experts require equal input and output dimensions",
+                "MLX packed gated-product experts require equal input and output dimensions",
             ));
         }
-        let SwiGluExpertLayout::Packed { gate_up, down } = spec.layout else {
+        let policy = spec.policy;
+        let GatedProductExpertLayout::Packed { gate_up, down } = spec.layout else {
             return Err(ComputeError::backend(
                 "independent expert units must be acquired through a runtime expert provider",
             ));
@@ -2364,23 +2445,73 @@ impl RoutedNeuralBackend for MlxBackend {
             }
             _ => false,
         };
-        let mut module = compute(common::moe::PackedSwiGluExperts::new(
+        let mut module = compute(common::moe::PackedGatedProductExperts::new(
             spec.expert_count,
             spec.input_dimensions,
             spec.intermediate_dimensions,
             gate_up.format.weight_quantization(),
             down.format.weight_quantization(),
+            [gate_up.bias.is_some(), down.bias.is_some()],
             context,
         ))?;
-        module = module.with_activation(spec.activation);
+        module = compute(module.with_policy(policy))?;
         if native_fp8 {
             module = compute(module.with_native_fp8_e8m0(context))?;
         }
-        if let Some(limit) = spec.limit {
-            module = compute(module.with_swiglu_limit(limit.get()))?;
+        let mut topology = vec![
+            ("gate_up_proj", gate_up.weight.clone()),
+            ("down_proj", down.weight.clone()),
+        ];
+        if let Some(bias) = gate_up.bias {
+            topology.push(("gate_up_proj_bias", bias));
         }
-        Ok(MlxSwiGluExpertBank {
-            module: MlxParameterTree::new(module, prefix)?,
+        if let Some(bias) = down.bias {
+            topology.push(("down_proj_bias", bias));
+        }
+        if native_fp8
+            || gate_up
+                .format
+                .weight_quantization()
+                .is_some_and(|format| !matches!(format, WeightQuantization::GgufIQuant { .. }))
+        {
+            topology.push((
+                "gate_up_proj_scales",
+                packed_expert_companion_spec(&gate_up.weight, "scales"),
+            ));
+        }
+        if gate_up
+            .format
+            .weight_quantization()
+            .is_some_and(WeightQuantization::has_biases)
+        {
+            topology.push((
+                "gate_up_proj_biases",
+                packed_expert_companion_spec(&gate_up.weight, "biases"),
+            ));
+        }
+        if native_fp8
+            || down
+                .format
+                .weight_quantization()
+                .is_some_and(|format| !matches!(format, WeightQuantization::GgufIQuant { .. }))
+        {
+            topology.push((
+                "down_proj_scales",
+                packed_expert_companion_spec(&down.weight, "scales"),
+            ));
+        }
+        if down
+            .format
+            .weight_quantization()
+            .is_some_and(WeightQuantization::has_biases)
+        {
+            topology.push((
+                "down_proj_biases",
+                packed_expert_companion_spec(&down.weight, "biases"),
+            ));
+        }
+        Ok(MlxGatedProductExpertBank {
+            module: MlxNamedModule::with_exact_topology(module, topology)?,
         })
     }
 
@@ -2440,29 +2571,29 @@ macro_rules! impl_attention_cache {
             }
             fn attention(
                 &mut self,
-                queries: Array,
-                keys: Array,
-                values: Array,
-                scale: f32,
-                mask: Option<&Array>,
+                request: AttentionRequest<'_, Array>,
                 context: &Stream,
             ) -> Result<Array, ComputeError> {
+                request.validate()?;
                 if let Some(output) = compute(KeyValueCache::paged_attention(
-                    self, &queries, scale, mask, None, context,
+                    self,
+                    &request.queries,
+                    request.scale,
+                    request.mask,
+                    request.sinks,
+                    context,
                 ))? {
                     return Ok(output);
                 }
-                compute(
-                    crate::backend::mlx::nn::tensor::scaled_dot_product_attention(
-                        queries,
-                        keys,
-                        values,
-                        Some(self),
-                        scale,
-                        mask,
-                        context,
-                    ),
-                )
+                compute(safemlx::fast::scaled_dot_product_attention(
+                    request.queries,
+                    request.keys,
+                    request.values,
+                    request.scale,
+                    request.mask.map(ScaledDotProductAttentionMask::Array),
+                    request.sinks,
+                    context,
+                ))
             }
         }
     };

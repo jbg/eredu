@@ -7,9 +7,9 @@ use eredu_core::cache::{
     PromptCacheOptions, StateTensorOwner, StateTensorRole,
 };
 use eredu_nn::{
-    AttentionCache, CompressedAttentionBlock, CompressedAttentionCache, CompressedAttentionScan,
-    CompressedAttentionState, CompressedAttentionView, Error as ComputeError,
-    PoolingAttentionCache, PoolingOverlap, PoolingWindows,
+    AttentionCache, AttentionRequest, CompressedAttentionBlock, CompressedAttentionCache,
+    CompressedAttentionScan, CompressedAttentionState, CompressedAttentionView,
+    Error as ComputeError, PoolingAttentionCache, PoolingOverlap, PoolingWindows,
 };
 use eredu_runtime::{
     CacheResidencyReport, LayerRuntimeState, RuntimeLayerState, RuntimeState,
@@ -1168,11 +1168,7 @@ impl AttentionCache<Array> for MlxHybridLayerState {
 
     fn attention(
         &mut self,
-        queries: Array,
-        keys: Array,
-        values: Array,
-        scale: f32,
-        mask: Option<&Array>,
+        request: AttentionRequest<'_, Array>,
         stream: &Stream,
     ) -> Result<Array, ComputeError> {
         AttentionCache::attention(
@@ -1184,11 +1180,7 @@ impl AttentionCache<Array> for MlxHybridLayerState {
                     ))
                 }
             },
-            queries,
-            keys,
-            values,
-            scale,
-            mask,
+            request,
             stream,
         )
     }

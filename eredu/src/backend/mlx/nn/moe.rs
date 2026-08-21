@@ -1,7 +1,7 @@
 //! Mixture-of-experts routing and packed expert implementations.
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_nn::GatedExpertActivation;
+use eredu_nn::{GatedProductActivation, GatedProductPolicy, TensorParallelExpertOutput};
 
 use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use safemlx::{
@@ -236,6 +236,8 @@ pub struct TopKRouterConfig {
     pub n_group: i32,
     /// Number of routing groups selected before expert top-k.
     pub topk_group: i32,
+    /// Whether to allocate an ordinary per-expert projection output bias.
+    pub projection_bias: bool,
     /// Whether to allocate a selection-only expert score correction bias.
     pub score_correction_bias: bool,
     /// Optional epsilon for weightless RMS normalization before projection.
@@ -270,6 +272,9 @@ pub struct TopKRouter {
     #[param]
     /// Router projection weight.
     pub weight: Param<Array>,
+    #[param]
+    /// Optional ordinary projection output bias applied to router logits.
+    pub bias: Param<Option<Array>>,
     #[param]
     /// Optional affine scales for a packed router projection.
     pub scales: Param<Option<Array>>,
@@ -310,8 +315,8 @@ pub struct TopKRouterOutput {
 }
 
 /// Selects the largest router logits and normalizes only the selected values.
-/// This matches routers such as GPT-OSS where the softmax is applied after
-/// top-k selection rather than across every expert.
+/// The softmax is applied after top-k selection rather than across every
+/// candidate expert.
 pub fn top_k_softmax_routing(
     logits: &Array,
     top_k: i32,
@@ -395,6 +400,11 @@ impl TopKRouter {
                     dense_dtype,
                     stream,
                 )?,
+            },
+            bias: if config.projection_bias {
+                Param::<Option<Array>>::unloaded_some(&[config.num_experts], dense_dtype, stream)?
+            } else {
+                Param::new(None)
             },
             scales: if let Some(quantization) = affine {
                 Param::<Option<Array>>::unloaded_some(
@@ -521,6 +531,10 @@ impl TopKRouter {
         } else {
             matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?
         };
+        let logits = match self.bias.as_ref() {
+            Some(bias) => logits.add(bias, stream)?,
+            None => logits,
+        };
         let scores = self.score_function.apply(logits, stream)?;
         let mut scores_for_choice = scores.clone();
         if let Some(bias) = self.e_score_correction_bias.as_ref() {
@@ -623,6 +637,10 @@ impl TopKRouter {
         } else {
             matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?
         };
+        let logits = match self.bias.as_ref() {
+            Some(bias) => logits.add(bias, stream)?,
+            None => logits,
+        };
         let scores = self.score_function.apply(logits, stream)?;
         let expert_indices = expert_indices.reshape(&[-1, self.top_k], stream)?;
         let mut weights = take_along_axis(scores, &expert_indices, -1, stream)?;
@@ -711,6 +729,10 @@ impl TopKRouter {
             )?
         } else {
             matmul(&flat, self.weight.as_ref().transpose(stream)?, stream)?
+        };
+        let logits = match self.bias.as_ref() {
+            Some(bias) => logits.add(bias, stream)?,
+            None => logits,
         };
         observer.observe(&format!("{prefix}.router_logits"), &logits)?;
         let scores = self.score_function.apply(logits, stream)?;
@@ -1110,18 +1132,16 @@ const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
 const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
 
 #[derive(Debug, Clone, ModuleParameters)]
-/// Packed SwiGLU expert bank with optional MLX affine or MXFP4 projections.
-pub struct PackedSwiGluExperts {
+/// Packed gated-product expert bank with optional MLX affine or MXFP4 projections.
+pub struct PackedGatedProductExperts {
     /// Number of experts.
     pub num_experts: i32,
     /// Model hidden dimension.
     pub hidden_dim: i32,
     /// Per-expert intermediate dimension.
     pub intermediate_dim: i32,
-    /// Gate activation selected by the architecture.
-    pub activation: GatedExpertActivation,
-    /// Optional finite bound applied before the SwiGLU product.
-    pub swiglu_limit: Option<f32>,
+    /// Exact gate activation, bounds, sigmoid multiplier, and up offset.
+    pub policy: GatedProductPolicy,
     /// Optional encoding for the concatenated gate/up projection.
     pub gate_up_affine: Option<WeightQuantization>,
     /// Optional encoding for the down projection.
@@ -1136,6 +1156,9 @@ pub struct PackedSwiGluExperts {
     /// Concatenated gate/up weights shaped `[experts, 2 * intermediate, hidden]`.
     pub gate_up_proj: Param<Array>,
     #[param]
+    /// Optional ordinary gate/up output bias shaped `[experts, 2 * intermediate]`.
+    pub gate_up_proj_bias: Param<Option<Array>>,
+    #[param]
     /// Gate/up quantization scales.
     pub gate_up_proj_scales: Param<Option<Array>>,
     #[param]
@@ -1144,6 +1167,9 @@ pub struct PackedSwiGluExperts {
     #[param]
     /// Down weights shaped `[experts, hidden, intermediate]`.
     pub down_proj: Param<Array>,
+    #[param]
+    /// Optional ordinary down output bias shaped `[experts, hidden]`.
+    pub down_proj_bias: Param<Option<Array>>,
     #[param]
     /// Down quantization scales.
     pub down_proj_scales: Param<Option<Array>>,
@@ -1154,7 +1180,7 @@ pub struct PackedSwiGluExperts {
 
 type ExpertProjectionParams = (Param<Array>, Param<Option<Array>>, Param<Option<Array>>);
 
-impl PackedSwiGluExperts {
+impl PackedGatedProductExperts {
     /// Creates an unloaded packed expert bank.
     pub fn new(
         num_experts: i32,
@@ -1162,6 +1188,7 @@ impl PackedSwiGluExperts {
         intermediate_dim: i32,
         gate_up_affine: Option<WeightQuantization>,
         down_affine: Option<WeightQuantization>,
+        projection_biases: [bool; 2],
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Self::new_with_dtype(
@@ -1170,6 +1197,7 @@ impl PackedSwiGluExperts {
             intermediate_dim,
             gate_up_affine,
             down_affine,
+            projection_biases,
             Dtype::Float32,
             stream,
         )
@@ -1182,6 +1210,7 @@ impl PackedSwiGluExperts {
         intermediate_dim: i32,
         gate_up_affine: Option<WeightQuantization>,
         down_affine: Option<WeightQuantization>,
+        projection_biases: [bool; 2],
         dense_dtype: Dtype,
         stream: &Stream,
     ) -> Result<Self, Exception> {
@@ -1217,6 +1246,12 @@ impl PackedSwiGluExperts {
                     Param::new(None),
                 ))
             } else if let Some(quantization) = quantization {
+                if in_features % quantization.group_size() != 0 {
+                    return Err(Exception::custom(format!(
+                        "packed expert input width {in_features} is not divisible by {quantization:?} group size {}",
+                        quantization.group_size(),
+                    )));
+                }
                 Ok((
                     Param::<Array>::unloaded(
                         &[
@@ -1278,39 +1313,46 @@ impl PackedSwiGluExperts {
             num_experts,
             hidden_dim,
             intermediate_dim,
-            activation: GatedExpertActivation::Silu,
-            swiglu_limit: None,
+            policy: GatedProductPolicy::ordinary_silu(),
             gate_up_affine,
             down_affine,
             gate_up_iquant,
             down_iquant,
             native_fp8_e8m0: false,
             gate_up_proj,
+            gate_up_proj_bias: if projection_biases[0] {
+                Param::<Option<Array>>::unloaded_some(
+                    &[num_experts, 2 * intermediate_dim],
+                    dense_dtype,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
             gate_up_proj_scales,
             gate_up_proj_biases,
             down_proj,
+            down_proj_bias: if projection_biases[1] {
+                Param::<Option<Array>>::unloaded_some(
+                    &[num_experts, hidden_dim],
+                    dense_dtype,
+                    stream,
+                )?
+            } else {
+                Param::new(None)
+            },
             down_proj_scales,
             down_proj_biases,
         })
     }
 
-    /// Applies a finite activation bound to gate and up projections.
-    ///
-    /// The gate is upper-bounded while the up projection is bounded on both
-    /// sides. A non-positive
-    /// value disables the bound.
-    pub fn with_swiglu_limit(mut self, limit: f32) -> Result<Self, Exception> {
-        if !limit.is_finite() {
-            return Err(Exception::custom("SwiGLU limit must be finite"));
-        }
-        self.swiglu_limit = (limit > 0.0).then_some(limit);
+    /// Selects a validated gated-product equation.
+    pub fn with_policy(mut self, policy: GatedProductPolicy) -> Result<Self, Exception> {
+        policy
+            .validate()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        self.policy = policy;
         Ok(self)
-    }
-
-    /// Selects the gated-product activation.
-    pub fn with_activation(mut self, activation: GatedExpertActivation) -> Self {
-        self.activation = activation;
-        self
     }
 
     /// Rebuilds projection storage for native block-FP8 expert tensors.
@@ -1400,15 +1442,35 @@ impl PackedSwiGluExperts {
                 stream,
             )?
         };
+        let gate_up = match self.gate_up_proj_bias.as_ref() {
+            Some(bias) => {
+                gate_up.add(bias.take_axis(&plan.sorted_group_ids, 0, stream)?, stream)?
+            }
+            None => gate_up,
+        };
         let mut gate = gate_up.try_index_device((.., ..self.intermediate_dim), stream)?;
         let mut up = gate_up.try_index_device((.., self.intermediate_dim..), stream)?;
-        if let Some(limit) = self.swiglu_limit {
-            gate = safemlx::ops::clip(gate, ((), limit), stream)?;
-            up = safemlx::ops::clip(up, (-limit, limit), stream)?;
+        if let Some(bound) = self.policy.gate_upper_bound() {
+            gate = safemlx::ops::clip(gate, ((), bound), stream)?;
         }
-        let gate = match self.activation {
-            GatedExpertActivation::Silu => silu(gate, stream)?,
-            GatedExpertActivation::GeluApproximate => safemlx::nn::gelu_approximate(gate, stream)?,
+        if let Some(bound) = self.policy.up_absolute_bound() {
+            up = safemlx::ops::clip(up, (-bound, bound), stream)?;
+        }
+        if self.policy.up_offset() != 0.0 {
+            up = up.add(Array::from_f32(self.policy.up_offset()), stream)?;
+        }
+        let gate = match self.policy.activation() {
+            GatedProductActivation::Silu if self.policy.sigmoid_multiplier() == 1.0 => {
+                silu(gate, stream)?
+            }
+            GatedProductActivation::Silu => gate.multiply(
+                sigmoid(
+                    gate.multiply(Array::from_f32(self.policy.sigmoid_multiplier()), stream)?,
+                    stream,
+                )?,
+                stream,
+            )?,
+            GatedProductActivation::GeluApproximate => safemlx::nn::gelu_approximate(gate, stream)?,
         };
         let activated = gate.multiply(up, stream)?;
         let output = if self.native_fp8_e8m0 {
@@ -1453,6 +1515,10 @@ impl PackedSwiGluExperts {
                 stream,
             )?
         };
+        let output = match self.down_proj_bias.as_ref() {
+            Some(bias) => output.add(bias.take_axis(&plan.sorted_group_ids, 0, stream)?, stream)?,
+            None => output,
+        };
         weighted_route_sum(output, top_k_weights, &plan, num_tokens, stream)
     }
 
@@ -1483,6 +1549,43 @@ impl PackedSwiGluExperts {
         concatenate_axis(&outputs, 0, stream)
     }
 
+    /// Separates the rank-local projection contribution from replicated routed
+    /// down bias so the latter can be added literally once after all-sum.
+    pub fn forward_tensor_parallel(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        partitions: usize,
+        stream: &Stream,
+    ) -> Result<TensorParallelExpertOutput<Array>, Exception> {
+        if partitions == 0 {
+            return Err(Exception::custom(
+                "tensor-parallel partition count must be positive",
+            ));
+        }
+        let output = self.forward(hidden_states, top_k_index, top_k_weights, stream)?;
+        let Some(bias) = self.down_proj_bias.as_ref() else {
+            return Ok(TensorParallelExpertOutput {
+                reducible: output,
+                post_reduce: None,
+            });
+        };
+        let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
+        let routed_bias = bias.take_axis(&plan.sorted_group_ids, 0, stream)?;
+        let bias = weighted_route_sum(
+            routed_bias,
+            top_k_weights,
+            &plan,
+            hidden_states.dim(0),
+            stream,
+        )?;
+        Ok(TensorParallelExpertOutput {
+            reducible: output.subtract(&bias, stream)?,
+            post_reduce: Some(bias),
+        })
+    }
+
     /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
 }
@@ -1508,6 +1611,7 @@ mod tests {
                 routed_scaling_factor: 1.0,
                 n_group: 1,
                 topk_group: 1,
+                projection_bias: false,
                 score_correction_bias: false,
                 input_rms_epsilon: Some(0.0),
                 input_inverse_sqrt_dimensions: true,
@@ -1558,5 +1662,160 @@ mod tests {
             assert!((weight - expected_weight).abs() < 1e-5);
         }
         assert_eq!(seen, [true, true]);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn mlx_projection_bias_affects_selected_softmax_while_correction_is_selection_only() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let mut router = TopKRouter::new(
+            TopKRouterConfig {
+                top_k: 2,
+                num_experts: 3,
+                hidden_size: 1,
+                score_function: TopKRouterScoreFunction::SelectedSoftmax,
+                norm_topk_prob: false,
+                normalization_epsilon: 0.0,
+                routed_scaling_factor: 1.0,
+                n_group: 1,
+                topk_group: 1,
+                projection_bias: true,
+                score_correction_bias: true,
+                input_rms_epsilon: None,
+                input_inverse_sqrt_dimensions: false,
+                route_scale: false,
+            },
+            stream,
+        )
+        .unwrap();
+        router.weight = Param::new(Array::from_slice(&[0.0_f32; 3], &[3, 1]));
+        router.bias = Param::new(Some(Array::from_slice(
+            &[0.0_f32, 2.0_f32.ln(), 4.0_f32.ln()],
+            &[3],
+        )));
+        router.e_score_correction_bias =
+            Param::new(Some(Array::from_slice(&[10.0_f32, 0.0, 0.0], &[3])));
+
+        let output = router
+            .forward_routes_with_selection_bias(
+                &Array::from_slice(&[1.0_f32], &[1, 1]),
+                None,
+                stream,
+            )
+            .unwrap();
+        eval([&output.indices, &output.scores, &output.weights]).unwrap();
+
+        let mut seen = [false; 3];
+        for route in 0..2 {
+            let expert = output
+                .indices
+                .try_index_device((0, route), stream)
+                .unwrap()
+                .item::<i32>(stream);
+            let score = output
+                .scores
+                .try_index_device((0, route), stream)
+                .unwrap()
+                .item::<f32>(stream);
+            let weight = output
+                .weights
+                .try_index_device((0, route), stream)
+                .unwrap()
+                .item::<f32>(stream);
+            let expected = match expert {
+                0 => 0.2,
+                2 => 0.8,
+                other => panic!("unexpected selected expert {other}"),
+            };
+            seen[expert as usize] = true;
+            assert!((score - expected).abs() < 1e-5);
+            assert!((weight - expected).abs() < 1e-5);
+        }
+        assert_eq!(seen, [true, false, true]);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn mlx_gated_product_policy_applies_projection_biases_at_exact_stages() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let policy =
+            GatedProductPolicy::new(GatedProductActivation::Silu, Some(2.0), Some(1.5), 1.7, 1.0)
+                .unwrap();
+        let mut bank = PackedGatedProductExperts::new(1, 1, 1, None, None, [true, true], stream)
+            .unwrap()
+            .with_policy(policy)
+            .unwrap();
+        bank.gate_up_proj = Param::new(Array::from_slice(&[0.0_f32, 0.0], &[1, 2, 1]));
+        bank.gate_up_proj_bias = Param::new(Some(Array::from_slice(&[2.5_f32, -3.0], &[1, 2])));
+        bank.down_proj = Param::new(Array::from_slice(&[2.0_f32], &[1, 1, 1]));
+        bank.down_proj_bias = Param::new(Some(Array::from_slice(&[5.0_f32], &[1, 1])));
+
+        let output = bank
+            .forward(
+                &Array::from_slice(&[7.0_f32], &[1, 1]),
+                &Array::from_slice(&[0_i32], &[1, 1]),
+                &Array::from_slice(&[0.25_f32], &[1, 1]),
+                stream,
+            )
+            .unwrap();
+        eval([&output]).unwrap();
+        let gate = 2.0 / (1.0 + (-3.4_f32).exp());
+        let expected = 0.25 * (2.0 * gate * -0.5 + 5.0);
+        assert!((output.item::<f32>(stream) - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime construction"]
+    fn mlx_mxfp4_expert_bank_rejects_indivisible_projection_width() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let error = PackedGatedProductExperts::new(
+            1,
+            33,
+            32,
+            Some(WeightQuantization::MxFp4),
+            Some(WeightQuantization::MxFp4),
+            [false, false],
+            stream,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not divisible"));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn mlx_tensor_parallel_down_bias_is_route_weighted_exactly_once() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = execution.stream();
+        let rank = |down_weight: f32| {
+            let mut bank =
+                PackedGatedProductExperts::new(1, 1, 1, None, None, [false, true], stream).unwrap();
+            bank.gate_up_proj = Param::new(Array::from_slice(&[1.0_f32, 1.0], &[1, 2, 1]));
+            bank.down_proj = Param::new(Array::from_slice(&[down_weight], &[1, 1, 1]));
+            bank.down_proj_bias = Param::new(Some(Array::from_slice(&[5.0_f32], &[1, 1])));
+            bank
+        };
+        let input = Array::from_slice(&[1.0_f32], &[1, 1]);
+        let expert = Array::from_slice(&[0_i32], &[1, 1]);
+        let route_weight = Array::from_slice(&[0.25_f32], &[1, 1]);
+        let mut rank_zero = rank(2.0);
+        let mut rank_one = rank(3.0);
+        let output_zero = rank_zero
+            .forward_tensor_parallel(&input, &expert, &route_weight, 2, stream)
+            .unwrap();
+        let output_one = rank_one
+            .forward_tensor_parallel(&input, &expert, &route_weight, 2, stream)
+            .unwrap();
+        let bias = output_zero.post_reduce.as_ref().unwrap();
+        eval([&output_zero.reducible, &output_one.reducible, bias]).unwrap();
+
+        let gated = 1.0 / (1.0 + (-1.0_f32).exp());
+        let expected = 0.25 * (5.0 * gated + 5.0);
+        let reduced = output_zero.reducible.item::<f32>(stream)
+            + output_one.reducible.item::<f32>(stream)
+            + bias.clone().item::<f32>(stream);
+        assert!((reduced - expected).abs() < 1e-5);
     }
 }

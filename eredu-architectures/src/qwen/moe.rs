@@ -1,9 +1,9 @@
-//! Qwen dense and routed SwiGLU feed-forward policy.
+//! Qwen dense and routed gated-product feed-forward policy.
 
 use eredu_nn::{
-    Error, ParameterSpec, Parameterized, RoutedNeuralBackend, RoutingOperator, RoutingScoring,
-    SwiGluExpertBankSpec, SwiGluExpertLayout, SwiGluExpertProjection, Tensor, TopKRouterSpec,
-    TopKRoutingSpec,
+    Error, ExpertProjectionSpec, GatedProductExpertBankSpec, GatedProductExpertLayout,
+    ParameterSpec, Parameterized, RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor,
+    TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
@@ -29,17 +29,17 @@ fn inferred_expert_pass<T: Tensor>(input: &T) -> ExpertPass {
 /// Qwen3 top-k router and packed expert bank.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct RoutedSwiGlu<B: RoutedNeuralBackend> {
+pub struct RoutedGatedProduct<B: RoutedNeuralBackend> {
     /// Global decoder layer used for runtime expert identity.
     #[parameter(skip)]
     pub layer: usize,
     /// Learned top-k router.
     pub router: B::Router,
     /// Packed or provider-materialized expert bank.
-    pub experts: B::SwiGluExpertBank,
+    pub experts: B::GatedProductExpertBank,
 }
 
-impl<B: RoutedNeuralBackend> RoutedSwiGlu<B> {
+impl<B: RoutedNeuralBackend> RoutedGatedProduct<B> {
     /// Builds one unloaded Qwen3-MoE feed-forward block.
     pub fn new(
         args: &ModelArgs,
@@ -61,6 +61,7 @@ impl<B: RoutedNeuralBackend> RoutedSwiGlu<B> {
             TopKRouterSpec {
                 input_dimensions: args.hidden_size,
                 weight: ParameterSpec::trainable(&router_name).map_err(Error::backend)?,
+                bias: None,
                 correction_bias: None,
                 input_transform: None,
                 route_scale: None,
@@ -72,21 +73,22 @@ impl<B: RoutedNeuralBackend> RoutedSwiGlu<B> {
         let experts_prefix = format!("{prefix}.experts");
         let gate_up_name = format!("{experts_prefix}.gate_up_proj");
         let down_name = format!("{experts_prefix}.down_proj");
-        let experts = B::swiglu_expert_bank(
-            SwiGluExpertBankSpec {
+        let experts = B::gated_product_expert_bank(
+            GatedProductExpertBankSpec {
                 expert_count: args.num_experts,
                 input_dimensions: args.hidden_size,
                 intermediate_dimensions: args.moe_intermediate_size,
                 output_dimensions: args.hidden_size,
-                activation: eredu_nn::GatedExpertActivation::Silu,
-                limit: None,
-                layout: SwiGluExpertLayout::Packed {
-                    gate_up: SwiGluExpertProjection {
+                policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+                layout: GatedProductExpertLayout::Packed {
+                    gate_up: ExpertProjectionSpec {
                         weight: ParameterSpec::trainable(&gate_up_name).map_err(Error::backend)?,
+                        bias: None,
                         format: args.weight_quantization_for(&gate_up_name).into(),
                     },
-                    down: SwiGluExpertProjection {
+                    down: ExpertProjectionSpec {
                         weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
+                        bias: None,
                         format: args.weight_quantization_for(&down_name).into(),
                     },
                 },
@@ -101,7 +103,7 @@ impl<B: RoutedNeuralBackend> RoutedSwiGlu<B> {
     }
 }
 
-impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for RoutedSwiGlu<B> {
+impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for RoutedGatedProduct<B> {
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,
@@ -128,8 +130,21 @@ impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for RoutedSwiGlu<B> {
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let output = self.forward_feed_forward(input, context)?;
-        B::sum_parallel(output, parallel, context)
+        let routes = self.router.route(input, context)?;
+        let mut provider = ResidentExpertProvider;
+        let output = RoutedExpertProvider::<B>::forward_routed_tensor_parallel(
+            &mut provider,
+            &mut self.experts,
+            RoutedExpertRequest {
+                layer: self.layer,
+                input,
+                routes: &routes,
+                pass: inferred_expert_pass(input),
+            },
+            B::parallel_size(parallel),
+            context,
+        )?;
+        eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
     }
 }
 
@@ -139,8 +154,8 @@ impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for RoutedSwiGlu<B> {
 pub enum FeedForward<B: RoutedNeuralBackend> {
     /// Dense SwiGLU used by Qwen2 and dense Qwen3.
     Dense(Mlp<B>),
-    /// Top-k routed SwiGLU used by Qwen3-MoE.
-    Routed(RoutedSwiGlu<B>),
+    /// Top-k routed gated-product used by Qwen3-MoE.
+    Routed(RoutedGatedProduct<B>),
 }
 
 impl<B: RoutedNeuralBackend> FeedForward<B> {
@@ -151,7 +166,7 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         if args.is_moe() {
-            RoutedSwiGlu::new(args, layer, context).map(Self::Routed)
+            RoutedGatedProduct::new(args, layer, context).map(Self::Routed)
         } else {
             Mlp::new(args, layer, context).map(Self::Dense)
         }
@@ -308,9 +323,22 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
     {
         match self {
             Self::Dense(mlp) => mlp.forward_feed_forward_parallel(input, parallel, context),
-            Self::Routed(_) => {
-                let output = self.forward_with_provider(layer, pass, input, context, provider)?;
-                B::sum_parallel(output, parallel, context)
+            Self::Routed(moe) => {
+                let routes = moe.router.route(input, context)?;
+                let output = provider
+                    .forward_routed_tensor_parallel(
+                        &mut moe.experts,
+                        RoutedExpertRequest {
+                            layer,
+                            input,
+                            routes: &routes,
+                            pass,
+                        },
+                        B::parallel_size(parallel),
+                        context,
+                    )
+                    .map_err(Error::backend)?;
+                eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
             }
         }
     }

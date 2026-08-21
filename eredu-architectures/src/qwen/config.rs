@@ -29,7 +29,7 @@ pub enum QwenVariant {
     Qwen2,
     /// Dense Qwen3 with per-head Q/K RMS normalization.
     Qwen3,
-    /// Qwen3 with top-k routed SwiGLU experts.
+    /// Qwen3 with top-k routed gated-product experts.
     Qwen3Moe,
 }
 

@@ -20,6 +20,9 @@ pub mod deepseek;
 /// Neutral Gemma 4 family implementation.
 pub mod gemma4;
 
+/// OpenAI GPT-OSS sparse causal decoder architecture.
+pub mod gpt_oss;
+
 /// Llama and Mistral-compatible decoder architecture.
 pub mod llama;
 

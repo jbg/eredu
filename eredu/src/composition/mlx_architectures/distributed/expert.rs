@@ -8,10 +8,9 @@
 //! the resulting token buffer. Sharded-token dispatch uses compact native or
 //! topology-routed variable-count all-to-all payload exchange.
 
-use eredu_architectures::kimi_linear;
+use eredu_architectures::{gpt_oss, kimi_linear};
 use eredu_checkpoint::WeightQuantization;
-use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
-use eredu_runtime::ShardingPolicy;
+use eredu_runtime::{ActivationObserver as RuntimeActivationObserver, ShardingPolicy};
 
 use std::{
     path::{Path, PathBuf},
@@ -50,9 +49,9 @@ use crate::{
     composition::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
-    composition::mlx_architectures::gpt_oss::model as gpt_oss,
     composition::{
-        kimi_linear as neutral_kimi_linear, lfm2 as neutral_lfm2, nemotron_h as neutral_nemotron_h,
+        gpt_oss as neutral_gpt_oss, kimi_linear as neutral_kimi_linear, lfm2 as neutral_lfm2,
+        nemotron_h as neutral_nemotron_h,
     },
     core::generation::MtpConfig,
     core::ModelKind,
@@ -65,22 +64,9 @@ use eredu_runtime::{
     LayerWeightResidency, PagedCacheOptions, WeightResidency,
 };
 
-use crate::backend::mlx::nn::moe::PackedSwiGluExperts;
+use crate::backend::mlx::nn::moe::PackedGatedProductExperts;
 
 pub use crate::backend::mlx::runtime::distributed::expert::*;
-
-impl LocalExpertBank for gpt_oss::Experts {
-    fn execute_local_routes(
-        &mut self,
-        hidden: &Array,
-        local_expert_ids: &Array,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
-        let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
-        Ok(self.forward(hidden, &ids, &weights, stream)?)
-    }
-}
 
 /// Physical residency of the routed experts owned by this EP rank.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -130,10 +116,8 @@ pub enum ExpertParallelCache {
     DeepSeek(crate::composition::deepseek::DeepSeekState),
     /// Architecture-declared heterogeneous attention and fixed state.
     Hybrid(MlxHybridState),
-    /// Neutral Qwen key/value state, device-resident or paged.
-    Qwen(MlxKeyValueState),
-    /// GPT-OSS cache following its canonical per-layer attention schedule.
-    GptOss(gpt_oss::Cache),
+    /// Neutral key/value state, device-resident or paged.
+    KeyValue(MlxKeyValueState),
 }
 
 impl ExpertParallelCache {
@@ -142,8 +126,7 @@ impl ExpertParallelCache {
         match self {
             Self::DeepSeek(cache) => cache.clear()?,
             Self::Hybrid(cache) => cache.clear()?,
-            Self::Qwen(cache) => cache.clear()?,
-            Self::GptOss(cache) => cache.reset()?,
+            Self::KeyValue(cache) => cache.clear()?,
         }
         Ok(())
     }
@@ -155,8 +138,7 @@ impl ExpertParallelCache {
         match self {
             Self::DeepSeek(cache) => cache.offset(),
             Self::Hybrid(cache) => cache.offset(),
-            Self::Qwen(cache) => cache.offset(),
-            Self::GptOss(cache) => cache.offset(),
+            Self::KeyValue(cache) => cache.offset(),
         }
     }
 }
@@ -466,9 +448,7 @@ enum ExpertArchitecture {
     DeepSeek(Box<crate::composition::deepseek::DeepSeekModel>),
     NeutralHybrid(Box<dyn NeutralHybridExpertArchitecture>),
     Qwen(Box<crate::composition::qwen::QwenModel>),
-    GptOssLayerwise(
-        Box<crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseModel>,
-    ),
+    GptOss(Box<neutral_gpt_oss::GptOssModel>),
 }
 
 impl ExpertArchitecture {
@@ -477,7 +457,7 @@ impl ExpertArchitecture {
             Self::DeepSeek(_) => {}
             Self::NeutralHybrid(_) => {}
             Self::Qwen(_) => {}
-            Self::GptOssLayerwise(model) => model.bind_parallel_topology(topology),
+            Self::GptOss(model) => model.bind_parallel_topology(topology),
         }
     }
 }
@@ -742,7 +722,7 @@ impl ExpertParallelModel {
             ExpertArchitecture::DeepSeek(model) => model.dense_stream_report(),
             ExpertArchitecture::NeutralHybrid(model) => model.dense_stream_report(),
             ExpertArchitecture::Qwen(model) => model.dense_stream_report(),
-            ExpertArchitecture::GptOssLayerwise(model) => model.dense_stream_report(),
+            ExpertArchitecture::GptOss(model) => model.dense_stream_report(),
         }
     }
 
@@ -757,10 +737,8 @@ impl ExpertParallelModel {
             ExpertArchitecture::NeutralHybrid(model) => {
                 ExpertParallelCache::Hybrid(model.new_cache())
             }
-            ExpertArchitecture::Qwen(model) => ExpertParallelCache::Qwen(model.new_cache()),
-            ExpertArchitecture::GptOssLayerwise(model) => {
-                ExpertParallelCache::GptOss(model.new_cache())
-            }
+            ExpertArchitecture::Qwen(model) => ExpertParallelCache::KeyValue(model.new_cache()),
+            ExpertArchitecture::GptOss(model) => ExpertParallelCache::KeyValue(model.new_cache()),
         }
     }
 
@@ -783,12 +761,12 @@ impl ExpertParallelModel {
                 ExpertArchitecture::NeutralHybrid(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::Hybrid),
-                ExpertArchitecture::GptOssLayerwise(model) => model
+                ExpertArchitecture::GptOss(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ExpertParallelCache::GptOss),
+                    .map(ExpertParallelCache::KeyValue),
                 ExpertArchitecture::Qwen(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ExpertParallelCache::Qwen),
+                    .map(ExpertParallelCache::KeyValue),
             },
         }
     }
@@ -800,9 +778,8 @@ impl ExpertParallelModel {
     ) -> Result<Option<CacheResidencyReport>, Error> {
         match cache {
             ExpertParallelCache::DeepSeek(cache) => cache.residency_report().map_err(Into::into),
-            ExpertParallelCache::GptOss(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::Hybrid(cache) => cache.residency_report().map_err(Into::into),
-            ExpertParallelCache::Qwen(cache) => cache.residency_report().map_err(Into::into),
+            ExpertParallelCache::KeyValue(cache) => cache.residency_report().map_err(Into::into),
         }
     }
 
@@ -824,9 +801,15 @@ impl ExpertParallelModel {
             (ExpertArchitecture::DeepSeek(model), ExpertParallelCache::DeepSeek(cache)) => {
                 model.save_prompt_cache(cache, directory, descriptor, prefix_token_ids, options)
             }
-            (ExpertArchitecture::GptOssLayerwise(_), ExpertParallelCache::GptOss(cache)) => cache
-                .save_prompt_cache(directory, descriptor, prefix_token_ids, options)
-                .map_err(Into::into),
+            (ExpertArchitecture::GptOss(model), ExpertParallelCache::KeyValue(cache)) => model
+                .save_prompt_cache(
+                    cache,
+                    directory,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    stream,
+                ),
             (ExpertArchitecture::NeutralHybrid(model), ExpertParallelCache::Hybrid(cache)) => model
                 .save_prompt_cache(
                     cache,
@@ -836,7 +819,7 @@ impl ExpertParallelModel {
                     options,
                     &identity,
                 ),
-            (ExpertArchitecture::Qwen(model), ExpertParallelCache::Qwen(cache)) => model
+            (ExpertArchitecture::Qwen(model), ExpertParallelCache::KeyValue(cache)) => model
                 .save_prompt_cache(
                     cache,
                     directory,
@@ -880,10 +863,10 @@ impl ExpertParallelModel {
                 .map(|(cache, manifest)| (ExpertParallelCache::Hybrid(cache), manifest)),
             ExpertArchitecture::Qwen(model) => model
                 .load_prompt_cache(&directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ExpertParallelCache::Qwen(cache), manifest)),
-            ExpertArchitecture::GptOssLayerwise(model) => model
+                .map(|(cache, manifest)| (ExpertParallelCache::KeyValue(cache), manifest)),
+            ExpertArchitecture::GptOss(model) => model
                 .load_prompt_cache(&directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ExpertParallelCache::GptOss(cache), manifest)),
+                .map(|(cache, manifest)| (ExpertParallelCache::KeyValue(cache), manifest)),
         }
     }
 
@@ -916,7 +899,7 @@ impl ExpertParallelModel {
             ExpertArchitecture::DeepSeek(model) => model.prompt_cache_identity()?,
             ExpertArchitecture::NeutralHybrid(model) => model.prompt_cache_model_identity()?,
             ExpertArchitecture::Qwen(model) => model.prompt_cache_model_identity()?,
-            ExpertArchitecture::GptOssLayerwise(model) => model.prompt_cache_model_identity()?,
+            ExpertArchitecture::GptOss(model) => model.prompt_cache_model_identity()?,
         };
         identity.topology = crate::backend::mlx::cache::prompt_cache_topology(self.topology);
         Ok(identity)
@@ -1046,7 +1029,7 @@ impl ExpertParallelModel {
                         stream,
                     )?
                 }
-                (ExpertArchitecture::Qwen(model), ExpertParallelCache::Qwen(cache)) => {
+                (ExpertArchitecture::Qwen(model), ExpertParallelCache::KeyValue(cache)) => {
                     let args = model.args().clone();
                     let mut execute =
                         |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
@@ -1090,47 +1073,29 @@ impl ExpertParallelModel {
                         )?,
                     }
                 }
-                (
-                    ExpertArchitecture::GptOssLayerwise(model),
-                    ExpertParallelCache::GptOss(cache),
-                ) => {
+                (ExpertArchitecture::GptOss(model), ExpertParallelCache::KeyValue(cache)) => {
                     let args = model.args().clone();
-                    let mut execute =
-                        |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_gpt_oss(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        };
+                    let mut provider = neutral_gpt_oss::expert::distributed_provider(
+                        &args,
+                        assignment,
+                        Some(group),
+                        expert_cache,
+                        &mut statistics,
+                    );
                     match tensor_group {
-                        Some(tensor_group) => model.forward_tensor_expert_parallel(
+                        Some(tensor_group) => model.forward_tensor_expert_provider(
                             tokens,
+                            mask,
                             cache,
                             tensor_group,
-                            &mut execute,
+                            &mut provider,
                             stream,
                         )?,
-                        None => model.forward_with_expert_executor(
+                        None => model.forward_with_expert_provider(
                             tokens,
+                            mask,
                             cache,
-                            &mut execute,
+                            &mut provider,
                             stream,
                         )?,
                     }
@@ -1766,7 +1731,7 @@ fn execute_cached_neutral_deepseek(
         NeutralDeepSeekArgs::V3(args) => crate::composition::deepseek_expert::v3_spec(args, layer),
         NeutralDeepSeekArgs::V4(args) => crate::composition::deepseek_expert::v4_spec(args, layer),
     };
-    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_swiglu_dispatched(
+    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
         cache,
         spec,
         layer,
@@ -1786,21 +1751,23 @@ pub(crate) fn execute_cached_neutral_gemma4(
     stream: &Stream,
 ) -> Result<Array, Error> {
     let prefix = format!("model.language_model.layers.{layer}.experts.switch_glu");
-    let spec = crate::backend::mlx::runtime::residency::expert_provider::CachedSwiGluBankSpec {
-        hidden_dimensions: args.hidden_size,
-        intermediate_dimensions: args.moe_intermediate_size.ok_or_else(|| {
-            Error::UnsupportedArchitecture("Gemma 4 sparse layer has no expert width".into())
-        })?,
-        gate_up_quantization: args
-            .linear_format_for(&format!("{prefix}.gate_up_proj"))
-            .weight_quantization(),
-        down_quantization: args
-            .linear_format_for(&format!("{prefix}.down_proj"))
-            .weight_quantization(),
-        activation: eredu_nn::GatedExpertActivation::GeluApproximate,
-        limit: None,
-    };
-    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_swiglu_dispatched(
+    let spec =
+        crate::backend::mlx::runtime::residency::expert_provider::CachedGatedProductBankSpec {
+            hidden_dimensions: args.hidden_size,
+            intermediate_dimensions: args.moe_intermediate_size.ok_or_else(|| {
+                Error::UnsupportedArchitecture("Gemma 4 sparse layer has no expert width".into())
+            })?,
+            gate_up_quantization: args
+                .linear_format_for(&format!("{prefix}.gate_up_proj"))
+                .weight_quantization(),
+            down_quantization: args
+                .linear_format_for(&format!("{prefix}.down_proj"))
+                .weight_quantization(),
+            gate_up_bias: false,
+            down_bias: false,
+            policy: eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
+        };
+    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
         cache,
         spec,
         layer,
@@ -1831,12 +1798,13 @@ pub(crate) fn execute_cached_kimi_linear(
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
             let prefix = format!("model.layers.{layer}.mlp.experts");
-            let mut bank = PackedSwiGluExperts::new(
+            let mut bank = PackedGatedProductExperts::new(
                 acquired.identities().len() as i32,
                 args.hidden_size,
                 args.moe_intermediate_size,
                 args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
                 args.weight_quantization_for(&format!("{prefix}.down_proj")),
+                [false, false],
                 stream,
             )?;
             bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
@@ -1879,80 +1847,6 @@ pub(crate) fn execute_cached_neutral_qwen3(
     )
 }
 
-fn execute_cached_gpt_oss(
-    args: &gpt_oss::ModelArgs,
-    layer: usize,
-    routes: &DispatchedRoutes,
-    pass: ExpertPass,
-    cache: &ExpertCache,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    execute_cached_gpt_oss_at(args, layer, routes, pass, cache, 1, stream)
-}
-
-pub(crate) fn execute_cached_gpt_oss_at(
-    args: &gpt_oss::ModelArgs,
-    layer: usize,
-    routes: &DispatchedRoutes,
-    pass: ExpertPass,
-    cache: &ExpertCache,
-    tensor_parallel_size: usize,
-    stream: &Stream,
-) -> Result<Array, Error> {
-    if tensor_parallel_size == 0 {
-        return Err(Error::Parallel(
-            "GPT-OSS cached expert execution requires a positive TP size".into(),
-        ));
-    }
-    Ok(cache.execute_routes_bounded(
-        ExpertRouteBatch::new(
-            layer,
-            &routes.hidden,
-            &routes.global_expert_ids,
-            &routes.weights,
-            pass,
-        ),
-        stream,
-        |hidden, acquired, _weights, stream| {
-            let started = Instant::now();
-            let gate_up_proj_blocks = acquired.compact_binding("gate_up_proj_blocks", stream)?;
-            let gate_up_proj_scales = acquired.compact_binding("gate_up_proj_scales", stream)?;
-            let gate_up_proj_bias = acquired.compact_binding("gate_up_proj_bias", stream)?;
-            let down_proj_blocks = acquired.compact_binding("down_proj_blocks", stream)?;
-            let down_proj_scales = acquired.compact_binding("down_proj_scales", stream)?;
-            let down_proj_bias = acquired.compact_binding("down_proj_bias", stream)?;
-            let mut compact_args = args.clone();
-            compact_args.num_local_experts = acquired.identities().len() as i32;
-            compact_args.intermediate_size = gate_up_proj_bias.dim(-1) / 2;
-            let mut bank = gpt_oss::Experts::new(&compact_args, stream)?;
-            bank.gate_up_proj_blocks = Param::new(gate_up_proj_blocks);
-            bank.gate_up_proj_scales = Param::new(gate_up_proj_scales);
-            bank.gate_up_proj_bias = Param::new(gate_up_proj_bias);
-            bank.down_proj_blocks = Param::new(down_proj_blocks);
-            bank.down_proj_scales = Param::new(down_proj_scales);
-            bank.down_proj_bias = Param::new(down_proj_bias);
-            cache.record_compact_bank(
-                acquired.pass(),
-                acquired.scratch_bytes(),
-                started.elapsed(),
-            )?;
-            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
-            let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
-            if tensor_parallel_size == 1 {
-                return Ok(output);
-            }
-            let bias =
-                bank.down_proj_bias
-                    .as_ref()
-                    .take_axis(acquired.compact_routes(), 0, stream)?;
-            Ok(output.subtract(&bias, stream)?.add(
-                bias.divide(Array::from_f32(tensor_parallel_size as f32), stream)?,
-                stream,
-            )?)
-        },
-    )?)
-}
-
 pub(crate) fn execute_cached_neutral_inkling(
     args: &eredu_architectures::inkling::ModelArgs,
     cache_layer: usize,
@@ -1968,9 +1862,9 @@ pub(crate) fn execute_cached_neutral_inkling(
         (cache_layer - layers, "shared_experts")
     };
     let prefix = format!("model.layers.{layer}.moe.{bank}");
-    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_swiglu_dispatched(
+    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
         cache,
-        crate::backend::mlx::runtime::residency::expert_provider::CachedSwiGluBankSpec {
+        crate::backend::mlx::runtime::residency::expert_provider::CachedGatedProductBankSpec {
             hidden_dimensions: args.text_config.hidden_size,
             intermediate_dimensions: args.text_config.moe_intermediate_size(),
             gate_up_quantization: args
@@ -1981,8 +1875,9 @@ pub(crate) fn execute_cached_neutral_inkling(
                 .text_config
                 .linear_format_for(&format!("{prefix}.down_proj"))
                 .weight_quantization(),
-            activation: eredu_nn::GatedExpertActivation::Silu,
-            limit: None,
+            gate_up_bias: false,
+            down_bias: false,
+            policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
         },
         cache_layer,
         &routes.hidden,
@@ -2012,15 +1907,16 @@ pub(crate) fn execute_cached_lfm2(
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
             let prefix = format!("model.layers.{layer}.feed_forward.experts");
-            let mut bank = PackedSwiGluExperts::new(
+            let mut bank = PackedGatedProductExperts::new(
                 acquired.identities().len() as i32,
                 args.hidden_size,
                 args.moe_intermediate_size,
                 args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
                 args.weight_quantization_for(&format!("{prefix}.down_proj")),
+                [false, false],
                 stream,
             )?;
-            populate_swiglu_bank(&mut bank, acquired, stream)?;
+            populate_gated_product_bank(&mut bank, acquired, stream)?;
             cache.record_compact_bank(
                 acquired.pass(),
                 acquired.scratch_bytes(),
@@ -2041,9 +1937,9 @@ pub(crate) fn execute_cached_muse_glimmer(
     stream: &Stream,
 ) -> Result<Array, Error> {
     let prefix = format!("model.layers.{layer}.mlp.experts");
-    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_swiglu_dispatched(
+    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
         cache,
-        crate::backend::mlx::runtime::residency::expert_provider::CachedSwiGluBankSpec {
+        crate::backend::mlx::runtime::residency::expert_provider::CachedGatedProductBankSpec {
             hidden_dimensions: args.hidden_size,
             intermediate_dimensions: args.moe_intermediate_size,
             gate_up_quantization: args
@@ -2052,8 +1948,9 @@ pub(crate) fn execute_cached_muse_glimmer(
             down_quantization: args
                 .linear_format_for(&format!("{prefix}.down_proj"))
                 .weight_quantization(),
-            activation: eredu_nn::GatedExpertActivation::Silu,
-            limit: None,
+            gate_up_bias: false,
+            down_bias: false,
+            policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
         },
         layer,
         &routes.hidden,
@@ -2095,17 +1992,20 @@ pub(crate) fn execute_cached_nemotron_h(
     )
 }
 
-fn populate_swiglu_bank(
-    bank: &mut PackedSwiGluExperts,
+fn populate_gated_product_bank(
+    bank: &mut PackedGatedProductExperts,
     acquired: &AcquiredExperts,
     stream: &Stream,
 ) -> Result<(), ExpertCacheError> {
     bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
+    bank.gate_up_proj_bias =
+        Param::new(acquired.optional_compact_binding("gate_up_proj_bias", stream)?);
     bank.gate_up_proj_scales =
         Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
     bank.gate_up_proj_biases =
         Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
     bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+    bank.down_proj_bias = Param::new(acquired.optional_compact_binding("down_proj_bias", stream)?);
     bank.down_proj_scales =
         Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
     bank.down_proj_biases =
@@ -2139,7 +2039,7 @@ fn expert_bank_needs_slicing(
 
 #[cfg(test)]
 pub(crate) fn finalize_qwen3_expert_bank(
-    bank: &mut PackedSwiGluExperts,
+    bank: &mut PackedGatedProductExperts,
     assignment: &ExpertAssignment,
     stream: &Stream,
 ) -> Result<usize, Error> {
@@ -2148,9 +2048,11 @@ pub(crate) fn finalize_qwen3_expert_bank(
     }
     let mut bytes = 0;
     bytes += slice_required(&mut bank.gate_up_proj, assignment, stream)?;
+    bytes += slice_optional(&mut bank.gate_up_proj_bias, assignment, stream)?;
     bytes += slice_optional(&mut bank.gate_up_proj_scales, assignment, stream)?;
     bytes += slice_optional(&mut bank.gate_up_proj_biases, assignment, stream)?;
     bytes += slice_required(&mut bank.down_proj, assignment, stream)?;
+    bytes += slice_optional(&mut bank.down_proj_bias, assignment, stream)?;
     bytes += slice_optional(&mut bank.down_proj_scales, assignment, stream)?;
     bytes += slice_optional(&mut bank.down_proj_biases, assignment, stream)?;
     bank.num_experts = assignment.local_expert_count() as i32;
@@ -2472,15 +2374,15 @@ fn load_external_gguf_ep(
         }
         "gpt-oss" => {
             let prepared =
-                gpt_oss::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+                neutral_gpt_oss::prepare_gpt_oss_gguf_checkpoint(checkpoint, metadata)?;
             let args = prepared.args;
             let assignment = resolve_model_assignment(
                 assignment,
                 args.num_local_experts as usize,
                 topology,
             )?;
-            let gguf_plan = crate::composition::mlx_architectures::gpt_oss::checkpoint::gguf_plan(&args)
-                .map_err(Error::UnsupportedArchitecture)?;
+            let gguf_plan =
+                gpt_oss::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
             let store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource> =
                 std::sync::Arc::new(open_gguf_checkpoint_source(
                     checkpoint.clone(),
@@ -2488,38 +2390,31 @@ fn load_external_gguf_ep(
                     gpt_oss::translate_gguf_weight_name,
                     max_mapped_shards,
                 )?);
-            let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::gpt_oss::layerwise::
-                    load_gpt_oss_sparse_tp_ep_base_with_store(
-                        store.clone(),
-                        args.clone(),
-                        non_expert,
-                        ParallelBuildContext::new(topology, ShardingPolicy::Require),
-                        stream,
-                        weights_stream,
-                    )?
+            let build = if topology.tensor_parallel_size > 1 {
+                Some(ParallelBuildContext::new(
+                    topology,
+                    ShardingPolicy::Require,
+                ))
             } else {
-                crate::composition::mlx_architectures::gpt_oss::layerwise::
-                    load_gpt_oss_sparse_ep_base_with_store(
-                        store.clone(),
-                        args.clone(),
-                        non_expert,
-                        stream,
-                        weights_stream,
-                    )?
+                None
             };
-            let store = model.checkpoint_store_arc();
-            let entries = crate::composition::mlx_architectures::gpt_oss::layerwise::gpt_oss_expert_catalog(
-                &args,
-                store.as_ref(),
+            let model = neutral_gpt_oss::load_external_experts_with_store(
+                store.clone(),
+                args.clone(),
+                non_expert,
+                build,
+                stream,
+                weights_stream,
             )?;
+            let store = model.checkpoint_store_arc();
+            let entries = model.external_expert_catalog()?;
             let replicated_parameter_bytes =
                 planned_replicated_bytes(&model.residency_report()?)?;
             finish_external_ep(
                 topology,
                 ModelKind::GptOss,
                 assignment,
-                ExpertArchitecture::GptOssLayerwise(Box::new(model)),
+                ExpertArchitecture::GptOss(Box::new(model)),
                 store,
                 entries,
                 expert_residency,
@@ -3202,37 +3097,28 @@ fn load_additional_external_ep(
     let store = open_external_safetensors_store(model_dir, max_mapped_shards)?;
     let (assignment, architecture, store, entries, replicated_parameter_bytes) = match kind {
         ModelKind::GptOss => {
-            let args = gpt_oss::get_model_args(model_dir)?;
+            let args = neutral_gpt_oss::load_model_args(model_dir)?;
             let assignment =
                 resolve_model_assignment(assignment, args.num_local_experts as usize, topology)?;
-            let model = if topology.tensor_parallel_size > 1 {
-                crate::composition::mlx_architectures::gpt_oss::layerwise::load_gpt_oss_sparse_tp_ep_base_with_store(
-                    store.clone(),
-                    args.clone(),
-                    non_expert,
-                    ParallelBuildContext::new(topology, ShardingPolicy::Require),
-                    stream,
-                    weights_stream,
-                )?
+            let build = if topology.tensor_parallel_size > 1 {
+                Some(ParallelBuildContext::new(topology, ShardingPolicy::Require))
             } else {
-                crate::composition::mlx_architectures::gpt_oss::layerwise::load_gpt_oss_sparse_ep_base_with_store(
-                    store.clone(),
-                    args.clone(),
-                    non_expert,
-                    stream,
-                    weights_stream,
-                )?
+                None
             };
+            let model = neutral_gpt_oss::load_external_experts_with_store(
+                store.clone(),
+                args.clone(),
+                non_expert,
+                build,
+                stream,
+                weights_stream,
+            )?;
             let store = model.checkpoint_store_arc();
-            let entries =
-                crate::composition::mlx_architectures::gpt_oss::layerwise::gpt_oss_expert_catalog(
-                    &args,
-                    store.as_ref(),
-                )?;
+            let entries = model.external_expert_catalog()?;
             let replicated = planned_replicated_bytes(&model.residency_report()?)?;
             (
                 assignment,
-                ExpertArchitecture::GptOssLayerwise(Box::new(model)),
+                ExpertArchitecture::GptOss(Box::new(model)),
                 store,
                 entries,
                 replicated,

@@ -585,7 +585,7 @@ impl DecoderConfig {
             .unwrap_or(LinearFormat::Dense)
     }
 
-    /// Returns whether decoder blocks use the routed SwiGLU bank.
+    /// Returns whether decoder blocks use the routed gated-product bank.
     pub const fn is_moe(&self) -> bool {
         self.num_experts > 0
     }

@@ -10,7 +10,7 @@ use safemlx::{Array, Stream};
 
 use crate::backend::mlx::runtime::residency::expert_cache::ExpertCache;
 use crate::backend::mlx::runtime::residency::expert_provider::{
-    execute_cached_swiglu_dispatched, CachedSwiGluBankSpec, CachedSwiGluExpertProvider,
+    execute_cached_gated_product_dispatched, CachedGatedProductBankSpec, CachedGatedProductExpertProvider,
 };
 use crate::backend::mlx::{
     error::Error,
@@ -31,19 +31,20 @@ pub(crate) fn expert_catalog(
 pub(crate) fn cached_provider<'a>(
     cache: &'a ExpertCache,
     args: &'a ModelArgs,
-) -> CachedSwiGluExpertProvider<'a, impl FnMut(usize) -> CachedSwiGluBankSpec + 'a> {
-    CachedSwiGluExpertProvider::new(cache, move |layer| cached_bank_spec(args, layer))
+) -> CachedGatedProductExpertProvider<'a, impl FnMut(usize) -> CachedGatedProductBankSpec + 'a> {
+    CachedGatedProductExpertProvider::new(cache, move |layer| cached_bank_spec(args, layer))
 }
 
-fn cached_bank_spec(args: &ModelArgs, layer: usize) -> CachedSwiGluBankSpec {
+fn cached_bank_spec(args: &ModelArgs, layer: usize) -> CachedGatedProductBankSpec {
     let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
-    CachedSwiGluBankSpec {
+    CachedGatedProductBankSpec {
         hidden_dimensions: args.hidden_size,
         intermediate_dimensions: args.moe_intermediate_size,
         gate_up_quantization: args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
         down_quantization: args.weight_quantization_for(&format!("{prefix}.down_proj")),
-        activation: eredu_nn::GatedExpertActivation::Silu,
-        limit: None,
+        gate_up_bias: false,
+        down_bias: false,
+        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
     }
 }
 
@@ -56,7 +57,7 @@ pub(crate) fn execute_cached_dispatched(
     pass: ExpertPass,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    execute_cached_swiglu_dispatched(
+    execute_cached_gated_product_dispatched(
         cache,
         cached_bank_spec(args, layer),
         layer,

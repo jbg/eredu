@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use eredu_nn::TensorParallelExpertOutput;
 use safemlx::{
     distributed::{self, Group},
     ops::{concatenate_axis, indexing::TryIndexOp, r#where, segment_sum_by_index, zeros_dtype},
@@ -22,7 +23,7 @@ use safemlx::{
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
+    backend::mlx::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
 };
 
 thread_local! {
@@ -460,6 +461,25 @@ pub trait LocalExpertBank {
         local_expert_ids: &Array,
         stream: &Stream,
     ) -> Result<Array, Error>;
+
+    /// Executes owner-local rows while separating replicated TP down bias.
+    fn execute_local_routes_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        local_expert_ids: &Array,
+        partitions: usize,
+        stream: &Stream,
+    ) -> Result<TensorParallelExpertOutput<Array>, Error> {
+        if partitions == 0 {
+            return Err(Error::Parallel(
+                "tensor-parallel partition count must be positive".into(),
+            ));
+        }
+        Ok(TensorParallelExpertOutput {
+            reducible: self.execute_local_routes(hidden, local_expert_ids, stream)?,
+            post_reduce: None,
+        })
+    }
 }
 
 pub(crate) fn unit_route_weights(
@@ -470,7 +490,7 @@ pub(crate) fn unit_route_weights(
     Ok(safemlx::ops::ones_dtype(&[routes, 1], dtype, stream)?)
 }
 
-impl LocalExpertBank for PackedSwiGluExperts {
+impl LocalExpertBank for PackedGatedProductExperts {
     fn execute_local_routes(
         &mut self,
         hidden: &Array,
@@ -480,6 +500,18 @@ impl LocalExpertBank for PackedSwiGluExperts {
         let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
         let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
         Ok(self.forward(hidden, &ids, &weights, stream)?)
+    }
+
+    fn execute_local_routes_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        local_expert_ids: &Array,
+        partitions: usize,
+        stream: &Stream,
+    ) -> Result<TensorParallelExpertOutput<Array>, Error> {
+        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
+        let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+        Ok(self.forward_tensor_parallel(hidden, &ids, &weights, partitions, stream)?)
     }
 }
 
@@ -633,6 +665,127 @@ pub fn dispatch_replicated(
     )
 }
 
+/// EP-reduced rank-local TP contribution with replicated bias kept separate.
+pub struct TensorParallelReturnedRoutes {
+    /// Tensor-parallel projection contribution and literal post-reduce bias.
+    pub output: TensorParallelExpertOutput<Array>,
+    /// Dispatch counters shared with ordinary expert execution.
+    pub statistics: RoutingStatistics,
+}
+
+/// Dispatches replicated routes across EP while preserving the TP bias split.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_replicated_tensor_parallel(
+    hidden_states: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    assignment: &ExpertAssignment,
+    bank: &mut impl LocalExpertBank,
+    group: &Group,
+    partitions: usize,
+    stream: &Stream,
+) -> Result<TensorParallelReturnedRoutes, Error> {
+    let hidden_dimensions = hidden_states.dim(-1);
+    let returned = dispatch_replicated_with_output_dimensions(
+        hidden_states,
+        expert_ids,
+        weights,
+        assignment,
+        group,
+        2 * hidden_dimensions,
+        stream,
+        |routes, stream| {
+            let output = bank.execute_local_routes_tensor_parallel(
+                &routes.hidden,
+                &routes.local_expert_ids,
+                partitions,
+                stream,
+            )?;
+            let post_reduce = match output.post_reduce {
+                Some(bias) => bias,
+                None => zeros_dtype(output.reducible.shape(), output.reducible.dtype(), stream)?,
+            };
+            Ok(concatenate_axis(
+                &[output.reducible, post_reduce],
+                -1,
+                stream,
+            )?)
+        },
+    )?;
+    let reducible = returned
+        .reduced_output
+        .try_index_device((.., ..hidden_dimensions), stream)?;
+    let post_reduce = returned
+        .reduced_output
+        .try_index_device((.., hidden_dimensions..), stream)?;
+    Ok(TensorParallelReturnedRoutes {
+        output: TensorParallelExpertOutput {
+            reducible,
+            post_reduce: Some(post_reduce),
+        },
+        statistics: returned.statistics,
+    })
+}
+
+/// Dispatches singleton-owner routes while preserving the TP bias split.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_local_tensor_parallel(
+    hidden_states: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    assignment: &ExpertAssignment,
+    bank: &mut impl LocalExpertBank,
+    partitions: usize,
+    stream: &Stream,
+) -> Result<TensorParallelReturnedRoutes, Error> {
+    if assignment.rank != 0 || assignment.group_size != 1 {
+        return Err(Error::Parallel(
+            "collective-free tensor-parallel expert dispatch requires a singleton rank-zero assignment"
+                .into(),
+        ));
+    }
+    let hidden_dimensions = hidden_states.dim(-1);
+    let returned = dispatch_owned_with(
+        hidden_states,
+        expert_ids,
+        weights,
+        assignment,
+        None,
+        2 * hidden_dimensions,
+        stream,
+        |routes, stream| {
+            let output = bank.execute_local_routes_tensor_parallel(
+                &routes.hidden,
+                &routes.local_expert_ids,
+                partitions,
+                stream,
+            )?;
+            let post_reduce = match output.post_reduce {
+                Some(bias) => bias,
+                None => zeros_dtype(output.reducible.shape(), output.reducible.dtype(), stream)?,
+            };
+            Ok(concatenate_axis(
+                &[output.reducible, post_reduce],
+                -1,
+                stream,
+            )?)
+        },
+    )?;
+    let reducible = returned
+        .reduced_output
+        .try_index_device((.., ..hidden_dimensions), stream)?;
+    let post_reduce = returned
+        .reduced_output
+        .try_index_device((.., hidden_dimensions..), stream)?;
+    Ok(TensorParallelReturnedRoutes {
+        output: TensorParallelExpertOutput {
+            reducible,
+            post_reduce: Some(post_reduce),
+        },
+        statistics: returned.statistics,
+    })
+}
+
 /// Dispatches replicated routes while delegating exact local route execution.
 ///
 /// The callback receives both global and owner-local ids after the existing
@@ -650,6 +803,32 @@ pub fn dispatch_replicated_with<F>(
 where
     F: FnOnce(&DispatchedRoutes, &Stream) -> Result<Array, Error>,
 {
+    dispatch_replicated_with_output_dimensions(
+        hidden_states,
+        expert_ids,
+        weights,
+        assignment,
+        group,
+        hidden_states.dim(-1),
+        stream,
+        execute,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_replicated_with_output_dimensions<F>(
+    hidden_states: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    assignment: &ExpertAssignment,
+    group: &Group,
+    output_dimensions: i32,
+    stream: &Stream,
+    execute: F,
+) -> Result<ReturnedRoutes, Error>
+where
+    F: FnOnce(&DispatchedRoutes, &Stream) -> Result<Array, Error>,
+{
     if group.rank() != assignment.rank || group.size() != assignment.group_size {
         return Err(Error::Parallel(
             "expert assignment does not match the supplied group".into(),
@@ -661,6 +840,7 @@ where
         weights,
         assignment,
         Some(group),
+        output_dimensions,
         stream,
         execute,
     )
@@ -694,6 +874,7 @@ where
         weights,
         assignment,
         None,
+        hidden_states.dim(-1),
         stream,
         execute,
     )
@@ -706,6 +887,7 @@ fn dispatch_owned_with<F>(
     weights: &Array,
     assignment: &ExpertAssignment,
     group: Option<&Group>,
+    output_dimensions: i32,
     stream: &Stream,
     execute: F,
 ) -> Result<ReturnedRoutes, Error>
@@ -728,10 +910,17 @@ where
     statistics.compaction_time += compaction_started.elapsed();
     let expert_started = Instant::now();
     let local_output = if statistics.local_routes == 0 {
-        zeros_dtype(hidden_states.shape(), hidden_states.dtype(), stream)?
+        zeros_dtype(
+            &[hidden_states.dim(0), output_dimensions],
+            hidden_states.dtype(),
+            stream,
+        )?
     } else {
         let output = execute(&routes, stream)?;
-        if output.ndim() != 2 || output.dim(0) != statistics.local_routes as i32 {
+        if output.ndim() != 2
+            || output.dim(0) != statistics.local_routes as i32
+            || output.dim(1) != output_dimensions
+        {
             return Err(Error::Parallel(format!(
                 "local expert bank returned invalid shape {:?}",
                 output.shape()

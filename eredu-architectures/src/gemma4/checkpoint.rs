@@ -7,7 +7,10 @@ use eredu_checkpoint::composite::{
     CompositeArtifactError, CompositeArtifactSchema, ProjectorCompatibility,
 };
 use eredu_checkpoint::{
-    expert::{resolve_swiglu_expert_recipes, SwiGluExpertLayoutNames, SwiGluExpertRecipes},
+    expert::{
+        resolve_gated_product_expert_recipes, GatedProductExpertLayoutNames,
+        GatedProductExpertRecipes,
+    },
     recipe::RecipeCatalog,
     schema::{
         matrix_for_linear_format, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
@@ -1085,7 +1088,7 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     args: &ModelArgs,
     root: &str,
     layer: usize,
-) -> Result<SwiGluExpertRecipes, String> {
+) -> Result<GatedProductExpertRecipes, String> {
     let policy = args
         .layer_policy(layer)
         .ok_or_else(|| format!("Gemma 4 expert recipe layer {layer} is out of range"))?;
@@ -1100,7 +1103,7 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
             format!("{base}.weight")
         }
     };
-    let names = SwiGluExpertLayoutNames {
+    let names = GatedProductExpertLayoutNames {
         target_gate_up: format!("{prefix}.gate_up_proj"),
         target_down: format!("{prefix}.down_proj"),
         packed_gate_up: source(&format!("{prefix}.gate_up_proj")),
@@ -1110,7 +1113,7 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
         separate_down: source(&format!("{prefix}.down_proj")),
         independent: Vec::new(),
     };
-    resolve_swiglu_expert_recipes(catalog, &names).map_err(|error| error.to_string())
+    resolve_gated_product_expert_recipes(catalog, &names).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1119,7 +1122,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use eredu_checkpoint::{
-        expert::SwiGluExpertStorageLayout,
+        expert::GatedProductExpertStorageLayout,
         recipe::{DerivedWeightRecipe, RecipeCatalog},
         store::{StoreError, TensorMetadata},
         StoredDtype,
@@ -1259,7 +1262,10 @@ mod tests {
         ]);
         let catalog = Catalog(tensors);
         let recipes = expert_recipes(&catalog, &sparse_args(), root, 0).unwrap();
-        assert_eq!(recipes.layout, SwiGluExpertStorageLayout::SeparatePacked);
+        assert_eq!(
+            recipes.layout,
+            GatedProductExpertStorageLayout::SeparatePacked
+        );
         assert_eq!(recipes.target_gate_up, format!("{prefix}.gate_up_proj"));
         assert_eq!(
             recipes.gate_up.infer(&catalog).unwrap().shape(),

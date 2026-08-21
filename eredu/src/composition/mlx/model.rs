@@ -15,8 +15,8 @@ use safemlx::{error::Exception, Array, Stream};
 use crate::backend::mlx::error::Error;
 use crate::backend::mlx::runtime::generation::sampler::SpeculativeSampler;
 use crate::backend::mlx::runtime::media::input;
+use crate::composition::gpt_oss;
 use crate::composition::mlx::speculative::{MlxDrafter, MtpExecutionStreams};
-use crate::composition::mlx_architectures::gpt_oss::model as gpt_oss;
 use crate::{LayerCachePolicy, LayerSchedule};
 use eredu_architectures::kimi_linear;
 use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
@@ -30,7 +30,7 @@ pub enum Model {
     /// Gemma 4 text and multimodal model.
     Gemma4(crate::composition::gemma4::Gemma4Model),
     /// OpenAI GPT-OSS model.
-    GptOss(crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseModel),
+    GptOss(crate::composition::gpt_oss::GptOssModel),
     /// Moonshot Kimi Linear hybrid KDA/MLA sparse decoder.
     KimiLinear(crate::composition::kimi_linear::KimiLinearModel),
     /// Thinking Machines Lab Inkling multimodal model.
@@ -603,7 +603,7 @@ impl Model {
             Self::Llama(model) => {
                 Ok(eredu_architectures::llama::prompt_cache_architecture_fingerprint(model.args()))
             }
-            Self::GptOss(model) => Ok(gpt_oss::prompt_cache_architecture_fingerprint(model.args())),
+            Self::GptOss(model) => Ok(model.prompt_cache_architecture_fingerprint()),
             Self::Inkling(model) => Ok(model.args().architecture_fingerprint()),
             Self::KimiLinear(model) => Ok(kimi_linear::prompt_cache_architecture_fingerprint(
                 model.args(),

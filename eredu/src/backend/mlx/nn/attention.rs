@@ -373,6 +373,7 @@ pub(crate) fn sliding_window_prefill_attention(
     query_position_offset: i32,
     batch: i32,
     seq_len: i32,
+    sinks: Option<&Array>,
     stream: &Stream,
 ) -> Result<Array, Exception> {
     if window_size <= 0 {
@@ -407,7 +408,7 @@ pub(crate) fn sliding_window_prefill_attention(
             values,
             scale,
             Some(ScaledDotProductAttentionMask::Causal),
-            None,
+            sinks,
             stream,
         )?
         .transpose_axes(&[0, 2, 1, 3], stream)?
@@ -441,7 +442,7 @@ pub(crate) fn sliding_window_prefill_attention(
             value_chunk,
             scale,
             Some(ScaledDotProductAttentionMask::Array(&mask)),
-            None,
+            sinks,
             stream,
         )?);
         start = end;
@@ -523,6 +524,7 @@ mod tests {
             0,
             1,
             5,
+            None,
             stream,
         )
         .unwrap();
@@ -531,6 +533,35 @@ mod tests {
             .all_close(&reference, 1e-5, 1e-5, None, stream)
             .unwrap()
             .item::<bool>(stream));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn chunked_sliding_prefill_preserves_sink_softmax_semantics() {
+        let ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let queries = Array::from_slice(&[0.0f32; 4], &[1, 1, 4, 1]);
+        let keys = Array::from_slice(&[0.0f32; 4], &[1, 1, 4, 1]);
+        let values = Array::from_slice(&[10.0f32, 20.0, 30.0, 40.0], &[1, 1, 4, 1]);
+        let sinks = Array::from_slice(&[0.0f32], &[1]);
+        let actual = sliding_window_prefill_attention(
+            queries,
+            keys,
+            values,
+            1.0,
+            2,
+            0,
+            1,
+            4,
+            Some(&sinks),
+            stream,
+        )
+        .unwrap();
+        let actual = actual.evaluated().unwrap();
+        let expected = [5.0f32, 10.0, 50.0 / 3.0, 70.0 / 3.0];
+        for (actual, expected) in actual.as_slice::<f32>().iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
     }
 
     #[test]
@@ -550,6 +581,7 @@ mod tests {
             0,
             1,
             4,
+            None,
             stream,
         )
         .unwrap();

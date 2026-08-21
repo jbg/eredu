@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, num::NonZeroU8};
 
 use eredu_architectures::{
-    gemma4, kimi_linear, lfm2,
+    gemma4, gpt_oss, kimi_linear, lfm2,
     llama::ModelArgs as LlamaModelArgs,
     nemotron_h,
     qwen::{
@@ -24,7 +24,6 @@ use safemlx::{Array, Stream};
 use super::{MlxBackend, MlxModelInput, MlxModelSession, Model};
 use crate::{
     backend::mlx::runtime::media::input::{self, InputPayload, Modality},
-    composition::mlx_architectures::gpt_oss::model as gpt_oss,
     core::attention::AttentionPolicy,
     core::residency::MemoryTier,
 };
@@ -2628,9 +2627,20 @@ mod tests {
                 )
             );
         }
-        let cache = gpt_oss::Cache::new_device(&args).unwrap();
-        assert_eq!(cache.layout.as_ref(), Some(&state_layout));
-        assert_eq!(cache.layers.len(), state_layout.len());
+        let identity = gpt_oss::state_identity(
+            &args,
+            &state_layout,
+            0,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap();
+        assert_eq!(identity.layer_count, state_layout.len());
+        assert_eq!(identity.global_layer_start, 0);
+        assert_eq!(identity.layer_prefix_offsets.len(), state_layout.len());
+        assert_eq!(
+            identity.architecture_fingerprint,
+            gpt_oss::prompt_cache_architecture_fingerprint(&args)
+        );
         let (_, _, strategy, _, estimate) = gpt_oss_spec(&args).unwrap();
         assert_eq!(
             strategy,

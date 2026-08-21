@@ -1653,7 +1653,7 @@ mod tests {
     }
 
     #[test]
-    fn gguf_dense_contiguous_span_rejects_packed_input_before_payload_io() {
+    fn gguf_native_contiguous_span_requires_block_alignment_before_payload_io() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.gguf");
         write_affine_gguf(&path);
@@ -1662,11 +1662,35 @@ mod tests {
                 name.to_string()
             })
             .unwrap();
-        let error = store
+
+        let lease = store
             .acquire(
                 "bank.weight",
                 TensorSelection::Contiguous {
                     offset_elements: 0,
+                    shape: vec![1, 4],
+                },
+            )
+            .unwrap();
+        assert_eq!(lease.output_shape(), [1, 4]);
+        assert_eq!(lease.selected_byte_len(), 16);
+        let WeightLeaseSource::Gguf(source) = &lease.source else {
+            panic!("expected GGUF lease");
+        };
+        assert!(matches!(
+            source.lease.identity().physical_selection(),
+            Some(GgufPhysicalSelection::DenseSpan(_))
+        ));
+        let diagnostics = store.source_diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 0);
+        assert_eq!(diagnostics.physical_read_bytes, 0);
+        assert!(diagnostics.touched_shard_paths.is_empty());
+
+        let error = store
+            .acquire(
+                "bank.weight",
+                TensorSelection::Contiguous {
+                    offset_elements: 1,
                     shape: vec![1, 4],
                 },
             )
@@ -1675,7 +1699,7 @@ mod tests {
             error,
             WeightStoreError::BoundedSelectionUnavailable { .. }
         ));
-        assert!(error.to_string().contains("unquantized F32, F16, or BF16"));
+        assert!(error.to_string().contains("must align"));
         let diagnostics = store.source_diagnostics().unwrap();
         assert_eq!(diagnostics.physical_reads, 0);
         assert_eq!(diagnostics.physical_read_bytes, 0);

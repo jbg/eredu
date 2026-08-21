@@ -16,8 +16,8 @@ use std::{
 
 use eredu_architectures::qwen::ModelArgs;
 use eredu_nn::{
-    ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized, RoutedNeuralBackend,
-    SwiGluExpertBankSpec, SwiGluExpertLayout, SwiGluExpertProjection,
+    ExpertProjectionSpec, GatedProductExpertBankSpec, GatedProductExpertLayout, ParameterSpec,
+    ParameterVisitor, ParameterVisitorMut, Parameterized, RoutedNeuralBackend,
 };
 use safemlx::{
     error::Exception,
@@ -1746,23 +1746,24 @@ impl QwenParallelComposition {
                 let prefix = format!("model.layers.{index}.mlp.experts");
                 let gate_up = format!("{prefix}.gate_up_proj");
                 let down = format!("{prefix}.down_proj");
-                moe.experts = <MlxBackend as RoutedNeuralBackend>::swiglu_expert_bank(
-                    SwiGluExpertBankSpec {
+                moe.experts = <MlxBackend as RoutedNeuralBackend>::gated_product_expert_bank(
+                    GatedProductExpertBankSpec {
                         expert_count: count,
                         input_dimensions: args.hidden_size,
                         intermediate_dimensions: args.moe_intermediate_size,
                         output_dimensions: args.hidden_size,
-                        activation: eredu_nn::GatedExpertActivation::Silu,
-                        limit: None,
-                        layout: SwiGluExpertLayout::Packed {
-                            gate_up: SwiGluExpertProjection {
+                        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+                        layout: GatedProductExpertLayout::Packed {
+                            gate_up: ExpertProjectionSpec {
                                 weight: ParameterSpec::trainable(&gate_up)
                                     .map_err(|error| Error::Parallel(error.to_string()))?,
+                                bias: None,
                                 format: args.weight_quantization_for(&gate_up).into(),
                             },
-                            down: SwiGluExpertProjection {
+                            down: ExpertProjectionSpec {
                                 weight: ParameterSpec::trainable(&down)
                                     .map_err(|error| Error::Parallel(error.to_string()))?,
+                                bias: None,
                                 format: args.weight_quantization_for(&down).into(),
                             },
                         },

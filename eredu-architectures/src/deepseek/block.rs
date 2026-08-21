@@ -321,15 +321,13 @@ where
         let source = selected
             .as_ref()
             .map_or(RouteSource::Learned, RouteSource::Selected);
-        let feed_forward = reduce(
-            self.feed_forward.forward_with_provider(
-                &normalized,
-                source,
-                pass,
-                provider,
-                context,
-            )?,
+        let feed_forward = self.feed_forward.forward_tensor_parallel_with_provider(
+            &normalized,
+            source,
+            pass,
+            provider,
             context,
+            &mut reduce,
         )?;
         self.feed_forward_connection
             .expand(&feed_forward, &hidden, &state, context)
@@ -515,7 +513,8 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(input, context)?;
         let up = self.up.forward(input, context)?;
-        let activated = B::swiglu(gate, up, None, context)?;
+        let activated =
+            B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
         self.down.forward(&activated, context)
     }
 }
@@ -710,16 +709,17 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> V3Block<B> {
         let residual = input.add(&attention, context)?;
         let normalized = self.post_attention_norm.forward(&residual, context)?;
         let feed_forward = match &mut self.feed_forward {
-            V3FeedForward::Dense(mlp) => mlp.forward(&normalized, context)?,
-            V3FeedForward::Routed(moe) => moe.forward_with_provider(
+            V3FeedForward::Dense(mlp) => reduce(mlp.forward(&normalized, context)?, context)?,
+            V3FeedForward::Routed(moe) => moe.forward_tensor_parallel_with_provider(
                 &normalized,
                 RouteSource::Learned,
                 pass,
                 provider,
                 context,
+                &mut reduce,
             )?,
         };
-        residual.add(&reduce(feed_forward, context)?, context)
+        residual.add(&feed_forward, context)
     }
 
     /// Executes the V3 block with stable MLA, routing, and intervention points.

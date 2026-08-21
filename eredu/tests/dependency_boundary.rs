@@ -560,7 +560,7 @@ fn qwen_neutral_cutover_has_no_legacy_or_backend_model_knowledge() {
             "Qwen composition still owns backend provider {removed_provider:?}"
         );
     }
-    assert!(expert_composition.contains("CachedSwiGluExpertProvider"));
+    assert!(expert_composition.contains("CachedGatedProductExpertProvider"));
 
     let distributed_expert = std::fs::read_to_string(
         crate_root.join("src/composition/mlx_architectures/distributed/expert.rs"),
@@ -591,6 +591,87 @@ fn qwen_neutral_cutover_has_no_legacy_or_backend_model_knowledge() {
         );
     }
     assert!(inspection.contains("pub use eredu_runtime::{NoopObserver, RoutingObservation"));
+}
+
+#[test]
+fn gpt_oss_cutover_has_one_neutral_implementation() {
+    let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_root.parent().expect("workspace root");
+    let legacy = crate_root.join("src/composition/mlx_architectures/gpt_oss");
+    assert!(
+        !legacy.exists(),
+        "legacy GPT-OSS implementation remains at {legacy:?}"
+    );
+
+    let neutral = workspace.join("eredu-architectures/src/gpt_oss");
+    assert!(neutral.is_dir(), "neutral GPT-OSS family is missing");
+    let mut neutral_sources = Vec::new();
+    rust_sources(&neutral, &mut neutral_sources);
+    assert!(
+        !neutral_sources.is_empty(),
+        "neutral GPT-OSS family is empty"
+    );
+    for source in neutral_sources {
+        let text = std::fs::read_to_string(&source).expect("neutral source must be readable");
+        for forbidden in [
+            "safemlx",
+            "backend::mlx",
+            "MlxBackend",
+            "mlx_architectures::",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "backend dependency {forbidden:?} leaked into {source:?}"
+            );
+        }
+    }
+
+    let legacy_module =
+        std::fs::read_to_string(crate_root.join("src/composition/mlx_architectures/mod.rs"))
+            .expect("legacy architecture module must be readable");
+    assert!(!legacy_module.contains("pub mod gpt_oss"));
+
+    let mut facade_sources = Vec::new();
+    rust_sources(&crate_root.join("src"), &mut facade_sources);
+    for source in facade_sources {
+        let text = std::fs::read_to_string(&source).expect("facade source must be readable");
+        for forbidden in [
+            "mlx_architectures::gpt_oss",
+            "GptOssLayerwiseAdapter",
+            "GptOssLayerwiseModel",
+            "struct GptOssStage",
+            "type GptOssStage",
+            "ExpertParallelCache::GptOss",
+            "CachedGptOssLocalBank",
+            "DistributedGptOssExpertProvider",
+            "execute_cached_gpt_oss",
+            "dispatch_cached_gpt_oss",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "legacy GPT-OSS dependency {forbidden:?} remains in {source:?}"
+            );
+        }
+    }
+
+    for relative in [
+        "eredu-nn/src",
+        "eredu-runtime/src",
+        "eredu-checkpoint/src",
+        "eredu/src/backend",
+    ] {
+        let mut shared_sources = Vec::new();
+        rust_sources(&workspace.join(relative), &mut shared_sources);
+        for source in shared_sources {
+            let text = std::fs::read_to_string(&source)
+                .expect("shared source must be readable")
+                .to_ascii_lowercase();
+            assert!(
+                !text.contains("gpt_oss") && !text.contains("gpt-oss"),
+                "GPT-OSS knowledge leaked into shared implementation {source:?}"
+            );
+        }
+    }
 }
 
 #[test]

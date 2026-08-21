@@ -25,13 +25,13 @@ use eredu::{
     composition::mlx_architectures::distributed::pipeline::{
         load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
     },
-    composition::mlx_architectures::gpt_oss::model as gpt_oss,
     core::{residency::OffloadConfig, BackendProvider as _, BackendSession as _},
     load_model, DenseDiskStreamLoadOptions, ExpertCacheLoadOptions, LayerwiseLoadOptions,
     MtpCapability, MtpCheckpointKind, MtpConfig, NonExpertWeightResidency, PromptCacheDescriptor,
     PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 use eredu::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_architectures::gpt_oss;
 use eredu_architectures::qwen::hybrid as qwen_hybrid;
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_gguf::{GgmlType, TensorInput, Writer};
@@ -375,12 +375,17 @@ fn pipeline_ring_worker() {
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
     if std::env::var_os(OPAQUE_SESSION).is_some() {
         let backend = MlxBackend::with_distributed_world(&stream, &stream, &group);
-        let model = load_model(
-            &backend,
-            &checkpoint,
-            ModelLoadOptions::with_parallel(topology),
-        )
-        .unwrap();
+        let load_options = if std::env::var_os(EXPERT_CACHE).is_some() {
+            ModelLoadOptions::with_parallel(topology).with_weight_residency(
+                WeightResidency::with_expert_cache(
+                    NonExpertWeightResidency::FullyResident,
+                    ExpertCacheLoadOptions::default(),
+                ),
+            )
+        } else {
+            ModelLoadOptions::with_parallel(topology)
+        };
+        let model = load_model(&backend, &checkpoint, load_options).unwrap();
         let mut session = backend.create_session(model).unwrap();
         let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
             .unwrap()
@@ -487,6 +492,7 @@ fn pipeline_ring_worker() {
         };
         let model_family = match outer_model_type {
             "gemma4" | "gemma4_unified" => "gemma4",
+            "gpt_oss" => "gpt_oss",
             "muse_glimmer" => "muse_glimmer",
             "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
             _ => "inkling",
@@ -2064,33 +2070,47 @@ fn write_gpt_oss_fixture(directory: &Path) {
         "quantization_config": {"quant_method": "mxfp4"},
         "swiglu_limit": 7.0
     });
+    let args = gpt_oss::model_args_from_config_value(&config).unwrap();
+    let plan = gpt_oss::safetensors_plan(&args).unwrap();
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let args = gpt_oss::model_args_from_config_value(&config).unwrap();
-    let mut model = gpt_oss::Model::new(args, stream).unwrap();
-    for (name, parameter) in model.parameters_mut().flatten() {
-        let shape = parameter.shape().to_vec();
-        *parameter = if name.ends_with("_scales") {
-            Array::full::<u8>(&shape, Array::from_slice(&[127u8], &[]), stream).unwrap()
-        } else if name.ends_with("_blocks") {
-            Array::full::<u8>(&shape, Array::from_slice(&[0x11u8], &[]), stream).unwrap()
-        } else if name.ends_with("norm.weight") {
-            Array::ones::<f32>(&shape, stream).unwrap()
-        } else {
-            let ordinal = name.bytes().fold(0u32, |sum, byte| sum + u32::from(byte)) % 17;
-            Array::full::<f32>(
-                &shape,
-                Array::from_f32(0.002 + ordinal as f32 * 0.0003),
-                stream,
-            )
-            .unwrap()
-        };
-    }
-    let arrays = model
-        .parameters()
-        .flatten()
-        .into_iter()
-        .map(|(name, value)| (canonical_checkpoint_name(&name), value.clone()))
+    let arrays = plan
+        .common_tensors
+        .iter()
+        .map(|tensor| {
+            let shape = tensor
+                .shape
+                .iter()
+                .map(|dimension| i32::try_from(*dimension).unwrap())
+                .collect::<Vec<_>>();
+            let value = match &tensor.dtype {
+                eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                    eredu_checkpoint::StoredDtype::U8,
+                ) if tensor.key.ends_with("_scales") => {
+                    Array::full::<u8>(&shape, Array::from_slice(&[127u8], &[]), stream).unwrap()
+                }
+                eredu_checkpoint::schema::StoredDtypeConstraint::Exact(
+                    eredu_checkpoint::StoredDtype::U8,
+                ) => Array::full::<u8>(&shape, Array::from_slice(&[0x11u8], &[]), stream).unwrap(),
+                _ if tensor.key.ends_with("norm.weight") => {
+                    Array::ones::<f32>(&shape, stream).unwrap()
+                }
+                _ => {
+                    let ordinal = tensor
+                        .key
+                        .bytes()
+                        .fold(0u32, |sum, byte| sum + u32::from(byte))
+                        % 17;
+                    Array::full::<f32>(
+                        &shape,
+                        Array::from_f32(0.002 + ordinal as f32 * 0.0003),
+                        stream,
+                    )
+                    .unwrap()
+                }
+            };
+            (tensor.key.clone(), value)
+        })
         .collect::<Vec<_>>();
     Array::save_safetensors(
         arrays.iter().map(|(name, value)| (name.as_str(), value)),
@@ -4664,7 +4684,7 @@ fn ring_four_process_gpt_oss_pipeline_expert_cache_session() {
         false,
         FixtureFamily::GptOss,
         "pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::OpaqueSessionExpertCache,
     );
 }
 
@@ -5913,6 +5933,7 @@ enum WorkerMode {
     ExpertCacheRequantize,
     Requantize,
     OpaqueSession,
+    OpaqueSessionExpertCache,
     OpaqueMuseImage,
     OpaqueInklingMedia,
     OpaqueInklingMtp,
@@ -6096,6 +6117,10 @@ fn run_ring_pipeline_processes(
             }
             WorkerMode::OpaqueSession => {
                 command.env(OPAQUE_SESSION, "1");
+            }
+            WorkerMode::OpaqueSessionExpertCache => {
+                command.env(OPAQUE_SESSION, "1");
+                command.env(EXPERT_CACHE, "1");
             }
             WorkerMode::OpaqueMuseImage => {
                 command.env(OPAQUE_SESSION, "1");

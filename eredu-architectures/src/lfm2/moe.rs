@@ -1,9 +1,9 @@
 //! Dense and routed LFM2 feed-forward policies.
 
 use eredu_nn::{
-    Error, LinearOperator, LinearSpec, ParameterSpec, Parameterized, RoutedNeuralBackend,
-    RoutingOperator, RoutingScoring, SwiGluExpertBankOperator, SwiGluExpertBankSpec,
-    SwiGluExpertLayout, SwiGluExpertProjection, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    Error, ExpertProjectionSpec, GatedProductExpertBankOperator, GatedProductExpertBankSpec,
+    GatedProductExpertLayout, LinearOperator, LinearSpec, ParameterSpec, Parameterized,
+    RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest};
 
@@ -58,24 +58,24 @@ impl<B: RoutedNeuralBackend> DenseSwiGlu<B> {
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(input, context)?;
         let up = self.up.forward(input, context)?;
-        B::swiglu(gate, up, None, context)
+        B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)
     }
 }
 
-/// Sigmoid router and routed SwiGLU expert bank used by LFM2-MoE.
+/// Sigmoid router and routed gated-product expert bank used by LFM2-MoE.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
-pub struct RoutedSwiGlu<B: RoutedNeuralBackend> {
+pub struct RoutedGatedProduct<B: RoutedNeuralBackend> {
     /// Global physical layer identity.
     #[parameter(skip)]
     pub layer: usize,
     /// Learned sigmoid top-k router.
     pub router: B::Router,
     /// Packed routed experts.
-    pub experts: B::SwiGluExpertBank,
+    pub experts: B::GatedProductExpertBank,
 }
 
-impl<B: RoutedNeuralBackend> RoutedSwiGlu<B> {
+impl<B: RoutedNeuralBackend> RoutedGatedProduct<B> {
     fn new(
         args: &ModelArgs,
         layer: usize,
@@ -95,6 +95,7 @@ impl<B: RoutedNeuralBackend> RoutedSwiGlu<B> {
             TopKRouterSpec {
                 input_dimensions: args.hidden_size,
                 weight: ParameterSpec::trainable(&gate_name).map_err(Error::backend)?,
+                bias: None,
                 correction_bias: args
                     .use_expert_bias
                     .then(|| ParameterSpec::trainable(format!("{prefix}.expert_bias")))
@@ -110,21 +111,22 @@ impl<B: RoutedNeuralBackend> RoutedSwiGlu<B> {
         let experts_prefix = format!("{prefix}.experts");
         let gate_up_name = format!("{experts_prefix}.gate_up_proj");
         let down_name = format!("{experts_prefix}.down_proj");
-        let experts = B::swiglu_expert_bank(
-            SwiGluExpertBankSpec {
+        let experts = B::gated_product_expert_bank(
+            GatedProductExpertBankSpec {
                 expert_count: args.num_experts,
                 input_dimensions: args.hidden_size,
                 intermediate_dimensions: intermediate,
                 output_dimensions: args.hidden_size,
-                activation: eredu_nn::GatedExpertActivation::Silu,
-                limit: None,
-                layout: SwiGluExpertLayout::Packed {
-                    gate_up: SwiGluExpertProjection {
+                policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+                layout: GatedProductExpertLayout::Packed {
+                    gate_up: ExpertProjectionSpec {
                         weight: ParameterSpec::trainable(&gate_up_name).map_err(Error::backend)?,
+                        bias: None,
                         format: args.weight_quantization_for(&gate_up_name).into(),
                     },
-                    down: SwiGluExpertProjection {
+                    down: ExpertProjectionSpec {
                         weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
+                        bias: None,
                         format: args.weight_quantization_for(&down_name).into(),
                     },
                 },
@@ -146,7 +148,7 @@ pub enum FeedForward<B: RoutedNeuralBackend> {
     /// Dense SwiGLU.
     Dense(DenseSwiGlu<B>),
     /// Routed LFM2-MoE SwiGLU.
-    Routed(RoutedSwiGlu<B>),
+    Routed(RoutedGatedProduct<B>),
 }
 
 impl<B: RoutedNeuralBackend> FeedForward<B> {
@@ -182,7 +184,7 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
                 DenseSwiGlu::new(args, layer, dense_intermediate, context).map(Self::Dense)
             }
             FeedForwardPolicy::SparseMoe => {
-                RoutedSwiGlu::new(args, layer, expert_intermediate, context).map(Self::Routed)
+                RoutedGatedProduct::new(args, layer, expert_intermediate, context).map(Self::Routed)
             }
         }
     }
@@ -245,7 +247,7 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
             }
             Self::Routed(routed) => {
                 let routes = routed.router.route(input, context)?;
-                let routed = RoutedExpertProvider::<B>::forward_routed(
+                let output = RoutedExpertProvider::<B>::forward_routed_tensor_parallel(
                     provider,
                     &mut routed.experts,
                     RoutedExpertRequest {
@@ -254,14 +256,11 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
                         routes: &routes,
                         pass,
                     },
+                    B::parallel_size(parallel),
                     context,
                 )
                 .map_err(|error| Error::backend(error.to_string()))?;
-                if provider.output_is_tensor_parallel_partial() {
-                    B::sum_parallel(routed, parallel, context)
-                } else {
-                    Ok(routed)
-                }
+                eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
             }
         }
     }
@@ -391,8 +390,13 @@ impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {
             }
             Self::Routed(routed) => {
                 let routes = routed.router.route(input, context)?;
-                let output = routed.experts.forward_routed(input, &routes, context)?;
-                B::sum_parallel(output, parallel, context)
+                let output = routed.experts.forward_routed_tensor_parallel(
+                    input,
+                    &routes,
+                    B::parallel_size(parallel),
+                    context,
+                )?;
+                eredu_runtime::reduce_tensor_parallel_expert_output::<B>(output, parallel, context)
             }
         }
     }

@@ -7,8 +7,8 @@ use eredu_checkpoint::schema::{
 };
 use eredu_checkpoint::{
     expert::{
-        resolve_swiglu_expert_recipes, IndependentSwiGluExpertNames, SwiGluExpertLayoutNames,
-        SwiGluExpertRecipes,
+        resolve_gated_product_expert_recipes, GatedProductExpertLayoutNames,
+        GatedProductExpertRecipes, IndependentGatedProductExpertNames,
     },
     recipe::RecipeCatalog,
 };
@@ -207,7 +207,7 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     args: &ModelArgs,
     root: &str,
     layer: usize,
-) -> Result<SwiGluExpertRecipes, String> {
+) -> Result<GatedProductExpertRecipes, String> {
     if !args.is_moe() {
         return Err("Qwen expert recipes require Qwen3-MoE arguments".into());
     }
@@ -227,7 +227,7 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     } else {
         ".weight"
     };
-    let names = SwiGluExpertLayoutNames {
+    let names = GatedProductExpertLayoutNames {
         target_gate_up: format!("{prefix}.gate_up_proj"),
         target_down: format!("{prefix}.down_proj"),
         packed_gate_up: format!("{prefix}.gate_up_proj"),
@@ -236,14 +236,14 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
         separate_up: format!("{prefix}.up_proj{separate_suffix}"),
         separate_down: format!("{prefix}.down_proj{separate_suffix}"),
         independent: (0..count)
-            .map(|expert| IndependentSwiGluExpertNames {
+            .map(|expert| IndependentGatedProductExpertNames {
                 gate: format!("{prefix}.{expert}.gate_proj.weight"),
                 up: format!("{prefix}.{expert}.up_proj.weight"),
                 down: format!("{prefix}.{expert}.down_proj.weight"),
             })
             .collect(),
     };
-    resolve_swiglu_expert_recipes(catalog, &names).map_err(|error| error.to_string())
+    resolve_gated_product_expert_recipes(catalog, &names).map_err(|error| error.to_string())
 }
 
 fn expert_layout_group(
@@ -589,7 +589,7 @@ mod tests {
     use super::*;
     use crate::qwen::model_args_from_config_value;
     use eredu_checkpoint::{
-        expert::SwiGluExpertStorageLayout,
+        expert::GatedProductExpertStorageLayout,
         recipe::DerivedWeightRecipe,
         store::{StoreError, TensorMetadata},
         StoredDtype,
@@ -833,7 +833,7 @@ mod tests {
         }
         let catalog = Catalog(tensors);
         let recipes = expert_recipes(&catalog, &args, "model", 0).unwrap();
-        assert_eq!(recipes.layout, SwiGluExpertStorageLayout::Independent);
+        assert_eq!(recipes.layout, GatedProductExpertStorageLayout::Independent);
         assert_eq!(recipes.target_gate_up, format!("{prefix}.gate_up_proj"));
         assert_eq!(recipes.target_down, format!("{prefix}.down_proj"));
         assert_eq!(

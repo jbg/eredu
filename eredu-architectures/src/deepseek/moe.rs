@@ -2,9 +2,9 @@
 
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{
-    Error, LinearOperator, LinearSpec, ParameterSpec, Parameterized, RoutedNeuralBackend,
-    RoutingOperator, RoutingScoring, SwiGluExpertBankSpec, SwiGluExpertLayout,
-    SwiGluExpertProjection, SwiGluLimit, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    Error, ExpertProjectionSpec, GatedProductExpertBankSpec, GatedProductExpertLayout,
+    GatedProductPolicy, LinearOperator, LinearSpec, ParameterSpec, Parameterized,
+    RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{
     observe_and_intervene, ActivationObserver, ExpertPass, ResidentExpertProvider,
@@ -39,8 +39,8 @@ pub struct MoePolicy {
     pub shared_down_format: LinearFormat,
     pub expert_gate_up_format: LinearFormat,
     pub expert_down_format: LinearFormat,
-    pub shared_limit: Option<SwiGluLimit>,
-    pub limit: Option<SwiGluLimit>,
+    pub shared_limit: Option<GatedProductPolicy>,
+    pub limit: Option<GatedProductPolicy>,
 }
 
 /// Learned routes or caller-selected token/hash routes.
@@ -60,12 +60,12 @@ pub struct RoutedPlusShared<B: RoutedNeuralBackend> {
     #[parameter(skip)]
     expert_count: i32,
     pub router: B::Router,
-    pub experts: B::SwiGluExpertBank,
+    pub experts: B::GatedProductExpertBank,
     shared_gate: B::Linear,
     shared_up: B::Linear,
     shared_down: B::Linear,
     #[parameter(skip)]
-    shared_limit: Option<SwiGluLimit>,
+    shared_limit: Option<GatedProductPolicy>,
 }
 
 #[allow(missing_docs)]
@@ -86,6 +86,7 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
             TopKRouterSpec {
                 input_dimensions: policy.hidden,
                 weight: parameter(&policy.router_weight)?,
+                bias: None,
                 correction_bias: policy
                     .correction_bias
                     .as_deref()
@@ -98,21 +99,22 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
             },
             context,
         )?;
-        let experts = B::swiglu_expert_bank(
-            SwiGluExpertBankSpec {
+        let experts = B::gated_product_expert_bank(
+            GatedProductExpertBankSpec {
                 expert_count: policy.expert_count,
                 input_dimensions: policy.hidden,
                 intermediate_dimensions: policy.expert_width,
                 output_dimensions: policy.hidden,
-                activation: eredu_nn::GatedExpertActivation::Silu,
-                limit: policy.limit,
-                layout: SwiGluExpertLayout::Packed {
-                    gate_up: SwiGluExpertProjection {
+                policy: policy.limit.unwrap_or_default(),
+                layout: GatedProductExpertLayout::Packed {
+                    gate_up: ExpertProjectionSpec {
                         weight: parameter(&policy.expert_gate_up)?,
+                        bias: None,
                         format: policy.expert_gate_up_format,
                     },
-                    down: SwiGluExpertProjection {
+                    down: ExpertProjectionSpec {
                         weight: parameter(&policy.expert_down)?,
+                        bias: None,
                         format: policy.expert_down_format,
                     },
                 },
@@ -191,6 +193,57 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
         )
     }
 
+    /// Executes routed/shared TP work with one reduction and literal post-bias.
+    pub fn forward_tensor_parallel_with_provider<P, F>(
+        &mut self,
+        input: &B::Tensor,
+        source: RouteSource<'_, B::Tensor>,
+        pass: ExpertPass,
+        provider: &mut P,
+        context: &<B::Tensor as Tensor>::Context,
+        mut reduce: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        P: RoutedExpertProvider<B>,
+        P::Error: std::fmt::Display,
+        F: FnMut(B::Tensor, &<B::Tensor as Tensor>::Context) -> Result<B::Tensor, Error>,
+    {
+        let routes = match source {
+            RouteSource::Learned => self.router.route(input, context)?,
+            RouteSource::Selected(ids) => self.router.route_selected(input, ids, context)?,
+        };
+        let routed = provider
+            .forward_routed_tensor_parallel(
+                &mut self.experts,
+                RoutedExpertRequest {
+                    layer: self.layer,
+                    input,
+                    routes: &routes,
+                    pass,
+                },
+                1,
+                context,
+            )
+            .map_err(Error::backend)?;
+        let gate = self.shared_gate.forward(input, context)?;
+        let up = self.shared_up.forward(input, context)?;
+        let shared = B::gated_product(gate, up, self.shared_limit.unwrap_or_default(), context)?;
+        let shared = self.shared_down.forward(&shared, context)?;
+        match routed {
+            eredu_runtime::RoutedExpertTensorParallelOutput::Complete(routed) => {
+                routed.add(&reduce(shared, context)?, context)
+            }
+            eredu_runtime::RoutedExpertTensorParallelOutput::Partial(mut routed) => {
+                routed.reducible = routed.reducible.add(&shared, context)?;
+                let reduced = reduce(routed.reducible, context)?;
+                match routed.post_reduce {
+                    Some(bias) => reduced.add(&bias, context),
+                    None => Ok(reduced),
+                }
+            }
+        }
+    }
+
     /// Executes routed/shared experts with normalized route observation and a
     /// stable intervention point on their combined contribution.
     #[allow(clippy::too_many_arguments)]
@@ -227,7 +280,7 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
             .map_err(Error::backend)?;
         let gate = self.shared_gate.forward(input, context)?;
         let up = self.shared_up.forward(input, context)?;
-        let shared = B::swiglu(gate, up, self.shared_limit, context)?;
+        let shared = B::gated_product(gate, up, self.shared_limit.unwrap_or_default(), context)?;
         let shared = self.shared_down.forward(&shared, context)?;
         let combined = routed.add(&shared, context)?;
         observer.observe_routing(RoutingObservation {

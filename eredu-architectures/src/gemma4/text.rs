@@ -4,11 +4,12 @@ use std::collections::HashMap;
 
 use eredu_core::AttentionPolicy;
 use eredu_nn::{
-    AttentionCache, AttentionStateSource, AttentionValueSource, Error, LinearOperator, LinearSpec,
+    AttentionCache, AttentionStateSource, AttentionValueSource, Error, ExpertProjectionSpec,
+    GatedProductExpertBankSpec, GatedProductExpertLayout, LinearOperator, LinearSpec,
     NeuralBackend, NormalizationOperator, NormalizationSpec, Parameter, ParameterSpec,
     Parameterized, RotaryOperator, RotaryPosition, RotarySpec, RotarySubspace, RoutedNeuralBackend,
-    RouterInputTransformSpec, RoutingOperator, RoutingScoring, SwiGluExpertBankSpec,
-    SwiGluExpertLayout, SwiGluExpertProjection, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    RouterInputTransformSpec, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec,
+    TopKRoutingSpec,
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
@@ -380,7 +381,7 @@ pub struct DenseBlock<B: RoutedNeuralBackend> {
     /// Optional selected-softmax sparse router.
     pub router: Option<B::Router>,
     /// Optional packed GELU-gated expert bank.
-    pub experts: Option<B::SwiGluExpertBank>,
+    pub experts: Option<B::GatedProductExpertBank>,
     /// Pre-attention normalization.
     pub input_norm: B::Normalization,
     /// Attention-delta normalization.
@@ -484,6 +485,7 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
                 TopKRouterSpec {
                     input_dimensions: args.hidden_size,
                     weight: ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
+                    bias: None,
                     correction_bias: None,
                     input_transform: Some(RouterInputTransformSpec {
                         epsilon: args.rms_norm_eps,
@@ -508,22 +510,23 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
             let experts_prefix = format!("{prefix}.experts.switch_glu");
             let gate_up_name = format!("{experts_prefix}.gate_up_proj");
             let down_name = format!("{experts_prefix}.down_proj");
-            let experts = B::swiglu_expert_bank(
-                SwiGluExpertBankSpec {
+            let experts = B::gated_product_expert_bank(
+                GatedProductExpertBankSpec {
                     expert_count,
                     input_dimensions: args.hidden_size,
                     intermediate_dimensions: expert_width,
                     output_dimensions: args.hidden_size,
-                    activation: eredu_nn::GatedExpertActivation::GeluApproximate,
-                    limit: None,
-                    layout: SwiGluExpertLayout::Packed {
-                        gate_up: SwiGluExpertProjection {
+                    policy: eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
+                    layout: GatedProductExpertLayout::Packed {
+                        gate_up: ExpertProjectionSpec {
                             weight: ParameterSpec::trainable(&gate_up_name)
                                 .map_err(Error::backend)?,
+                            bias: None,
                             format: args.linear_format_for(&gate_up_name),
                         },
-                        down: SwiGluExpertProjection {
+                        down: ExpertProjectionSpec {
                             weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
+                            bias: None,
                             format: args.linear_format_for(&down_name),
                         },
                     },
@@ -706,44 +709,47 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
         let hidden = input.hidden.add(&attention, context)?;
         let normalized = self.pre_feed_forward_norm.forward(&hidden, context)?;
         let dense = self.mlp.forward_parallel(&normalized, parallel, context)?;
-        let mlp = if let (Some(router), Some(experts)) =
-            (self.router.as_mut(), self.experts.as_mut())
-        {
-            let dense = self
-                .post_feed_forward_norm_1
-                .as_mut()
-                .ok_or_else(|| Error::backend("sparse Gemma block has no dense branch norm"))?
-                .forward(&dense, context)?;
-            let shape = hidden.shape().to_vec();
-            let flat = hidden.reshape(&[-1, hidden.dim(2)], context)?;
-            let routed_input = self
-                .pre_feed_forward_norm_2
-                .as_mut()
-                .ok_or_else(|| Error::backend("sparse Gemma block has no routed input norm"))?
-                .forward(&flat, context)?;
-            let routes = router.route(&flat, context)?;
-            let routed = provider
-                .forward_routed(
-                    experts,
-                    RoutedExpertRequest {
-                        layer: self.layer,
-                        input: &routed_input,
-                        routes: &routes,
-                        pass,
-                    },
-                    context,
-                )
-                .map_err(Error::backend)?;
-            let routed = B::sum_parallel(routed, parallel, context)?.reshape(&shape, context)?;
-            let routed = self
-                .post_feed_forward_norm_2
-                .as_mut()
-                .ok_or_else(|| Error::backend("sparse Gemma block has no routed output norm"))?
-                .forward(&routed, context)?;
-            dense.add(&routed, context)?
-        } else {
-            dense
-        };
+        let mlp =
+            if let (Some(router), Some(experts)) = (self.router.as_mut(), self.experts.as_mut()) {
+                let dense = self
+                    .post_feed_forward_norm_1
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("sparse Gemma block has no dense branch norm"))?
+                    .forward(&dense, context)?;
+                let shape = hidden.shape().to_vec();
+                let flat = hidden.reshape(&[-1, hidden.dim(2)], context)?;
+                let routed_input = self
+                    .pre_feed_forward_norm_2
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("sparse Gemma block has no routed input norm"))?
+                    .forward(&flat, context)?;
+                let routes = router.route(&flat, context)?;
+                let routed = provider
+                    .forward_routed_tensor_parallel(
+                        experts,
+                        RoutedExpertRequest {
+                            layer: self.layer,
+                            input: &routed_input,
+                            routes: &routes,
+                            pass,
+                        },
+                        B::parallel_size(parallel),
+                        context,
+                    )
+                    .map_err(Error::backend)?;
+                let routed = eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(
+                    routed, parallel, context,
+                )?
+                .reshape(&shape, context)?;
+                let routed = self
+                    .post_feed_forward_norm_2
+                    .as_mut()
+                    .ok_or_else(|| Error::backend("sparse Gemma block has no routed output norm"))?
+                    .forward(&routed, context)?;
+                dense.add(&routed, context)?
+            } else {
+                dense
+            };
         let mlp = self.post_feed_forward_norm.forward(&mlp, context)?;
         let mut hidden = hidden.add(&mlp, context)?;
         if let (Some(media), Some(gate), Some(projection), Some(norm)) = (

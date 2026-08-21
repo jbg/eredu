@@ -12,10 +12,7 @@ use eredu_core::{GgufArchitecture, ModelKind};
 use super::ModelLoadOptions;
 use crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames;
 use crate::backend::mlx::{error::Error, runtime::checkpoint::store::SafetensorsWeightStore};
-use crate::composition::{
-    llama_checkpoint,
-    mlx_architectures::{gpt_oss::checkpoint as gpt_oss_checkpoint, moshi::personaplex_checkpoint},
-};
+use crate::composition::{llama_checkpoint, mlx_architectures::moshi::personaplex_checkpoint};
 
 pub(crate) use eredu_checkpoint::validation::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,
@@ -159,7 +156,7 @@ pub(crate) fn validate_safetensors(
             ModelKind::DeepSeekV3 => validate_neutral_deepseek_v3_safetensors(config, store),
             ModelKind::DeepSeekV4 => validate_neutral_deepseek_v4_safetensors(config, store),
             ModelKind::Gemma4 => validate_neutral_gemma4_safetensors(config, store),
-            ModelKind::GptOss => gpt_oss_checkpoint::validate_safetensors(config, store),
+            ModelKind::GptOss => validate_neutral_gpt_oss_safetensors(config, store),
             ModelKind::Inkling => validate_neutral_inkling_safetensors(config, store),
             ModelKind::KimiLinear => validate_neutral_kimi_safetensors(config, store),
             ModelKind::Lfm2 => validate_neutral_lfm2_safetensors(config, store),
@@ -204,7 +201,7 @@ pub(crate) fn validate_gguf(
         StructuralValidationPolicy::Exact => match architecture {
             GgufArchitecture::DeepSeek2 => validate_neutral_deepseek_v3_gguf(checkpoint, metadata),
             GgufArchitecture::DeepSeek4 => validate_neutral_deepseek_v4_gguf(checkpoint, metadata),
-            GgufArchitecture::GptOss => gpt_oss_checkpoint::validate_gguf(checkpoint, metadata),
+            GgufArchitecture::GptOss => validate_neutral_gpt_oss_gguf(checkpoint, metadata),
             GgufArchitecture::Gemma4 => {
                 if let Err(error) = architecture.validate_load_policy(options) {
                     invalid_geometry(error.to_string())
@@ -276,6 +273,21 @@ fn validate_neutral_gemma4_safetensors(
     eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
 }
 
+fn validate_neutral_gpt_oss_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> StructuralValidation {
+    let args = match eredu_architectures::gpt_oss::model_args_from_config_value(config) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::gpt_oss::safetensors_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    eredu_checkpoint::validation::validate_safetensors_plan(store, &plan)
+}
+
 fn validate_neutral_inkling_safetensors(
     config: &Value,
     store: &SafetensorsWeightStore,
@@ -338,6 +350,29 @@ fn validate_neutral_gemma4_gguf(
         Err(error) => return invalid_geometry(error),
     };
     eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
+}
+
+fn validate_neutral_gpt_oss_gguf(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    if let Err(error) = checkpoint
+        .catalog()
+        .translated_outputs(eredu_architectures::gpt_oss::translate_gguf_weight_name)
+    {
+        return StructuralValidation::Invalid(vec![StructuralIssue {
+            kind: StructuralIssueKind::ConflictingLayout,
+            detail: error.to_string(),
+            tensor_name: None,
+            tensor_type_code: None,
+            metadata_key: None,
+        }]);
+    }
+    let args = match eredu_architectures::gpt_oss::model_args_from_gguf_catalog(metadata) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    eredu_architectures::gpt_oss::validate_gguf(checkpoint, &args)
 }
 
 fn validate_neutral_inkling_gguf(

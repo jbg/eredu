@@ -1,8 +1,8 @@
 //! Nemotron-H dense and routed ReLU-squared feed-forward operators.
 
 use eredu_nn::{
-    Error, LinearOperator, LinearSpec, ParameterSpec, Parameterized, Relu2ExpertBankSpec,
-    RoutedNeuralBackend, RoutingOperator, RoutingScoring, SwiGluExpertProjection, Tensor,
+    Error, ExpertProjectionSpec, LinearOperator, LinearSpec, ParameterSpec, Parameterized,
+    Relu2ExpertBankSpec, RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor,
     TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest};
@@ -138,6 +138,7 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
             TopKRouterSpec {
                 input_dimensions: args.hidden_size,
                 weight: ParameterSpec::trainable(&gate_weight).map_err(Error::backend)?,
+                bias: None,
                 correction_bias: Some(
                     ParameterSpec::trainable(format!("{prefix}.gate.e_score_correction_bias"))
                         .map_err(Error::backend)?,
@@ -156,12 +157,14 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
                 expert_count: args.n_routed_experts,
                 hidden_dimensions: args.hidden_size,
                 intermediate_dimensions: routed_intermediate,
-                up: SwiGluExpertProjection {
+                up: ExpertProjectionSpec {
                     weight: ParameterSpec::trainable(&up_name).map_err(Error::backend)?,
+                    bias: None,
                     format: args.weight_quantization_for(&up_name).into(),
                 },
-                down: SwiGluExpertProjection {
+                down: ExpertProjectionSpec {
                     weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
+                    bias: None,
                     format: args.weight_quantization_for(&down_name).into(),
                 },
             },

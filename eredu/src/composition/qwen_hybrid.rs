@@ -56,7 +56,7 @@ use crate::backend::mlx::{
         media::input,
         residency::{
             expert_cache::{ExpertCache, ExpertCatalogEntry},
-            expert_provider::{CachedSwiGluBankSpec, CachedSwiGluExpertProvider},
+            expert_provider::{CachedGatedProductBankSpec, CachedGatedProductExpertProvider},
         },
     },
 };
@@ -1270,14 +1270,14 @@ fn planned_expert_binding(
 pub(crate) fn cached_expert_spec(
     config: &HybridConfig,
     layer: usize,
-) -> crate::backend::mlx::runtime::residency::expert_provider::CachedSwiGluBankSpec {
+) -> crate::backend::mlx::runtime::residency::expert_provider::CachedGatedProductBankSpec {
     let target = config.num_hidden_layers as usize;
     let root = if layer < target {
         format!("model.layers.{layer}.mlp.experts")
     } else {
         format!("mtp.layers.{}.mlp.experts", layer - target)
     };
-    crate::backend::mlx::runtime::residency::expert_provider::CachedSwiGluBankSpec {
+    crate::backend::mlx::runtime::residency::expert_provider::CachedGatedProductBankSpec {
         hidden_dimensions: config.hidden_size,
         intermediate_dimensions: config.moe_intermediate_size,
         gate_up_quantization: config
@@ -1286,16 +1286,17 @@ pub(crate) fn cached_expert_spec(
         down_quantization: config
             .linear_format(&format!("{root}.down_proj"))
             .weight_quantization(),
-        activation: eredu_nn::GatedExpertActivation::Silu,
-        limit: None,
+        gate_up_bias: false,
+        down_bias: false,
+        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
     }
 }
 
 fn cached_provider<'a>(
     cache: &'a ExpertCache,
     config: &'a HybridConfig,
-) -> CachedSwiGluExpertProvider<'a, impl FnMut(usize) -> CachedSwiGluBankSpec + 'a> {
-    CachedSwiGluExpertProvider::new(cache, move |layer| cached_expert_spec(config, layer))
+) -> CachedGatedProductExpertProvider<'a, impl FnMut(usize) -> CachedGatedProductBankSpec + 'a> {
+    CachedGatedProductExpertProvider::new(cache, move |layer| cached_expert_spec(config, layer))
 }
 
 struct HybridGgufCatalog<'a>(&'a GgufCheckpoint);

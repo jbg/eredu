@@ -112,7 +112,7 @@ impl DenseTensorSpan {
     }
 }
 
-/// Metadata-only physical read plan for one dense contiguous tensor span.
+/// Metadata-only physical read plan for one block-aligned contiguous tensor span.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenseTensorSpanPlan {
     selection: DenseTensorSpan,
@@ -121,24 +121,25 @@ pub struct DenseTensorSpanPlan {
 }
 
 impl DenseTensorSpanPlan {
-    /// Validates a fixed-width dense span without reading its payload.
+    /// Validates a block-aligned contiguous span without reading its payload.
+    ///
+    /// `selection` is expressed in the descriptor's physical scalar units.
+    /// Native quantized spans must begin and end on complete GGML blocks.
     pub fn new(tensor: &TensorDescriptor, selection: DenseTensorSpan) -> Result<Self> {
-        if !matches!(
-            tensor.ggml_type,
-            GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16
-        ) {
+        let tensor_elements = tensor.element_count()?;
+        let (block_values, block_bytes) = tensor.ggml_type.block_and_bytes()?;
+        if !tensor_elements.is_multiple_of(block_values) {
             return Err(Error::tensor(
                 &tensor.name,
                 format!(
-                    "contiguous scalar spans require an unquantized F32, F16, or BF16 tensor, got {:?}",
+                    "tensor element count {tensor_elements} is not divisible by {:?} block length {block_values}",
                     tensor.ggml_type
                 ),
             ));
         }
-        let tensor_elements = tensor.element_count()?;
-        let (_, element_bytes) = tensor.ggml_type.block_and_bytes()?;
         let expected_source_bytes = tensor_elements
-            .checked_mul(element_bytes)
+            .checked_div(block_values)
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
             .ok_or(Error::Overflow("dense tensor byte length"))?;
         if expected_source_bytes != tensor.byte_len {
             return Err(Error::tensor(
@@ -163,14 +164,37 @@ impl DenseTensorSpanPlan {
                 ),
             ));
         }
-        let (block_values, _) = tensor.ggml_type.block_and_bytes()?;
-        debug_assert_eq!(block_values, 1);
+        if !selection.offset_elements.is_multiple_of(block_values)
+            || !selected_elements.is_multiple_of(block_values)
+        {
+            return Err(Error::tensor(
+                &tensor.name,
+                format!(
+                    "contiguous span {}..{selected_end} must align to {:?} block length {block_values}",
+                    selection.offset_elements, tensor.ggml_type
+                ),
+            ));
+        }
+        let fastest = selection.shape.last().copied().ok_or_else(|| {
+            Error::tensor(&tensor.name, "contiguous span has no fastest dimension")
+        })?;
+        if !fastest.is_multiple_of(block_values) {
+            return Err(Error::tensor(
+                &tensor.name,
+                format!(
+                    "contiguous span fastest dimension {fastest} must align to {:?} block length {block_values}",
+                    tensor.ggml_type
+                ),
+            ));
+        }
         let byte_offset = selection
             .offset_elements
-            .checked_mul(element_bytes)
+            .checked_div(block_values)
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
             .ok_or(Error::Overflow("dense tensor span byte offset"))?;
         let byte_len = selected_elements
-            .checked_mul(element_bytes)
+            .checked_div(block_values)
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
             .ok_or(Error::Overflow("dense tensor span byte length"))?;
         let offset = tensor
             .data_offset
@@ -876,7 +900,7 @@ impl<R: Read + Seek> Reader<R> {
         crate::convert::convert(plan.selected_descriptor(), &raw, self.endian)
     }
 
-    /// Execute a validated fixed-width dense contiguous-span plan.
+    /// Execute a validated block-aligned contiguous-span plan.
     pub fn read_dense_tensor_span(
         &mut self,
         plan: &DenseTensorSpanPlan,

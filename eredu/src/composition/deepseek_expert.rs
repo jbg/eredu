@@ -12,7 +12,7 @@ use crate::backend::mlx::{
         checkpoint::binding_plan::{BindingPlan, PlannedBinding},
         residency::{
             expert_cache::{ExpertCache, ExpertCatalogEntry},
-            expert_provider::{CachedSwiGluBankSpec, CachedSwiGluExpertProvider},
+            expert_provider::{CachedGatedProductBankSpec, CachedGatedProductExpertProvider},
         },
     },
 };
@@ -242,20 +242,20 @@ fn recipe_binding(
 pub(crate) fn v3_provider<'a>(
     cache: &'a ExpertCache,
     args: &'a V3Args,
-) -> CachedSwiGluExpertProvider<'a, impl FnMut(usize) -> CachedSwiGluBankSpec + 'a> {
-    CachedSwiGluExpertProvider::new(cache, move |layer| v3_spec(args, layer))
+) -> CachedGatedProductExpertProvider<'a, impl FnMut(usize) -> CachedGatedProductBankSpec + 'a> {
+    CachedGatedProductExpertProvider::new(cache, move |layer| v3_spec(args, layer))
 }
 
 pub(crate) fn v4_provider<'a>(
     cache: &'a ExpertCache,
     args: &'a V4Args,
-) -> CachedSwiGluExpertProvider<'a, impl FnMut(usize) -> CachedSwiGluBankSpec + 'a> {
-    CachedSwiGluExpertProvider::new(cache, move |layer| v4_spec(args, layer))
+) -> CachedGatedProductExpertProvider<'a, impl FnMut(usize) -> CachedGatedProductBankSpec + 'a> {
+    CachedGatedProductExpertProvider::new(cache, move |layer| v4_spec(args, layer))
 }
 
-pub(crate) fn v3_spec(args: &V3Args, layer: usize) -> CachedSwiGluBankSpec {
+pub(crate) fn v3_spec(args: &V3Args, layer: usize) -> CachedGatedProductBankSpec {
     let root = format!("model.layers.{layer}.mlp.experts");
-    CachedSwiGluBankSpec {
+    CachedGatedProductBankSpec {
         hidden_dimensions: args.hidden_size,
         intermediate_dimensions: args.moe_intermediate_size,
         gate_up_quantization: args
@@ -264,12 +264,13 @@ pub(crate) fn v3_spec(args: &V3Args, layer: usize) -> CachedSwiGluBankSpec {
         down_quantization: args
             .linear_format_for(&format!("{root}.down_proj"))
             .weight_quantization(),
-        activation: eredu_nn::GatedExpertActivation::Silu,
-        limit: None,
+        gate_up_bias: false,
+        down_bias: false,
+        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
     }
 }
 
-pub(crate) fn v4_spec(args: &V4Args, layer: usize) -> CachedSwiGluBankSpec {
+pub(crate) fn v4_spec(args: &V4Args, layer: usize) -> CachedGatedProductBankSpec {
     let root = if layer < args.num_hidden_layers as usize {
         format!("layers.{layer}.ffn.switch_mlp")
     } else {
@@ -278,7 +279,7 @@ pub(crate) fn v4_spec(args: &V4Args, layer: usize) -> CachedSwiGluBankSpec {
             layer - args.num_hidden_layers as usize
         )
     };
-    CachedSwiGluBankSpec {
+    CachedGatedProductBankSpec {
         hidden_dimensions: args.hidden_size,
         intermediate_dimensions: args.moe_intermediate_size,
         gate_up_quantization: args
@@ -287,7 +288,8 @@ pub(crate) fn v4_spec(args: &V4Args, layer: usize) -> CachedSwiGluBankSpec {
         down_quantization: args
             .linear_format_for(&format!("{root}.down_proj"))
             .weight_quantization(),
-        activation: eredu_nn::GatedExpertActivation::Silu,
-        limit: args.swiglu_limit.map(|limit| limit.get()),
+        gate_up_bias: false,
+        down_bias: false,
+        policy: args.swiglu_limit.unwrap_or_default(),
     }
 }

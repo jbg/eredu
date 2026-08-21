@@ -69,7 +69,12 @@ pub use execution::{
     ExecutionGroupSchedule, ExecutionGroupSpec, ExecutionScheduleError, ExecutionUnitAddress,
     ExecutionUnitLayout, ExecutionUnitLayoutError, ReadyGroupState,
 };
-pub use expert::{ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest};
+pub use expert::{
+    combine_routed_expert_tensor_parallel, combine_tensor_parallel_expert_outputs,
+    reduce_routed_expert_tensor_parallel, reduce_tensor_parallel_expert_output,
+    ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
+    RoutedExpertTensorParallelOutput,
+};
 pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,
     PenaltyConfig, Sampler, SamplingBackend, SamplingConfigurationError, SpeculativeSampler,

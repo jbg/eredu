@@ -7,14 +7,15 @@ use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::cache::LayerCachePolicy;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{
-    AttentionCache, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator, LinearSpec,
-    NeuralBackend, NormalizationOperator, NormalizationSpec, ParameterSpec, RotaryOperator,
-    RotaryPosition, RotarySpec, RotarySubspace, SwiGluLimit, Tensor,
+    AttentionCache, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error, GatedProductPolicy,
+    Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec,
+    Parameter, ParameterSpec, RotaryOperator, RotaryPosition, RotarySpec, RotarySubspace, Tensor,
 };
 use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, partitioned_projection_group,
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, MemberSharding, ParallelPlanError,
-    ParameterGroupSpec, ParameterRole, ProjectionSharding, StateLayout,
+    aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
+    partitioned_projection_group, LayerRuntimeState, LayeredArchitecture, LayeredForwardState,
+    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole, ProjectionSharding,
+    StateLayout,
 };
 
 /// Geometry and policy required by the shared decoder mechanics.
@@ -45,14 +46,18 @@ pub trait Config: 'static {
     fn vocabulary_size(&self) -> i32;
     /// Whether one attention projection owns a learned bias.
     fn attention_bias(&self, projection: AttentionProjection) -> bool;
+    /// Whether each attention layer owns one learned logit per query head.
+    fn learned_attention_sinks(&self) -> bool {
+        false
+    }
     /// Optional per-head Q/K RMS-normalization epsilon.
     fn query_key_norm_epsilon(&self) -> Option<f32> {
         None
     }
     /// Whether projections own MLP biases.
     fn mlp_bias(&self) -> bool;
-    /// Optional bound applied before each dense SwiGLU product.
-    fn swiglu_limit(&self) -> Option<SwiGluLimit> {
+    /// Optional equation policy applied by each dense gated product.
+    fn gated_product_policy(&self) -> Option<GatedProductPolicy> {
         None
     }
     /// Whether the language-model head is tied to input embeddings.
@@ -228,6 +233,8 @@ pub struct Attention<B: NeuralBackend> {
     pub value: B::Linear,
     /// Output projection.
     pub output: B::Linear,
+    /// Optional learned logit participating in attention softmax for each query head.
+    pub sinks: Option<Parameter<B::Tensor>>,
     /// Optional per-head query normalization.
     pub query_norm: Option<B::Normalization>,
     /// Optional per-head key normalization.
@@ -348,6 +355,7 @@ impl<B: NeuralBackend> Attention<B> {
             key,
             value,
             output,
+            sinks: None,
             query_norm,
             key_norm,
             rotary,
@@ -417,6 +425,17 @@ impl<B: NeuralBackend> Attention<B> {
                 hidden,
                 config.attention_bias(AttentionProjection::Output),
             )?,
+            sinks: config
+                .learned_attention_sinks()
+                .then(|| {
+                    Parameter::unloaded(
+                        ParameterSpec::trainable(format!("{prefix}.sinks"))
+                            .map_err(Error::backend)?,
+                        &[query_heads],
+                        context,
+                    )
+                })
+                .transpose()?,
             query_norm: config
                 .query_key_norm_epsilon()
                 .map(|epsilon| {
@@ -557,18 +576,37 @@ impl<B: NeuralBackend> Attention<B> {
             Some(cache) => cache.update_for_attention(keys, values, context)?,
             None => (keys, values),
         };
+        let sinks = self.sinks.as_ref().map(Parameter::as_ref);
         if let Some(window) = self
             .sliding_window
             .filter(|_| allow_sliding_prefill && sequence > 1)
         {
-            return B::sliding_window_attention(
-                queries, keys, values, self.scale, window, offset, context,
+            return B::sliding_window_attention_with_sinks(
+                AttentionRequest {
+                    queries,
+                    keys,
+                    values,
+                    scale: self.scale,
+                    mask,
+                    sinks,
+                },
+                window,
+                offset,
+                context,
             );
         }
+        let request = AttentionRequest {
+            queries,
+            keys,
+            values,
+            scale: self.scale,
+            mask,
+            sinks,
+        };
         let attended = if let Some(cache) = cache {
-            cache.attention(queries, keys, values, self.scale, mask, context)?
+            cache.attention(request, context)?
         } else {
-            B::attention(queries, keys, values, self.scale, mask, context)?
+            B::attention_with_sinks(request, context)?
         };
         let attended = attended
             .transpose_axes(&[0, 2, 1, 3], context)?
@@ -627,7 +665,7 @@ pub struct Mlp<B: NeuralBackend> {
     pub down: B::Linear,
     /// Optional shared pre-activation bound.
     #[parameter(skip)]
-    pub limit: Option<SwiGluLimit>,
+    pub limit: Option<GatedProductPolicy>,
 }
 
 impl<B: NeuralBackend> Mlp<B> {
@@ -668,7 +706,7 @@ impl<B: NeuralBackend> Mlp<B> {
                 config.intermediate_size(),
                 config.hidden_size(),
             )?,
-            limit: config.swiglu_limit(),
+            limit: config.gated_product_policy(),
         })
     }
 
@@ -679,7 +717,7 @@ impl<B: NeuralBackend> Mlp<B> {
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(input, context)?;
         let up = self.up.forward(input, context)?;
-        B::swiglu(gate, up, self.limit, context)
+        B::gated_product(gate, up, self.limit.unwrap_or_default(), context)
     }
 
     fn forward(
@@ -971,6 +1009,22 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
         |_, _| Ok(MemberSharding::Replicated),
     )?;
     let mut groups = vec![attention];
+    if let Some(sinks) = &block.self_attention.sinks {
+        groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
+            format!("{prefix}.self_attn.sinks"),
+            ParameterRole::AttentionHeads,
+            query_heads,
+            sinks,
+            |_, shape| {
+                if shape != [query_heads] {
+                    return Err(ParallelPlanError::InvalidTensor(format!(
+                        "decoder attention sinks have shape {shape:?}, expected [{query_heads}]"
+                    )));
+                }
+                Ok(MemberSharding::Partitioned { axis: 0 })
+            },
+        )?);
+    }
     if let Some(norm) = &block.self_attention.query_norm {
         groups.push(module_parameter_group::<B::Tensor, _>(
             format!("{prefix}.self_attn.q_norm"),
@@ -1798,9 +1852,11 @@ where
             Some(mask.clone())
         } else if sequence > 1 {
             let cache = state.layer(0).map_err(Error::backend)?;
-            let window = cache.max_size();
-            let offset = window.map_or(cache.offset(), |window| cache.offset().min(window));
-            Some(B::causal_mask(sequence, offset, window, context)?)
+            // The shared mask is consumed by full-attention layers. Sliding
+            // layers use their typed window-aware attention path, so deriving
+            // this mask from layer zero's retention policy would incorrectly
+            // impose that window on later full-attention layers.
+            Some(B::causal_mask(sequence, cache.offset(), None, context)?)
         } else {
             None
         };

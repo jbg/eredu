@@ -120,7 +120,7 @@ fn reads_one_reshaped_contiguous_span_from_a_dense_bank() {
 }
 
 #[test]
-fn dense_span_type_rejects_packed_and_out_of_bounds_sources() {
+fn contiguous_span_requires_valid_payload_bounds_and_native_block_alignment() {
     let dense = TensorDescriptor {
         name: "dense.weight".into(),
         dimensions: vec![4, 3, 2],
@@ -147,9 +147,15 @@ fn dense_span_type_rejects_packed_and_out_of_bounds_sources() {
         data_offset: 128,
         byte_len: 36,
     };
-    let error = DenseTensorSpanPlan::new(&packed, DenseTensorSpan::new(0, vec![1, 32]).unwrap())
-        .unwrap_err();
-    assert!(error.to_string().contains("unquantized F32, F16, or BF16"));
+    let packed_plan =
+        DenseTensorSpanPlan::new(&packed, DenseTensorSpan::new(0, vec![1, 32]).unwrap()).unwrap();
+    assert_eq!(packed_plan.encoded_byte_len(), 18);
+    assert!(
+        DenseTensorSpanPlan::new(&packed, DenseTensorSpan::new(1, vec![1, 32]).unwrap()).is_err()
+    );
+    assert!(
+        DenseTensorSpanPlan::new(&packed, DenseTensorSpan::new(0, vec![1, 16]).unwrap()).is_err()
+    );
     assert!(DenseTensorSpan::new(0, vec![]).is_err());
     assert!(DenseTensorSpan::new(0, vec![1, 0, 4]).is_err());
 }

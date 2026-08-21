@@ -20,7 +20,7 @@ pub use config::{
     FeedForwardPolicy, GgufTensorCatalog, LayerCacheGeometry, LayerPolicy, ModelArgs,
     OperatorPolicy, RopeConfig,
 };
-pub use moe::{DenseSwiGlu, FeedForward, RoutedSwiGlu};
+pub use moe::{DenseSwiGlu, FeedForward, RoutedGatedProduct};
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_geometry, local_state_geometry,
     static_parallel_parameter_groups,

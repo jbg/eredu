@@ -9,7 +9,7 @@ mod model;
 mod mtp;
 mod parallel;
 
-pub use block::{Block, FeedForward, SharedRoutedSwiGlu, TokenMixer};
+pub use block::{Block, FeedForward, SharedRoutedGatedProduct, TokenMixer};
 pub use checkpoint::{
     gguf_plan, qwen3_next_fused_recipes, safetensors_plan, translate_gguf_weight_name,
 };

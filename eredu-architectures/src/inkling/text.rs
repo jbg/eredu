@@ -2,12 +2,12 @@
 
 use eredu_core::AttentionPolicy;
 use eredu_nn::{
-    AttentionCache, AuxiliaryConvolutionState, CausalDepthwiseConvolution,
+    AttentionCache, AttentionRequest, AuxiliaryConvolutionState, CausalDepthwiseConvolution,
     CausalDepthwiseConvolutionSpec, ConvolutionActivation, EmbeddingOperator, EmbeddingSpec, Error,
-    GatedExpertActivation, JointExpertRoutingInput, LinearOperator, LinearSpec, NeuralBackend,
+    ExpertProjectionSpec, GatedProductExpertBankOperator, GatedProductExpertBankSpec,
+    GatedProductExpertLayout, JointExpertRoutingInput, LinearOperator, LinearSpec, NeuralBackend,
     NormalizationOperator, NormalizationSpec, Parameter, ParameterSpec, Parameterized,
-    RelativeAttentionInput, RoutedNeuralBackend, RoutingResult, SwiGluExpertBankOperator,
-    SwiGluExpertBankSpec, SwiGluExpertLayout, SwiGluExpertProjection, Tensor,
+    RelativeAttentionInput, RoutedNeuralBackend, RoutingResult, Tensor,
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
 
@@ -70,15 +70,10 @@ where
 
     fn attention(
         &mut self,
-        queries: T,
-        keys: T,
-        values: T,
-        scale: f32,
-        mask: Option<&T>,
+        request: AttentionRequest<'_, T>,
         context: &T::Context,
     ) -> Result<T, Error> {
-        self.attention
-            .attention(queries, keys, values, scale, mask, context)
+        self.attention.attention(request, context)
     }
 }
 
@@ -531,7 +526,7 @@ impl<B: NeuralBackend> DenseMlp<B> {
     ) -> Result<B::Tensor, Error> {
         let gate = self.gate.forward(hidden, context)?;
         let up = self.up.forward(hidden, context)?;
-        let hidden = B::swiglu(gate, up, None, context)?;
+        let hidden = B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
         self.down
             .forward(&hidden, context)?
             .multiply(self.global_scale.as_ref(), context)
@@ -548,7 +543,7 @@ impl<B: NeuralBackend> DenseMlp<B> {
     {
         let gate = self.gate.forward(hidden, context)?;
         let up = self.up.forward(hidden, context)?;
-        let hidden = B::swiglu(gate, up, None, context)?;
+        let hidden = B::gated_product(gate, up, eredu_nn::GatedProductPolicy::default(), context)?;
         B::row_parallel_linear(&mut self.down, &hidden, parallel, context)?
             .multiply(self.global_scale.as_ref(), context)
     }
@@ -573,9 +568,9 @@ pub struct SparseMlp<B: RoutedNeuralBackend> {
     /// Learned global route multiplier.
     pub global_scale: Parameter<B::Tensor>,
     /// Selectable routed experts.
-    pub routed_experts: B::SwiGluExpertBank,
+    pub routed_experts: B::GatedProductExpertBank,
     /// Always-on shared experts.
-    pub shared_experts: B::SwiGluExpertBank,
+    pub shared_experts: B::GatedProductExpertBank,
 }
 
 impl<B: RoutedNeuralBackend> SparseMlp<B> {
@@ -589,21 +584,22 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
         let bank = |field: &str, count| {
             let gate_up = format!("{prefix}.{field}.gate_up_proj");
             let down = format!("{prefix}.{field}.down_proj");
-            B::swiglu_expert_bank(
-                SwiGluExpertBankSpec {
+            B::gated_product_expert_bank(
+                GatedProductExpertBankSpec {
                     expert_count: count,
                     input_dimensions: args.hidden_size,
                     intermediate_dimensions: intermediate,
                     output_dimensions: args.hidden_size,
-                    activation: GatedExpertActivation::Silu,
-                    limit: None,
-                    layout: SwiGluExpertLayout::Packed {
-                        gate_up: SwiGluExpertProjection {
+                    policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+                    layout: GatedProductExpertLayout::Packed {
+                        gate_up: ExpertProjectionSpec {
                             weight: ParameterSpec::trainable(&gate_up).map_err(Error::backend)?,
+                            bias: None,
                             format: args.linear_format_for(&gate_up),
                         },
-                        down: SwiGluExpertProjection {
+                        down: ExpertProjectionSpec {
                             weight: ParameterSpec::trainable(&down).map_err(Error::backend)?,
+                            bias: None,
                             format: args.linear_format_for(&down),
                         },
                     },
@@ -710,13 +706,14 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
             },
             context,
         )?;
-        let routed = self.routed_experts.forward_routed(
+        let routed = self.routed_experts.forward_routed_tensor_parallel(
             hidden,
             &RoutingResult {
                 expert_ids: routes.routed_ids,
                 selected_scores: routes.routed_weights.clone(),
                 route_weights: routes.routed_weights,
             },
+            B::parallel_size(parallel),
             context,
         )?;
         let tokens = hidden.shape()[..hidden.shape().len() - 1]
@@ -729,16 +726,19 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
             context,
         )?
         .broadcast_to(&[tokens, self.shared_count], context)?;
-        let shared = self.shared_experts.forward_routed(
+        let shared = self.shared_experts.forward_routed_tensor_parallel(
             hidden,
             &RoutingResult {
                 expert_ids: shared_ids,
                 selected_scores: routes.shared_weights.clone(),
                 route_weights: routes.shared_weights,
             },
+            B::parallel_size(parallel),
             context,
         )?;
-        B::sum_parallel(routed.add(&shared, context)?, parallel, context)
+        let output =
+            eredu_runtime::combine_tensor_parallel_expert_outputs::<B>(routed, shared, context)?;
+        eredu_runtime::reduce_tensor_parallel_expert_output::<B>(output, parallel, context)
     }
 
     fn forward_with_provider<P>(
@@ -847,7 +847,7 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
             route_weights: routes.routed_weights,
         };
         let routed = provider
-            .forward_routed(
+            .forward_routed_tensor_parallel(
                 &mut self.routed_experts,
                 RoutedExpertRequest {
                     layer,
@@ -855,6 +855,7 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
                     routes: &routed_routes,
                     pass,
                 },
+                B::parallel_size(parallel),
                 context,
             )
             .map_err(Error::backend)?;
@@ -874,7 +875,7 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
             route_weights: routes.shared_weights,
         };
         let shared = provider
-            .forward_routed(
+            .forward_routed_tensor_parallel(
                 &mut self.shared_experts,
                 RoutedExpertRequest {
                     layer: shared_layer,
@@ -882,10 +883,13 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
                     routes: &shared_routes,
                     pass,
                 },
+                B::parallel_size(parallel),
                 context,
             )
             .map_err(Error::backend)?;
-        B::sum_parallel(routed.add(&shared, context)?, parallel, context)
+        let output =
+            eredu_runtime::combine_routed_expert_tensor_parallel::<B>(routed, shared, context)?;
+        eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
     }
 }
 
@@ -1383,15 +1387,7 @@ impl<T: Tensor> AttentionCache<T> for NoCache {
     fn update_for_attention(&mut self, _: T, _: T, _: &T::Context) -> Result<(T, T), Error> {
         unreachable!("stateless Inkling attention never updates NoCache")
     }
-    fn attention(
-        &mut self,
-        _: T,
-        _: T,
-        _: T,
-        _: f32,
-        _: Option<&T>,
-        _: &T::Context,
-    ) -> Result<T, Error> {
+    fn attention(&mut self, _: AttentionRequest<'_, T>, _: &T::Context) -> Result<T, Error> {
         unreachable!("stateless Inkling attention never calls NoCache")
     }
 }

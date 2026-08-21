@@ -7,7 +7,10 @@ use eredu_checkpoint::{
         ArtifactComponentSchema, ArtifactRole, ComponentId, ComponentParameterCatalog,
         CompositeArtifactError, CompositeArtifactSchema, ProjectorCompatibility,
     },
-    expert::{resolve_swiglu_expert_recipes, SwiGluExpertLayoutNames, SwiGluExpertRecipes},
+    expert::{
+        resolve_gated_product_expert_recipes, GatedProductExpertLayoutNames,
+        GatedProductExpertRecipes,
+    },
     recipe::RecipeCatalog,
     schema::{
         matrix_for_linear_format, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
@@ -807,12 +810,12 @@ fn local_with_root(root: &str, local: &str) -> String {
 pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     layer: usize,
-) -> Result<SwiGluExpertRecipes, String> {
+) -> Result<GatedProductExpertRecipes, String> {
     let root = format!("model.layers.{layer}.mlp.experts");
     let raw = format!("blk.{layer}");
-    resolve_swiglu_expert_recipes(
+    resolve_gated_product_expert_recipes(
         catalog,
-        &SwiGluExpertLayoutNames {
+        &GatedProductExpertLayoutNames {
             target_gate_up: format!("{root}.gate_up_proj"),
             target_down: format!("{root}.down_proj"),
             packed_gate_up: format!("{root}.gate_up_proj"),

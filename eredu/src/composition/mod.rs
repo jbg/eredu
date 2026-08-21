@@ -11,6 +11,8 @@ pub(crate) mod gemma4_expert;
 #[cfg(feature = "mlx-media")]
 pub(crate) mod gemma4_processor;
 #[cfg(feature = "mlx")]
+pub(crate) mod gpt_oss;
+#[cfg(feature = "mlx")]
 pub(crate) mod inkling;
 #[cfg(feature = "mlx")]
 pub(crate) mod inkling_expert;

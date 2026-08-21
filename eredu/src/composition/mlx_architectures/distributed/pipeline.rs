@@ -83,8 +83,8 @@ use crate::{
     },
     backend::mlx::runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
     backend::mlx::runtime::distributed::expert::{
-        dispatch_local_with, dispatch_replicated, dispatch_replicated_with, ExpertAssignment,
-        RoutingStatistics,
+        dispatch_local_with, dispatch_replicated_tensor_parallel, dispatch_replicated_with,
+        ExpertAssignment, RoutingStatistics,
     },
     backend::mlx::runtime::distributed::parallel::{
         ParallelBuildContext, ParallelExecutionContext,
@@ -108,9 +108,9 @@ use crate::{
     composition::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
     },
-    composition::mlx_architectures::gpt_oss::model as gpt_oss,
     composition::{
         gemma4::{Gemma4PipelineAdapter, Gemma4PipelineIngressState, Gemma4PipelineUnit},
+        gpt_oss as neutral_gpt_oss,
         inkling::{InklingPipelineAdapter, InklingPipelineIngressState, InklingPipelineUnit},
         kimi_linear::KimiLinearPipelineAdapter,
         lfm2::Lfm2PipelineAdapter,
@@ -132,6 +132,8 @@ use crate::{
     core::ParallelCoordinates,
     core::{MtpCapability, MtpCheckpointKind},
 };
+
+use eredu_architectures::gpt_oss;
 use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_core::MtpStats;
 use eredu_runtime::DenseDiskStreamReport;
@@ -274,8 +276,8 @@ impl_pipeline_quantization_adapter!(
     MlxModule<eredu_architectures::nemotron_h::Unit<MlxBackend>>
 );
 impl_pipeline_quantization_adapter!(
-    crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter,
-    gpt_oss::TransformerBlock
+    crate::composition::gpt_oss::GptOssParallelComposition,
+    MlxModule<eredu_architectures::gpt_oss::TransformerBlock<MlxBackend>>
 );
 
 fn quantize_pipeline_stage_store<A: PipelineQuantizationAdapter>(
@@ -1323,21 +1325,17 @@ impl eredu_nn::AttentionCache<Array> for PipelineHybridLayerState<'_> {
 
     fn attention(
         &mut self,
-        queries: Array,
-        keys: Array,
-        values: Array,
-        scale: f32,
-        mask: Option<&Array>,
+        request: eredu_nn::AttentionRequest<'_, Array>,
         stream: &Stream,
     ) -> Result<Array, eredu_nn::Error> {
         match self.0 {
             PipelineLayerCache::KeyValue { cache, .. } => match cache {
-                PipelineKeyValueCache::Standard(cache) => eredu_nn::AttentionCache::attention(
-                    cache, queries, keys, values, scale, mask, stream,
-                ),
-                PipelineKeyValueCache::Paged(cache) => eredu_nn::AttentionCache::attention(
-                    cache, queries, keys, values, scale, mask, stream,
-                ),
+                PipelineKeyValueCache::Standard(cache) => {
+                    eredu_nn::AttentionCache::attention(cache, request, stream)
+                }
+                PipelineKeyValueCache::Paged(cache) => {
+                    eredu_nn::AttentionCache::attention(cache, request, stream)
+                }
             },
             _ => Err(eredu_nn::Error::backend(
                 "fixed-state hybrid pipeline layer has no attention cache",
@@ -1391,6 +1389,12 @@ type QwenStage = NeutralDecoderStage<
     eredu_architectures::qwen::ModelArgs,
     crate::composition::qwen::QwenParallelComposition,
     MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>,
+>;
+
+type NeutralGptOssStage = NeutralDecoderStage<
+    eredu_architectures::gpt_oss::ModelArgs,
+    crate::composition::gpt_oss::GptOssParallelComposition,
+    MlxModule<eredu_architectures::gpt_oss::TransformerBlock<MlxBackend>>,
 >;
 
 type NeutralV3Architecture = eredu_architectures::deepseek::v3::Model<MlxBackend>;
@@ -1504,25 +1508,6 @@ struct NeutralQwenConditionalStage {
     parallel_geometry: Option<Vec<eredu_architectures::qwen::hybrid::HybridStateGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
     expert_storage: PipelineExpertStorage,
-    routing_statistics: RoutingStatistics,
-}
-
-struct GptOssStage {
-    args: gpt_oss::ModelArgs,
-    layer_adapter:
-        crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter,
-    range: Range<usize>,
-    embedding: Option<MaybeQuantized<nn::Embedding>>,
-    layers: Vec<gpt_oss::TransformerBlock>,
-    dense_layers: Option<PipelineLayerStorage>,
-    norm: Option<nn::RmsNorm>,
-    lm_head: Option<MaybeQuantized<nn::Linear>>,
-    parallel_embedding: Option<crate::backend::mlx::nn::parallel::VocabParallelEmbedding>,
-    parallel_lm_head: Option<crate::backend::mlx::nn::parallel::VocabParallelLmHead>,
-    parallel_layout: Option<eredu_runtime::LocalModelLayout>,
-    parallel_kv_heads: Option<Vec<i32>>,
-    expert_assignment: Option<ExpertAssignment>,
-    expert_cache: Option<ExpertCache>,
     routing_statistics: RoutingStatistics,
 }
 
@@ -5148,19 +5133,21 @@ where
                        routed_hidden: &Array,
                        ids: &Array,
                        weights: &Array,
+                       partitions: usize,
                        route_stream: &Stream| {
-        let returned = dispatch_replicated(
+        let returned = dispatch_replicated_tensor_parallel(
             routed_hidden,
             ids,
             weights,
             assignment,
             bank,
             group,
+            partitions,
             route_stream,
         )
         .map_err(|error| Exception::custom(error.to_string()))?;
         statistics.accumulate(&returned.statistics);
-        Ok(returned.reduced_output)
+        Ok(returned.output)
     };
     let mut provider =
         crate::backend::mlx::runtime::residency::expert_provider::ResidentExpertExecutorProvider::new(&mut execute);
@@ -6733,7 +6720,7 @@ impl PipelineStageSemantics for NeutralQwenConditionalStage {
     }
 }
 
-impl PipelineStageSemantics for GptOssStage {
+impl PipelineStageSemantics for NeutralGptOssStage {
     fn model_kind(&self) -> ModelKind {
         ModelKind::GptOss
     }
@@ -6806,7 +6793,7 @@ impl PipelineStageSemantics for GptOssStage {
         if self.expert_cache.is_some() {
             self.forward_external_experts(input, step, mask, cache, None, stream)
         } else {
-            GptOssStage::forward(self, input, step, mask, cache, stream)
+            NeutralGptOssStage::forward(self, input, step, mask, cache, stream)
         }
     }
 
@@ -10595,12 +10582,9 @@ pub(crate) fn load_pipeline_model_with_options(
             }
             crate::core::GgufArchitecture::GptOss => {
                 let prepared =
-                    gpt_oss::prepare_gguf_checkpoint(&checkpoint, &metadata, weights_stream)?;
+                    neutral_gpt_oss::prepare_gpt_oss_gguf_checkpoint(&checkpoint, &metadata)?;
                 let gguf_plan =
-                    crate::composition::mlx_architectures::gpt_oss::checkpoint::gguf_plan(
-                        &prepared.args,
-                    )
-                    .map_err(Error::UnsupportedArchitecture)?;
+                    gpt_oss::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                     checkpoint,
                     &gguf_plan,
@@ -10995,7 +10979,7 @@ pub(crate) fn load_pipeline_model_with_options(
         }
         Some("gpt_oss") => {
             load_gpt_oss_pipeline(
-                gpt_oss::get_model_args(model_dir)?,
+                neutral_gpt_oss::load_model_args(model_dir)?,
                 store,
                 topology,
                 options.quantization,
@@ -14525,7 +14509,7 @@ fn execute_pipeline_cached_neutral_deepseek_v4(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_neutral_deepseek(
-    spec: crate::backend::mlx::runtime::residency::expert_provider::CachedSwiGluBankSpec,
+    spec: crate::backend::mlx::runtime::residency::expert_provider::CachedGatedProductBankSpec,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -14540,7 +14524,7 @@ fn execute_pipeline_cached_neutral_deepseek(
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        crate::backend::mlx::runtime::residency::expert_provider::execute_cached_swiglu_dispatched(
+        crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
             cache,
             spec,
             global_layer,
@@ -14636,7 +14620,7 @@ fn execute_pipeline_cached_neutral_qwen_hybrid(
     let spec = crate::composition::qwen::hybrid::cached_expert_spec(args, global_layer);
     let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        crate::backend::mlx::runtime::residency::expert_provider::execute_cached_swiglu_dispatched(
+        crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
             cache,
             spec,
             global_layer,
@@ -14751,49 +14735,87 @@ fn execute_pipeline_cached_nemotron_h(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_pipeline_cached_gpt_oss(
-    args: &gpt_oss::ModelArgs,
-    global_layer: usize,
+fn execute_gpt_oss_pipeline_layer<C>(
+    block: &mut MlxModule<gpt_oss::TransformerBlock<MlxBackend>>,
     hidden: &Array,
-    expert_ids: &Array,
-    weights: &Array,
+    mask: Option<&Array>,
+    cache: &mut C,
+    args: &gpt_oss::ModelArgs,
+    layout: Option<&eredu_runtime::LocalModelLayout>,
+    global_layer: usize,
     pass: ExpertPass,
-    cache: &ExpertCache,
-    assignment: &ExpertAssignment,
+    assignment: Option<&ExpertAssignment>,
+    expert_cache: Option<&ExpertCache>,
     expert_group: Option<&Group>,
     tensor_group: Option<&Group>,
     statistics: &mut RoutingStatistics,
     stream: &Stream,
-) -> Result<Array, Error> {
+) -> Result<Array, Error>
+where
+    C: KeyValueCache + eredu_nn::AttentionCache<Array>,
+{
+    let input = gpt_oss::AttentionInput {
+        hidden,
+        mask,
+        cache: Some(cache),
+        allow_sliding_prefill: false,
+        rotary_position: None,
+    };
+    let Some(assignment) = assignment else {
+        let mut provider = eredu_runtime::ResidentExpertProvider;
+        return match tensor_group {
+            Some(group) => gpt_oss::block::forward_parallel_with_provider(
+                block.as_mut(),
+                input,
+                pass,
+                group,
+                &mut provider,
+                stream,
+            ),
+            None => gpt_oss::block::forward_with_provider(
+                block.as_mut(),
+                input,
+                pass,
+                &mut provider,
+                stream,
+            ),
+        }
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()));
+    };
+    let expert_cache = expert_cache.ok_or_else(|| {
+        Error::Parallel("GPT-OSS pipeline expert assignment has no external cache".into())
+    })?;
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let tensor_parallel_size = tensor_group.map_or(1, Group::size);
-    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
-                   stream: &Stream| {
-        super::expert::execute_cached_gpt_oss_at(
-            args,
-            global_layer,
-            routes,
-            pass,
-            cache,
-            tensor_parallel_size,
-            stream,
-        )
+    let local_args = match layout {
+        Some(layout) => gpt_oss::local_block_args(args, global_layer, layout)
+            .map_err(|error| Error::Parallel(error.to_string()))?,
+        None => args.clone(),
     };
-    let returned = match expert_group {
-        Some(group) => dispatch_replicated_with(
-            hidden, expert_ids, weights, assignment, group, stream, execute,
-        )?,
-        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
-    };
-    statistics.accumulate(&returned.statistics);
+    let mut provider = neutral_gpt_oss::expert::distributed_provider(
+        &local_args,
+        assignment,
+        expert_group,
+        expert_cache,
+        statistics,
+    );
     match tensor_group {
-        Some(group) => Ok(distributed::all_sum(
-            &returned.reduced_output,
+        Some(group) => gpt_oss::block::forward_parallel_with_provider(
+            block.as_mut(),
+            input,
+            pass,
             group,
+            &mut provider,
             stream,
-        )?),
-        None => Ok(returned.reduced_output),
+        ),
+        None => gpt_oss::block::forward_with_provider(
+            block.as_mut(),
+            input,
+            pass,
+            &mut provider,
+            stream,
+        ),
     }
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14810,15 +14832,12 @@ fn load_gpt_oss_pipeline(
     let expert_cache_options = expert_cache_options
         .or_else(|| (topology.expert_parallel_size > 1).then(ExpertCacheLoadOptions::default));
     let binding_adapter = if expert_cache_options.is_some() {
-        crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new_external_experts(
+        neutral_gpt_oss::GptOssParallelComposition::new_external_experts(
             source_args.clone(),
             stream,
         )?
     } else {
-        crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new(
-            source_args.clone(),
-            stream,
-        )?
+        neutral_gpt_oss::GptOssParallelComposition::new(source_args.clone(), stream)?
     };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
@@ -14827,12 +14846,6 @@ fn load_gpt_oss_pipeline(
             .as_ref()
             .map(ExpertAssignment::global_expert_count),
     )?;
-    if requested_quantization.is_some_and(|value| value != WeightQuantization::MxFp4) {
-        return Err(Error::Quantization(
-            "GPT-OSS native MXFP4 experts cannot be implicitly dequantized and requantized to affine"
-                .into(),
-        ));
-    }
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -14849,17 +14862,16 @@ fn load_gpt_oss_pipeline(
         target_args.quantization = Some(quantization);
         target_args.quantized_weight_configs = None;
     }
-    let expert_quantization = quantize_on_load;
+    // Native expert banks remain checkpoint MXFP4. A load-time request applies
+    // only to ordinary dense matrices selected by the neutral block schema.
+    let expert_quantization = None;
     let target_binding_adapter = if expert_cache_options.is_some() {
-        crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new_external_experts(
+        neutral_gpt_oss::GptOssParallelComposition::new_external_experts(
             target_args.clone(),
             stream,
         )?
     } else {
-        crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new(
-            target_args.clone(),
-            stream,
-        )?
+        neutral_gpt_oss::GptOssParallelComposition::new(target_args.clone(), stream)?
     };
     let range = topology.layer_range(source_args.attention_schedule.len())?;
     let mut info = base_info(
@@ -14869,7 +14881,7 @@ fn load_gpt_oss_pipeline(
         ModelKind::GptOss,
         source_args.hidden_size,
     );
-    let mut stage = GptOssStage::new(
+    let mut stage = NeutralGptOssStage::new(
         target_args.clone(),
         range,
         &info,
@@ -15116,7 +15128,7 @@ fn load_gpt_oss_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if let Some(options) = expert_cache_options {
-        let entries = crate::composition::mlx_architectures::gpt_oss::layerwise::gpt_oss_expert_catalog_cartesian(
+        let entries = neutral_gpt_oss::expert::expert_catalog_cartesian(
             &source_args,
             store.as_ref(),
             parallel_layout.as_ref(),
@@ -15150,7 +15162,7 @@ fn load_gpt_oss_pipeline(
     PipelineModel::from_adapter(topology, info, PipelineStage(stage))
 }
 
-impl GptOssStage {
+impl NeutralGptOssStage {
     fn new(
         args: gpt_oss::ModelArgs,
         range: Range<usize>,
@@ -15159,15 +15171,9 @@ impl GptOssStage {
         stream: &Stream,
     ) -> Result<Self, Error> {
         let layer_adapter = if external_experts {
-            crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new_external_experts(
-                args.clone(),
-                stream,
-            )?
+            neutral_gpt_oss::GptOssParallelComposition::new_external_experts(args.clone(), stream)?
         } else {
-            crate::composition::mlx_architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new(
-                args.clone(),
-                stream,
-            )?
+            neutral_gpt_oss::GptOssParallelComposition::new(args.clone(), stream)?
         };
         let embedding = info
             .is_first
@@ -15182,7 +15188,11 @@ impl GptOssStage {
             .transpose()?;
         let layers = range
             .clone()
-            .map(|layer| gpt_oss::TransformerBlock::new(&args, layer, stream))
+            .map(|layer| {
+                gpt_oss::new_block::<MlxBackend>(&args, layer, stream)
+                    .map(MlxModule::new)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let norm = info
             .is_last
@@ -15207,11 +15217,13 @@ impl GptOssStage {
             layer_adapter,
             range,
             embedding,
+            output_embedding: None,
             layers,
             dense_layers: None,
             norm,
             lm_head,
             parallel_embedding: None,
+            parallel_output_embedding: None,
             parallel_lm_head: None,
             parallel_layout: None,
             parallel_kv_heads: None,
@@ -15258,7 +15270,11 @@ impl GptOssStage {
                 hidden,
                 stream,
             },
-            |global_layer, stream| Ok(gpt_oss::TransformerBlock::new(args, global_layer, stream)?),
+            |global_layer, stream| {
+                gpt_oss::new_block::<MlxBackend>(args, global_layer, stream)
+                    .map(MlxModule::new)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            },
             |global_layer, layer, hidden, cache, stream| {
                 let policy = *args
                     .attention_schedule
@@ -15293,12 +15309,50 @@ impl GptOssStage {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Standard(cache),
                         ..
-                    } if *cached == global_layer => Ok(layer.forward(hidden, mask, cache, stream)?),
+                    } if *cached == global_layer => execute_gpt_oss_pipeline_layer(
+                        layer,
+                        hidden,
+                        mask,
+                        cache,
+                        args,
+                        self.parallel_layout.as_ref(),
+                        global_layer,
+                        if step.sequence_length > 1 {
+                            ExpertPass::Prefill
+                        } else {
+                            ExpertPass::Decode
+                        },
+                        None,
+                        None,
+                        None,
+                        None,
+                        &mut self.routing_statistics,
+                        stream,
+                    ),
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Paged(cache),
                         ..
-                    } if *cached == global_layer => Ok(layer.forward(hidden, mask, cache, stream)?),
+                    } if *cached == global_layer => execute_gpt_oss_pipeline_layer(
+                        layer,
+                        hidden,
+                        mask,
+                        cache,
+                        args,
+                        self.parallel_layout.as_ref(),
+                        global_layer,
+                        if step.sequence_length > 1 {
+                            ExpertPass::Prefill
+                        } else {
+                            ExpertPass::Decode
+                        },
+                        None,
+                        None,
+                        None,
+                        None,
+                        &mut self.routing_statistics,
+                        stream,
+                    ),
                     _ => Err(Error::Parallel(format!(
                         "GPT-OSS stage cache does not match global layer {global_layer}"
                     ))),
@@ -15332,13 +15386,6 @@ impl GptOssStage {
             Error::Parallel("GPT-OSS PP+EP stage has no rank-local expert assignment".into())
         })?;
         validate_pipeline_expert_dispatch(assignment, group, self.expert_cache.is_some())?;
-        let resident_group = if self.expert_cache.is_none() {
-            Some(group.ok_or_else(|| {
-                Error::Parallel("resident GPT-OSS pipeline experts require an EP group".into())
-            })?)
-        } else {
-            None
-        };
         validate_scheduled_pipeline_kv_cache(
             "GPT-OSS PP+EP",
             self.range.clone(),
@@ -15421,78 +15468,42 @@ impl GptOssStage {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Standard(cache),
                         ..
-                    } if *cached == global_layer => match expert_cache {
-                        Some(expert_cache) => layer.forward_with_expert_executor(
-                            hidden,
-                            mask,
-                            cache,
-                            stream,
-                            |hidden, ids, weights, stream| {
-                                execute_pipeline_cached_gpt_oss(
-                                    &args,
-                                    global_layer,
-                                    hidden,
-                                    ids,
-                                    weights,
-                                    pass,
-                                    expert_cache,
-                                    &expert_assignment,
-                                    group,
-                                    None,
-                                    &mut self.routing_statistics,
-                                    stream,
-                                )
-                                .map_err(|error| Exception::custom(error.to_string()))
-                            },
-                        )?,
-                        None => layer.forward_expert_parallel(
-                            hidden,
-                            mask,
-                            cache,
-                            &expert_assignment,
-                            resident_group.expect("validated resident EP group"),
-                            &mut self.routing_statistics,
-                            stream,
-                        )?,
-                    },
+                    } if *cached == global_layer => execute_gpt_oss_pipeline_layer(
+                        layer,
+                        hidden,
+                        mask,
+                        cache,
+                        &args,
+                        parallel_layout.as_ref(),
+                        global_layer,
+                        pass,
+                        Some(&expert_assignment),
+                        expert_cache,
+                        group,
+                        None,
+                        &mut self.routing_statistics,
+                        stream,
+                    )?,
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Paged(cache),
                         ..
-                    } if *cached == global_layer => match expert_cache {
-                        Some(expert_cache) => layer.forward_with_expert_executor(
-                            hidden,
-                            mask,
-                            cache,
-                            stream,
-                            |hidden, ids, weights, stream| {
-                                execute_pipeline_cached_gpt_oss(
-                                    &args,
-                                    global_layer,
-                                    hidden,
-                                    ids,
-                                    weights,
-                                    pass,
-                                    expert_cache,
-                                    &expert_assignment,
-                                    group,
-                                    None,
-                                    &mut self.routing_statistics,
-                                    stream,
-                                )
-                                .map_err(|error| Exception::custom(error.to_string()))
-                            },
-                        )?,
-                        None => layer.forward_expert_parallel(
-                            hidden,
-                            mask,
-                            cache,
-                            &expert_assignment,
-                            resident_group.expect("validated resident EP group"),
-                            &mut self.routing_statistics,
-                            stream,
-                        )?,
-                    },
+                    } if *cached == global_layer => execute_gpt_oss_pipeline_layer(
+                        layer,
+                        hidden,
+                        mask,
+                        cache,
+                        &args,
+                        parallel_layout.as_ref(),
+                        global_layer,
+                        pass,
+                        Some(&expert_assignment),
+                        expert_cache,
+                        group,
+                        None,
+                        &mut self.routing_statistics,
+                        stream,
+                    )?,
                     _ => {
                         return Err(Error::Parallel(format!(
                             "GPT-OSS PP+EP cache does not match global layer {global_layer}"
@@ -15622,104 +15633,48 @@ impl GptOssStage {
                     })
                     .transpose()?;
                 let mask = explicit_mask.or(generated_mask.as_ref());
-                let forward_standard = |layer: &mut gpt_oss::TransformerBlock,
-                                        cache: &mut ConcatKeyValueCache,
-                                        statistics: &mut RoutingStatistics|
-                 -> Result<Array, Error> {
-                    match (expert_assignment.as_ref(), expert_cache) {
-                        (Some(assignment), Some(expert_cache)) => layer
-                            .forward_tensor_with_expert_executor(
-                                hidden,
-                                mask,
-                                cache,
-                                group,
-                                stream,
-                                |hidden, ids, weights, stream| {
-                                    execute_pipeline_cached_gpt_oss(
-                                        &args,
-                                        global_layer,
-                                        hidden,
-                                        ids,
-                                        weights,
-                                        pass,
-                                        expert_cache,
-                                        assignment,
-                                        expert_group,
-                                        Some(group),
-                                        statistics,
-                                        stream,
-                                    )
-                                    .map_err(|error| Exception::custom(error.to_string()))
-                                },
-                            )
-                            .map_err(Error::from),
-                        (Some(assignment), None) => layer
-                            .forward_tensor_expert_parallel(
-                                hidden,
-                                mask,
-                                cache,
-                                assignment,
-                                group,
-                                expert_group.expect("validated resident EP group"),
-                                statistics,
-                                stream,
-                            )
-                            .map_err(Error::from),
-                        (None, None) => layer
-                            .forward_tensor_parallel(hidden, mask, cache, group, stream)
-                            .map_err(Error::from),
-                        (None, Some(_)) => unreachable!("validated expert assignment"),
-                    }
-                };
-                let forward_paged = |layer: &mut gpt_oss::TransformerBlock,
-                                     cache: &mut PagedKeyValueCache,
-                                     statistics: &mut RoutingStatistics|
-                 -> Result<Array, Error> {
-                    match (expert_assignment.as_ref(), expert_cache) {
-                        (Some(assignment), Some(expert_cache)) => layer
-                            .forward_tensor_with_expert_executor(
-                                hidden,
-                                mask,
-                                cache,
-                                group,
-                                stream,
-                                |hidden, ids, weights, stream| {
-                                    execute_pipeline_cached_gpt_oss(
-                                        &args,
-                                        global_layer,
-                                        hidden,
-                                        ids,
-                                        weights,
-                                        pass,
-                                        expert_cache,
-                                        assignment,
-                                        expert_group,
-                                        Some(group),
-                                        statistics,
-                                        stream,
-                                    )
-                                    .map_err(|error| Exception::custom(error.to_string()))
-                                },
-                            )
-                            .map_err(Error::from),
-                        (Some(assignment), None) => layer
-                            .forward_tensor_expert_parallel(
-                                hidden,
-                                mask,
-                                cache,
-                                assignment,
-                                group,
-                                expert_group.expect("validated resident EP group"),
-                                statistics,
-                                stream,
-                            )
-                            .map_err(Error::from),
-                        (None, None) => layer
-                            .forward_tensor_parallel(hidden, mask, cache, group, stream)
-                            .map_err(Error::from),
-                        (None, Some(_)) => unreachable!("validated expert assignment"),
-                    }
-                };
+                let forward_standard =
+                    |layer: &mut MlxModule<gpt_oss::TransformerBlock<MlxBackend>>,
+                     cache: &mut ConcatKeyValueCache,
+                     statistics: &mut RoutingStatistics| {
+                        execute_gpt_oss_pipeline_layer(
+                            layer,
+                            hidden,
+                            mask,
+                            cache,
+                            &args,
+                            parallel_layout.as_ref(),
+                            global_layer,
+                            pass,
+                            expert_assignment.as_ref(),
+                            expert_cache,
+                            expert_group,
+                            Some(group),
+                            statistics,
+                            stream,
+                        )
+                    };
+                let forward_paged =
+                    |layer: &mut MlxModule<gpt_oss::TransformerBlock<MlxBackend>>,
+                     cache: &mut PagedKeyValueCache,
+                     statistics: &mut RoutingStatistics| {
+                        execute_gpt_oss_pipeline_layer(
+                            layer,
+                            hidden,
+                            mask,
+                            cache,
+                            &args,
+                            parallel_layout.as_ref(),
+                            global_layer,
+                            pass,
+                            expert_assignment.as_ref(),
+                            expert_cache,
+                            expert_group,
+                            Some(group),
+                            statistics,
+                            stream,
+                        )
+                    };
                 let forwarded = match cache {
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,

@@ -10,7 +10,7 @@ use std::{
 
 use eredu::{
     backend::mlx::error::Error,
-    backend::mlx::nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
+    backend::mlx::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
     backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
     backend::mlx::runtime::residency::expert_cache::{
         ExpertCache, ExpertCatalogEntry, ExpertRouteBatch,
@@ -101,9 +101,9 @@ fn relu2_bank(stream: &Stream) -> PackedRelu2Experts {
     bank
 }
 
-struct ScaledSwiGluExperts;
+struct ScaledGatedProductExperts;
 
-impl LocalExpertBank for ScaledSwiGluExperts {
+impl LocalExpertBank for ScaledGatedProductExperts {
     fn execute_local_routes(
         &mut self,
         hidden: &Array,
@@ -154,21 +154,22 @@ fn execute_cached_qwen_routes(
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
-            let mut bank = PackedSwiGluExperts {
-                activation: eredu_nn::GatedExpertActivation::Silu,
+            let mut bank = PackedGatedProductExperts {
+                policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
                 num_experts: acquired.identities().len() as i32,
                 hidden_dim: 1,
                 intermediate_dim: 1,
-                swiglu_limit: None,
                 gate_up_affine: None,
                 down_affine: None,
                 gate_up_iquant: None,
                 down_iquant: None,
                 native_fp8_e8m0: false,
                 gate_up_proj: Param::new(acquired.compact_binding("gate_up_proj", stream)?),
+                gate_up_proj_bias: Param::new(None),
                 gate_up_proj_scales: Param::new(None),
                 gate_up_proj_biases: Param::new(None),
                 down_proj: Param::new(acquired.compact_binding("down_proj", stream)?),
+                down_proj_bias: Param::new(None),
                 down_proj_scales: Param::new(None),
                 down_proj_biases: Param::new(None),
             };
@@ -291,7 +292,7 @@ fn expert_exchange_ring_worker() {
     assert_eq!(empty_dispatched.statistics.count_consensus_count, 1);
     assert_eq!(empty_dispatched.statistics.padding_routes, 0);
 
-    let mut scaled = ScaledSwiGluExperts;
+    let mut scaled = ScaledGatedProductExperts;
     let scaled_dispatched = dispatch_sharded(
         full_dispatch_blocks(expected_rank, &stream),
         &assignment,
@@ -323,21 +324,22 @@ fn expert_exchange_ring_worker() {
     let qwen_hidden = f32_array(&[1.0, 2.0], &[2, 1], &stream);
     let qwen_ids = i32_array(&[0, 1, 2, 3], &[2, 2], &stream);
     let qwen_weights = f32_array(&[0.25, 0.75, 0.4, 0.6], &[2, 2], &stream);
-    let mut full_qwen = PackedSwiGluExperts {
-        activation: eredu_nn::GatedExpertActivation::Silu,
+    let mut full_qwen = PackedGatedProductExperts {
+        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
         num_experts: 4,
         hidden_dim: 1,
         intermediate_dim: 1,
-        swiglu_limit: None,
         gate_up_affine: None,
         down_affine: None,
         gate_up_iquant: None,
         down_iquant: None,
         native_fp8_e8m0: false,
         gate_up_proj: Param::new(f32_array(&qwen_gate_up, &[4, 2, 1], &stream)),
+        gate_up_proj_bias: Param::new(None),
         gate_up_proj_scales: Param::new(None),
         gate_up_proj_biases: Param::new(None),
         down_proj: Param::new(f32_array(&qwen_down, &[4, 1, 1], &stream)),
+        down_proj_bias: Param::new(None),
         down_proj_scales: Param::new(None),
         down_proj_biases: Param::new(None),
     };

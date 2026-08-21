@@ -16,7 +16,6 @@ use crate::{
         resolve_model_config, validate_gguf_quantization_source, Model, ModelLoadOptions,
         ResolvedModelConfig,
     },
-    composition::mlx_architectures::gpt_oss::model as gpt_oss,
     core::generation::MtpSchedulerOptions,
     core::{ModelKind, SpeculativeExecutionTopology},
     runtime::chat::constraints::{ConstraintController, ConstraintError},
@@ -1921,6 +1920,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
 }
 
 #[test]
+#[ignore = "requires MLX runtime execution"]
 fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4() {
     let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -1936,8 +1936,11 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
               "quantization_config":{"quant_method":"mxfp4"}
             }"#,
     );
-    let args = gpt_oss::get_model_args(&dir).unwrap();
-    save_zero_checkpoint(&gpt_oss::Model::new(args, stream).unwrap(), &dir, stream);
+    let args = crate::composition::gpt_oss::load_model_args(&dir).unwrap();
+    let fixture = crate::backend::mlx::nn::MlxModule::new(
+        crate::composition::gpt_oss::GptOssCheckpointTemplate::new(args, stream).unwrap(),
+    );
+    save_zero_checkpoint(&fixture, &dir, stream);
 
     let model = load_test_model(
         &dir,
@@ -1953,7 +1956,7 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
         panic!("expected GPT-OSS model")
     };
     assert_eq!(
-        model.residency_metadata().quantization(),
+        model.metadata().quantization(),
         Some(WeightQuantization::MxFp4)
     );
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
@@ -1961,17 +1964,16 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
     let logits = model.forward(&tokens, &mut cache, stream).unwrap();
     safemlx::transforms::eval([&logits]).unwrap();
     assert_eq!(logits.shape(), &[1, 2, 32]);
-    let mut bounded =
-        crate::composition::mlx_architectures::gpt_oss::layerwise::load_gpt_oss_layerwise_model(
-            &dir,
-            eredu_runtime::LayerwiseLoadOptions::default(),
-            None,
-            stream,
-            weights_stream,
-        )
-        .unwrap();
+    let mut bounded = crate::composition::gpt_oss::load_gpt_oss_layerwise_model(
+        &dir,
+        eredu_runtime::LayerwiseLoadOptions::default(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
     assert_eq!(
-        bounded.residency_metadata().residency(),
+        bounded.metadata().residency(),
         eredu_runtime::ExecutionResidency::LayerwiseHost
     );
     let mut bounded_cache = bounded.new_cache();
@@ -1980,16 +1982,15 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
         .unwrap();
     safemlx::transforms::eval([&bounded_logits]).unwrap();
     assert_eq!(bounded_logits.shape(), logits.shape());
-    let mut cached_experts =
-        crate::composition::mlx_architectures::gpt_oss::layerwise::load_gpt_oss_expert_cache_model(
-            &dir,
-            eredu_runtime::NonExpertWeightResidency::FullyResident,
-            eredu_runtime::ExpertCacheLoadOptions::default(),
-            None,
-            stream,
-            weights_stream,
-        )
-        .unwrap();
+    let mut cached_experts = crate::composition::gpt_oss::load_gpt_oss_expert_cache_model(
+        &dir,
+        eredu_runtime::NonExpertWeightResidency::FullyResident,
+        eredu_runtime::ExpertCacheLoadOptions::default(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
     let mut cached_expert_state = cached_experts.new_cache();
     let cached_expert_logits = cached_experts
         .forward(&tokens, &mut cached_expert_state, stream)

@@ -7,8 +7,8 @@ use eredu_checkpoint::schema::{
 };
 use eredu_checkpoint::{
     expert::{
-        resolve_swiglu_expert_recipes, IndependentSwiGluExpertNames, SwiGluExpertLayoutNames,
-        SwiGluExpertRecipes,
+        resolve_gated_product_expert_recipes, GatedProductExpertLayoutNames,
+        GatedProductExpertRecipes, IndependentGatedProductExpertNames,
     },
     recipe::RecipeCatalog,
 };
@@ -428,7 +428,7 @@ pub fn v3_expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     args: &V3Args,
     layer: usize,
-) -> Result<SwiGluExpertRecipes, String> {
+) -> Result<GatedProductExpertRecipes, String> {
     let total = count(
         args.num_hidden_layers + args.num_nextn_predict_layers,
         "V3 layer count",
@@ -438,9 +438,9 @@ pub fn v3_expert_recipes<C: RecipeCatalog + ?Sized>(
     }
     let count = dimension(args.n_routed_experts, "expert count")?;
     let root = format!("model.layers.{layer}.mlp.experts");
-    resolve_swiglu_expert_recipes(
+    resolve_gated_product_expert_recipes(
         catalog,
-        &SwiGluExpertLayoutNames {
+        &GatedProductExpertLayoutNames {
             target_gate_up: format!("{root}.gate_up_proj"),
             target_down: format!("{root}.down_proj"),
             packed_gate_up: format!("{root}.gate_up_proj"),
@@ -449,7 +449,7 @@ pub fn v3_expert_recipes<C: RecipeCatalog + ?Sized>(
             separate_up: format!("{root}.up_proj"),
             separate_down: format!("{root}.down_proj"),
             independent: (0..count)
-                .map(|expert| IndependentSwiGluExpertNames {
+                .map(|expert| IndependentGatedProductExpertNames {
                     gate: format!("{root}.{expert}.gate_proj.weight"),
                     up: format!("{root}.{expert}.up_proj.weight"),
                     down: format!("{root}.{expert}.down_proj.weight"),
@@ -466,7 +466,7 @@ pub fn v4_expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     args: &V4Args,
     layer: usize,
-) -> Result<SwiGluExpertRecipes, String> {
+) -> Result<GatedProductExpertRecipes, String> {
     let target = count(args.num_hidden_layers, "V4 target layer count")?;
     let total = count(
         args.num_hidden_layers + args.num_nextn_predict_layers,
@@ -483,9 +483,9 @@ pub fn v4_expert_recipes<C: RecipeCatalog + ?Sized>(
     };
     let physical = format!("{block}.ffn");
     let target = format!("{physical}.switch_mlp");
-    resolve_swiglu_expert_recipes(
+    resolve_gated_product_expert_recipes(
         catalog,
-        &SwiGluExpertLayoutNames {
+        &GatedProductExpertLayoutNames {
             target_gate_up: format!("{target}.gate_up_proj"),
             target_down: format!("{target}.down_proj"),
             packed_gate_up: format!("{target}.gate_up_proj"),
@@ -494,7 +494,7 @@ pub fn v4_expert_recipes<C: RecipeCatalog + ?Sized>(
             separate_up: format!("{physical}.expert_banks.w3"),
             separate_down: format!("{physical}.expert_banks.w2"),
             independent: (0..count)
-                .map(|expert| IndependentSwiGluExpertNames {
+                .map(|expert| IndependentGatedProductExpertNames {
                     gate: format!("{physical}.experts.{expert}.w1.weight"),
                     up: format!("{physical}.experts.{expert}.w3.weight"),
                     down: format!("{physical}.experts.{expert}.w2.weight"),

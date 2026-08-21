@@ -1,27 +1,28 @@
 use std::{cell::Cell, collections::BTreeMap};
 
 use eredu_architectures::{
-    deepseek, gemma4, inkling, kimi_linear, lfm2, muse_glimmer, nemotron_h, qwen,
+    decoder, deepseek, gemma4, gpt_oss, inkling, kimi_linear, lfm2, muse_glimmer, nemotron_h, qwen,
 };
 use eredu_core::cache::{LayerCachePolicy, StateTensorRole};
 use eredu_nn::{
-    reference_gated_delta_scan, reference_selective_state_space_scan, AttentionCache,
-    AttentionMask, BlockwiseAttentionBackend, BlockwiseAttentionSpec, CausalDepthwiseConvolution,
-    CausalDepthwiseConvolutionSpec, CompressedAttentionBlock, CompressedAttentionCache,
-    CompressedAttentionScan, CompressedAttentionState, CompressedAttentionView,
-    ConvolutionActivation, EmbeddingOperator, EmbeddingSpec, Error, GatedDeltaScanInput,
-    GatedDeltaScanOutput, GatedShortConvolution, GatedShortConvolutionSpec, HyperConnection,
-    HyperConnectionOperator, HyperConnectionSpec, HyperConnectionState, HyperHead,
-    HyperHeadOperator, HyperHeadSpec, HyperNeuralBackend, Index, IndexedAttentionInput,
-    JointExpertRoutingInput, JointExpertRoutingResult, LinearOperator, LinearSpec,
-    LowRankProjection, LowRankProjectionSpec, NeuralBackend, NormalizationOperator,
-    NormalizationSpec, PadMode, ParameterMetadata, ParameterSpec, ParameterVisitor,
-    ParameterVisitorMut, Parameterized, PooledAttentionInput, PooledPositionInput,
-    PoolingAttentionCache, PoolingOverlap, PoolingWindows, RelativeAttentionInput,
-    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
-    RotarySubspace, RoutedNeuralBackend, RoutingOperator, RoutingResult,
-    SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, SwiGluExpertBankOperator,
-    SwiGluExpertBankSpec, SwiGluExpertLayout, Tensor, TopKRouterSpec, TopKRoutingSpec,
+    reference_gated_delta_scan, reference_selective_state_space_scan, validate_parameter_topology,
+    AttentionCache, AttentionMask, AttentionRequest, BlockwiseAttentionBackend,
+    BlockwiseAttentionSpec, CausalDepthwiseConvolution, CausalDepthwiseConvolutionSpec,
+    CompressedAttentionBlock, CompressedAttentionCache, CompressedAttentionScan,
+    CompressedAttentionState, CompressedAttentionView, ConvolutionActivation, EmbeddingOperator,
+    EmbeddingSpec, Error, GatedDeltaScanInput, GatedDeltaScanOutput,
+    GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
+    GatedShortConvolution, GatedShortConvolutionSpec, HyperConnection, HyperConnectionOperator,
+    HyperConnectionSpec, HyperConnectionState, HyperHead, HyperHeadOperator, HyperHeadSpec,
+    HyperNeuralBackend, Index, IndexedAttentionInput, JointExpertRoutingInput,
+    JointExpertRoutingResult, LinearOperator, LinearSpec, LowRankProjection, LowRankProjectionSpec,
+    NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode, ParameterMetadata,
+    ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized, PooledAttentionInput,
+    PooledPositionInput, PoolingAttentionCache, PoolingOverlap, PoolingWindows,
+    RelativeAttentionInput, Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator,
+    RotaryPosition, RotarySpec, RotarySubspace, RoutedNeuralBackend, RoutingOperator,
+    RoutingResult, SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
+    TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{
     DeviceState, LayerRuntimeState, ResidentRuntime, RuntimeLayerState, RuntimeStateComponents,
@@ -2222,17 +2223,34 @@ impl NeuralBackend for NumericBackend {
         })
     }
 
-    fn swiglu(
+    fn gated_product(
         gate: Self::Tensor,
         up: Self::Tensor,
-        limit: Option<eredu_nn::SwiGluLimit>,
+        policy: eredu_nn::GatedProductPolicy,
         _: &NumericContext,
     ) -> Result<Self::Tensor, Error> {
-        let gate = gate.map(|value| limit.map_or(value, |bound| value.min(bound.get())));
-        let up =
-            up.map(|value| limit.map_or(value, |bound| value.clamp(-bound.get(), bound.get())));
-        gate.map(|value| value / (1.0 + (-value).exp()))
-            .zip(&up, |left, right| left * right)
+        policy.validate()?;
+        let gate = gate.map(|value| {
+            policy
+                .gate_upper_bound()
+                .map_or(value, |bound| value.min(bound))
+        });
+        let up = up.map(|value| {
+            policy
+                .up_absolute_bound()
+                .map_or(value, |bound| value.clamp(-bound, bound))
+                + policy.up_offset()
+        });
+        let gate = match policy.activation() {
+            eredu_nn::GatedProductActivation::Silu => {
+                gate.map(|value| value / (1.0 + (-policy.sigmoid_multiplier() * value).exp()))
+            }
+            eredu_nn::GatedProductActivation::GeluApproximate => gate.map(|value| {
+                0.5 * value
+                    * (1.0 + (0.797_884_6 * (value + 0.044_715 * value * value * value)).tanh())
+            }),
+        };
+        gate.zip(&up, |left, right| left * right)
     }
 
     fn attention(
@@ -2441,15 +2459,44 @@ impl NeuralBackend for NumericBackend {
     }
 
     fn attention_with_sinks(
-        queries: NumericTensor,
-        keys: NumericTensor,
-        values: NumericTensor,
-        scale: f32,
-        mask: Option<&NumericTensor>,
-        sinks: Option<&NumericTensor>,
+        request: AttentionRequest<'_, NumericTensor>,
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
-        attention_with_sinks(&queries, &keys, &values, scale, mask, sinks)
+        request.validate()?;
+        attention_with_sinks(
+            &request.queries,
+            &request.keys,
+            &request.values,
+            request.scale,
+            request.mask,
+            request.sinks,
+        )
+    }
+
+    fn sliding_window_attention_with_sinks(
+        request: AttentionRequest<'_, NumericTensor>,
+        window: i32,
+        position_offset: i32,
+        context: &NumericContext,
+    ) -> Result<NumericTensor, Error> {
+        request.validate()?;
+        context
+            .sliding_attention_calls
+            .set(context.sliding_attention_calls.get() + 1);
+        let batch = request.queries.shape[0];
+        let sequence = request.queries.shape[2];
+        let attended = attention_with_sinks_windowed(
+            &request.queries,
+            &request.keys,
+            &request.values,
+            request.scale,
+            request.sinks,
+            window,
+            position_offset,
+        )?;
+        attended
+            .transpose_axes(&[0, 2, 1, 3], context)?
+            .reshape(&[batch, sequence, -1], context)
     }
 
     fn rms_norm_without_weight(
@@ -2813,14 +2860,17 @@ fn attention_with_sinks(
     if queries.shape.len() != 4
         || keys.shape.len() != 4
         || values.shape != keys.shape
-        || keys.shape[1] != 1
         || queries.shape[0] != keys.shape[0]
         || queries.shape[3] != keys.shape[3]
+        || keys.shape[1] <= 0
+        || queries.shape[1] % keys.shape[1] != 0
     {
         return Err(Error::backend("numeric sink-attention geometry mismatch"));
     }
     let batch = queries.shape[0] as usize;
     let heads = queries.shape[1] as usize;
+    let key_heads = keys.shape[1] as usize;
+    let groups = heads / key_heads;
     let query_tokens = queries.shape[2] as usize;
     let key_tokens = keys.shape[2] as usize;
     let dimensions = queries.shape[3] as usize;
@@ -2835,11 +2885,12 @@ fn attention_with_sinks(
     let mut output = NumericTensor::zeros(queries.shape.clone());
     for b in 0..batch {
         for head in 0..heads {
+            let key_head = head / groups;
             for query in 0..query_tokens {
                 let query_base = ((b * heads + head) * query_tokens + query) * dimensions;
                 let mut scores = (0..key_tokens)
                     .map(|key| {
-                        let key_base = (b * key_tokens + key) * dimensions;
+                        let key_base = ((b * key_heads + key_head) * key_tokens + key) * dimensions;
                         (0..dimensions)
                             .map(|dimension| {
                                 queries.data[query_base + dimension]
@@ -2861,7 +2912,9 @@ fn attention_with_sinks(
                     output.data[query_base + dimension] = (0..key_tokens)
                         .map(|key| {
                             weights[key]
-                                * values.data[(b * key_tokens + key) * dimensions + dimension]
+                                * values.data[((b * key_heads + key_head) * key_tokens + key)
+                                    * dimensions
+                                    + dimension]
                         })
                         .sum::<f32>()
                         / denominator;
@@ -2870,6 +2923,42 @@ fn attention_with_sinks(
         }
     }
     Ok(output)
+}
+
+fn attention_with_sinks_windowed(
+    queries: &NumericTensor,
+    keys: &NumericTensor,
+    values: &NumericTensor,
+    scale: f32,
+    sinks: Option<&NumericTensor>,
+    window: i32,
+    query_offset: i32,
+) -> Result<NumericTensor, Error> {
+    if window <= 0 || queries.shape.len() != 4 || keys.shape.len() != 4 {
+        return Err(Error::backend(
+            "numeric sliding sink-attention geometry mismatch",
+        ));
+    }
+    let query_tokens = queries.shape[2];
+    let key_tokens = keys.shape[2];
+    let key_offset = query_offset + query_tokens - key_tokens;
+    if key_offset < 0 {
+        return Err(Error::backend(
+            "numeric sliding attention key origin precedes position zero",
+        ));
+    }
+    let mut mask = NumericTensor::zeros(vec![query_tokens, key_tokens]);
+    for query in 0..query_tokens {
+        let absolute_query = query_offset + query;
+        let first_visible = (absolute_query - window + 1).max(0);
+        for key in 0..key_tokens {
+            let absolute_key = key_offset + key;
+            if absolute_key < first_visible || absolute_key > absolute_query {
+                mask.data[(query * key_tokens + key) as usize] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    attention_with_sinks(queries, keys, values, scale, Some(&mask), sinks)
 }
 
 fn pooled_attention(
@@ -3248,16 +3337,18 @@ impl RoutingOperator<NumericTensor> for NumericRouter {
 #[derive(Debug, Clone)]
 struct NumericExpert {
     gate: NumericTensor,
+    gate_bias: Option<NumericTensor>,
     up: NumericTensor,
+    up_bias: Option<NumericTensor>,
     down: NumericTensor,
+    down_bias: Option<NumericTensor>,
 }
 
 #[derive(Debug, Clone)]
 struct NumericExpertBank {
     experts: Vec<NumericExpert>,
     parameters: Vec<(NumericTensor, ParameterMetadata)>,
-    limit: Option<eredu_nn::SwiGluLimit>,
-    activation: eredu_nn::GatedExpertActivation,
+    policy: eredu_nn::GatedProductPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -3369,7 +3460,7 @@ impl Parameterized<NumericTensor> for NumericExpertBank {
     }
 }
 
-impl SwiGluExpertBankOperator<NumericTensor> for NumericExpertBank {
+impl GatedProductExpertBankOperator<NumericTensor> for NumericExpertBank {
     fn forward_routed(
         &mut self,
         input: &NumericTensor,
@@ -3397,21 +3488,29 @@ impl SwiGluExpertBankOperator<NumericTensor> for NumericExpertBank {
                     .experts
                     .get(expert_id)
                     .ok_or_else(|| Error::backend("numeric expert id is out of range"))?;
-                let gate = linear(&token_input, &expert.gate, None)?
-                    .map(|value| self.limit.map_or(value, |bound| value.min(bound.get())));
-                let gate = gate.map(|value| match self.activation {
-                    eredu_nn::GatedExpertActivation::Silu => value / (1.0 + (-value).exp()),
-                    eredu_nn::GatedExpertActivation::GeluApproximate => {
+                let gate =
+                    linear(&token_input, &expert.gate, expert.gate_bias.as_ref())?.map(|value| {
+                        self.policy
+                            .gate_upper_bound()
+                            .map_or(value, |bound| value.min(bound))
+                    });
+                let gate = gate.map(|value| match self.policy.activation() {
+                    eredu_nn::GatedProductActivation::Silu => {
+                        value / (1.0 + (-self.policy.sigmoid_multiplier() * value).exp())
+                    }
+                    eredu_nn::GatedProductActivation::GeluApproximate => {
                         0.5 * value
                             * (1.0 + (0.797_884_6 * (value + 0.044_715 * value.powi(3))).tanh())
                     }
                 });
-                let up = linear(&token_input, &expert.up, None)?.map(|value| {
-                    self.limit
-                        .map_or(value, |bound| value.clamp(-bound.get(), bound.get()))
+                let up = linear(&token_input, &expert.up, expert.up_bias.as_ref())?.map(|value| {
+                    self.policy
+                        .up_absolute_bound()
+                        .map_or(value, |bound| value.clamp(-bound, bound))
+                        + self.policy.up_offset()
                 });
                 let activated = gate.zip(&up, |left, right| left * right)?;
-                let expert_output = linear(&activated, &expert.down, None)?;
+                let expert_output = linear(&activated, &expert.down, expert.down_bias.as_ref())?;
                 let weight = routes.route_weights.data[route_index];
                 for dimension in 0..hidden {
                     output.data[token * hidden + dimension] +=
@@ -3490,7 +3589,7 @@ impl HyperNeuralBackend for NumericBackend {
 
 impl RoutedNeuralBackend for NumericBackend {
     type Router = NumericRouter;
-    type SwiGluExpertBank = NumericExpertBank;
+    type GatedProductExpertBank = NumericExpertBank;
     type Relu2ExpertBank = NumericRelu2ExpertBank;
 
     fn top_k_router(spec: TopKRouterSpec, context: &NumericContext) -> Result<Self::Router, Error> {
@@ -3501,7 +3600,7 @@ impl RoutedNeuralBackend for NumericBackend {
                 input: spec.input_dimensions,
                 output: routing.expert_count(),
                 weight: spec.weight,
-                bias: None,
+                bias: spec.bias,
                 format: spec.quantization.into(),
             },
             context,
@@ -3536,18 +3635,19 @@ impl RoutedNeuralBackend for NumericBackend {
         })
     }
 
-    fn swiglu_expert_bank(
-        spec: SwiGluExpertBankSpec,
+    fn gated_product_expert_bank(
+        spec: GatedProductExpertBankSpec,
         _: &NumericContext,
-    ) -> Result<Self::SwiGluExpertBank, Error> {
+    ) -> Result<Self::GatedProductExpertBank, Error> {
         spec.validate()?;
         let expert_count = spec.expert_count as usize;
         let hidden = spec.input_dimensions;
         let intermediate = spec.intermediate_dimensions;
+        let policy = spec.policy;
         let mut experts = Vec::with_capacity(expert_count);
         let mut parameters = Vec::new();
         match spec.layout {
-            SwiGluExpertLayout::Packed { gate_up, down } => {
+            GatedProductExpertLayout::Packed { gate_up, down } => {
                 let packed_gate_up = parameter(
                     &gate_up.weight,
                     vec![spec.expert_count, 2 * intermediate, hidden],
@@ -3558,6 +3658,13 @@ impl RoutedNeuralBackend for NumericBackend {
                     vec![spec.expert_count, spec.output_dimensions, intermediate],
                     false,
                 );
+                let packed_gate_up_bias = gate_up
+                    .bias
+                    .as_ref()
+                    .map(|bias| parameter(bias, vec![spec.expert_count, 2 * intermediate], false));
+                let packed_down_bias = down.bias.as_ref().map(|bias| {
+                    parameter(bias, vec![spec.expert_count, spec.output_dimensions], false)
+                });
                 let gate_up_per_expert = (2 * intermediate * hidden) as usize;
                 let projection_per_expert = (intermediate * hidden) as usize;
                 let down_per_expert = (spec.output_dimensions * intermediate) as usize;
@@ -3571,28 +3678,65 @@ impl RoutedNeuralBackend for NumericBackend {
                                 [gate_up_start..gate_up_start + projection_per_expert]
                                 .to_vec(),
                         ),
+                        gate_bias: packed_gate_up_bias.as_ref().map(|bias| {
+                            NumericTensor::new(
+                                vec![intermediate],
+                                bias.data[expert * 2 * intermediate as usize
+                                    ..expert * 2 * intermediate as usize + intermediate as usize]
+                                    .to_vec(),
+                            )
+                        }),
                         up: NumericTensor::new(
                             vec![intermediate, hidden],
                             packed_gate_up.data[gate_up_start + projection_per_expert
                                 ..gate_up_start + 2 * projection_per_expert]
                                 .to_vec(),
                         ),
+                        up_bias: packed_gate_up_bias.as_ref().map(|bias| {
+                            let start = expert * 2 * intermediate as usize + intermediate as usize;
+                            NumericTensor::new(
+                                vec![intermediate],
+                                bias.data[start..start + intermediate as usize].to_vec(),
+                            )
+                        }),
                         down: NumericTensor::new(
                             vec![spec.output_dimensions, intermediate],
                             packed_down.data[down_start..down_start + down_per_expert].to_vec(),
                         ),
+                        down_bias: packed_down_bias.as_ref().map(|bias| {
+                            let width = spec.output_dimensions as usize;
+                            NumericTensor::new(
+                                vec![spec.output_dimensions],
+                                bias.data[expert * width..(expert + 1) * width].to_vec(),
+                            )
+                        }),
                     });
                 }
                 parameters.push((
                     packed_gate_up,
                     ParameterMetadata::from_spec(&gate_up.weight, gate_up.weight.trainable),
                 ));
+                if let (Some(parameter_spec), Some(value)) =
+                    (gate_up.bias.as_ref(), packed_gate_up_bias)
+                {
+                    parameters.push((
+                        value,
+                        ParameterMetadata::from_spec(parameter_spec, parameter_spec.trainable),
+                    ));
+                }
+                if let (Some(parameter_spec), Some(value)) = (down.bias.as_ref(), packed_down_bias)
+                {
+                    parameters.push((
+                        value,
+                        ParameterMetadata::from_spec(parameter_spec, parameter_spec.trainable),
+                    ));
+                }
                 parameters.push((
                     packed_down,
                     ParameterMetadata::from_spec(&down.weight, down.weight.trainable),
                 ));
             }
-            SwiGluExpertLayout::Independent(specs) => {
+            GatedProductExpertLayout::Independent(specs) => {
                 for expert_spec in specs {
                     let gate =
                         parameter(&expert_spec.gate.weight, vec![intermediate, hidden], false);
@@ -3602,10 +3746,28 @@ impl RoutedNeuralBackend for NumericBackend {
                         vec![spec.output_dimensions, intermediate],
                         false,
                     );
+                    let gate_bias = expert_spec
+                        .gate
+                        .bias
+                        .as_ref()
+                        .map(|bias| parameter(bias, vec![intermediate], false));
+                    let up_bias = expert_spec
+                        .up
+                        .bias
+                        .as_ref()
+                        .map(|bias| parameter(bias, vec![intermediate], false));
+                    let down_bias = expert_spec
+                        .down
+                        .bias
+                        .as_ref()
+                        .map(|bias| parameter(bias, vec![spec.output_dimensions], false));
                     experts.push(NumericExpert {
                         gate: gate.clone(),
+                        gate_bias: gate_bias.clone(),
                         up: up.clone(),
+                        up_bias: up_bias.clone(),
                         down: down.clone(),
+                        down_bias: down_bias.clone(),
                     });
                     parameters.extend([
                         (
@@ -3630,14 +3792,30 @@ impl RoutedNeuralBackend for NumericBackend {
                             ),
                         ),
                     ]);
+                    for (projection, value) in [
+                        (&expert_spec.gate, gate_bias),
+                        (&expert_spec.up, up_bias),
+                        (&expert_spec.down, down_bias),
+                    ] {
+                        if let (Some(parameter_spec), Some(value)) =
+                            (projection.bias.as_ref(), value)
+                        {
+                            parameters.push((
+                                value,
+                                ParameterMetadata::from_spec(
+                                    parameter_spec,
+                                    parameter_spec.trainable,
+                                ),
+                            ));
+                        }
+                    }
                 }
             }
         }
         Ok(NumericExpertBank {
             experts,
             parameters,
-            limit: spec.limit,
-            activation: spec.activation,
+            policy,
         })
     }
 
@@ -3745,23 +3923,39 @@ impl AttentionCache<NumericTensor> for NumericCache {
 
     fn attention(
         &mut self,
-        queries: NumericTensor,
-        keys: NumericTensor,
-        values: NumericTensor,
-        scale: f32,
-        mask: Option<&NumericTensor>,
+        request: AttentionRequest<'_, NumericTensor>,
         _: &NumericContext,
     ) -> Result<NumericTensor, Error> {
-        let query_offset = self.offset - queries.shape[2];
-        attention(
-            &queries,
-            &keys,
-            &values,
-            scale,
-            mask,
-            self.window,
-            query_offset,
-        )
+        request.validate()?;
+        let query_offset = self.offset - request.queries.shape[2];
+        match request.sinks {
+            Some(sinks) if self.window.is_some() => attention_with_sinks_windowed(
+                &request.queries,
+                &request.keys,
+                &request.values,
+                request.scale,
+                Some(sinks),
+                self.window.unwrap(),
+                query_offset,
+            ),
+            Some(sinks) => attention_with_sinks(
+                &request.queries,
+                &request.keys,
+                &request.values,
+                request.scale,
+                request.mask,
+                Some(sinks),
+            ),
+            None => attention(
+                &request.queries,
+                &request.keys,
+                &request.values,
+                request.scale,
+                request.mask,
+                self.window,
+                query_offset,
+            ),
+        }
     }
 }
 
@@ -3947,17 +4141,13 @@ impl AttentionCache<NumericTensor> for NumericHybridLayerState {
 
     fn attention(
         &mut self,
-        queries: NumericTensor,
-        keys: NumericTensor,
-        values: NumericTensor,
-        scale: f32,
-        mask: Option<&NumericTensor>,
+        request: AttentionRequest<'_, NumericTensor>,
         context: &NumericContext,
     ) -> Result<NumericTensor, Error> {
         self.attention
             .as_mut()
             .ok_or_else(|| Error::backend("fixed layer has no attention state"))?
-            .attention(queries, keys, values, scale, mask, context)
+            .attention(request, context)
     }
 }
 
@@ -3997,6 +4187,166 @@ fn config(model_type: &str, tied: bool) -> serde_json::Value {
         config["norm_topk_prob"] = true.into();
     }
     config
+}
+
+#[derive(Debug, Clone)]
+struct SinkDecoderConfig(qwen::ModelArgs);
+
+impl decoder::Config for SinkDecoderConfig {
+    fn model_identity(&self) -> &str {
+        decoder::Config::model_identity(&self.0)
+    }
+    fn parameter_root(&self) -> &str {
+        decoder::Config::parameter_root(&self.0)
+    }
+    fn validate_config(&self) -> Result<(), Error> {
+        decoder::Config::validate_config(&self.0)
+    }
+    fn hidden_size(&self) -> i32 {
+        decoder::Config::hidden_size(&self.0)
+    }
+    fn num_hidden_layers(&self) -> i32 {
+        decoder::Config::num_hidden_layers(&self.0)
+    }
+    fn intermediate_size(&self) -> i32 {
+        decoder::Config::intermediate_size(&self.0)
+    }
+    fn num_attention_heads(&self) -> i32 {
+        decoder::Config::num_attention_heads(&self.0)
+    }
+    fn num_key_value_heads(&self) -> i32 {
+        decoder::Config::num_key_value_heads(&self.0)
+    }
+    fn head_dim(&self) -> i32 {
+        decoder::Config::head_dim(&self.0)
+    }
+    fn rms_norm_epsilon(&self) -> f32 {
+        decoder::Config::rms_norm_epsilon(&self.0)
+    }
+    fn vocabulary_size(&self) -> i32 {
+        decoder::Config::vocabulary_size(&self.0)
+    }
+    fn attention_bias(&self, projection: decoder::AttentionProjection) -> bool {
+        decoder::Config::attention_bias(&self.0, projection)
+    }
+    fn learned_attention_sinks(&self) -> bool {
+        true
+    }
+    fn query_key_norm_epsilon(&self) -> Option<f32> {
+        decoder::Config::query_key_norm_epsilon(&self.0)
+    }
+    fn mlp_bias(&self) -> bool {
+        decoder::Config::mlp_bias(&self.0)
+    }
+    fn tie_word_embeddings(&self) -> bool {
+        decoder::Config::tie_word_embeddings(&self.0)
+    }
+    fn attention_schedule(&self) -> &eredu_core::LayerSchedule<eredu_core::AttentionPolicy> {
+        decoder::Config::attention_schedule(&self.0)
+    }
+    fn weight_quantization(&self, name: &str) -> Option<eredu_checkpoint::WeightQuantization> {
+        decoder::Config::weight_quantization(&self.0, name)
+    }
+    fn rotary_spec(&self, dimensions: i32) -> RotarySpec<'_> {
+        decoder::Config::rotary_spec(&self.0, dimensions)
+    }
+}
+
+#[test]
+fn shared_decoder_constructs_optional_trainable_attention_sinks() {
+    let args = qwen::model_args_from_config_value(&config("qwen2", false)).unwrap();
+    let context = NumericContext::default();
+    let ordinary = decoder::Attention::<NumericBackend>::new(&args, 0, &context).unwrap();
+    assert!(ordinary.sinks.is_none());
+
+    let sink_aware =
+        decoder::Attention::<NumericBackend>::new(&SinkDecoderConfig(args), 0, &context).unwrap();
+    assert_eq!(sink_aware.sinks.as_ref().unwrap().as_ref().shape, [2]);
+    assert!(validate_parameter_topology::<NumericTensor, _>(&sink_aware)
+        .unwrap()
+        .iter()
+        .any(
+            |parameter| parameter.id.as_str() == "model.layers.0.self_attn.sinks"
+                && parameter.trainable
+        ));
+}
+
+#[test]
+fn sink_aware_request_matches_cached_full_and_sliding_scalar_references() {
+    let context = NumericContext::default();
+    let queries = NumericTensor::zeros(vec![1, 1, 3, 1]);
+    let keys = NumericTensor::zeros(vec![1, 1, 3, 1]);
+    let values = NumericTensor::new(vec![1, 1, 3, 1], vec![10.0, 20.0, 30.0]);
+    let sinks = NumericTensor::zeros(vec![1]);
+    let mask = NumericBackend::causal_mask(3, 0, None, &context).unwrap();
+
+    let uncached = NumericBackend::attention_with_sinks(
+        AttentionRequest {
+            queries: queries.clone(),
+            keys: keys.clone(),
+            values: values.clone(),
+            scale: 1.0,
+            mask: Some(&mask),
+            sinks: Some(&sinks),
+        },
+        &context,
+    )
+    .unwrap();
+    assert_tensor_close(
+        &uncached,
+        &NumericTensor::new(vec![1, 1, 3, 1], vec![5.0, 10.0, 15.0]),
+        "uncached attention sinks",
+    );
+
+    let mut full = NumericCache::new(None);
+    let (cached_keys, cached_values) = full
+        .update_for_attention(keys.clone(), values.clone(), &context)
+        .unwrap();
+    let cached = full
+        .attention(
+            AttentionRequest {
+                queries: queries.clone(),
+                keys: cached_keys,
+                values: cached_values,
+                scale: 1.0,
+                mask: Some(&mask),
+                sinks: Some(&sinks),
+            },
+            &context,
+        )
+        .unwrap();
+    assert_tensor_close(&cached, &uncached, "cached attention sinks");
+
+    let sliding = NumericBackend::sliding_window_attention_with_sinks(
+        AttentionRequest {
+            queries,
+            keys,
+            values,
+            scale: 1.0,
+            mask: None,
+            sinks: Some(&sinks),
+        },
+        2,
+        0,
+        &context,
+    )
+    .unwrap();
+    assert_tensor_close(
+        &sliding,
+        &NumericTensor::new(vec![1, 3, 1], vec![5.0, 10.0, 50.0 / 3.0]),
+        "sliding attention sinks",
+    );
+
+    let malformed_sinks = NumericTensor::zeros(vec![2]);
+    let malformed = AttentionRequest {
+        queries: NumericTensor::zeros(vec![1, 1, 1, 1]),
+        keys: NumericTensor::zeros(vec![1, 1, 1, 1]),
+        values: NumericTensor::zeros(vec![1, 1, 1, 1]),
+        scale: 1.0,
+        mask: None,
+        sinks: Some(&malformed_sinks),
+    };
+    assert!(malformed.validate().is_err());
 }
 
 struct ForwardResult {
@@ -4114,6 +4464,102 @@ fn numerical_qwen2_qwen3_and_moe_prefill_decode_goldens() {
             }
         );
         assert_eq!(result.sliding_calls, usize::from(model_type == "qwen2"));
+    }
+}
+
+#[test]
+fn neutral_gpt_oss_prefill_decode_is_chunk_invariant() {
+    let args = gpt_oss::model_args_from_config_value(&serde_json::json!({
+        "model_type": "gpt_oss",
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "vocab_size": 17,
+        "num_local_experts": 2,
+        "num_experts_per_tok": 1,
+        "rms_norm_eps": 0.00001,
+        "sliding_window": 2,
+        "max_position_embeddings": 64,
+        "rope_theta": 150000.0,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "quantization_config": {"quant_method": "mxfp4"},
+        "swiglu_limit": 7.0
+    }))
+    .unwrap();
+    let context = NumericContext::default();
+    let layout = gpt_oss::state_layout(&args).unwrap();
+    let mut whole_state = DeviceState::<NumericBackend, _>::create(layout.clone(), |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let mut chunked_state = DeviceState::<NumericBackend, _>::create(layout, |_, policy| {
+        Ok::<_, Error>(NumericHybridLayerState::new(policy))
+    })
+    .unwrap();
+    let mut whole = ResidentRuntime::new(
+        gpt_oss::LayeredModel::<NumericBackend>::new(args.clone(), &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+    let mut chunked = ResidentRuntime::new(
+        gpt_oss::LayeredModel::<NumericBackend>::new(args, &context).unwrap(),
+        &context,
+    )
+    .unwrap();
+
+    let whole_tokens = NumericTensor::token_ids(&[1, 2, 3]);
+    let whole_logits = whole
+        .forward(
+            decoder::LayeredInput {
+                tokens: &whole_tokens,
+                mask: None,
+            },
+            &mut whole_state,
+            &context,
+        )
+        .unwrap();
+    let prefix_tokens = NumericTensor::token_ids(&[1, 2]);
+    let prefix_logits = chunked
+        .forward(
+            decoder::LayeredInput {
+                tokens: &prefix_tokens,
+                mask: None,
+            },
+            &mut chunked_state,
+            &context,
+        )
+        .unwrap();
+    let decode_tokens = NumericTensor::token_ids(&[3]);
+    let decode_logits = chunked
+        .forward(
+            decoder::LayeredInput {
+                tokens: &decode_tokens,
+                mask: None,
+            },
+            &mut chunked_state,
+            &context,
+        )
+        .unwrap();
+
+    let final_whole = whole_logits
+        .axis_slice(1, 2, 3)
+        .reshape(&[1, 1, 17], &context)
+        .unwrap();
+    let whole_prefix = whole_logits.axis_slice(1, 0, 2);
+    assert_tensor_close(&prefix_logits, &whole_prefix, "neutral GPT-OSS prefix");
+    assert_tensor_close(&decode_logits, &final_whole, "neutral GPT-OSS decode");
+    assert!(checksum(&decode_logits.data)
+        .iter()
+        .all(|value| value.is_finite()));
+    for layer in 0..2 {
+        assert_eq!(AttentionCache::offset(whole_state.layer(layer).unwrap()), 3);
+        assert_eq!(
+            AttentionCache::offset(chunked_state.layer(layer).unwrap()),
+            3
+        );
     }
 }
 
@@ -4660,18 +5106,23 @@ fn reference_router_and_packed_experts_match_analytical_values() {
         experts: vec![
             NumericExpert {
                 gate: NumericTensor::new(vec![1, 2], vec![1.0, 0.0]),
+                gate_bias: None,
                 up: NumericTensor::new(vec![1, 2], vec![0.0, 1.0]),
+                up_bias: None,
                 down: NumericTensor::new(vec![2, 1], vec![1.0, 2.0]),
+                down_bias: None,
             },
             NumericExpert {
                 gate: NumericTensor::new(vec![1, 2], vec![0.0, 1.0]),
+                gate_bias: None,
                 up: NumericTensor::new(vec![1, 2], vec![1.0, 0.0]),
+                up_bias: None,
                 down: NumericTensor::new(vec![2, 1], vec![2.0, -1.0]),
+                down_bias: None,
             },
         ],
         parameters: Vec::new(),
-        limit: None,
-        activation: eredu_nn::GatedExpertActivation::Silu,
+        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
     };
     let routes = RoutingResult {
         expert_ids: NumericTensor::new(vec![1, 2], vec![0.0, 1.0]),
@@ -4729,16 +5180,68 @@ fn selected_softmax_router_applies_rms_input_and_per_expert_scales() {
 }
 
 #[test]
+fn selected_softmax_router_projection_bias_affects_ids_and_weights() {
+    let mut router = NumericBackend::top_k_router(
+        TopKRouterSpec {
+            input_dimensions: 1,
+            weight: ParameterSpec::trainable("router.biased.weight").unwrap(),
+            bias: Some(ParameterSpec::trainable("router.biased.bias").unwrap()),
+            correction_bias: Some(
+                ParameterSpec::trainable("router.biased.correction_bias").unwrap(),
+            ),
+            input_transform: None,
+            route_scale: None,
+            quantization: None,
+            routing: TopKRoutingSpec::new(3, 2, eredu_nn::RoutingScoring::SelectedSoftmax, false)
+                .unwrap(),
+        },
+        &NumericContext::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        validate_parameter_topology::<NumericTensor, _>(&router)
+            .unwrap()
+            .into_iter()
+            .map(|parameter| parameter.id.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        [
+            "router.biased.weight",
+            "router.biased.bias",
+            "router.biased.correction_bias",
+        ]
+    );
+    router.linear.weight = NumericTensor::new(vec![3, 1], vec![0.0; 3]);
+    router.linear.bias.as_mut().unwrap().0 =
+        NumericTensor::new(vec![3], vec![0.0, 2.0_f32.ln(), 4.0_f32.ln()]);
+    router.correction_bias.as_mut().unwrap().0 = NumericTensor::new(vec![3], vec![10.0, 0.0, 0.0]);
+
+    let routes = router
+        .route(
+            &NumericTensor::new(vec![1, 1], vec![1.0]),
+            &NumericContext::default(),
+        )
+        .unwrap();
+
+    assert_eq!(routes.expert_ids.data, [0.0, 2.0]);
+    assert_close(routes.selected_scores.data[0], 0.2);
+    assert_close(routes.selected_scores.data[1], 0.8);
+    assert_close(routes.route_weights.data[0], 0.2);
+    assert_close(routes.route_weights.data[1], 0.8);
+}
+
+#[test]
 fn routed_gated_experts_support_approximate_gelu() {
     let mut experts = NumericExpertBank {
         experts: vec![NumericExpert {
             gate: NumericTensor::new(vec![1, 1], vec![1.0]),
+            gate_bias: None,
             up: NumericTensor::new(vec![1, 1], vec![2.0]),
+            up_bias: None,
             down: NumericTensor::new(vec![1, 1], vec![3.0]),
+            down_bias: None,
         }],
         parameters: Vec::new(),
-        limit: None,
-        activation: eredu_nn::GatedExpertActivation::GeluApproximate,
+        policy: eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
     };
     let routes = RoutingResult {
         expert_ids: NumericTensor::new(vec![1, 1], vec![0.0]),
@@ -4754,6 +5257,71 @@ fn routed_gated_experts_support_approximate_gelu() {
         .unwrap();
     let gelu = 0.5 * (1.0 + (0.797_884_6_f32 * 1.044_715).tanh());
     assert_close(output.data[0], gelu * 2.0 * 3.0);
+}
+
+#[test]
+fn gated_product_policy_and_projection_biases_match_analytical_value() {
+    let parameter = |name: &str| ParameterSpec::trainable(name).unwrap();
+    let policy = eredu_nn::GatedProductPolicy::new(
+        eredu_nn::GatedProductActivation::Silu,
+        Some(2.0),
+        Some(1.5),
+        1.7,
+        1.0,
+    )
+    .unwrap();
+    let mut bank = NumericBackend::gated_product_expert_bank(
+        GatedProductExpertBankSpec {
+            expert_count: 1,
+            input_dimensions: 1,
+            intermediate_dimensions: 1,
+            output_dimensions: 1,
+            policy,
+            layout: GatedProductExpertLayout::Packed {
+                gate_up: eredu_nn::ExpertProjectionSpec {
+                    weight: parameter("experts.gate_up_proj"),
+                    bias: Some(parameter("experts.gate_up_proj_bias")),
+                    format: eredu_nn::LinearFormat::Dense,
+                },
+                down: eredu_nn::ExpertProjectionSpec {
+                    weight: parameter("experts.down_proj"),
+                    bias: Some(parameter("experts.down_proj_bias")),
+                    format: eredu_nn::LinearFormat::Dense,
+                },
+            },
+        },
+        &NumericContext::default(),
+    )
+    .unwrap();
+    let topology = validate_parameter_topology::<NumericTensor, _>(&bank)
+        .unwrap()
+        .into_iter()
+        .map(|parameter| parameter.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert!(topology.contains(&"experts.gate_up_proj_bias".to_owned()));
+    assert!(topology.contains(&"experts.down_proj_bias".to_owned()));
+
+    bank.experts[0].gate = NumericTensor::new(vec![1, 1], vec![0.0]);
+    bank.experts[0].gate_bias = Some(NumericTensor::new(vec![1], vec![2.5]));
+    bank.experts[0].up = NumericTensor::new(vec![1, 1], vec![0.0]);
+    bank.experts[0].up_bias = Some(NumericTensor::new(vec![1], vec![-3.0]));
+    bank.experts[0].down = NumericTensor::new(vec![1, 1], vec![2.0]);
+    bank.experts[0].down_bias = Some(NumericTensor::new(vec![1], vec![5.0]));
+    let routes = RoutingResult {
+        expert_ids: NumericTensor::new(vec![1, 1], vec![0.0]),
+        selected_scores: NumericTensor::new(vec![1, 1], vec![0.25]),
+        route_weights: NumericTensor::new(vec![1, 1], vec![0.25]),
+    };
+    let output = bank
+        .forward_routed(
+            &NumericTensor::new(vec![1, 1], vec![7.0]),
+            &routes,
+            &NumericContext::default(),
+        )
+        .unwrap();
+    let gate = 2.0 / (1.0 + (-3.4_f32).exp());
+    let expected = 0.25 * (2.0 * gate * -0.5 + 5.0);
+    assert_close(output.data[0], expected);
 }
 
 #[test]
@@ -5357,11 +5925,11 @@ fn grouped_sigmoid_and_caller_selected_routes_preserve_unbiased_scores() {
 }
 
 #[test]
-fn limited_swiglu_caps_gate_and_up_before_activation() {
-    let output = NumericBackend::swiglu(
+fn bounded_gated_product_caps_gate_and_up_before_activation() {
+    let output = NumericBackend::gated_product(
         NumericTensor::new(vec![1, 2], vec![10.0, -10.0]),
         NumericTensor::new(vec![1, 2], vec![10.0, -10.0]),
-        Some(eredu_nn::SwiGluLimit::new(2.0).unwrap()),
+        eredu_nn::GatedProductPolicy::bounded_silu(2.0).unwrap(),
         &NumericContext::default(),
     )
     .unwrap();

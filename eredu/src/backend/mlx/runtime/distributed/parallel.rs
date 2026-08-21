@@ -150,6 +150,30 @@ pub(crate) enum ProjectionSharding {
     Row,
 }
 
+/// Returns TP placement for expert-major packed projection members.
+///
+/// Packed weights/quantization companions are `[experts, output, input]` and
+/// ordinary output biases are `[experts, output]`. Column sharding therefore
+/// uses axis 1 for every member; row sharding uses axis 2 for rank-3 members
+/// and replicates the rank-2 ordinary output bias.
+pub(crate) fn packed_expert_member_sharding(
+    name: &str,
+    shape: &[i32],
+    placement: ProjectionSharding,
+) -> Result<MemberSharding, Error> {
+    match placement {
+        ProjectionSharding::Replicated => Ok(MemberSharding::Replicated),
+        ProjectionSharding::Column if shape.len() >= 2 => Ok(MemberSharding::Equal { axis: 1 }),
+        ProjectionSharding::Row if shape.len() >= 3 => Ok(MemberSharding::Equal { axis: 2 }),
+        ProjectionSharding::Row if shape.len() == 2 && name.ends_with("bias") => {
+            Ok(MemberSharding::Replicated)
+        }
+        _ => Err(Error::Parallel(format!(
+            "unsupported packed expert member {name} with shape {shape:?} for {placement:?}",
+        ))),
+    }
+}
+
 /// Describes every parameter in a module as one typed logical group.
 pub(crate) fn module_parameter_group(
     logical_name: &str,
@@ -826,6 +850,24 @@ mod tests {
     fn topology(rank: usize, parts: usize) -> MlxParallelContext {
         MlxParallelContext::for_rank(rank, parts, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
             .unwrap()
+    }
+
+    #[test]
+    fn packed_expert_bias_uses_output_axis_or_replication() {
+        assert_eq!(
+            packed_expert_member_sharding(
+                "gate_up_proj_bias",
+                &[8, 64],
+                ProjectionSharding::Column,
+            )
+            .unwrap(),
+            MemberSharding::Equal { axis: 1 },
+        );
+        assert_eq!(
+            packed_expert_member_sharding("down_proj_bias", &[8, 32], ProjectionSharding::Row,)
+                .unwrap(),
+            MemberSharding::Replicated,
+        );
     }
 
     #[test]

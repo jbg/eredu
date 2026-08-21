@@ -4,12 +4,12 @@ use eredu_architectures::{
 };
 use eredu_core::{AttentionPolicy, Completion, LayerSchedule};
 use eredu_nn::{
-    AttentionCache, AttentionMask, EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator,
-    LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode,
-    ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized,
-    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
-    RoutedNeuralBackend, RoutingOperator, RoutingResult, SwiGluExpertBankOperator,
-    SwiGluExpertBankSpec, Tensor, TopKRouterSpec,
+    AttentionCache, AttentionMask, AttentionRequest, EmbeddingOperator, EmbeddingSpec, Error,
+    GatedProductExpertBankOperator, GatedProductExpertBankSpec, Index, LinearOperator, LinearSpec,
+    NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode, ParameterMetadata,
+    ParameterVisitor, ParameterVisitorMut, Parameterized, Relu2ExpertBankOperator,
+    Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend,
+    RoutingOperator, RoutingResult, Tensor, TopKRouterSpec,
 };
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, DeviceState, ExpertPass, LayerRuntimeState,
@@ -270,7 +270,7 @@ impl RoutingOperator<ReferenceTensor> for ReferenceLinear {
     }
 }
 
-impl SwiGluExpertBankOperator<ReferenceTensor> for ReferenceLinear {
+impl GatedProductExpertBankOperator<ReferenceTensor> for ReferenceLinear {
     fn forward_routed(
         &mut self,
         input: &ReferenceTensor,
@@ -425,10 +425,10 @@ impl NeuralBackend for ReferenceBackend {
         Ok(input)
     }
 
-    fn swiglu(
+    fn gated_product(
         gate: Self::Tensor,
         _up: Self::Tensor,
-        _limit: Option<eredu_nn::SwiGluLimit>,
+        _policy: eredu_nn::GatedProductPolicy,
         _: &(),
     ) -> Result<Self::Tensor, Error> {
         Ok(gate)
@@ -469,7 +469,7 @@ impl NeuralBackend for ReferenceBackend {
 
 impl RoutedNeuralBackend for ReferenceBackend {
     type Router = ReferenceLinear;
-    type SwiGluExpertBank = ReferenceLinear;
+    type GatedProductExpertBank = ReferenceLinear;
     type Relu2ExpertBank = ReferenceLinear;
 
     fn top_k_router(spec: TopKRouterSpec, _: &()) -> Result<Self::Router, Error> {
@@ -480,13 +480,15 @@ impl RoutedNeuralBackend for ReferenceBackend {
         })
     }
 
-    fn swiglu_expert_bank(
-        spec: SwiGluExpertBankSpec,
+    fn gated_product_expert_bank(
+        spec: GatedProductExpertBankSpec,
         _: &(),
-    ) -> Result<Self::SwiGluExpertBank, Error> {
+    ) -> Result<Self::GatedProductExpertBank, Error> {
         let weight = match spec.layout {
-            eredu_nn::SwiGluExpertLayout::Packed { gate_up, .. } => gate_up.weight,
-            eredu_nn::SwiGluExpertLayout::Independent(mut experts) => experts.remove(0).gate.weight,
+            eredu_nn::GatedProductExpertLayout::Packed { gate_up, .. } => gate_up.weight,
+            eredu_nn::GatedProductExpertLayout::Independent(mut experts) => {
+                experts.remove(0).gate.weight
+            }
         };
         Ok(ReferenceLinear {
             output: spec.output_dimensions,
@@ -646,14 +648,10 @@ impl AttentionCache<ReferenceTensor> for ReferenceCache {
     }
     fn attention(
         &mut self,
-        queries: ReferenceTensor,
-        _: ReferenceTensor,
-        _: ReferenceTensor,
-        _: f32,
-        _: Option<&ReferenceTensor>,
+        request: AttentionRequest<'_, ReferenceTensor>,
         _: &(),
     ) -> Result<ReferenceTensor, Error> {
-        Ok(queries)
+        Ok(request.queries)
     }
 }
 
