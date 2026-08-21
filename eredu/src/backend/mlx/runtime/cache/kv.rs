@@ -3284,7 +3284,7 @@ mod tests {
             PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
         },
     };
-    use eredu_runtime::{inspect_prompt_cache, PagedCacheOptions};
+    use eredu_runtime::{inspect_prompt_cache, resolve_prompt_cache_root, PagedCacheOptions};
     use safemlx::{
         fast::ScaledDotProductAttentionMask,
         ops::{indexing::TryIndexOp, zeros_dtype},
@@ -4305,7 +4305,10 @@ mod tests {
             .all(|block| block.rank == Some(rank)));
         drop(cache);
         drop(manager);
-        assert!(destination.join("manifest.json").is_file());
+        assert!(resolve_prompt_cache_root(&destination)
+            .unwrap()
+            .join("manifest.json")
+            .is_file());
 
         let mut incompatible = descriptor.clone();
         incompatible.topology.pipeline = Some((2, 0));
@@ -4344,7 +4347,9 @@ mod tests {
         assert_eq!(restored.offset(), 6);
         assert_eq!(loaded_manager.report().unwrap().prompt_cache_loads, 1);
 
-        let manifest_path = destination.join("manifest.json");
+        let manifest_path = resolve_prompt_cache_root(&destination)
+            .unwrap()
+            .join("manifest.json");
         let mut corrupted: serde_json::Value =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
         corrupted["blocks"][0]["logical_bytes"] = serde_json::json!(1);

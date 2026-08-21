@@ -3739,8 +3739,9 @@ mod tests {
     };
     use crate::core::{AttentionPolicy, LayerSchedule};
     use eredu_runtime::{
-        CachePoolLimits, CacheResidencyConfigurationError, MutableCacheTail,
-        PromptCachePersistenceError, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+        resolve_prompt_cache_root, CachePoolLimits, CacheResidencyConfigurationError,
+        MutableCacheTail, PromptCachePersistenceError, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+        PROMPT_CACHE_CURRENT_FILE, PROMPT_CACHE_GENERATIONS_DIRECTORY,
     };
     use safemlx::{
         host_transfer_capacity_upper_bound, transforms::async_eval_with_event, Array, Device,
@@ -3750,7 +3751,7 @@ mod tests {
     use std::{
         fs,
         hash::{DefaultHasher, Hash, Hasher},
-        path::Path,
+        path::{Path, PathBuf},
         sync::{mpsc, Arc, OnceLock},
         thread,
         time::Duration,
@@ -4013,8 +4014,31 @@ mod tests {
         }
     }
 
+    const TEST_PROMPT_CACHE_GENERATION: &str = "generation-test";
+
+    fn create_prompt_fixture_generation(root: &Path) -> PathBuf {
+        let generation = root
+            .join(PROMPT_CACHE_GENERATIONS_DIRECTORY)
+            .join(TEST_PROMPT_CACHE_GENERATION);
+        fs::create_dir_all(&generation).unwrap();
+        fs::write(
+            root.join(PROMPT_CACHE_CURRENT_FILE),
+            format!("{TEST_PROMPT_CACHE_GENERATION}\n"),
+        )
+        .unwrap();
+        generation
+    }
+
+    fn prompt_fixture_root(root: &Path) -> PathBuf {
+        resolve_prompt_cache_root(root).unwrap()
+    }
+
+    fn prompt_fixture_manifest_path(root: &Path) -> PathBuf {
+        prompt_fixture_root(root).join("manifest.json")
+    }
+
     fn write_prompt_fixture(root: &Path, namespace: &str) -> PromptCacheManifest {
-        fs::create_dir_all(root).unwrap();
+        let generation = create_prompt_fixture_generation(root);
         let keys = 1.0f32.to_le_bytes();
         let values = 2.0f32.to_le_bytes();
         let key_view = TensorView::new(StoredDtype::F32, vec![1, 1, 1, 1], &keys).unwrap();
@@ -4022,7 +4046,7 @@ mod tests {
         serialize_to_file(
             [("keys", key_view), ("values", value_view)],
             None,
-            &root.join("block.safetensors"),
+            &generation.join("block.safetensors"),
         )
         .unwrap();
         let descriptor = prompt_descriptor();
@@ -4059,13 +4083,15 @@ mod tests {
                 first_dtype: "Float32".into(),
                 second_dtype: "Float32".into(),
                 logical_bytes: 8,
-                payload_sha256: hash_prompt_cache_shard_payload(&root.join("block.safetensors"))
-                    .unwrap(),
+                payload_sha256: hash_prompt_cache_shard_payload(
+                    &generation.join("block.safetensors"),
+                )
+                .unwrap(),
             }],
             state_tensors: Vec::new(),
         };
         fs::write(
-            root.join("manifest.json"),
+            generation.join("manifest.json"),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
@@ -4183,8 +4209,9 @@ mod tests {
     #[test]
     fn schema_v3_is_rejected_before_v4_fields_are_decoded() {
         let directory = tempfile::tempdir().unwrap();
+        let generation = create_prompt_fixture_generation(directory.path());
         fs::write(
-            directory.path().join("manifest.json"),
+            generation.join("manifest.json"),
             br#"{"schema_version":3,"layer_layout":[]}"#,
         )
         .unwrap();
@@ -4215,7 +4242,7 @@ mod tests {
         draft.global_layer = 1;
         manifest.blocks = vec![manifest.blocks[0].clone(), target_tail, draft];
         fs::write(
-            directory.path().join("manifest.json"),
+            prompt_fixture_manifest_path(directory.path()),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
@@ -4229,7 +4256,7 @@ mod tests {
 
         manifest.layer_prefix_offsets = vec![0, 0];
         fs::write(
-            directory.path().join("manifest.json"),
+            prompt_fixture_manifest_path(directory.path()),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
@@ -4321,12 +4348,12 @@ mod tests {
     }
 
     fn write_fixed_state_fixture(root: &Path) -> PromptCacheManifest {
-        fs::create_dir_all(root).unwrap();
+        let generation = create_prompt_fixture_generation(root);
         let values = (0..12)
             .flat_map(|value| (value as f32).to_le_bytes())
             .collect::<Vec<_>>();
         let view = TensorView::new(StoredDtype::F32, vec![1, 3, 4], &values).unwrap();
-        let shard = root.join("state.safetensors");
+        let shard = generation.join("state.safetensors");
         serialize_to_file([("state", view)], None, &shard).unwrap();
         let policy = StateTensorPolicy::new(
             StateTensorRole::Convolution { slot: 0 },
@@ -4375,7 +4402,7 @@ mod tests {
             }],
         };
         fs::write(
-            root.join("manifest.json"),
+            generation.join("manifest.json"),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
@@ -4389,7 +4416,7 @@ mod tests {
         inspect_prompt_cache(directory.path()).unwrap();
         let write = |manifest: &PromptCacheManifest| {
             fs::write(
-                directory.path().join("manifest.json"),
+                prompt_fixture_manifest_path(directory.path()),
                 serde_json::to_vec(manifest).unwrap(),
             )
             .unwrap();
@@ -4430,7 +4457,7 @@ mod tests {
 
         let write = |manifest: &PromptCacheManifest| {
             fs::write(
-                directory.path().join("manifest.json"),
+                prompt_fixture_manifest_path(directory.path()),
                 serde_json::to_vec(manifest).unwrap(),
             )
             .unwrap();
@@ -4463,7 +4490,7 @@ mod tests {
         let mut kind = base.clone();
         kind.layer_layout = PromptCacheModelIdentity::compressed_layouts(1, 1, 1).unwrap();
         fs::write(
-            directory.path().join("manifest.json"),
+            prompt_fixture_manifest_path(directory.path()),
             serde_json::to_vec(&kind).unwrap(),
         )
         .unwrap();
@@ -4475,7 +4502,7 @@ mod tests {
         let mut geometry = base;
         geometry.layer_layout = PromptCacheModelIdentity::key_value_layouts([None], 2, 1).unwrap();
         fs::write(
-            directory.path().join("manifest.json"),
+            prompt_fixture_manifest_path(directory.path()),
             serde_json::to_vec(&geometry).unwrap(),
         )
         .unwrap();
@@ -4489,7 +4516,7 @@ mod tests {
     fn same_length_prompt_payload_corruption_is_rejected_before_array_conversion() {
         let directory = tempfile::tempdir().unwrap();
         let manifest = write_prompt_fixture(directory.path(), "payload-checksum");
-        let shard = directory.path().join(&manifest.blocks[0].shard);
+        let shard = prompt_fixture_root(directory.path()).join(&manifest.blocks[0].shard);
         let mut bytes = fs::read(&shard).unwrap();
         let final_byte = bytes.last_mut().expect("fixture shard has a payload");
         *final_byte ^= 0x01;
@@ -4598,14 +4625,14 @@ mod tests {
         serialize_to_file(
             [("keys", key_view), ("values", value_view)],
             None,
-            &directory.path().join("block.safetensors"),
+            &prompt_fixture_root(directory.path()).join("block.safetensors"),
         )
         .unwrap();
         manifest.blocks[0].first_shape = vec![1, 2, 1, 4];
         manifest.blocks[0].second_shape = vec![1, 2, 1, 4];
         manifest.blocks[0].logical_bytes = 64;
         fs::write(
-            directory.path().join("manifest.json"),
+            prompt_fixture_manifest_path(directory.path()),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
@@ -4632,7 +4659,7 @@ mod tests {
         serialize_to_file(
             [("latent", latent_view), ("rotary_key", rotary_view)],
             None,
-            &directory.path().join("block.safetensors"),
+            &prompt_fixture_root(directory.path()).join("block.safetensors"),
         )
         .unwrap();
         manifest.blocks[0].representation = CacheRepresentation::CompressedLatentRotary;
@@ -4642,7 +4669,7 @@ mod tests {
         manifest.blocks[0].second_shape = vec![1, 1, 2];
         manifest.blocks[0].logical_bytes = 24;
         fs::write(
-            directory.path().join("manifest.json"),
+            prompt_fixture_manifest_path(directory.path()),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
