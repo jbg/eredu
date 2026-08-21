@@ -409,7 +409,8 @@ impl QwenConditionalPipelineBindings {
         >>::static_modules(architecture);
         let recipes = static_transform_recipes(store)?;
         let mut units = Vec::new();
-        for (role, module) in [("vision", MlxModule::new(modules.vision.clone()))] {
+        {
+            let (role, module) = ("vision", MlxModule::new(modules.vision.clone()));
             let id = format!("qwen_conditional.static.{role}");
             if select(&id) {
                 units.push(StaticUnitBindings::new(
@@ -936,7 +937,7 @@ fn add_split_bank_companions(
         let up = format!("{root}.up_proj_{suffix}");
         if store.tensor_metadata(&gate).is_ok() && store.tensor_metadata(&up).is_ok() {
             planned.push(planned_expert_binding(
-                &format!("gate_up_proj_{suffix}"),
+                format!("gate_up_proj_{suffix}"),
                 DerivedWeightRecipe::Concatenate {
                     axis: 1,
                     inputs: vec![
@@ -950,7 +951,7 @@ fn add_split_bank_companions(
         let down = format!("{root}.down_proj_{suffix}");
         if store.tensor_metadata(&down).is_ok() {
             planned.push(planned_expert_binding(
-                &format!("down_proj_{suffix}"),
+                format!("down_proj_{suffix}"),
                 DerivedWeightRecipe::source(down, selection.clone()),
                 store,
             )?);
@@ -2551,7 +2552,7 @@ fn qwen35_value_head_recipe(
             .ok_or_else(|| {
                 Error::UnsupportedArchitecture("Qwen3.5 value-tail width overflow".into())
             })?;
-        if prefix >= shape[0] || (shape[0] - prefix) % num_v != 0 {
+        if prefix >= shape[0] || !(shape[0] - prefix).is_multiple_of(num_v) {
             return Ok(None);
         }
         let leading = DerivedWeightRecipe::Select {
@@ -2588,7 +2589,7 @@ fn qwen35_value_head_recipe(
     } else {
         0
     };
-    if axis >= shape.len() || shape[axis] % num_v != 0 {
+    if axis >= shape.len() || !shape[axis].is_multiple_of(num_v) {
         return Ok(None);
     }
     let admitted = suffix.ends_with("in_proj_z.weight")

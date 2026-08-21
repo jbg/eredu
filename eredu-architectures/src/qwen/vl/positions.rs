@@ -99,12 +99,13 @@ pub fn mrope_values(
         .collect::<Vec<_>>();
     let mut cosine = Vec::with_capacity(length * head_dim as usize);
     let mut sine = Vec::with_capacity(length * head_dim as usize);
-    for token in 0..length {
-        let axes = [
-            position_ids[0][token],
-            position_ids[1][token],
-            position_ids[2][token],
-        ];
+    for ((&first, &second), &third) in position_ids[0]
+        .iter()
+        .zip(&position_ids[1])
+        .zip(&position_ids[2])
+        .take(length)
+    {
+        let axes = [first, second, third];
         let angles = frequency
             .iter()
             .enumerate()

@@ -1002,13 +1002,15 @@ impl ResidencyController {
     }
 }
 
+type BindingLocation = (OffloadUnitId, String);
+type BindingAliasMap = BTreeMap<BindingLocation, BindingLocation>;
+
 fn validate_global_binding_aliases(
     units: &BTreeMap<OffloadUnitId, OffloadUnit>,
-) -> Result<BTreeMap<(OffloadUnitId, String), (OffloadUnitId, String)>, ResidencyControllerError> {
-    type Location = (OffloadUnitId, String);
-    let mut identities = BTreeMap::<String, Vec<Location>>::new();
-    let mut aliases = BTreeMap::<Location, String>::new();
-    let mut bytes = BTreeMap::<Location, u64>::new();
+) -> Result<BindingAliasMap, ResidencyControllerError> {
+    let mut identities = BTreeMap::<String, Vec<BindingLocation>>::new();
+    let mut aliases = BTreeMap::<BindingLocation, String>::new();
+    let mut bytes = BTreeMap::<BindingLocation, u64>::new();
     for (unit_id, unit) in units {
         for binding in unit.bindings() {
             let location = (unit_id.clone(), binding.name().to_owned());
@@ -1028,11 +1030,11 @@ fn validate_global_binding_aliases(
     }
 
     fn resolve(
-        location: &Location,
-        identities: &BTreeMap<String, Vec<Location>>,
-        aliases: &BTreeMap<Location, String>,
-        visiting: &mut BTreeSet<Location>,
-    ) -> Result<Location, ResidencyControllerError> {
+        location: &BindingLocation,
+        identities: &BTreeMap<String, Vec<BindingLocation>>,
+        aliases: &BTreeMap<BindingLocation, String>,
+        visiting: &mut BTreeSet<BindingLocation>,
+    ) -> Result<BindingLocation, ResidencyControllerError> {
         let Some(destination) = aliases.get(location) else {
             return Ok(location.clone());
         };

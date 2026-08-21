@@ -378,7 +378,7 @@ pub fn reference_flattened_patch_projection(
     output: usize,
     bias: Option<&[f32]>,
 ) -> Result<Vec<f32>, Error> {
-    if patches == 0 || output == 0 || input.len() % patches != 0 {
+    if patches == 0 || output == 0 || !input.len().is_multiple_of(patches) {
         return Err(Error::backend("invalid scalar patch projection geometry"));
     }
     let input_width = input.len() / patches;
@@ -519,6 +519,7 @@ pub fn reference_patch_convolution_2d(
 }
 
 /// Scalar reference for centroid-selected vocabulary projection.
+#[allow(clippy::too_many_arguments)] // Reference oracle mirrors the primitive's full contract.
 pub fn reference_masked_output_projection(
     hidden: &[f32],
     rows: usize,
@@ -534,7 +535,7 @@ pub fn reference_masked_output_projection(
     if rows == 0
         || hidden_size == 0
         || centroids == 0
-        || vocabulary % centroids != 0
+        || !vocabulary.is_multiple_of(centroids)
         || top_centroids == 0
         || top_centroids > centroids
         || hidden.len() != rows * hidden_size

@@ -460,10 +460,10 @@ fn add_block_at(
         hidden,
     );
     match policy {
-        HybridLayerPolicy::SelfAttention(_) => add_attention(config, &root, common)?,
-        HybridLayerPolicy::LinearAttention => add_linear_attention(config, &root, common, groups)?,
+        HybridLayerPolicy::SelfAttention(_) => add_attention(config, root, common)?,
+        HybridLayerPolicy::LinearAttention => add_linear_attention(config, root, common, groups)?,
     }
-    add_feed_forward(config, &root, common, groups)
+    add_feed_forward(config, root, common, groups)
 }
 
 fn add_attention(

@@ -594,7 +594,7 @@ fn bindings(
     let selected = names
         .iter()
         .filter_map(|name| {
-            let canonical = canonical_checkpoint_name(&name);
+            let canonical = canonical_checkpoint_name(name);
             recipes
                 .outputs
                 .get(&canonical)

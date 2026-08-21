@@ -681,7 +681,7 @@ impl InklingPipelinePartition {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<InklingIngressState, Error> {
-        let prepared = PreparedInklingInput::new(&self.args(), typed, stream)?;
+        let prepared = PreparedInklingInput::new(self.args(), typed, stream)?;
         let parts = prepared
             .tokens
             .iter()
@@ -1723,7 +1723,7 @@ impl Gemma4PipelinePartition {
         stream: &Stream,
     ) -> Result<Gemma4IngressState, Error> {
         crate::backend::mlx::runtime::media::input::validate(typed)?;
-        let prepared = Gemma4PreparedParts::new(&self.args(), typed, stream)?;
+        let prepared = Gemma4PreparedParts::new(self.args(), typed, stream)?;
         let parts = prepared.decoder_parts();
         let mut state = MlxHybridState::device(self.state_layout()?)?;
         let input = eredu_architectures::gemma4::ModelInput {
@@ -1811,7 +1811,7 @@ impl Gemma4PipelinePartition {
         stream: &Stream,
     ) -> Result<Gemma4IngressState, Error> {
         crate::backend::mlx::runtime::media::input::validate(typed)?;
-        let prepared = Gemma4PreparedParts::new(&self.args(), typed, stream)?;
+        let prepared = Gemma4PreparedParts::new(self.args(), typed, stream)?;
         let vision_hidden = prepared.vision_input().map(|input| input.patches.clone());
         let vision_state = prepared
             .vision_input()
@@ -5785,7 +5785,7 @@ impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let full = eredu_architectures::deepseek::v3::state_layout(&self.args())
+        let full = eredu_architectures::deepseek::v3::state_layout(self.args())
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let policies = full
             .layers()
@@ -5800,7 +5800,7 @@ impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
             topology,
             "deepseek_v3",
             &self.args().model_type,
-            eredu_architectures::deepseek::v3_architecture_fingerprint(&self.args()),
+            eredu_architectures::deepseek::v3_architecture_fingerprint(self.args()),
             self.args().num_hidden_layers as usize,
             self.range().clone(),
             layout.clone(),
@@ -6235,7 +6235,7 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let full = eredu_architectures::deepseek::v4::state_layout(&self.args())
+        let full = eredu_architectures::deepseek::v4::state_layout(self.args())
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let policies = full
             .layers()
@@ -6250,7 +6250,7 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
             topology,
             "deepseek_v4",
             &self.args().model_type,
-            eredu_architectures::deepseek::v4_architecture_fingerprint(&self.args()),
+            eredu_architectures::deepseek::v4_architecture_fingerprint(self.args()),
             self.args().num_hidden_layers as usize,
             self.range().clone(),
             layout.clone(),
@@ -6875,14 +6875,14 @@ impl PipelinePlacedIngress for Gemma4PipelinePartition {
             .groups()
             .iter()
             .enumerate()
-            .filter_map(|(index, group)| {
+            .filter(|(index, _)| {
                 matches!(
-                    self.group_kind(index),
+                    self.group_kind(*index),
                     eredu_runtime::ArchitectureGroupKind::VisionEncoder
                         | eredu_runtime::ArchitectureGroupKind::AudioEncoder
                 )
-                .then(|| group.id().to_owned())
             })
+            .map(|(_, group)| group.id().to_owned())
             .collect::<Vec<_>>();
         for group in media {
             self.execute_placed_media(&group, &mut state, execution, stream)?;
@@ -7348,13 +7348,16 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
             .state()
             .ok_or_else(|| Error::Parallel("Inkling partition has no runtime state".into()))?;
         let state_layout = partition_state.layout();
+        let topology_identity = if topology.tensor_parallel_size > 1 {
+            crate::backend::mlx::cache::prompt_cache_topology(topology)
+        } else {
+            Default::default()
+        };
         let complete = eredu_architectures::inkling::state_identity(
-            &self.args(),
+            self.args(),
             state_layout,
             partition_state.global_layer_offset(),
-            (topology.tensor_parallel_size > 1)
-                .then(|| crate::backend::mlx::cache::prompt_cache_topology(topology))
-                .unwrap_or_default(),
+            topology_identity,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?
         .prompt_cache_identity(state_layout)
@@ -7524,7 +7527,7 @@ impl PipelineEmbeddedMtp for InklingPipelinePartition {
         &self,
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
-        let layout = eredu_architectures::inkling::mtp_state_layout(&self.args())
+        let layout = eredu_architectures::inkling::mtp_state_layout(self.args())
             .map_err(|error| Error::Parallel(error.to_string()))?
             .ok_or_else(|| {
                 Error::UnsupportedArchitecture(
@@ -8079,7 +8082,7 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
             topology,
             "qwen3_vl",
             &self.args().model_type,
-            eredu_architectures::qwen::vl::prompt_cache_architecture_fingerprint(&self.args()),
+            eredu_architectures::qwen::vl::prompt_cache_architecture_fingerprint(self.args()),
             self.args().text.num_hidden_layers as usize,
             self.range().clone(),
             local,
@@ -9239,9 +9242,11 @@ impl PipelinePartitionMetadata for Lfm2PipelinePartition {
             .partition
             .state()
             .ok_or_else(|| Error::Parallel("LFM2 partition has no runtime state".into()))?;
-        let topology_identity = (topology.tensor_parallel_size > 1)
-            .then(|| crate::backend::mlx::cache::prompt_cache_topology(topology))
-            .unwrap_or_default();
+        let topology_identity = if topology.tensor_parallel_size > 1 {
+            crate::backend::mlx::cache::prompt_cache_topology(topology)
+        } else {
+            Default::default()
+        };
         let complete = eredu_architectures::lfm2::state_identity(
             self.args(),
             state.layout(),
@@ -9424,11 +9429,13 @@ impl PipelinePartitionMetadata for NemotronHPipelinePartition {
             .partition
             .state()
             .ok_or_else(|| Error::Parallel("Nemotron-H partition has no runtime state".into()))?;
-        let topology_identity = (topology.tensor_parallel_size > 1)
-            .then(|| crate::backend::mlx::cache::prompt_cache_topology(topology))
-            .unwrap_or_default();
+        let topology_identity = if topology.tensor_parallel_size > 1 {
+            crate::backend::mlx::cache::prompt_cache_topology(topology)
+        } else {
+            Default::default()
+        };
         let complete = eredu_architectures::nemotron_h::state_identity(
-            &self.args(),
+            self.args(),
             state.layout(),
             state.global_layer_offset(),
             topology_identity,
@@ -9626,9 +9633,11 @@ impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
             .partition
             .state()
             .ok_or_else(|| Error::Parallel("Kimi Linear partition has no runtime state".into()))?;
-        let topology_identity = (topology.tensor_parallel_size > 1)
-            .then(|| crate::backend::mlx::cache::prompt_cache_topology(topology))
-            .unwrap_or_default();
+        let topology_identity = if topology.tensor_parallel_size > 1 {
+            crate::backend::mlx::cache::prompt_cache_topology(topology)
+        } else {
+            Default::default()
+        };
         let complete = eredu_architectures::kimi_linear::state_identity(
             self.args(),
             state.layout(),
@@ -15245,7 +15254,6 @@ fn load_muse_glimmer_pipeline(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn load_neutral_qwen_vl_pipeline(
     source_args: eredu_architectures::qwen::vl::ModelArgs,
     store: SharedCheckpointSource,
@@ -15777,7 +15785,7 @@ fn load_neutral_qwen_vl_pipeline(
 
 impl QwenPipelinePartition {
     fn args(&self) -> &eredu_architectures::qwen::ModelArgs {
-        &self.architecture.args()
+        self.architecture.args()
     }
 
     fn new(
@@ -17206,7 +17214,6 @@ fn execute_pipeline_cached_nemotron_h(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn load_gpt_oss_pipeline(
     source_args: gpt_oss::ModelArgs,
     store: SharedCheckpointSource,
@@ -17606,7 +17613,7 @@ fn load_gpt_oss_pipeline(
 
 impl GptOssPipelinePartition {
     fn args(&self) -> &gpt_oss::ModelArgs {
-        &self.architecture.args()
+        self.architecture.args()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -18367,11 +18374,7 @@ fn load_nemotron_h_pipeline(
         .mtp_policies()
         .map_err(|error| Error::Parallel(error.to_string()))?
         .len();
-    let prediction_pattern = if prediction_steps == 0 {
-        0
-    } else {
-        prediction_units / prediction_steps
-    };
+    let prediction_pattern = prediction_units.checked_div(prediction_steps).unwrap_or(0);
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&global_architecture)?;
     let prediction_groups = (0..prediction_steps)
         .map(|depth| {
@@ -18485,7 +18488,7 @@ fn load_nemotron_h_pipeline(
         .collect::<Result<Vec<_>, _>>()?;
     let owns_mtp = stage.range().end == target_units && prediction_steps > 0;
     info.owns_embedded_mtp = owns_mtp;
-    info.embedded_mtp_layers = owns_mtp.then_some(prediction_steps).unwrap_or(0);
+    info.embedded_mtp_layers = if owns_mtp { prediction_steps } else { 0 };
     if owns_mtp {
         for &group in &prediction_groups {
             stage.prediction_layers.push(
@@ -19068,7 +19071,7 @@ impl NemotronHPipelinePartition {
         depth: usize,
         state: &mut MlxHybridState,
         execution: Option<&ParallelExecutionContext<'_>>,
-        mut execute: Option<&mut F>,
+        execute: Option<&mut F>,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Error>
     where
@@ -19092,7 +19095,7 @@ impl NemotronHPipelinePartition {
             hidden: prior,
             depth,
         };
-        let (logits, hidden) = if let Some(execute) = execute.as_deref_mut() {
+        let (logits, hidden) = if let Some(execute) = execute {
             let mut provider = ExpertExecutorProvider::new(execute);
             execute_neutral_routed_output_group(
                 &mut self.architecture,
@@ -19473,7 +19476,7 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
             topology,
             "qwen_hybrid",
             &self.args().model_type,
-            eredu_architectures::qwen::hybrid::prompt_cache_architecture_fingerprint(&self.args()),
+            eredu_architectures::qwen::hybrid::prompt_cache_architecture_fingerprint(self.args()),
             self.args().num_hidden_layers as usize,
             self.range().clone(),
             layout,

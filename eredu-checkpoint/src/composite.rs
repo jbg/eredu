@@ -198,7 +198,7 @@ impl ConvolutionKernelLayout {
             Self::TwoDimensional => 4,
             Self::FlattenedThreeDimensional => 5,
         };
-        if shape.len() != expected_rank || shape.iter().any(|dimension| *dimension == 0) {
+        if shape.len() != expected_rank || shape.contains(&0) {
             return Err(CompositeArtifactError::InvalidConvolutionShape {
                 layout: self,
                 shape: shape.to_vec(),

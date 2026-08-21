@@ -557,12 +557,12 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                 OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role("vision"), group)
             }))
             .collect::<Vec<_>>();
-        for group_index in 0..2 {
+        for (group_index, &count) in counts.iter().enumerate() {
             let group_id = layout
                 .group_id(group_index)
                 .expect("Qwen3-VL layout group")
                 .clone();
-            for index in 0..counts[group_index] {
+            for index in 0..count {
                 let unit = self.construct_unit(group_index, index, context)?;
                 let groups = match unit {
                     Unit::Vision(block) => block_parallel_parameter_groups(
@@ -933,10 +933,9 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             }
         }
         let mut positions = position_ids_tensor::<B::Tensor>(&positions, context)?;
-        let delta = if media || persisted_delta.is_none() {
-            B::Tensor::full_i32(computed_delta, &[1], context)?
-        } else {
-            persisted_delta.expect("checked persisted delta").clone()
+        let delta = match (media, persisted_delta) {
+            (false, Some(delta)) => delta.clone(),
+            _ => B::Tensor::full_i32(computed_delta, &[1], context)?,
         };
         if !media {
             positions = positions.add(&delta, context)?;
@@ -1649,22 +1648,20 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        if group == 0 && forward.vision_state.is_some() {
-            let output = self.static_modules.vision.finish(
-                hidden,
-                forward
-                    .vision_state
-                    .as_mut()
-                    .expect("validated vision state"),
-                context,
-            )?;
-            forward.deepstack = output.deepstack_features;
-            forward.vision_output = Some(output.embeddings);
-            return Ok(forward
-                .vision_output
-                .as_ref()
-                .expect("installed vision output")
-                .clone());
+        if group == 0 {
+            if let Some(vision_state) = forward.vision_state.as_mut() {
+                let output = self
+                    .static_modules
+                    .vision
+                    .finish(hidden, vision_state, context)?;
+                forward.deepstack = output.deepstack_features;
+                forward.vision_output = Some(output.embeddings);
+                return Ok(forward
+                    .vision_output
+                    .as_ref()
+                    .expect("installed vision output")
+                    .clone());
+            }
         }
         Ok(hidden.clone())
     }
@@ -1868,19 +1865,18 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        if group == 0 && forward.vision_state.is_some() {
-            let output = self.static_modules.vision.finish_parallel(
-                hidden,
-                forward
-                    .vision_state
-                    .as_mut()
-                    .expect("validated vision state"),
-                parallel,
-                context,
-            )?;
-            forward.deepstack = output.deepstack_features;
-            forward.vision_output = Some(output.embeddings);
-            return Ok(forward.vision_output.as_ref().unwrap().clone());
+        if group == 0 {
+            if let Some(vision_state) = forward.vision_state.as_mut() {
+                let output = self.static_modules.vision.finish_parallel(
+                    hidden,
+                    vision_state,
+                    parallel,
+                    context,
+                )?;
+                forward.deepstack = output.deepstack_features;
+                forward.vision_output = Some(output.embeddings);
+                return Ok(forward.vision_output.as_ref().unwrap().clone());
+            }
         }
         Ok(hidden.clone())
     }

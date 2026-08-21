@@ -69,7 +69,7 @@ pub use decision::{
     FullyForcedTailDecision, PredictionDirective, SequentialDecision, SequentialDecisionBoundary,
     SequentialDecisionDiagnostic, SequentialDecisionDriver, SequentialDecisionError,
     SequentialDecisionMode, SequentialDecisionPlan, SequentialDecisionPlanError,
-    SequentialDecisionSource, SequentialDecisionTraversal,
+    SequentialDecisionSource, SequentialDecisionTraversal, SequentialSamplingState,
 };
 pub use dense::{
     DenseCacheMetrics, DenseDiskStreamReport, DenseExecutionGroupReport, DensePassCounterSnapshot,

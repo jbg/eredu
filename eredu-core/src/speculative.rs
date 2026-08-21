@@ -1272,6 +1272,18 @@ pub struct PublishedSpeculativeVerification<TargetState, DraftState, Distributio
     pub status: SpeculativePublicationStatus<DraftState, Distribution>,
 }
 
+/// Publication result produced after a speculative verification commits.
+pub type PublishedSpeculativeResult<E, S> = Result<
+    PublishedSpeculativeVerification<
+        <E as SpeculativeExecutor>::TargetState,
+        <E as SpeculativeExecutor>::DraftState,
+        <S as SpeculativeSampling>::Distribution,
+        <S as SpeculativeSampling>::RandomState,
+        <E as SpeculativeExecutor>::Telemetry,
+    >,
+    SpeculativeDriverError<<E as SpeculativeExecutor>::Error>,
+>;
+
 /// Waits, resolves, commits, and only then publishes one verification.
 ///
 /// Portable sampler, sequence, constraint, telemetry, and optimistic state are
@@ -1288,16 +1300,7 @@ pub fn resolve_commit_and_publish<'a, E, S, C, P>(
     mut stats: MtpStats,
     options: MtpSchedulerOptions,
     context: E::Context<'a>,
-) -> Result<
-    PublishedSpeculativeVerification<
-        E::TargetState,
-        E::DraftState,
-        S::Distribution,
-        S::RandomState,
-        E::Telemetry,
-    >,
-    SpeculativeDriverError<E::Error>,
->
+) -> PublishedSpeculativeResult<E, S>
 where
     E: SpeculativeExecutor + 'a,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'a> = E::Context<'a>> + 'a,

@@ -1117,15 +1117,7 @@ impl<B: NeuralBackend> Attention<B> {
                 (query, key, value)
             }
         };
-        let query = query.reshape(
-            &[
-                batch,
-                sequence,
-                self.query_heads,
-                if self.query_output_gate { -1 } else { -1 },
-            ],
-            context,
-        )?;
+        let query = query.reshape(&[batch, sequence, self.query_heads, -1], context)?;
         let (query, output_gate) = if self.query_output_gate {
             let projected = query.dim(3);
             if projected <= 0 || projected % 2 != 0 {

@@ -459,12 +459,12 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
                 OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role("vision"), group)
             }))
             .collect::<Vec<_>>();
-        for group_index in 0..counts.len() {
+        for (group_index, &count) in counts.iter().enumerate() {
             let group_id = layout
                 .group_id(group_index)
                 .expect("conditional layout group")
                 .clone();
-            for index in 0..counts[group_index] {
+            for index in 0..count {
                 let unit = self.construct_unit(group_index, index, context)?;
                 let groups = match unit {
                     ConditionalUnit::Vision(block) => {
@@ -1559,15 +1559,16 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        if group == 0 && forward.vision_state.is_some() {
-            let output = self.static_modules.vision.finish(
-                hidden,
-                forward.vision_state.as_mut().expect("validated state"),
-                context,
-            )?;
-            forward.deepstack = output.deepstack_features;
-            forward.vision_output = Some(output.embeddings);
-            return Ok(forward.vision_output.as_ref().unwrap().clone());
+        if group == 0 {
+            if let Some(vision_state) = forward.vision_state.as_mut() {
+                let output = self
+                    .static_modules
+                    .vision
+                    .finish(hidden, vision_state, context)?;
+                forward.deepstack = output.deepstack_features;
+                forward.vision_output = Some(output.embeddings);
+                return Ok(forward.vision_output.as_ref().unwrap().clone());
+            }
         }
         if group == 1 || matches!(forward.mode, ForwardMode::Draft(depth) if group == depth + 2) {
             forward.target_hidden = Some(hidden.clone());
@@ -1832,16 +1833,18 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        if group == 0 && forward.vision_state.is_some() {
-            let output = self.static_modules.vision.finish_parallel(
-                hidden,
-                forward.vision_state.as_mut().expect("validated state"),
-                parallel,
-                context,
-            )?;
-            forward.deepstack = output.deepstack_features;
-            forward.vision_output = Some(output.embeddings);
-            return Ok(forward.vision_output.as_ref().unwrap().clone());
+        if group == 0 {
+            if let Some(vision_state) = forward.vision_state.as_mut() {
+                let output = self.static_modules.vision.finish_parallel(
+                    hidden,
+                    vision_state,
+                    parallel,
+                    context,
+                )?;
+                forward.deepstack = output.deepstack_features;
+                forward.vision_output = Some(output.embeddings);
+                return Ok(forward.vision_output.as_ref().unwrap().clone());
+            }
         }
         if group == 1 || matches!(forward.mode, ForwardMode::Draft(depth) if group == depth + 2) {
             forward.target_hidden = Some(hidden.clone());

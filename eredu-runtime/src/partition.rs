@@ -351,7 +351,7 @@ pub trait ArchitectureBoundary<T>: Sized {
             if !roles.insert(*role) {
                 return Err(ArchitectureBoundaryError::DuplicateTensorRole {
                     boundary: Self::IDENTITY,
-                    role: *role,
+                    role,
                 });
             }
         }

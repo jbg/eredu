@@ -181,6 +181,9 @@ where
     diagnostics: Vec<SequentialDecisionDiagnostic<B::Logits>>,
 }
 
+/// Sampler instances and optional backend randomness advanced by one decision pass.
+pub type SequentialSamplingState<S, R> = (Vec<S>, Option<R>);
+
 impl<B, S> SequentialDecisionDriver<B, S>
 where
     B: SamplingBackend,
@@ -391,7 +394,7 @@ where
     /// before atomically adopting these state components.
     pub fn finish_into_sampling_state(
         self,
-    ) -> Result<(Vec<S>, Option<B::RandomState>), SequentialDecisionError<B::Error>> {
+    ) -> Result<SequentialSamplingState<S, B::RandomState>, SequentialDecisionError<B::Error>> {
         self.finish()?;
         Ok((self.samplers, self.random))
     }

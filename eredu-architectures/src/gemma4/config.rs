@@ -200,8 +200,8 @@ impl ModelArgs {
         }
         let first_shared = (layers - shared) as usize;
         let mut key_as_value = None;
-        for layer in 0..first_shared {
-            if pattern[layer] {
+        for (layer, local) in pattern.iter().copied().enumerate().take(first_shared) {
+            if local {
                 continue;
             }
             let has_key = catalog.contains(&format!("blk.{layer}.attn_k.weight"));

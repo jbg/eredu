@@ -546,45 +546,46 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
             .iter()
             .map(|owned| owned.group().clone())
             .collect::<Vec<_>>();
-        let mut add_static = |role: &'static str, groups: Vec<_>| {
-            expected.extend(groups.iter().cloned());
-            owned.extend(groups.into_iter().map(|group| {
-                OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role(role), group)
-            }));
-        };
-        if let Some(vision) = &self.static_modules.vision {
-            add_static(
-                "vision",
-                vision_static_parameter_groups(vision).map_err(Error::backend)?,
-            );
+        {
+            let mut add_static = |role: &'static str, groups: Vec<_>| {
+                expected.extend(groups.iter().cloned());
+                owned.extend(groups.into_iter().map(|group| {
+                    OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role(role), group)
+                }));
+            };
+            if let Some(vision) = &self.static_modules.vision {
+                add_static(
+                    "vision",
+                    vision_static_parameter_groups(vision).map_err(Error::backend)?,
+                );
+            }
+            if let Some(projector) = &self.static_modules.vision_projection {
+                add_static(
+                    "vision_projection",
+                    modality_projection_parameter_groups("model.vision_projector", projector)
+                        .map_err(Error::backend)?,
+                );
+            }
+            if let Some(audio) = &self.static_modules.audio {
+                add_static(
+                    "audio",
+                    audio_static_parameter_groups(audio).map_err(Error::backend)?,
+                );
+            }
+            if let Some(projector) = &self.static_modules.audio_projection {
+                add_static(
+                    "audio_projection",
+                    modality_projection_parameter_groups("model.audio_projector", projector)
+                        .map_err(Error::backend)?,
+                );
+            }
         }
-        if let Some(projector) = &self.static_modules.vision_projection {
-            add_static(
-                "vision_projection",
-                modality_projection_parameter_groups("model.vision_projector", projector)
-                    .map_err(Error::backend)?,
-            );
-        }
-        if let Some(audio) = &self.static_modules.audio {
-            add_static(
-                "audio",
-                audio_static_parameter_groups(audio).map_err(Error::backend)?,
-            );
-        }
-        if let Some(projector) = &self.static_modules.audio_projection {
-            add_static(
-                "audio_projection",
-                modality_projection_parameter_groups("model.audio_projector", projector)
-                    .map_err(Error::backend)?,
-            );
-        }
-        drop(add_static);
-        for group_index in 0..3 {
+        for (group_index, &count) in counts.iter().enumerate() {
             let owner_group = layout
                 .group_id(group_index)
                 .expect("Gemma layout group")
                 .clone();
-            for index in 0..counts[group_index] {
+            for index in 0..count {
                 let groups = match group_index {
                     0 => vision_layer_parameter_groups(
                         &VisionLayer::<B>::new(
@@ -1816,7 +1817,7 @@ where
                 );
                 Ok(forward.audio_output.as_ref().unwrap().clone())
             }
-            0 | 1 | 2 => Ok(hidden.clone()),
+            0..=2 => Ok(hidden.clone()),
             _ => Err(Error::backend("invalid Gemma 4 execution group")),
         }
     }

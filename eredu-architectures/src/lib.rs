@@ -5,6 +5,13 @@
 //! kernels, caches, and collective implementations.
 
 #![warn(missing_docs)]
+// Architecture entry points intentionally expose complete execution context,
+// and neutral operator enums stay inline to avoid backend-visible indirection.
+#![allow(
+    clippy::large_enum_variant,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 /// Shared decoder mechanics used by backend-neutral text architectures.
 pub mod decoder;

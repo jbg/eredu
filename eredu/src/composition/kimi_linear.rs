@@ -672,7 +672,7 @@ pub(crate) fn expert_catalog(
                     let up = format!("{prefix}.up_proj{suffix}");
                     if keys.contains(&gate) && keys.contains(&up) {
                         planned.push(planned_expert_binding(
-                            &format!("gate_up_proj{suffix}"),
+                            format!("gate_up_proj{suffix}"),
                             DerivedWeightRecipe::Concatenate {
                                 axis: 1,
                                 inputs: vec![
@@ -686,7 +686,7 @@ pub(crate) fn expert_catalog(
                     let down = format!("{packed_down}{suffix}");
                     if keys.contains(&down) {
                         planned.push(planned_expert_binding(
-                            &format!("down_proj{suffix}"),
+                            format!("down_proj{suffix}"),
                             DerivedWeightRecipe::source(down, selection.clone()),
                             store,
                         )?);

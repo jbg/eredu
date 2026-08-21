@@ -70,7 +70,7 @@ impl RgbImage {
     pub fn new(pixels: Vec<u8>, width: u32, height: u32) -> Result<Self, MediaRequestError> {
         let expected = usize::try_from(width)
             .ok()
-            .and_then(|width| usize::try_from(height).ok().map(|height| (width, height)))
+            .zip(usize::try_from(height).ok())
             .and_then(|(width, height)| width.checked_mul(height))
             .and_then(|pixels| pixels.checked_mul(3))
             .unwrap_or(usize::MAX);

@@ -196,7 +196,7 @@ where
         .route_weights
         .reshape(&[-1, request.routes.route_weights.dim(-1)], stream)?;
     let output = execute(request.layer, &hidden, &expert_ids, &route_weights, stream)?;
-    Ok(output.reshape(&original_shape, stream)?)
+    output.reshape(&original_shape, stream)
 }
 
 impl<F> RoutedExpertProvider<MlxBackend> for ExpertExecutorProvider<'_, F>

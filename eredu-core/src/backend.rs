@@ -378,6 +378,12 @@ pub trait BackendSession<B: BackendProvider> {
     ) -> Result<Submission<Self::Output, Self::Completion>, B::Error>;
 }
 
+/// One submission produced by the selected backend session.
+pub type SessionSubmission<B> = Submission<
+    <<B as BackendProvider>::Session as BackendSession<B>>::Output,
+    <<B as BackendProvider>::Session as BackendSession<B>>::Completion,
+>;
+
 /// A prepared model, its selected backend, and its backend-owned session.
 ///
 /// This is the canonical client-side execution owner. Keeping the backend and
@@ -427,13 +433,7 @@ impl<B: BackendProvider> ModelRuntime<B> {
     pub fn prefill(
         &mut self,
         input: <B::Session as BackendSession<B>>::PrefillInput,
-    ) -> Result<
-        Submission<
-            <B::Session as BackendSession<B>>::Output,
-            <B::Session as BackendSession<B>>::Completion,
-        >,
-        B::Error,
-    > {
+    ) -> Result<SessionSubmission<B>, B::Error> {
         self.session.prefill(&self.backend, input)
     }
 
@@ -441,13 +441,7 @@ impl<B: BackendProvider> ModelRuntime<B> {
     pub fn decode(
         &mut self,
         input: <B::Session as BackendSession<B>>::DecodeInput,
-    ) -> Result<
-        Submission<
-            <B::Session as BackendSession<B>>::Output,
-            <B::Session as BackendSession<B>>::Completion,
-        >,
-        B::Error,
-    > {
+    ) -> Result<SessionSubmission<B>, B::Error> {
         self.session.decode(&self.backend, input)
     }
 }
@@ -775,6 +769,14 @@ where
     remaining_tokens: Option<usize>,
 }
 
+type ControlledGenerationResult<B, C> = Result<
+    <B as TextGenerationBackend>::Token,
+    ControlledTextGenerationError<
+        <B as BackendProvider>::Error,
+        <C as TokenFilterController>::Error,
+    >,
+>;
+
 impl<'a, B, C> ControlledTextGeneration<'a, B, C>
 where
     B: TextGenerationBackend,
@@ -853,9 +855,7 @@ where
         Ok(())
     }
 
-    fn next_output(
-        &mut self,
-    ) -> Option<Result<B::Token, ControlledTextGenerationError<B::Error, C::Error>>> {
+    fn next_output(&mut self) -> Option<ControlledGenerationResult<B, C>> {
         if self.remaining_tokens == Some(0) {
             self.step = None;
             return None;
@@ -1054,7 +1054,7 @@ pub trait DistributedBackend: BackendProvider {
     type DistributedSession: DistributedSession<Error = Self::Error>;
 
     /// Returns communication for a distributed model session.
-    fn distributed_session<'a>(session: &'a Self::Session) -> Option<&'a Self::DistributedSession>;
+    fn distributed_session(session: &Self::Session) -> Option<&Self::DistributedSession>;
 }
 
 #[cfg(test)]
@@ -1654,9 +1654,7 @@ mod tests {
     impl DistributedBackend for Mock {
         type DistributedSession = MockDistributed;
 
-        fn distributed_session<'a>(
-            session: &'a MockSession,
-        ) -> Option<&'a Self::DistributedSession> {
+        fn distributed_session(session: &MockSession) -> Option<&Self::DistributedSession> {
             session.distributed.as_ref()
         }
     }

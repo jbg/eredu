@@ -190,7 +190,7 @@ pub fn reference_expand_heads(
     target_heads: usize,
 ) -> Result<(Vec<f32>, Vec<usize>), Error> {
     let source_heads = shape.get(axis).copied().unwrap_or(0);
-    if source_heads == 0 || target_heads == 0 || target_heads % source_heads != 0 {
+    if source_heads == 0 || target_heads == 0 || !target_heads.is_multiple_of(source_heads) {
         return Err(Error::backend(format!(
             "invalid reference head expansion axis={axis} target={target_heads} shape={shape:?}"
         )));
@@ -1743,6 +1743,7 @@ pub struct ExpertProjectionSpec {
 
 /// Logical parameter layout for a gated-product expert bank.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Packed layout stays inline on the construction hot path.
 pub enum GatedProductExpertLayout {
     /// Component-major fused gate-then-up and down tensors whose leading axis
     /// indexes experts.

@@ -110,7 +110,7 @@ impl<B: NeuralBackend> VisionStatic<B> {
         hidden: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = self.final_norm.forward(&hidden, context)?;
+        let hidden = self.final_norm.forward(hidden, context)?;
         hidden.reshape(&[1, -1, self.hidden_size], context)
     }
 }

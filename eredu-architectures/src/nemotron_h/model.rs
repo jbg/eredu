@@ -322,12 +322,12 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                 )
             })
             .collect::<Vec<_>>();
-        for group_index in 0..counts.len() {
+        for (group_index, &count) in counts.iter().enumerate() {
             let owner_group = layout
                 .group_id(group_index)
                 .expect("Nemotron-H layout group")
                 .clone();
-            for index in 0..counts[group_index] {
+            for index in 0..count {
                 let unit = self.construct_unit(group_index, index, context)?;
                 let flat = if group_index == 0 {
                     index

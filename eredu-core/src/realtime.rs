@@ -76,6 +76,7 @@ impl<'de> Deserialize<'de> for RealtimeSpeechConfig {
 
 impl RealtimeSpeechConfig {
     /// Creates and validates portable realtime codec geometry.
+    #[allow(clippy::too_many_arguments)] // Public codec geometry is intentionally explicit.
     pub fn new(
         total_audio_codebooks: usize,
         input_audio_codebooks: usize,

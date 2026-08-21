@@ -386,11 +386,7 @@ fn execution_layout(args: &ModelArgs) -> Result<ExecutionUnitLayout, Error> {
     let policies = args
         .mtp_policies()
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let pattern = if steps == 0 {
-        0
-    } else {
-        policies.len() / steps
-    };
+    let pattern = policies.len().checked_div(steps).unwrap_or(0);
     let graph = ExecutionGraph::chain(
         std::iter::once("target".to_owned()).chain((0..steps).map(|depth| format!("mtp.{depth}"))),
     )

@@ -5,6 +5,17 @@
 
 #![warn(missing_docs)]
 #![cfg_attr(test, allow(dead_code))]
+// Backend execution boundaries intentionally pass complete runtime context;
+// concrete models remain unboxed; builder helpers can return typed builders;
+// explicit drops delimit provider borrows; and MLX completions are process-local.
+#![allow(
+    clippy::arc_with_non_send_sync,
+    clippy::drop_non_drop,
+    clippy::large_enum_variant,
+    clippy::new_ret_no_self,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 /// High-level model loading, dispatch, and request APIs.
 pub mod api;

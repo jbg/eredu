@@ -411,12 +411,12 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
                 OwnedParameterGroupSpec::new(ParameterGroupOwner::static_role("mtp"), group)
             }))
             .collect::<Vec<_>>();
-        for group_index in 0..2 {
+        for (group_index, &count) in counts.iter().enumerate() {
             let owner_group = layout
                 .group_id(group_index)
                 .expect("Inkling layout group")
                 .clone();
-            for index in 0..counts[group_index] {
+            for index in 0..count {
                 let groups = if group_index == 0 {
                     let vision = self
                         .args
