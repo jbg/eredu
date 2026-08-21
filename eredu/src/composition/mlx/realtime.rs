@@ -94,6 +94,11 @@ impl MlxRealtimeModel {
         self.model.source_config().artifact_profile()
     }
 
+    /// Returns parameter topology, residency, quantization, and materialization metadata.
+    pub fn metadata(&self) -> &eredu_runtime::LayerwiseModelMetadata {
+        self.model.metadata()
+    }
+
     /// Returns current residency telemetry for the selected parameter policy.
     pub fn residency_report(&self) -> Result<Option<eredu_runtime::ResidencyReport>, Error> {
         self.model.residency_report().map(Some)
@@ -1428,7 +1433,7 @@ mod tests {
                 ModelLoadOptions::default().with_weight_residency(residency),
             )
             .unwrap_or_else(|error| panic!("load tiny {execution:?} model: {error}"));
-            assert_eq!(model.model().model.metadata().residency(), execution);
+            assert_eq!(model.model().metadata().residency(), execution);
             assert_eq!(run_tiny_realtime_frames(&mut model), expected);
             let report = model
                 .model()
@@ -1459,7 +1464,7 @@ mod tests {
                 ModelLoadOptions::with_quantization(quantization),
             )
             .unwrap_or_else(|error| panic!("load-time {quantization:?} tiny model: {error}"));
-            let metadata = model.model().model.metadata();
+            let metadata = model.model().metadata();
             assert_eq!(metadata.quantization(), Some(quantization));
             let materialization = metadata
                 .materialization()
@@ -1490,7 +1495,7 @@ mod tests {
                 ModelLoadOptions::default(),
             )
             .unwrap_or_else(|error| panic!("load checkpoint-native {quantization:?}: {error}"));
-            let metadata = model.model().model.metadata();
+            let metadata = model.model().metadata();
             assert_eq!(metadata.quantization(), Some(quantization));
             assert_eq!(metadata.materialization(), None);
             assert_eq!(run_tiny_realtime_frames(&mut model), expected);

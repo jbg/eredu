@@ -113,17 +113,11 @@ impl MlxUnitFactory<MoshiUnit> for MoshiUnitFactory {
 /// Stable source-artifact and execution-topology identities for a loaded model.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MoshiModelIdentity {
-    artifact: String,
     source_architecture: String,
     execution_architecture: String,
 }
 
 impl MoshiModelIdentity {
-    /// Content identity of the source SafeTensors files.
-    pub fn artifact(&self) -> &str {
-        &self.artifact
-    }
-
     /// Fingerprint of the unmodified source artifact configuration.
     pub fn source_architecture(&self) -> &str {
         &self.source_architecture
@@ -417,7 +411,6 @@ pub fn load(
         Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
     };
     let identity = MoshiModelIdentity {
-        artifact: format!("{artifact_identity:?}"),
         source_architecture: source_config.architecture_fingerprint().to_owned(),
         execution_architecture: target_config.architecture_fingerprint().to_owned(),
     };
@@ -537,7 +530,6 @@ fn load_parallel(
         Execution::ParallelBounded(Box::new(LayerwiseRuntime::new(composition, policy)))
     };
     let identity = MoshiModelIdentity {
-        artifact: format!("{artifact_identity:?}"),
         source_architecture: source_config.architecture_fingerprint().to_owned(),
         execution_architecture: format!(
             "{};tp-rank={}/{}",

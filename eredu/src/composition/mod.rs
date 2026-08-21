@@ -26,7 +26,7 @@ pub(crate) mod llama;
 #[cfg(feature = "mlx")]
 pub mod mlx;
 #[cfg(feature = "mlx")]
-pub mod moshi;
+pub(crate) mod moshi;
 #[cfg(feature = "mlx")]
 pub(crate) mod moshi_parallel;
 #[cfg(feature = "mlx")]
@@ -36,7 +36,7 @@ pub(crate) mod muse_glimmer_expert;
 #[cfg(feature = "mlx-image")]
 pub(crate) mod muse_glimmer_processor;
 #[cfg(feature = "mlx")]
-pub mod nemotron_h;
+pub(crate) mod nemotron_h;
 #[cfg(feature = "mlx")]
 pub(crate) mod qwen;
 
