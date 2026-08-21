@@ -6,6 +6,7 @@ use eredu_nn::{
 };
 
 use crate::ExpertPass;
+use crate::{ActivationObserver, RoutingObservation};
 
 /// One architecture route batch submitted to a runtime expert provider.
 pub struct RoutedExpertRequest<'a, T> {
@@ -162,6 +163,176 @@ where
         let _ = partitions;
         self.forward_relu2_routed(resident_bank, request, context)
             .map(RoutedExpertTensorParallelOutput::Complete)
+    }
+}
+
+/// Stable routing metadata supplied by an architecture composition at one
+/// canonical unit boundary.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RoutedObservationPoint {
+    path: String,
+    expert_count: i32,
+}
+
+impl RoutedObservationPoint {
+    /// Creates one routed observation point.
+    pub fn new(path: impl Into<String>, expert_count: i32) -> Self {
+        Self {
+            path: path.into(),
+            expert_count,
+        }
+    }
+
+    /// Returns the stable routed-module path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the total number of routed experts.
+    pub const fn expert_count(&self) -> i32 {
+        self.expert_count
+    }
+}
+
+/// Failure from either canonical expert execution or its observation hook.
+#[derive(Debug)]
+pub enum ObservedExpertProviderError<P, O> {
+    /// The wrapped provider rejected or failed the expert request.
+    Provider(P),
+    /// The observer rejected the normalized routing event.
+    Observer(O),
+}
+
+impl<P, O> std::fmt::Display for ObservedExpertProviderError<P, O>
+where
+    P: std::fmt::Display,
+    O: std::fmt::Display,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider(error) => write!(formatter, "routed expert provider failed: {error}"),
+            Self::Observer(error) => write!(formatter, "routed expert observer failed: {error}"),
+        }
+    }
+}
+
+impl<P, O> std::error::Error for ObservedExpertProviderError<P, O>
+where
+    P: std::error::Error + 'static,
+    O: std::error::Error + 'static,
+{
+}
+
+/// Decorates a routed provider with normalized routing observation.
+///
+/// The decorator sees the exact request and output of canonical provider
+/// execution. It therefore adds observation without reimplementing a model
+/// family's block, routing, shape, or residency lifecycle. Tensor-parallel
+/// requests are delegated without an event because their provider result may
+/// still require an architecture-owned reduction before it is observable.
+pub struct ObservedExpertProvider<'a, P, O: ?Sized, E> {
+    provider: &'a mut P,
+    observer: &'a mut O,
+    point: RoutedObservationPoint,
+    error: std::marker::PhantomData<fn() -> E>,
+}
+
+impl<'a, P, O: ?Sized, E> ObservedExpertProvider<'a, P, O, E> {
+    /// Wraps `provider` for one canonical routed module invocation.
+    pub fn new(provider: &'a mut P, observer: &'a mut O, point: RoutedObservationPoint) -> Self {
+        Self {
+            provider,
+            observer,
+            point,
+            error: std::marker::PhantomData,
+        }
+    }
+
+    fn observe<T, ObservationError>(
+        &mut self,
+        routes: &eredu_nn::RoutingResult<T>,
+        output: &T,
+    ) -> Result<(), ObservationError>
+    where
+        O: ActivationObserver<T, ObservationError>,
+    {
+        self.observer.observe_routing(RoutingObservation {
+            path: self.point.path(),
+            selected_experts: &routes.expert_ids,
+            selected_scores: &routes.selected_scores,
+            route_weights: &routes.route_weights,
+            routed_output: output,
+            local_routed_output: None,
+            reduced_routed_output: None,
+            shared_output: None,
+            combined_output: None,
+            expert_count: self.point.expert_count(),
+        })
+    }
+}
+
+impl<B, P, O, E> RoutedExpertProvider<B> for ObservedExpertProvider<'_, P, O, E>
+where
+    B: RoutedNeuralBackend,
+    P: RoutedExpertProvider<B>,
+    O: ActivationObserver<B::Tensor, E> + ?Sized,
+{
+    type Error = ObservedExpertProviderError<P::Error, E>;
+
+    fn forward_routed(
+        &mut self,
+        resident_bank: &mut B::GatedProductExpertBank,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        let routes = request.routes;
+        let output = self
+            .provider
+            .forward_routed(resident_bank, request, context)
+            .map_err(ObservedExpertProviderError::Provider)?;
+        self.observe(routes, &output)
+            .map_err(ObservedExpertProviderError::Observer)?;
+        Ok(output)
+    }
+
+    fn forward_routed_tensor_parallel(
+        &mut self,
+        resident_bank: &mut B::GatedProductExpertBank,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        self.provider
+            .forward_routed_tensor_parallel(resident_bank, request, partitions, context)
+            .map_err(ObservedExpertProviderError::Provider)
+    }
+
+    fn forward_relu2_routed(
+        &mut self,
+        resident_bank: &mut B::Relu2ExpertBank,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        let routes = request.routes;
+        let output = self
+            .provider
+            .forward_relu2_routed(resident_bank, request, context)
+            .map_err(ObservedExpertProviderError::Provider)?;
+        self.observe(routes, &output)
+            .map_err(ObservedExpertProviderError::Observer)?;
+        Ok(output)
+    }
+
+    fn forward_relu2_routed_tensor_parallel(
+        &mut self,
+        resident_bank: &mut B::Relu2ExpertBank,
+        request: RoutedExpertRequest<'_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        self.provider
+            .forward_relu2_routed_tensor_parallel(resident_bank, request, partitions, context)
+            .map_err(ObservedExpertProviderError::Provider)
     }
 }
 

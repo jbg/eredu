@@ -76,6 +76,33 @@ pub type Cache = MlxKeyValueState;
 type NeutralBlock = eredu_architectures::gpt_oss::TransformerBlock<MlxBackend>;
 type NeutralArchitecture = eredu_architectures::gpt_oss::LayeredModel<MlxBackend>;
 
+struct NeutralGptOssObserver<'a> {
+    inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+}
+
+impl eredu_runtime::ActivationObserver<Array, eredu_nn::Error> for NeutralGptOssObserver<'_> {
+    fn observe(&mut self, path: &str, value: &Array) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .observe(path, value)
+            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+    }
+
+    fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, eredu_nn::Error> {
+        self.inner
+            .intervene(path, value)
+            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+    }
+
+    fn observe_routing(
+        &mut self,
+        routing: eredu_runtime::RoutingObservation<'_, Array>,
+    ) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .observe_routing(routing)
+            .map_err(|error| eredu_nn::Error::backend(error.to_string()))
+    }
+}
+
 fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Result<(), Error> {
     let transport = <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
         MlxBackend,
@@ -1412,6 +1439,7 @@ impl GptOssModel {
         observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
     ) -> Result<Array, Error> {
         let expert_cache = self.expert_cache.take();
+        let mut observer = NeutralGptOssObserver { inner: observer };
         let result = match expert_cache.as_ref() {
             Some(expert_cache) => {
                 let args = self.args.clone();
@@ -1422,7 +1450,7 @@ impl GptOssModel {
                     cache,
                     &mut provider,
                     stream,
-                    observer,
+                    &mut observer,
                 )
             }
             None => {
@@ -1433,7 +1461,7 @@ impl GptOssModel {
                     cache,
                     &mut provider,
                     stream,
-                    observer,
+                    &mut observer,
                 )
             }
         };
@@ -1448,7 +1476,7 @@ impl GptOssModel {
         cache: &mut Cache,
         provider: &mut P,
         stream: &Stream,
-        observer: &mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
+        observer: &mut NeutralGptOssObserver<'_>,
     ) -> Result<Array, Error>
     where
         P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
@@ -1460,43 +1488,45 @@ impl GptOssModel {
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let parameter_root = self.args.parameter_root.clone();
-        let input = eredu_architectures::decoder::LayeredInput {
-            tokens: inputs,
-            mask,
-        };
-        let hook = |architecture: &mut NeutralArchitecture,
-                    _group: usize,
-                    index: usize,
-                    block: &mut NeutralBlock,
-                    hidden: &Array,
-                    state: &mut Cache,
-                    forward: &mut eredu_architectures::gpt_oss::ForwardContext<Array>,
-                    context: &Stream| {
-            let path = format!("{parameter_root}.layers.{index}");
-            let hidden =
-                eredu_runtime::observe_and_intervene(observer, &format!("{path}.input"), hidden)
-                    .map_err(|error| eredu_nn::Error::backend(error.to_string()))?;
-            let output = architecture.forward_block_with_feed_forward(
-                index,
-                block,
-                &hidden,
-                state,
-                forward,
-                context,
-                |mlp, normalized, context| {
-                    mlp.forward_with_provider(normalized, pass, provider, context)
-                },
-            )?;
-            eredu_runtime::observe_and_intervene(observer, &format!("{path}.output"), &output)
-                .map_err(|error| eredu_nn::Error::backend(error.to_string()))
-        };
+        let expert_count = self.args.num_local_experts;
         let output = match &mut self.execution {
             GptOssExecution::Resident(runtime) => runtime
-                .forward_with_unit_executor(input, cache, stream, hook)
+                .forward_with_routed_observer(
+                    eredu_architectures::decoder::LayeredInput {
+                        tokens: inputs,
+                        mask,
+                    },
+                    cache,
+                    pass,
+                    provider,
+                    stream,
+                    observer,
+                    |path, _, _| {
+                        Some(eredu_runtime::RoutedObservationPoint::new(
+                            format!("{path}.mlp"),
+                            expert_count,
+                        ))
+                    },
+                )
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
             GptOssExecution::Layerwise(runtime) => runtime
-                .forward_with_unit_executor(input, cache, stream, hook)
+                .forward_with_routed_observer(
+                    eredu_architectures::decoder::LayeredInput {
+                        tokens: inputs,
+                        mask,
+                    },
+                    cache,
+                    pass,
+                    provider,
+                    stream,
+                    observer,
+                    |path, _, _| {
+                        Some(eredu_runtime::RoutedObservationPoint::new(
+                            format!("{path}.mlp"),
+                            expert_count,
+                        ))
+                    },
+                )
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
             GptOssExecution::TensorParallelResident(_)
             | GptOssExecution::TensorParallelLayerwise(_) => {

@@ -1,7 +1,6 @@
 //! Unified Qwen/Mistral loading across weight-residency policies.
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::{
     CausalModel, ExecutionGraph, ExecutionResidency, ExecutionUnitLayout, LayerWeightResidency,
     LayerwiseRuntime, RuntimeState, WeightResidency,
@@ -154,91 +153,6 @@ impl eredu_runtime::ActivationObserver<Array, eredu_nn::Error> for NeutralQwenOb
             .observe_routing(routing)
             .map_err(|error| eredu_nn::Error::backend(error.to_string()))
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn forward_qwen_observed_unit(
-    architecture: &mut NeutralArchitecture,
-    args: &ModelArgs,
-    _group: usize,
-    index: usize,
-    block: &mut NeutralBlock,
-    hidden: &Array,
-    state: &mut MlxKeyValueState,
-    forward: &mut eredu_architectures::qwen::ForwardContext<Array>,
-    stream: &Stream,
-    observer: &mut NeutralQwenObserver<'_>,
-) -> Result<Array, eredu_nn::Error> {
-    let path = format!("{}.layers.{index}", args.parameter_root);
-    observer.observe(&format!("{path}.input"), hidden)?;
-    let mut output = architecture.forward_block_with_feed_forward(
-        index,
-        block,
-        hidden,
-        state,
-        forward,
-        stream,
-        |policy, normalized, context| {
-            policy.forward_observed(
-                &format!("{path}.mlp"),
-                args.num_experts,
-                normalized,
-                context,
-                observer,
-            )
-        },
-    )?;
-    output = eredu_runtime::observe_and_intervene(observer, &format!("{path}.output"), &output)?;
-    Ok(output)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn forward_qwen_cached_observed_unit(
-    architecture: &mut NeutralArchitecture,
-    args: &ModelArgs,
-    expert_cache: &ExpertCache,
-    pass: eredu_runtime::ExpertPass,
-    _group: usize,
-    index: usize,
-    block: &mut NeutralBlock,
-    hidden: &Array,
-    state: &mut MlxKeyValueState,
-    forward: &mut eredu_architectures::qwen::ForwardContext<Array>,
-    stream: &Stream,
-    observer: &mut NeutralQwenObserver<'_>,
-) -> Result<Array, eredu_nn::Error> {
-    let path = format!("{}.layers.{index}", args.parameter_root);
-    let mut provider = expert::cached_provider(expert_cache, args);
-    observer.observe(&format!("{path}.input"), hidden)?;
-    let mut output = architecture.forward_block_with_feed_forward(
-        index,
-        block,
-        hidden,
-        state,
-        forward,
-        stream,
-        |policy, normalized, context| {
-            let shape = normalized.shape().to_vec();
-            let flat = normalized
-                .reshape(&[-1, normalized.dim(-1)], context)
-                .map_err(eredu_nn::Error::backend)?;
-            policy
-                .forward_observed_with_provider(
-                    &format!("{path}.mlp"),
-                    index,
-                    pass,
-                    args.num_experts,
-                    &flat,
-                    context,
-                    observer,
-                    &mut provider,
-                )?
-                .reshape(&shape, context)
-                .map_err(eredu_nn::Error::backend)
-        },
-    )?;
-    output = eredu_runtime::observe_and_intervene(observer, &format!("{path}.output"), &output)?;
-    Ok(output)
 }
 
 fn decoder_unit_layout(layer_count: usize) -> Result<ExecutionUnitLayout, Error> {
@@ -686,91 +600,31 @@ impl QwenModel {
         };
         let expert_cache = self.expert_cache.take();
         let mut observer = NeutralQwenObserver { inner: observer };
-        let result = match &mut self.execution {
-            QwenExecution::TensorParallelResident(_)
-            | QwenExecution::TensorParallelLayerwise(_) => Err(Error::Parallel(
-                "tensor-parallel observation requires its collective execution context".into(),
-            )),
-            QwenExecution::Resident(execution) => execution
-                .forward_with_unit_executor(
-                    eredu_architectures::qwen::LayeredInput {
-                        tokens: inputs,
-                        mask,
-                    },
+        let result = match expert_cache.as_ref() {
+            Some(expert_cache) => {
+                let mut provider = expert::cached_provider(expert_cache, &args);
+                self.forward_observed_with_provider(
+                    inputs,
+                    mask,
                     cache,
+                    pass,
+                    &mut provider,
                     stream,
-                    |architecture, group, index, block, hidden, state, forward, stream| {
-                        match expert_cache.as_ref() {
-                            Some(expert_cache) => forward_qwen_cached_observed_unit(
-                                architecture,
-                                &args,
-                                expert_cache,
-                                pass,
-                                group,
-                                index,
-                                block,
-                                hidden,
-                                state,
-                                forward,
-                                stream,
-                                &mut observer,
-                            ),
-                            None => forward_qwen_observed_unit(
-                                architecture,
-                                &args,
-                                group,
-                                index,
-                                block,
-                                hidden,
-                                state,
-                                forward,
-                                stream,
-                                &mut observer,
-                            ),
-                        }
-                    },
+                    &mut observer,
                 )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
-            QwenExecution::Layerwise(execution) => execution
-                .forward_with_unit_executor(
-                    eredu_architectures::qwen::LayeredInput {
-                        tokens: inputs,
-                        mask,
-                    },
+            }
+            None => {
+                let mut provider = eredu_runtime::ResidentExpertProvider;
+                self.forward_observed_with_provider(
+                    inputs,
+                    mask,
                     cache,
+                    pass,
+                    &mut provider,
                     stream,
-                    |architecture, group, index, block, hidden, state, forward, stream| {
-                        match expert_cache.as_ref() {
-                            Some(expert_cache) => forward_qwen_cached_observed_unit(
-                                architecture,
-                                &args,
-                                expert_cache,
-                                pass,
-                                group,
-                                index,
-                                block,
-                                hidden,
-                                state,
-                                forward,
-                                stream,
-                                &mut observer,
-                            ),
-                            None => forward_qwen_observed_unit(
-                                architecture,
-                                &args,
-                                group,
-                                index,
-                                block,
-                                hidden,
-                                state,
-                                forward,
-                                stream,
-                                &mut observer,
-                            ),
-                        }
-                    },
+                    &mut observer,
                 )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+            }
         };
         self.expert_cache = expert_cache;
         let output = result?;
@@ -779,6 +633,67 @@ impl QwenModel {
             .observe("model.logits", &output)
             .map_err(Error::from)?;
         Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_observed_with_provider<P>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut MlxKeyValueState,
+        pass: eredu_runtime::ExpertPass,
+        provider: &mut P,
+        stream: &Stream,
+        observer: &mut NeutralQwenObserver<'_>,
+    ) -> Result<Array, Error>
+    where
+        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P::Error: std::fmt::Display,
+    {
+        let expert_count = self.args.num_experts;
+        match &mut self.execution {
+            QwenExecution::Resident(runtime) => runtime.forward_with_routed_observer(
+                eredu_architectures::qwen::LayeredInput {
+                    tokens: inputs,
+                    mask,
+                },
+                cache,
+                pass,
+                provider,
+                stream,
+                observer,
+                |path, _, _| {
+                    Some(eredu_runtime::RoutedObservationPoint::new(
+                        format!("{path}.mlp"),
+                        expert_count,
+                    ))
+                },
+            ),
+            QwenExecution::Layerwise(runtime) => runtime.forward_with_routed_observer(
+                eredu_architectures::qwen::LayeredInput {
+                    tokens: inputs,
+                    mask,
+                },
+                cache,
+                pass,
+                provider,
+                stream,
+                observer,
+                |path, _, _| {
+                    Some(eredu_runtime::RoutedObservationPoint::new(
+                        format!("{path}.mlp"),
+                        expert_count,
+                    ))
+                },
+            ),
+            QwenExecution::TensorParallelResident(_)
+            | QwenExecution::TensorParallelLayerwise(_) => {
+                return Err(Error::Parallel(
+                    "tensor-parallel observation requires its collective execution context".into(),
+                ))
+            }
+        }
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 
     /// Runs a rank-local tensor-parallel forward pass.

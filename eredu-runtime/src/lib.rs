@@ -84,8 +84,9 @@ pub use execution::{
 pub use expert::{
     combine_routed_expert_tensor_parallel, combine_tensor_parallel_expert_outputs,
     reduce_routed_expert_tensor_parallel, reduce_tensor_parallel_expert_output,
-    ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
-    RoutedExpertTensorParallelOutput,
+    ObservedExpertProvider, ObservedExpertProviderError, ResidentExpertProvider,
+    RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
+    RoutedObservationPoint,
 };
 pub use generation::{
     CausalModel, ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler,

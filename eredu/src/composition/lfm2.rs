@@ -9,10 +9,10 @@ use std::{
 use eredu_architectures::lfm2::{Block, LayeredModel, ModelArgs};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
-    ActivationObserver, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionGraph,
-    ExecutionUnitLayout, ExpertIdentity, LayerWeightResidency, LayerwiseModelMetadata,
-    LayerwiseRuntime, OffloadUnit, PagedCacheOptions, ParallelModelInfo, ParameterRole,
-    ResidencyReport, StaticUnitBindings, WeightBinding, WeightResidency,
+    CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionGraph, ExecutionUnitLayout,
+    ExpertIdentity, LayerWeightResidency, LayerwiseModelMetadata, LayerwiseRuntime, OffloadUnit,
+    PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport, StaticUnitBindings,
+    WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -1382,45 +1382,35 @@ impl Lfm2Model {
             eredu_runtime::ExpertPass::Decode
         };
         let expert_count = self.args.num_experts;
-        let input = eredu_architectures::decoder::LayeredInput { tokens, mask };
-        let hook = |architecture: &mut NeutralArchitecture,
-                    _group: usize,
-                    index: usize,
-                    block: &mut NeutralBlock,
-                    hidden: &Array,
-                    state: &mut MlxHybridState,
-                    forward: &mut eredu_architectures::lfm2::ForwardContext<Array>,
-                    context: &Stream| {
-            let path = format!("model.layers.{index}");
-            observer.observe(&format!("{path}.input"), hidden)?;
-            let output = architecture.forward_block_with_feed_forward(
-                index,
-                block,
-                hidden,
-                state,
-                forward,
-                context,
-                |policy, normalized, context| {
-                    policy.forward_observed_with_provider(
-                        &format!("{path}.feed_forward"),
-                        expert_count,
-                        normalized,
-                        pass,
-                        context,
-                        observer,
-                        provider,
-                    )
-                },
-            )?;
-            eredu_runtime::observe_and_intervene(observer, &format!("{path}.output"), &output)
-        };
         match &mut self.execution {
-            Lfm2Execution::Resident(runtime) => {
-                runtime.forward_with_unit_executor(input, cache, stream, hook)
-            }
-            Lfm2Execution::Layerwise(runtime) => {
-                runtime.forward_with_unit_executor(input, cache, stream, hook)
-            }
+            Lfm2Execution::Resident(runtime) => runtime.forward_with_routed_observer(
+                eredu_architectures::decoder::LayeredInput { tokens, mask },
+                cache,
+                pass,
+                provider,
+                stream,
+                observer,
+                |path, _, _| {
+                    Some(eredu_runtime::RoutedObservationPoint::new(
+                        format!("{path}.feed_forward"),
+                        expert_count,
+                    ))
+                },
+            ),
+            Lfm2Execution::Layerwise(runtime) => runtime.forward_with_routed_observer(
+                eredu_architectures::decoder::LayeredInput { tokens, mask },
+                cache,
+                pass,
+                provider,
+                stream,
+                observer,
+                |path, _, _| {
+                    Some(eredu_runtime::RoutedObservationPoint::new(
+                        format!("{path}.feed_forward"),
+                        expert_count,
+                    ))
+                },
+            ),
             _ => {
                 return Err(Error::Parallel(
                     "tensor-parallel LFM2 observation requires distributed observation".into(),

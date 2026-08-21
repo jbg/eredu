@@ -2151,6 +2151,80 @@ fn tiny_qwen_neutral_runtime_executes_resident_and_bounded_layers() {
 }
 
 #[test]
+fn tiny_qwen_moe_observation_wraps_canonical_routed_execution() {
+    #[derive(Default)]
+    struct QwenObserver {
+        activations: Vec<String>,
+        routes: Vec<String>,
+    }
+
+    impl eredu_runtime::ActivationObserver<Array, safemlx::error::Exception> for QwenObserver {
+        fn observe(&mut self, path: &str, _value: &Array) -> Result<(), safemlx::error::Exception> {
+            self.activations.push(path.to_string());
+            Ok(())
+        }
+
+        fn observe_routing(
+            &mut self,
+            routing: eredu_runtime::RoutingObservation<'_, Array>,
+        ) -> Result<(), safemlx::error::Exception> {
+            self.routes.push(routing.path.to_string());
+            Ok(())
+        }
+    }
+
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let weights_stream = weights_context.stream();
+    let dir = temp_model_dir(
+        r#"{
+              "model_type":"qwen3_moe","hidden_size":16,"num_hidden_layers":2,
+              "intermediate_size":24,"moe_intermediate_size":8,
+              "num_experts":4,"num_experts_per_tok":2,"norm_topk_prob":true,
+              "num_attention_heads":4,"num_key_value_heads":2,
+              "head_dim":4,"rms_norm_eps":0.00001,"vocab_size":24,
+              "max_position_embeddings":64,"rope_theta":10000.0,
+              "tie_word_embeddings":false,"rope_scaling":null
+            }"#,
+    );
+    let args = crate::composition::qwen::load_model_args(&dir).unwrap();
+    save_zero_qwen_checkpoint(&args, &dir, stream);
+    let mut model = crate::composition::qwen::load_qwen_safetensors_mlx(
+        &dir,
+        eredu_runtime::WeightResidency::fully_resident(),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let mut cache = model.new_cache();
+    let mut observer = QwenObserver::default();
+    let logits = model
+        .forward_with_observer(&tokens, None, &mut cache, stream, &mut observer)
+        .unwrap();
+    safemlx::transforms::eval([&logits]).unwrap();
+
+    assert_eq!(logits.shape(), &[1, 2, 24]);
+    assert_eq!(
+        observer.activations,
+        [
+            "model.layers.0.input",
+            "model.layers.0.output",
+            "model.layers.1.input",
+            "model.layers.1.output",
+            "model.logits",
+        ]
+    );
+    assert_eq!(
+        observer.routes,
+        ["model.layers.0.mlp", "model.layers.1.mlp"]
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn tiny_hybrid_qwen_neutral_runtime_executes_recurrent_and_attention_layers() {
     let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));

@@ -5,8 +5,9 @@
 use eredu_nn::{NeuralBackend, Parameterized};
 
 use crate::{
-    ExecutionGraph, ExecutionGroupSchedule, ExecutionUnitLayout, ExpertPass, RoutedExpertProvider,
-    RuntimeState, SubmissionBackend,
+    observe_and_intervene, ActivationObserver, ExecutionGraph, ExecutionGroupSchedule,
+    ExecutionUnitLayout, ExpertPass, ObservedExpertProvider, RoutedExpertProvider,
+    RoutedObservationPoint, RuntimeState, SubmissionBackend,
 };
 
 /// Backend-native activation and architecture-owned forward context.
@@ -1097,6 +1098,64 @@ where
             |_, _, _| Ok(()),
         )
         .map(|(output, _)| output)
+    }
+
+    /// Runs canonical provider-backed unit execution with unit-boundary and
+    /// routed-expert observation.
+    ///
+    /// Observation wraps [`RoutedLayeredArchitecture::forward_unit_with_provider`]
+    /// instead of replacing it. Architecture-owned validation, state lookup,
+    /// shape handling, routing, and provider dispatch therefore remain shared
+    /// with ordinary execution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_routed_observer<'a, Provider, Observer, Point>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        pass: ExpertPass,
+        provider: &mut Provider,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut Observer,
+        mut observation_point: Point,
+    ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        B: eredu_nn::RoutedNeuralBackend,
+        A: RoutedLayeredArchitecture<B, S>,
+        A::Error: std::fmt::Display,
+        Provider: RoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+        Point: FnMut(&str, usize, usize) -> Option<RoutedObservationPoint>,
+    {
+        self.forward_with_unit_executor(
+            input,
+            state,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, context| {
+                let path = architecture.unit_path(group, index)?;
+                let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
+                let output = match observation_point(&path, group, index) {
+                    Some(point) => {
+                        let mut observed = ObservedExpertProvider::new(provider, observer, point);
+                        architecture.forward_unit_with_provider(
+                            group,
+                            index,
+                            unit,
+                            &input,
+                            state,
+                            forward,
+                            pass,
+                            &mut observed,
+                            context,
+                        )?
+                    }
+                    None => architecture.forward_unit_with_provider(
+                        group, index, unit, &input, state, forward, pass, provider, context,
+                    )?,
+                };
+                observe_and_intervene(observer, &format!("{path}.output"), &output)
+            },
+        )
     }
 
     /// Runs one pass with both a custom unit executor and post-unit context hook.

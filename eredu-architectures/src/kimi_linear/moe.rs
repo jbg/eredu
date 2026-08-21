@@ -294,58 +294,6 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
             }
         }
     }
-
-    /// Executes with stable activation and routing observations.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_observed_with_provider<O, P>(
-        &mut self,
-        path: &str,
-        expert_count: i32,
-        input: &B::Tensor,
-        pass: eredu_runtime::ExpertPass,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-        provider: &mut P,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error>,
-        P: RoutedExpertProvider<B>,
-        P::Error: std::fmt::Display,
-    {
-        match self {
-            Self::Dense(dense) => dense.forward(input, context),
-            Self::Sparse(sparse) => {
-                let routes = sparse.router.route(input, context)?;
-                let routed = provider
-                    .forward_routed(
-                        &mut sparse.experts,
-                        RoutedExpertRequest {
-                            layer: sparse.layer,
-                            input,
-                            routes: &routes,
-                            pass,
-                        },
-                        context,
-                    )
-                    .map_err(|error| Error::backend(error.to_string()))?;
-                let shared = sparse.shared.forward(input, context)?;
-                let combined = routed.add(&shared, context)?;
-                observer.observe_routing(eredu_runtime::RoutingObservation {
-                    path,
-                    selected_experts: &routes.expert_ids,
-                    selected_scores: &routes.selected_scores,
-                    route_weights: &routes.route_weights,
-                    routed_output: &routed,
-                    local_routed_output: None,
-                    reduced_routed_output: None,
-                    shared_output: Some(&shared),
-                    combined_output: Some(&combined),
-                    expert_count,
-                })?;
-                Ok(combined)
-            }
-        }
-    }
 }
 
 impl<B: RoutedNeuralBackend> FeedForwardOperator<B> for FeedForward<B> {

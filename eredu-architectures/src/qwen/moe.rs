@@ -172,52 +172,6 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
         }
     }
 
-    /// Executes the selected feed-forward policy and emits normalized routing
-    /// data for routed blocks without changing the ordinary hot path.
-    pub fn forward_observed<O>(
-        &mut self,
-        path: &str,
-        expert_count: i32,
-        input: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error>,
-    {
-        match self {
-            Self::Dense(mlp) => mlp.forward_feed_forward(input, context),
-            Self::Routed(moe) => {
-                let routes = moe.router.route(input, context)?;
-                let mut provider = ResidentExpertProvider;
-                let output = RoutedExpertProvider::<B>::forward_routed(
-                    &mut provider,
-                    &mut moe.experts,
-                    RoutedExpertRequest {
-                        layer: moe.layer,
-                        input,
-                        routes: &routes,
-                        pass: inferred_expert_pass(input),
-                    },
-                    context,
-                )?;
-                observer.observe_routing(eredu_runtime::RoutingObservation {
-                    path,
-                    selected_experts: &routes.expert_ids,
-                    selected_scores: &routes.selected_scores,
-                    route_weights: &routes.route_weights,
-                    routed_output: &output,
-                    local_routed_output: None,
-                    reduced_routed_output: None,
-                    shared_output: None,
-                    combined_output: None,
-                    expert_count,
-                })?;
-                Ok(output)
-            }
-        }
-    }
-
     /// Executes through a runtime-owned routed-expert provider.
     ///
     /// Dense blocks retain their ordinary static path. Routed blocks submit
@@ -251,57 +205,6 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
                         context,
                     )
                     .map_err(Error::backend)
-            }
-        }
-    }
-
-    /// Provider-backed execution with normalized route observation.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_observed_with_provider<O, P>(
-        &mut self,
-        path: &str,
-        layer: usize,
-        pass: ExpertPass,
-        expert_count: i32,
-        input: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-        provider: &mut P,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: eredu_runtime::ActivationObserver<B::Tensor, Error>,
-        P: RoutedExpertProvider<B>,
-        P::Error: std::fmt::Display,
-    {
-        match self {
-            Self::Dense(mlp) => mlp.forward_feed_forward(input, context),
-            Self::Routed(moe) => {
-                let routes = moe.router.route(input, context)?;
-                let output = provider
-                    .forward_routed(
-                        &mut moe.experts,
-                        RoutedExpertRequest {
-                            layer,
-                            input,
-                            routes: &routes,
-                            pass,
-                        },
-                        context,
-                    )
-                    .map_err(Error::backend)?;
-                observer.observe_routing(eredu_runtime::RoutingObservation {
-                    path,
-                    selected_experts: &routes.expert_ids,
-                    selected_scores: &routes.selected_scores,
-                    route_weights: &routes.route_weights,
-                    routed_output: &output,
-                    local_routed_output: None,
-                    reduced_routed_output: None,
-                    shared_output: None,
-                    combined_output: None,
-                    expert_count,
-                })?;
-                Ok(output)
             }
         }
     }
