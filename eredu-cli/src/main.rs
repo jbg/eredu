@@ -462,6 +462,10 @@ struct Cli {
     #[arg(long, value_name = "EFFORT")]
     reasoning_effort: Option<String>,
 
+    /// Suppress reasoning content while retaining generated answers and diagnostics.
+    #[arg(long)]
+    hide_reasoning: bool,
+
     /// Allow `--thinking on` to fall back to unparsed raw response text.
     #[arg(long)]
     allow_unparsed_reasoning: bool,
@@ -767,8 +771,15 @@ enum ReasoningOutput {
 }
 
 impl ReasoningOutput {
-    fn for_streams(verbose: bool, stdout_is_terminal: bool, stderr_is_terminal: bool) -> Self {
-        if verbose {
+    fn for_streams(
+        verbose: bool,
+        hide_reasoning: bool,
+        stdout_is_terminal: bool,
+        stderr_is_terminal: bool,
+    ) -> Self {
+        if hide_reasoning {
+            Self::Hidden
+        } else if verbose {
             Self::Verbose
         } else if !stdout_is_terminal {
             Self::Hidden
@@ -2251,8 +2262,12 @@ fn main() -> Result<()> {
     let mut reasoning_stream = ReasoningStream::default();
     let stdout = io::stdout();
     let stderr = io::stderr();
-    let reasoning_output =
-        ReasoningOutput::for_streams(args.verbose, stdout.is_terminal(), stderr.is_terminal());
+    let reasoning_output = ReasoningOutput::for_streams(
+        args.verbose,
+        args.hide_reasoning,
+        stdout.is_terminal(),
+        stderr.is_terminal(),
+    );
     let mut stdout = stdout.lock();
 
     if args.verbose && prepared_chat.is_none() {
@@ -4169,21 +4184,38 @@ mod tests {
 
     #[test]
     fn reasoning_output_follows_stdout_terminal_and_colors_only_terminal_stderr() {
+        let args = Cli::try_parse_from([
+            "eredu",
+            "--model",
+            "model-id",
+            "--verbose",
+            "--hide-reasoning",
+            "prompt",
+        ])
+        .unwrap();
+        assert!(args.verbose);
+        assert!(args.hide_reasoning);
+
         assert_eq!(
-            ReasoningOutput::for_streams(false, false, true),
+            ReasoningOutput::for_streams(false, false, false, true),
             ReasoningOutput::Hidden
         );
         assert_eq!(
-            ReasoningOutput::for_streams(false, true, false),
+            ReasoningOutput::for_streams(false, false, true, false),
             ReasoningOutput::InteractivePlain
         );
         assert_eq!(
-            ReasoningOutput::for_streams(false, true, true),
+            ReasoningOutput::for_streams(false, false, true, true),
             ReasoningOutput::InteractiveDimmed
         );
         assert_eq!(
-            ReasoningOutput::for_streams(true, false, false),
+            ReasoningOutput::for_streams(true, false, false, false),
             ReasoningOutput::Verbose
+        );
+        assert_eq!(
+            ReasoningOutput::for_streams(true, true, true, true),
+            ReasoningOutput::Hidden,
+            "--hide-reasoning must override --verbose reasoning output"
         );
     }
 
