@@ -1124,6 +1124,11 @@ pub struct QwenHybridModel {
 }
 
 impl QwenHybridModel {
+    /// Complete validated text and optional vision architecture policy.
+    pub fn parsed_args(&self) -> &ParsedHybridConfig {
+        &self.parsed
+    }
+
     /// Validated neutral text policy.
     pub fn args(&self) -> &HybridConfig {
         &self.parsed.text

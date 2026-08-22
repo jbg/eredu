@@ -1,29 +1,18 @@
 //! MLX model capability derivation, resource observation, and admission adapter.
 
-use std::{collections::BTreeMap, num::NonZeroU8};
+use std::num::NonZeroU8;
 
-use eredu_architectures::{
-    gemma4, gpt_oss, kimi_linear, lfm2,
-    llama::ModelArgs as LlamaModelArgs,
-    nemotron_h,
-    qwen::{
-        hybrid::{HybridConfig as QwenHybridConfig, HybridLayerPolicy as QwenHybridLayerPolicy},
-        vision::{VisionAttentionPolicy, VisionConfig},
-        ModelArgs as QwenModelArgs, QwenVariant,
-    },
-};
+use eredu_architectures::qwen::vision::{VisionAttentionPolicy, VisionConfig};
 use eredu_core::{
-    estimate_runtime_state, AvailableMemory, CacheStateStrategy, CapabilityError,
-    EstimationCompleteness, GrowingState, InputModalities, InputTokenCount, ModelCapabilities,
+    estimate_runtime_state, AvailableMemory, CapabilityError, InputTokenCount, ModelCapabilities,
     ModelCapabilityBackend, ModelRuntime, ObservationKind, Observed, PhysicalMemorySemantics,
-    RuntimeStateEstimate, SlidingWindowLayerCount, StateLayout, StaticMemoryReport,
+    RuntimeStateEstimate, StateLayout, StaticMemoryReport,
 };
-use eredu_nn::RopeValue;
 use safemlx::{Array, Stream};
 
 use super::{MlxBackend, MlxModelInput, MlxModelSession, Model};
 use crate::backend::mlx::runtime::media::input::{self, InputPayload, Modality};
-use eredu_core::{attention::AttentionPolicy, residency::MemoryTier};
+use eredu_core::residency::MemoryTier;
 
 fn positive(value: i32, field: &'static str) -> Result<u64, CapabilityError> {
     u64::try_from(value).map_err(|_| CapabilityError::InvalidConfiguration {
@@ -68,1034 +57,36 @@ fn estimate_mlx_runtime_state(
     )
 }
 
-fn config_number(config: &std::collections::HashMap<String, RopeValue>, key: &str) -> Option<f32> {
-    match config.get(key) {
-        Some(RopeValue::Float(value)) => Some(*value),
-        Some(RopeValue::String(value)) => value.parse().ok(),
-        Some(RopeValue::Bool(_)) | None => None,
-    }
-}
-
-fn context_from_rope(
-    effective: i32,
-    rope: Option<&std::collections::HashMap<String, RopeValue>>,
-) -> Result<(Observed<u64>, Observed<u64>), CapabilityError> {
-    let effective = positive(effective, "max_position_embeddings")?;
-    let original =
-        match rope.and_then(|rope| config_number(rope, "original_max_position_embeddings")) {
-            Some(value)
-                if value.is_finite()
-                    && value > 0.0
-                    && value.fract() == 0.0
-                    && value <= u64::MAX as f32 =>
-            {
-                Some(value as u64)
-            }
-            Some(_) => {
-                return Ok((
-                    Observed::Unsupported {
-                        reason: "RoPE original context is not a positive integer".into(),
-                    },
-                    Observed::Available {
-                        value: effective,
-                        kind: ObservationKind::Exact,
-                        source: "validated model configuration".into(),
-                    },
-                ))
-            }
-            None => None,
-        };
-    let native = original.unwrap_or(effective);
-    let effective = if original.is_none() {
-        match rope
-            .and_then(|rope| config_number(rope, "factor"))
-            .filter(|factor| factor.is_finite() && *factor > 1.0)
-        {
-            Some(factor) => {
-                let scaled = effective as f64 * f64::from(factor);
-                if !scaled.is_finite() || scaled.fract() != 0.0 || scaled > u64::MAX as f64 {
-                    return Ok((
-                        Observed::Available {
-                            value: native,
-                            kind: ObservationKind::Exact,
-                            source: "validated model configuration".into(),
-                        },
-                        Observed::Unsupported {
-                            reason:
-                                "RoPE factor does not produce an exact integer effective context"
-                                    .into(),
-                        },
-                    ));
-                }
-                scaled as u64
-            }
-            None => effective,
-        }
-    } else {
-        effective
-    };
-    Ok((
-        Observed::Available {
-            value: native,
-            kind: ObservationKind::Exact,
-            source: "validated model configuration".into(),
-        },
-        Observed::Available {
-            value: effective,
-            kind: ObservationKind::Exact,
-            source: "validated model configuration and supported RoPE setup".into(),
-        },
-    ))
-}
-
-fn plain_context(maximum: i32) -> Result<(Observed<u64>, Observed<u64>), CapabilityError> {
-    context_from_rope(maximum, None)
-}
-
-fn kv_scalars(kv_heads: i32, head_dim: i32) -> Result<u64, CapabilityError> {
-    let one = checked_mul(
-        positive(kv_heads, "num_key_value_heads")?,
-        positive(head_dim, "head_dim")?,
-        "K/V heads times head dimension",
-    )?;
-    checked_mul(one, 2, "key plus value scalars")
-}
-
-fn text_modalities() -> InputModalities {
-    InputModalities::TEXT
-}
-
 impl Model {
-    fn capabilities_and_estimate(
+    fn architecture_capability_estimate(
         &self,
-    ) -> Result<(ModelCapabilities, StateLayout), CapabilityError> {
-        let model_type = self.model_type().to_string();
-        let result = match self {
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, CapabilityError> {
+        use eredu_architectures::capability;
+
+        match self {
             Self::DeepSeek(model) => {
                 if let Some(args) = model.v3_args() {
-                    neutral_deepseek_v3_spec(args)?
+                    capability::deepseek_v3(args)
                 } else {
-                    neutral_deepseek_v4_spec(model.v4_args().expect("DeepSeek family"))?
+                    capability::deepseek_v4(model.v4_args().expect("DeepSeek family"))
                 }
             }
-            Self::Llama(model) => llama_spec(model.args(), false)?,
-            Self::Qwen(model) => qwen_spec(model.args(), false)?,
-            Self::MuseGlimmer(model) => muse_glimmer_spec(model.args())?,
-            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => qwen_spec(&model.args().text, true)?,
-            Self::GptOss(model) => gpt_oss_spec(model.args())?,
-            Self::Gemma4(model) => {
-                let args = model.args();
-                gemma4_spec(
-                    &args.text,
-                    InputModalities {
-                        text: true,
-                        image: args.image_token_id.is_some(),
-                        audio: args.audio_token_id.is_some(),
-                        video: args.video_token_id.is_some(),
-                    },
-                )?
-            }
-            Self::Inkling(model) => inkling_spec(model.args())?,
-            Self::KimiLinear(model) => kimi_linear_spec(model.args())?,
-            Self::Lfm2(model) => lfm2_spec(model.args())?,
-            Self::NemotronH(model) => nemotron_spec(model.args())?,
+            Self::Llama(model) => capability::llama(model.args()),
+            Self::Qwen(model) => capability::qwen(model.args()),
+            Self::MuseGlimmer(model) => capability::muse_glimmer(model.args()),
+            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => capability::qwen_vl(model.args()),
+            Self::GptOss(model) => capability::gpt_oss(model.args()),
+            Self::Gemma4(model) => capability::gemma4(model.args()),
+            Self::Inkling(model) => capability::inkling(model.args()),
+            Self::KimiLinear(model) => capability::kimi_linear(model.args()),
+            Self::Lfm2(model) => capability::lfm2(model.args()),
+            Self::NemotronH(model) => capability::nemotron_h(model.args()),
             Self::Qwen3Next(model) | Self::Qwen35(model) => {
-                qwen_hybrid_spec(model.args(), model.vision_spatial_merge_size().is_some())?
+                capability::qwen_hybrid(model.parsed_args())
             }
-        };
-        let (native_max_context, effective_max_context, state_strategy, modalities, estimate) =
-            result;
-        Ok((
-            ModelCapabilities {
-                model_type,
-                native_max_context,
-                effective_max_context,
-                state_strategy,
-                modalities,
-                estimation: if modalities.image || modalities.audio || modalities.video {
-                    EstimationCompleteness::Conservative
-                } else {
-                    estimate.completeness
-                },
-            },
-            estimate,
-        ))
-    }
-}
-
-type Spec = (
-    Observed<u64>,
-    Observed<u64>,
-    CacheStateStrategy,
-    InputModalities,
-    StateLayout,
-);
-
-fn llama_spec(args: &LlamaModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
-    let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
-    let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
-    let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
-    if args.attention_schedule.len() != layers as usize {
-        return Err(CapabilityError::InvalidConfiguration {
-            field: "attention_schedule",
-            detail: format!(
-                "has {} layers, expected {layers}",
-                args.attention_schedule.len()
-            ),
-        });
-    }
-    let full = args.attention_schedule.full_layer_count() as u64;
-    let sliding = args
-        .attention_schedule
-        .sliding_windows()
-        .into_iter()
-        .map(|(window, layers)| SlidingWindowLayerCount {
-            layers: layers as u64,
-            window: u64::from(window.get()),
-        })
-        .collect::<Vec<_>>();
-    let base = match (full, sliding.as_slice()) {
-        (_, []) => CacheStateStrategy::FullKv,
-        (0, [only]) => CacheStateStrategy::SlidingKv {
-            window: only.window,
-        },
-        _ => CacheStateStrategy::MixedKv {
-            full_layers: full,
-            sliding: sliding.clone(),
-        },
-    };
-    let strategy = if multimodal {
-        CacheStateStrategy::Multimodal {
-            decoder: Box::new(base),
-            media_consumes_decoder_positions: true,
-        }
-    } else {
-        base
-    };
-    let completeness = EstimationCompleteness::Complete;
-    Ok((
-        context.0,
-        context.1,
-        strategy,
-        if multimodal {
-            InputModalities {
-                text: true,
-                image: true,
-                audio: false,
-                video: true,
-            }
-        } else {
-            text_modalities()
-        },
-        StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing: std::iter::once(GrowingState {
-                layers: full,
-                scalars_per_position: scalars,
-                window: None,
-            })
-            .filter(|state| state.layers > 0)
-            .chain(sliding.into_iter().map(|group| GrowingState {
-                layers: group.layers,
-                scalars_per_position: scalars,
-                window: Some(group.window),
-            }))
-            .collect(),
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 1,
-            completeness,
-        },
-    ))
-}
-
-fn qwen_spec(args: &QwenModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
-    let mut spec = llama_spec(
-        &LlamaModelArgs {
-            model_type: args.model_type.clone(),
-            hidden_size: args.hidden_size,
-            num_hidden_layers: args.num_hidden_layers,
-            intermediate_size: args.intermediate_size,
-            num_attention_heads: args.num_attention_heads,
-            rms_norm_eps: args.rms_norm_eps,
-            vocab_size: args.vocab_size,
-            num_key_value_heads: args.num_key_value_heads,
-            max_position_embeddings: args.max_position_embeddings,
-            rope_theta: args.rope_theta,
-            rope_traditional: false,
-            head_dim: args.head_dim,
-            tie_word_embeddings: args.tie_word_embeddings,
-            attention_bias: args.variant == QwenVariant::Qwen2,
-            mlp_bias: false,
-            rope_scaling: args.rope_scaling.clone(),
-            attention_schedule: args.attention_schedule.clone(),
-            quantization: None,
-            quantization_config: None,
-            quantized_weights: None,
-            quantized_weight_configs: None,
-        },
-        multimodal,
-    )?;
-    let full_layers = args.attention_schedule.full_layer_count() as u64;
-    let sliding = args
-        .attention_schedule
-        .sliding_windows()
-        .into_iter()
-        .map(|(window, layers)| SlidingWindowLayerCount {
-            window: u64::from(window.get()),
-            layers: layers as u64,
-        })
-        .collect::<Vec<_>>();
-    if !sliding.is_empty() {
-        let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
-        spec.2 = if full_layers == 0 && sliding.len() == 1 {
-            CacheStateStrategy::SlidingKv {
-                window: sliding[0].window,
-            }
-        } else {
-            CacheStateStrategy::MixedKv {
-                full_layers,
-                sliding: sliding.clone(),
-            }
-        };
-        spec.4.growing = std::iter::once(GrowingState {
-            layers: full_layers,
-            scalars_per_position: scalars,
-            window: None,
-        })
-        .filter(|state| state.layers > 0)
-        .chain(sliding.into_iter().map(|group| GrowingState {
-            layers: group.layers,
-            scalars_per_position: scalars,
-            window: Some(group.window),
-        }))
-        .collect();
-    }
-    Ok(spec)
-}
-
-fn muse_glimmer_spec(
-    args: &eredu_architectures::muse_glimmer::DecoderConfig,
-) -> Result<Spec, CapabilityError> {
-    let context = plain_context(args.max_position_embeddings)?;
-    let full_layers = args.attention_schedule.full_layer_count() as u64;
-    let sliding = args
-        .attention_schedule
-        .sliding_windows()
-        .into_iter()
-        .map(|(window, layers)| SlidingWindowLayerCount {
-            window: u64::from(window.get()),
-            layers: layers as u64,
-        })
-        .collect::<Vec<_>>();
-    let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
-    let state_strategy = CacheStateStrategy::MixedKv {
-        full_layers,
-        sliding: sliding.clone(),
-    };
-    let growing = std::iter::once(GrowingState {
-        layers: full_layers,
-        scalars_per_position: scalars,
-        window: None,
-    })
-    .filter(|state| state.layers > 0)
-    .chain(sliding.into_iter().map(|group| GrowingState {
-        layers: group.layers,
-        scalars_per_position: scalars,
-        window: Some(group.window),
-    }))
-    .collect();
-    Ok((
-        context.0,
-        context.1,
-        state_strategy,
-        InputModalities {
-            text: true,
-            image: true,
-            audio: false,
-            video: args.weight_convention
-                == eredu_architectures::muse_glimmer::WeightConvention::HuggingFace,
-        },
-        StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing,
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        },
-    ))
-}
-
-fn neutral_deepseek_v3_spec(
-    args: &eredu_architectures::deepseek::V3Args,
-) -> Result<Spec, CapabilityError> {
-    let effective = positive(args.max_position_embeddings, "max_position_embeddings")?;
-    let native = args
-        .rope_scaling
-        .as_ref()
-        .map(|rope| {
-            positive(
-                rope.original_max_position_embeddings,
-                "original_max_position_embeddings",
-            )
-        })
-        .transpose()?
-        .unwrap_or(effective);
-    let layers = u64::try_from(args.layer_schedule.len()).map_err(|_| {
-        CapabilityError::InvalidConfiguration {
-            field: "layer_schedule",
-            detail: "decoder layer count exceeds runtime-state accounting range".into(),
-        }
-    })?;
-    let latent = positive(args.kv_lora_rank, "kv_lora_rank")?;
-    let rotary = positive(args.qk_rope_head_dim, "qk_rope_head_dim")?;
-    Ok((
-        Observed::Available {
-            value: native,
-            kind: ObservationKind::Exact,
-            source: "validated neutral DeepSeek YaRN configuration".into(),
-        },
-        Observed::Available {
-            value: effective,
-            kind: ObservationKind::Exact,
-            source: "validated neutral DeepSeek configuration".into(),
-        },
-        CacheStateStrategy::CompressedMla {
-            latent_width: latent,
-            rotary_width: rotary,
-        },
-        text_modalities(),
-        StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing: vec![GrowingState {
-                layers,
-                scalars_per_position: checked_add(latent, rotary, "MLA latent plus rotary width")?,
-                window: None,
-            }],
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 256,
-            completeness: EstimationCompleteness::Complete,
-        },
-    ))
-}
-
-fn neutral_deepseek_v4_spec(
-    args: &eredu_architectures::deepseek::V4Args,
-) -> Result<Spec, CapabilityError> {
-    let effective = positive(args.max_position_embeddings, "max_position_embeddings")?;
-    let native = args
-        .rope_scaling
-        .as_ref()
-        .map(|rope| {
-            positive(
-                rope.original_max_position_embeddings,
-                "original_max_position_embeddings",
-            )
-        })
-        .transpose()?
-        .unwrap_or(effective);
-    let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
-    let compressed = args
-        .attention_schedule
-        .iter()
-        .filter(|policy| {
-            matches!(
-                policy,
-                eredu_architectures::deepseek::V4AttentionPolicy::Compressed { .. }
-            )
-        })
-        .count() as u64;
-    let head_dim = positive(args.head_dim, "head_dim")?;
-    Ok((
-        Observed::Available {
-            value: native,
-            kind: ObservationKind::Exact,
-            source: "validated neutral DeepSeek-V4 YaRN configuration".into(),
-        },
-        Observed::Available {
-            value: effective,
-            kind: ObservationKind::Exact,
-            source: "validated neutral DeepSeek-V4 configuration".into(),
-        },
-        CacheStateStrategy::MixedKv {
-            full_layers: compressed,
-            sliding: vec![SlidingWindowLayerCount {
-                layers,
-                window: positive(args.sliding_window, "sliding_window")?,
-            }],
-        },
-        text_modalities(),
-        StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing: vec![
-                GrowingState {
-                    layers,
-                    scalars_per_position: head_dim,
-                    window: Some(positive(args.sliding_window, "sliding_window")?),
-                },
-                GrowingState {
-                    layers: compressed,
-                    scalars_per_position: head_dim,
-                    window: None,
-                },
-            ],
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 128,
-            completeness: EstimationCompleteness::Conservative,
-        },
-    ))
-}
-
-fn kimi_linear_spec(args: &kimi_linear::ModelArgs) -> Result<Spec, CapabilityError> {
-    let context = plain_context(args.model_max_length)?;
-    let attention = args
-        .layer_schedule
-        .iter()
-        .filter(|policy| policy.attention == kimi_linear::AttentionKind::Mla)
-        .count() as u64;
-    let recurrent = args.layer_schedule.len() as u64 - attention;
-    let heads = positive(args.kda_config.num_heads, "kda_config.num_heads")?;
-    let head_dim = positive(args.kda_config.head_dim, "kda_config.head_dim")?;
-    let projection = checked_mul(heads, head_dim, "KDA projected width")?;
-    let conv_state = checked_mul(
-        checked_mul(
-            positive(
-                args.kda_config.short_conv_kernel_size - 1,
-                "kda_config.short_conv_kernel_size",
-            )?,
-            projection,
-            "KDA convolution history width",
-        )?,
-        3,
-        "KDA Q/K/V convolution states",
-    )?;
-    let recurrent_state = checked_mul(
-        checked_mul(heads, head_dim, "KDA recurrent heads times key width")?,
-        head_dim,
-        "KDA recurrent state",
-    )?;
-    let fixed = checked_mul(
-        recurrent,
-        checked_add(conv_state, recurrent_state, "KDA fixed layer state")?,
-        "all KDA fixed state",
-    )?;
-    let mla_width = checked_add(
-        positive(args.kv_lora_rank, "kv_lora_rank")?,
-        positive(args.qk_rope_head_dim, "qk_rope_head_dim")?,
-        "Kimi MLA latent plus identity positional width",
-    )?;
-    Ok((
-        context.0,
-        context.1,
-        CacheStateStrategy::HybridRecurrent {
-            full_attention_layers: attention,
-            sliding_attention: Vec::new(),
-            recurrent_layers: recurrent,
-        },
-        text_modalities(),
-        StateLayout {
-            fixed_scalars_per_batch: fixed,
-            growing: vec![GrowingState {
-                layers: attention,
-                scalars_per_position: mla_width,
-                window: None,
-            }],
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 256,
-            completeness: EstimationCompleteness::Complete,
-        },
-    ))
-}
-
-fn gpt_oss_spec(args: &gpt_oss::ModelArgs) -> Result<Spec, CapabilityError> {
-    let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
-    positive(args.num_hidden_layers, "num_hidden_layers")?;
-    let full = args.attention_schedule.full_layer_count() as u64;
-    let sliding = args
-        .attention_schedule
-        .sliding_windows()
-        .into_iter()
-        .map(|(window, layers)| SlidingWindowLayerCount {
-            layers: layers as u64,
-            window: u64::from(window.get()),
-        })
-        .collect::<Vec<_>>();
-    let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
-    let state_strategy = match (full, sliding.as_slice()) {
-        (_, []) => CacheStateStrategy::FullKv,
-        (0, [only]) => CacheStateStrategy::SlidingKv {
-            window: only.window,
-        },
-        _ => CacheStateStrategy::MixedKv {
-            full_layers: full,
-            sliding: sliding.clone(),
-        },
-    };
-    Ok((
-        context.0,
-        context.1,
-        state_strategy,
-        text_modalities(),
-        StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing: std::iter::once(GrowingState {
-                layers: full,
-                scalars_per_position: scalars,
-                window: None,
-            })
-            .filter(|state| state.layers > 0)
-            .chain(sliding.into_iter().map(|group| GrowingState {
-                layers: group.layers,
-                scalars_per_position: scalars,
-                window: Some(group.window),
-            }))
-            .collect(),
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        },
-    ))
-}
-
-fn gemma4_spec(
-    args: &gemma4::ModelArgs,
-    modalities: InputModalities,
-) -> Result<Spec, CapabilityError> {
-    let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
-    let layers = args.num_hidden_layers() as u64;
-    let shared = args
-        .layer_schedule
-        .iter()
-        .filter(|policy| !policy.key_value.owns_state())
-        .count() as u64;
-    let cached = layers - shared;
-    let mut sliding_by_window = BTreeMap::<u64, u64>::new();
-    for policy in args.layer_schedule.iter() {
-        if let Some(window) = policy.attention.window() {
-            *sliding_by_window
-                .entry(u64::from(window.get()))
-                .or_default() += 1;
         }
     }
-    let total_sliding = sliding_by_window.values().sum::<u64>();
-    let full_attention_layers = layers - total_sliding;
-    let sliding_attention = sliding_by_window
-        .into_iter()
-        .map(|(window, layers)| SlidingWindowLayerCount { window, layers })
-        .collect();
-    let decoder = if shared > 0 || total_sliding > 0 {
-        CacheStateStrategy::SharedFullKv {
-            cached_layers: cached,
-            shared_layers: shared,
-            full_attention_layers,
-            sliding_attention,
-        }
-    } else {
-        CacheStateStrategy::FullKv
-    };
-    let has_media = modalities.image || modalities.audio || modalities.video;
-    Ok((
-        context.0,
-        context.1,
-        if has_media {
-            CacheStateStrategy::Multimodal {
-                decoder: Box::new(decoder),
-                media_consumes_decoder_positions: true,
-            }
-        } else {
-            decoder
-        },
-        modalities,
-        StateLayout {
-            fixed_scalars_per_batch: 0,
-            growing: {
-                let mut groups = BTreeMap::<u64, u64>::new();
-                for policy in args
-                    .layer_schedule
-                    .iter()
-                    .filter(|policy| policy.key_value.owns_state())
-                {
-                    let scalars = 2
-                        * u64::from(policy.num_key_value_heads.get())
-                        * u64::from(policy.head_dim.get());
-                    *groups.entry(scalars).or_default() += 1;
-                }
-                groups
-                    .into_iter()
-                    .map(|(scalars_per_position, layers)| GrowingState {
-                        layers,
-                        scalars_per_position,
-                        // Gemma masks sliding attention but retains full KV backing.
-                        window: None,
-                    })
-                    .collect()
-            },
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 256,
-            completeness: EstimationCompleteness::Complete,
-        },
-    ))
 }
-
-fn inkling_spec(args: &eredu_architectures::inkling::ModelArgs) -> Result<Spec, CapabilityError> {
-    let text = &args.text_config;
-    let context = match text.model_max_length {
-        Some(maximum) => plain_context(maximum)?,
-        None => (
-            Observed::Unsupported {
-                reason: "Inkling configuration does not expose a native maximum context".into(),
-            },
-            Observed::Unsupported {
-                reason: "Inkling configuration does not expose an effective maximum context".into(),
-            },
-        ),
-    };
-    let layers = positive(text.num_hidden_layers, "num_hidden_layers")?;
-    let global = text
-        .layer_schedule
-        .iter()
-        .filter(|policy| policy.attention == AttentionPolicy::Full)
-        .count() as u64;
-    let sliding = text
-        .layer_schedule
-        .iter()
-        .filter_map(|policy| policy.attention.window())
-        .fold(BTreeMap::<u64, u64>::new(), |mut groups, window| {
-            *groups.entry(u64::from(window.get())).or_default() += 1;
-            groups
-        })
-        .into_iter()
-        .map(|(window, layers)| SlidingWindowLayerCount { layers, window })
-        .collect::<Vec<_>>();
-    let local_kv = kv_scalars(
-        text.swa_num_key_value_heads
-            .unwrap_or(text.num_key_value_heads),
-        text.swa_head_dim.unwrap_or(text.head_dim),
-    )?;
-    let global_kv = kv_scalars(text.num_key_value_heads, text.head_dim)?;
-    let conv_width = checked_mul(
-        positive(text.hidden_size, "hidden_size")?,
-        4,
-        "Inkling convolution widths",
-    )?;
-    let fixed = checked_mul(
-        checked_mul(
-            layers,
-            positive(text.sconv_kernel_size - 1, "sconv_kernel_size")?,
-            "Inkling layers times convolution state",
-        )?,
-        conv_width,
-        "Inkling fixed convolution state",
-    )?;
-    let modalities = InputModalities {
-        text: true,
-        image: args.vision_config.is_some(),
-        audio: args.audio_config.is_some(),
-        video: false,
-    };
-    let decoder = match (global, sliding.as_slice()) {
-        (_, []) => CacheStateStrategy::FullKv,
-        (0, [only]) => CacheStateStrategy::SlidingKv {
-            window: only.window,
-        },
-        _ => CacheStateStrategy::MixedKv {
-            full_layers: global,
-            sliding: sliding.clone(),
-        },
-    };
-    Ok((
-        context.0,
-        context.1,
-        CacheStateStrategy::Multimodal {
-            decoder: Box::new(decoder),
-            media_consumes_decoder_positions: true,
-        },
-        modalities,
-        StateLayout {
-            fixed_scalars_per_batch: fixed,
-            growing: std::iter::once(GrowingState {
-                layers: global,
-                scalars_per_position: global_kv,
-                window: None,
-            })
-            .filter(|state| state.layers > 0)
-            .chain(sliding.into_iter().map(|group| GrowingState {
-                layers: group.layers,
-                scalars_per_position: local_kv,
-                window: Some(group.window),
-            }))
-            .collect(),
-            hidden_size: positive(text.hidden_size, "hidden_size")?,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        },
-    ))
-}
-
-fn lfm2_spec(args: &lfm2::ModelArgs) -> Result<Spec, CapabilityError> {
-    let context = plain_context(args.max_position_embeddings)?;
-    let attention = args
-        .layer_schedule
-        .iter()
-        .filter(|policy| matches!(policy.operator, lfm2::OperatorPolicy::SelfAttention(_)))
-        .count() as u64;
-    let conv = args
-        .layer_schedule
-        .iter()
-        .filter(|policy| matches!(policy.operator, lfm2::OperatorPolicy::CausalConvolution))
-        .count() as u64;
-    let head_dim = args.hidden_size / args.num_attention_heads;
-    let fixed = checked_mul(
-        checked_mul(
-            conv,
-            positive(args.conv_l_cache - 1, "conv_L_cache")?,
-            "LFM convolution layers times history",
-        )?,
-        positive(args.hidden_size, "hidden_size")?,
-        "LFM fixed convolution state",
-    )?;
-    Ok((
-        context.0,
-        context.1,
-        CacheStateStrategy::HybridRecurrent {
-            full_attention_layers: attention,
-            sliding_attention: Vec::new(),
-            recurrent_layers: conv,
-        },
-        text_modalities(),
-        StateLayout {
-            fixed_scalars_per_batch: fixed,
-            growing: vec![GrowingState {
-                layers: attention,
-                scalars_per_position: kv_scalars(args.num_key_value_heads, head_dim)?,
-                window: None,
-            }],
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 256,
-            completeness: EstimationCompleteness::Complete,
-        },
-    ))
-}
-
-fn nemotron_spec(args: &nemotron_h::ModelArgs) -> Result<Spec, CapabilityError> {
-    let context = plain_context(args.max_position_embeddings)?;
-    let mamba = args
-        .layer_schedule
-        .iter()
-        .filter(|policy| **policy == nemotron_h::LayerPolicy::Mamba)
-        .count() as u64;
-    let mut attention_groups = BTreeMap::<Option<u64>, u64>::new();
-    for policy in args.layer_schedule.iter() {
-        if let nemotron_h::LayerPolicy::SelfAttention(policy) = policy {
-            let window = policy.window().map(|window| u64::from(window.get()));
-            *attention_groups.entry(window).or_default() += 1;
-        }
-    }
-    let intermediate = checked_mul(
-        positive(args.mamba_num_heads, "mamba_num_heads")?,
-        positive(args.mamba_head_dim, "mamba_head_dim")?,
-        "Mamba intermediate width",
-    )?;
-    let conv_dim = checked_add(
-        intermediate,
-        checked_mul(
-            checked_mul(2, positive(args.n_groups, "n_groups")?, "Mamba B/C groups")?,
-            positive(args.ssm_state_size, "ssm_state_size")?,
-            "Mamba B/C state width",
-        )?,
-        "Mamba convolution width",
-    )?;
-    let conv_state = checked_mul(
-        positive(args.conv_kernel - 1, "conv_kernel")?,
-        conv_dim,
-        "Mamba convolution state",
-    )?;
-    let ssm_state = checked_mul(
-        checked_mul(
-            positive(args.mamba_num_heads, "mamba_num_heads")?,
-            positive(args.mamba_head_dim, "mamba_head_dim")?,
-            "Mamba heads times head dimension",
-        )?,
-        positive(args.ssm_state_size, "ssm_state_size")?,
-        "Mamba SSM state",
-    )?;
-    let fixed = checked_mul(
-        mamba,
-        checked_add(conv_state, ssm_state, "Mamba fixed layer state")?,
-        "all Mamba fixed state",
-    )?;
-    let full_attention_layers = attention_groups.get(&None).copied().unwrap_or(0);
-    let sliding_attention = attention_groups
-        .iter()
-        .filter_map(|(window, layers)| {
-            window.map(|window| SlidingWindowLayerCount {
-                layers: *layers,
-                window,
-            })
-        })
-        .collect();
-    Ok((
-        context.0,
-        context.1,
-        CacheStateStrategy::HybridRecurrent {
-            full_attention_layers,
-            sliding_attention,
-            recurrent_layers: mamba,
-        },
-        text_modalities(),
-        StateLayout {
-            fixed_scalars_per_batch: fixed,
-            growing: attention_groups
-                .into_iter()
-                .map(|(window, layers)| {
-                    Ok(GrowingState {
-                        layers,
-                        scalars_per_position: kv_scalars(args.num_key_value_heads, args.head_dim)?,
-                        window,
-                    })
-                })
-                .collect::<Result<Vec<_>, CapabilityError>>()?,
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        },
-    ))
-}
-
-fn qwen_hybrid_spec(args: &QwenHybridConfig, multimodal: bool) -> Result<Spec, CapabilityError> {
-    let configured = positive(args.max_position_embeddings, "max_position_embeddings")?;
-    let original = args
-        .rope_scaling
-        .as_ref()
-        .and_then(|config| config.get("original_max_position_embeddings"))
-        .and_then(serde_json::Value::as_u64);
-    let native = original.unwrap_or(configured);
-    let effective = if original.is_some() {
-        Observed::Available {
-            value: configured,
-            kind: ObservationKind::Exact,
-            source: "validated Qwen RoPE configuration".into(),
-        }
-    } else {
-        match args
-            .rope_scaling
-            .as_ref()
-            .and_then(|config| config.get("factor"))
-            .and_then(serde_json::Value::as_f64)
-            .filter(|factor| factor.is_finite() && *factor > 1.0)
-        {
-            Some(factor) => {
-                let scaled = configured as f64 * factor;
-                if scaled.is_finite() && scaled.fract() == 0.0 && scaled <= u64::MAX as f64 {
-                    Observed::Available {
-                        value: scaled as u64,
-                        kind: ObservationKind::Exact,
-                        source: "validated Qwen configuration and supported RoPE setup".into(),
-                    }
-                } else {
-                    Observed::Unsupported {
-                        reason:
-                            "Qwen RoPE factor does not produce an exact integer effective context"
-                                .into(),
-                    }
-                }
-            }
-            None => Observed::Available {
-                value: configured,
-                kind: ObservationKind::Exact,
-                source: "validated Qwen configuration".into(),
-            },
-        }
-    };
-    let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
-    let attention = args
-        .layer_schedule
-        .iter()
-        .filter(|policy| {
-            matches!(
-                policy,
-                QwenHybridLayerPolicy::SelfAttention(AttentionPolicy::Full)
-            )
-        })
-        .count() as u64;
-    let recurrent = layers.saturating_sub(attention);
-    let key_dim = checked_mul(
-        positive(args.linear_num_key_heads, "linear_num_key_heads")?,
-        positive(args.linear_key_head_dim, "linear_key_head_dim")?,
-        "linear key width",
-    )?;
-    let value_dim = checked_mul(
-        positive(args.linear_num_value_heads, "linear_num_value_heads")?,
-        positive(args.linear_value_head_dim, "linear_value_head_dim")?,
-        "linear value width",
-    )?;
-    let conv_dim = checked_add(
-        checked_mul(2, key_dim, "linear query/key width")?,
-        value_dim,
-        "linear convolution width",
-    )?;
-    let conv_state = checked_mul(
-        positive(args.linear_conv_kernel_dim - 1, "linear_conv_kernel_dim")?,
-        conv_dim,
-        "linear convolution state",
-    )?;
-    let recurrent_state = checked_mul(
-        checked_mul(
-            positive(args.linear_num_value_heads, "linear_num_value_heads")?,
-            positive(args.linear_key_head_dim, "linear_key_head_dim")?,
-            "linear recurrent heads times key width",
-        )?,
-        positive(args.linear_value_head_dim, "linear_value_head_dim")?,
-        "linear recurrent state",
-    )?;
-    let fixed = checked_mul(
-        recurrent,
-        checked_add(conv_state, recurrent_state, "linear fixed layer state")?,
-        "all linear-attention fixed state",
-    )?;
-    let base = CacheStateStrategy::HybridRecurrent {
-        full_attention_layers: attention,
-        sliding_attention: Vec::new(),
-        recurrent_layers: recurrent,
-    };
-    Ok((
-        Observed::Available {
-            value: native,
-            kind: ObservationKind::Exact,
-            source: "validated Qwen RoPE configuration".into(),
-        },
-        effective,
-        if multimodal {
-            CacheStateStrategy::Multimodal {
-                decoder: Box::new(base),
-                media_consumes_decoder_positions: true,
-            }
-        } else {
-            base
-        },
-        if multimodal {
-            InputModalities {
-                text: true,
-                image: true,
-                audio: false,
-                video: true,
-            }
-        } else {
-            text_modalities()
-        },
-        StateLayout {
-            fixed_scalars_per_batch: fixed,
-            growing: vec![GrowingState {
-                layers: attention,
-                scalars_per_position: kv_scalars(args.num_key_value_heads, args.head_dim)?,
-                window: None,
-            }],
-            hidden_size: positive(args.hidden_size, "hidden_size")?,
-            allocation_granularity: 1,
-            completeness: EstimationCompleteness::Complete,
-        },
-    ))
-}
-
 fn unavailable_counter(error: safemlx::error::Exception) -> Observed<u64> {
     Observed::Unavailable {
         reason: error.to_string(),
@@ -2070,8 +1061,8 @@ impl Model {
 
 pub fn model_capabilities(model: &Model) -> Result<ModelCapabilities, CapabilityError> {
     model
-        .capabilities_and_estimate()
-        .map(|(capabilities, _)| capabilities)
+        .architecture_capability_estimate()
+        .map(|estimate| estimate.into_parts().0)
 }
 
 pub fn count_prepared_input(
@@ -2162,8 +1153,13 @@ pub fn model_runtime_state(
     max_output_tokens: u64,
     batch_size: u64,
 ) -> Result<RuntimeStateEstimate, CapabilityError> {
-    let (_, estimate) = model.capabilities_and_estimate()?;
-    estimate_mlx_runtime_state(&estimate, input, max_output_tokens, batch_size)
+    let estimate = model.architecture_capability_estimate()?;
+    estimate_mlx_runtime_state(
+        estimate.state_layout(),
+        input,
+        max_output_tokens,
+        batch_size,
+    )
 }
 
 pub fn static_model_memory(
@@ -2478,6 +1474,14 @@ pub fn available_memory() -> Result<AvailableMemory, CapabilityError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eredu_architectures::{
+        capability as architecture_capability, gemma4, gpt_oss, kimi_linear, lfm2,
+        llama::ModelArgs as LlamaModelArgs, nemotron_h,
+    };
+    use eredu_core::{
+        attention::AttentionPolicy, CacheStateStrategy, EstimationCompleteness, GrowingState,
+        InputModalities, SlidingWindowLayerCount,
+    };
     use safemlx::{Device, DeviceType};
     use serde_json::json;
 
@@ -2492,7 +1496,8 @@ mod tests {
                 "sliding_window": 8, "max_window_layers": 4
         }))
         .unwrap();
-        let (_, _, strategy, _, estimate) = qwen_spec(&args, false).unwrap();
+        let (capabilities, estimate) = architecture_capability::qwen(&args).unwrap().into_parts();
+        let strategy = capabilities.state_strategy;
         assert_eq!(
             strategy,
             CacheStateStrategy::MixedKv {
@@ -2532,7 +1537,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let (_, _, strategy, _, layout) = qwen_spec(&args, false).unwrap();
+        let (capabilities, layout) = architecture_capability::qwen(&args).unwrap().into_parts();
+        let strategy = capabilities.state_strategy;
         assert_eq!(
             strategy,
             CacheStateStrategy::MixedKv {
@@ -2565,7 +1571,8 @@ mod tests {
             "layer_types": ["conv", "full_attention", "conv"]
         }))
         .unwrap();
-        let (_, _, strategy, _, estimate) = lfm2_spec(&args).unwrap();
+        let (capabilities, estimate) = architecture_capability::lfm2(&args).unwrap().into_parts();
+        let strategy = capabilities.state_strategy;
         assert_eq!(
             strategy,
             CacheStateStrategy::HybridRecurrent {
@@ -2638,7 +1645,10 @@ mod tests {
             identity.architecture_fingerprint,
             gpt_oss::prompt_cache_architecture_fingerprint(&args)
         );
-        let (_, _, strategy, _, estimate) = gpt_oss_spec(&args).unwrap();
+        let (capabilities, estimate) = architecture_capability::gpt_oss(&args)
+            .unwrap()
+            .into_parts();
+        let strategy = capabilities.state_strategy;
         assert_eq!(
             strategy,
             CacheStateStrategy::MixedKv {
@@ -2678,7 +1688,10 @@ mod tests {
             "mamba_hidden_act": "silu"
         }))
         .unwrap();
-        let (_, _, strategy, _, estimate) = nemotron_spec(&args).unwrap();
+        let (capabilities, estimate) = architecture_capability::nemotron_h(&args)
+            .unwrap()
+            .into_parts();
+        let strategy = capabilities.state_strategy;
         assert_eq!(
             strategy,
             CacheStateStrategy::HybridRecurrent {
@@ -2717,9 +1730,11 @@ mod tests {
                 "linear_attention", "full_attention"
             ]
         }))
-        .unwrap()
-        .text;
-        let (_, _, strategy, _, estimate) = qwen_hybrid_spec(&args, false).unwrap();
+        .unwrap();
+        let (capabilities, estimate) = architecture_capability::qwen_hybrid(&args)
+            .unwrap()
+            .into_parts();
+        let strategy = capabilities.state_strategy;
         assert_eq!(
             strategy,
             CacheStateStrategy::HybridRecurrent {
@@ -2829,6 +1844,23 @@ mod tests {
         }
     }
 
+    fn gemma4_capability(
+        text: gemma4::ModelArgs,
+        modalities: InputModalities,
+    ) -> eredu_architectures::capability::CapabilityEstimate {
+        let model_type = text.model_type.clone();
+        architecture_capability::gemma4(&gemma4::FamilyConfig {
+            model_type,
+            text,
+            vision: None,
+            image_token_id: modalities.image.then_some(1),
+            video_token_id: modalities.video.then_some(2),
+            audio: None,
+            audio_token_id: modalities.audio.then_some(3),
+        })
+        .unwrap()
+    }
+
     fn estimate(
         fixed: u64,
         components: Vec<GrowingState>,
@@ -2851,13 +1883,18 @@ mod tests {
 
     #[test]
     fn standard_kv_and_gqa_use_kv_head_count() {
-        let (_, _, strategy, _, llama_layout) = llama_spec(&tiny_llama(4, None), false).unwrap();
+        let (capabilities, llama_layout) = architecture_capability::llama(&tiny_llama(4, None))
+            .unwrap()
+            .into_parts();
+        let strategy = capabilities.state_strategy;
         assert_eq!(strategy, CacheStateStrategy::FullKv);
         let llama =
             estimate_mlx_runtime_state(&llama_layout, InputTokenCount::text(10), 0, 1).unwrap();
         assert_eq!(llama.requested_state_bytes, 2 * 2 * 4 * 8 * 10 * 4);
 
-        let (_, _, _, _, gqa_layout) = llama_spec(&tiny_llama(1, None), false).unwrap();
+        let (_, gqa_layout) = architecture_capability::llama(&tiny_llama(1, None))
+            .unwrap()
+            .into_parts();
         let gqa = estimate_mlx_runtime_state(&gqa_layout, InputTokenCount::text(10), 0, 1).unwrap();
         assert_eq!(gqa.requested_state_bytes, llama.requested_state_bytes / 4);
     }
@@ -2872,7 +1909,8 @@ mod tests {
             vec![AttentionPolicy::Full, AttentionPolicy::sliding(3).unwrap()],
         )
         .unwrap();
-        let (_, _, strategy, _, layout) = llama_spec(&args, false).unwrap();
+        let (capabilities, layout) = architecture_capability::llama(&args).unwrap().into_parts();
+        let strategy = capabilities.state_strategy;
         assert_eq!(
             strategy,
             CacheStateStrategy::MixedKv {
@@ -2962,7 +2000,13 @@ mod tests {
             "topk_group": 1
         }))
         .unwrap();
-        let (native, effective, strategy, modalities, estimate) = kimi_linear_spec(&args).unwrap();
+        let (capabilities, estimate) = architecture_capability::kimi_linear(&args)
+            .unwrap()
+            .into_parts();
+        let native = capabilities.native_max_context;
+        let effective = capabilities.effective_max_context;
+        let strategy = capabilities.state_strategy;
+        let modalities = capabilities.modalities;
         assert_eq!(native.value(), Some(&128));
         assert_eq!(effective.value(), Some(&128));
         assert_eq!(
@@ -3186,7 +2230,10 @@ mod tests {
         )
         .unwrap();
 
-        let (_, _, strategy, _, layout) = inkling_spec(&args).unwrap();
+        let (capabilities, layout) = architecture_capability::inkling(&args)
+            .unwrap()
+            .into_parts();
+        let strategy = capabilities.state_strategy;
         assert_eq!(
             strategy,
             CacheStateStrategy::Multimodal {
@@ -3250,7 +2297,8 @@ mod tests {
             audio: false,
             video: false,
         };
-        let (_, _, strategy, _, layout) = gemma4_spec(&tiny_gemma4(), modalities).unwrap();
+        let (capabilities, layout) = gemma4_capability(tiny_gemma4(), modalities).into_parts();
+        let strategy = capabilities.state_strategy;
         assert_eq!(
             strategy,
             CacheStateStrategy::Multimodal {
@@ -3303,7 +2351,8 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let (_, _, strategy, _, _) = gemma4_spec(&args, text_modalities()).unwrap();
+        let (capabilities, _) = gemma4_capability(args, InputModalities::TEXT).into_parts();
+        let strategy = capabilities.state_strategy;
         assert_eq!(
             strategy,
             CacheStateStrategy::SharedFullKv {
@@ -3331,7 +2380,7 @@ mod tests {
         policies[0].head_dim = std::num::NonZeroU32::new(8).unwrap();
         args.layer_schedule = eredu_core::attention::LayerSchedule::new(4, policies).unwrap();
 
-        let (_, _, _, _, layout) = gemma4_spec(&args, text_modalities()).unwrap();
+        let (_, layout) = gemma4_capability(args, InputModalities::TEXT).into_parts();
         assert_eq!(layout.growing.len(), 2);
         assert_eq!(layout.growing[0].layers, 2);
         assert_eq!(layout.growing[0].scalars_per_position, 8);
@@ -3409,24 +2458,5 @@ mod tests {
             reason: "not supported".into(),
         };
         assert!(unsupported.value().is_none());
-    }
-
-    #[test]
-    fn context_scaling_distinguishes_native_and_effective_limits() {
-        let linear = std::collections::HashMap::from([("factor".into(), RopeValue::Float(4.0))]);
-        let (native, effective) = context_from_rope(2_048, Some(&linear)).unwrap();
-        assert_eq!(native.value(), Some(&2_048));
-        assert_eq!(effective.value(), Some(&8_192));
-
-        let yarn = std::collections::HashMap::from([
-            ("factor".into(), RopeValue::Float(40.0)),
-            (
-                "original_max_position_embeddings".into(),
-                RopeValue::Float(4_096.0),
-            ),
-        ]);
-        let (native, effective) = context_from_rope(163_840, Some(&yarn)).unwrap();
-        assert_eq!(native.value(), Some(&4_096));
-        assert_eq!(effective.value(), Some(&163_840));
     }
 }

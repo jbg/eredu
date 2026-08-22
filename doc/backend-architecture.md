@@ -67,6 +67,13 @@ recipes for binding, materialization, sharding, and transfer; they do not
 redeclare family-specific stacking, concatenation, reshaping, normalization,
 or recurrent-weight transformations.
 
+Architecture capability estimates likewise own native and effective context,
+accepted modalities, cache ownership and sharing, attention windows,
+recurrent-state geometry, and backend-neutral scalar state layouts. Concrete
+backends select the loaded architecture estimate, apply their physical state
+scalar width, and add live allocator, residency, and system-memory
+observations; they do not reconstruct family state geometry.
+
 A backend owns runtime-specific resources and computation:
 
 - tensors, neural operators, queues or streams, random state, and sampling math;

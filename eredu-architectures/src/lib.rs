@@ -13,6 +13,9 @@
     clippy::type_complexity
 )]
 
+/// Portable model capabilities and scalar runtime-state estimates.
+pub mod capability;
+
 /// Shared decoder mechanics used by backend-neutral text architectures.
 pub mod decoder;
 /// Shared assembly for heterogeneous stateful text decoders.
