@@ -6357,6 +6357,15 @@ impl decoder::Config for SinkDecoderConfig {
     fn model_identity(&self) -> &str {
         decoder::Config::model_identity(&self.0)
     }
+    fn architecture_fingerprint(&self) -> String {
+        eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
+            "reference_sink_decoder",
+            [
+                ("base", decoder::Config::architecture_fingerprint(&self.0)),
+                ("learned_attention_sinks", "true".into()),
+            ],
+        )
+    }
     fn parameter_root(&self) -> &str {
         decoder::Config::parameter_root(&self.0)
     }

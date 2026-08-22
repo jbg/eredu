@@ -1395,6 +1395,24 @@ impl decoder::Config for ProjectionLayoutConfig {
         &self.args.model_type
     }
 
+    fn architecture_fingerprint(&self) -> String {
+        eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
+            "reference_projection_layout_decoder",
+            [
+                (
+                    "base",
+                    decoder::Config::architecture_fingerprint(&self.args),
+                ),
+                ("fused", self.fused.to_string()),
+                ("empty_field", self.empty_field.to_string()),
+                ("alternate_fields", self.alternate_fields.to_string()),
+                ("attention_bias", "false".into()),
+                ("mlp_bias", "false".into()),
+                ("weight_quantization", "dense".into()),
+            ],
+        )
+    }
+
     fn validate_config(&self) -> Result<(), Error> {
         Ok(())
     }

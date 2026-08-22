@@ -113,39 +113,9 @@ pub trait Config: 'static {
     fn model_identity(&self) -> &str;
     /// Stable identity of the complete normalized architecture policy.
     ///
-    /// Production families override this with their canonical architecture
-    /// fingerprint. The default keeps small downstream/test configurations
-    /// source-compatible while still binding geometry to shared decoder
-    /// semantics.
-    fn architecture_fingerprint(&self) -> String {
-        eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
-            "shared_decoder",
-            [
-                ("model_identity", self.model_identity().to_owned()),
-                ("parameter_root", self.parameter_root().to_owned()),
-                ("hidden_size", self.hidden_size().to_string()),
-                ("layers", self.num_hidden_layers().to_string()),
-                ("intermediate_size", self.intermediate_size().to_string()),
-                ("query_heads", self.num_attention_heads().to_string()),
-                ("key_value_heads", self.num_key_value_heads().to_string()),
-                ("head_dim", self.head_dim().to_string()),
-                (
-                    "rms_norm_epsilon",
-                    format!("{:08x}", self.rms_norm_epsilon().to_bits()),
-                ),
-                ("vocabulary_size", self.vocabulary_size().to_string()),
-                ("tied_output", self.tie_word_embeddings().to_string()),
-                (
-                    "attention_schedule",
-                    self.attention_schedule().fingerprint_component(),
-                ),
-                (
-                    "rotary_spec",
-                    format!("{:?}", self.rotary_spec(self.head_dim())),
-                ),
-            ],
-        )
-    }
+    /// Implementations must bind every construction, equation, state, and
+    /// encoding policy that can affect decoder or cache compatibility.
+    fn architecture_fingerprint(&self) -> String;
     /// Canonical parameter namespace for this decoder body.
     fn parameter_root(&self) -> &str {
         "model"

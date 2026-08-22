@@ -190,6 +190,54 @@ impl MoshiTransformerConfig {
         &self.parameter_root
     }
 
+    /// Stable identity of this decoder's complete normalized policy.
+    pub fn architecture_fingerprint(&self) -> String {
+        derive_prompt_cache_architecture_fingerprint(
+            "moshi_shared_decoder",
+            [
+                ("model_identity", self.model_identity.clone()),
+                ("parameter_root", self.parameter_root.clone()),
+                ("block_fields", "self_attn:q_proj:k_proj:v_proj:out_proj:sinks:q_norm:k_norm:gating:gate:up:linear_out:norm1:norm2".into()),
+                ("hidden_size", self.hidden_size.to_string()),
+                ("layers", self.num_hidden_layers.to_string()),
+                ("intermediate_size", self.gated_hidden_size.to_string()),
+                ("feed_forward_size", self.feed_forward_size.to_string()),
+                ("query_heads", self.num_attention_heads.to_string()),
+                ("key_value_heads", self.num_attention_heads.to_string()),
+                ("head_dim", self.head_dim.to_string()),
+                ("context", self.context.to_string()),
+                ("attention_window", self.attention_window.to_string()),
+                ("rms_norm_epsilon", f32_fingerprint(self.rms_norm_epsilon)),
+                ("vocabulary_size", self.vocabulary_size.to_string()),
+                ("attention_biases", "q=false,k=false,v=false,o=false".into()),
+                ("attention_projection", "component_major_fused:self_attn.in_proj".into()),
+                ("learned_attention_sinks", "false".into()),
+                ("query_key_norm", "none".into()),
+                ("mlp_bias", "false".into()),
+                ("gated_projection", "fused:gating.linear_in".into()),
+                ("gated_product_policy", "ordinary_silu".into()),
+                ("tied_output", "false".into()),
+                (
+                    "attention_schedule",
+                    self.attention_schedule.fingerprint_component(),
+                ),
+                (
+                    "weight_quantization",
+                    quantization_fingerprint(self.native_quantization),
+                ),
+                ("rotary_base", f32_fingerprint(self.rope_base)),
+                ("rotary_traditional", "true".into()),
+                ("rotary_max_positions", self.context.to_string()),
+                ("rotary_scaling", "none".into()),
+                (
+                    "rotary_enabled",
+                    (self.positional_encoding == PositionalEncoding::Rope).to_string(),
+                ),
+                ("parallel_local", self.parallel_local.to_string()),
+            ],
+        )
+    }
+
     /// Transformer residual width.
     pub const fn hidden_size(&self) -> i32 {
         self.hidden_size
@@ -343,6 +391,10 @@ impl MoshiTransformerConfig {
 impl DecoderConfig for MoshiTransformerConfig {
     fn model_identity(&self) -> &str {
         &self.model_identity
+    }
+
+    fn architecture_fingerprint(&self) -> String {
+        MoshiTransformerConfig::architecture_fingerprint(self)
     }
 
     fn parameter_root(&self) -> &str {
@@ -1542,6 +1594,17 @@ mod tests {
         assert_eq!(slice.model_identity(), "moshi.depth.7");
         assert_eq!(slice.intermediate_size(), 2_816);
         assert!(config.depth_transformer(8).is_err());
+    }
+
+    #[test]
+    fn shared_decoder_fingerprint_covers_rotary_enablement() {
+        let config = MoshiConfig::native_v0_1().unwrap();
+        let enabled = DecoderConfig::architecture_fingerprint(config.temporal());
+        let mut disabled = config.temporal().clone();
+        disabled.positional_encoding = PositionalEncoding::None;
+
+        assert_ne!(enabled, DecoderConfig::architecture_fingerprint(&disabled));
+        assert!(enabled.starts_with("sha256:"));
     }
 
     #[test]

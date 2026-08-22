@@ -333,6 +333,10 @@ Core separates logical policy from physical storage:
   reservations atomically.
 - Prompt-cache schemas validate identity, topology, fingerprints, coverage,
   and safe payload paths.
+- Architecture-owned shared-decoder configurations must provide an
+  authoritative fingerprint covering all construction, equation, state, and
+  encoding policy; the shared decoder does not synthesize compatibility
+  identities from a partial policy subset.
 
 A backend supplies concrete tensors, host buffers, mapped payloads, files,
 workers, native transfer objects, and allocation observations. It applies core
