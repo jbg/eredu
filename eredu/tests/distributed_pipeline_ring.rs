@@ -33,8 +33,7 @@ use eredu_backend_mlx::{
         media::{input::InputPayload, PreparedModelInput},
     },
     backend::mlx::{
-        DeviceAssignment, MlxBackend, MlxDistributedSession, MlxModelKind, MlxParallelContext,
-        ModelLoadOptions,
+        DeviceAssignment, MlxBackend, MlxDistributedSession, MlxParallelContext, ModelLoadOptions,
     },
     composition::mlx::distributed::pipeline::{
         load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
@@ -418,10 +417,7 @@ fn pipeline_ring_worker() {
             ModelLoadOptions::with_parallel(topology)
         };
         let model = load_model(&backend, &checkpoint, load_options).unwrap();
-        let expected_mtp_capability = match &model.inner {
-            MlxModelKind::Complete(model) => model.mtp_capability(),
-            MlxModelKind::Pipeline(model) => model.mtp_capability(),
-        };
+        let expected_mtp_capability = model.mtp_capability_for_test();
         let mut runtime = eredu::ModelRuntime::from_prepared(backend, model).unwrap();
         assert_eq!(
             <MlxBackend<'_> as eredu::SpeculativeGenerationBackend>::mtp_capability(&runtime),

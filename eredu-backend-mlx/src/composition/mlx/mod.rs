@@ -28,6 +28,5 @@ pub use session::{
 };
 
 pub use crate::backend::mlx::{
-    error::Error, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, MlxModelKind,
-    ModelLoadOptions,
+    error::Error, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, ModelLoadOptions,
 };

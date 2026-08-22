@@ -332,7 +332,9 @@ Core separates logical policy from physical storage:
 - Process-wide cache admission tracks device, host, transfer, and disk
   reservations atomically.
 - Prompt-cache schemas validate identity, topology, fingerprints, coverage,
-  and safe payload paths.
+  and safe payload paths. Architecture fingerprints use a backend-neutral
+  `eredu` domain; obsolete backend-branded domains are intentionally
+  incompatible.
 - Architecture-owned shared-decoder configurations must provide an
   authoritative fingerprint covering all construction, equation, state, and
   encoding policy; the shared decoder does not synthesize compatibility
@@ -380,7 +382,9 @@ internally between reusable backend mechanics and family/backend composition:
   is the sole MLX implementation of `eredu_nn::Tensor`;
 - `composition::mlx::MlxModelSession` owns the executable model, cache,
   processor state, and
-  optional distributed context.
+  optional distributed context. The prepared `MlxModel` wrapper exposes
+  neutral capabilities and telemetry while keeping its executable kind and
+  architecture-specific payload private.
 - neural-network modules implement reusable MLX tensor operations;
 - runtime modules implement checkpoint materialization, sampling, caches,
   residency workers, media processing, and collectives. Their production

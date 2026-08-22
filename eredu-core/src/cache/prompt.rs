@@ -766,7 +766,7 @@ where
         .collect::<Vec<_>>();
     fields.sort_unstable();
     let mut hasher = Sha256::new();
-    hash_component(&mut hasher, b"safemlx-prompt-cache-architecture-v1");
+    hash_component(&mut hasher, b"eredu-prompt-cache-architecture-v1");
     hash_component(&mut hasher, model_family.as_bytes());
     for (key, value) in fields {
         hash_component(&mut hasher, key.as_bytes());
@@ -876,6 +876,18 @@ mod tests {
         let restored: PromptCacheManifest = serde_json::from_str(&json).unwrap();
         restored.validate().unwrap();
         assert_eq!(restored, manifest);
+    }
+
+    #[test]
+    fn architecture_fingerprint_uses_the_eredu_domain() {
+        let fingerprint = derive_prompt_cache_architecture_fingerprint(
+            "llama",
+            [("layers", "32"), ("hidden_size", "4096")],
+        );
+        assert_eq!(
+            fingerprint,
+            "sha256:9ee0b30ea8687d04eb4b65db3a58ccfff0a72bdd502805e9fdd6edb223ca5949"
+        );
     }
 
     #[test]

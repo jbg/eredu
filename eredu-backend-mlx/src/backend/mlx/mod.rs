@@ -46,13 +46,13 @@ use crate::{
 /// this type. Architecture-specific rank-local executables are deliberately
 /// not exposed through the public loading API.
 pub struct MlxModel {
-    pub inner: MlxModelKind,
+    inner: MlxModelKind,
     runtime_state_dtype_bytes: NonZeroU8,
     #[cfg(feature = "media")]
-    pub processor: Option<ModelProcessor>,
+    processor: Option<ModelProcessor>,
 }
 
-pub enum MlxModelKind {
+pub(crate) enum MlxModelKind {
     Complete(Model),
     Pipeline(PipelineModel),
 }
@@ -87,6 +87,24 @@ impl MlxModel {
 
     pub(crate) const fn runtime_state_dtype_bytes(&self) -> NonZeroU8 {
         self.runtime_state_dtype_bytes
+    }
+
+    /// Reports speculative-weight readiness to backend integration tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mtp_capability_for_test(&self) -> eredu_core::MtpCapability {
+        match &self.inner {
+            MlxModelKind::Complete(model) => model.mtp_capability(),
+            MlxModelKind::Pipeline(model) => model.mtp_capability(),
+        }
+    }
+
+    pub(crate) fn into_kind(self) -> MlxModelKind {
+        self.inner
+    }
+
+    #[cfg(feature = "media")]
+    pub(crate) fn take_processor(&mut self) -> Option<ModelProcessor> {
+        self.processor.take()
     }
 
     #[cfg(feature = "media")]

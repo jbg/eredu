@@ -16,9 +16,9 @@ use safemlx::{
 use std::path::Path;
 
 use crate::{
-    backend::mlx::error::Error,
     backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
     backend::mlx::runtime::media::input,
+    backend::mlx::{error::Error, MlxModelKind},
     composition::mlx::distributed::pipeline::{
         PipelineCache, PipelineStageCompletion, PipelineStep,
     },
@@ -31,9 +31,7 @@ use eredu_core::generation::MtpConfig;
 use eredu_core::{MtpCapability, MtpStats};
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
-use super::{
-    MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, MlxModelKind, Model, ModelCache,
-};
+use super::{MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, Model, ModelCache};
 
 struct ArrayObserverAdapter<'a, O: ?Sized> {
     inner: &'a mut O,
@@ -314,8 +312,10 @@ impl<'a> MlxModelSession<'a> {
             }
         }
         #[cfg(feature = "media")]
-        let processor = model.processor;
-        let inner = match model.inner {
+        let mut model = model;
+        #[cfg(feature = "media")]
+        let processor = model.take_processor();
+        let inner = match model.into_kind() {
             MlxModelKind::Complete(model) => {
                 let cache = model.new_cache();
                 MlxSessionKind::Complete(model, cache)
