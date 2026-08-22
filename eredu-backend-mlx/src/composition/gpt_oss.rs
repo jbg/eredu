@@ -8,7 +8,7 @@ use std::{
 
 use eredu_architectures::gpt_oss::ModelArgs;
 use eredu_checkpoint::{store::CheckpointSource, store::TensorSelection, WeightQuantization};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use eredu_nn::ParameterSpec;
 use eredu_nn::{
     ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized, RoutedNeuralBackend,
