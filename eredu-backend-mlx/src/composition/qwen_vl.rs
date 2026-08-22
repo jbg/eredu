@@ -1411,8 +1411,11 @@ fn attach_expert_cache(
         Execution::Resident(runtime) => runtime.policy().checkpoint_store_arc(),
         Execution::Bounded(runtime) => runtime.policy().checkpoint_store_arc(),
     };
-    let entries =
-        crate::composition::qwen::expert::expert_catalog(&model.args.text, store.as_ref())?;
+    let entries = crate::composition::qwen::expert::expert_catalog(
+        &model.args.text,
+        store.as_ref(),
+        stream,
+    )?;
     model.expert_cache = Some(ExpertCache::new_shared(
         store,
         entries,

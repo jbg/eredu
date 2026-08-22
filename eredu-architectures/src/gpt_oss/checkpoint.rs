@@ -114,6 +114,24 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
     .map_err(|error| error.to_string())
 }
 
+/// Returns the exact published SafeTensors storage owned by routed experts.
+///
+/// This keeps physical native-MXFP4 names and companions in the architecture
+/// checkpoint contract instead of requiring backends to classify path text.
+pub fn safetensors_expert_tensors(
+    args: &ModelArgs,
+) -> Result<Vec<SafetensorsTensorConstraint>, String> {
+    let geometry = Geometry::new(args)?;
+    let mut tensors = Vec::new();
+    for layer in 0..geometry.layers {
+        tensors.extend(safetensors_expert_constraints(
+            &format!("{}.layers.{layer}.mlp.experts", args.parameter_root),
+            geometry,
+        )?);
+    }
+    Ok(tensors)
+}
+
 /// Builds the exact canonical llama.cpp GPT-OSS GGUF catalog.
 pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
     let geometry = Geometry::new(args)?;
@@ -237,6 +255,21 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
     }
     GgufCheckpointPlan::new("GPT-OSS GGUF", tensors, Vec::new(), CatalogPolicy::strict())
         .map_err(|error| error.to_string())
+}
+
+/// Returns translated GGUF weight targets whose storage belongs to routed experts.
+///
+/// These are source-layout targets, before the architecture's expert recipes
+/// normalize separate gate/up/down matrices into the runtime expert bank.
+pub fn gguf_expert_quantization_targets(args: &ModelArgs) -> Result<Vec<String>, String> {
+    let geometry = Geometry::new(args)?;
+    Ok((0..geometry.layers)
+        .flat_map(|layer| {
+            ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(move |projection| {
+                translate_gguf_weight_name(&format!("blk.{layer}.{projection}.weight"))
+            })
+        })
+        .collect())
 }
 
 /// Validates the portable GGUF catalog and matching gate/up physical encodings.

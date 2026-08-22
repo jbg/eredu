@@ -4,8 +4,9 @@ use eredu_architectures::gpt_oss::{expert_recipes, ModelArgs};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
 use eredu_nn::{GatedProductExpertBankOperator, GatedProductExpertBankSpec};
 use eredu_runtime::{
-    ExpertIdentity, ExpertPass, OffloadUnit, RoutedExpertProvider, RoutedExpertRequest,
-    RoutedExpertTensorParallelOutput, WeightBinding,
+    ExpertIdentity, ExpertPass, LayeredArchitecture, OffloadUnit, ParameterGroupOwner,
+    ParameterRole, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
+    WeightBinding,
 };
 use safemlx::{distributed::Group, Array, Stream};
 
@@ -40,7 +41,20 @@ pub fn expert_catalog_cartesian(
     args: &ModelArgs,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     layout: Option<&eredu_runtime::LocalModelLayout>,
+    stream: &Stream,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let architecture = eredu_architectures::gpt_oss::LayeredModel::<MlxBackend>::new(
+        args.clone(),
+        stream,
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let description = eredu_architectures::gpt_oss::parameter_description(&architecture, stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    let graph = <eredu_architectures::gpt_oss::LayeredModel<MlxBackend> as LayeredArchitecture<
+        MlxBackend,
+        super::Cache,
+    >>::execution_graph(&architecture)
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let layers = positive_dimension(args.num_hidden_layers, "layer count")?;
     let experts = positive_dimension(args.num_local_experts, "expert count")?;
     let capacity = layers.checked_mul(experts).ok_or_else(|| {
@@ -49,7 +63,42 @@ pub fn expert_catalog_cartesian(
     let mut entries = Vec::with_capacity(capacity);
 
     for layer in 0..layers {
-        let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
+        let mut owner_group = None;
+        let expert_targets = description
+            .groups()
+            .iter()
+            .filter(|owned| owned.role() == ParameterRole::ExpertIntermediate)
+            .filter_map(|owned| match owned.owner() {
+                ParameterGroupOwner::ExecutionUnit { group, global_unit }
+                    if *global_unit == layer =>
+                {
+                    owner_group.get_or_insert(group.clone());
+                    Some(owned.members())
+                }
+                _ => None,
+            })
+            .flatten()
+            .map(|member| member.target().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let owner_group = owner_group.ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "GPT-OSS layer {layer} declares no expert-intermediate owner"
+            ))
+        })?;
+        let group = graph
+            .groups()
+            .iter()
+            .position(|candidate| candidate.id() == owner_group.as_str())
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "GPT-OSS expert owner group {owner_group:?} is absent from the execution graph"
+                ))
+            })?;
+        let unit_path = <eredu_architectures::gpt_oss::LayeredModel<MlxBackend> as LayeredArchitecture<
+            MlxBackend,
+            super::Cache,
+        >>::unit_path(&architecture, group, layer)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let resolved =
             expert_recipes(store, args, layer).map_err(Error::UnsupportedArchitecture)?;
         let canonical = resolved.into_outputs().into_outputs();
@@ -62,9 +111,14 @@ pub fn expert_catalog_cartesian(
             };
             let mut bindings = Vec::with_capacity(canonical.len());
             for (target, recipe) in &canonical {
-                let local_name = target.strip_prefix(&format!("{prefix}.")).ok_or_else(|| {
+                if !expert_targets.contains(target) {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "GPT-OSS expert recipe target {target:?} is not owned by the architecture expert-intermediate role"
+                    )));
+                }
+                let local_name = target.rsplit('.').next().ok_or_else(|| {
                     Error::UnsupportedArchitecture(format!(
-                        "GPT-OSS expert recipe target {target:?} is outside {prefix:?}"
+                        "GPT-OSS expert recipe target {target:?} has no compact binding name"
                     ))
                 })?;
                 let selected = recipe.select_bounded(store, expert_selection.clone())?;
@@ -72,17 +126,7 @@ pub fn expert_catalog_cartesian(
             }
 
             if let Some(layout) = layout {
-                bindings = shard_layer_bindings(bindings, &prefix, store, layout)?;
-                // TP rewriting preserves local lookup names but creates fresh
-                // bindings. Restore the canonical destination used by loading,
-                // inspection, and native-format provenance.
-                bindings = bindings
-                    .into_iter()
-                    .map(|binding| {
-                        let target = format!("{prefix}.{}", binding.name());
-                        binding.with_logical_target(target).map_err(Error::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                bindings = shard_layer_bindings(bindings, &unit_path, store, layout)?;
             }
 
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {

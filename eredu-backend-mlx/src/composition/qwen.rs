@@ -6,7 +6,11 @@ use eredu_runtime::{
     WeightResidency,
 };
 
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 
 use eredu_architectures::qwen::ModelArgs;
 use eredu_nn::RoutedNeuralBackend;
@@ -27,19 +31,21 @@ use crate::{
         binding_bytes, build_module_binding_plan_with_recipes,
         build_module_binding_plan_with_recipes_excluding, build_module_bindings,
         build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
-        parameter_role_targets,
+        parameter_role_targets, populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, store::open_gguf_checkpoint_source,
     },
     backend::mlx::runtime::execution::generic::{
         prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
+        MlxUnitPopulator,
     },
     backend::mlx::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
     },
     backend::mlx::runtime::media::input,
     backend::mlx::runtime::residency::expert_cache::{ExpertCache, ExpertCacheReport},
+    backend::mlx::runtime::residency::manager::ResidentUnitLease,
 };
 
 pub mod expert {
@@ -83,6 +89,19 @@ fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Re
     }
 }
 
+fn decoder_unit_path(
+    architecture: &NeutralArchitecture,
+    group: usize,
+    index: usize,
+) -> Result<String, Error> {
+    require_decoder_group(architecture, group)?;
+    <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
+        MlxBackend,
+        MlxKeyValueState,
+    >>::unit_path(architecture, group, index)
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
 type NeutralResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxBackend,
@@ -93,7 +112,7 @@ type NeutralLayerwiseRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxBackend,
     MlxKeyValueState,
-    MlxLayerwisePolicy<NeutralBlock>,
+    MlxLayerwisePolicy<NeutralBlock, QwenUnitPopulator>,
 >;
 
 type NeutralParallelResidentRuntime = LayerwiseRuntime<
@@ -106,8 +125,27 @@ type NeutralParallelLayerwiseRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxBackend,
     MlxKeyValueState,
-    MlxLayerwisePolicy<NeutralBlock>,
+    MlxLayerwisePolicy<NeutralBlock, QwenUnitPopulator>,
 >;
+
+#[derive(Clone)]
+struct QwenUnitPopulator {
+    external_experts: bool,
+    expert_targets: Arc<BTreeSet<String>>,
+}
+
+impl MlxUnitPopulator<NeutralBlock> for QwenUnitPopulator {
+    fn populate(
+        &mut self,
+        unit: &mut MlxModule<NeutralBlock>,
+        lease: &ResidentUnitLease,
+    ) -> Result<(), Error> {
+        populate_module_from_lease_excluding(unit, lease, |name| {
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
+        })?;
+        Ok(())
+    }
+}
 
 enum QwenExecution {
     Resident(Box<NeutralResidentRuntime>),
@@ -230,10 +268,14 @@ fn load_neutral_qwen(
     let binding_args = args.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
+    let factory = QwenUnitPopulator {
+        external_experts,
+        expert_targets: Arc::clone(&expert_targets),
+    };
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
-        (),
+        factory,
         std::marker::PhantomData::<MlxKeyValueState>,
         options,
         stream,
@@ -1086,7 +1128,7 @@ fn attach_qwen_expert_cache(
         ));
     }
     let store = model.checkpoint_store_arc();
-    let entries = expert::expert_catalog(&model.args, store.as_ref())?;
+    let entries = expert::expert_catalog(&model.args, store.as_ref(), stream)?;
     model.expert_cache = Some(ExpertCache::new_shared(
         store,
         entries,
@@ -1178,10 +1220,14 @@ fn load_neutral_qwen_parallel(
     let binding_layout = layout.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
+    let factory = QwenUnitPopulator {
+        external_experts,
+        expert_targets: Arc::clone(&expert_targets),
+    };
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
         &mut architecture,
-        (),
+        factory,
         std::marker::PhantomData::<MlxKeyValueState>,
         options,
         stream,
@@ -1614,9 +1660,12 @@ impl QwenPipelineBindings {
                 .collect::<Result<Vec<_>, _>>()?;
         }
         match layout {
-            Some(layout) => {
-                shard_layer_bindings(bindings, &format!("model.layers.{index}"), store, layout)
-            }
+            Some(layout) => shard_layer_bindings(
+                bindings,
+                &decoder_unit_path(architecture, group, index)?,
+                store,
+                layout,
+            ),
             None => Ok(bindings),
         }
     }

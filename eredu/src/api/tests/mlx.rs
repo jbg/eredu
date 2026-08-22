@@ -2290,6 +2290,23 @@ fn tiny_qwen_moe_observation_wraps_canonical_routed_execution() {
         observer.routes,
         ["model.layers.0.mlp", "model.layers.1.mlp"]
     );
+
+    let mut cached = eredu_backend_mlx::composition::qwen::load_qwen_safetensors_mlx(
+        &dir,
+        eredu_runtime::WeightResidency::with_expert_cache(
+            eredu_runtime::NonExpertWeightResidency::FullyResident,
+            eredu_runtime::ExpertCacheLoadOptions::default(),
+        ),
+        None,
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    let mut cached_state = cached.new_cache();
+    let cached_logits = cached.forward(&tokens, &mut cached_state, stream).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&cached_logits]).unwrap();
+    assert_eq!(cached_logits.shape(), logits.shape());
+    assert!(cached.expert_cache_report().unwrap().is_some());
     fs::remove_dir_all(dir).unwrap();
 }
 

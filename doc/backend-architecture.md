@@ -91,6 +91,14 @@ They also normalize physical checkpoint format metadata onto canonical runtime
 parameters, including fused expert projections, so each backend consumes the
 same family-specific quantization identities.
 
+Parameter-class selection follows the architecture's validated parameter
+description. Backends select exact targets by semantic role, retain the
+declared static or execution-unit owner, and obtain sharding prefixes from the
+architecture's canonical unit path. Checkpoint-only physical companions or
+source-layout projections are exposed explicitly by the architecture
+checkpoint contract. Loading, residency, and quantization code must not infer
+any of those facts from substrings in checkpoint names.
+
 Routed expert banks retain and expose their architecture-owned construction
 specification. Resident, cached, distributed, and future backend execution
 paths all consume that same geometry, projection encoding, bias layout, and

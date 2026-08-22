@@ -1,6 +1,10 @@
 //! MLX loading and runtime binding for the backend-neutral GPT-OSS decoder.
 
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 
 use eredu_architectures::gpt_oss::ModelArgs;
 use eredu_checkpoint::{store::CheckpointSource, store::TensorSelection, WeightQuantization};
@@ -68,6 +72,26 @@ pub type Cache = MlxKeyValueState;
 type NeutralBlock = eredu_architectures::gpt_oss::TransformerBlock<MlxBackend>;
 type NeutralArchitecture = eredu_architectures::gpt_oss::LayeredModel<MlxBackend>;
 
+fn expert_parameter_targets(
+    architecture: &NeutralArchitecture,
+    stream: &Stream,
+) -> Result<BTreeSet<String>, Error> {
+    let mut targets = eredu_architectures::gpt_oss::parameter_description(architecture, stream)
+        .map_err(|error| Error::Parallel(error.to_string()))?
+        .targets_for_role(ParameterRole::ExpertIntermediate);
+    targets.extend(
+        eredu_architectures::gpt_oss::safetensors_expert_tensors(architecture.args())
+            .map_err(Error::UnsupportedArchitecture)?
+            .into_iter()
+            .map(|tensor| tensor.key),
+    );
+    targets.extend(
+        eredu_architectures::gpt_oss::gguf_expert_quantization_targets(architecture.args())
+            .map_err(Error::UnsupportedArchitecture)?,
+    );
+    Ok(targets)
+}
+
 struct NeutralGptOssObserver<'a> {
     inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, Exception>,
 }
@@ -129,6 +153,19 @@ fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Re
         )))
     }
 }
+
+fn decoder_unit_path(
+    architecture: &NeutralArchitecture,
+    group: usize,
+    index: usize,
+) -> Result<String, Error> {
+    require_decoder_group(architecture, group)?;
+    <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
+        MlxBackend,
+        MlxKeyValueState,
+    >>::unit_path(architecture, group, index)
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
 type ResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
     MlxBackend,
@@ -159,6 +196,7 @@ type ParallelLayerwiseExecution = LayerwiseRuntime<
 pub struct GptOssCheckpointTemplate {
     pub static_modules: eredu_architectures::decoder::StaticModules<MlxBackend>,
     pub layers: Vec<NeutralBlock>,
+    expert_targets: BTreeSet<String>,
     native_experts: Vec<GptOssCheckpointParameter>,
 }
 
@@ -175,18 +213,17 @@ impl GptOssCheckpointTemplate {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let architecture = NeutralArchitecture::new(args.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let expert_targets = expert_parameter_targets(&architecture, stream)?;
         let layers = (0..args.num_hidden_layers as usize)
             .map(|index| {
                 eredu_architectures::gpt_oss::new_block::<MlxBackend>(&args, index, stream)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let plan = eredu_architectures::gpt_oss::safetensors_plan(&args)
+        let expert_tensors = eredu_architectures::gpt_oss::safetensors_expert_tensors(&args)
             .map_err(Error::UnsupportedArchitecture)?;
-        let native_experts = plan
-            .common_tensors
+        let native_experts = expert_tensors
             .into_iter()
-            .filter(|tensor| tensor.key.contains(".mlp.experts."))
             .map(|tensor| {
                 let shape = tensor
                     .shape
@@ -226,6 +263,7 @@ impl GptOssCheckpointTemplate {
         Ok(Self {
             static_modules: architecture.static_modules().clone(),
             layers,
+            expert_targets,
             native_experts,
         })
     }
@@ -237,21 +275,21 @@ impl Parameterized<crate::MlxTensor> for GptOssCheckpointTemplate {
     where
         V: ParameterVisitor<'a, crate::MlxTensor>,
     {
-        struct NonExpert<'v, V>(&'v mut V);
+        struct NonExpert<'v, V>(&'v mut V, &'v BTreeSet<String>);
         impl<'a, V: ParameterVisitor<'a, crate::MlxTensor>> ParameterVisitor<'a, crate::MlxTensor>
             for NonExpert<'_, V>
         {
             fn visit(&mut self, metadata: ParameterMetadata, value: &'a crate::MlxTensor) {
-                if !is_expert_parameter(&metadata) {
+                if !parameter_name_in_targets(metadata.id.as_str(), self.1) {
                     self.0.visit(metadata, value);
                 }
             }
         }
 
         self.static_modules
-            .visit_parameters(&mut NonExpert(visitor));
+            .visit_parameters(&mut NonExpert(visitor, &self.expert_targets));
         for layer in &self.layers {
-            layer.visit_parameters(&mut NonExpert(visitor));
+            layer.visit_parameters(&mut NonExpert(visitor, &self.expert_targets));
         }
         for parameter in &self.native_experts {
             visitor.visit(
@@ -265,21 +303,21 @@ impl Parameterized<crate::MlxTensor> for GptOssCheckpointTemplate {
     where
         V: ParameterVisitorMut<'a, crate::MlxTensor>,
     {
-        struct NonExpert<'v, V>(&'v mut V);
+        struct NonExpert<'v, V>(&'v mut V, &'v BTreeSet<String>);
         impl<'a, V: ParameterVisitorMut<'a, crate::MlxTensor>>
             ParameterVisitorMut<'a, crate::MlxTensor> for NonExpert<'_, V>
         {
             fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut crate::MlxTensor) {
-                if !is_expert_parameter(&metadata) {
+                if !parameter_name_in_targets(metadata.id.as_str(), self.1) {
                     self.0.visit_mut(metadata, value);
                 }
             }
         }
 
         self.static_modules
-            .visit_parameters_mut(&mut NonExpert(visitor));
+            .visit_parameters_mut(&mut NonExpert(visitor, &self.expert_targets));
         for layer in &mut self.layers {
-            layer.visit_parameters_mut(&mut NonExpert(visitor));
+            layer.visit_parameters_mut(&mut NonExpert(visitor, &self.expert_targets));
         }
         for parameter in &mut self.native_experts {
             visitor.visit_mut(
@@ -301,6 +339,7 @@ impl Parameterized<crate::MlxTensor> for GptOssCheckpointTemplate {
 #[derive(Clone)]
 struct GptOssUnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<BTreeSet<String>>,
 }
 
 impl MlxUnitPopulator<NeutralBlock> for GptOssUnitPopulator {
@@ -310,7 +349,7 @@ impl MlxUnitPopulator<NeutralBlock> for GptOssUnitPopulator {
         lease: &ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".mlp.experts.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -319,6 +358,7 @@ impl MlxUnitPopulator<NeutralBlock> for GptOssUnitPopulator {
 #[derive(Clone)]
 struct GptOssParallelUnitPopulator {
     external_experts: bool,
+    expert_targets: Arc<BTreeSet<String>>,
 }
 
 impl MlxUnitPopulator<NeutralBlock> for GptOssParallelUnitPopulator {
@@ -328,7 +368,7 @@ impl MlxUnitPopulator<NeutralBlock> for GptOssParallelUnitPopulator {
         lease: &ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
-            self.external_experts && name.contains(".mlp.experts.")
+            self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
         })?;
         Ok(())
     }
@@ -344,10 +384,9 @@ enum GptOssExecution {
 /// Parameter view used only to select ordinary dense matrices for load-time
 /// quantization. Native expert matrices retain their exact MXFP4 recipes.
 #[derive(Debug, Clone)]
-struct DenseUnit(NeutralBlock);
-
-fn is_expert_parameter(metadata: &ParameterMetadata) -> bool {
-    metadata.id.as_str().contains(".mlp.experts.")
+struct DenseUnit {
+    block: NeutralBlock,
+    expert_targets: Arc<BTreeSet<String>>,
 }
 
 impl Parameterized<crate::MlxTensor> for DenseUnit {
@@ -355,38 +394,40 @@ impl Parameterized<crate::MlxTensor> for DenseUnit {
     where
         V: ParameterVisitor<'a, crate::MlxTensor>,
     {
-        struct Filter<'v, V>(&'v mut V);
+        struct Filter<'v, V>(&'v mut V, &'v BTreeSet<String>);
         impl<'a, V: ParameterVisitor<'a, crate::MlxTensor>> ParameterVisitor<'a, crate::MlxTensor>
             for Filter<'_, V>
         {
             fn visit(&mut self, metadata: ParameterMetadata, value: &'a crate::MlxTensor) {
-                if !is_expert_parameter(&metadata) {
+                if !parameter_name_in_targets(metadata.id.as_str(), self.1) {
                     self.0.visit(metadata, value);
                 }
             }
         }
-        self.0.visit_parameters(&mut Filter(visitor));
+        self.block
+            .visit_parameters(&mut Filter(visitor, &self.expert_targets));
     }
 
     fn visit_parameters_mut<'a, V>(&'a mut self, visitor: &mut V)
     where
         V: ParameterVisitorMut<'a, crate::MlxTensor>,
     {
-        struct Filter<'v, V>(&'v mut V);
+        struct Filter<'v, V>(&'v mut V, &'v BTreeSet<String>);
         impl<'a, V: ParameterVisitorMut<'a, crate::MlxTensor>>
             ParameterVisitorMut<'a, crate::MlxTensor> for Filter<'_, V>
         {
             fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut crate::MlxTensor) {
-                if !is_expert_parameter(&metadata) {
+                if !parameter_name_in_targets(metadata.id.as_str(), self.1) {
                     self.0.visit_mut(metadata, value);
                 }
             }
         }
-        self.0.visit_parameters_mut(&mut Filter(visitor));
+        self.block
+            .visit_parameters_mut(&mut Filter(visitor, &self.expert_targets));
     }
 
     fn set_trainable(&mut self, trainable: bool) {
-        self.0.set_trainable(trainable);
+        self.block.set_trainable(trainable);
     }
 }
 
@@ -443,8 +484,14 @@ pub fn load_neutral_with_store(
     let mut architecture =
         eredu_architectures::gpt_oss::new_layered_model::<MlxBackend>(args.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let factory = GptOssUnitPopulator { external_experts };
+    let expert_targets = Arc::new(expert_parameter_targets(&architecture, stream)?);
+    let factory = GptOssUnitPopulator {
+        external_experts,
+        expert_targets: Arc::clone(&expert_targets),
+    };
     let binding_args = args.clone();
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
@@ -456,7 +503,7 @@ pub fn load_neutral_with_store(
         move |key| {
             key.starts_with("rope_freqs.")
                 || key.ends_with(".rotary_emb.inv_freq")
-                || (external_experts && key.contains(".mlp.experts."))
+                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
         },
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
@@ -473,7 +520,7 @@ pub fn load_neutral_with_store(
                 "",
                 store,
                 recipes,
-                |name| external_experts && name.contains(".mlp.experts."),
+                |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )
             .map_err(Into::into)
         },
@@ -521,6 +568,7 @@ fn load_neutral_parallel_with_store(
         .map_err(|_| Error::UnsupportedArchitecture("invalid GPT-OSS layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let expert_targets = Arc::new(expert_parameter_targets(&global_architecture, stream)?);
     let mut planner = build.planner();
     for group in eredu_architectures::gpt_oss::static_parameter_groups::<MlxBackend>(
         global_architecture.static_modules(),
@@ -550,7 +598,10 @@ fn load_neutral_parallel_with_store(
     let state_layout = architecture
         .runtime_state_layout()
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let factory = GptOssParallelUnitPopulator { external_experts };
+    let factory = GptOssParallelUnitPopulator {
+        external_experts,
+        expert_targets: Arc::clone(&expert_targets),
+    };
 
     let global_static = MlxModule::new(global_architecture.static_modules().clone());
     let mut global_parameter_bytes =
@@ -568,7 +619,7 @@ fn load_neutral_parallel_with_store(
             "",
             store.as_ref(),
             recipes,
-            |name| external_experts && name.contains(".mlp.experts."),
+            |name| external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
         global_parameter_bytes = global_parameter_bytes
             .checked_add(binding_bytes(&bindings)?)
@@ -580,6 +631,8 @@ fn load_neutral_parallel_with_store(
     let local_layout = Arc::new(layout);
     let static_layout = Arc::clone(&local_layout);
     let unit_local_layout = Arc::clone(&local_layout);
+    let excluded_expert_targets = Arc::clone(&expert_targets);
+    let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
         &mut architecture,
@@ -591,7 +644,7 @@ fn load_neutral_parallel_with_store(
         move |key| {
             key.starts_with("rope_freqs.")
                 || key.ends_with(".rotary_emb.inv_freq")
-                || (external_experts && key.contains(".mlp.experts."))
+                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
         },
         move |_modules, store| {
             let global = MlxModule::new(global_static_modules.clone());
@@ -613,7 +666,7 @@ fn load_neutral_parallel_with_store(
                 "",
                 store,
                 recipes,
-                |name| external_experts && name.contains(".mlp.experts."),
+                |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
             shard_layer_bindings(bindings, path, store, &unit_local_layout)
         },
@@ -662,7 +715,9 @@ fn load_neutral_parallel_with_store(
         )))
     };
     let planned_external_experts = external_experts
-        .then(|| expert::expert_catalog_cartesian(&args, store.as_ref(), Some(&local_layout)))
+        .then(|| {
+            expert::expert_catalog_cartesian(&args, store.as_ref(), Some(&local_layout), stream)
+        })
         .transpose()?;
     Ok(GptOssModel {
         args,
@@ -700,22 +755,32 @@ pub fn quantize_neutral_store(
     let target =
         eredu_architectures::gpt_oss::new_layered_model::<MlxBackend>(target_args.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let source_expert_targets = Arc::new(expert_parameter_targets(&source, stream)?);
+    let target_expert_targets = Arc::new(expert_parameter_targets(&target, stream)?);
     let count = usize::try_from(source_args.num_hidden_layers)
         .map_err(|_| Error::UnsupportedArchitecture("invalid GPT-OSS layer count".into()))?;
     let source_unit_args = source_args.clone();
     let target_unit_args = target_args.clone();
+    let source_unit_expert_targets = Arc::clone(&source_expert_targets);
+    let target_unit_expert_targets = Arc::clone(&target_expert_targets);
     let (store, report) = quantize_parameterized_store(
         store,
         source.static_modules(),
         target.static_modules(),
         move |index, stream| {
             eredu_architectures::gpt_oss::new_block::<MlxBackend>(&source_unit_args, index, stream)
-                .map(DenseUnit)
+                .map(|block| DenseUnit {
+                    block,
+                    expert_targets: Arc::clone(&source_unit_expert_targets),
+                })
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         },
         move |index, stream| {
             eredu_architectures::gpt_oss::new_block::<MlxBackend>(&target_unit_args, index, stream)
-                .map(DenseUnit)
+                .map(|block| DenseUnit {
+                    block,
+                    expert_targets: Arc::clone(&target_unit_expert_targets),
+                })
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         },
         count,
@@ -889,7 +954,7 @@ impl GptOssPipelineBindings {
         match layout {
             Some(layout) => shard_layer_bindings(
                 bindings,
-                &format!("{}.layers.{index}", architecture.args().parameter_root),
+                &decoder_unit_path(architecture, group, index)?,
                 store,
                 layout,
             ),
@@ -1016,9 +1081,12 @@ impl GptOssModel {
     }
 
     /// Builds expert-cache units with this rank's exact TP selections.
-    pub fn external_expert_catalog(&self) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    pub fn external_expert_catalog(
+        &self,
+        stream: &Stream,
+    ) -> Result<Vec<ExpertCatalogEntry>, Error> {
         self.planned_external_experts.clone().map_or_else(
-            || expert::expert_catalog_cartesian(&self.args, self.checkpoint_store(), None),
+            || expert::expert_catalog_cartesian(&self.args, self.checkpoint_store(), None, stream),
             Ok,
         )
     }
@@ -1625,7 +1693,7 @@ fn attach_expert_cache(
     weights_stream: &Stream,
 ) -> Result<(), Error> {
     let store = model.checkpoint_store_arc();
-    let entries = model.external_expert_catalog()?;
+    let entries = model.external_expert_catalog(stream)?;
     model.expert_cache = Some(ExpertCache::new_shared(
         store,
         entries,
@@ -1808,7 +1876,11 @@ pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
         .translated_outputs(translate)
         .map_err(safemlx::error::IoError::from)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
-    configs.retain(|name, _| !name.contains(".mlp.experts."));
+    let expert_targets = eredu_architectures::gpt_oss::gguf_expert_quantization_targets(&args)
+        .map_err(Error::UnsupportedArchitecture)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    configs.retain(|name, _| !expert_targets.contains(name));
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
     args.validate()

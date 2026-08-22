@@ -15094,6 +15094,7 @@ fn load_qwen_pipeline(
             &source_args,
             store.as_ref(),
             parallel_layout.as_ref(),
+            stream,
         )?
         .into_iter()
         .filter(|entry| range.contains(&entry.identity().layer))
@@ -16108,6 +16109,7 @@ fn load_neutral_qwen_vl_pipeline(
             &source_args.text,
             store.as_ref(),
             parallel_layout.as_ref(),
+            stream,
         )?
         .into_iter()
         .filter(|entry| stage.range().contains(&entry.identity().layer))
@@ -17980,6 +17982,7 @@ fn load_gpt_oss_pipeline(
             &source_args,
             store.as_ref(),
             parallel_layout.as_ref(),
+            stream,
         )?
         .into_iter()
         .filter(|entry| range.contains(&entry.identity().layer))
