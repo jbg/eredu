@@ -367,9 +367,12 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
     }
 
     let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+    let composite_plan =
+        eredu_architectures::preparation::gguf_composite_artifact_plan(gguf_architecture);
+    let mut capabilities_valid = false;
     match eredu_architectures::preparation::gguf_capabilities(gguf_architecture, &checkpoint) {
-        Ok(capabilities) => {
-            report.expected_modalities = artifact_modalities(capabilities.input_modalities());
+        Ok(_) => {
+            capabilities_valid = true;
             apply_structural_validation(
                 &mut report,
                 structural::validate_gguf(gguf_architecture, &checkpoint, &metadata, options.load),
@@ -398,7 +401,12 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
         },
         Err(error) => reject_load_policy(&mut report, &error),
     }
-    inspect_gguf_projector(&mut report, path, gguf_architecture, &checkpoint, &metadata);
+    let composition =
+        inspect_gguf_projector(&mut report, path, gguf_architecture, &checkpoint, &metadata);
+    if capabilities_valid {
+        report.expected_modalities =
+            artifact_modalities(composite_plan.input_modalities(composition));
+    }
 
     if let Err(error) = gguf_eos_token_ids(&metadata) {
         report.issue(
@@ -558,7 +566,10 @@ fn inspect_gguf_projector(
     architecture: GgufArchitecture,
     model_checkpoint: &GgufCheckpoint,
     model_metadata: &HashMap<String, GgufMetadataValue>,
-) {
+) -> eredu_architectures::preparation::GgufArtifactComposition {
+    use eredu_architectures::preparation::GgufArtifactComposition;
+
+    let mut composition = GgufArtifactComposition::ModelOnly;
     match architecture {
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             match required_qwen_mmproj(path, "qwen3vl") {
@@ -575,6 +586,9 @@ fn inspect_gguf_projector(
                             &metadata,
                         );
                         let exact = matches!(validation, structural::StructuralValidation::Exact);
+                        if exact {
+                            composition = GgufArtifactComposition::ValidatedMediaProjector;
+                        }
                         apply_structural_validation(report, validation, &projector);
                         report.multimodal = if !exact {
                             InspectionReadiness::Invalid
@@ -618,6 +632,9 @@ fn inspect_gguf_projector(
                             &metadata,
                         );
                         let exact = matches!(validation, structural::StructuralValidation::Exact);
+                        if exact {
+                            composition = GgufArtifactComposition::ValidatedMediaProjector;
+                        }
                         apply_structural_validation(report, validation, &projector_path);
                         report.multimodal = if !exact {
                             InspectionReadiness::Invalid
@@ -670,6 +687,9 @@ fn inspect_gguf_projector(
                     &metadata,
                 );
                 let exact = matches!(validation, structural::StructuralValidation::Exact);
+                if exact {
+                    composition = GgufArtifactComposition::ValidatedMediaProjector;
+                }
                 apply_structural_validation(report, validation, &projector_path);
                 report.multimodal = if !exact {
                     InspectionReadiness::Invalid
@@ -705,6 +725,9 @@ fn inspect_gguf_projector(
                     &metadata,
                 );
                 let exact = matches!(validation, structural::StructuralValidation::Exact);
+                if exact {
+                    composition = GgufArtifactComposition::ValidatedMediaProjector;
+                }
                 apply_structural_validation(report, validation, &projector_path);
                 report.multimodal = if !exact {
                     InspectionReadiness::Invalid
@@ -754,6 +777,9 @@ fn inspect_gguf_projector(
                     &metadata,
                 );
                 let exact = matches!(validation, structural::StructuralValidation::Exact);
+                if exact {
+                    composition = GgufArtifactComposition::ValidatedMediaProjector;
+                }
                 apply_structural_validation(report, validation, &projector_path);
                 report.multimodal = if !exact {
                     InspectionReadiness::Invalid
@@ -796,6 +822,7 @@ fn inspect_gguf_projector(
         },
         _ => report.multimodal = InspectionReadiness::NotApplicable,
     }
+    composition
 }
 
 fn reject_projector(
@@ -989,6 +1016,40 @@ mod tests {
         assert_eq!(report.multimodal, InspectionReadiness::NotApplicable);
         assert!(report.requirements.is_empty());
         assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn composite_gguf_plan_keeps_readiness_and_expected_modalities_consistent() {
+        use eredu_architectures::preparation::{
+            gguf_composite_artifact_plan, GgufArtifactComposition,
+        };
+
+        for (architecture, expected) in [
+            (
+                GgufArchitecture::Qwen35,
+                vec![
+                    ArtifactModality::Text,
+                    ArtifactModality::Image,
+                    ArtifactModality::Video,
+                ],
+            ),
+            (
+                GgufArchitecture::Gemma4,
+                vec![
+                    ArtifactModality::Text,
+                    ArtifactModality::Image,
+                    ArtifactModality::Audio,
+                ],
+            ),
+            (
+                GgufArchitecture::MuseGlimmer,
+                vec![ArtifactModality::Text, ArtifactModality::Image],
+            ),
+        ] {
+            let modalities = gguf_composite_artifact_plan(architecture)
+                .input_modalities(GgufArtifactComposition::ValidatedMediaProjector);
+            assert_eq!(artifact_modalities(modalities), expected);
+        }
     }
 
     #[test]

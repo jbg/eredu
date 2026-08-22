@@ -109,6 +109,11 @@ that exact normalized configuration. Backends translate those neutral flags
 into report and build-feature readiness, but do not infer image, audio, or
 video support from a family name. Text-only and partially multimodal variants
 therefore do not acquire processor or feature requirements they cannot use.
+For composite GGUF artifacts, the architecture additionally owns the plan that
+maps a validated sibling media projector to the resulting input modalities.
+Inspection applies that plan after projector discovery and structural
+validation, so expected modalities and multimodal readiness describe the same
+validated artifact composition.
 
 Multimodal preprocessing starts with an architecture-owned processor plan.
 That neutral plan parses family model and processor metadata, selects released

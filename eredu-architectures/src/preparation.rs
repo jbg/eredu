@@ -55,6 +55,99 @@ impl Default for ArchitectureCapabilities {
     }
 }
 
+/// Artifact pieces that have passed structural validation for a GGUF model.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum GgufArtifactComposition {
+    /// Only the language-model checkpoint has been validated.
+    #[default]
+    ModelOnly,
+    /// The language-model checkpoint and its media projector have been validated.
+    ValidatedMediaProjector,
+}
+
+/// Architecture-owned modality policy for a possibly composite GGUF artifact.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct GgufCompositeArtifactPlan {
+    model_modalities: InputModalities,
+    projector_modalities: Option<InputModalities>,
+}
+
+impl GgufCompositeArtifactPlan {
+    const fn new(
+        model_modalities: InputModalities,
+        projector_modalities: Option<InputModalities>,
+    ) -> Self {
+        Self {
+            model_modalities,
+            projector_modalities,
+        }
+    }
+
+    /// Input modalities provided by the validated artifact composition.
+    pub const fn input_modalities(self, composition: GgufArtifactComposition) -> InputModalities {
+        match (composition, self.projector_modalities) {
+            (GgufArtifactComposition::ValidatedMediaProjector, Some(modalities)) => modalities,
+            _ => self.model_modalities,
+        }
+    }
+}
+
+/// Declares how a validated sibling projector changes one GGUF architecture's
+/// accepted input modalities.
+pub const fn gguf_composite_artifact_plan(
+    architecture: GgufArchitecture,
+) -> GgufCompositeArtifactPlan {
+    let (model_modalities, projector_modalities) = match architecture {
+        GgufArchitecture::Inkling => {
+            let modalities = InputModalities {
+                text: true,
+                image: true,
+                audio: true,
+                video: false,
+            };
+            (modalities, Some(modalities))
+        }
+        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
+            let modalities = InputModalities {
+                text: true,
+                image: true,
+                audio: false,
+                video: true,
+            };
+            (modalities, Some(modalities))
+        }
+        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => (
+            InputModalities::TEXT,
+            Some(InputModalities {
+                text: true,
+                image: true,
+                audio: false,
+                video: true,
+            }),
+        ),
+        GgufArchitecture::Gemma4 => (
+            InputModalities::TEXT,
+            Some(InputModalities {
+                text: true,
+                image: true,
+                audio: true,
+                video: false,
+            }),
+        ),
+        GgufArchitecture::MuseGlimmer => (
+            InputModalities::TEXT,
+            Some(InputModalities {
+                text: true,
+                image: true,
+                audio: false,
+                video: false,
+            }),
+        ),
+        _ => (InputModalities::TEXT, None),
+    };
+    GgufCompositeArtifactPlan::new(model_modalities, projector_modalities)
+}
+
 /// Architecture-owned distributed capabilities for one normalized model.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct ParallelCapabilityPlan {
@@ -279,24 +372,59 @@ pub fn gguf_capabilities(
         | GgufArchitecture::Qwen3Vl
         | GgufArchitecture::Qwen35 => false,
     };
-    let input_modalities = match architecture {
-        GgufArchitecture::Inkling => InputModalities {
-            text: true,
-            image: true,
-            audio: true,
-            video: false,
-        },
-        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => InputModalities {
-            text: true,
-            image: true,
-            audio: false,
-            video: true,
-        },
-        _ => InputModalities::TEXT,
-    };
+    let input_modalities = gguf_composite_artifact_plan(architecture)
+        .input_modalities(GgufArtifactComposition::ModelOnly);
     Ok(ArchitectureCapabilities::new(
         architecture.model_kind(),
         routed,
         input_modalities,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validated_optional_projectors_expand_gguf_modalities() {
+        for (architecture, expected) in [
+            (
+                GgufArchitecture::Qwen35,
+                InputModalities {
+                    text: true,
+                    image: true,
+                    audio: false,
+                    video: true,
+                },
+            ),
+            (
+                GgufArchitecture::Gemma4,
+                InputModalities {
+                    text: true,
+                    image: true,
+                    audio: true,
+                    video: false,
+                },
+            ),
+            (
+                GgufArchitecture::MuseGlimmer,
+                InputModalities {
+                    text: true,
+                    image: true,
+                    audio: false,
+                    video: false,
+                },
+            ),
+        ] {
+            let plan = gguf_composite_artifact_plan(architecture);
+            assert_eq!(
+                plan.input_modalities(GgufArtifactComposition::ModelOnly),
+                InputModalities::TEXT
+            );
+            assert_eq!(
+                plan.input_modalities(GgufArtifactComposition::ValidatedMediaProjector),
+                expected
+            );
+        }
+    }
 }
