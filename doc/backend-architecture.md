@@ -383,7 +383,9 @@ internally between reusable backend mechanics and family/backend composition:
   optional distributed context.
 - neural-network modules implement reusable MLX tensor operations;
 - runtime modules implement checkpoint materialization, sampling, caches,
-  residency workers, media processing, and collectives;
+  residency workers, media processing, and collectives. Their production
+  checkpoint API consumes canonical parameter names and architecture-derived
+  recipes; it does not expose parsers for physical family checkpoint names;
 - GGUF family selection and structural admission are composition concerns.
   Composition consumes the architecture resolved by backend-neutral artifact
   inspection, validates the native checkpoint once, and passes an admitted

@@ -946,9 +946,10 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Projection kind in a split gated-product expert checkpoint.
-pub enum GatedProductExpertProjection {
+enum GatedProductExpertProjection {
     /// Gate projection (`w1`).
     Gate,
     /// Down projection (`w2`).
@@ -957,9 +958,10 @@ pub enum GatedProductExpertProjection {
     Up,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// Stored component of one split expert projection.
-pub enum GatedProductExpertComponent {
+enum GatedProductExpertComponent {
     /// Projection values.
     Weight,
     /// Quantization scales.
@@ -988,7 +990,8 @@ struct GatedProductExpertParts {
 }
 
 /// Parses keys like `prefix.experts.17.w1.weight`.
-pub fn parse_split_gated_product_expert_projection_key(
+#[cfg(test)]
+fn parse_split_gated_product_expert_projection_key(
     key: &str,
 ) -> Option<(
     String,
@@ -1128,9 +1131,10 @@ pub fn transform_split_gated_product_experts(
     Ok(transformed)
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Projection kind in a split ReLU2 expert checkpoint.
-pub enum Relu2ExpertProjection {
+enum Relu2ExpertProjection {
     /// Expert up projection.
     Up,
     /// Expert down projection.
@@ -1145,7 +1149,8 @@ struct Relu2ExpertParts {
 }
 
 /// Parses keys like `prefix.experts.17.up_proj.weight`.
-pub fn parse_split_relu2_expert_projection_key(
+#[cfg(test)]
+fn parse_split_relu2_expert_projection_key(
     key: &str,
 ) -> Option<(String, i32, Relu2ExpertProjection)> {
     let (prefix, rest) = key.split_once(".experts.")?;
