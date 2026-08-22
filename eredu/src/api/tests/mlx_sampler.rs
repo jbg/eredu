@@ -20,7 +20,7 @@ use crate::{
     },
     runtime::chat::{GenerationRuntimePlan, ParallelToolCallPolicy, ToolChoice},
 };
-use eredu_backend_mlx::backend::mlx::runtime::generation::sampler::{
+use eredu_backend_mlx::testing::backend::mlx::runtime::generation::sampler::{
     ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler, MlxSamplingBackend,
     Sampler, SpeculativeSampler,
 };

@@ -14,8 +14,8 @@ use eredu::{
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
     MtpCapability, MtpCheckpointKind, MtpSchedulerOptions, SemanticEvent,
 };
-use eredu_backend_mlx::composition::mlx::speculative::MlxDrafter;
 use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
+use eredu_backend_mlx::MlxDrafter;
 use serde_json::json;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let mut model = LoadedModel::load(
-        eredu_backend_mlx::backend::mlx::MlxBackend::new(target.stream(), target.stream()),
+        eredu_backend_mlx::MlxBackend::new(target.stream(), target.stream()),
         &target_path,
         Default::default(),
     )?;

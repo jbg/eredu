@@ -8,10 +8,8 @@ use eredu::{
     core::{BackendProvider as _, BackendSession as _},
     load_model, DenseDiskStreamLoadOptions, LayerwiseLoadOptions, WeightResidency,
 };
-use eredu_backend_mlx::backend::mlx::{
-    nn::generation::sample, runtime::media::input, MlxBackend, ModelLoadOptions,
-};
 use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
+use eredu_backend_mlx::{sample, InputPart, MlxBackend, ModelInput, ModelLoadOptions};
 
 #[derive(Debug, Parser)]
 #[command(about = "Measure synchronous Llama decoder-layer host transfers")]
@@ -135,10 +133,10 @@ fn main() -> anyhow::Result<()> {
 
     stream.synchronize()?;
     let prompt_array = Array::from_slice(&prompt, &[1, prompt.len() as i32]);
-    let prompt_parts = [input::InputPart::text_token_ids(&prompt_array)];
+    let prompt_parts = [InputPart::text_token_ids(&prompt_array)];
     let prefill_started = Instant::now();
     let _ = session
-        .prefill(&backend, input::ModelInput::new(&prompt_parts).into())?
+        .prefill(&backend, ModelInput::new(&prompt_parts).into())?
         .wait()?;
     stream.synchronize()?;
     let prefill = prefill_started.elapsed();
@@ -147,7 +145,7 @@ fn main() -> anyhow::Result<()> {
     session.reset()?;
     let repeated_prefill_started = Instant::now();
     let mut logits = session
-        .prefill(&backend, input::ModelInput::new(&prompt_parts).into())?
+        .prefill(&backend, ModelInput::new(&prompt_parts).into())?
         .wait()?
         .into_logits()
         .expect("replicated model session returns logits");

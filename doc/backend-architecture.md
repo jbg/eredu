@@ -28,8 +28,11 @@ the facade's development dependency; the production `mlx` feature does not
 enable backend `test-support`.
 
 The facade root and `api` namespace expose portable application concepts plus
-the narrow selected-backend adapter. The complete backend-native module tree
-remains available only from its owning implementation crate.
+the narrow selected-backend adapter. `eredu-backend-mlx` likewise exposes its
+adapter types and operations as an explicit flat root API; its backend runtime,
+family composition, and architecture-erased dispatch modules are crate-private.
+The feature-gated `testing` namespace exists only for cross-crate integration
+fixtures and is not enabled by the production `mlx` feature.
 
 ## Ownership boundary
 

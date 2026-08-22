@@ -17,9 +17,9 @@ use eredu_backend_mlx::native::{
     Array, Device, DeviceType, Stream,
 };
 use eredu_backend_mlx::{
-    backend::mlx::error::Error,
-    backend::mlx::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
-    backend::mlx::runtime::{
+    testing::backend::mlx::error::Error,
+    testing::backend::mlx::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
+    testing::backend::mlx::runtime::{
         checkpoint::store::{SafetensorsWeightStore, TensorSelection},
         distributed::expert::{
             dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings,

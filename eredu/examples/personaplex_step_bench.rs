@@ -8,8 +8,7 @@ use eredu_backend_mlx::native::{
     transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
 };
 use eredu_backend_mlx::{
-    backend::mlx::ModelLoadOptions,
-    composition::mlx::realtime::{personaplex_prompt, MlxRealtimeBackend, MlxRealtimeInput},
+    personaplex_sine_frame, MlxRealtimeBackend, MlxRealtimeInput, ModelLoadOptions,
 };
 use eredu_checkpoint::AffineQuantization;
 
@@ -85,7 +84,7 @@ fn benchmark_model(
     frames: i32,
     stream: &Stream,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let input = personaplex_prompt::sine_frame(1, stream)?;
+    let input = personaplex_sine_frame(1, stream)?;
     let _ = run_steps(model, &input, 4, stream)?;
     let result = run_steps(model, &input, frames, stream)?;
     report(

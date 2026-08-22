@@ -23,13 +23,13 @@ use eredu_backend_mlx::native::{
     Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
 };
 use eredu_backend_mlx::{
-    backend::mlx::error::Error,
-    backend::mlx::runtime::checkpoint::quantization::CheckpointQuantizationOptions,
-    backend::mlx::runtime::execution::inspection::ActivationRecorder,
-    backend::mlx::runtime::generation::sampler::{ConstrainedSampler, DefaultSampler},
-    backend::mlx::runtime::media::input,
-    backend::mlx::ModelLoadOptions,
-    composition::mlx::{validate_gguf_quantization_source, Model},
+    testing::backend::mlx::error::Error,
+    testing::backend::mlx::runtime::checkpoint::quantization::CheckpointQuantizationOptions,
+    testing::backend::mlx::runtime::execution::inspection::ActivationRecorder,
+    testing::backend::mlx::runtime::generation::sampler::{ConstrainedSampler, DefaultSampler},
+    testing::backend::mlx::runtime::media::input,
+    testing::backend::mlx::ModelLoadOptions,
+    testing::composition::mlx::{validate_gguf_quantization_source, Model},
 };
 use eredu_gguf::{GgmlType, MetadataValue as GgufWriterMetadata, TensorInput, Writer};
 use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized};
@@ -53,10 +53,10 @@ fn load_test_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<
-    crate::PreparedModel<eredu_backend_mlx::backend::mlx::MlxModel>,
+    crate::PreparedModel<eredu_backend_mlx::testing::backend::mlx::MlxModel>,
     crate::ModelLoadError<Error>,
 > {
-    let backend = eredu_backend_mlx::backend::mlx::MlxBackend::new(stream, weights_stream);
+    let backend = eredu_backend_mlx::testing::backend::mlx::MlxBackend::new(stream, weights_stream);
     crate::load_model(&backend, path, options)
 }
 
@@ -72,7 +72,10 @@ fn observer_forward_reports_attention_and_residual_hooks() {
         eredu_backend_mlx::native::Device::new(eredu_backend_mlx::native::DeviceType::Cpu, 0),
     );
     let mut model = LoadedModel::load(
-        eredu_backend_mlx::backend::mlx::MlxBackend::new(ctx.stream(), weights_ctx.stream()),
+        eredu_backend_mlx::testing::backend::mlx::MlxBackend::new(
+            ctx.stream(),
+            weights_ctx.stream(),
+        ),
         model_dir,
         ModelLoadOptions::default(),
     )
@@ -86,10 +89,12 @@ fn observer_forward_reports_attention_and_residual_hooks() {
         .unwrap();
     let mut recorder = ActivationRecorder::new();
     let parts = [
-        eredu_backend_mlx::backend::mlx::runtime::media::input::InputPart::text_token_ids(&input),
+        eredu_backend_mlx::testing::backend::mlx::runtime::media::input::InputPart::text_token_ids(
+            &input,
+        ),
     ];
-    let input = eredu_backend_mlx::composition::mlx::MlxModelInput::from(
-        eredu_backend_mlx::backend::mlx::runtime::media::input::ModelInput::new(&parts),
+    let input = eredu_backend_mlx::testing::composition::mlx::MlxModelInput::from(
+        eredu_backend_mlx::testing::backend::mlx::runtime::media::input::ModelInput::new(&parts),
     );
     let (backend, session) = model.runtime_mut().parts_mut();
     session
@@ -133,7 +138,7 @@ fn chat_preparation_contracts_are_public_and_default_conservatively() {
         ParallelToolCallPolicy::Disabled
     );
     let _: fn(
-        &mut LoadedModel<eredu_backend_mlx::backend::mlx::MlxBackend<'static>>,
+        &mut LoadedModel<eredu_backend_mlx::testing::backend::mlx::MlxBackend<'static>>,
         ChatTemplateRequest,
     ) -> Result<PreparedChat, TextModelError> = LoadedModel::prepare_chat;
 }
@@ -179,18 +184,23 @@ fn prepared_chat_input_keeps_its_semantic_owner_with_an_opaque_backend_prompt() 
         preserved_structural_token_ids: Vec::new(),
         profile_stop_sequences: Vec::new(),
     };
-    let input: PreparedChatInput<'_, eredu_backend_mlx::backend::mlx::MlxBackend<'static>> =
-        PreparedChatInput::rendered_prompt(&prepared);
+    let input: PreparedChatInput<
+        '_,
+        eredu_backend_mlx::testing::backend::mlx::MlxBackend<'static>,
+    > = PreparedChatInput::rendered_prompt(&prepared);
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
     assert!(input.backend_prompt().is_none());
-    let model_input = eredu_backend_mlx::backend::mlx::runtime::media::prepared_model_input(vec![
-        eredu_backend_mlx::backend::mlx::runtime::media::PreparedInputPart::text_token_ids(&[7]),
+    let model_input = eredu_backend_mlx::testing::backend::mlx::runtime::media::prepared_model_input(vec![
+        eredu_backend_mlx::testing::backend::mlx::runtime::media::PreparedInputPart::text_token_ids(&[7]),
     ])
     .unwrap();
-    let model_input = model_input
-        .with_model_input(|input| eredu_backend_mlx::composition::mlx::MlxModelInput::from(input));
-    let input: PreparedChatInput<'_, eredu_backend_mlx::backend::mlx::MlxBackend<'static>> =
-        PreparedChatInput::prepared_backend_input(&prepared, model_input);
+    let model_input = model_input.with_model_input(|input| {
+        eredu_backend_mlx::testing::composition::mlx::MlxModelInput::from(input)
+    });
+    let input: PreparedChatInput<
+        '_,
+        eredu_backend_mlx::testing::backend::mlx::MlxBackend<'static>,
+    > = PreparedChatInput::prepared_backend_input(&prepared, model_input);
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
     assert!(input.backend_prompt().is_some());
 }
@@ -233,11 +243,12 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         "layer_types": ["full_attention"]
     });
     let parsed = eredu_architectures::qwen::hybrid::model_args_from_config_value(&config).unwrap();
-    let qwen = eredu_backend_mlx::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
-        parsed.text,
-        stream,
-    )
-    .unwrap();
+    let qwen =
+        eredu_backend_mlx::testing::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
+            parsed.text,
+            stream,
+        )
+        .unwrap();
     let directory = temp_model_dir(&config.to_string());
     save_zero_neutral_checkpoint(&qwen, &directory, stream);
     let Model::Qwen35(qwen) =
@@ -250,9 +261,9 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         panic!("expected canonical Qwen3.5 model");
     };
     let runtime = eredu_core::ModelRuntime::from_prepared(
-        eredu_backend_mlx::backend::mlx::MlxBackend::new(stream, stream),
+        eredu_backend_mlx::testing::backend::mlx::MlxBackend::new(stream, stream),
         eredu_core::PreparedModel::new(
-            eredu_backend_mlx::backend::mlx::MlxModel::complete_for_test(
+            eredu_backend_mlx::testing::backend::mlx::MlxModel::complete_for_test(
                 Model::Qwen35(qwen),
                 std::num::NonZeroU8::new(4).unwrap(),
             ),
@@ -273,7 +284,7 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
 
     let capabilities = model.capabilities().unwrap();
     assert_eq!(capabilities.model_type, "qwen3_5_text");
-    let prompt = <eredu_backend_mlx::backend::mlx::MlxBackend<'static> as eredu_core::TextGenerationBackend>::prepare_text_prompt(
+    let prompt = <eredu_backend_mlx::testing::backend::mlx::MlxBackend<'static> as eredu_core::TextGenerationBackend>::prepare_text_prompt(
         model.runtime().backend(),
         vec![1, 2],
     )
@@ -1320,7 +1331,7 @@ fn save_zero_qwen_checkpoint(
     }
 
     let architecture = eredu_architectures::qwen::LayeredModel::<
-        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
     >::new(args.clone(), stream)
     .unwrap();
     let mut collector = ZeroCollector {
@@ -1332,7 +1343,7 @@ fn save_zero_qwen_checkpoint(
         .visit_parameters(&mut collector);
     for layer in 0..args.num_hidden_layers as usize {
         eredu_architectures::qwen::new_block::<
-            eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
         >(args, layer, stream)
         .unwrap()
         .visit_parameters(&mut collector);
@@ -1378,28 +1389,28 @@ fn save_zero_gemma4_checkpoint(
     }
 
     type Architecture = eredu_architectures::gemma4::LayeredModel<
-        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
     >;
-    type State = eredu_backend_mlx::backend::mlx::runtime::cache::state::MlxHybridState;
+    type State = eredu_backend_mlx::testing::backend::mlx::runtime::cache::state::MlxHybridState;
     let architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut collector = ZeroCollector {
         stream,
         arrays: Vec::new(),
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     for group in 0..3 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -1441,28 +1452,28 @@ fn save_zero_inkling_checkpoint(
     }
 
     type Architecture = eredu_architectures::inkling::LayeredModel<
-        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
     >;
-    type State = eredu_backend_mlx::backend::mlx::runtime::cache::state::MlxHybridState;
+    type State = eredu_backend_mlx::testing::backend::mlx::runtime::cache::state::MlxHybridState;
     let architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut collector = ZeroCollector {
         stream,
         arrays: Vec::new(),
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     for group in 0..2 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -1503,7 +1514,7 @@ fn tiny_gemma4_neutral_runtime_executes_independent_expert_cache() {
     )
     .unwrap();
     save_zero_gemma4_checkpoint(&args, &dir, stream);
-    let mut model = eredu_backend_mlx::composition::gemma4::load_safetensors(
+    let mut model = eredu_backend_mlx::testing::composition::gemma4::load_safetensors(
         &dir,
         eredu_runtime::WeightResidency::with_expert_cache(
             eredu_runtime::NonExpertWeightResidency::FullyResident,
@@ -1547,7 +1558,7 @@ fn tiny_gemma4_external_assistant_uses_neutral_transaction_path() {
     )
     .unwrap();
     save_zero_gemma4_checkpoint(&target_args, &target_dir, stream);
-    let mut target = eredu_backend_mlx::composition::gemma4::load_safetensors(
+    let mut target = eredu_backend_mlx::testing::composition::gemma4::load_safetensors(
         &target_dir,
         eredu_runtime::WeightResidency::fully_resident(),
         None,
@@ -1572,30 +1583,34 @@ fn tiny_gemma4_external_assistant_uses_neutral_transaction_path() {
     )
     .unwrap();
     let assistant_module = eredu_architectures::gemma4::Assistant::<
-        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
     >::new(assistant_config, stream)
     .unwrap();
     save_zero_neutral_checkpoint(&assistant_module, &assistant_dir, stream);
-    let mut assistant = eredu_backend_mlx::composition::gemma4::load_assistant_safetensors(
-        &assistant_dir,
-        ModelLoadOptions::default(),
-        stream,
-        weights_stream,
-    )
-    .unwrap();
+    let mut assistant =
+        eredu_backend_mlx::testing::composition::gemma4::load_assistant_safetensors(
+            &assistant_dir,
+            ModelLoadOptions::default(),
+            stream,
+            weights_stream,
+        )
+        .unwrap();
 
     let mut cache = target.new_cache();
     let mut executor =
-        eredu_backend_mlx::composition::mlx::speculative::external::Gemma4ExternalExecutor::new(
+        eredu_backend_mlx::testing::composition::mlx::speculative::external::Gemma4ExternalExecutor::new(
             &mut target,
             &mut assistant,
         );
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [input::InputPart::text_token_ids(&tokens)];
-    let prepared =
-        eredu_backend_mlx::composition::mlx::MlxModelInput::from(input::ModelInput::new(&parts));
+    let prepared = eredu_backend_mlx::testing::composition::mlx::MlxModelInput::from(
+        input::ModelInput::new(&parts),
+    );
     let streams =
-        eredu_backend_mlx::composition::mlx::speculative::MtpExecutionStreams::single(stream);
+        eredu_backend_mlx::testing::composition::mlx::speculative::MtpExecutionStreams::single(
+            stream,
+        );
     let prefill = executor.prefill(prepared, &mut cache, streams).unwrap();
     let mut draft = executor
         .begin_proposal(&prefill.state, 2, 2, streams)
@@ -1603,7 +1618,10 @@ fn tiny_gemma4_external_assistant_uses_neutral_transaction_path() {
     let draft_logits = executor.proposal_logits(&mut draft, 2, streams).unwrap();
     assert_eq!(draft_logits.shape(), &[1, 1, 32]);
 
-    let checkpoint = <eredu_backend_mlx::composition::mlx::speculative::external::Gemma4ExternalExecutor<'_> as SpeculativeExecutor>::checkpoint(&cache);
+    let checkpoint =
+        <eredu_backend_mlx::testing::composition::mlx::speculative::external::Gemma4ExternalExecutor<
+            '_,
+        > as SpeculativeExecutor>::checkpoint(&cache);
     let verification = executor
         .submit_verification(&[3, 4], &mut cache, streams)
         .unwrap();
@@ -1650,7 +1668,7 @@ fn tiny_inkling_embedded_mtp_uses_neutral_transaction_path() {
     )
     .unwrap();
     save_zero_inkling_checkpoint(&args, &dir, stream);
-    let mut target = eredu_backend_mlx::composition::inkling::load_safetensors(
+    let mut target = eredu_backend_mlx::testing::composition::inkling::load_safetensors(
         &dir,
         eredu_runtime::WeightResidency::fully_resident(),
         None,
@@ -1662,15 +1680,18 @@ fn tiny_inkling_embedded_mtp_uses_neutral_transaction_path() {
 
     let mut cache = target.new_cache();
     let mut executor =
-        eredu_backend_mlx::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
+        eredu_backend_mlx::testing::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
             &mut target,
         );
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [input::InputPart::text_token_ids(&tokens)];
-    let prepared =
-        eredu_backend_mlx::composition::mlx::MlxModelInput::from(input::ModelInput::new(&parts));
+    let prepared = eredu_backend_mlx::testing::composition::mlx::MlxModelInput::from(
+        input::ModelInput::new(&parts),
+    );
     let streams =
-        eredu_backend_mlx::composition::mlx::speculative::MtpExecutionStreams::single(stream);
+        eredu_backend_mlx::testing::composition::mlx::speculative::MtpExecutionStreams::single(
+            stream,
+        );
     let prefill = executor.prefill(prepared, &mut cache, streams).unwrap();
     let mut draft = executor
         .begin_proposal(&prefill.state, 2, 2, streams)
@@ -1679,9 +1700,9 @@ fn tiny_inkling_embedded_mtp_uses_neutral_transaction_path() {
     assert_eq!(draft_logits.shape(), &[1, 1, 64]);
 
     let checkpoint =
-        <eredu_backend_mlx::composition::mlx::speculative::embedded::EmbeddedMtpExecutor<
+        <eredu_backend_mlx::testing::composition::mlx::speculative::embedded::EmbeddedMtpExecutor<
             '_,
-            eredu_backend_mlx::composition::inkling::InklingModel,
+            eredu_backend_mlx::testing::composition::inkling::InklingModel,
         > as SpeculativeExecutor>::checkpoint(&cache);
     let verification = executor
         .submit_verification(&[3, 4], &mut cache, streams)
@@ -1775,21 +1796,23 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 )
                 .unwrap();
                 let model = eredu_architectures::llama::Model::<
-                    eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+                    eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
                 >::new(&args, stream)
                 .unwrap();
                 save_zero_neutral_checkpoint(&model, &dir, stream);
             }
             "qwen3" => {
-                let args = eredu_backend_mlx::composition::qwen::load_model_args(&dir).unwrap();
+                let args =
+                    eredu_backend_mlx::testing::composition::qwen::load_model_args(&dir).unwrap();
                 save_zero_qwen_checkpoint(&args, &dir, stream);
             }
             "qwen3_5" => {
                 let parsed =
-                    eredu_backend_mlx::composition::qwen::hybrid::load_parsed_config(&dir).unwrap();
+                    eredu_backend_mlx::testing::composition::qwen::hybrid::load_parsed_config(&dir)
+                        .unwrap();
                 if parsed.vision.is_some() {
                     save_zero_neutral_checkpoint(
-                        &eredu_backend_mlx::composition::qwen::hybrid::QwenConditionalCheckpointTemplate::new(
+                        &eredu_backend_mlx::testing::composition::qwen::hybrid::QwenConditionalCheckpointTemplate::new(
                             parsed, stream,
                         )
                         .unwrap(),
@@ -1798,7 +1821,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                     );
                 } else {
                     save_zero_neutral_checkpoint(
-                        &eredu_backend_mlx::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
+                        &eredu_backend_mlx::testing::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
                             parsed.text,
                             stream,
                         )
@@ -1844,7 +1867,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 "q4"
             };
             let saved_dir = dir.with_extension(suffix);
-            eredu_backend_mlx::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
+            eredu_backend_mlx::testing::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
                 &dir,
                 &saved_dir,
                 &CheckpointQuantizationOptions {
@@ -1951,9 +1974,9 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 }
 
                 let mut runtime = eredu_core::ModelRuntime::from_prepared(
-                    eredu_backend_mlx::backend::mlx::MlxBackend::new(stream, stream),
+                    eredu_backend_mlx::testing::backend::mlx::MlxBackend::new(stream, stream),
                     eredu_core::PreparedModel::new(
-                        eredu_backend_mlx::backend::mlx::MlxModel::complete_for_test(
+                        eredu_backend_mlx::testing::backend::mlx::MlxModel::complete_for_test(
                             dense,
                             std::num::NonZeroU8::new(4).unwrap(),
                         ),
@@ -1997,10 +2020,12 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
               "quantization_config":{"quant_method":"mxfp4"}
             }"#,
     );
-    let args = eredu_backend_mlx::composition::gpt_oss::load_model_args(&dir).unwrap();
-    let fixture = eredu_backend_mlx::backend::mlx::nn::MlxModule::new(
-        eredu_backend_mlx::composition::gpt_oss::GptOssCheckpointTemplate::new(args, stream)
-            .unwrap(),
+    let args = eredu_backend_mlx::testing::composition::gpt_oss::load_model_args(&dir).unwrap();
+    let fixture = eredu_backend_mlx::testing::backend::mlx::nn::MlxModule::new(
+        eredu_backend_mlx::testing::composition::gpt_oss::GptOssCheckpointTemplate::new(
+            args, stream,
+        )
+        .unwrap(),
     );
     save_zero_checkpoint(&fixture, &dir, stream);
 
@@ -2026,14 +2051,15 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
     let logits = model.forward(&tokens, &mut cache, stream).unwrap();
     eredu_backend_mlx::native::transforms::eval([&logits]).unwrap();
     assert_eq!(logits.shape(), &[1, 2, 32]);
-    let mut bounded = eredu_backend_mlx::composition::gpt_oss::load_gpt_oss_layerwise_model(
-        &dir,
-        eredu_runtime::LayerwiseLoadOptions::default(),
-        None,
-        stream,
-        weights_stream,
-    )
-    .unwrap();
+    let mut bounded =
+        eredu_backend_mlx::testing::composition::gpt_oss::load_gpt_oss_layerwise_model(
+            &dir,
+            eredu_runtime::LayerwiseLoadOptions::default(),
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
     assert_eq!(
         bounded.metadata().residency(),
         eredu_runtime::ExecutionResidency::LayerwiseHost
@@ -2045,7 +2071,7 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
     eredu_backend_mlx::native::transforms::eval([&bounded_logits]).unwrap();
     assert_eq!(bounded_logits.shape(), logits.shape());
     let mut cached_experts =
-        eredu_backend_mlx::composition::gpt_oss::load_gpt_oss_expert_cache_model(
+        eredu_backend_mlx::testing::composition::gpt_oss::load_gpt_oss_expert_cache_model(
             &dir,
             eredu_runtime::NonExpertWeightResidency::FullyResident,
             eredu_runtime::ExpertCacheLoadOptions::default(),
@@ -2081,15 +2107,16 @@ fn tiny_lfm2_neutral_runtime_executes_convolution_and_attention_layers() {
               "tie_word_embeddings":false
             }"#,
     );
-    let args = eredu_backend_mlx::composition::lfm2::load_model_args(&dir).unwrap();
+    let args = eredu_backend_mlx::testing::composition::lfm2::load_model_args(&dir).unwrap();
     save_zero_neutral_checkpoint(
-        &eredu_backend_mlx::composition::lfm2::Lfm2CheckpointTemplate::new(args, stream).unwrap(),
+        &eredu_backend_mlx::testing::composition::lfm2::Lfm2CheckpointTemplate::new(args, stream)
+            .unwrap(),
         &dir,
         stream,
     );
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
 
-    let mut resident = eredu_backend_mlx::composition::lfm2::load_lfm2_model(
+    let mut resident = eredu_backend_mlx::testing::composition::lfm2::load_lfm2_model(
         &dir,
         eredu_runtime::WeightResidency::fully_resident(),
         None,
@@ -2104,7 +2131,7 @@ fn tiny_lfm2_neutral_runtime_executes_convolution_and_attention_layers() {
     eredu_backend_mlx::native::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 16]);
 
-    let mut bounded = eredu_backend_mlx::composition::lfm2::load_lfm2_model(
+    let mut bounded = eredu_backend_mlx::testing::composition::lfm2::load_lfm2_model(
         &dir,
         eredu_runtime::WeightResidency::layerwise_host(
             eredu_runtime::LayerwiseLoadOptions::default(),
@@ -2139,11 +2166,11 @@ fn tiny_qwen_neutral_runtime_executes_resident_and_bounded_layers() {
               "tie_word_embeddings":false,"rope_scaling":null
             }"#,
     );
-    let args = eredu_backend_mlx::composition::qwen::load_model_args(&dir).unwrap();
+    let args = eredu_backend_mlx::testing::composition::qwen::load_model_args(&dir).unwrap();
     save_zero_qwen_checkpoint(&args, &dir, stream);
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
 
-    let mut resident = eredu_backend_mlx::composition::qwen::load_qwen_safetensors_mlx(
+    let mut resident = eredu_backend_mlx::testing::composition::qwen::load_qwen_safetensors_mlx(
         &dir,
         eredu_runtime::WeightResidency::fully_resident(),
         None,
@@ -2158,7 +2185,7 @@ fn tiny_qwen_neutral_runtime_executes_resident_and_bounded_layers() {
     eredu_backend_mlx::native::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 24]);
 
-    let mut bounded = eredu_backend_mlx::composition::qwen::load_qwen_safetensors_mlx(
+    let mut bounded = eredu_backend_mlx::testing::composition::qwen::load_qwen_safetensors_mlx(
         &dir,
         eredu_runtime::WeightResidency::layerwise_host(
             eredu_runtime::LayerwiseLoadOptions::default(),
@@ -2186,7 +2213,7 @@ fn tiny_qwen_neutral_runtime_executes_resident_and_bounded_layers() {
     eredu_backend_mlx::native::transforms::eval([&paged_logits]).unwrap();
     assert_eq!(paged_logits.shape(), resident_logits.shape());
 
-    let mut streamed = eredu_backend_mlx::composition::qwen::load_qwen_safetensors_mlx(
+    let mut streamed = eredu_backend_mlx::testing::composition::qwen::load_qwen_safetensors_mlx(
         &dir,
         eredu_runtime::WeightResidency::dense_disk_stream(
             eredu_runtime::DenseDiskStreamLoadOptions::new(1 << 20, 1 << 20, 1, 1).unwrap(),
@@ -2257,9 +2284,9 @@ fn tiny_qwen_moe_observation_wraps_canonical_routed_execution() {
               "tie_word_embeddings":false,"rope_scaling":null
             }"#,
     );
-    let args = eredu_backend_mlx::composition::qwen::load_model_args(&dir).unwrap();
+    let args = eredu_backend_mlx::testing::composition::qwen::load_model_args(&dir).unwrap();
     save_zero_qwen_checkpoint(&args, &dir, stream);
-    let mut model = eredu_backend_mlx::composition::qwen::load_qwen_safetensors_mlx(
+    let mut model = eredu_backend_mlx::testing::composition::qwen::load_qwen_safetensors_mlx(
         &dir,
         eredu_runtime::WeightResidency::fully_resident(),
         None,
@@ -2291,7 +2318,7 @@ fn tiny_qwen_moe_observation_wraps_canonical_routed_execution() {
         ["model.layers.0.mlp", "model.layers.1.mlp"]
     );
 
-    let mut cached = eredu_backend_mlx::composition::qwen::load_qwen_safetensors_mlx(
+    let mut cached = eredu_backend_mlx::testing::composition::qwen::load_qwen_safetensors_mlx(
         &dir,
         eredu_runtime::WeightResidency::with_expert_cache(
             eredu_runtime::NonExpertWeightResidency::FullyResident,
@@ -2331,11 +2358,11 @@ fn tiny_hybrid_qwen_neutral_runtime_executes_recurrent_and_attention_layers() {
               "tie_word_embeddings":false
             }"#,
     );
-    let args = eredu_backend_mlx::composition::qwen::hybrid::load_parsed_config(&dir)
+    let args = eredu_backend_mlx::testing::composition::qwen::hybrid::load_parsed_config(&dir)
         .unwrap()
         .text;
     save_zero_neutral_checkpoint(
-        &eredu_backend_mlx::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
+        &eredu_backend_mlx::testing::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
             args, stream,
         )
         .unwrap(),
@@ -2344,7 +2371,7 @@ fn tiny_hybrid_qwen_neutral_runtime_executes_recurrent_and_attention_layers() {
     );
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
 
-    let mut resident = eredu_backend_mlx::composition::qwen::hybrid::load_safetensors(
+    let mut resident = eredu_backend_mlx::testing::composition::qwen::hybrid::load_safetensors(
         &dir,
         eredu_runtime::LayerWeightResidency::FullyResident,
         None,
@@ -2359,7 +2386,7 @@ fn tiny_hybrid_qwen_neutral_runtime_executes_recurrent_and_attention_layers() {
     eredu_backend_mlx::native::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 24]);
 
-    let mut bounded = eredu_backend_mlx::composition::qwen::hybrid::load_safetensors(
+    let mut bounded = eredu_backend_mlx::testing::composition::qwen::hybrid::load_safetensors(
         &dir,
         eredu_runtime::LayerwiseLoadOptions::default(),
         None,
@@ -2396,16 +2423,18 @@ fn tiny_lfm2_moe_neutral_runtime_executes_independent_expert_cache() {
               "norm_topk_prob":true,"use_expert_bias":true
             }"#,
     );
-    let args = eredu_backend_mlx::composition::lfm2::load_model_args(&dir).unwrap();
+    let args = eredu_backend_mlx::testing::composition::lfm2::load_model_args(&dir).unwrap();
     save_zero_checkpoint(
-        &eredu_backend_mlx::backend::mlx::nn::MlxModule::new(
-            eredu_backend_mlx::composition::lfm2::Lfm2CheckpointTemplate::new(args, stream)
-                .unwrap(),
+        &eredu_backend_mlx::testing::backend::mlx::nn::MlxModule::new(
+            eredu_backend_mlx::testing::composition::lfm2::Lfm2CheckpointTemplate::new(
+                args, stream,
+            )
+            .unwrap(),
         ),
         &dir,
         stream,
     );
-    let mut model = eredu_backend_mlx::composition::lfm2::load_lfm2_model(
+    let mut model = eredu_backend_mlx::testing::composition::lfm2::load_lfm2_model(
         &dir,
         eredu_runtime::WeightResidency::with_expert_cache(
             eredu_runtime::NonExpertWeightResidency::FullyResident,
@@ -2485,14 +2514,15 @@ fn tiny_kimi_linear_neutral_runtime_executes_hybrid_state_and_expert_cache() {
     .unwrap();
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
 
-    let mut resident = eredu_backend_mlx::composition::kimi_linear::load_kimi_linear_model(
-        &dir,
-        eredu_runtime::WeightResidency::fully_resident(),
-        None,
-        stream,
-        weights_stream,
-    )
-    .unwrap();
+    let mut resident =
+        eredu_backend_mlx::testing::composition::kimi_linear::load_kimi_linear_model(
+            &dir,
+            eredu_runtime::WeightResidency::fully_resident(),
+            None,
+            stream,
+            weights_stream,
+        )
+        .unwrap();
     let mut resident_cache = resident.new_cache();
     let resident_logits = resident
         .forward(&tokens, &mut resident_cache, stream)
@@ -2500,7 +2530,7 @@ fn tiny_kimi_linear_neutral_runtime_executes_hybrid_state_and_expert_cache() {
     eredu_backend_mlx::native::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 16]);
 
-    let mut bounded = eredu_backend_mlx::composition::kimi_linear::load_kimi_linear_model(
+    let mut bounded = eredu_backend_mlx::testing::composition::kimi_linear::load_kimi_linear_model(
         &dir,
         eredu_runtime::WeightResidency::layerwise_host(
             eredu_runtime::LayerwiseLoadOptions::default(),
@@ -2518,7 +2548,7 @@ fn tiny_kimi_linear_neutral_runtime_executes_hybrid_state_and_expert_cache() {
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
     assert!(bounded.residency_report().unwrap().initialized());
 
-    let mut sparse = eredu_backend_mlx::composition::kimi_linear::load_kimi_linear_model(
+    let mut sparse = eredu_backend_mlx::testing::composition::kimi_linear::load_kimi_linear_model(
         &dir,
         eredu_runtime::WeightResidency::with_expert_cache(
             eredu_runtime::NonExpertWeightResidency::FullyResident,
@@ -2602,7 +2632,7 @@ fn tiny_deepseek_v3_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     .unwrap();
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
 
-    let mut resident = eredu_backend_mlx::composition::deepseek::load_safetensors(
+    let mut resident = eredu_backend_mlx::testing::composition::deepseek::load_safetensors(
         &dir,
         eredu_runtime::WeightResidency::fully_resident(),
         None,
@@ -2618,7 +2648,7 @@ fn tiny_deepseek_v3_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     assert_eq!(resident_logits.shape(), &[1, 2, 16]);
     assert_eq!(resident.mtp_len(), 1);
 
-    let mut bounded = eredu_backend_mlx::composition::deepseek::load_safetensors(
+    let mut bounded = eredu_backend_mlx::testing::composition::deepseek::load_safetensors(
         &dir,
         eredu_runtime::WeightResidency::layerwise_host(
             eredu_runtime::LayerwiseLoadOptions::default(),
@@ -2636,7 +2666,7 @@ fn tiny_deepseek_v3_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
     assert!(bounded.residency_report().unwrap().initialized());
 
-    let mut sparse = eredu_backend_mlx::composition::deepseek::load_safetensors(
+    let mut sparse = eredu_backend_mlx::testing::composition::deepseek::load_safetensors(
         &dir,
         eredu_runtime::WeightResidency::with_expert_cache(
             eredu_runtime::NonExpertWeightResidency::FullyResident,
@@ -2713,7 +2743,7 @@ fn tiny_deepseek_v4_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     .unwrap();
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
 
-    let mut resident = eredu_backend_mlx::composition::deepseek::load_safetensors(
+    let mut resident = eredu_backend_mlx::testing::composition::deepseek::load_safetensors(
         &dir,
         eredu_runtime::WeightResidency::fully_resident(),
         None,
@@ -2729,7 +2759,7 @@ fn tiny_deepseek_v4_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     assert_eq!(resident_logits.shape(), &[1, 2, 16]);
     assert_eq!(resident.mtp_len(), 1);
 
-    let mut bounded = eredu_backend_mlx::composition::deepseek::load_safetensors(
+    let mut bounded = eredu_backend_mlx::testing::composition::deepseek::load_safetensors(
         &dir,
         eredu_runtime::WeightResidency::layerwise_host(
             eredu_runtime::LayerwiseLoadOptions::default(),
@@ -2747,7 +2777,7 @@ fn tiny_deepseek_v4_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
     assert!(bounded.residency_report().unwrap().initialized());
 
-    let mut sparse = eredu_backend_mlx::composition::deepseek::load_safetensors(
+    let mut sparse = eredu_backend_mlx::testing::composition::deepseek::load_safetensors(
         &dir,
         eredu_runtime::WeightResidency::with_expert_cache(
             eredu_runtime::NonExpertWeightResidency::FullyResident,
@@ -2768,7 +2798,7 @@ fn tiny_deepseek_v4_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
 
 #[test]
 fn tiny_deepseek_v4_dspark_executes_through_shared_draft_boundary() {
-    use eredu_backend_mlx::composition::mlx::speculative::embedded::EmbeddedMtpTarget;
+    use eredu_backend_mlx::testing::composition::mlx::speculative::embedded::EmbeddedMtpTarget;
 
     let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -2829,7 +2859,7 @@ fn tiny_deepseek_v4_dspark_executes_through_shared_draft_boundary() {
     )
     .unwrap();
 
-    let mut model = eredu_backend_mlx::composition::deepseek::load_safetensors(
+    let mut model = eredu_backend_mlx::testing::composition::deepseek::load_safetensors(
         &dir,
         eredu_runtime::WeightResidency::fully_resident(),
         None,
@@ -2857,7 +2887,7 @@ fn tiny_deepseek_v4_dspark_executes_through_shared_draft_boundary() {
     )
     .unwrap();
     let mut draft =
-        <eredu_backend_mlx::composition::deepseek::DeepSeekModel as EmbeddedMtpTarget>::draft_cache(
+        <eredu_backend_mlx::testing::composition::deepseek::DeepSeekModel as EmbeddedMtpTarget>::draft_cache(
             &model, &state,
         );
     let proposal =
@@ -2900,8 +2930,10 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
         serde_json::from_reader(std::fs::File::open(dir.join("config.json")).unwrap()).unwrap();
     let args = eredu_architectures::qwen::vl::model_args_from_config_value(&config).unwrap();
     save_zero_neutral_checkpoint_with_names(
-        &eredu_backend_mlx::composition::qwen::vl::QwenVlCheckpointTemplate::new(args, stream)
-            .unwrap(),
+        &eredu_backend_mlx::testing::composition::qwen::vl::QwenVlCheckpointTemplate::new(
+            args, stream,
+        )
+        .unwrap(),
         &dir,
         stream,
         |name| {
@@ -2947,7 +2979,7 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
         .unwrap();
     assert_eq!(logits.shape(), &[1, 32]);
 
-    let mut bounded = eredu_backend_mlx::composition::qwen::vl::load_safetensors(
+    let mut bounded = eredu_backend_mlx::testing::composition::qwen::vl::load_safetensors(
         &dir,
         eredu_runtime::LayerwiseLoadOptions::default(),
         None,
@@ -2964,7 +2996,7 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     assert!(bounded.residency_report().unwrap().initialized());
 
     let saved_dir = dir.with_extension("mxfp4");
-    eredu_backend_mlx::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
+    eredu_backend_mlx::testing::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
         &dir,
         &saved_dir,
         &CheckpointQuantizationOptions {
@@ -3035,11 +3067,11 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
           }
         }"#;
     let dir = temp_model_dir(config);
-    let args = eredu_backend_mlx::composition::qwen::hybrid::load_parsed_config(&dir)
+    let args = eredu_backend_mlx::testing::composition::qwen::hybrid::load_parsed_config(&dir)
         .unwrap()
         .text;
     save_zero_neutral_checkpoint(
-        &eredu_backend_mlx::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
+        &eredu_backend_mlx::testing::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
             args, stream,
         )
         .unwrap(),

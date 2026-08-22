@@ -13,13 +13,16 @@
     clippy::type_complexity
 )]
 
-/// Concrete MLX backend implementation and runtime infrastructure.
-pub mod backend;
+mod adapter;
+#[allow(dead_code, unused_imports)]
+mod backend;
 /// Optional MLX bindings for backend-neutral audio codecs.
 #[cfg(feature = "codec")]
 pub mod codec;
-/// MLX bindings for Eredu's backend-neutral model-family definitions.
-pub mod composition;
+#[allow(dead_code, unused_imports)]
+mod composition;
+
+pub use adapter::*;
 
 /// Backend-neutral core contracts used by the extracted implementation.
 pub use eredu_core as core;
@@ -36,3 +39,19 @@ mod tensor;
 mod test_utils;
 
 pub use tensor::MlxTensor;
+
+/// Internal fixtures shared with Eredu's backend integration-test package.
+///
+/// This module is not part of the production adapter API. It is available only
+/// when the explicit `test-support` feature is enabled.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod testing {
+    pub mod backend {
+        pub use crate::backend::mlx;
+    }
+
+    pub mod composition {
+        pub use crate::composition::*;
+    }
+}

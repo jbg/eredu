@@ -13,9 +13,9 @@ use eredu_backend_mlx::native::{
     DeviceType, Stream,
 };
 use eredu_backend_mlx::{
-    backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
-    backend::mlx::runtime::distributed::topology::load_safetensors_partition,
-    backend::mlx::{DeviceAssignment, MlxParallelContext, PlacementPlan},
+    testing::backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
+    testing::backend::mlx::runtime::distributed::topology::load_safetensors_partition,
+    testing::backend::mlx::{DeviceAssignment, MlxParallelContext, PlacementPlan},
 };
 use eredu_runtime::TensorPlacement;
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};

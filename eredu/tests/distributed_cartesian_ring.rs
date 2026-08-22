@@ -8,13 +8,13 @@ use std::{
 };
 
 use eredu::core::{CollectiveScope, DistributedSession};
-use eredu_backend_mlx::backend::mlx::{
-    runtime::distributed::expert::{AllToAllVPlan, RoutedTransport},
-    DeviceAssignment, MlxBackend, MlxParallelContext,
-};
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     Array, Device, DeviceType, Stream,
+};
+use eredu_backend_mlx::testing::backend::mlx::{
+    runtime::distributed::expert::{AllToAllVPlan, RoutedTransport},
+    DeviceAssignment, MlxBackend, MlxParallelContext,
 };
 use eredu_backend_mlx::MlxTensor;
 

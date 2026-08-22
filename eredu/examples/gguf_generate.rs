@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
     let weights_ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = ctx.stream();
     let mut model = LoadedModel::load(
-        eredu_backend_mlx::backend::mlx::MlxBackend::new(stream, weights_ctx.stream()),
+        eredu_backend_mlx::MlxBackend::new(stream, weights_ctx.stream()),
         &gguf_file,
         Default::default(),
     )?;

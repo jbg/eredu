@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
-use eredu_backend_mlx::backend::mlx::runtime::checkpoint::quantization::CheckpointQuantizationOptions;
 use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
+use eredu_backend_mlx::{quantize_checkpoint, CheckpointQuantizationOptions};
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -69,13 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exclude: args.exclude,
         minimum_elements: args.minimum_elements,
     };
-    let report =
-        eredu_backend_mlx::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
-            args.source,
-            args.output,
-            &options,
-            stream,
-        )?;
+    let report = quantize_checkpoint(args.source, args.output, &options, stream)?;
     println!("quantized_tensors={}", report.quantized_tensors);
     println!("copied_tensors={}", report.copied_tensors);
     println!("shards={}", report.shards);

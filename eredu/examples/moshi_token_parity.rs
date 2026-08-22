@@ -14,8 +14,8 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use eredu::load_realtime_model;
-use eredu_backend_mlx::composition::mlx::realtime::{generate_encoded_greedy, MlxRealtimeBackend};
 use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
+use eredu_backend_mlx::{generate_encoded_greedy, MlxRealtimeBackend};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();

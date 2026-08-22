@@ -1,8 +1,8 @@
 use std::{path::PathBuf, time::Instant};
 
 use eredu::{api::LoadedModel, GenerationConfigOverrides, TextGenerationConfig, TokenOutput};
-use eredu_backend_mlx::backend::mlx::ModelLoadOptions;
 use eredu_backend_mlx::native::ExecutionContext;
+use eredu_backend_mlx::ModelLoadOptions;
 use eredu_checkpoint::AffineQuantization;
 
 const DEFAULT_DECODE_TOKENS: usize = 128;
@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
         ModelLoadOptions::default()
     };
     let mut model = LoadedModel::load(
-        eredu_backend_mlx::backend::mlx::MlxBackend::new(stream, weights_stream),
+        eredu_backend_mlx::MlxBackend::new(stream, weights_stream),
         &model_dir,
         options,
     )?;
@@ -129,7 +129,7 @@ struct BenchResult {
 }
 
 fn run_case(
-    model: &mut LoadedModel<eredu_backend_mlx::backend::mlx::MlxBackend<'static>>,
+    model: &mut LoadedModel<eredu_backend_mlx::MlxBackend<'static>>,
     prompt: &str,
     decode_tokens: usize,
 ) -> anyhow::Result<BenchResult> {
@@ -181,7 +181,7 @@ fn run_case(
 }
 
 fn prompt_near_token_count(
-    model: &mut LoadedModel<eredu_backend_mlx::backend::mlx::MlxBackend<'static>>,
+    model: &mut LoadedModel<eredu_backend_mlx::MlxBackend<'static>>,
     target_tokens: usize,
 ) -> anyhow::Result<String> {
     let base = "Discuss hybrid linear attention, sparse mixture-of-experts routing, recurrent cache updates, grouped convolution, and vocabulary projection in a text generation runtime. ";

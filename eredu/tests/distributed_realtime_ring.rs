@@ -19,8 +19,8 @@ use eredu_backend_mlx::native::{
     Array, Device, DeviceType, Stream,
 };
 use eredu_backend_mlx::{
-    backend::mlx::{DeviceAssignment, MlxParallelContext, ModelLoadOptions},
-    composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
+    testing::backend::mlx::{DeviceAssignment, MlxParallelContext, ModelLoadOptions},
+    testing::composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
 };
 
 const WORKER_RANK: &str = "EREDU_MOSHI_RING_WORKER";

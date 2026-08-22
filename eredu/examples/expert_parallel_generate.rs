@@ -4,13 +4,13 @@ use eredu::{
     core::{BackendProvider as _, BackendSession as _},
     load_model, ExpertCacheLoadOptions, NonExpertWeightResidency, WeightResidency,
 };
-use eredu_backend_mlx::backend::mlx::{
-    runtime::{generation::sampler::DefaultSampler, media::input},
-    DeviceAssignment, MlxBackend, MlxParallelContext, ModelLoadOptions,
-};
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     DeviceType, Stream,
+};
+use eredu_backend_mlx::{
+    DefaultSampler, DeviceAssignment, InputPart, MlxBackend, MlxParallelContext, ModelInput,
+    ModelLoadOptions,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,9 +45,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut session = backend.create_session(model)?;
     let prompt = eredu_backend_mlx::native::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-    let parts = [input::InputPart::text_token_ids(&prompt)];
+    let parts = [InputPart::text_token_ids(&prompt)];
     let mut logits = session
-        .prefill(&backend, input::ModelInput::new(&parts).into())?
+        .prefill(&backend, ModelInput::new(&parts).into())?
         .wait()?
         .into_logits()
         .ok_or("expert-parallel session returned no logits")?;

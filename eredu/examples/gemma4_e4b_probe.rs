@@ -7,8 +7,8 @@ use eredu::{
     api::{LoadedModel, LoadedModelLoadError},
     GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
-use eredu_backend_mlx::backend::mlx::error::Error;
 use eredu_backend_mlx::native::ExecutionContext;
+use eredu_backend_mlx::MlxError;
 use serde_json::Value;
 
 fn main() -> anyhow::Result<()> {
@@ -40,12 +40,12 @@ fn main() -> anyhow::Result<()> {
     ));
     let weights_stream = weights_ctx.stream();
     let mut model = match LoadedModel::load(
-        eredu_backend_mlx::backend::mlx::MlxBackend::new(stream, weights_stream),
+        eredu_backend_mlx::MlxBackend::new(stream, weights_stream),
         &model_dir,
         Default::default(),
     ) {
         Ok(model) => model,
-        Err(LoadedModelLoadError::Backend(Error::StrictLoadValidation { missing, unused })) => {
+        Err(LoadedModelLoadError::Backend(MlxError::StrictLoadValidation { missing, unused })) => {
             print_strict_report(&missing, &unused);
             anyhow::bail!(
                 "strict load failed; implement the missing architecture or key mapping above"
@@ -111,7 +111,7 @@ fn gemma4_message(prompt: &str, model_type: &str) -> serde_json::Value {
 }
 
 fn print_first_token_distribution(
-    model: &mut LoadedModel<eredu_backend_mlx::backend::mlx::MlxBackend<'static>>,
+    model: &mut LoadedModel<eredu_backend_mlx::MlxBackend<'static>>,
     tokens: Vec<u32>,
 ) -> anyhow::Result<()> {
     let resolved = model.resolve_generation_config(GenerationConfigOverrides {

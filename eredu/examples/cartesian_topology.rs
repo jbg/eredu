@@ -1,10 +1,10 @@
 //! Inspect a pairwise Cartesian distributed topology before loading weights.
 
-use eredu_backend_mlx::backend::mlx::{DeviceAssignment, MlxParallelContext};
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     DeviceType,
 };
+use eredu_backend_mlx::{DeviceAssignment, MlxParallelContext};
 
 fn parse(index: usize, name: &str) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(std::env::args()

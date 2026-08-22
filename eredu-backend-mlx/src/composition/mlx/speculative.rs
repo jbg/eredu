@@ -146,14 +146,14 @@ impl MlxDrafter {
     }
 
     /// Architecture detected from the checkpoint itself.
-    pub const fn kind(&self) -> MlxDrafterKind {
+    pub(crate) const fn kind(&self) -> MlxDrafterKind {
         match self.model {
             MlxDrafterModel::Gemma4(_) => MlxDrafterKind::Gemma4Assistant,
             MlxDrafterModel::MuseGlimmerDFlash(_) => MlxDrafterKind::MuseGlimmerDFlash,
         }
     }
 
-    pub fn gemma4(&self) -> &Gemma4AssistantModel {
+    pub(crate) fn gemma4(&self) -> &Gemma4AssistantModel {
         match &self.model {
             MlxDrafterModel::Gemma4(model) => model,
             MlxDrafterModel::MuseGlimmerDFlash(_) => {
@@ -162,7 +162,7 @@ impl MlxDrafter {
         }
     }
 
-    pub fn gemma4_mut(&mut self) -> &mut Gemma4AssistantModel {
+    pub(crate) fn gemma4_mut(&mut self) -> &mut Gemma4AssistantModel {
         match &mut self.model {
             MlxDrafterModel::Gemma4(model) => model,
             MlxDrafterModel::MuseGlimmerDFlash(_) => {
@@ -171,7 +171,7 @@ impl MlxDrafter {
         }
     }
 
-    pub fn muse_glimmer(&self) -> &MuseGlimmerDFlashModel {
+    pub(crate) fn muse_glimmer(&self) -> &MuseGlimmerDFlashModel {
         match &self.model {
             MlxDrafterModel::MuseGlimmerDFlash(model) => model,
             MlxDrafterModel::Gemma4(_) => {
@@ -180,7 +180,7 @@ impl MlxDrafter {
         }
     }
 
-    pub fn muse_glimmer_mut(&mut self) -> &mut MuseGlimmerDFlashModel {
+    pub(crate) fn muse_glimmer_mut(&mut self) -> &mut MuseGlimmerDFlashModel {
         match &mut self.model {
             MlxDrafterModel::MuseGlimmerDFlash(model) => model,
             MlxDrafterModel::Gemma4(_) => {

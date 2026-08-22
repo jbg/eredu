@@ -18,11 +18,11 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use eredu::{load_realtime_model, RealtimeSampling, RealtimeScheduler, RequestId, SchedulerLimits};
-use eredu_backend_mlx::composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput};
 use eredu_backend_mlx::native::{
     ops::{indexing::TryIndexOp, stack_axis},
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
+use eredu_backend_mlx::{MlxRealtimeBackend, MlxRealtimeInput};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
