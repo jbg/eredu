@@ -11,7 +11,7 @@ use eredu::{
     core::{BackendProvider as _, BackendSession as _},
     load_model, DenseDiskStreamLoadOptions, LayerwiseLoadOptions, WeightResidency,
 };
-use safemlx::{Array, Device, DeviceType, ExecutionContext};
+use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
 
 #[derive(Debug, Parser)]
 #[command(about = "Measure synchronous Llama decoder-layer host transfers")]

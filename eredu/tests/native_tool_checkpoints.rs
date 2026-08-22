@@ -12,7 +12,7 @@ use eredu::{
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
     FinishReason, SemanticEvent,
 };
-use safemlx::{Device, DeviceType, ExecutionContext};
+use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
 use serde_json::json;
 
 fn profile_requires_structural_tool_tokens(identity: &str) -> bool {

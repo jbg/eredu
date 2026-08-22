@@ -847,22 +847,17 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "eredu-architectures",
+ "eredu-backend-mlx",
  "eredu-checkpoint",
  "eredu-core",
  "eredu-gguf",
  "eredu-nn",
  "eredu-runtime",
  "eredu-text",
- "half",
  "idna_adapter",
- "image",
  "lazy_static",
- "libc",
  "llguidance",
- "memmap2",
  "minijinja",
- "rustfft",
- "safemlx",
  "safetensors",
  "serde",
  "serde_json",
@@ -890,6 +885,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "eredu-backend-mlx"
+version = "0.1.0"
+dependencies = [
+ "eredu-architectures",
+ "eredu-checkpoint",
+ "eredu-codec",
+ "eredu-core",
+ "eredu-gguf",
+ "eredu-nn",
+ "eredu-runtime",
+ "half",
+ "image",
+ "libc",
+ "memmap2",
+ "ref-cast",
+ "rustfft",
+ "safemlx",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smallvec",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "eredu-checkpoint"
 version = "0.1.0"
 dependencies = [
@@ -909,9 +931,9 @@ dependencies = [
  "anyhow",
  "clap",
  "eredu",
+ "eredu-backend-mlx",
  "eredu-checkpoint",
  "hf-hub",
- "safemlx",
  "serde",
  "serde_json",
  "tempfile",
@@ -921,14 +943,7 @@ dependencies = [
 name = "eredu-codec"
 version = "0.1.0"
 dependencies = [
- "eredu",
  "eredu-nn",
- "memmap2",
- "safemlx",
- "safetensors",
- "sentencepiece-rs",
- "serde",
- "serde_json",
  "thiserror",
 ]
 
@@ -958,7 +973,7 @@ name = "eredu-ios"
 version = "0.1.0"
 dependencies = [
  "eredu",
- "safemlx",
+ "eredu-backend-mlx",
  "serde_json",
 ]
 
@@ -968,9 +983,7 @@ version = "0.1.0"
 dependencies = [
  "eredu-checkpoint",
  "eredu-nn-macros",
- "safemlx",
  "serde",
- "smallvec",
  "thiserror",
 ]
 
@@ -2549,6 +2562,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-cast"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e440fb4e4b4147295338efb76001ab9e4efc0e5839df2c47fc5ac2381d365c3"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2914,12 +2947,6 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-
-[[package]]
-name = "sentencepiece-rs"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bc4483945bfd66b8727ed59005af1543d3d966ca92f9bc065bfef532de1d7e8"
 
 [[package]]
 name = "serde"

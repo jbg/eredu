@@ -1,7 +1,7 @@
 //! Inspect a pairwise Cartesian distributed topology before loading weights.
 
 use eredu::backend::mlx::{DeviceAssignment, MlxParallelContext};
-use safemlx::{
+use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     DeviceType,
 };

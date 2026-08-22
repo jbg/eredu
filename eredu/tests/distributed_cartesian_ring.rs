@@ -12,10 +12,11 @@ use eredu::{
     composition::mlx::distributed::expert::{AllToAllVPlan, RoutedTransport},
     core::{CollectiveScope, DistributedSession},
 };
-use safemlx::{
+use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     Array, Device, DeviceType, Stream,
 };
+use eredu_backend_mlx::MlxTensor;
 
 const WORKER_ENV: &str = "SAFEMLX_CARTESIAN_RING_WORKER";
 const TRIPLE_WORKER_ENV: &str = "SAFEMLX_CARTESIAN_TRIPLE_RING_WORKER";
@@ -98,7 +99,12 @@ fn cartesian_ring_worker() {
             exchange.statistics.payload_allocation_upper_bound_bytes
         );
     }
-    let empty = safemlx::ops::zeros_dtype(&[0, 3], safemlx::Dtype::Float32, &stream).unwrap();
+    let empty = eredu_backend_mlx::native::ops::zeros_dtype(
+        &[0, 3],
+        eredu_backend_mlx::native::Dtype::Float32,
+        &stream,
+    )
+    .unwrap();
     let empty_counts = [0usize; 4];
     let empty =
         distributed::all_to_all_v(&empty, &empty_counts, &empty_counts, &world, &stream).unwrap();
@@ -114,7 +120,7 @@ fn cartesian_ring_worker() {
         let execution = MlxBackend::new(&stream, &stream)
             .communication_for_topology(topology(expected_rank, 2, 2, 1), &world)
             .unwrap();
-        let input = scalar(expected_rank as i32 + 1);
+        let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
             CollectiveScope::Axis(eredu::core::topology::ParallelAxis::Tensor),
@@ -124,12 +130,13 @@ fn cartesian_ring_worker() {
         .wait()
         .unwrap();
         assert_eq!(
-            values(&reduced),
+            values(reduced.as_array()),
             vec![if expected_rank < 2 { 3 } else { 7 }]
         );
         if execution.topology().pipeline_parallel_rank == 0 {
+            let value = MlxTensor::from_array(scalar(expected_rank as i32 + 10));
             execution
-                .send_pipeline(&scalar(expected_rank as i32 + 10))
+                .send_pipeline(&value)
                 .unwrap()
                 .synchronize()
                 .unwrap();
@@ -139,7 +146,7 @@ fn cartesian_ring_worker() {
                 .unwrap()
                 .into_value()
                 .unwrap();
-            assert_eq!(values(&received), vec![expected_rank as i32 + 8]);
+            assert_eq!(values(received.as_array()), vec![expected_rank as i32 + 8]);
         }
     }
 
@@ -148,7 +155,7 @@ fn cartesian_ring_worker() {
         let execution = MlxBackend::new(&stream, &stream)
             .communication_for_topology(topology(expected_rank, 2, 1, 2), &world)
             .unwrap();
-        let input = scalar(expected_rank as i32 + 1);
+        let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
             CollectiveScope::Axis(eredu::core::topology::ParallelAxis::Tensor),
@@ -158,7 +165,7 @@ fn cartesian_ring_worker() {
         .wait()
         .unwrap();
         assert_eq!(
-            values(&reduced),
+            values(reduced.as_array()),
             vec![if expected_rank.is_multiple_of(2) {
                 4
             } else {
@@ -174,7 +181,7 @@ fn cartesian_ring_worker() {
         .wait()
         .unwrap();
         assert_eq!(
-            values(&reduced),
+            values(reduced.as_array()),
             vec![if expected_rank < 2 { 3 } else { 7 }]
         );
 
@@ -189,7 +196,8 @@ fn cartesian_ring_worker() {
         let local_rank = expert_subgroup.rank;
         let logical_send = if local_rank == 0 { [0, 2] } else { [1, 0] };
         let logical_recv = if local_rank == 0 { [0, 1] } else { [2, 0] };
-        let logical_input = compact_rows(expected_rank, &logical_send, 2, &stream);
+        let logical_input =
+            MlxTensor::from_array(compact_rows(expected_rank, &logical_send, 2, &stream));
         let logical_received = DistributedSession::all_to_all_v(
             &execution,
             expert_scope,
@@ -208,7 +216,7 @@ fn cartesian_ring_worker() {
                 [value, -value]
             })
             .collect::<Vec<_>>();
-        assert_eq!(values(&logical_received), expected);
+        assert_eq!(values(logical_received.as_array()), expected);
     }
 
     // PP+EP: stage-local EP reduction followed by matching-EP pipeline transport.
@@ -216,7 +224,7 @@ fn cartesian_ring_worker() {
         let execution = MlxBackend::new(&stream, &stream)
             .communication_for_topology(topology(expected_rank, 1, 2, 2), &world)
             .unwrap();
-        let input = scalar(expected_rank as i32 + 1);
+        let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
         let reduced = DistributedSession::all_reduce_sum(
             &execution,
             CollectiveScope::Axis(eredu::core::topology::ParallelAxis::Expert),
@@ -226,12 +234,13 @@ fn cartesian_ring_worker() {
         .wait()
         .unwrap();
         assert_eq!(
-            values(&reduced),
+            values(reduced.as_array()),
             vec![if expected_rank < 2 { 3 } else { 7 }]
         );
         if execution.topology().pipeline_parallel_rank == 0 {
+            let value = MlxTensor::from_array(scalar(expected_rank as i32 + 20));
             execution
-                .send_pipeline(&scalar(expected_rank as i32 + 20))
+                .send_pipeline(&value)
                 .unwrap()
                 .synchronize()
                 .unwrap();
@@ -241,7 +250,7 @@ fn cartesian_ring_worker() {
                 .unwrap()
                 .into_value()
                 .unwrap();
-            assert_eq!(values(&received), vec![expected_rank as i32 + 18]);
+            assert_eq!(values(received.as_array()), vec![expected_rank as i32 + 18]);
         }
         let (failed, cancelled) = execution
             .operation_consensus(expected_rank == 1, expected_rank == 2)
@@ -271,7 +280,7 @@ fn cartesian_triple_ring_worker() {
     let execution = MlxBackend::new(&stream, &stream)
         .communication_for_topology(topology, &world)
         .unwrap();
-    let input = scalar(expected_rank as i32 + 1);
+    let input = MlxTensor::from_array(scalar(expected_rank as i32 + 1));
 
     let tp = DistributedSession::all_reduce_sum(
         &execution,
@@ -288,7 +297,7 @@ fn cartesian_triple_ring_worker() {
         .iter()
         .map(|rank| *rank as i32 + 1)
         .sum::<i32>();
-    assert_eq!(values(&tp), vec![expected_tp]);
+    assert_eq!(values(tp.as_array()), vec![expected_tp]);
 
     let ep = DistributedSession::all_reduce_sum(
         &execution,
@@ -305,11 +314,12 @@ fn cartesian_triple_ring_worker() {
         .iter()
         .map(|rank| *rank as i32 + 1)
         .sum::<i32>();
-    assert_eq!(values(&ep), vec![expected_ep]);
+    assert_eq!(values(ep.as_array()), vec![expected_ep]);
 
     if topology.pipeline_parallel_rank == 0 {
+        let value = MlxTensor::from_array(scalar(expected_rank as i32 + 100));
         execution
-            .send_pipeline(&scalar(expected_rank as i32 + 100))
+            .send_pipeline(&value)
             .unwrap()
             .synchronize()
             .unwrap();
@@ -319,7 +329,7 @@ fn cartesian_triple_ring_worker() {
             .unwrap()
             .into_value()
             .unwrap();
-        assert_eq!(values(&received), vec![expected_rank as i32 + 96]);
+        assert_eq!(values(received.as_array()), vec![expected_rank as i32 + 96]);
     }
     let consensus = execution
         .operation_consensus(expected_rank == 1, expected_rank == 6)

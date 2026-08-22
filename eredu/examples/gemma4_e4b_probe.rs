@@ -8,7 +8,7 @@ use eredu::{
     backend::mlx::error::Error,
     GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
-use safemlx::ExecutionContext;
+use eredu_backend_mlx::native::ExecutionContext;
 use serde_json::Value;
 
 fn main() -> anyhow::Result<()> {
@@ -29,9 +29,15 @@ fn main() -> anyhow::Result<()> {
 
     print_config_summary(&model_dir)?;
 
-    let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    let ctx = ExecutionContext::new(eredu_backend_mlx::native::Device::new(
+        eredu_backend_mlx::native::DeviceType::Gpu,
+        0,
+    ));
     let stream = ctx.stream();
-    let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let weights_ctx = ExecutionContext::new(eredu_backend_mlx::native::Device::new(
+        eredu_backend_mlx::native::DeviceType::Cpu,
+        0,
+    ));
     let weights_stream = weights_ctx.stream();
     let mut model = match LoadedModel::load(
         eredu::backend::mlx::MlxBackend::new(stream, weights_stream),

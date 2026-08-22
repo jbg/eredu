@@ -14,30 +14,27 @@ eredu-core / eredu-checkpoint / eredu-nn
                     |
            eredu-architectures
                     |
-       eredu composition + backends
+          eredu-backend-mlx
                     |
               eredu API
 ```
 
-- `eredu-core`, `eredu-checkpoint`, and `eredu-runtime` are backend-neutral and
-  must not depend on `eredu`, `eredu-architectures`, `safemlx`, or another
-  native accelerator runtime. The default `eredu-nn` contract layer is also
-  backend-neutral; any concrete implementation feature it exposes must remain
-  optional and must not enter an architecture crate's dependency graph.
+- `eredu-core`, `eredu-checkpoint`, `eredu-nn`, `eredu-runtime`, and
+  `eredu-codec` are backend-neutral and must not depend on `eredu`,
+  `eredu-backend-mlx`, `safemlx`, or another native accelerator runtime.
   Target-specific operating system support for portable facilities is allowed.
 - `eredu-architectures` owns model-family configuration, checkpoint schemas,
   parameter topology, module construction, state geometry, parallel semantic
   plans, and embedding/layer/output execution. It may use neutral backend
   traits, but must not import `safemlx`, `eredu::backend`, or another concrete
   backend.
-- `eredu/src/backend/<backend>` owns reusable native tensors, operators,
+- `eredu-backend-mlx` owns reusable MLX tensors, operators,
   streams, completion objects, materialization, cache storage, transfers, and
-  collectives. Reusable backend modules must not own model-family configuration,
-  checkpoint naming policy, layer equations, or family-specific state geometry.
-- `eredu/src/composition` is the integration layer. It may select a family and
-  a backend, bind architecture-declared parameters, and assemble sessions or
-  distributed executables. Family/backend coupling belongs here rather than in
-  a neutral crate or reusable backend module.
+  collectives. It also owns MLX family composition, which may bind
+  architecture-declared parameters and assemble sessions or distributed
+  executables. Reusable backend modules must not own model-family
+  configuration, checkpoint naming policy, layer equations, or family-specific
+  state geometry. The crate must not depend on the `eredu` facade.
 - `eredu/src/api` and `eredu/src/runtime` own backend-independent facade
   orchestration. Production backend code must not import them. A backend's
   public adapter may depend on narrow composition-owned executable or session
@@ -54,6 +51,8 @@ eredu-core / eredu-checkpoint / eredu-nn
 - `eredu` with `default-features = false` is the portable facade. Native MLX,
   CUDA, media, and codec dependencies must remain optional and enabled by their
   corresponding features.
+- `eredu-nn` and `eredu-codec` expose no concrete-backend features, including
+  under `--all-features`. MLX implementations belong in `eredu-backend-mlx`.
 - Feature-gate concrete backend adapters and backend-specific composition, not
   the family they adapt. If a family integration currently mixes neutral and
   native code, separate those surfaces instead of hiding the family behind the

@@ -33,15 +33,16 @@ use eredu::{
 use eredu::{CacheResidencyPolicy, PagedCacheOptions};
 use eredu_architectures::gpt_oss;
 use eredu_architectures::qwen::hybrid as qwen_hybrid;
-use eredu_checkpoint::{AffineQuantization, WeightQuantization};
-use eredu_gguf::{GgmlType, TensorInput, Writer};
-use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized};
-use safemlx::{
+use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     module::ModuleParameters,
     ops::{indexing::TryIndexOp, stack_axis, GgufMetadataValue},
     Array, Device, DeviceType, Dtype as MlxDtype, ExecutionContext, Stream,
 };
+use eredu_backend_mlx::MlxTensor;
+use eredu_checkpoint::{AffineQuantization, WeightQuantization};
+use eredu_gguf::{GgmlType, TensorInput, Writer};
+use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized};
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 const WORKER_RANK: &str = "EREDU_PIPELINE_RING_WORKER";
@@ -933,7 +934,7 @@ fn pipeline_ring_worker() {
             .into_logits()
             .unwrap()
     } else {
-        let prompt = safemlx::Array::from_slice(&prefix_ids, &[1, prompt_length]);
+        let prompt = eredu_backend_mlx::native::Array::from_slice(&prefix_ids, &[1, prompt_length]);
         forward_pipeline_model(
             &mut model,
             (pipeline_rank == 0).then_some(&prompt),
@@ -984,7 +985,7 @@ fn pipeline_ring_worker() {
             &stream,
         )
         .unwrap();
-    let token = safemlx::Array::from_slice(&[0u32], &[1, 1]);
+    let token = eredu_backend_mlx::native::Array::from_slice(&[0u32], &[1, 1]);
     let uninterrupted = forward_pipeline_model(
         &mut model,
         (pipeline_rank == 0).then_some(&token),
@@ -1650,10 +1651,10 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
         stream: &'a Stream,
         arrays: Vec<(String, Array)>,
     }
-    impl<'tensor> ParameterVisitor<'tensor, Array> for Collector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+    impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
             let name = metadata.id.to_string();
-            let shape = parameter.shape().to_vec();
+            let shape = parameter.as_array().shape().to_vec();
             let value = if name.ends_with("norm.weight") {
                 Array::ones::<f32>(&shape, self.stream).unwrap()
             } else {
@@ -1842,8 +1843,9 @@ fn write_gemma_fixture(directory: &Path) {
         stream: &'a Stream,
         arrays: Vec<(String, Array)>,
     }
-    impl<'tensor> ParameterVisitor<'tensor, Array> for Collector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+    impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
+            let parameter = parameter.as_array();
             let value = if metadata.id.as_str().ends_with("norm.weight") {
                 Array::ones::<f32>(parameter.shape(), self.stream).unwrap()
             } else {
@@ -1958,10 +1960,10 @@ fn qwen_fixture_arrays(
         stream: &'a Stream,
         arrays: Vec<(String, Array)>,
     }
-    impl<'tensor> ParameterVisitor<'tensor, Array> for Collector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+    impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
             let name = metadata.id.to_string();
-            let shape = parameter.shape().to_vec();
+            let shape = parameter.as_array().shape().to_vec();
             let value = if name.ends_with("norm.weight") {
                 Array::ones::<f32>(&shape, self.stream).unwrap()
             } else {
@@ -2565,7 +2567,9 @@ fn write_lfm2_moe_gguf_fixture(path: &Path) {
         (key("attention.head_count"), GgufMetadataValue::Uint32(6)),
         (
             key("attention.head_count_kv"),
-            GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![0, 3])),
+            GgufMetadataValue::Array(eredu_backend_mlx::native::ops::GgufMetadataArray::Uint32(
+                vec![0, 3],
+            )),
         ),
         (
             key("attention.layer_norm_rms_epsilon"),
@@ -3005,11 +3009,15 @@ fn write_nemotron_h_moe_gguf_fixture(path: &Path) {
         (key("embedding_length"), GgufMetadataValue::Uint32(12)),
         (
             key("feed_forward_length"),
-            GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![0, 17, 17, 0])),
+            GgufMetadataValue::Array(eredu_backend_mlx::native::ops::GgufMetadataArray::Uint32(
+                vec![0, 17, 17, 0],
+            )),
         ),
         (
             key("attention.head_count_kv"),
-            GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![0, 0, 0, 3])),
+            GgufMetadataValue::Array(eredu_backend_mlx::native::ops::GgufMetadataArray::Uint32(
+                vec![0, 0, 0, 3],
+            )),
         ),
         (key("attention.head_count"), GgufMetadataValue::Uint32(6)),
         (key("attention.key_length"), GgufMetadataValue::Uint32(2)),
@@ -3408,12 +3416,17 @@ fn write_inkling_mtp_fixture(directory: &Path) {
         stream: &'a Stream,
         arrays: &'a mut Vec<(String, Array)>,
     }
-    impl<'tensor> ParameterVisitor<'tensor, Array> for Collector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+    impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
+            let parameter = parameter.as_array();
             self.arrays.push((
                 metadata.id.to_string(),
-                safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
-                    .unwrap(),
+                eredu_backend_mlx::native::ops::zeros_dtype(
+                    parameter.shape(),
+                    parameter.dtype(),
+                    self.stream,
+                )
+                .unwrap(),
             ));
         }
     }
@@ -3548,12 +3561,17 @@ fn write_gemma4_tensor_parallel_fixture_with_options(
         stream: &'a Stream,
         arrays: &'a mut Vec<(String, Array)>,
     }
-    impl<'tensor> ParameterVisitor<'tensor, Array> for Collector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+    impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
+            let parameter = parameter.as_array();
             self.arrays.push((
                 metadata.id.to_string(),
-                safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
-                    .unwrap(),
+                eredu_backend_mlx::native::ops::zeros_dtype(
+                    parameter.shape(),
+                    parameter.dtype(),
+                    self.stream,
+                )
+                .unwrap(),
             ));
         }
     }
@@ -3676,12 +3694,17 @@ fn write_muse_glimmer_tensor_parallel_fixture(directory: &Path) {
         stream: &'a Stream,
         arrays: &'a mut Vec<(String, Array)>,
     }
-    impl<'tensor> ParameterVisitor<'tensor, Array> for Collector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+    impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for Collector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
+            let parameter = parameter.as_array();
             self.arrays.push((
                 metadata.id.to_string(),
-                safemlx::ops::zeros_dtype(parameter.shape(), parameter.dtype(), self.stream)
-                    .unwrap(),
+                eredu_backend_mlx::native::ops::zeros_dtype(
+                    parameter.shape(),
+                    parameter.dtype(),
+                    self.stream,
+                )
+                .unwrap(),
             ));
         }
     }
@@ -3741,10 +3764,11 @@ fn initialized_inkling_parameters(
         parameters: &'a mut BTreeMap<String, Array>,
     }
 
-    impl<'tensor> ParameterVisitorMut<'tensor, Array> for Initializer<'_> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, parameter: &'tensor mut Array) {
+    impl<'tensor> ParameterVisitorMut<'tensor, MlxTensor> for Initializer<'_> {
+        fn visit_mut(&mut self, metadata: ParameterMetadata, parameter: &'tensor mut MlxTensor) {
             let name = metadata.id.to_string();
-            let shape = parameter.shape().to_vec();
+            let shape = parameter.as_array().shape().to_vec();
+            let dtype = parameter.as_array().dtype();
             let value = if name.ends_with("norm.weight")
                 || name.ends_with("layernorm.weight")
                 || name.ends_with("o_norm.weight")
@@ -3763,10 +3787,10 @@ fn initialized_inkling_parameters(
                 )
                 .unwrap()
             }
-            .as_dtype(parameter.dtype(), self.stream)
+            .as_dtype(dtype, self.stream)
             .unwrap();
-            *parameter = value;
-            self.parameters.insert(name, parameter.clone());
+            *parameter = MlxTensor::from_array(value);
+            self.parameters.insert(name, parameter.as_array().clone());
         }
     }
 
@@ -3875,7 +3899,7 @@ fn write_inkling_fixture_with_config(directory: &Path, config: serde_json::Value
 }
 
 fn inkling_gguf_metadata() -> BTreeMap<String, GgufMetadataValue> {
-    use safemlx::ops::GgufMetadataArray;
+    use eredu_backend_mlx::native::ops::GgufMetadataArray;
     BTreeMap::from([
         (
             "general.architecture".into(),
@@ -4308,7 +4332,9 @@ fn kimi_linear_gguf_metadata() -> BTreeMap<String, GgufMetadataValue> {
         ),
         (
             "kimi-linear.attention.head_count_kv".into(),
-            GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![0, 1])),
+            GgufMetadataValue::Array(eredu_backend_mlx::native::ops::GgufMetadataArray::Uint32(
+                vec![0, 1],
+            )),
         ),
         (
             "kimi-linear.rope.dimension_count".into(),

@@ -13,15 +13,15 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
-use safemlx::{
+use eredu::{
+    api::LoadedModel,
+    runtime::media::input::{InputPart, ModelInput},
+};
+use eredu_backend_mlx::native::{
     memory,
     ops::indexing::{NewAxis, TryIndexOp},
     transforms::async_eval_timed,
     Array, Device, DeviceType, ExecutionContext, Stream,
-};
-use eredu::{
-    api::LoadedModel,
-    runtime::media::input::{InputPart, ModelInput},
 };
 use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 use serde::Serialize;

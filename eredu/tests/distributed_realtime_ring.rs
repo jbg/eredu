@@ -16,7 +16,7 @@ use eredu::{
     RealtimeScheduler, RequestId, SchedulerLimits,
 };
 use eredu_architectures::moshi::{MoshiCollectiveCount, MoshiConfig};
-use safemlx::{
+use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     Array, Device, DeviceType, Stream,
 };
@@ -35,7 +35,7 @@ fn balanced_widths(total: usize) -> [usize; 2] {
 fn verify_canonical_vocabulary(
     total: usize,
     rank: usize,
-    group: &safemlx::distributed::Group,
+    group: &eredu_backend_mlx::native::distributed::Group,
     stream: &Stream,
 ) {
     let widths = balanced_widths(total);

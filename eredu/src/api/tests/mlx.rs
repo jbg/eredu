@@ -1,6 +1,7 @@
 use eredu_checkpoint::AffineQuantization;
 
 use eredu_architectures::kimi_linear;
+use eredu_backend_mlx::MlxTensor;
 use eredu_checkpoint::WeightQuantization;
 
 use super::*;
@@ -21,14 +22,14 @@ use crate::{
     runtime::chat::constraints::{ConstraintController, ConstraintError},
     runtime::chat::PreparedChat,
 };
-use eredu_gguf::{GgmlType, MetadataValue as GgufWriterMetadata, TensorInput, Writer};
-use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized};
-use safemlx::{
+use eredu_backend_mlx::native::{
     argmax_axis,
     module::ModuleParameters,
     ops::{indexing::TryIndexOp, zeros_dtype, GgufMetadataArray, GgufMetadataValue},
     Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
 };
+use eredu_gguf::{GgmlType, MetadataValue as GgufWriterMetadata, TensorInput, Writer};
+use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized};
 
 const GEMMA4_LARGE_FIXTURE: &str =
     include_str!("../../../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");
@@ -58,9 +59,12 @@ fn load_test_model(
 fn observer_forward_reports_attention_and_residual_hooks() {
     let model_dir = std::env::var("SAFEMLX_INSPECTION_MODEL_DIR")
         .expect("set SAFEMLX_INSPECTION_MODEL_DIR to a local model directory");
-    let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let weights_ctx =
-        safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let ctx = eredu_backend_mlx::native::ExecutionContext::new(
+        eredu_backend_mlx::native::Device::new(eredu_backend_mlx::native::DeviceType::Gpu, 0),
+    );
+    let weights_ctx = eredu_backend_mlx::native::ExecutionContext::new(
+        eredu_backend_mlx::native::Device::new(eredu_backend_mlx::native::DeviceType::Cpu, 0),
+    );
     let mut model = LoadedModel::load(
         crate::backend::mlx::MlxBackend::new(ctx.stream(), weights_ctx.stream()),
         model_dir,
@@ -68,8 +72,11 @@ fn observer_forward_reports_attention_and_residual_hooks() {
     )
     .unwrap();
     let ids = model.encode("hello", true).unwrap();
-    let input = safemlx::Array::from(ids.as_slice())
-        .try_index_device(safemlx::ops::indexing::NewAxis, ctx.stream())
+    let input = eredu_backend_mlx::native::Array::from(ids.as_slice())
+        .try_index_device(
+            eredu_backend_mlx::native::ops::indexing::NewAxis,
+            ctx.stream(),
+        )
         .unwrap();
     let mut recorder = ActivationRecorder::new();
     let parts = [crate::backend::mlx::runtime::media::input::InputPart::text_token_ids(&input)];
@@ -1195,7 +1202,7 @@ fn save_zero_checkpoint_with_names<M: ModuleParameters>(
     .unwrap();
 }
 
-fn save_zero_neutral_checkpoint<M: Parameterized<Array>>(
+fn save_zero_neutral_checkpoint<M: Parameterized<MlxTensor>>(
     model: &M,
     dir: &std::path::Path,
     stream: &Stream,
@@ -1204,11 +1211,16 @@ fn save_zero_neutral_checkpoint<M: Parameterized<Array>>(
         stream: &'a Stream,
         arrays: Vec<(String, Array)>,
     }
-    impl<'tensor> ParameterVisitor<'tensor, Array> for ZeroCollector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+    impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for ZeroCollector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
             self.arrays.push((
                 metadata.id.to_string(),
-                zeros_dtype(parameter.shape(), parameter.dtype(), self.stream).unwrap(),
+                zeros_dtype(
+                    parameter.as_array().shape(),
+                    parameter.as_array().dtype(),
+                    self.stream,
+                )
+                .unwrap(),
             ));
         }
     }
@@ -1229,7 +1241,7 @@ fn save_zero_neutral_checkpoint<M: Parameterized<Array>>(
     .unwrap();
 }
 
-fn save_zero_neutral_checkpoint_with_names<M: Parameterized<Array>>(
+fn save_zero_neutral_checkpoint_with_names<M: Parameterized<MlxTensor>>(
     model: &M,
     dir: &std::path::Path,
     stream: &Stream,
@@ -1240,11 +1252,16 @@ fn save_zero_neutral_checkpoint_with_names<M: Parameterized<Array>>(
         canonical_name: F,
         arrays: Vec<(String, Array)>,
     }
-    impl<'tensor, F: Fn(&str) -> String> ParameterVisitor<'tensor, Array> for ZeroCollector<'_, F> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+    impl<'tensor, F: Fn(&str) -> String> ParameterVisitor<'tensor, MlxTensor> for ZeroCollector<'_, F> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
             self.arrays.push((
                 (self.canonical_name)(metadata.id.as_str()),
-                zeros_dtype(parameter.shape(), parameter.dtype(), self.stream).unwrap(),
+                zeros_dtype(
+                    parameter.as_array().shape(),
+                    parameter.as_array().dtype(),
+                    self.stream,
+                )
+                .unwrap(),
             ));
         }
     }
@@ -1275,11 +1292,16 @@ fn save_zero_qwen_checkpoint(
         stream: &'a Stream,
         arrays: Vec<(String, Array)>,
     }
-    impl<'tensor> ParameterVisitor<'tensor, Array> for ZeroCollector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+    impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for ZeroCollector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
             self.arrays.push((
                 metadata.id.to_string(),
-                zeros_dtype(parameter.shape(), parameter.dtype(), self.stream).unwrap(),
+                zeros_dtype(
+                    parameter.as_array().shape(),
+                    parameter.as_array().dtype(),
+                    self.stream,
+                )
+                .unwrap(),
             ));
         }
     }
@@ -1322,8 +1344,8 @@ fn save_zero_gemma4_checkpoint(
         stream: &'a Stream,
         arrays: Vec<(String, Array)>,
     }
-    impl<'tensor> ParameterVisitor<'tensor, Array> for ZeroCollector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+    impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for ZeroCollector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
             let mut name = metadata.id.to_string();
             if name.contains(".experts.switch_glu.")
                 && (name.ends_with(".gate_up_proj") || name.ends_with(".down_proj"))
@@ -1332,7 +1354,12 @@ fn save_zero_gemma4_checkpoint(
             }
             self.arrays.push((
                 name,
-                zeros_dtype(parameter.shape(), parameter.dtype(), self.stream).unwrap(),
+                zeros_dtype(
+                    parameter.as_array().shape(),
+                    parameter.as_array().dtype(),
+                    self.stream,
+                )
+                .unwrap(),
             ));
         }
     }
@@ -1385,11 +1412,16 @@ fn save_zero_inkling_checkpoint(
         stream: &'a Stream,
         arrays: Vec<(String, Array)>,
     }
-    impl<'tensor> ParameterVisitor<'tensor, Array> for ZeroCollector<'_> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor Array) {
+    impl<'tensor> ParameterVisitor<'tensor, MlxTensor> for ZeroCollector<'_> {
+        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'tensor MlxTensor) {
             self.arrays.push((
                 metadata.id.to_string(),
-                zeros_dtype(parameter.shape(), parameter.dtype(), self.stream).unwrap(),
+                zeros_dtype(
+                    parameter.as_array().shape(),
+                    parameter.as_array().dtype(),
+                    self.stream,
+                )
+                .unwrap(),
             ));
         }
     }
@@ -1467,11 +1499,11 @@ fn tiny_gemma4_neutral_runtime_executes_independent_expert_cache() {
         weights_stream,
     )
     .unwrap();
-    let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let tokens = MlxTensor::from_array(Array::from_slice(&[1u32, 2], &[1, 2]));
     let mut cache = model.new_cache();
     let logits = model.forward_tokens(&tokens, &mut cache, stream).unwrap();
-    safemlx::transforms::eval([&logits]).unwrap();
-    assert_eq!(logits.shape(), &[1, 2, 32]);
+    eredu_backend_mlx::native::transforms::eval([logits.as_array()]).unwrap();
+    assert_eq!(logits.as_array().shape(), &[1, 2, 32]);
     assert!(model.expert_cache_report().unwrap().is_some());
     fs::remove_dir_all(dir).unwrap();
 }
@@ -1962,7 +1994,7 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
     let mut cache = model.new_cache();
     let logits = model.forward(&tokens, &mut cache, stream).unwrap();
-    safemlx::transforms::eval([&logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&logits]).unwrap();
     assert_eq!(logits.shape(), &[1, 2, 32]);
     let mut bounded = crate::composition::gpt_oss::load_gpt_oss_layerwise_model(
         &dir,
@@ -1980,7 +2012,7 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
     let bounded_logits = bounded
         .forward(&tokens, &mut bounded_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&bounded_logits]).unwrap();
     assert_eq!(bounded_logits.shape(), logits.shape());
     let mut cached_experts = crate::composition::gpt_oss::load_gpt_oss_expert_cache_model(
         &dir,
@@ -1995,7 +2027,7 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
     let cached_expert_logits = cached_experts
         .forward(&tokens, &mut cached_expert_state, stream)
         .unwrap();
-    safemlx::transforms::eval([&cached_expert_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&cached_expert_logits]).unwrap();
     assert_eq!(cached_expert_logits.shape(), logits.shape());
     assert!(cached_experts.expert_cache_report().unwrap().is_some());
     fs::remove_dir_all(dir).unwrap();
@@ -2038,7 +2070,7 @@ fn tiny_lfm2_neutral_runtime_executes_convolution_and_attention_layers() {
     let resident_logits = resident
         .forward(&tokens, &mut resident_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&resident_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 16]);
 
     let mut bounded = crate::composition::lfm2::load_lfm2_model(
@@ -2055,7 +2087,7 @@ fn tiny_lfm2_neutral_runtime_executes_convolution_and_attention_layers() {
     let bounded_logits = bounded
         .forward(&tokens, &mut bounded_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&bounded_logits]).unwrap();
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
     assert!(bounded.residency_report().unwrap().initialized());
     fs::remove_dir_all(dir).unwrap();
@@ -2092,7 +2124,7 @@ fn tiny_qwen_neutral_runtime_executes_resident_and_bounded_layers() {
     let resident_logits = resident
         .forward(&tokens, &mut resident_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&resident_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 24]);
 
     let mut bounded = crate::composition::qwen::load_qwen_safetensors_mlx(
@@ -2109,7 +2141,7 @@ fn tiny_qwen_neutral_runtime_executes_resident_and_bounded_layers() {
     let bounded_logits = bounded
         .forward(&tokens, &mut bounded_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&bounded_logits]).unwrap();
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
     assert!(bounded.residency_report().unwrap().unwrap().initialized());
 
@@ -2120,7 +2152,7 @@ fn tiny_qwen_neutral_runtime_executes_resident_and_bounded_layers() {
         .new_cache_with_options(eredu_runtime::CacheResidencyPolicy::Paged(paged))
         .unwrap();
     let paged_logits = resident.forward(&tokens, &mut paged_cache, stream).unwrap();
-    safemlx::transforms::eval([&paged_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&paged_logits]).unwrap();
     assert_eq!(paged_logits.shape(), resident_logits.shape());
 
     let mut streamed = crate::composition::qwen::load_qwen_safetensors_mlx(
@@ -2137,7 +2169,7 @@ fn tiny_qwen_neutral_runtime_executes_resident_and_bounded_layers() {
     let streamed_logits = streamed
         .forward(&tokens, &mut streamed_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&streamed_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&streamed_logits]).unwrap();
     assert_eq!(streamed_logits.shape(), resident_logits.shape());
     assert!(
         streamed
@@ -2158,8 +2190,14 @@ fn tiny_qwen_moe_observation_wraps_canonical_routed_execution() {
         routes: Vec<String>,
     }
 
-    impl eredu_runtime::ActivationObserver<Array, safemlx::error::Exception> for QwenObserver {
-        fn observe(&mut self, path: &str, _value: &Array) -> Result<(), safemlx::error::Exception> {
+    impl eredu_runtime::ActivationObserver<Array, eredu_backend_mlx::native::error::Exception>
+        for QwenObserver
+    {
+        fn observe(
+            &mut self,
+            path: &str,
+            _value: &Array,
+        ) -> Result<(), eredu_backend_mlx::native::error::Exception> {
             self.activations.push(path.to_string());
             Ok(())
         }
@@ -2167,7 +2205,7 @@ fn tiny_qwen_moe_observation_wraps_canonical_routed_execution() {
         fn observe_routing(
             &mut self,
             routing: eredu_runtime::RoutingObservation<'_, Array>,
-        ) -> Result<(), safemlx::error::Exception> {
+        ) -> Result<(), eredu_backend_mlx::native::error::Exception> {
             self.routes.push(routing.path.to_string());
             Ok(())
         }
@@ -2204,7 +2242,7 @@ fn tiny_qwen_moe_observation_wraps_canonical_routed_execution() {
     let logits = model
         .forward_with_observer(&tokens, None, &mut cache, stream, &mut observer)
         .unwrap();
-    safemlx::transforms::eval([&logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&logits]).unwrap();
 
     assert_eq!(logits.shape(), &[1, 2, 24]);
     assert_eq!(
@@ -2267,7 +2305,7 @@ fn tiny_hybrid_qwen_neutral_runtime_executes_recurrent_and_attention_layers() {
     let resident_logits = resident
         .forward(&tokens, &mut resident_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&resident_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 24]);
 
     let mut bounded = crate::composition::qwen::hybrid::load_safetensors(
@@ -2282,7 +2320,7 @@ fn tiny_hybrid_qwen_neutral_runtime_executes_recurrent_and_attention_layers() {
     let bounded_logits = bounded
         .forward(&tokens, &mut bounded_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&bounded_logits]).unwrap();
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
     assert!(bounded.residency_report().unwrap().initialized());
     fs::remove_dir_all(dir).unwrap();
@@ -2329,7 +2367,7 @@ fn tiny_lfm2_moe_neutral_runtime_executes_independent_expert_cache() {
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
     let mut cache = model.new_cache();
     let logits = model.forward(&tokens, &mut cache, stream).unwrap();
-    safemlx::transforms::eval([&logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&logits]).unwrap();
     assert_eq!(logits.shape(), &[1, 2, 16]);
     assert!(model.expert_cache_report().unwrap().is_some());
     fs::remove_dir_all(dir).unwrap();
@@ -2407,7 +2445,7 @@ fn tiny_kimi_linear_neutral_runtime_executes_hybrid_state_and_expert_cache() {
     let resident_logits = resident
         .forward(&tokens, &mut resident_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&resident_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 16]);
 
     let mut bounded = crate::composition::kimi_linear::load_kimi_linear_model(
@@ -2424,7 +2462,7 @@ fn tiny_kimi_linear_neutral_runtime_executes_hybrid_state_and_expert_cache() {
     let bounded_logits = bounded
         .forward(&tokens, &mut bounded_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&bounded_logits]).unwrap();
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
     assert!(bounded.residency_report().unwrap().initialized());
 
@@ -2441,7 +2479,7 @@ fn tiny_kimi_linear_neutral_runtime_executes_hybrid_state_and_expert_cache() {
     .unwrap();
     let mut sparse_cache = sparse.new_cache();
     let sparse_logits = sparse.forward(&tokens, &mut sparse_cache, stream).unwrap();
-    safemlx::transforms::eval([&sparse_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&sparse_logits]).unwrap();
     assert_eq!(sparse_logits.shape(), resident_logits.shape());
     assert!(sparse.expert_cache_report().unwrap().is_some());
     fs::remove_dir_all(dir).unwrap();
@@ -2524,7 +2562,7 @@ fn tiny_deepseek_v3_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     let resident_logits = resident
         .forward(&tokens, &mut resident_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&resident_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 16]);
     assert_eq!(resident.mtp_len(), 1);
 
@@ -2542,7 +2580,7 @@ fn tiny_deepseek_v3_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     let bounded_logits = bounded
         .forward(&tokens, &mut bounded_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&bounded_logits]).unwrap();
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
     assert!(bounded.residency_report().unwrap().initialized());
 
@@ -2559,7 +2597,7 @@ fn tiny_deepseek_v3_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     .unwrap();
     let mut sparse_cache = sparse.new_state().unwrap();
     let sparse_logits = sparse.forward(&tokens, &mut sparse_cache, stream).unwrap();
-    safemlx::transforms::eval([&sparse_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&sparse_logits]).unwrap();
     assert_eq!(sparse_logits.shape(), resident_logits.shape());
     assert!(sparse.expert_cache_report().unwrap().is_some());
     fs::remove_dir_all(dir).unwrap();
@@ -2635,7 +2673,7 @@ fn tiny_deepseek_v4_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     let resident_logits = resident
         .forward(&tokens, &mut resident_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&resident_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&resident_logits]).unwrap();
     assert_eq!(resident_logits.shape(), &[1, 2, 16]);
     assert_eq!(resident.mtp_len(), 1);
 
@@ -2653,7 +2691,7 @@ fn tiny_deepseek_v4_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     let bounded_logits = bounded
         .forward(&tokens, &mut bounded_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&bounded_logits]).unwrap();
     assert_eq!(bounded_logits.shape(), resident_logits.shape());
     assert!(bounded.residency_report().unwrap().initialized());
 
@@ -2670,7 +2708,7 @@ fn tiny_deepseek_v4_neutral_runtime_executes_compressed_state_mtp_and_expert_cac
     .unwrap();
     let mut sparse_cache = sparse.new_state().unwrap();
     let sparse_logits = sparse.forward(&tokens, &mut sparse_cache, stream).unwrap();
-    safemlx::transforms::eval([&sparse_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&sparse_logits]).unwrap();
     assert_eq!(sparse_logits.shape(), resident_logits.shape());
     assert!(sparse.expert_cache_report().unwrap().is_some());
     fs::remove_dir_all(dir).unwrap();
@@ -2749,6 +2787,7 @@ fn tiny_deepseek_v4_dspark_executes_through_shared_draft_boundary() {
     .unwrap();
     let mut state = model.new_state().unwrap();
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let neutral_tokens = MlxTensor::from_array(tokens.clone());
     let parts = [input::InputPart::text_token_ids(&tokens)];
     let output = EmbeddedMtpTarget::prefill_target(
         &mut model,
@@ -2757,8 +2796,14 @@ fn tiny_deepseek_v4_dspark_executes_through_shared_draft_boundary() {
         stream,
     )
     .unwrap();
-    EmbeddedMtpTarget::prefill_draft_cache(&mut model, &output, &tokens, &mut state, stream)
-        .unwrap();
+    EmbeddedMtpTarget::prefill_draft_cache(
+        &mut model,
+        &output,
+        &neutral_tokens,
+        &mut state,
+        stream,
+    )
+    .unwrap();
     let mut draft = <crate::composition::deepseek::DeepSeekModel as EmbeddedMtpTarget>::draft_cache(
         &model, &state,
     );
@@ -2766,9 +2811,9 @@ fn tiny_deepseek_v4_dspark_executes_through_shared_draft_boundary() {
         EmbeddedMtpTarget::fused_draft_logits(&mut model, &output.hidden, 2, 2, &mut draft, stream)
             .unwrap()
             .expect("DSpark must provide fused proposal logits");
-    safemlx::transforms::eval([&proposal]).unwrap();
-    assert_eq!(output.logits.shape(), &[1, 2, 16]);
-    assert_eq!(proposal.shape(), &[1, 2, 16]);
+    eredu_backend_mlx::native::transforms::eval([proposal.as_array()]).unwrap();
+    assert_eq!(output.logits.as_array().shape(), &[1, 2, 16]);
+    assert_eq!(proposal.as_array().shape(), &[1, 2, 16]);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -2860,7 +2905,7 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     let bounded_logits = bounded
         .prefill(input::ModelInput::new(&parts), &mut bounded_cache, stream)
         .unwrap();
-    safemlx::transforms::eval([&bounded_logits]).unwrap();
+    eredu_backend_mlx::native::transforms::eval([&bounded_logits]).unwrap();
     assert_eq!(bounded_logits.shape(), &[1, 3, 32]);
     assert!(bounded.residency_report().unwrap().initialized());
 

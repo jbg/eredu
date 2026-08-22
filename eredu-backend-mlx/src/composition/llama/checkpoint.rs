@@ -1,0 +1,216 @@
+//! MLX checkpoint adaptation for the backend-neutral Llama architecture.
+//!
+//! The architecture crate owns tensor geometry, canonical plans, and name
+//! translation. This module applies those contracts to concrete MLX
+//! SafeTensors and GGUF sources during cold-path validation and loading.
+
+use std::collections::{BTreeSet, HashMap};
+
+use eredu_architectures::llama::ModelArgs;
+use eredu_checkpoint::schema::SafetensorsTensorConstraint;
+use eredu_checkpoint::WeightQuantization;
+use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
+use safemlx::Stream;
+use serde_json::Value;
+
+use crate::backend::mlx::error::Error;
+use crate::backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames};
+use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
+use eredu_checkpoint::store::WeightStore;
+use eredu_checkpoint::validation;
+use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};
+
+pub fn validate_safetensors(
+    config: &Value,
+    store: &SafetensorsWeightStore,
+) -> CheckpointValidation {
+    let args = match eredu_architectures::llama::model_args_from_config_value(config) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    if args.num_hidden_layers as usize > store.keys().len() {
+        return invalid_geometry(format!(
+            "configured layer count {} exceeds the entire {}-tensor checkpoint catalog",
+            args.num_hidden_layers,
+            store.keys().len()
+        ));
+    }
+    let plan = match eredu_architectures::llama::safetensors_plan(&args) {
+        Ok(plan) => plan,
+        Err(eredu_architectures::llama::SafetensorsPlanError::Geometry(error)) => {
+            return invalid_geometry(error)
+        }
+        Err(eredu_architectures::llama::SafetensorsPlanError::Companion { name, detail }) => {
+            return CheckpointValidation::Invalid(vec![CheckpointIssue {
+                kind: CheckpointIssueKind::CompanionMismatch,
+                detail,
+                tensor_name: Some(name),
+                tensor_type_code: None,
+                metadata_key: Some("quantization_config.quant_method".into()),
+            }]);
+        }
+    };
+    let mut issues = validation_issues(validation::validate_safetensors_plan(store, &plan));
+    let allowed = physical_keys(&plan.common_tensors);
+    for key in store.keys() {
+        if !allowed.contains(&key)
+            && !key.starts_with("rope_freqs.")
+            && !key.ends_with(".rotary_emb.inv_freq")
+        {
+            issues.push(unexpected(&key, "Llama SafeTensors"));
+        }
+    }
+    CheckpointValidation::from_issues(issues)
+}
+
+fn physical_keys(tensors: &[SafetensorsTensorConstraint]) -> BTreeSet<String> {
+    tensors
+        .iter()
+        .flat_map(|tensor| std::iter::once(&tensor.key).chain(&tensor.aliases))
+        .cloned()
+        .collect()
+}
+
+pub fn validate_gguf(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> CheckpointValidation {
+    if let Err(error) = checkpoint
+        .catalog()
+        .translated_outputs(eredu_architectures::llama::translate_gguf_weight_name)
+    {
+        return CheckpointValidation::Invalid(vec![CheckpointIssue {
+            kind: CheckpointIssueKind::ConflictingLayout,
+            detail: error.to_string(),
+            tensor_name: None,
+            tensor_type_code: None,
+            metadata_key: None,
+        }]);
+    }
+    let args = match model_args_from_gguf_catalog(checkpoint, metadata) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    if args.num_hidden_layers as usize > checkpoint.catalog().physical_tensor_count() {
+        return invalid_geometry(format!(
+            "configured layer count {} exceeds the entire {}-tensor GGUF catalog",
+            args.num_hidden_layers,
+            checkpoint.catalog().physical_tensor_count()
+        ));
+    }
+    let plan = match eredu_architectures::llama::gguf_plan(&args) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    let mut issues = validation_issues(validation::validate_gguf_plan(checkpoint, &plan));
+    let allowed = plan
+        .common_tensors
+        .iter()
+        .flat_map(|tensor| std::iter::once(&tensor.key).chain(&tensor.aliases))
+        .collect::<BTreeSet<_>>();
+    for tensor in checkpoint.catalog().tensors() {
+        let name = &tensor.descriptor().name;
+        if !allowed.contains(name) && !name.starts_with("rope_freqs.") {
+            issues.push(unexpected(name, "Llama GGUF"));
+        }
+    }
+    CheckpointValidation::from_issues(issues)
+}
+
+fn validation_issues(validation: CheckpointValidation) -> Vec<CheckpointIssue> {
+    match validation {
+        CheckpointValidation::Exact => Vec::new(),
+        CheckpointValidation::Invalid(issues) => issues,
+        CheckpointValidation::Unverified(issue) => vec![issue],
+    }
+}
+
+fn unexpected(name: &str, loader: &str) -> CheckpointIssue {
+    CheckpointIssue {
+        kind: CheckpointIssueKind::UnexpectedTensor,
+        detail: format!("{loader} catalog contains unexpected tensor {name:?}"),
+        tensor_name: Some(name.into()),
+        tensor_type_code: None,
+        metadata_key: None,
+    }
+}
+
+fn invalid_geometry(detail: String) -> CheckpointValidation {
+    CheckpointValidation::Invalid(vec![CheckpointIssue {
+        kind: CheckpointIssueKind::InvalidGeometry,
+        detail,
+        tensor_name: None,
+        tensor_type_code: None,
+        metadata_key: None,
+    }])
+}
+
+pub struct PreparedLlamaGguf {
+    pub args: ModelArgs,
+    pub eos_token_ids: Vec<u32>,
+}
+
+pub fn prepare_llama_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    quantization: Option<WeightQuantization>,
+    _weights_stream: &Stream,
+) -> Result<PreparedLlamaGguf, Error> {
+    let mut args = model_args_from_gguf_catalog(checkpoint, metadata)?;
+    let architecture = args.model_type.clone();
+    let gguf_architecture = eredu_core::GgufArchitecture::resolve(&architecture)?;
+    crate::composition::mlx::structural::validate_gguf(
+        gguf_architecture,
+        checkpoint,
+        metadata,
+        crate::backend::mlx::ModelLoadOptions::default(),
+    )
+    .into_loader_result()?;
+
+    checkpoint
+        .catalog()
+        .translated_outputs(eredu_architectures::llama::translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+    let quantized_weight_configs = gguf_quantization_configs(
+        checkpoint,
+        eredu_architectures::llama::translate_gguf_weight_name,
+    )?;
+    if let Some(quantization) = quantization {
+        args.quantized_weights = None;
+        args.quantization = Some(quantization);
+        args.quantized_weight_configs = None;
+    } else {
+        args.quantized_weights = Some(quantized_weight_configs.keys().cloned().collect());
+        args.quantization = None;
+        args.quantized_weight_configs = Some(quantized_weight_configs);
+    }
+
+    let eos_token_ids = crate::composition::mlx::gguf_eos_token_ids(metadata)?;
+    Ok(PreparedLlamaGguf {
+        args,
+        eos_token_ids,
+    })
+}
+
+struct NeutralGgufCatalog<'a, T: ?Sized>(&'a T);
+
+impl<T: GgufTensorNames + ?Sized> eredu_architectures::llama::GgufTensorCatalog
+    for NeutralGgufCatalog<'_, T>
+{
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains_gguf_tensor(name)
+    }
+
+    fn any(&self, predicate: &mut dyn FnMut(&str) -> bool) -> bool {
+        self.0.any_gguf_tensor(predicate)
+    }
+}
+
+/// Parses the GGUF arguments shared by structural preflight and loading.
+pub fn model_args_from_gguf_catalog(
+    arrays: &(impl GgufTensorNames + ?Sized),
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> Result<ModelArgs, Error> {
+    eredu_architectures::llama::model_args_from_gguf_catalog(&NeutralGgufCatalog(arrays), metadata)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}

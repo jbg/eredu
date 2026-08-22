@@ -4,8 +4,8 @@ use eredu::{
     api::LoadedModel, backend::mlx::ModelLoadOptions, GenerationConfigOverrides,
     TextGenerationConfig, TokenOutput,
 };
+use eredu_backend_mlx::native::ExecutionContext;
 use eredu_checkpoint::AffineQuantization;
-use safemlx::ExecutionContext;
 
 const DEFAULT_DECODE_TOKENS: usize = 128;
 const CASES: &[(&str, usize)] = &[
@@ -40,11 +40,17 @@ fn main() -> anyhow::Result<()> {
     println!("decode_tokens={decode_tokens}");
     println!("quantize_on_load={quantize_on_load}");
 
-    let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    let ctx = ExecutionContext::new(eredu_backend_mlx::native::Device::new(
+        eredu_backend_mlx::native::DeviceType::Gpu,
+        0,
+    ));
     let stream = ctx.stream();
-    let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let weights_ctx = ExecutionContext::new(eredu_backend_mlx::native::Device::new(
+        eredu_backend_mlx::native::DeviceType::Cpu,
+        0,
+    ));
     let weights_stream = weights_ctx.stream();
-    safemlx::memory::reset_peak_memory()?;
+    eredu_backend_mlx::native::memory::reset_peak_memory()?;
     let load_start = Instant::now();
     let options = if quantize_on_load {
         ModelLoadOptions::with_quantization(AffineQuantization::default())
@@ -61,12 +67,15 @@ fn main() -> anyhow::Result<()> {
     println!("load_s={:.3}", load_elapsed.as_secs_f64());
     println!(
         "mlx_active_memory_bytes={}",
-        safemlx::memory::active_memory()?
+        eredu_backend_mlx::native::memory::active_memory()?
     );
-    println!("mlx_peak_memory_bytes={}", safemlx::memory::peak_memory()?);
+    println!(
+        "mlx_peak_memory_bytes={}",
+        eredu_backend_mlx::native::memory::peak_memory()?
+    );
     println!(
         "mlx_cache_memory_bytes={}",
-        safemlx::memory::cache_memory()?
+        eredu_backend_mlx::native::memory::cache_memory()?
     );
 
     let warmup_start = Instant::now();

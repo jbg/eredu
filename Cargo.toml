@@ -12,6 +12,7 @@ members = [
     "eredu-checkpoint",
     "eredu-nn",
     "eredu-nn-macros",
+    "eredu-backend-mlx",
     "eredu-runtime",
     "eredu-architectures",
     "eredu-codec",
@@ -42,6 +43,7 @@ eredu-text = { version = "0.1.4", path = "eredu-text", default-features = false 
 eredu-checkpoint = { version = "0.1.0", path = "eredu-checkpoint" }
 eredu-nn = { version = "0.1.0", path = "eredu-nn", default-features = false }
 eredu-nn-macros = { version = "0.1.0", path = "eredu-nn-macros" }
+eredu-backend-mlx = { version = "0.1.0", path = "eredu-backend-mlx", default-features = false }
 eredu-runtime = { version = "0.1.0", path = "eredu-runtime" }
 eredu-architectures = { version = "0.1.0", path = "eredu-architectures" }
 eredu-codec = { version = "0.1.0", path = "eredu-codec", default-features = false }

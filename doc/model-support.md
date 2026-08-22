@@ -15,9 +15,9 @@ readiness matters:
 ```rust,no_run
 use eredu::{
     api::{inspect_text_model, TextInspectionOptions},
-    composition::mlx::{inspect_model, MlxInspectionOptions},
     InspectionSeverity,
 };
+use eredu_backend_mlx::composition::mlx::{inspect_model, MlxInspectionOptions};
 
 let structural = inspect_model("/path/to/model", MlxInspectionOptions::default())?;
 let report = inspect_text_model(structural, TextInspectionOptions::default());
@@ -30,7 +30,7 @@ if !report.is_loadable() {
         eprintln!("{:?}: {}", issue.code, issue.detail);
     }
 }
-# Ok::<(), eredu::backend::mlx::error::Error>(())
+# Ok::<(), eredu_backend_mlx::backend::mlx::error::Error>(())
 ```
 
 Structural inspection reads configuration and bounded checkpoint headers,

@@ -15,7 +15,7 @@ use eredu::{
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
     MtpCapability, MtpCheckpointKind, MtpSchedulerOptions, SemanticEvent,
 };
-use safemlx::{Device, DeviceType, ExecutionContext};
+use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
 use serde_json::json;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -87,9 +87,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // drafter retain their respective execution placements.
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let drafter_tokenizer = eredu::api::load_tokenizer(&drafter_path)?;
-        let mut drafter = MlxDrafter::load(
+        let mut drafter = MlxDrafter::load_with_fingerprint(
             &drafter_path,
-            &drafter_tokenizer,
+            eredu_text::tokenizer::vocabulary_fingerprint(&drafter_tokenizer),
+            Default::default(),
             draft.stream(),
             draft.stream(),
         )?;

@@ -102,6 +102,10 @@ name = "core_types"
 path = "tests/core_types.rs"
 
 [[test]]
+name = "dependency_boundary"
+path = "tests/dependency_boundary.rs"
+
+[[test]]
 name = "distributed_pipeline_ring"
 path = "tests/distributed_pipeline_ring_target.rs"
 required-features = ["mlx"]
@@ -109,6 +113,11 @@ required-features = ["mlx"]
 [[test]]
 name = "distributed_realtime_ring"
 path = "tests/distributed_realtime_ring.rs"
+required-features = ["mlx"]
+
+[[test]]
+name = "facade_compatibility"
+path = "tests/facade_compatibility.rs"
 required-features = ["mlx"]
 
 [[test]]
@@ -129,25 +138,20 @@ features = ["mlx-image", "mlx-audio"]
 default = ["mlx", "onig", "esaxx_fast"]
 
 mlx = [
-    "eredu-nn/mlx",
-    "dep:safemlx",
-    "dep:safetensors",
-    "dep:memmap2",
-    "dep:tempfile",
-    "dep:half",
-    "dep:libc",
+    "dep:eredu-backend-mlx",
+    "eredu-backend-mlx/test-support",
 ]
-cuda = ["mlx", "safemlx/cuda"]
+cuda = ["mlx", "eredu-backend-mlx/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "eredu-text/esaxx_fast"]
 onig = ["tokenizers/onig", "eredu-text/onig"]
-nccl = ["cuda", "safemlx/nccl"]
-mlx-media = ["mlx"]
-mlx-image = ["mlx-media", "dep:image"]
-mlx-audio = ["mlx-media", "dep:rustfft"]
+nccl = ["cuda", "eredu-backend-mlx/nccl"]
+mlx-media = ["mlx", "eredu-backend-mlx/media"]
+mlx-image = ["mlx-media", "eredu-backend-mlx/image"]
+mlx-audio = ["mlx-media", "eredu-backend-mlx/audio"]
 
 [dependencies]
 # Local dependencies
-safemlx = { workspace = true, features = ["safetensors"], optional = true }
+eredu-backend-mlx = { workspace = true, optional = true }
 eredu-core.workspace = true
 eredu-text = { workspace = true, default-features = false }
 eredu-gguf.workspace = true
@@ -164,18 +168,13 @@ idna_adapter = "1"
 thiserror = "2"
 serde_json = "1"
 minijinja = "2"
-safetensors = { version = "0.8", optional = true }
-memmap2 = { version = "0.9", optional = true }
-tempfile = { workspace = true, optional = true }
-half = { workspace = true, optional = true }
 sha2.workspace = true
 llguidance = { version = "=1.7.6", default-features = false, features = ["ahash", "lark"] }
 toktrie_hf_tokenizers = "=1.7.6"
-libc = { version = "0.2", optional = true }
-image = { version = "0.25", default-features = false, optional = true }
-rustfft = { version = "6", optional = true }
 
 [dev-dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 lazy_static = "1"
+safetensors = "0.8"
+tempfile.workspace = true

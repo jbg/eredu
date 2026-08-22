@@ -40,16 +40,17 @@ use eredu::{
     SemanticEvent, TextGenerationConfig, TimingTelemetry, TokenOutput, WeightTransformationPlan,
     EXECUTION_PLAN_SCHEMA_VERSION,
 };
-use eredu_checkpoint::{AffineQuantization, WeightQuantization};
-use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
-use safemlx::{
+use eredu_backend_mlx::native::{
+    memory::{active_memory, cache_memory, peak_memory, reset_peak_memory, set_cache_limit},
     ops::indexing::{NewAxis, TryIndexOp},
-    random::RandomState,
+    random::{key, RandomState},
     transforms::eval,
     Array, Stream,
 };
 #[cfg(test)]
-use safemlx::{Device, DeviceType, ExecutionContext};
+use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
+use eredu_checkpoint::{AffineQuantization, WeightQuantization};
+use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2076,8 +2077,7 @@ fn main() -> Result<()> {
         .or_else(|| args.telemetry_json.as_ref().map(|_| discover_hardware()));
     if let Some(bytes) = args.mlx_cache_limit_bytes {
         let bytes = usize::try_from(bytes).context("--mlx-cache-limit-bytes exceeds usize")?;
-        safemlx::memory::set_cache_limit(bytes)
-            .context("failed to set the MLX allocator-cache limit")?;
+        set_cache_limit(bytes).context("failed to set the MLX allocator-cache limit")?;
     }
     let prompt = read_prompt(args.prompt.as_deref())?;
 
@@ -2109,7 +2109,7 @@ fn main() -> Result<()> {
 
     if args.verbose || args.telemetry_json.is_some() {
         // Capture the complete model-load and generation high-water mark.
-        safemlx::memory::reset_peak_memory()?;
+        reset_peak_memory()?;
     }
     let resource_profile = if let Some(report) = &automatic_report {
         Some(report.resources.clone())
@@ -2389,7 +2389,7 @@ fn main() -> Result<()> {
             args.frequency_penalty,
             args.presence_penalty,
         );
-        let mut random = RandomState::from_key(safemlx::random::key(args.seed)?);
+        let mut random = RandomState::from_key(key(args.seed)?);
         let parts = [InputPart::text_token_ids(&tokens)];
         let prompt = MlxModelInput::from(ModelInput::new(&parts));
         let mut logits = model
@@ -2470,9 +2470,9 @@ fn main() -> Result<()> {
     let allocator_telemetry = if args.verbose || args.telemetry_json.is_some() {
         stream.synchronize()?;
         Some(AllocatorTelemetry {
-            peak_bytes: safemlx::memory::peak_memory()? as u64,
-            active_bytes: safemlx::memory::active_memory()? as u64,
-            cache_bytes: safemlx::memory::cache_memory()? as u64,
+            peak_bytes: peak_memory()? as u64,
+            active_bytes: active_memory()? as u64,
+            cache_bytes: cache_memory()? as u64,
         })
     } else {
         None
@@ -4451,6 +4451,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an MLX execution device even when selecting the CPU stream"]
     fn cpu_execution_device_runs_mlx_work() {
         let context = super::ExecutionContext::new(CliDevice::Cpu.mlx());
         assert_eq!(context.device().get_type().unwrap(), DeviceType::Cpu);

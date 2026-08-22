@@ -75,6 +75,7 @@ portable components or implementation layers for specialized use.
 | [`eredu-core`](eredu-core/) | Backend-neutral runtime contracts, scheduling, validation, residency, and portable schemas |
 | [`eredu-text`](eredu-text/) | Backend-neutral tokenization and chat-template utilities |
 | [`eredu-gguf`](eredu-gguf/) | Bounded, framework-independent GGUF reading, writing, and tensor conversion |
+| [`eredu-backend-mlx`](eredu-backend-mlx/) | Concrete MLX tensor, execution, checkpoint, composition, media, and codec integration |
 | [`safemlx`](safemlx/) | Low-level MLX implementation used by Eredu's default backend |
 | [`safemlx-sys`](safemlx-sys/) | MLX C bindings and native build integration |
 | [`eredu-nn`](eredu-nn/) | Backend-neutral tensor and neural-operation contracts for shared architectures |

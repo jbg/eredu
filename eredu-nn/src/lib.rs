@@ -15,8 +15,6 @@ use eredu_checkpoint::WeightQuantization;
 
 pub use eredu_nn_macros::Parameterized;
 
-#[cfg(feature = "mlx")]
-mod mlx;
 /// Reusable patch projection and multi-axis position operations.
 pub mod multimodal;
 /// Pure sequence layouts shared by patch-based encoders.

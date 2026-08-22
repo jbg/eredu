@@ -9,7 +9,9 @@ use eredu::{
     AttentionPolicy, CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor,
     PromptCacheOptions, PromptCacheTopology,
 };
-use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext};
+use eredu_backend_mlx::native::{
+    transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "Verify reusable paged prompt-cache parity")]

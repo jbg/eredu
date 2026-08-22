@@ -17,7 +17,7 @@ use eredu::{
     composition::mlx::realtime::{generate_encoded_greedy, MlxRealtimeBackend},
     load_realtime_model,
 };
-use safemlx::{Array, Device, DeviceType, ExecutionContext};
+use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -61,7 +61,7 @@ fn main() -> anyhow::Result<()> {
 fn compare_tokens(
     actual: &Array,
     expected: &Array,
-    stream: &safemlx::Stream,
+    stream: &eredu_backend_mlx::native::Stream,
     label: &str,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(

@@ -13,11 +13,11 @@ use eredu::{
     backend::mlx::runtime::distributed::topology::load_safetensors_partition,
     backend::mlx::{DeviceAssignment, MlxParallelContext, PlacementPlan},
 };
-use eredu_runtime::TensorPlacement;
-use safemlx::{
+use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     DeviceType, Stream,
 };
+use eredu_runtime::TensorPlacement;
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 const WORKER_RANK: &str = "EREDU_PARTITION_RING_WORKER";

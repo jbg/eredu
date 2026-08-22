@@ -21,7 +21,7 @@ use eredu::{
     composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
     load_realtime_model, RealtimeSampling, RealtimeScheduler, RequestId, SchedulerLimits,
 };
-use safemlx::{
+use eredu_backend_mlx::native::{
     ops::{indexing::TryIndexOp, stack_axis},
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
@@ -68,8 +68,11 @@ fn main() -> anyhow::Result<()> {
         if step > 0 {
             let text = output.text_token.squeeze_axes(&[-1], stream)?;
             let text = text.expand_dims(1, stream)?;
-            let frame =
-                safemlx::ops::concatenate_axis(&[text, output.sampled_audio_tokens], 1, stream)?;
+            let frame = eredu_backend_mlx::native::ops::concatenate_axis(
+                &[text, output.sampled_audio_tokens],
+                1,
+                stream,
+            )?;
             sampled.push(frame);
         }
         if let Some(tokens) = output.output_audio_tokens {

@@ -4,7 +4,7 @@ use eredu::{
     api::LoadedModel, GenerationConfigOverrides, TextGenerationBackend, TextGenerationConfig,
     TokenOutput,
 };
-use safemlx::{Device, DeviceType, ExecutionContext};
+use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
 
 fn generate<B: TextGenerationBackend>(
     model: &mut LoadedModel<B>,

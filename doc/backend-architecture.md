@@ -13,13 +13,17 @@ eredu-core        eredu-checkpoint        eredu-nn
                            |
                    eredu-architectures
                            |
-             eredu composition + backends
+                  eredu-backend-mlx
+                           |
+                         eredu
 ```
 
-The neutral crates contain no native accelerator dependency. The `eredu`
-facade is also portable when built with `default-features = false`. Its default
-`mlx` feature adds reusable MLX capabilities under `eredu::backend::mlx` and
-connects them to neutral architectures under `eredu::composition`.
+The neutral crates contain no native accelerator dependency under any feature.
+The `eredu` facade is also portable when built with
+`default-features = false`. Its default `mlx` feature selects the optional
+`eredu-backend-mlx` crate. Compatibility re-exports keep MLX capabilities
+available under `eredu::backend::mlx` and family adapters under
+`eredu::composition`.
 
 The facade root and `api` namespace expose portable application concepts.
 Backend-native types remain in their backend namespace.
@@ -194,11 +198,12 @@ collective tensor math remain backend-specific.
 
 ## MLX implementation
 
-The default MLX implementation is split between backend mechanics under
-`eredu::backend::mlx` and the public model facade under
-`eredu::composition::mlx`:
+The complete concrete implementation lives in `eredu-backend-mlx`, split
+internally between reusable backend mechanics and family/backend composition:
 
 - `MlxBackend` owns execution and weight-materialization streams.
+- `MlxTensor` is a transparent, zero-copy wrapper around `safemlx::Array` and
+  is the sole MLX implementation of `eredu_nn::Tensor`;
 - `composition::mlx::MlxModelSession` owns the executable model, cache,
   processor state, and
   optional distributed context.
@@ -208,10 +213,11 @@ The default MLX implementation is split between backend mechanics under
 - MLX events provide exact completion while retaining arrays and source
   resources required by submitted work.
 
-Model-family selection and MLX composition live under `eredu::composition`;
-the backend module does not re-export that facade.
-The MLX backend directory contains no Llama configuration, checkpoint names,
-cache geometry, parallel head rules, or layer math.
+Model-family definitions, equations, checkpoint schemas, and state geometry
+remain in `eredu-architectures`. The backend crate owns only the MLX binding,
+materialization, and execution adapters. `eredu` delegates through neutral
+contracts and may re-export backend APIs for compatibility, but the backend
+crate never depends upward on the facade.
 
 The adapter translates native failures into structured backend errors and
 populates portable capability, inspection, memory, admission, and telemetry
@@ -247,8 +253,10 @@ associated implementation types.
 
 The repository mechanically verifies stable dependency and behavior boundaries:
 
-- `eredu-core` and `eredu-runtime` dependency-graph tests reject upward facade,
-  architecture, and accelerator-runtime dependencies;
+- `eredu-core`, `eredu-nn`, `eredu-runtime`, `eredu-architectures`, and
+  `eredu-codec` dependency-graph tests reject upward or accelerator-runtime
+  dependencies;
+- `eredu-backend-mlx` dependency-graph tests reject a dependency on `eredu`;
 - the feature-disabled `portable_facade` and `backend_conformance` suites compile
   and exercise the public contracts through mock backends; and
 - architecture, runtime, and backend conformance tests cover the relevant
@@ -259,7 +267,7 @@ source-layout tests:
 
 - `eredu-architectures` contains model-family policy but no concrete backend
   imports;
-- reusable modules under `eredu::backend::mlx` contain backend mechanics but no
+- reusable modules in `eredu-backend-mlx` contain backend mechanics but no
   model-family configuration, checkpoint naming policy, state geometry, or
   layer equations;
 - native dependencies remain behind facade features, preserving the

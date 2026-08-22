@@ -12,8 +12,8 @@ description = "Command-line interface for running local models with Eredu"
 readme = "README.md"
 
 [features]
-cuda = ["safemlx/cuda", "eredu/cuda"]
-nccl = ["cuda", "safemlx/nccl", "eredu/nccl"]
+cuda = ["eredu-backend-mlx/cuda", "eredu/cuda"]
+nccl = ["cuda", "eredu-backend-mlx/nccl", "eredu/nccl"]
 
 [[bin]]
 name = "eredu"
@@ -23,8 +23,8 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 hf-hub = { version = "=1.0.0", features = ["blocking"] }
-safemlx.workspace = true
 eredu.workspace = true
+eredu-backend-mlx.workspace = true
 eredu-checkpoint.workspace = true
 serde.workspace = true
 serde_json.workspace = true

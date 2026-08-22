@@ -31,6 +31,15 @@ The default build uses MLX:
 eredu = "0.4"
 ```
 
+Applications that configure MLX devices, inspect native allocator telemetry,
+or name concrete backend types should also depend on the implementation crate:
+
+```toml
+[dependencies]
+eredu = "0.4"
+eredu-backend-mlx = "0.1"
+```
+
 A portable facade build does not compile or link MLX:
 
 ```toml
@@ -50,10 +59,8 @@ EOS, generation-default, and chat-template metadata. The same loading and
 generation methods work for every backend:
 
 ```rust,ignore
-use eredu::{
-    api::LoadedModel,
-    backend::mlx::{MlxBackend, ModelLoadOptions},
-};
+use eredu::api::LoadedModel;
+use eredu_backend_mlx::backend::mlx::{MlxBackend, ModelLoadOptions};
 
 let backend = MlxBackend::new(execution_stream, weights_stream);
 let mut model = LoadedModel::load(
@@ -64,7 +71,9 @@ let mut model = LoadedModel::load(
 ```
 
 For MLX, native models, caches, streams, load policies, architecture modules,
-and diagnostics are available only under `backend::mlx`. Generic APIs do not
+and diagnostics are owned by `eredu-backend-mlx`. The
+`eredu::backend::mlx` and `eredu::composition::mlx` paths remain compatibility
+re-exports when the facade's `mlx` feature is enabled. Generic APIs do not
 expose MLX arrays, streams, devices, or errors.
 
 Use `LoadedModel::load_execution_plan` or `LoadedModel::plan_and_load` when the

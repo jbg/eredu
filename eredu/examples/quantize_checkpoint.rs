@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use eredu::backend::mlx::runtime::checkpoint::quantization::CheckpointQuantizationOptions;
+use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
-use safemlx::{Device, DeviceType, ExecutionContext};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Mode {

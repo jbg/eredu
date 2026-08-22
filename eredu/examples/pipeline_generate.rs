@@ -6,7 +6,7 @@ use eredu::{
     core::{BackendProvider as _, BackendSession as _},
     load_model,
 };
-use safemlx::{
+use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     DeviceType, Stream,
 };
@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ModelLoadOptions::with_parallel(topology),
     )?;
     let mut session = backend.create_session(model)?;
-    let prompt = safemlx::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
+    let prompt = eredu_backend_mlx::native::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let parts = [input::InputPart::text_token_ids(&prompt)];
     let mut logits = session
         .prefill(&backend, input::ModelInput::new(&parts).into())?

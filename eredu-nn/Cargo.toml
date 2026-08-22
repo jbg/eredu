@@ -8,14 +8,8 @@ license.workspace = true
 rust-version.workspace = true
 description = "Backend-neutral neural computation contracts for Eredu architectures"
 
-[features]
-default = []
-mlx = ["dep:safemlx", "dep:smallvec"]
-
 [dependencies]
 eredu-checkpoint.workspace = true
 eredu-nn-macros.workspace = true
-safemlx = { workspace = true, optional = true }
-smallvec = { version = "1", optional = true }
 serde.workspace = true
 thiserror.workspace = true

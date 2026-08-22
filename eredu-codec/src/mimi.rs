@@ -12,15 +12,6 @@ use eredu_nn::{
 };
 use std::collections::HashMap;
 
-#[cfg(feature = "mlx")]
-use memmap2::MmapOptions;
-#[cfg(feature = "mlx")]
-use safemlx::{Array, Stream};
-#[cfg(feature = "mlx")]
-use safetensors::SafeTensors;
-#[cfg(feature = "mlx")]
-use std::{fs::File, path::Path};
-
 use crate::{AudioTokenizer, AudioTokenizerConfig, Error};
 
 const EPSILON: f32 = 1e-5;
@@ -334,48 +325,53 @@ impl<T: Tensor> Mimi<T> {
     }
 }
 
-#[cfg(feature = "mlx")]
-fn load_decoder_safetensors_arrays(
-    path: impl AsRef<Path>,
-    stream: &Stream,
-) -> Result<impl Iterator<Item = Result<(String, Array), Error>>, Error> {
-    let file = File::open(path)?;
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
-    let tensors = SafeTensors::deserialize(&mmap).map_err(|err| Error::Other(Box::new(err)))?;
-    let mut loaded = Vec::new();
-    for (key, view) in tensors.iter() {
-        let Some(key) = transform_decoder_key(key) else {
-            continue;
+/// Backend-independent layout conversion required by a Mimi checkpoint tensor.
+///
+/// Backends use this metadata to convert framework-native checkpoint layouts
+/// into the layouts expected by [`Mimi::load_parameters`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CheckpointTensorLayout {
+    /// The checkpoint and model use the same tensor layout.
+    Identity,
+    /// A rank-three checkpoint tensor must be transposed along these axes.
+    Transpose3d([i32; 3]),
+}
+
+/// Backend-independent loading plan for one tensor in a released Mimi
+/// checkpoint.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CheckpointTensorPlan {
+    /// Stable [`Mimi`] parameter identity.
+    pub parameter: String,
+    /// Checkpoint-to-model layout conversion required before loading.
+    pub layout: CheckpointTensorLayout,
+}
+
+/// Maps a released Mimi checkpoint tensor name to its stable model parameter
+/// and required layout conversion.
+///
+/// Returns `None` for checkpoint entries that are not model parameters owned
+/// by [`Mimi`]. Reading a checkpoint and performing the planned conversion are
+/// backend responsibilities.
+pub fn checkpoint_tensor_plan(key: &str) -> Option<CheckpointTensorPlan> {
+    let parameter = transform_decoder_key(key)?;
+    let layout = if parameter.ends_with(".weight") && is_conv_weight_key(&parameter) {
+        // PyTorch ConvTranspose1d stores non-depthwise weights as
+        // [input, output/groups, kernel]. All other Mimi convolutions,
+        // including its depthwise top-level upsampler, retain their leading
+        // channel dimension.
+        let axes = if parameter.contains(".upsample.") {
+            [1, 2, 0]
+        } else {
+            [0, 2, 1]
         };
-        let mut value = Array::try_from(view).map_err(|err| Error::Other(Box::new(err)))?;
-        if key.ends_with(".weight") && is_conv_weight_key(&key) {
-            value = pytorch_conv_weight_to_mlx(&key, value, stream)?;
-        }
-        loaded.push(Ok((
-            key,
-            value.copy(stream).map_err(eredu_nn::Error::backend)?,
-        )));
-    }
-    Ok(loaded.into_iter())
+        CheckpointTensorLayout::Transpose3d(axes)
+    } else {
+        CheckpointTensorLayout::Identity
+    };
+    Some(CheckpointTensorPlan { parameter, layout })
 }
 
-#[cfg(feature = "mlx")]
-impl Mimi<Array> {
-    /// Loads a Mimi checkpoint into the MLX tensor backend.
-    pub fn load(
-        path: impl AsRef<Path>,
-        num_codebooks: Option<i32>,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        let mut model = Self::new(Config::v0_1(num_codebooks), stream)?;
-        model.load_parameters(
-            load_decoder_safetensors_arrays(path, stream)?.collect::<Result<Vec<_>, _>>()?,
-        )?;
-        Ok(model)
-    }
-}
-
-#[cfg(feature = "mlx")]
 fn transform_decoder_key(key: &str) -> Option<String> {
     if key.starts_with("quantizer.") {
         return Some(key.to_string());
@@ -409,7 +405,6 @@ fn transform_decoder_key(key: &str) -> Option<String> {
     None
 }
 
-#[cfg(feature = "mlx")]
 fn transform_seanet_encoder_key(key: &str) -> Option<String> {
     let (source, target) = [
         ("0.conv.conv.", "encoder.init_conv1d."),
@@ -456,7 +451,6 @@ fn transform_seanet_encoder_key(key: &str) -> Option<String> {
     Some(format!("{target}{}", &key[source.len()..]))
 }
 
-#[cfg(feature = "mlx")]
 fn transform_seanet_decoder_key(key: &str) -> Option<String> {
     let (source, target) = [
         ("0.conv.conv.", "decoder.init_conv1d."),
@@ -503,7 +497,6 @@ fn transform_seanet_decoder_key(key: &str) -> Option<String> {
     Some(format!("{target}{}", &key[source.len()..]))
 }
 
-#[cfg(feature = "mlx")]
 fn is_conv_weight_key(key: &str) -> bool {
     key.starts_with("upsample.")
         || key.starts_with("downsample.")
@@ -512,22 +505,6 @@ fn is_conv_weight_key(key: &str) -> bool {
         || key.contains(".init_conv1d.")
         || key.contains(".final_conv1d.")
         || key.contains(".block.")
-}
-
-#[cfg(feature = "mlx")]
-fn pytorch_conv_weight_to_mlx(key: &str, value: Array, stream: &Stream) -> Result<Array, Error> {
-    if value.shape().len() != 3 {
-        return Ok(value);
-    }
-    if key.contains(".upsample.") {
-        Ok(value
-            .transpose_axes(&[1, 2, 0], stream)
-            .map_err(eredu_nn::Error::backend)?)
-    } else {
-        Ok(value
-            .transpose_axes(&[0, 2, 1], stream)
-            .map_err(eredu_nn::Error::backend)?)
-    }
 }
 
 impl<T: Tensor> AudioTokenizer for Mimi<T> {
@@ -2044,15 +2021,12 @@ fn validate_codes<T: Tensor>(codes: &T, max_codebooks: i32) -> Result<(), Error>
     Ok(())
 }
 
-#[cfg(all(test, feature = "mlx"))]
+#[cfg(test)]
 mod tests {
-    use super::{transform_decoder_key, AudioTokenizer, Config, Mimi, MimiModuleParameters};
-    use eredu_nn::{AttentionMask, Error as ComputeError, Index, PadMode, Tensor};
-    use safemlx::{
-        ops::{concatenate_axis, indexing::TryIndexOp},
-        transforms::eval,
-        Array, Device, DeviceType, ExecutionContext,
+    use super::{
+        checkpoint_tensor_plan, CheckpointTensorLayout, Config, Mimi, MimiModuleParameters,
     };
+    use eredu_nn::{AttentionMask, Error as ComputeError, Index, PadMode, Tensor};
 
     #[derive(Debug, Clone)]
     struct ShapeTensor(Vec<i32>);
@@ -2246,7 +2220,32 @@ mod tests {
     #[test]
     fn checkpoint_quantizer_keys_keep_the_model_root() {
         let key = "quantizer.rvq_first.vq.layers.0._codebook.embedding_sum";
-        assert_eq!(transform_decoder_key(key).as_deref(), Some(key));
+        let plan = checkpoint_tensor_plan(key).unwrap();
+        assert_eq!(plan.parameter, key);
+        assert_eq!(plan.layout, CheckpointTensorLayout::Identity);
+    }
+
+    #[test]
+    fn checkpoint_plan_declares_canonical_convolution_layouts() {
+        assert_eq!(
+            checkpoint_tensor_plan("encoder.model.0.conv.conv.weight")
+                .unwrap()
+                .layout,
+            CheckpointTensorLayout::Transpose3d([0, 2, 1])
+        );
+        assert_eq!(
+            checkpoint_tensor_plan("decoder.model.2.convtr.convtr.weight")
+                .unwrap()
+                .layout,
+            CheckpointTensorLayout::Transpose3d([1, 2, 0])
+        );
+        assert_eq!(
+            checkpoint_tensor_plan("upsample.convtr.convtr.convtr.weight")
+                .unwrap()
+                .layout,
+            CheckpointTensorLayout::Transpose3d([0, 2, 1])
+        );
+        assert!(checkpoint_tensor_plan("optimizer.state").is_none());
     }
 
     #[test]
@@ -2271,8 +2270,9 @@ mod tests {
             "decoder_transformer.transformer.layers.0.linear1.weight",
             "decoder.model.0.conv.conv.weight",
         ] {
-            let model_name = transform_decoder_key(checkpoint_name)
-                .unwrap_or_else(|| panic!("checkpoint key was not mapped: {checkpoint_name}"));
+            let model_name = checkpoint_tensor_plan(checkpoint_name)
+                .unwrap_or_else(|| panic!("checkpoint key was not mapped: {checkpoint_name}"))
+                .parameter;
             assert!(
                 unique.binary_search(&model_name).is_ok(),
                 "mapped parameter is absent from Mimi: {checkpoint_name} -> {model_name}"
@@ -2288,104 +2288,5 @@ mod tests {
         assert_eq!(cfg.num_codebooks, 16);
         assert_eq!(cfg.total_codebooks, 32);
         assert_eq!(cfg.bins, 2_048);
-    }
-
-    #[test]
-    #[ignore = "requires EREDU_MIMI_PATH with a released Mimi safetensors checkpoint and Metal"]
-    fn local_mimi_checkpoint_encode_decode_smoke() {
-        let path = std::env::var("EREDU_MIMI_PATH")
-            .expect("EREDU_MIMI_PATH must point to a Mimi safetensors checkpoint");
-        let ctx = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let stream = ctx.stream();
-        let mut mimi = Mimi::load(path, Some(8), stream).unwrap();
-        let cfg = mimi.config();
-        assert_eq!(cfg.codebooks, 8);
-        assert_eq!(cfg.cardinality, 2_048);
-
-        let codes = Array::zeros::<i32>(&[1, 8, 2], stream).unwrap();
-        let latent = mimi.decode_latent(&codes, stream).unwrap();
-        assert_eq!(latent.shape(), &[1, 512, 2]);
-        let recoded = mimi.encode_latent(&latent, stream).unwrap();
-        assert_eq!(recoded.shape(), &[1, 8, 2]);
-        let pcm = mimi.decode(&codes, stream).unwrap();
-        assert_eq!(pcm.shape(), &[1, 1, 3840]);
-        let alternate_codes = Array::ones::<i32>(&[1, 8, 2], stream).unwrap();
-        let alternate_pcm = mimi.decode(&alternate_codes, stream).unwrap();
-        eval([&pcm, &alternate_pcm]).unwrap();
-        stream.synchronize().unwrap();
-        let pcm_values = pcm.evaluated().unwrap();
-        let alternate_values = alternate_pcm.evaluated().unwrap();
-        let difference = pcm_values
-            .as_slice::<f32>()
-            .iter()
-            .zip(alternate_values.as_slice::<f32>())
-            .map(|(left, right)| (left - right).abs())
-            .sum::<f32>();
-        assert!(difference > 1e-3, "Mimi decode ignored token values");
-        let encoded = mimi.encode(&pcm, stream).unwrap();
-        assert_eq!(encoded.shape(), &[1, 8, 2]);
-
-        // PyTorch Mimi oracle for x[n] = ((n mod 17) - 8) / 64. This catches
-        // architecture drift that a shape-only checkpoint smoke test cannot.
-        let parity_pcm = (0..7680)
-            .map(|sample| ((sample % 17) as f32 - 8.0) / 64.0)
-            .collect::<Vec<_>>();
-        let parity_pcm = Array::from_slice(&parity_pcm, &[1, 1, 7680])
-            .copy(stream)
-            .unwrap();
-        let actual_codes = mimi.encode(&parity_pcm, stream).unwrap();
-        let expected_codes = Array::from_slice(
-            &[
-                1049, 605, 1964, 1964, 74, 712, 712, 712, 1441, 1441, 1441, 1441, 1820, 1820, 1820,
-                1820, 1711, 1711, 1711, 1711, 1386, 818, 818, 1418, 127, 755, 755, 127, 130, 1228,
-                1228, 1115,
-            ],
-            &[1, 8, 4],
-        )
-        .copy(stream)
-        .unwrap();
-        assert!(
-            actual_codes
-                .all_close(&expected_codes, 0.0, 0.0, None, stream)
-                .unwrap()
-                .item::<bool>(stream),
-            "Mimi encode tokens differ from the released PyTorch checkpoint oracle"
-        );
-
-        mimi.reset_encode_state();
-        let encoded_first = mimi
-            .encode_step(
-                &pcm.try_index_device((.., .., 0..1920), stream).unwrap(),
-                stream,
-            )
-            .unwrap()
-            .expect("first PCM frame should encode to one Mimi frame");
-        let encoded_second = mimi
-            .encode_step(
-                &pcm.try_index_device((.., .., 1920..3840), stream).unwrap(),
-                stream,
-            )
-            .unwrap()
-            .expect("second PCM frame should encode to one Mimi frame");
-        assert_eq!(encoded_first.shape(), &[1, 8]);
-        assert_eq!(encoded_second.shape(), &[1, 8]);
-
-        mimi.reset_decode_state();
-        let first = mimi
-            .decode_step(
-                &codes.try_index_device((.., .., 0), stream).unwrap(),
-                stream,
-            )
-            .unwrap();
-        let second = mimi
-            .decode_step(
-                &codes.try_index_device((.., .., 1), stream).unwrap(),
-                stream,
-            )
-            .unwrap();
-        assert_eq!(first.shape(), &[1, 1, 1920]);
-        assert_eq!(second.shape(), &[1, 1, 1920]);
-        let streamed = concatenate_axis(&[first, second], 2, stream).unwrap();
-        assert_eq!(streamed.shape(), pcm.shape());
     }
 }

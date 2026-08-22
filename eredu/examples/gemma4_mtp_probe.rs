@@ -9,7 +9,7 @@ use eredu::{
     composition::mlx::speculative::MlxDrafter,
     GenerationCancellationToken, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
-use safemlx::{ExecutionContext, Stream};
+use eredu_backend_mlx::native::{ExecutionContext, Stream};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -36,9 +36,15 @@ fn main() -> anyhow::Result<()> {
     println!("assistant: {}", assistant_dir.display());
     println!("prompt: {prompt:?}");
 
-    let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    let ctx = ExecutionContext::new(eredu_backend_mlx::native::Device::new(
+        eredu_backend_mlx::native::DeviceType::Gpu,
+        0,
+    ));
     let stream = ctx.stream();
-    let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let weights_ctx = ExecutionContext::new(eredu_backend_mlx::native::Device::new(
+        eredu_backend_mlx::native::DeviceType::Cpu,
+        0,
+    ));
     let weights_stream = weights_ctx.stream();
     let prepared = prepare_prompt(&target_dir, &prompt, stream, weights_stream)?;
     println!(
@@ -168,8 +174,13 @@ fn run_mtp(
         Default::default(),
     )?;
     let assistant_tokenizer = eredu::api::load_tokenizer(assistant_dir)?;
-    let mut assistant =
-        MlxDrafter::load(assistant_dir, &assistant_tokenizer, stream, weights_stream)?;
+    let mut assistant = MlxDrafter::load_with_fingerprint(
+        assistant_dir,
+        eredu_text::tokenizer::vocabulary_fingerprint(&assistant_tokenizer),
+        Default::default(),
+        stream,
+        weights_stream,
+    )?;
     let output = target.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
         input: PreparedChatInput::rendered_prompt(prepared),
         drafting: SpeculativeDraft::External(&mut assistant),
