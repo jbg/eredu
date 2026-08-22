@@ -78,6 +78,13 @@ backends select the loaded architecture estimate, apply their physical state
 scalar width, and add live allocator, residency, and system-memory
 observations; they do not reconstruct family state geometry.
 
+Prepared-media admission follows the same boundary. Architecture media plans
+validate family payload shapes, patch/window/pooling geometry, valid-position
+masks, and artifact-specific modality policy, then report decoder positions
+and conservative scalar workspace. Concrete backends only extract shapes and
+small metadata values from native arrays, apply physical scalar widths, and
+account for the arrays' actual byte sizes.
+
 Backend types also declare the optional neural forward operators they support.
 Architecture constructors preflight family-owned operator requirement sets
 before allocating modules or loading parameters, so a missing recurrent scan,

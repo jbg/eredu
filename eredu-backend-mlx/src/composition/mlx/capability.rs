@@ -2,7 +2,9 @@
 
 use std::num::NonZeroU8;
 
-use eredu_architectures::qwen::vision::{VisionAttentionPolicy, VisionConfig};
+use eredu_architectures::media_plan::{
+    self, MediaMetadata, MediaModality, MediaShapePlan, PreparedMediaInput,
+};
 use eredu_core::{
     estimate_runtime_state, AvailableMemory, CapabilityError, InputTokenCount, ModelCapabilities,
     ModelCapabilityBackend, ModelRuntime, ObservationKind, Observed, PhysicalMemorySemantics,
@@ -19,17 +21,6 @@ fn positive(value: i32, field: &'static str) -> Result<u64, CapabilityError> {
         field,
         detail: format!("expected a non-negative value, got {value}"),
     })
-}
-
-fn nonzero_positive(value: i32, field: &'static str) -> Result<u64, CapabilityError> {
-    let value = positive(value, field)?;
-    if value == 0 {
-        return Err(CapabilityError::InvalidConfiguration {
-            field,
-            detail: "expected a positive value, got zero".into(),
-        });
-    }
-    Ok(value)
 }
 
 fn checked_add(left: u64, right: u64, operation: &'static str) -> Result<u64, CapabilityError> {
@@ -112,17 +103,69 @@ fn runtime_counter(
     }
 }
 
-fn bool_count(array: &Array) -> Result<u64, CapabilityError> {
-    let evaluated = array
-        .evaluated()
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    let values = evaluated
-        .try_as_slice::<bool>()
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    u64::try_from(values.iter().filter(|value| **value).count()).map_err(|_| {
-        CapabilityError::ArithmeticOverflow {
-            operation: "boolean mask count",
-        }
+fn array_shape(array: &Array) -> Result<Vec<u64>, CapabilityError> {
+    array
+        .shape()
+        .iter()
+        .map(|dimension| {
+            u64::try_from(*dimension).map_err(|_| CapabilityError::ArithmeticOverflow {
+                operation: "prepared media array dimension",
+            })
+        })
+        .collect()
+}
+
+fn i32_metadata(array: Option<&Array>) -> Result<Option<MediaMetadata<i32>>, CapabilityError> {
+    array
+        .map(|array| {
+            let evaluated = array
+                .evaluated()
+                .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+            let values = evaluated
+                .try_as_slice::<i32>()
+                .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+            Ok(MediaMetadata {
+                shape: array_shape(array)?,
+                values: values.to_vec(),
+            })
+        })
+        .transpose()
+}
+
+fn bool_metadata(array: Option<&Array>) -> Result<Option<MediaMetadata<bool>>, CapabilityError> {
+    array
+        .map(|array| {
+            let evaluated = array
+                .evaluated()
+                .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+            let values = evaluated
+                .try_as_slice::<bool>()
+                .map_err(|error| CapabilityError::Observation(error.to_string()))?;
+            Ok(MediaMetadata {
+                shape: array_shape(array)?,
+                values: values.to_vec(),
+            })
+        })
+        .transpose()
+}
+
+fn prepared_media_input(
+    modality: Modality,
+    payload: &Array,
+    metadata: input::InputMetadata<'_>,
+) -> Result<PreparedMediaInput, CapabilityError> {
+    let modality = match modality {
+        Modality::Image => MediaModality::Image,
+        Modality::Audio => MediaModality::Audio,
+        Modality::Video => MediaModality::Video,
+        Modality::Text => unreachable!("text handled separately"),
+    };
+    Ok(PreparedMediaInput {
+        modality,
+        payload_shape: array_shape(payload)?,
+        patch_grid: i32_metadata(metadata.patch_grid)?,
+        patch_positions: i32_metadata(metadata.patch_positions)?,
+        audio_mask: bool_metadata(metadata.audio_mask)?,
     })
 }
 
@@ -134,931 +177,67 @@ fn four_byte_scalars(scalars: u64, operation: &'static str) -> Result<u64, Capab
     checked_mul(scalars, 4, operation)
 }
 
-fn qwen_attention_chunk_squares(
-    grid: &[(i32, i32, i32)],
-    merge: u64,
-    window_size: i32,
-    patch_size: i32,
-) -> Result<(u64, u64), CapabilityError> {
-    let patch = nonzero_positive(patch_size, "Qwen vision patch size")?;
-    let window_pixels = nonzero_positive(window_size, "Qwen vision window size")?;
-    let merger_window = window_pixels / merge / patch;
-    if merger_window == 0 {
-        return Err(CapabilityError::InvalidConfiguration {
-            field: "window_size",
-            detail: format!(
-                "Qwen vision window {window_pixels} is too small for merge {merge} and patch {patch}"
-            ),
-        });
-    }
-    let merge_area = checked_mul(merge, merge, "Qwen attention merge area")?;
-    let merge_area_square =
-        checked_mul(merge_area, merge_area, "Qwen attention merge-area square")?;
-    let mut full_squares = 0u64;
-    let mut window_squares = 0u64;
-    for (time, height, width) in grid {
-        let time = nonzero_positive(*time, "Qwen grid time")?;
-        let height = nonzero_positive(*height, "Qwen grid height")?;
-        let width = nonzero_positive(*width, "Qwen grid width")?;
-        if height % merge != 0 || width % merge != 0 {
-            return Err(CapabilityError::InvalidConfiguration {
-                field: "patch_grid",
-                detail: format!(
-                    "Qwen grid ({height}, {width}) is not divisible by spatial merge {merge}"
-                ),
-            });
-        }
-        let full_length = checked_mul(height, width, "Qwen full-attention chunk length")?;
-        full_squares = checked_add(
-            full_squares,
-            checked_mul(
-                time,
-                checked_mul(full_length, full_length, "Qwen full-attention chunk square")?,
-                "Qwen full-attention temporal chunks",
-            )?,
-            "Qwen full-attention chunk-square total",
-        )?;
-
-        let merged_height = height / merge;
-        let merged_width = width / merge;
-        let height_full = merged_height / merger_window;
-        let height_remainder = merged_height % merger_window;
-        let width_full = merged_width / merger_window;
-        let width_remainder = merged_width % merger_window;
-        let window_square = checked_mul(merger_window, merger_window, "Qwen merger-window square")?;
-        let height_square_sum = checked_add(
-            checked_mul(
-                height_full,
-                window_square,
-                "Qwen full height-window squares",
-            )?,
-            checked_mul(
-                height_remainder,
-                height_remainder,
-                "Qwen remainder height-window square",
-            )?,
-            "Qwen height-window square sum",
-        )?;
-        let width_square_sum = checked_add(
-            checked_mul(width_full, window_square, "Qwen full width-window squares")?,
-            checked_mul(
-                width_remainder,
-                width_remainder,
-                "Qwen remainder width-window square",
-            )?,
-            "Qwen width-window square sum",
-        )?;
-        let item_window_squares = checked_mul(
-            checked_mul(
-                height_square_sum,
-                width_square_sum,
-                "Qwen merged window-area squares",
-            )?,
-            merge_area_square,
-            "Qwen patch window-area squares",
-        )?;
-        window_squares = checked_add(
-            window_squares,
-            checked_mul(time, item_window_squares, "Qwen temporal window chunks")?,
-            "Qwen window-attention chunk-square total",
-        )?;
-    }
-    Ok((full_squares, window_squares))
-}
-
-fn gemma_valid_patch_count(positions: &Array, architecture: &str) -> Result<u64, CapabilityError> {
-    if positions.ndim() != 3 || positions.dim(0) != 1 || positions.dim(2) != 2 {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: format!(
-                "Gemma patch positions must be [1, patches, 2], got {:?}",
-                positions.shape()
-            ),
-        });
-    }
-    let evaluated = positions
-        .evaluated()
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    let values = evaluated
-        .try_as_slice::<i32>()
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    u64::try_from(
-        values
-            .chunks_exact(2)
-            .filter(|pair| pair[0] >= 0 && pair[1] >= 0)
-            .count(),
-    )
-    .map_err(|_| CapabilityError::ArithmeticOverflow {
-        operation: "Gemma valid patch count",
-    })
-}
-
-fn qwen_vision_workspace(
-    config: &VisionConfig,
-    modality: Modality,
-    payload: &Array,
-    metadata: input::InputMetadata<'_>,
-    stream: &Stream,
-    architecture: &str,
-) -> Result<(u64, u64), CapabilityError> {
-    if !matches!(modality, Modality::Image | Modality::Video) {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: format!("{} is not a Qwen vision modality", modality.as_str()),
-        });
-    }
-    if payload.ndim() != 2 {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: format!(
-                "Qwen prepared vision tensor must be [patches, patch_dims], got {:?}",
-                payload.shape()
-            ),
-        });
-    }
-    let patches = positive(payload.dim(0), "Qwen prepared patch count")?;
-    let merge = nonzero_positive(config.spatial_merge_size, "spatial_merge_size")?;
-    let patch = nonzero_positive(config.patch_size, "Qwen vision patch size")?;
-    let expected_patch_dims = checked_mul(
-        checked_mul(
-            nonzero_positive(config.in_channels, "Qwen vision input channels")?,
-            nonzero_positive(
-                config.temporal_patch_size,
-                "Qwen vision temporal patch size",
-            )?,
-            "Qwen temporal input channels",
-        )?,
-        checked_mul(patch, patch, "Qwen vision patch area")?,
-        "Qwen vision patch dimensions",
-    )?;
-    if positive(payload.dim(1), "Qwen prepared patch dimensions")? != expected_patch_dims {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: format!(
-                "Qwen prepared patches have width {}, expected {expected_patch_dims}",
-                payload.dim(1)
-            ),
-        });
-    }
-    let merge_area = checked_mul(merge, merge, "Qwen spatial merge area")?;
-    if patches % merge_area != 0 {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: format!("Qwen patch count {patches} is not divisible by {merge_area}"),
-        });
-    }
-    let positions = patches / merge_area;
-    let grid = metadata
-        .patch_grid
-        .ok_or_else(|| CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: "prepared Qwen media has no grid_thw metadata".into(),
-        })
-        .and_then(|grid| {
-            input::patch_grid_from_array(grid, stream).map_err(|error| {
-                CapabilityError::UnsupportedInput {
-                    architecture: architecture.into(),
-                    reason: error.to_string(),
-                }
-            })
-        })?;
-    let described_patches = grid.iter().try_fold(0u64, |total, (time, height, width)| {
-        let item_patches = checked_mul(
-            checked_mul(
-                nonzero_positive(*time, "Qwen grid time")?,
-                nonzero_positive(*height, "Qwen grid height")?,
-                "Qwen grid time-height",
-            )?,
-            nonzero_positive(*width, "Qwen grid width")?,
-            "Qwen grid item patches",
-        )?;
-        checked_add(total, item_patches, "Qwen described patch total")
-    })?;
-    if described_patches != patches {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: format!(
-                "Qwen grid describes {described_patches} patches but payload has {patches}"
-            ),
-        });
-    }
-    let (full_chunk_squares, window_chunk_squares) =
-        qwen_attention_chunk_squares(&grid, merge, config.window_size, config.patch_size)?;
-    let depth =
-        u64::try_from(config.layer_count()).map_err(|_| CapabilityError::ArithmeticOverflow {
-            operation: "Qwen vision depth",
-        })?;
-    let full_blocks = u64::try_from(
-        config
-            .layer_schedule
-            .iter()
-            .filter(|policy| matches!(policy.attention, VisionAttentionPolicy::Full))
-            .count(),
-    )
-    .map_err(|_| CapabilityError::ArithmeticOverflow {
-        operation: "Qwen full-attention block count",
-    })?;
-    let window_blocks = depth - full_blocks;
-    let heads = positive(config.num_heads, "Qwen vision heads")?;
-    let hidden = positive(config.hidden_size, "Qwen vision hidden size")?;
-    let intermediate = positive(config.intermediate_size, "Qwen vision intermediate size")?;
-    let out_hidden = positive(config.out_hidden_size, "Qwen vision output size")?;
-
-    // Conservative model-visible graph bound: normalization/rotary/residual
-    // temporaries, QKV and MLP outputs, fused-attention inputs/outputs, every
-    // configured block, and all patch-merger/deepstack outputs.
-    let patch_hidden = checked_mul(patches, hidden, "Qwen patch hidden elements")?;
-    let patch_intermediate =
-        checked_mul(patches, intermediate, "Qwen patch intermediate elements")?;
-    let per_block = checked_add(
-        checked_mul(32, patch_hidden, "Qwen block hidden workspace")?,
-        checked_mul(6, patch_intermediate, "Qwen block intermediate workspace")?,
-        "Qwen block workspace",
-    )?;
-    let block_workspace = checked_mul(depth, per_block, "Qwen all-block workspace")?;
-    let full_attention = checked_mul(
-        checked_mul(
-            checked_mul(
-                full_blocks,
-                full_chunk_squares,
-                "Qwen full-attention blocks",
-            )?,
-            heads,
-            "Qwen full-attention heads",
-        )?,
-        2,
-        "Qwen full-attention score/probability bound",
-    )?;
-    let window_attention = checked_mul(
-        checked_mul(
-            checked_mul(
-                window_blocks,
-                window_chunk_squares,
-                "Qwen window-attention blocks",
-            )?,
-            heads,
-            "Qwen window-attention heads",
-        )?,
-        2,
-        "Qwen window-attention score/probability bound",
-    )?;
-    let merge_width = checked_mul(hidden, merge_area, "Qwen merger width")?;
-    let merger_output = checked_mul(
-        positions,
-        checked_add(
-            checked_mul(12, merge_width, "Qwen merger hidden workspace")?,
-            checked_mul(6, out_hidden, "Qwen merger output workspace")?,
-            "Qwen merger per-position workspace",
-        )?,
-        "Qwen merger workspace",
-    )?;
-    let mergers = checked_add(
-        1,
-        u64::try_from(config.deepstack_layer_count()).map_err(|_| {
-            CapabilityError::ArithmeticOverflow {
-                operation: "Qwen deepstack merger count",
-            }
-        })?,
-        "Qwen merger count",
-    )?;
-    let graph_scalars = checked_add(
-        checked_add(
-            checked_mul(16, patch_hidden, "Qwen vision setup workspace")?,
-            block_workspace,
-            "Qwen setup plus blocks",
-        )?,
-        checked_add(
-            checked_add(full_attention, window_attention, "Qwen attention workspace")?,
-            checked_mul(mergers, merger_output, "Qwen all-merger workspace")?,
-            "Qwen attention plus mergers",
-        )?,
-        "Qwen vision graph workspace",
-    )?;
-    Ok((
-        positions,
-        checked_add(
-            array_bytes(payload, "Qwen prepared media bytes")?,
-            four_byte_scalars(graph_scalars, "Qwen vision graph bytes")?,
-            "Qwen total vision workspace",
-        )?,
-    ))
-}
-
-fn gemma_vision_workspace(
-    config: &eredu_architectures::gemma4::VisionConfig,
-    text_hidden: u64,
-    payload: &Array,
-    metadata: input::InputMetadata<'_>,
-    architecture: &str,
-) -> Result<(u64, u64), CapabilityError> {
-    if payload.ndim() != 3 || payload.dim(0) != 1 {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: format!(
-                "Gemma prepared vision tensor must be [1, patches, patch_dims], got {:?}",
-                payload.shape()
-            ),
-        });
-    }
-    let patch = nonzero_positive(config.patch_size, "Gemma vision patch size")?;
-    let expected_patch_dims = checked_mul(
-        3,
-        checked_mul(patch, patch, "Gemma vision patch area")?,
-        "Gemma vision patch dimensions",
-    )?;
-    if positive(payload.dim(2), "Gemma prepared patch dimensions")? != expected_patch_dims {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: format!(
-                "Gemma prepared patches have width {}, expected {expected_patch_dims}",
-                payload.dim(2)
-            ),
-        });
-    }
-    let position_ids =
-        metadata
-            .patch_positions
-            .ok_or_else(|| CapabilityError::UnsupportedInput {
-                architecture: architecture.into(),
-                reason: "prepared Gemma media has no patch positions".into(),
-            })?;
-    let valid_patches = gemma_valid_patch_count(position_ids, architecture)?;
-    let pool = nonzero_positive(config.pooling_kernel_size, "Gemma pooling kernel")?;
-    let pool_area = checked_mul(pool, pool, "Gemma pooling area")?;
-    if valid_patches % pool_area != 0 {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: format!(
-                "Gemma valid patch count {valid_patches} is not divisible by {pool_area}"
-            ),
-        });
-    }
-    let positions = valid_patches / pool_area;
-    let padded_patches = positive(payload.dim(1), "Gemma padded patch count")?;
-    if positive(position_ids.dim(1), "Gemma patch-position count")? != padded_patches {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: format!(
-                "Gemma patch positions {:?} do not match prepared vision payload {:?}",
-                position_ids.shape(),
-                payload.shape()
-            ),
-        });
-    }
-    let hidden = positive(config.hidden_size, "Gemma vision hidden size")?;
-    let intermediate = positive(config.intermediate_size, "Gemma vision intermediate size")?;
-    let depth = positive(config.num_hidden_layers, "Gemma vision depth")?;
-    let patch_hidden = checked_mul(padded_patches, hidden, "Gemma vision patch hidden elements")?;
-    let per_layer = checked_add(
-        checked_mul(48, patch_hidden, "Gemma vision layer hidden workspace")?,
-        checked_mul(
-            8,
-            checked_mul(
-                padded_patches,
-                intermediate,
-                "Gemma vision intermediate elements",
-            )?,
-            "Gemma vision MLP workspace",
-        )?,
-        "Gemma vision layer workspace",
-    )?;
-    let output_workspace = checked_mul(
-        positions,
-        checked_add(
-            checked_mul(8, hidden, "Gemma pooled vision workspace")?,
-            checked_mul(8, text_hidden, "Gemma projected vision workspace")?,
-            "Gemma vision output workspace per position",
-        )?,
-        "Gemma vision output workspace",
-    )?;
-    let graph_scalars = checked_add(
-        checked_mul(20, patch_hidden, "Gemma vision setup workspace")?,
-        checked_add(
-            checked_mul(depth, per_layer, "Gemma all vision layers")?,
-            output_workspace,
-            "Gemma layers plus output workspace",
-        )?,
-        "Gemma vision graph workspace",
-    )?;
-    let input_bytes = checked_add(
-        array_bytes(payload, "Gemma prepared vision bytes")?,
-        array_bytes(position_ids, "Gemma patch-position bytes")?,
-        "Gemma prepared vision input bytes",
-    )?;
-    Ok((
-        positions,
-        checked_add(
-            input_bytes,
-            four_byte_scalars(graph_scalars, "Gemma vision graph bytes")?,
-            "Gemma total vision workspace",
-        )?,
-    ))
-}
-
-fn gemma_audio_workspace(
-    config: &eredu_architectures::gemma4::AudioConfig,
-    text_hidden: u64,
-    payload: &Array,
-    metadata: input::InputMetadata<'_>,
-    architecture: &str,
-) -> Result<(u64, u64), CapabilityError> {
-    if payload.ndim() != 3 || payload.dim(0) != 1 || payload.dim(2) != 128 {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: format!(
-                "Gemma prepared audio tensor must be [1, frames, 128], got {:?}",
-                payload.shape()
-            ),
-        });
-    }
-    let mask = metadata
-        .audio_mask
-        .ok_or_else(|| CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: "prepared Gemma audio has no frame mask".into(),
-        })?;
-    let frames = positive(payload.dim(1), "Gemma padded audio frames")?;
-    if mask.ndim() != 2
-        || mask.dim(0) != 1
-        || positive(mask.dim(1), "Gemma audio mask frames")? != frames
-    {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: format!(
-                "Gemma audio mask must be [1, {frames}], got {:?}",
-                mask.shape()
-            ),
-        });
-    }
-    let positions = bool_count(mask)?.div_ceil(4);
-    let sequence = frames.div_ceil(4);
-    let hidden = positive(config.hidden_size, "Gemma audio hidden size")?;
-    let depth = positive(config.num_hidden_layers, "Gemma audio depth")?;
-    let heads = positive(config.num_attention_heads, "Gemma audio heads")?;
-    let chunk = nonzero_positive(config.attention_chunk_size, "Gemma audio attention chunk")?;
-    let past = nonzero_positive(
-        config.attention_context_left.checked_sub(1).ok_or(
-            CapabilityError::ArithmeticOverflow {
-                operation: "Gemma audio left context",
-            },
-        )?,
-        "Gemma audio left context",
-    )?;
-    let padded_sequence = checked_mul(
-        sequence.div_ceil(chunk),
-        chunk,
-        "Gemma padded audio sequence",
-    )?;
-    let chunks = padded_sequence / chunk;
-    let attention_elements = checked_mul(
-        checked_mul(
-            checked_mul(
-                checked_mul(chunks, heads, "Gemma audio attention chunk heads")?,
-                chunk,
-                "Gemma audio attention queries",
-            )?,
-            checked_add(chunk, past, "Gemma audio attention key bound")?,
-            "Gemma audio attention scores",
-        )?,
-        4,
-        "Gemma audio logits/relative/mask/probability workspace",
-    )?;
-    let layer_workspace = checked_add(
-        checked_mul(
-            80,
-            checked_mul(sequence, hidden, "Gemma audio hidden elements")?,
-            "Gemma audio layer hidden workspace",
-        )?,
-        attention_elements,
-        "Gemma audio layer workspace",
-    )?;
-    let first_frames = frames.div_ceil(2);
-    let first_channels = positive(
-        *config.subsampling_conv_channels.first().ok_or_else(|| {
-            CapabilityError::InvalidConfiguration {
-                field: "subsampling_conv_channels",
-                detail: "Gemma audio has no first convolution channel count".into(),
-            }
-        })?,
-        "Gemma audio first convolution channels",
-    )?;
-    let second_channels = positive(
-        *config.subsampling_conv_channels.get(1).ok_or_else(|| {
-            CapabilityError::InvalidConfiguration {
-                field: "subsampling_conv_channels",
-                detail: "Gemma audio has no second convolution channel count".into(),
-            }
-        })?,
-        "Gemma audio second convolution channels",
-    )?;
-    let conv_workspace = checked_add(
-        checked_mul(
-            6,
-            checked_mul(
-                checked_mul(first_frames, 64, "Gemma first convolution grid")?,
-                first_channels,
-                "Gemma first convolution elements",
-            )?,
-            "Gemma first convolution workspace",
-        )?,
-        checked_mul(
-            6,
-            checked_mul(
-                checked_mul(sequence, 32, "Gemma second convolution grid")?,
-                second_channels,
-                "Gemma second convolution elements",
-            )?,
-            "Gemma second convolution workspace",
-        )?,
-        "Gemma convolution workspace",
-    )?;
-    let output = positive(config.output_proj_dims, "Gemma audio output size")?;
-    let output_workspace = checked_mul(
-        positions,
-        checked_add(
-            checked_mul(8, output, "Gemma audio output workspace")?,
-            checked_mul(8, text_hidden, "Gemma audio text projection workspace")?,
-            "Gemma audio output workspace per position",
-        )?,
-        "Gemma audio projected output workspace",
-    )?;
-    let graph_scalars = checked_add(
-        conv_workspace,
-        checked_add(
-            checked_mul(depth, layer_workspace, "Gemma all audio layers")?,
-            output_workspace,
-            "Gemma audio layers plus output",
-        )?,
-        "Gemma audio graph workspace",
-    )?;
-    let input_bytes = checked_add(
-        array_bytes(payload, "Gemma prepared audio bytes")?,
-        array_bytes(mask, "Gemma audio mask bytes")?,
-        "Gemma prepared audio input bytes",
-    )?;
-    Ok((
-        positions,
-        checked_add(
-            input_bytes,
-            four_byte_scalars(graph_scalars, "Gemma audio graph bytes")?,
-            "Gemma total audio workspace",
-        )?,
-    ))
-}
-
-fn inkling_workspace(
-    args: &eredu_architectures::inkling::ModelArgs,
-    modality: Modality,
-    payload: &Array,
-    metadata: input::InputMetadata<'_>,
-    architecture: &str,
-) -> Result<(u64, u64), CapabilityError> {
-    match modality {
-        Modality::Image => {
-            let config =
-                args.vision_config
-                    .as_ref()
-                    .ok_or_else(|| CapabilityError::UnsupportedInput {
-                        architecture: architecture.into(),
-                        reason: "loaded Inkling model has no vision configuration".into(),
-                    })?;
-            if payload.ndim() != 5 || payload.shape()[1..] != [2, 40, 40, 3] {
-                return Err(CapabilityError::UnsupportedInput {
-                    architecture: architecture.into(),
-                    reason: format!(
-                        "Inkling image patches must be [patches, 2, 40, 40, 3], got {:?}",
-                        payload.shape()
-                    ),
-                });
-            }
-            let patches = positive(payload.dim(0), "Inkling image patch count")?;
-            let text_hidden = positive(config.text_hidden_size, "Inkling vision output size")?;
-            let layer_outputs = [
-                checked_mul(
-                    checked_mul(
-                        checked_mul(patches, 2, "Inkling vision time")?,
-                        8 * 8,
-                        "Inkling vision grid",
-                    )?,
-                    128,
-                    "Inkling vision layer 1",
-                )?,
-                checked_mul(
-                    checked_mul(
-                        checked_mul(patches, 2, "Inkling vision time")?,
-                        4 * 4,
-                        "Inkling vision grid",
-                    )?,
-                    512,
-                    "Inkling vision layer 2",
-                )?,
-                checked_mul(
-                    checked_mul(patches, 2, "Inkling vision time")?,
-                    4_800,
-                    "Inkling vision layer 3",
-                )?,
-                checked_mul(patches, text_hidden, "Inkling vision layer 4")?,
-            ];
-            let graph_scalars = layer_outputs.iter().try_fold(0u64, |total, value| {
-                checked_add(
-                    total,
-                    checked_mul(12, *value, "Inkling vision layer workspace")?,
-                    "Inkling vision graph workspace",
-                )
-            })?;
-            Ok((
-                patches,
-                checked_add(
-                    array_bytes(payload, "Inkling prepared image bytes")?,
-                    four_byte_scalars(graph_scalars, "Inkling vision graph bytes")?,
-                    "Inkling total vision workspace",
-                )?,
-            ))
-        }
-        Modality::Audio => {
-            let config =
-                args.audio_config
-                    .as_ref()
-                    .ok_or_else(|| CapabilityError::UnsupportedInput {
-                        architecture: architecture.into(),
-                        reason: "loaded Inkling model has no audio configuration".into(),
-                    })?;
-            let (padded_frames, payload_codebooks) = match payload.ndim() {
-                2 => (
-                    positive(payload.dim(0), "Inkling audio frame count")?,
-                    positive(payload.dim(1), "Inkling audio payload codebooks")?,
-                ),
-                3 if payload.dim(0) == 1 => (
-                    positive(payload.dim(1), "Inkling audio frame count")?,
-                    positive(payload.dim(2), "Inkling audio payload codebooks")?,
-                ),
-                _ => {
-                    return Err(CapabilityError::UnsupportedInput {
-                        architecture: architecture.into(),
-                        reason: format!(
-                            "Inkling audio tokens must be [frames, codebooks] or [1, frames, codebooks], got {:?}",
-                            payload.shape()
-                        ),
-                    });
-                }
-            };
-            let codebooks = positive(config.num_codebooks, "Inkling audio codebooks")?;
-            if payload_codebooks != codebooks {
-                return Err(CapabilityError::UnsupportedInput {
-                    architecture: architecture.into(),
-                    reason: format!(
-                        "Inkling audio payload has {payload_codebooks} codebooks, expected {codebooks}"
-                    ),
-                });
-            }
-            let frames = if let Some(mask) = metadata.audio_mask {
-                if mask.ndim() != 2
-                    || mask.dim(0) != 1
-                    || positive(mask.dim(1), "Inkling audio mask frames")? != padded_frames
-                {
-                    return Err(CapabilityError::UnsupportedInput {
-                        architecture: architecture.into(),
-                        reason: format!(
-                            "Inkling audio mask must be [1, {padded_frames}], got {:?}",
-                            mask.shape()
-                        ),
-                    });
-                }
-                bool_count(mask)?
-            } else {
-                padded_frames
-            };
-            let hidden = positive(config.text_hidden_size, "Inkling audio hidden size")?;
-            let embedded = checked_mul(
-                checked_mul(padded_frames, codebooks, "Inkling audio frame codebooks")?,
-                hidden,
-                "Inkling audio embedding elements",
-            )?;
-            let reduced = checked_mul(padded_frames, hidden, "Inkling audio reduced elements")?;
-            let graph_scalars = checked_add(
-                checked_mul(4, embedded, "Inkling audio embedding workspace")?,
-                checked_mul(12, reduced, "Inkling audio reduction/norm workspace")?,
-                "Inkling audio graph workspace",
-            )?;
-            let mut input_bytes = array_bytes(payload, "Inkling prepared audio bytes")?;
-            if let Some(mask) = metadata.audio_mask {
-                input_bytes = checked_add(
-                    input_bytes,
-                    array_bytes(mask, "Inkling audio mask bytes")?,
-                    "Inkling prepared audio input bytes",
-                )?;
-            }
-            Ok((
-                frames,
-                checked_add(
-                    input_bytes,
-                    four_byte_scalars(graph_scalars, "Inkling audio graph bytes")?,
-                    "Inkling total audio workspace",
-                )?,
-            ))
-        }
-        Modality::Video => Err(CapabilityError::UnsupportedInput {
-            architecture: architecture.into(),
-            reason: "video is not a supported Inkling modality".into(),
-        }),
-        Modality::Text => unreachable!("text handled separately"),
-    }
-}
-
 impl Model {
-    fn prepared_media_accounting(
+    fn prepared_media_plan(
         &self,
-        modality: Modality,
-        payload: &Array,
-        metadata: input::InputMetadata<'_>,
-        stream: &Stream,
-    ) -> Result<(u64, u64), CapabilityError> {
+        input: &PreparedMediaInput,
+    ) -> Result<MediaShapePlan, CapabilityError> {
         match self {
-            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => qwen_vision_workspace(
-                &model.args().vision,
-                modality,
-                payload,
-                metadata,
-                stream,
-                self.model_type(),
-            ),
-            Self::Qwen3Next(model) | Self::Qwen35(model) => model
-                .vision_config()
-                .ok_or_else(|| CapabilityError::UnsupportedInput {
-                    architecture: self.model_type().into(),
-                    reason: "loaded model has no vision configuration".into(),
-                })
-                .and_then(|config| {
-                    qwen_vision_workspace(
-                        config,
-                        modality,
-                        payload,
-                        metadata,
-                        stream,
-                        self.model_type(),
-                    )
-                }),
-            Self::Gemma4(model) => {
-                let args = model.args();
-                match modality {
-                    Modality::Image | Modality::Video => args
-                        .vision
-                        .as_ref()
-                        .ok_or_else(|| CapabilityError::UnsupportedInput {
-                            architecture: self.model_type().into(),
-                            reason: "loaded model has no vision tower".into(),
-                        })
-                        .and_then(|config| {
-                            gemma_vision_workspace(
-                                config,
-                                positive(args.text.hidden_size, "Gemma text hidden size")?,
-                                payload,
-                                metadata,
-                                self.model_type(),
-                            )
-                        }),
-                    Modality::Audio => args
-                        .audio
-                        .as_ref()
-                        .ok_or_else(|| CapabilityError::UnsupportedInput {
-                            architecture: self.model_type().into(),
-                            reason: "loaded model has no audio tower".into(),
-                        })
-                        .and_then(|config| {
-                            gemma_audio_workspace(
-                                config,
-                                positive(args.text.hidden_size, "Gemma text hidden size")?,
-                                payload,
-                                metadata,
-                                self.model_type(),
-                            )
-                        }),
-                    Modality::Text => unreachable!("text handled separately"),
-                }
+            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
+                media_plan::qwen_vision(&model.args().vision, input, self.model_type())
             }
-            Self::Inkling(model) => {
-                inkling_workspace(model.args(), modality, payload, metadata, self.model_type())
+            Self::Qwen3Next(model) | Self::Qwen35(model) => {
+                media_plan::qwen_hybrid_vision(model.vision_config(), input, self.model_type())
             }
+            Self::Gemma4(model) => media_plan::gemma4(model.args(), input),
+            Self::Inkling(model) => media_plan::inkling(model.args(), input),
+            Self::MuseGlimmer(model) => media_plan::muse_glimmer(model.args(), input),
             Self::DeepSeek(_)
             | Self::GptOss(_)
             | Self::KimiLinear(_)
             | Self::Llama(_)
             | Self::Lfm2(_)
             | Self::NemotronH(_)
-            | Self::Qwen(_) => Err(CapabilityError::UnsupportedInput {
-                architecture: self.model_type().into(),
-                reason: format!("{} media is not supported", modality.as_str()),
-            }),
-            Self::MuseGlimmer(model) => {
-                let config = &model.args().vision_config;
-                if modality == Modality::Audio
-                    || (modality == Modality::Video
-                        && model.args().weight_convention
-                            == eredu_architectures::muse_glimmer::WeightConvention::Gguf)
-                {
-                    return Err(CapabilityError::UnsupportedInput {
-                        architecture: self.model_type().into(),
-                        reason: format!(
-                            "loaded Muse-Glimmer artifact does not support {}",
-                            modality.as_str()
-                        ),
-                    });
-                }
-                let grid =
-                    metadata
-                        .patch_grid
-                        .ok_or_else(|| CapabilityError::UnsupportedInput {
-                            architecture: self.model_type().into(),
-                            reason: "Muse-Glimmer media requires patch_grid metadata".into(),
-                        })?;
-                if grid.ndim() != 2 || grid.dim(1) != 3 {
-                    return Err(CapabilityError::UnsupportedInput {
-                        architecture: self.model_type().into(),
-                        reason: format!(
-                            "Muse-Glimmer patch_grid must be [items, 3], got {:?}",
-                            grid.shape()
-                        ),
-                    });
-                }
-                let evaluated = grid
-                    .evaluated()
-                    .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-                let values = evaluated
-                    .try_as_slice::<i32>()
-                    .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-                if values.len() % 3 != 0 {
-                    return Err(CapabilityError::UnsupportedInput {
-                        architecture: self.model_type().into(),
-                        reason: "Muse-Glimmer patch_grid has an incomplete row".into(),
-                    });
-                }
-                let mut patches = 0u64;
-                let mut positions = 0u64;
-                for entry in values.chunks_exact(3) {
-                    if entry.iter().any(|value| *value <= 0)
-                        || entry[1] % config.merge_size != 0
-                        || entry[2] % config.merge_size != 0
-                    {
-                        return Err(CapabilityError::UnsupportedInput {
-                            architecture: self.model_type().into(),
-                            reason:
-                                "Muse-Glimmer vision grids must be positive and merge-divisible"
-                                    .into(),
-                        });
-                    }
-                    let t = entry[0] as u64;
-                    let h = entry[1] as u64;
-                    let w = entry[2] as u64;
-                    patches = checked_add(
-                        patches,
-                        checked_mul(
-                            checked_mul(t, h, "Muse vision t*h")?,
-                            w,
-                            "Muse vision patches",
-                        )?,
-                        "Muse vision patch total",
-                    )?;
-                    positions = checked_add(
-                        positions,
-                        checked_mul(
-                            checked_mul(t, h / config.merge_size as u64, "Muse merged t*h")?,
-                            w / config.merge_size as u64,
-                            "Muse merged positions",
-                        )?,
-                        "Muse merged position total",
-                    )?;
-                }
-                if positive(payload.dim(0), "Muse vision payload patches")? != patches {
-                    return Err(CapabilityError::UnsupportedInput {
-                        architecture: self.model_type().into(),
-                        reason: format!(
-                            "Muse-Glimmer payload has {} patches but metadata describes {patches}",
-                            payload.dim(0)
-                        ),
-                    });
-                }
-                let input = array_bytes(payload, "Muse-Glimmer prepared media bytes")?;
-                let graph = checked_mul(
-                    patches,
-                    positive(config.hidden_size, "Muse vision hidden size")?,
-                    "Muse vision activation scalars",
-                )?;
-                Ok((
-                    positions,
-                    checked_add(
-                        input,
-                        four_byte_scalars(
-                            checked_mul(graph, 8, "Muse vision graph multiplier")?,
-                            "Muse vision graph bytes",
-                        )?,
-                        "Muse total media workspace",
-                    )?,
-                ))
-            }
+            | Self::Qwen(_) => media_plan::text_only(self.model_type(), input),
         }
     }
-}
 
+    fn prepared_media_accounting(
+        &self,
+        modality: Modality,
+        payload: &Array,
+        metadata: input::InputMetadata<'_>,
+    ) -> Result<(u64, u64), CapabilityError> {
+        let input = prepared_media_input(modality, payload, metadata)?;
+        let plan = self.prepared_media_plan(&input)?;
+        let mut input_bytes = array_bytes(payload, "prepared media payload bytes")?;
+        for array in [
+            metadata.patch_grid,
+            metadata.patch_positions,
+            metadata.audio_mask,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            input_bytes = checked_add(
+                input_bytes,
+                array_bytes(array, "prepared media metadata bytes")?,
+                "prepared media input bytes",
+            )?;
+        }
+        Ok((
+            plan.decoder_positions,
+            checked_add(
+                input_bytes,
+                four_byte_scalars(
+                    plan.execution_workspace_scalars,
+                    "prepared media execution workspace bytes",
+                )?,
+                "prepared media total workspace bytes",
+            )?,
+        ))
+    }
+}
 pub fn model_capabilities(model: &Model) -> Result<ModelCapabilities, CapabilityError> {
     model
         .architecture_capability_estimate()
@@ -1068,7 +247,7 @@ pub fn model_capabilities(model: &Model) -> Result<ModelCapabilities, Capability
 pub fn count_prepared_input(
     model: &Model,
     prepared: input::ModelInput<'_>,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<InputTokenCount, CapabilityError> {
     let mut text_tokens = 0u64;
     let mut media_positions = 0u64;
@@ -1116,7 +295,7 @@ pub fn count_prepared_input(
             }
             (modality, InputPayload::Tensor(tensor)) => {
                 let (positions, workspace_bytes) =
-                    model.prepared_media_accounting(modality, tensor, part.metadata, stream)?;
+                    model.prepared_media_accounting(modality, tensor, part.metadata)?;
                 media_positions =
                     checked_add(media_positions, positions, "prepared media-position total")?;
                 media_execution_workspace_bytes = checked_add(
@@ -1482,7 +661,6 @@ mod tests {
         attention::AttentionPolicy, CacheStateStrategy, EstimationCompleteness, GrowingState,
         InputModalities, SlidingWindowLayerCount,
     };
-    use safemlx::{Device, DeviceType};
     use serde_json::json;
 
     #[test]
@@ -2056,124 +1234,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn gemma4_prepared_patch_positions_ignore_padding() {
-        let positions = Array::from_slice(&[0, 0, 1, 0, 0, 1, 1, 1, -1, -1], &[1, 5, 2]);
-        assert_eq!(gemma_valid_patch_count(&positions, "gemma4").unwrap(), 4);
-    }
-
-    #[test]
-    fn gemma4_prepared_media_bounds_vision_and_audio_workspaces() {
-        let vision_config = eredu_architectures::gemma4::VisionConfig {
-            hidden_size: 8,
-            intermediate_size: 16,
-            num_hidden_layers: 2,
-            num_attention_heads: 2,
-            num_key_value_heads: 2,
-            head_dim: 4,
-            patch_size: 1,
-            pooling_kernel_size: 2,
-            position_embedding_size: 4,
-            rms_norm_eps: 1e-5,
-            hidden_activation: "gelu_pytorch_tanh".into(),
-            standardize: false,
-            rope_parameters: None,
-            weight_quantization: None,
-            quantized_weights: None,
-            quantized_weight_configs: None,
-        };
-        let vision = Array::from_slice(&[0.0f32; 15], &[1, 5, 3]);
-        let patch_positions = Array::from_slice(&[0, 0, 1, 0, 0, 1, 1, 1, -1, -1], &[1, 5, 2]);
-        let (vision_positions, vision_workspace) = gemma_vision_workspace(
-            &vision_config,
-            8,
-            &vision,
-            super::input::InputMetadata::patch_positions(&patch_positions),
-            "gemma4",
-        )
-        .unwrap();
-        assert_eq!(vision_positions, 1);
-        assert!(vision_workspace > array_bytes(&vision, "test vision bytes").unwrap());
-
-        let audio_config = eredu_architectures::gemma4::AudioConfig {
-            hidden_size: 8,
-            num_hidden_layers: 2,
-            num_attention_heads: 2,
-            output_proj_dims: 8,
-            conv_kernel_size: 3,
-            attention_chunk_size: 4,
-            attention_context_left: 3,
-            attention_context_right: 0,
-            attention_invalid_logits_value: -1e9,
-            attention_logit_cap: 50.0,
-            residual_weight: 1.0,
-            rms_norm_eps: 1e-5,
-            subsampling_conv_channels: vec![4, 8],
-            weight_quantization: None,
-            quantized_weights: None,
-            quantized_weight_configs: None,
-        };
-        let audio = Array::from_slice(&[0.0f32; 8 * 128], &[1, 8, 128]);
-        let audio_mask =
-            Array::from_slice(&[true, true, true, true, true, true, false, false], &[1, 8]);
-        let (audio_positions, audio_workspace) = gemma_audio_workspace(
-            &audio_config,
-            8,
-            &audio,
-            super::input::InputMetadata::audio_mask(&audio_mask),
-            "gemma4",
-        )
-        .unwrap();
-        assert_eq!(audio_positions, 2);
-        assert!(audio_workspace > array_bytes(&audio, "test audio bytes").unwrap());
-    }
-
-    #[test]
-    fn qwen_prepared_grid_bounds_vision_workspace() {
-        let config = VisionConfig {
-            layer_schedule: eredu_core::attention::LayerSchedule::new(
-                2,
-                vec![
-                    eredu_architectures::qwen::vision::VisionLayerPolicy {
-                        attention: VisionAttentionPolicy::Windowed,
-                        deepstack_merger: Some(0),
-                    },
-                    eredu_architectures::qwen::vision::VisionLayerPolicy {
-                        attention: VisionAttentionPolicy::Full,
-                        deepstack_merger: None,
-                    },
-                ],
-            )
-            .unwrap(),
-            hidden_size: 8,
-            hidden_act: "silu".into(),
-            intermediate_size: 16,
-            num_heads: 2,
-            num_position_embeddings: 4,
-            in_channels: 3,
-            patch_size: 1,
-            spatial_merge_size: 2,
-            temporal_patch_size: 1,
-            window_size: 4,
-            out_hidden_size: 8,
-            linear_formats: Default::default(),
-        };
-        let payload = Array::from_slice(&[0.0f32; 12], &[4, 3]);
-        let grid = Array::from_slice(&[1, 2, 2], &[1, 3]);
-        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let (positions, workspace) = qwen_vision_workspace(
-            &config,
-            Modality::Image,
-            &payload,
-            super::input::InputMetadata::patch_grid(&grid),
-            &stream,
-            "qwen3_vl",
-        )
-        .unwrap();
-        assert_eq!(positions, 1);
-        assert!(workspace > payload.nbytes() as u64);
-    }
-
     fn tiny_inkling() -> eredu_architectures::inkling::ModelArgs {
         eredu_architectures::inkling::ModelArgs::from_hf_json(
             &serde_json::to_vec(&json!({
@@ -2258,35 +1318,6 @@ mod tests {
         // Full KV: 1 x 10 x (1 head x 8 x K/V). Sliding KV: (3 + 5) x
         // (2 heads x 8 x K/V), all for two batches of f32 state.
         assert_eq!(state.context_state_bytes, (10 * 16 + (3 + 5) * 32) * 2 * 4);
-    }
-
-    #[test]
-    fn inkling_prepared_media_bounds_hmlp_and_dmel_workspaces() {
-        let args = tiny_inkling();
-        let image = Array::from_slice(&[0.0f32; 2 * 40 * 40 * 3], &[1, 2, 40, 40, 3]);
-        let (image_positions, image_workspace) = inkling_workspace(
-            &args,
-            Modality::Image,
-            &image,
-            super::input::InputMetadata::empty(),
-            "inkling",
-        )
-        .unwrap();
-        assert_eq!(image_positions, 1);
-        assert!(image_workspace > image.nbytes() as u64);
-
-        let audio = Array::from_slice(&[0u32; 3 * 80], &[1, 3, 80]);
-        let mask = Array::from_slice(&[true, true, false], &[1, 3]);
-        let (audio_positions, audio_workspace) = inkling_workspace(
-            &args,
-            Modality::Audio,
-            &audio,
-            super::input::InputMetadata::audio_mask(&mask),
-            "inkling",
-        )
-        .unwrap();
-        assert_eq!(audio_positions, 2);
-        assert!(audio_workspace > audio.nbytes() as u64);
     }
 
     #[test]

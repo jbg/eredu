@@ -15,6 +15,8 @@
 
 /// Portable model capabilities and scalar runtime-state estimates.
 pub mod capability;
+/// Backend-neutral prepared-media admission and workspace plans.
+pub mod media_plan;
 /// Optional backend operators required by each architecture family.
 pub mod operator_requirements;
 
