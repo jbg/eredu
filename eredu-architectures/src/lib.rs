@@ -19,6 +19,8 @@ pub mod capability;
 pub mod media_plan;
 /// Optional backend operators required by each architecture family.
 pub mod operator_requirements;
+/// Architecture-derived capabilities used before backend materialization.
+pub mod preparation;
 
 /// Shared decoder mechanics used by backend-neutral text architectures.
 pub mod decoder;

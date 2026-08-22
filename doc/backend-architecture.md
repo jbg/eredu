@@ -78,6 +78,13 @@ backends select the loaded architecture estimate, apply their physical state
 scalar width, and add live allocator, residency, and system-memory
 observations; they do not reconstruct family state geometry.
 
+Pre-materialization capabilities follow the same rule. The normalized
+architecture reports whether independently addressable routed experts exist;
+the selected backend intersects that fact with its expert-cache
+materializers. Core selects the neutral expert-cache route but does not infer
+support from `ModelKind`, because one kind may contain both dense and MoE
+variants.
+
 Prepared-media admission follows the same boundary. Architecture media plans
 validate family payload shapes, patch/window/pooling geometry, valid-position
 masks, and artifact-specific modality policy, then report decoder positions
@@ -107,16 +114,19 @@ per-layer and per-token paths.
 
 ## Loading and session creation
 
-Artifact loading has three stages:
+Artifact loading has four stages:
 
 1. Portable inspection validates checkpoint metadata and tensor catalogs and
    resolves a model kind.
-2. Portable planning combines the artifact description with topology,
+2. The selected backend validates the requested policy against normalized
+   architecture facts and its own capabilities.
+3. Portable planning combines the artifact description with topology,
    quantization, and residency policy.
-3. The selected backend materializes the plan into its executable model and
+4. The selected backend materializes the plan into its executable model and
    creates a stateful session.
 
-`ModelLoadingBackend` implements backend policy and materialization.
+`ModelLoadingBackend` implements backend policy, architecture/backend
+capability intersection, and materialization.
 `Backend::create_session` consumes a `PreparedModel`, so an executable cannot
 be paired with a cache or session created by another backend.
 

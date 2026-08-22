@@ -2955,7 +2955,7 @@ fn load_policy_admits_fully_resident_inkling_and_nemotron_materialization() {
             crate::core::ModelKind::NemotronH,
         ] {
             options
-                .validate_preparation(kind, None, eredu_core::ArtifactFormat::SafeTensors)
+                .validate_preparation(kind, eredu_core::ArtifactFormat::SafeTensors)
                 .unwrap();
         }
     }
@@ -3108,7 +3108,7 @@ fn resolve_model_config_normalizes_moshi_family_before_text_loader_admission() {
         eredu_architectures::moshi::CheckpointLayout::NativeMlx
     );
     assert!(ModelLoadOptions::default()
-        .validate_preparation(resolved.kind, None, eredu_core::ArtifactFormat::SafeTensors,)
+        .validate_preparation(resolved.kind, eredu_core::ArtifactFormat::SafeTensors)
         .unwrap_err()
         .to_string()
         .contains("realtime"));

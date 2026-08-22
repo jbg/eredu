@@ -460,6 +460,14 @@ impl ModelLoadingBackend for MockBackend {
         Ok(eredu_core::PreparationPolicy::default())
     }
 
+    fn validate_preparation(
+        &self,
+        _: &eredu_core::ArtifactInspection,
+        _: eredu_core::PreparationPolicy,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     fn model_config(
         &self,
         plan: eredu_core::ModelPreparationPlan,

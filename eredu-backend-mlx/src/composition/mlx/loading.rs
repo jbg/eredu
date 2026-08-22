@@ -531,6 +531,7 @@ fn validate_plan_options(
             "MLX materialization options do not match the backend-neutral preparation plan".into(),
         ));
     }
+    super::structural::validate_inspected_preparation(plan.inspection(), plan.policy())?;
     Ok(())
 }
 

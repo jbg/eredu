@@ -318,6 +318,14 @@ impl ModelLoadingBackend for MlxBackend<'_> {
         options.preparation_policy()
     }
 
+    fn validate_preparation(
+        &self,
+        inspection: &eredu_core::ArtifactInspection,
+        policy: eredu_core::PreparationPolicy,
+    ) -> Result<(), Self::Error> {
+        crate::composition::mlx::structural::validate_inspected_preparation(inspection, policy)
+    }
+
     fn model_config(
         &self,
         plan: eredu_core::ModelPreparationPlan,

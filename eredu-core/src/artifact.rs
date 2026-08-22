@@ -257,25 +257,6 @@ impl GgufArchitecture {
             Self::Qwen3Next => "qwen3next",
         }
     }
-
-    /// Whether this architecture has routed experts addressable independently.
-    pub const fn supports_expert_cache(self) -> bool {
-        matches!(
-            self,
-            Self::KimiLinear
-                | Self::DeepSeek2
-                | Self::DeepSeek4
-                | Self::GptOss
-                | Self::Inkling
-                | Self::Gemma4
-                | Self::Lfm2Moe
-                | Self::NemotronHMoe
-                | Self::Qwen3Moe
-                | Self::Qwen3VlMoe
-                | Self::Qwen35Moe
-                | Self::Qwen3Next
-        )
-    }
 }
 
 /// Artifact container selected during inspection.
@@ -504,12 +485,8 @@ pub fn plan_model_preparation(
     inspection: ArtifactInspection,
     policy: PreparationPolicy,
 ) -> Result<ModelPreparationPlan, ArtifactError> {
-    let route = validate_preparation_policy(
-        inspection.configuration.kind,
-        inspection.configuration.gguf_architecture,
-        inspection.format,
-        policy,
-    )?;
+    let route =
+        validate_preparation_policy(inspection.configuration.kind, inspection.format, policy)?;
     Ok(ModelPreparationPlan {
         inspection,
         policy,
@@ -520,7 +497,6 @@ pub fn plan_model_preparation(
 /// Validate a preparation policy against resolved portable artifact facts.
 pub fn validate_preparation_policy(
     kind: ModelKind,
-    gguf_architecture: Option<GgufArchitecture>,
     format: ArtifactFormat,
     policy: PreparationPolicy,
 ) -> Result<MaterializationRoute, ArtifactError> {
@@ -540,31 +516,6 @@ pub fn validate_preparation_policy(
             "load-time quantization is unsupported for {} nonresident loading",
             kind.model_type_name()
         )));
-    }
-    if policy.residency == ResidencyRequest::ExpertCache {
-        let supported = match gguf_architecture {
-            Some(architecture) => architecture.supports_expert_cache(),
-            None => matches!(
-                kind,
-                ModelKind::KimiLinear
-                    | ModelKind::DeepSeekV3
-                    | ModelKind::DeepSeekV4
-                    | ModelKind::GptOss
-                    | ModelKind::Inkling
-                    | ModelKind::Lfm2
-                    | ModelKind::NemotronH
-                    | ModelKind::Qwen3
-                    | ModelKind::Qwen3Next
-                    | ModelKind::Qwen3VlMoe
-                    | ModelKind::Qwen35
-            ),
-        };
-        if !supported {
-            return Err(ArtifactError::UnsupportedResidencyPolicy(format!(
-                "independent expert caching is unavailable for {}",
-                kind.model_type_name()
-            )));
-        }
     }
     let route = match policy.residency {
         ResidencyRequest::FullyResident => MaterializationRoute::Resident,
@@ -1052,21 +1003,18 @@ mod tests {
     }
 
     #[test]
-    fn policy_fails_closed_for_dense_expert_cache() {
+    fn policy_leaves_expert_cache_capability_to_architecture_and_backend() {
         let root = tempfile::tempdir().unwrap();
         write_safetensors_fixture(root.path(), "llama");
-        let error = plan_model_preparation(
+        let plan = plan_model_preparation(
             inspect_artifact(root.path()).unwrap(),
             PreparationPolicy {
                 residency: ResidencyRequest::ExpertCache,
                 ..PreparationPolicy::default()
             },
         )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ArtifactError::UnsupportedResidencyPolicy(_)
-        ));
+        .unwrap();
+        assert_eq!(plan.route(), MaterializationRoute::ExpertCache);
     }
 
     #[test]

@@ -130,10 +130,10 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
                 report.architecture = Some(supported.effective_model_type);
                 report.expected_modalities = modalities_for_safetensors(supported.kind, config);
                 report.architecture_support = InspectionReadiness::Ready;
-                match options.load.validate_preparation(
+                match structural::validate_safetensors_preparation(
                     supported.kind,
-                    None,
-                    eredu_core::ArtifactFormat::SafeTensors,
+                    config,
+                    options.load,
                 ) {
                     Ok(_) => report.requested_load = InspectionReadiness::Ready,
                     Err(error) => reject_load_policy(&mut report, &error),
@@ -424,7 +424,11 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
                     path,
                 );
             }
-            match gguf_architecture.validate_load_policy(options.load) {
+            match structural::validate_gguf_preparation(
+                gguf_architecture,
+                &checkpoint,
+                options.load,
+            ) {
                 Ok(()) => match validate_gguf_quantization_source(
                     &checkpoint,
                     &metadata,

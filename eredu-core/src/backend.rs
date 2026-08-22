@@ -293,6 +293,18 @@ pub trait ModelLoadingBackend: BackendProvider {
         options: &Self::LoadOptions,
     ) -> Result<PreparationPolicy, Self::Error>;
 
+    /// Intersects normalized architecture requirements with backend support.
+    ///
+    /// Core deliberately does not infer architecture capabilities from a
+    /// coarse model-family identity. Implementations must fail closed for
+    /// requested routes that the exact normalized architecture or backend
+    /// cannot realize.
+    fn validate_preparation(
+        &self,
+        inspection: &ArtifactInspection,
+        policy: PreparationPolicy,
+    ) -> Result<(), Self::Error>;
+
     /// Binds a neutral preparation plan to backend-owned materialization input.
     fn model_config(
         &self,
@@ -338,6 +350,9 @@ pub fn prepare_inspected_model<B: ModelLoadingBackend>(
 ) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
     let policy = backend
         .preparation_policy(&options)
+        .map_err(ModelLoadError::Backend)?;
+    backend
+        .validate_preparation(&inspection, policy)
         .map_err(ModelLoadError::Backend)?;
     let plan = plan_model_preparation(inspection, policy)?;
     let config = backend
@@ -1191,6 +1206,14 @@ mod tests {
             _: &Self::LoadOptions,
         ) -> Result<PreparationPolicy, Self::Error> {
             Ok(PreparationPolicy::default())
+        }
+
+        fn validate_preparation(
+            &self,
+            _: &ArtifactInspection,
+            _: PreparationPolicy,
+        ) -> Result<(), Self::Error> {
+            Ok(())
         }
 
         fn model_config(

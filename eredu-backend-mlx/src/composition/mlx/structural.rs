@@ -19,6 +19,105 @@ pub use eredu_checkpoint::validation::{
     CheckpointValidation as StructuralValidation,
 };
 
+const fn mlx_supports_expert_cache(kind: ModelKind) -> bool {
+    matches!(
+        kind,
+        ModelKind::KimiLinear
+            | ModelKind::DeepSeekV3
+            | ModelKind::DeepSeekV4
+            | ModelKind::Gemma4
+            | ModelKind::GptOss
+            | ModelKind::Inkling
+            | ModelKind::Lfm2
+            | ModelKind::MuseGlimmer
+            | ModelKind::NemotronH
+            | ModelKind::Qwen3
+            | ModelKind::Qwen3Next
+            | ModelKind::Qwen3VlMoe
+            | ModelKind::Qwen35
+    )
+}
+
+fn validate_expert_cache_capability(
+    kind: ModelKind,
+    capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
+) -> Result<(), Error> {
+    if capabilities.independently_addressable_experts() && mlx_supports_expert_cache(kind) {
+        return Ok(());
+    }
+    Err(Error::Artifact(
+        eredu_core::artifact::ArtifactError::UnsupportedResidencyPolicy(format!(
+            "independent expert caching is unavailable for the normalized {} architecture on MLX",
+            kind.model_type_name()
+        )),
+    ))
+}
+
+pub(crate) fn validate_safetensors_preparation(
+    kind: ModelKind,
+    config: &Value,
+    options: ModelLoadOptions,
+) -> Result<(), Error> {
+    options.validate_preparation(kind, eredu_core::ArtifactFormat::SafeTensors)?;
+    if options.preparation_policy()?.residency != eredu_core::ResidencyRequest::ExpertCache {
+        return Ok(());
+    }
+    let capabilities = eredu_architectures::preparation::safetensors_capabilities(kind, config)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    validate_expert_cache_capability(kind, capabilities)
+}
+
+pub(crate) fn validate_gguf_preparation(
+    architecture: GgufArchitecture,
+    checkpoint: &GgufCheckpoint,
+    options: ModelLoadOptions,
+) -> Result<(), Error> {
+    architecture.validate_load_policy(options)?;
+    if options.preparation_policy()?.residency != eredu_core::ResidencyRequest::ExpertCache {
+        return Ok(());
+    }
+    let capabilities =
+        eredu_architectures::preparation::gguf_capabilities(architecture, checkpoint)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    validate_expert_cache_capability(architecture.model_kind(), capabilities)
+}
+
+pub(crate) fn validate_inspected_preparation(
+    inspection: &eredu_core::ArtifactInspection,
+    policy: eredu_core::PreparationPolicy,
+) -> Result<(), Error> {
+    if policy.residency != eredu_core::ResidencyRequest::ExpertCache {
+        return Ok(());
+    }
+    let configuration = inspection.configuration();
+    let capabilities = match inspection.format() {
+        eredu_core::ArtifactFormat::SafeTensors => {
+            eredu_architectures::preparation::safetensors_capabilities(
+                configuration.kind,
+                configuration.json.as_ref().ok_or_else(|| {
+                    Error::UnsupportedArchitecture(
+                        "SafeTensors inspection omitted normalized JSON configuration".into(),
+                    )
+                })?,
+            )
+        }
+        eredu_core::ArtifactFormat::Gguf => eredu_architectures::preparation::gguf_capabilities(
+            configuration.gguf_architecture.ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "GGUF inspection omitted normalized architecture".into(),
+                )
+            })?,
+            inspection.gguf_checkpoint().ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "GGUF inspection omitted portable checkpoint metadata".into(),
+                )
+            })?,
+        ),
+    }
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    validate_expert_cache_capability(configuration.kind, capabilities)
+}
+
 pub trait GgufArchitectureValidation {
     fn validate_load_policy(self, options: ModelLoadOptions) -> Result<(), Error>;
     fn validate_catalog(
@@ -30,11 +129,7 @@ pub trait GgufArchitectureValidation {
 
 impl GgufArchitectureValidation for GgufArchitecture {
     fn validate_load_policy(self, options: ModelLoadOptions) -> Result<(), Error> {
-        options.validate_preparation(
-            self.model_kind(),
-            Some(self),
-            eredu_core::ArtifactFormat::Gguf,
-        )?;
+        options.validate_preparation(self.model_kind(), eredu_core::ArtifactFormat::Gguf)?;
         Ok(())
     }
 
@@ -971,6 +1066,113 @@ fn invalid_geometry(detail: String) -> StructuralValidation {
 #[cfg(test)]
 mod admission_policy_tests {
     use super::*;
+
+    fn expert_cache_options() -> ModelLoadOptions {
+        ModelLoadOptions::default().with_weight_residency(
+            eredu_runtime::WeightResidency::with_expert_cache(
+                eredu_runtime::NonExpertWeightResidency::FullyResident,
+                eredu_runtime::ExpertCacheLoadOptions::default(),
+            ),
+        )
+    }
+
+    fn gemma4_config(routed: bool) -> Value {
+        let mut config = serde_json::json!({
+            "model_type":"gemma4", "tie_word_embeddings":true,
+            "text_config":{
+                "model_type":"gemma4_text", "hidden_size":32,
+                "num_hidden_layers":1, "intermediate_size":64,
+                "num_attention_heads":4, "num_key_value_heads":2, "head_dim":8,
+                "rms_norm_eps":0.00001, "vocab_size":32,
+                "max_position_embeddings":128, "layer_types":["full_attention"],
+                "enable_moe_block":false
+            }
+        });
+        if routed {
+            config["text_config"]["enable_moe_block"] = true.into();
+            config["text_config"]["num_experts"] = 2.into();
+            config["text_config"]["top_k_experts"] = 1.into();
+            config["text_config"]["moe_intermediate_size"] = 32.into();
+        }
+        config
+    }
+
+    fn muse_glimmer_config(routed: bool) -> Value {
+        let mut config = serde_json::json!({
+            "architectures":["MuseGlimmerForConditionalGeneration"],
+            "model_type":"muse_glimmer", "image_token_id":22, "video_token_id":23,
+            "out_hidden_size":32, "projector_hidden_size":16,
+            "text_config":{
+                "model_type":"muse_glimmer_text", "hidden_size":16,
+                "num_hidden_layers":2, "intermediate_size":24,
+                "num_attention_heads":4, "num_key_value_heads":2, "head_dim":4,
+                "rms_norm_eps":0.00001, "post_norm_eps":0.00001,
+                "vocab_size":24, "max_position_embeddings":64,
+                "rope_theta":10000.0,
+                "layer_types":["sliding_attention","full_attention"],
+                "layer_rope_theta":[10000.0,0.0], "sliding_window":8,
+                "tie_word_embeddings":false, "hidden_act":"silu",
+                "attention_dropout":0.0, "qk_scale_factor":1.0,
+                "output_multiplier":1.0, "final_logit_softcapping":30.0
+            },
+            "vision_config":{
+                "model_type":"muse_glimmer_vision", "hidden_size":8,
+                "intermediate_size":12, "num_attention_heads":2,
+                "num_hidden_layers":1, "patch_size":2, "patch_temporal":1,
+                "merge_size":2, "pos_emb_height":2, "pos_emb_width":2,
+                "max_position_embeddings":4, "layer_norm_eps":0.00001,
+                "hidden_act":"gelu", "layer_types":["full_attention"],
+                "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}
+            }
+        });
+        if routed {
+            config["text_config"]["intermediate_size"] = 0.into();
+            config["text_config"]["moe_intermediate_size"] = 12.into();
+            config["text_config"]["num_experts"] = 8.into();
+            config["text_config"]["num_experts_per_tok"] = 2.into();
+            config["text_config"]["norm_topk_prob"] = true.into();
+        }
+        config
+    }
+
+    fn dense_qwen3_config() -> Value {
+        serde_json::json!({
+            "model_type":"qwen3", "hidden_size":16, "num_hidden_layers":3,
+            "intermediate_size":32, "num_attention_heads":4,
+            "num_key_value_heads":2, "head_dim":4, "rms_norm_eps":0.000001,
+            "vocab_size":64, "max_position_embeddings":128,
+            "rope_theta":1000000.0, "tie_word_embeddings":true
+        })
+    }
+
+    #[test]
+    fn expert_cache_admits_normalized_gemma4_and_muse_glimmer_moe() {
+        let options = expert_cache_options();
+        validate_safetensors_preparation(ModelKind::Gemma4, &gemma4_config(true), options).unwrap();
+        validate_safetensors_preparation(
+            ModelKind::MuseGlimmer,
+            &muse_glimmer_config(true),
+            options,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn expert_cache_rejects_dense_variants_of_mixed_families() {
+        let options = expert_cache_options();
+        for (kind, config) in [
+            (ModelKind::Gemma4, gemma4_config(false)),
+            (ModelKind::MuseGlimmer, muse_glimmer_config(false)),
+            (ModelKind::Qwen3, dense_qwen3_config()),
+        ] {
+            assert!(matches!(
+                validate_safetensors_preparation(kind, &config, options),
+                Err(Error::Artifact(
+                    eredu_core::artifact::ArtifactError::UnsupportedResidencyPolicy(_)
+                ))
+            ));
+        }
+    }
 
     #[test]
     fn non_strict_catalog_ignores_only_unexpected_tensors() {

@@ -88,12 +88,10 @@ impl ModelLoadOptions {
     pub fn validate_preparation(
         self,
         kind: eredu_core::ModelKind,
-        gguf_architecture: Option<eredu_core::GgufArchitecture>,
         format: eredu_core::ArtifactFormat,
     ) -> Result<eredu_core::MaterializationRoute, Error> {
         Ok(eredu_core::validate_preparation_policy(
             kind,
-            gguf_architecture,
             format,
             self.preparation_policy()?,
         )?)
@@ -130,7 +128,6 @@ mod tests {
         options
             .validate_preparation(
                 eredu_core::ModelKind::GptOss,
-                None,
                 eredu_core::ArtifactFormat::Gguf,
             )
             .unwrap();
