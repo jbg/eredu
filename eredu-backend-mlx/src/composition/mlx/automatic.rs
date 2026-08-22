@@ -347,6 +347,7 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
             model_kind,
             Some(
                 ModelKind::DeepSeekV3
+                    | ModelKind::DeepSeekV4
                     | ModelKind::Inkling
                     | ModelKind::NemotronH
                     | ModelKind::Qwen3Next
@@ -613,5 +614,21 @@ mod tests {
         let mut plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap());
         plan.topology = eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap();
         assert!(mlx_load_options(&MlxBackendFactory::default(), &plan).is_err());
+    }
+
+    #[test]
+    fn deepseek_v4_automatic_planning_reads_embedded_mtp_count() {
+        let model = tempfile::tempdir().unwrap();
+        fs::write(
+            model.path().join("config.json"),
+            r#"{"model_type":"deepseek_v4","num_nextn_predict_layers":2}"#,
+        )
+        .unwrap();
+
+        let layers = MlxBackendFactory::default()
+            .embedded_draft_layers(model.path(), Some(ModelKind::DeepSeekV4))
+            .unwrap();
+
+        assert_eq!(layers, Some(2));
     }
 }
