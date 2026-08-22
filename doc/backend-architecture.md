@@ -94,6 +94,14 @@ backends select the loaded architecture estimate, apply their physical state
 scalar width, and add live allocator, residency, and system-memory
 observations; they do not reconstruct family state geometry.
 
+Runtime state follows the same contract at materialization time. Architecture
+`StateLayout` values are authoritative for per-layer attention windows,
+append-only pooling streams, and named segment boundaries and lifetimes.
+Concrete backends derive native cache objects directly from those policies;
+model-family arguments are not a second source of state geometry. Composite
+model layouts, such as a target decoder plus embedded prediction state, are
+assembled by the architecture before a backend consumes them.
+
 Pre-materialization capabilities follow the same rule. The normalized
 architecture reports whether independently addressable routed experts exist;
 the selected backend intersects that fact with its expert-cache

@@ -21,7 +21,10 @@ pub use config::{
     AudioConfig, ConfigError, FeedForwardPolicy, LayerPolicy, ModelArgs, MtpConfig, TextArgs,
     VisionConfig,
 };
-pub use graph::{component_graph, mtp_state_layout, parallel_state_layout, state_layout};
+pub use graph::{
+    component_graph, composite_state_layout, mtp_state_layout, parallel_state_layout, state_layout,
+    PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
+};
 pub use model::{
     state_identity, DecoderInputPart, ForwardContext, LayeredModel, ModelInput, PartitionMtpOutput,
     StaticModules, TextPartitionInput, Unit,

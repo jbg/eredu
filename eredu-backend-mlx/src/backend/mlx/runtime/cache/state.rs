@@ -8,7 +8,8 @@ use std::{
 
 use eredu_core::cache::{
     LayerCachePolicy, PoolingStateComponent, PromptCacheDescriptor, PromptCacheManifest,
-    PromptCacheOptions, StateTensorOwner, StateTensorRole,
+    PromptCacheOptions, StateTensorDimension, StateTensorOwner, StateTensorPresence,
+    StateTensorRole,
 };
 use eredu_core::scheduler::SemanticStateTransaction;
 use eredu_nn::{
@@ -17,9 +18,9 @@ use eredu_nn::{
     Error as ComputeError, PoolingAttentionCache, PoolingOverlap, PoolingWindows,
 };
 use eredu_runtime::{
-    CacheResidencyReport, LayerRuntimeState, ResettableRuntimeLayerState, ResettableRuntimeState,
-    RuntimeLayerState, RuntimeState, RuntimeStateComponents, StateError, StateLayout,
-    StateSegmentId, StateSegmentSpec,
+    CacheResidencyReport, DeviceState, LayerRuntimeState, ResettableRuntimeLayerState,
+    ResettableRuntimeState, RuntimeLayerState, RuntimeState, RuntimeStateComponents, StateError,
+    StateLayout, StateSegmentId, StateSegmentSpec,
 };
 use safemlx::{
     error::Exception,
@@ -86,51 +87,98 @@ pub enum MlxPoolingAttentionCache {
     },
 }
 
+/// Complete MLX pooling-attention state realized directly from a neutral
+/// architecture layout.
+pub type MlxPoolingAttentionState = DeviceState<MlxBackend, MlxPoolingAttentionCache>;
+
+/// Architecture-independent MLX materializer for pooling-attention layouts.
+pub struct MlxPoolingAttentionStateFactory;
+
+impl MlxPoolingAttentionStateFactory {
+    /// Materializes device-resident state for every declared layer.
+    pub fn device(layout: StateLayout) -> Result<MlxPoolingAttentionState, Exception> {
+        DeviceState::create(layout, MlxPoolingAttentionCache::resident_from_policy)
+    }
+
+    /// Materializes paged local keys plus device pooling streams for every
+    /// declared layer.
+    pub fn paged(
+        layout: StateLayout,
+        manager: CacheResidencyManager,
+        global_layer_start: usize,
+        prefix_tokens: i32,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<MlxPoolingAttentionState, Exception> {
+        DeviceState::create(layout, move |layer, policy| {
+            let global_layer = global_layer_start.checked_add(layer).ok_or_else(|| {
+                Exception::custom("pooling-attention global layer index overflowed")
+            })?;
+            MlxPoolingAttentionCache::paged_from_policy(
+                layer,
+                policy,
+                manager.clone(),
+                global_layer,
+                prefix_tokens,
+                rank,
+            )
+        })
+    }
+}
+
 impl MlxPoolingAttentionCache {
-    /// Creates resident state for a scheduled compression ratio.
-    pub fn resident(ratio: i32, sliding_window: i32) -> Result<Self, Exception> {
-        Self::with_local(
-            ratio,
+    /// Creates resident pooling-attention state from one architecture-declared
+    /// layer policy.
+    pub fn resident_from_policy(
+        layer: usize,
+        policy: &LayerCachePolicy,
+    ) -> Result<Self, Exception> {
+        let geometry = pooling_attention_geometry(layer, policy)?;
+        Self::with_streams(
             LiveKeyValueCache::resident(ConcatKeyValueCache::new_for_sliding_attention(
-                sliding_window,
+                geometry.sliding_window,
             )),
+            &geometry.stream_ratios,
         )
     }
 
-    /// Creates paged local state under one shared manager.
-    pub fn paged(
-        ratio: i32,
-        sliding_window: i32,
+    /// Creates paged pooling-attention state from one architecture-declared
+    /// layer policy.
+    pub fn paged_from_policy(
+        layer: usize,
+        policy: &LayerCachePolicy,
         manager: CacheResidencyManager,
         global_layer: usize,
         prefix_tokens: i32,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
-        Self::with_local(
-            ratio,
+        let geometry = pooling_attention_geometry(layer, policy)?;
+        Self::with_streams(
             LiveKeyValueCache::paged_key_only(
                 manager,
                 global_layer,
-                Some(sliding_window),
+                Some(geometry.sliding_window),
                 prefix_tokens,
                 rank,
             )?,
+            &geometry.stream_ratios,
         )
     }
 
-    fn with_local(ratio: i32, local: LiveKeyValueCache) -> Result<Self, Exception> {
-        match ratio {
-            0 => Ok(Self::Local(local)),
-            4 => Ok(Self::Sparse {
+    fn with_streams(local: LiveKeyValueCache, ratios: &[i32]) -> Result<Self, Exception> {
+        match ratios {
+            [] => Ok(Self::Local(local)),
+            [ratio] => Ok(Self::Compressed {
                 local,
-                pool: PoolingCache::new(4)?,
-                index_pool: PoolingCache::new(4)?,
+                pool: PoolingCache::new(*ratio)?,
             }),
-            ratio if ratio > 0 => Ok(Self::Compressed {
+            [ratio, index_ratio] => Ok(Self::Sparse {
                 local,
-                pool: PoolingCache::new(ratio)?,
+                pool: PoolingCache::new(*ratio)?,
+                index_pool: PoolingCache::new(*index_ratio)?,
             }),
-            _ => Err(Exception::custom("pooling ratio must be nonnegative")),
+            _ => Err(Exception::custom(
+                "MLX pooling attention supports at most two declared streams",
+            )),
         }
     }
 
@@ -299,6 +347,265 @@ impl MlxPoolingAttentionCache {
                 restore_pooling_state(global_layer, 1, index_pool, tensors, processed_tokens, true)
             }
         }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PoolingAttentionGeometry {
+    sliding_window: i32,
+    stream_ratios: Vec<i32>,
+}
+
+fn pooling_attention_geometry(
+    layer: usize,
+    policy: &LayerCachePolicy,
+) -> Result<PoolingAttentionGeometry, Exception> {
+    let (attention, tensors) = match policy {
+        LayerCachePolicy::KeyOnly { attention, .. } => (attention, &[][..]),
+        LayerCachePolicy::KeyOnlyWithFixedState {
+            attention, tensors, ..
+        } => (attention, tensors.as_slice()),
+        _ => {
+            return Err(Exception::custom(format!(
+                "MLX pooling-attention state requires key-only policy at layer {layer}: {policy:?}"
+            )))
+        }
+    };
+    let sliding_window = attention
+        .sliding_window_i32()
+        .map_err(|error| Exception::custom(error.to_string()))?
+        .ok_or_else(|| {
+            Exception::custom(format!(
+                "MLX pooling-attention state requires a sliding window at layer {layer}"
+            ))
+        })?;
+    let mut streams = BTreeMap::<u32, BTreeMap<PoolingStateComponent, _>>::new();
+    for tensor in tensors {
+        let StateTensorRole::Pooling { stream, component } = tensor.role else {
+            return Err(Exception::custom(format!(
+                "MLX pooling-attention state found non-pooling component at layer {layer}: {:?}",
+                tensor.role
+            )));
+        };
+        streams.entry(stream).or_default().insert(component, tensor);
+    }
+    let mut stream_ratios = Vec::with_capacity(streams.len());
+    let mut stream_overlaps = Vec::with_capacity(streams.len());
+    for (expected_stream, (stream, components)) in streams.into_iter().enumerate() {
+        if stream as usize != expected_stream {
+            return Err(Exception::custom(format!(
+                "MLX pooling-attention streams must be contiguous at layer {layer}, expected {expected_stream}, got {stream}"
+            )));
+        }
+        let (ratio, overlapping) = pooling_stream_geometry(layer, stream, &components)?;
+        stream_ratios.push(ratio);
+        stream_overlaps.push(overlapping);
+    }
+    if !matches!(stream_overlaps.as_slice(), [] | [false] | [true, true]) {
+        return Err(Exception::custom(format!(
+            "MLX pooling-attention stream overlap layout is unsupported at layer {layer}"
+        )));
+    }
+    Ok(PoolingAttentionGeometry {
+        sliding_window,
+        stream_ratios,
+    })
+}
+
+fn pooling_stream_geometry(
+    layer: usize,
+    stream: u32,
+    components: &BTreeMap<PoolingStateComponent, &eredu_core::cache::StateTensorPolicy>,
+) -> Result<(i32, bool), Exception> {
+    let get = |component| {
+        components.get(&component).copied().ok_or_else(|| {
+            Exception::custom(format!(
+                "MLX pooling stream {stream} at layer {layer} is missing {component:?}"
+            ))
+        })
+    };
+    let pooled = get(PoolingStateComponent::Pooled)?;
+    let ratio = match (pooled.shape.as_slice(), pooled.presence) {
+        (
+            [StateTensorDimension::Batch, StateTensorDimension::PrefixTokensDiv(shape_ratio), StateTensorDimension::Fixed(_)],
+            StateTensorPresence::PrefixAtLeast(presence_ratio),
+        ) if shape_ratio == &presence_ratio => *shape_ratio,
+        _ => {
+            return Err(Exception::custom(format!(
+                "MLX pooling stream {stream} at layer {layer} has invalid pooled geometry"
+            )))
+        }
+    };
+    for component in [
+        PoolingStateComponent::PendingValues,
+        PoolingStateComponent::PendingGates,
+    ] {
+        let pending = get(component)?;
+        match (pending.shape.as_slice(), pending.presence) {
+            (
+                [StateTensorDimension::Batch, StateTensorDimension::PrefixTokensRem(shape_ratio), StateTensorDimension::Fixed(_)],
+                StateTensorPresence::PrefixRemainderNonZero(presence_ratio),
+            ) if shape_ratio == &ratio && presence_ratio == ratio => {}
+            _ => {
+                return Err(Exception::custom(format!(
+                "MLX pooling stream {stream} at layer {layer} has invalid {component:?} geometry"
+            )))
+            }
+        }
+    }
+    let overlap_values = components.get(&PoolingStateComponent::OverlapValues);
+    let overlap_gates = components.get(&PoolingStateComponent::OverlapGates);
+    if overlap_values.is_some() != overlap_gates.is_some() {
+        return Err(Exception::custom(format!(
+            "MLX pooling stream {stream} at layer {layer} has incomplete overlap geometry"
+        )));
+    }
+    for (component, overlap) in [
+        (PoolingStateComponent::OverlapValues, overlap_values),
+        (PoolingStateComponent::OverlapGates, overlap_gates),
+    ] {
+        let Some(overlap) = overlap else { continue };
+        match (overlap.shape.as_slice(), overlap.presence) {
+            (
+                [StateTensorDimension::Batch, StateTensorDimension::Fixed(shape_ratio), StateTensorDimension::Fixed(_)],
+                StateTensorPresence::PrefixAtLeast(presence_ratio),
+            ) if shape_ratio == &ratio && presence_ratio == ratio => {}
+            _ => {
+                return Err(Exception::custom(format!(
+                "MLX pooling stream {stream} at layer {layer} has invalid {component:?} geometry"
+            )))
+            }
+        }
+    }
+    if components.len() != 3 + usize::from(overlap_values.is_some()) * 2 {
+        return Err(Exception::custom(format!(
+            "MLX pooling stream {stream} at layer {layer} has undeclared components"
+        )));
+    }
+    i32::try_from(ratio.get())
+        .map(|ratio| (ratio, overlap_values.is_some()))
+        .map_err(|_| Exception::custom("pooling ratio exceeds MLX runtime range"))
+}
+
+#[cfg(test)]
+mod pooling_layout_tests {
+    use std::num::NonZeroU32;
+
+    use eredu_core::{
+        cache::{MutableStateResidency, StateResidencyClass, StateTensorDtype, StateTensorPolicy},
+        AttentionPolicy, LayerSchedule,
+    };
+
+    use super::*;
+
+    fn pooling_stream(stream: u32, ratio: u32, overlapping: bool) -> Vec<StateTensorPolicy> {
+        let ratio = NonZeroU32::new(ratio).unwrap();
+        let role = |component| StateTensorRole::Pooling { stream, component };
+        let pending = |component| {
+            StateTensorPolicy::new(
+                role(component),
+                vec![
+                    StateTensorDimension::Batch,
+                    StateTensorDimension::PrefixTokensRem(ratio),
+                    StateTensorDimension::fixed(8).unwrap(),
+                ],
+                StateTensorDtype::Floating,
+                MutableStateResidency::AlwaysDeviceMutable,
+            )
+            .unwrap()
+            .when_prefix_remainder_nonzero(ratio)
+        };
+        let mut policies = vec![
+            pending(PoolingStateComponent::PendingValues),
+            pending(PoolingStateComponent::PendingGates),
+            StateTensorPolicy::new_with_residency(
+                role(PoolingStateComponent::Pooled),
+                vec![
+                    StateTensorDimension::Batch,
+                    StateTensorDimension::PrefixTokensDiv(ratio),
+                    StateTensorDimension::fixed(8).unwrap(),
+                ],
+                StateTensorDtype::Floating,
+                StateResidencyClass::SealablePaged,
+            )
+            .unwrap()
+            .when_prefix_at_least(ratio),
+        ];
+        if overlapping {
+            for component in [
+                PoolingStateComponent::OverlapValues,
+                PoolingStateComponent::OverlapGates,
+            ] {
+                policies.push(
+                    StateTensorPolicy::new(
+                        role(component),
+                        vec![
+                            StateTensorDimension::Batch,
+                            StateTensorDimension::Fixed(ratio),
+                            StateTensorDimension::fixed(8).unwrap(),
+                        ],
+                        StateTensorDtype::Floating,
+                        MutableStateResidency::AlwaysDeviceMutable,
+                    )
+                    .unwrap()
+                    .when_prefix_at_least(ratio),
+                );
+            }
+        }
+        policies
+    }
+
+    #[test]
+    fn materializes_window_and_pooling_streams_from_layer_policy() {
+        let mut tensors = pooling_stream(0, 4, true);
+        tensors.extend(pooling_stream(1, 6, true));
+        let policy = LayerCachePolicy::key_only_with_fixed_state(
+            AttentionPolicy::sliding(37).unwrap(),
+            1,
+            8,
+            tensors,
+        )
+        .unwrap();
+
+        let geometry = pooling_attention_geometry(7, &policy).unwrap();
+        assert_eq!(
+            geometry,
+            PoolingAttentionGeometry {
+                sliding_window: 37,
+                stream_ratios: vec![4, 6],
+            }
+        );
+        let state = MlxPoolingAttentionCache::resident_from_policy(7, &policy).unwrap();
+        let MlxPoolingAttentionCache::Sparse {
+            pool, index_pool, ..
+        } = state
+        else {
+            panic!("two declared streams must create sparse pooling state")
+        };
+        assert_eq!(pool.ratio(), 4);
+        assert_eq!(index_pool.ratio(), 6);
+
+        let layout = StateLayout::new(LayerSchedule::new(1, vec![policy]).unwrap()).unwrap();
+        let state = MlxPoolingAttentionStateFactory::device(layout.clone()).unwrap();
+        assert_eq!(state.layout(), &layout);
+    }
+
+    #[test]
+    fn materializes_local_only_policy_without_family_arguments() {
+        let policy =
+            LayerCachePolicy::key_only(AttentionPolicy::sliding(23).unwrap(), 1, 8).unwrap();
+
+        assert_eq!(
+            pooling_attention_geometry(2, &policy).unwrap(),
+            PoolingAttentionGeometry {
+                sliding_window: 23,
+                stream_ratios: Vec::new(),
+            }
+        );
+        assert!(matches!(
+            MlxPoolingAttentionCache::resident_from_policy(2, &policy).unwrap(),
+            MlxPoolingAttentionCache::Local(_)
+        ));
     }
 }
 

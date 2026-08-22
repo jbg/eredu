@@ -9,10 +9,15 @@ use eredu_core::{
 };
 use eredu_runtime::{
     ComponentDomain, ComponentGraph, ComponentGraphError, ComponentKind, ComponentResidencyClass,
-    ComponentSpec, StateError, StateLayout,
+    ComponentSpec, StateError, StateLayout, StateSegmentLifetime, StateSegmentSpec,
 };
 
 use super::ModelArgs;
+
+/// Stable segment identity for the target decoder state.
+pub const TARGET_STATE_SEGMENT: &str = "target";
+/// Stable segment identity for checkpoint-embedded prediction state.
+pub const PREDICTION_STATE_SEGMENT: &str = "prediction";
 
 /// Builds the text/media/prediction graph from normalized family config.
 pub fn component_graph(args: &ModelArgs) -> Result<ComponentGraph, ComponentGraphError> {
@@ -182,6 +187,48 @@ pub fn mtp_state_layout(args: &ModelArgs) -> Result<Option<StateLayout>, StateEr
     .map(Some)
 }
 
+/// Declares the complete target plus checkpoint-embedded prediction layout.
+///
+/// Both segments persist across accepted generation steps, but remain
+/// independently identified so persistence and future lifecycle policy consume
+/// architecture-owned boundaries rather than a flattened backend schedule.
+pub fn composite_state_layout(
+    target: &StateLayout,
+    prediction: Option<&StateLayout>,
+) -> Result<StateLayout, StateError> {
+    let prediction_len = prediction.map_or(0, StateLayout::len);
+    let total_len = target.len().checked_add(prediction_len).ok_or_else(|| {
+        StateError::InvalidResidency("Inkling composite state layer count overflowed".into())
+    })?;
+    let layers = target
+        .layers()
+        .iter()
+        .cloned()
+        .chain(
+            prediction
+                .into_iter()
+                .flat_map(|layout| layout.layers().iter().cloned()),
+        )
+        .collect::<Vec<_>>();
+    let mut segments = vec![StateSegmentSpec::new(
+        TARGET_STATE_SEGMENT,
+        0..target.len(),
+        StateSegmentLifetime::Persistent,
+    )?];
+    if prediction_len > 0 {
+        segments.push(StateSegmentSpec::new(
+            PREDICTION_STATE_SEGMENT,
+            target.len()..total_len,
+            StateSegmentLifetime::Persistent,
+        )?);
+    }
+    StateLayout::segmented(
+        LayerSchedule::new(total_len, layers)
+            .map_err(|error| StateError::InvalidResidency(error.to_string()))?,
+        segments,
+    )
+}
+
 fn text_state_layout(text: &super::TextArgs) -> Result<StateLayout, StateError> {
     let layers = text
         .layer_schedule
@@ -302,5 +349,25 @@ mod tests {
                 StateTensorDimension::fixed(2).unwrap()
             );
         }
+
+        let target = state_layout(&args).unwrap();
+        let composite = composite_state_layout(&target, Some(&layout)).unwrap();
+        assert_eq!(composite.len(), 4);
+        assert_eq!(composite.segments().len(), 2);
+        assert_eq!(composite.segments()[0].id().as_str(), TARGET_STATE_SEGMENT);
+        assert_eq!(composite.segments()[0].layers(), 0..2);
+        assert_eq!(
+            composite.segments()[0].lifetime(),
+            StateSegmentLifetime::Persistent
+        );
+        assert_eq!(
+            composite.segments()[1].id().as_str(),
+            PREDICTION_STATE_SEGMENT
+        );
+        assert_eq!(composite.segments()[1].layers(), 2..4);
+        assert_eq!(
+            composite.segments()[1].lifetime(),
+            StateSegmentLifetime::Persistent
+        );
     }
 }

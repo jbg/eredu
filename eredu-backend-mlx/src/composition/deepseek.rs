@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use eredu_architectures::deepseek::{self, V3Args, V4Args, V4AttentionPolicy};
+use eredu_architectures::deepseek::{self, V3Args, V4Args};
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
     CacheResidencyPolicy, CausalModel, DeviceState, ExecutionUnitLayout, LayerWeightResidency,
@@ -33,7 +33,7 @@ use crate::backend::mlx::{
             residency::{
                 load_prompt_cache_state_tensors, open_prompt_cache, CacheResidencyManager,
             },
-            state::MlxPoolingAttentionCache,
+            state::{MlxPoolingAttentionState, MlxPoolingAttentionStateFactory},
             CompressedLatentCache,
         },
         checkpoint::binding::{
@@ -73,7 +73,7 @@ type V3Layerwise = LayerwiseRuntime<
 
 type V4Architecture = deepseek::v4::Model<MlxBackend>;
 type V4Unit = deepseek::v4::Unit<MlxBackend>;
-type V4State = DeviceState<MlxBackend, MlxPoolingAttentionCache>;
+type V4State = MlxPoolingAttentionState;
 type V4Resident = LayerwiseRuntime<V4Architecture, MlxBackend, V4State, MlxResidentPolicy<V4Unit>>;
 type V4Layerwise = LayerwiseRuntime<
     V4Architecture,
@@ -732,21 +732,12 @@ impl DeepSeekModel {
                 })?),
                 target_layers: args.num_hidden_layers as usize,
             }),
-            DeepSeekModelInner::V4 { args, .. } => {
-                let state_args = args.clone();
-                Ok(DeepSeekState {
-                    inner: DeepSeekStateInner::V4(DeviceState::create(layout, move |layer, _| {
-                        let ratio = match state_args.attention_policy(layer) {
-                            Some(V4AttentionPolicy::Local) => 0,
-                            Some(V4AttentionPolicy::Compressed { ratio }) => ratio,
-                            None => return Err(unsupported("missing V4 state attention policy")),
-                        };
-                        MlxPoolingAttentionCache::resident(ratio, state_args.sliding_window)
-                            .map_err(Into::into)
-                    })?),
-                    target_layers: args.num_hidden_layers as usize,
-                })
-            }
+            DeepSeekModelInner::V4 { args, .. } => Ok(DeepSeekState {
+                inner: DeepSeekStateInner::V4(
+                    MlxPoolingAttentionStateFactory::device(layout).map_err(Error::from)?,
+                ),
+                target_layers: args.num_hidden_layers as usize,
+            }),
         }
     }
 
@@ -779,28 +770,13 @@ impl DeepSeekModel {
                 })?),
                 target_layers: args.num_hidden_layers as usize,
             }),
-            DeepSeekModelInner::V4 { args, .. } => {
-                let state_args = args.clone();
-                Ok(DeepSeekState {
-                    inner: DeepSeekStateInner::V4(DeviceState::create(layout, move |layer, _| {
-                        let ratio = match state_args.attention_policy(layer) {
-                            Some(V4AttentionPolicy::Local) => 0,
-                            Some(V4AttentionPolicy::Compressed { ratio }) => ratio,
-                            None => return Err(unsupported("missing V4 state attention policy")),
-                        };
-                        MlxPoolingAttentionCache::paged(
-                            ratio,
-                            state_args.sliding_window,
-                            manager.clone(),
-                            layer,
-                            prefix_tokens,
-                            rank,
-                        )
-                        .map_err(Error::from)
-                    })?),
-                    target_layers: args.num_hidden_layers as usize,
-                })
-            }
+            DeepSeekModelInner::V4 { args, .. } => Ok(DeepSeekState {
+                inner: DeepSeekStateInner::V4(
+                    MlxPoolingAttentionStateFactory::paged(layout, manager, 0, prefix_tokens, rank)
+                        .map_err(Error::from)?,
+                ),
+                target_layers: args.num_hidden_layers as usize,
+            }),
         }
     }
 

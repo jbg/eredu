@@ -1409,24 +1409,6 @@ fn concatenate(values: &[Array], axis: i32, stream: &Stream) -> Result<Option<Ar
     }
 }
 
-fn combined_prompt_state_layout(
-    target: &eredu_runtime::StateLayout,
-    mtp: Option<&eredu_runtime::StateLayout>,
-) -> Result<eredu_runtime::StateLayout, Error> {
-    let layers = target
-        .layers()
-        .iter()
-        .cloned()
-        .chain(
-            mtp.into_iter()
-                .flat_map(|layout| layout.layers().iter().cloned()),
-        )
-        .collect::<Vec<_>>();
-    let schedule = eredu_core::LayerSchedule::new(layers.len(), layers)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    eredu_runtime::StateLayout::new(schedule).map_err(|error| Error::Parallel(error.to_string()))
-}
-
 impl CausalModel<InklingState> for InklingModel {
     type Tensor = crate::MlxTensor;
     type Input<'a> = input::ModelInput<'a>;
@@ -1912,8 +1894,11 @@ fn load_store(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mtp_state_layout = eredu_architectures::inkling::mtp_state_layout(&args)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let prompt_state_layout =
-        combined_prompt_state_layout(&state_layout, mtp_state_layout.as_ref())?;
+    let prompt_state_layout = eredu_architectures::inkling::composite_state_layout(
+        &state_layout,
+        mtp_state_layout.as_ref(),
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     Ok(InklingModel {
         state_layout,
         mtp_state_layout,
@@ -2120,8 +2105,11 @@ fn load_parallel_store(
     };
     let mtp_state_layout = eredu_architectures::inkling::mtp_state_layout(&args)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let prompt_state_layout =
-        combined_prompt_state_layout(&state_layout, mtp_state_layout.as_ref())?;
+    let prompt_state_layout = eredu_architectures::inkling::composite_state_layout(
+        &state_layout,
+        mtp_state_layout.as_ref(),
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     Ok(InklingModel {
         args,
         state_layout,

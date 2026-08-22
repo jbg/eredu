@@ -6367,28 +6367,24 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
     ) -> Result<Vec<PipelineLayerCache>, Error> {
         let pinned_prefix_tokens = i32::try_from(identity.sink_tokens)
             .map_err(|_| Error::Parallel("V4 attention sink count exceeds i32".into()))?;
+        let layout = eredu_architectures::deepseek::v4::state_layout(self.args())
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         self.range()
             .clone()
             .map(|global_layer| {
-                let ratio = match self.args().attention_policy(global_layer) {
-                    Some(eredu_architectures::deepseek::V4AttentionPolicy::Local) => 0,
-                    Some(eredu_architectures::deepseek::V4AttentionPolicy::Compressed {
-                        ratio,
-                    }) => ratio,
-                    None => {
-                        return Err(Error::Parallel(format!("missing V4 layer {global_layer}")))
-                    }
-                };
+                let policy = layout.layer(global_layer).ok_or_else(|| {
+                    Error::Parallel(format!("missing V4 state layout layer {global_layer}"))
+                })?;
                 let cache = match &paged {
-                    Some((manager, rank)) => MlxPoolingAttentionCache::paged(
-                        ratio,
-                        self.args().sliding_window,
+                    Some((manager, rank)) => MlxPoolingAttentionCache::paged_from_policy(
+                        global_layer,
+                        policy,
                         manager.clone(),
                         global_layer,
                         pinned_prefix_tokens,
                         *rank,
                     )?,
-                    None => MlxPoolingAttentionCache::resident(ratio, self.args().sliding_window)?,
+                    None => MlxPoolingAttentionCache::resident_from_policy(global_layer, policy)?,
                 };
                 Ok(PipelineLayerCache::PoolingAttention {
                     global_layer,
@@ -6409,27 +6405,25 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
         paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
     ) -> Result<PipelineMtpCache, Error> {
         let target = self.args().num_hidden_layers as usize;
+        let layout = eredu_architectures::deepseek::v4::state_layout(self.args())
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         let caches = (0..self.mtp_layers.len())
             .map(|depth| {
                 let layer = target + depth;
-                let ratio = match self.args().attention_policy(layer) {
-                    Some(eredu_architectures::deepseek::V4AttentionPolicy::Local) => 0,
-                    Some(eredu_architectures::deepseek::V4AttentionPolicy::Compressed {
-                        ratio,
-                    }) => ratio,
-                    None => return Err(Error::Parallel(format!("missing V4 MTP layer {layer}"))),
-                };
+                let policy = layout.layer(layer).ok_or_else(|| {
+                    Error::Parallel(format!("missing V4 MTP state layout layer {layer}"))
+                })?;
                 match &paged {
-                    Some((manager, rank)) => MlxPoolingAttentionCache::paged(
-                        ratio,
-                        self.args().sliding_window,
+                    Some((manager, rank)) => MlxPoolingAttentionCache::paged_from_policy(
+                        layer,
+                        policy,
                         manager.clone(),
                         layer,
                         0,
                         *rank,
                     )
                     .map_err(Into::into),
-                    None => MlxPoolingAttentionCache::resident(ratio, self.args().sliding_window)
+                    None => MlxPoolingAttentionCache::resident_from_policy(layer, policy)
                         .map_err(Into::into),
                 }
             })
