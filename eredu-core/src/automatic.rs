@@ -91,7 +91,11 @@ impl<T> Observed<T> {
     }
 }
 
-/// Header-only model resource accounting used before a model is loaded.
+fn unobserved_embedded_draft_layers() -> Observed<usize> {
+    Observed::unavailable("embedded drafting requires normalized architecture inspection")
+}
+
+/// Architecture and header-derived planning facts used before a model is loaded.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelResourceProfile {
     /// Version of this serialized resource schema.
@@ -112,6 +116,9 @@ pub struct ModelResourceProfile {
     /// Number of physical checkpoint shards.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint_shards: Option<usize>,
+    /// Embedded prediction depth derived from normalized architecture policy.
+    #[serde(default = "unobserved_embedded_draft_layers")]
+    pub embedded_draft_layers: Observed<usize>,
     /// Sum of encoded tensor payload bytes, excluding container metadata.
     pub stored_tensor_bytes: Observed<u64>,
     /// Largest encoded logical or physical tensor payload.
@@ -142,6 +149,7 @@ impl ModelResourceProfile {
             architecture: None,
             tensor_count: None,
             checkpoint_shards: None,
+            embedded_draft_layers: unobserved_embedded_draft_layers(),
             stored_tensor_bytes: Observed::unavailable(
                 "checkpoint tensor catalog was not established",
             ),
@@ -588,12 +596,6 @@ pub trait AutomaticPlanningBackend {
         model_path: &std::path::Path,
         plan: &ExecutionPlan,
     ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError>;
-    /// Reports embedded speculative prediction layers when observable.
-    fn embedded_draft_layers(
-        &self,
-        model_path: &std::path::Path,
-        model_kind: Option<ModelKind>,
-    ) -> Result<Option<usize>, AutomaticPlanningError>;
 }
 
 /// One target-backend instance and load policy realized from a portable execution plan.
@@ -956,8 +958,7 @@ impl AutomaticPlanner {
             }
         }
 
-        let embedded_layers =
-            backend.embedded_draft_layers(&request.model_path, resources.model_kind)?;
+        let embedded_layers = resources.embedded_draft_layers.value().copied();
         if embedded_layers.is_some_and(|layers| layers > 0) {
             plan.drafting = DraftingPlan::Embedded {
                 max_draft_tokens: self.policy.embedded_mtp_draft_tokens,
@@ -1304,6 +1305,8 @@ mod tests {
             let mut profile =
                 ModelResourceProfile::unmeasured(path.into(), ArtifactFormat::SafeTensors);
             profile.model_kind = Some(ModelKind::Llama);
+            profile.embedded_draft_layers =
+                Observed::exact(self.embedded_layers, "normalized architecture fixture");
             profile.stored_tensor_bytes = Observed::exact(self.model_bytes, "fixture");
             profile.materialized_parameter_bytes = Observed::exact(self.model_bytes, "fixture");
             Ok(profile)
@@ -1331,14 +1334,6 @@ mod tests {
                 required_bytes: 3 << 20,
                 depth: 1,
             })
-        }
-
-        fn embedded_draft_layers(
-            &self,
-            _path: &std::path::Path,
-            _kind: Option<ModelKind>,
-        ) -> Result<Option<usize>, AutomaticPlanningError> {
-            Ok(Some(self.embedded_layers))
         }
     }
 

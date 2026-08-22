@@ -521,6 +521,7 @@ impl AutomaticPlanningBackend for MockBackend {
         profile.architecture = Some("llama".into());
         profile.tensor_count = Some(1);
         profile.checkpoint_shards = Some(1);
+        profile.embedded_draft_layers = Observed::exact(0, "normalized architecture fixture");
         profile.stored_tensor_bytes = Observed::exact(4, "conformance fixture");
         profile.largest_stored_tensor_bytes = Observed::exact(4, "conformance fixture");
         profile.materialized_parameter_bytes = Observed::exact(16 * 1024, "conformance fixture");
@@ -555,15 +556,6 @@ impl AutomaticPlanningBackend for MockBackend {
             required_bytes: 3072,
             depth: 1,
         })
-    }
-
-    fn embedded_draft_layers(
-        &self,
-        _: &Path,
-        model_kind: Option<ModelKind>,
-    ) -> Result<Option<usize>, AutomaticPlanningError> {
-        assert_eq!(model_kind, Some(ModelKind::Llama));
-        Ok(Some(0))
     }
 }
 

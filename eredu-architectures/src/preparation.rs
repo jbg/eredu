@@ -11,6 +11,7 @@ use serde_json::Value;
 pub struct ArchitectureCapabilities {
     parallel: ParallelCapabilityPlan,
     input_modalities: InputModalities,
+    embedded_draft_layers: Option<usize>,
 }
 
 impl ArchitectureCapabilities {
@@ -29,10 +30,19 @@ impl ArchitectureCapabilities {
         self.input_modalities
     }
 
+    /// Exact embedded prediction depth exposed by the normalized architecture.
+    ///
+    /// `None` means that the artifact convention does not expose enough
+    /// architecture-owned information to make an automatic drafting decision.
+    pub const fn embedded_draft_layers(self) -> Option<usize> {
+        self.embedded_draft_layers
+    }
+
     const fn new(
         kind: ModelKind,
         independently_addressable_experts: bool,
         input_modalities: InputModalities,
+        embedded_draft_layers: Option<usize>,
     ) -> Self {
         Self {
             parallel: ParallelCapabilityPlan::new(
@@ -42,6 +52,7 @@ impl ArchitectureCapabilities {
                 independently_addressable_experts,
             ),
             input_modalities,
+            embedded_draft_layers,
         }
     }
 }
@@ -51,6 +62,7 @@ impl Default for ArchitectureCapabilities {
         Self {
             parallel: ParallelCapabilityPlan::default(),
             input_modalities: InputModalities::TEXT,
+            embedded_draft_layers: None,
         }
     }
 }
@@ -208,23 +220,35 @@ pub fn safetensors_capabilities(
     kind: ModelKind,
     config: &Value,
 ) -> Result<ArchitectureCapabilities, PreparationCapabilityError> {
-    let (routed, input_modalities) = match kind {
+    let (routed, input_modalities, embedded_draft_layers) = match kind {
         ModelKind::DeepSeekV3 => {
-            crate::deepseek::parse_v3_config(config).map_err(invalid)?;
-            (true, InputModalities::TEXT)
+            let args = crate::deepseek::parse_v3_config(config).map_err(invalid)?;
+            (
+                true,
+                InputModalities::TEXT,
+                usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?,
+            )
         }
         ModelKind::DeepSeekV4 => {
-            crate::deepseek::parse_v4_config(config).map_err(invalid)?;
-            (true, InputModalities::TEXT)
+            let args = crate::deepseek::parse_v4_config(config).map_err(invalid)?;
+            (
+                true,
+                InputModalities::TEXT,
+                usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?,
+            )
         }
         ModelKind::Gemma4 => {
             let bytes = serde_json::to_vec(config).map_err(invalid)?;
             let family = crate::gemma4::FamilyConfig::from_hf_json(&bytes).map_err(invalid)?;
-            (family.text.num_experts.is_some(), family.input_modalities())
+            (
+                family.text.num_experts.is_some(),
+                family.input_modalities(),
+                0,
+            )
         }
         ModelKind::GptOss => {
             crate::gpt_oss::model_args_from_config_value(config).map_err(invalid)?;
-            (true, InputModalities::TEXT)
+            (true, InputModalities::TEXT, 0)
         }
         ModelKind::Inkling => {
             let bytes = serde_json::to_vec(config).map_err(invalid)?;
@@ -233,20 +257,24 @@ pub fn safetensors_capabilities(
                 args.text_config.layer_schedule.iter().any(|policy| {
                     policy.feed_forward == crate::inkling::FeedForwardPolicy::SparseMoe
                 });
-            (routed, args.input_modalities())
+            let embedded = args
+                .mtp_config
+                .as_ref()
+                .map_or(0, |mtp| mtp.num_nextn_predict_layers);
+            (
+                routed,
+                args.input_modalities(),
+                usize::try_from(embedded).map_err(invalid)?,
+            )
         }
-        ModelKind::KimiLinear => (
-            crate::kimi_linear::model_args_from_config_value(config)
-                .map_err(invalid)?
-                .has_sparse_moe_layers(),
-            InputModalities::TEXT,
-        ),
-        ModelKind::Lfm2 => (
-            crate::lfm2::model_args_from_config_value(config)
-                .map_err(invalid)?
-                .has_sparse_moe_layers(),
-            InputModalities::TEXT,
-        ),
+        ModelKind::KimiLinear => {
+            let args = crate::kimi_linear::model_args_from_config_value(config).map_err(invalid)?;
+            (args.has_sparse_moe_layers(), InputModalities::TEXT, 0)
+        }
+        ModelKind::Lfm2 => {
+            let args = crate::lfm2::model_args_from_config_value(config).map_err(invalid)?;
+            (args.has_sparse_moe_layers(), InputModalities::TEXT, 0)
+        }
         ModelKind::MuseGlimmer => {
             let args =
                 crate::muse_glimmer::DecoderConfig::from_hf_value(config).map_err(invalid)?;
@@ -259,20 +287,21 @@ pub fn safetensors_capabilities(
                     video: args.weight_convention
                         == crate::muse_glimmer::WeightConvention::HuggingFace,
                 },
+                0,
             )
         }
-        ModelKind::NemotronH => (
-            crate::nemotron_h::model_args_from_config_value(config)
-                .map_err(invalid)?
-                .has_sparse_moe_layers(),
-            InputModalities::TEXT,
-        ),
-        ModelKind::Qwen2 | ModelKind::Qwen3 => (
-            crate::qwen::model_args_from_config_value(config)
-                .map_err(invalid)?
-                .is_moe(),
-            InputModalities::TEXT,
-        ),
+        ModelKind::NemotronH => {
+            let args = crate::nemotron_h::model_args_from_config_value(config).map_err(invalid)?;
+            (
+                args.has_sparse_moe_layers(),
+                InputModalities::TEXT,
+                usize::try_from(args.num_nextn_predict_layers).map_err(invalid)?,
+            )
+        }
+        ModelKind::Qwen2 | ModelKind::Qwen3 => {
+            let args = crate::qwen::model_args_from_config_value(config).map_err(invalid)?;
+            (args.is_moe(), InputModalities::TEXT, 0)
+        }
         ModelKind::Qwen3Next | ModelKind::Qwen35 => {
             let args =
                 crate::qwen::hybrid::model_args_from_config_value(config).map_err(invalid)?;
@@ -285,6 +314,7 @@ pub fn safetensors_capabilities(
                     audio: false,
                     video: multimodal,
                 },
+                usize::try_from(args.text.mtp_num_hidden_layers).map_err(invalid)?,
             )
         }
         ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
@@ -297,6 +327,7 @@ pub fn safetensors_capabilities(
                     audio: false,
                     video: true,
                 },
+                0,
             )
         }
         ModelKind::Moshi => (
@@ -307,13 +338,18 @@ pub fn safetensors_capabilities(
                 audio: true,
                 video: false,
             },
+            0,
         ),
-        ModelKind::Llama => (false, InputModalities::TEXT),
+        ModelKind::Llama => {
+            crate::llama::model_args_from_config_value(config).map_err(invalid)?;
+            (false, InputModalities::TEXT, 0)
+        }
     };
     Ok(ArchitectureCapabilities::new(
         kind,
         routed,
         input_modalities,
+        Some(embedded_draft_layers),
     ))
 }
 
@@ -378,6 +414,7 @@ pub fn gguf_capabilities(
         architecture.model_kind(),
         routed,
         input_modalities,
+        None,
     ))
 }
 

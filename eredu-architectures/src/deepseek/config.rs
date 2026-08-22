@@ -1380,6 +1380,18 @@ mod tests {
     }
 
     #[test]
+    fn preparation_reports_embedded_depth_from_normalized_v3_policy() {
+        let mut value = fixture();
+        value["num_nextn_predict_layers"] = Value::from(2);
+
+        let capabilities =
+            crate::preparation::safetensors_capabilities(eredu_core::ModelKind::DeepSeekV3, &value)
+                .unwrap();
+
+        assert_eq!(capabilities.embedded_draft_layers(), Some(2));
+    }
+
+    #[test]
     fn maps_official_fp8_metadata_to_general_linear_format() {
         let mut fixture = fixture();
         fixture["quantization_config"] = serde_json::json!({

@@ -677,6 +677,26 @@ mod tests {
     }
 
     #[test]
+    fn preparation_ignores_unrelated_nested_draft_field() {
+        let value = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "intermediate_size": 32,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 64,
+            "unrelated": {"num_nextn_predict_layers": 7}
+        });
+
+        let capabilities =
+            crate::preparation::safetensors_capabilities(eredu_core::ModelKind::Llama, &value)
+                .unwrap();
+
+        assert_eq!(capabilities.embedded_draft_layers(), Some(0));
+    }
+
+    #[test]
     fn normalizes_gguf_without_backend_types() {
         let metadata = HashMap::from([
             (

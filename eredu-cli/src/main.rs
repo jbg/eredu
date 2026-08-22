@@ -3723,6 +3723,7 @@ mod tests {
             architecture: Some("fixture".into()),
             tensor_count: Some(1),
             checkpoint_shards: Some(1),
+            embedded_draft_layers: eredu::Observed::unsupported("fixture"),
             stored_tensor_bytes: eredu::Observed::exact(7, "fixture"),
             largest_stored_tensor_bytes: eredu::Observed::exact(7, "fixture"),
             materialized_parameter_bytes: eredu::Observed::unavailable("fixture"),

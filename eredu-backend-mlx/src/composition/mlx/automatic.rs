@@ -2,17 +2,17 @@
 
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 
-use std::{fs, path::Path};
+use std::path::Path;
 
 use eredu_core::{
     AutomaticPlanningBackend, AutomaticPlanningError, BackendId, BoundedResidencyRequirement,
     CandidateAdmission, DevicePlan, DraftPlacementPlan, DraftingPlan, DurationSeconds,
     ExecutionPlan, ExecutionPlanBackendFactory, ExecutionPlanTarget, ExpertCacheTelemetry,
     ExternalDraftArtifact, HardwareBackendProfile, HardwareDeviceProfile, HardwareMemorySemantics,
-    HardwareProfile, InspectionSeverity, ModelKind, ModelResourceProfile, ModelRuntime,
-    MtpCapability, MtpCheckpointKind, MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics,
-    RealizedDrafting, ResidencyPlan, ResidencyTelemetry, SpeculativeGenerationBackend,
-    TransferTelemetry, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
+    HardwareProfile, InspectionSeverity, ModelResourceProfile, ModelRuntime, MtpCapability,
+    MtpCheckpointKind, MtpStats, MtpTelemetry, Observed, PhysicalMemorySemantics, RealizedDrafting,
+    ResidencyPlan, ResidencyTelemetry, SpeculativeGenerationBackend, TransferTelemetry,
+    WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 use safemlx::{Device, DeviceType, Stream};
 
@@ -337,41 +337,6 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
             }),
         }
     }
-
-    fn embedded_draft_layers(
-        &self,
-        model_path: &Path,
-        model_kind: Option<ModelKind>,
-    ) -> Result<Option<usize>, AutomaticPlanningError> {
-        if !matches!(
-            model_kind,
-            Some(
-                ModelKind::DeepSeekV3
-                    | ModelKind::DeepSeekV4
-                    | ModelKind::Inkling
-                    | ModelKind::NemotronH
-                    | ModelKind::Qwen3Next
-                    | ModelKind::Qwen35
-            )
-        ) {
-            return Ok(Some(0));
-        }
-        if !model_path.is_dir() {
-            return Ok(None);
-        }
-        let bytes = fs::read(model_path.join("config.json"))
-            .map_err(|error| planning_backend_error("read_drafting_metadata", error))?;
-        let config: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|error| planning_backend_error("decode_drafting_metadata", error))?;
-        embedded_mtp_count(&config)
-            .map(|count| {
-                usize::try_from(count).map_err(|_| {
-                    AutomaticPlanningError::Invalid("embedded MTP layer count exceeds usize".into())
-                })
-            })
-            .transpose()
-            .map(|count| Some(count.unwrap_or(0)))
-    }
 }
 
 impl ExecutionPlanBackendFactory for MlxBackendFactory {
@@ -559,21 +524,6 @@ fn mlx_device(device: &DevicePlan) -> Result<Device, AutomaticPlanningError> {
     Ok(Device::new(kind, index))
 }
 
-fn embedded_mtp_count(value: &serde_json::Value) -> Option<u64> {
-    match value {
-        serde_json::Value::Object(object) => {
-            for key in ["mtp_num_hidden_layers", "num_nextn_predict_layers"] {
-                if let Some(count) = object.get(key).and_then(serde_json::Value::as_u64) {
-                    return Some(count);
-                }
-            }
-            object.values().find_map(embedded_mtp_count)
-        }
-        serde_json::Value::Array(values) => values.iter().find_map(embedded_mtp_count),
-        _ => None,
-    }
-}
-
 fn transfer_direction_name(direction: TransferDirection) -> &'static str {
     match direction {
         TransferDirection::DeviceToHost => "device_to_host",
@@ -614,21 +564,5 @@ mod tests {
         let mut plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap());
         plan.topology = eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap();
         assert!(mlx_load_options(&MlxBackendFactory::default(), &plan).is_err());
-    }
-
-    #[test]
-    fn deepseek_v4_automatic_planning_reads_embedded_mtp_count() {
-        let model = tempfile::tempdir().unwrap();
-        fs::write(
-            model.path().join("config.json"),
-            r#"{"model_type":"deepseek_v4","num_nextn_predict_layers":2}"#,
-        )
-        .unwrap();
-
-        let layers = MlxBackendFactory::default()
-            .embedded_draft_layers(model.path(), Some(ModelKind::DeepSeekV4))
-            .unwrap();
-
-        assert_eq!(layers, Some(2));
     }
 }

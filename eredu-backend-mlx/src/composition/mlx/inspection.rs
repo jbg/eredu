@@ -63,6 +63,16 @@ fn is_gguf_file(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
 }
 
+fn record_embedded_drafting(
+    report: &mut ModelInspectionReport,
+    capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
+) {
+    report.resources.embedded_draft_layers = capabilities.embedded_draft_layers().map_or_else(
+        || Observed::unsupported("artifact convention does not expose embedded drafting"),
+        |layers| Observed::exact(layers, "normalized architecture configuration"),
+    );
+}
+
 fn required_qwen_mmproj(path: &Path, architecture: &str) -> Result<PathBuf, Error> {
     crate::composition::mlx::artifact::find_sibling_mmproj(path, architecture)?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!(
@@ -133,6 +143,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
                 ) {
                     Ok(capabilities) => {
                         resolved_kind = Some(supported.kind);
+                        record_embedded_drafting(&mut report, capabilities);
                         report.expected_modalities =
                             artifact_modalities(capabilities.input_modalities());
                         report.architecture_support = InspectionReadiness::Ready;
@@ -371,8 +382,9 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
         eredu_architectures::preparation::gguf_composite_artifact_plan(gguf_architecture);
     let mut capabilities_valid = false;
     match eredu_architectures::preparation::gguf_capabilities(gguf_architecture, &checkpoint) {
-        Ok(_) => {
+        Ok(capabilities) => {
             capabilities_valid = true;
+            record_embedded_drafting(&mut report, capabilities);
             apply_structural_validation(
                 &mut report,
                 structural::validate_gguf(gguf_architecture, &checkpoint, &metadata, options.load),

@@ -203,6 +203,11 @@ configuration. `LoadedModel::load_execution_plan` and
 `LoadedModel::plan_and_load` therefore do not require callers to construct
 backend devices, queues, streams, or assistant models.
 
+Architecture inspection also reports embedded-draft depth from the normalized
+family configuration in `ModelResourceProfile`. The neutral automatic planner
+consumes that observation directly; concrete backends must not infer family
+semantics by searching raw configuration documents.
+
 ## Submission and completion
 
 `BackendSession` provides high-level prefill and decode submissions. Associated
