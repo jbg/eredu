@@ -109,6 +109,13 @@ Concrete backends execute those declarations: they resize pixels, extract
 features, pack patches, and construct native tensors. A new backend therefore
 consumes the same family protocol instead of reimplementing it.
 
+Realtime prompt protocols follow the same ownership rule. The neutral Moshi
+architecture declares PersonaPlex's released silence, sine-conditioning, and
+text-padding tokens, system-text framing, accepted prompt geometry, and
+ordered forced-frame plan. A concrete backend only slices and materializes
+native arrays from that plan and enqueues the resulting frames; it does not
+redeclare PersonaPlex application policy.
+
 Prepared-media admission follows the same boundary after tensor construction.
 Architecture media plans validate family payload shapes,
 patch/window/pooling geometry, valid-position masks, and artifact-specific

@@ -53,7 +53,7 @@ fn main() -> EvalResult<()> {
     let weights_stream = cpu.stream();
     let mut mimi = load(
         &mimi_path,
-        Some(personaplex_prompt::AUDIO_TOKENS_PER_STREAM),
+        Some(personaplex_prompt::AUDIO_TOKENS_PER_STREAM as i32),
         stream,
     )?;
     let pcm_array =

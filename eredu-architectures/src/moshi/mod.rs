@@ -6,6 +6,7 @@ mod config;
 mod depth;
 mod model;
 mod parallel;
+pub mod personaplex_prompt;
 
 pub use checkpoint::{canonical_recipes, safetensors_plan};
 pub use config::{
