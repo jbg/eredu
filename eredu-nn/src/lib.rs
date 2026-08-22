@@ -2485,11 +2485,153 @@ pub trait PoolingAttentionCache<T: Tensor>: Debug {
     fn clear(&mut self) -> Result<(), Error>;
 }
 
+/// Explicit forward-pass operators a backend promises to execute.
+///
+/// These capabilities cover optional methods on [`NeuralBackend`] whose
+/// default implementations fail closed. Architectures validate their required
+/// set while constructing modules, before parameters are loaded or a forward
+/// pass can begin.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct NeuralOperatorCapabilities(u64);
+
+impl NeuralOperatorCapabilities {
+    /// No optional forward operators.
+    pub const NONE: Self = Self(0);
+    /// Tanh-approximated GELU.
+    pub const GELU_APPROXIMATE: Self = Self(1 << 0);
+    /// Logistic sigmoid.
+    pub const SIGMOID: Self = Self(1 << 1);
+    /// Softplus.
+    pub const SOFTPLUS: Self = Self(1 << 2);
+    /// Natural exponential.
+    pub const EXP: Self = Self(1 << 3);
+    /// Gated grouped RMS normalization.
+    pub const GATED_GROUP_RMS_NORM: Self = Self(1 << 4);
+    /// L2 normalization.
+    pub const L2_NORMALIZE: Self = Self(1 << 5);
+    /// SiLU-gated grouped RMS normalization.
+    pub const SILU_GATED_GROUP_RMS_NORM: Self = Self(1 << 6);
+    /// Segmented attention.
+    pub const SEGMENTED_ATTENTION: Self = Self(1 << 7);
+    /// Gated-delta recurrent scan.
+    pub const GATED_DELTA_SCAN: Self = Self(1 << 8);
+    /// Selective state-space scan.
+    pub const SELECTIVE_STATE_SPACE_SCAN: Self = Self(1 << 9);
+    /// Indexed sparse attention.
+    pub const INDEXED_ATTENTION: Self = Self(1 << 10);
+    /// Dense pooled attention.
+    pub const POOLED_ATTENTION: Self = Self(1 << 11);
+    /// Pooled-position selection.
+    pub const POOLED_POSITION_SELECTION: Self = Self(1 << 12);
+    /// Pooled-mask gathering.
+    pub const POOLED_MASK_GATHER: Self = Self(1 << 13);
+    /// Attention with learned sink logits.
+    pub const ATTENTION_SINKS: Self = Self(1 << 14);
+    /// Learned relative-profile attention.
+    pub const RELATIVE_ATTENTION: Self = Self(1 << 15);
+    /// Joint routed/shared expert selection.
+    pub const JOINT_EXPERT_ROUTING: Self = Self(1 << 16);
+    /// Weightless RMS normalization.
+    pub const RMS_NORM_WITHOUT_WEIGHT: Self = Self(1 << 17);
+    /// Grouped block-diagonal linear projection.
+    pub const GROUPED_LINEAR: Self = Self(1 << 18);
+    /// Tensor-parallel sum reduction.
+    pub const SUM_PARALLEL: Self = Self(1 << 19);
+    /// Every currently declared optional forward operator.
+    pub const ALL: Self = Self((1 << 20) - 1);
+
+    /// Returns the union of two capability sets.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns whether this set contains every required capability.
+    pub const fn contains(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+
+    fn missing_names(self, required: Self) -> Vec<&'static str> {
+        const NAMES: &[(NeuralOperatorCapabilities, &str)] = &[
+            (
+                NeuralOperatorCapabilities::GELU_APPROXIMATE,
+                "gelu_approximate",
+            ),
+            (NeuralOperatorCapabilities::SIGMOID, "sigmoid"),
+            (NeuralOperatorCapabilities::SOFTPLUS, "softplus"),
+            (NeuralOperatorCapabilities::EXP, "exp"),
+            (
+                NeuralOperatorCapabilities::GATED_GROUP_RMS_NORM,
+                "gated_group_rms_norm",
+            ),
+            (NeuralOperatorCapabilities::L2_NORMALIZE, "l2_normalize"),
+            (
+                NeuralOperatorCapabilities::SILU_GATED_GROUP_RMS_NORM,
+                "silu_gated_group_rms_norm",
+            ),
+            (
+                NeuralOperatorCapabilities::SEGMENTED_ATTENTION,
+                "segmented_attention",
+            ),
+            (
+                NeuralOperatorCapabilities::GATED_DELTA_SCAN,
+                "gated_delta_scan",
+            ),
+            (
+                NeuralOperatorCapabilities::SELECTIVE_STATE_SPACE_SCAN,
+                "selective_state_space_scan",
+            ),
+            (
+                NeuralOperatorCapabilities::INDEXED_ATTENTION,
+                "indexed_attention",
+            ),
+            (
+                NeuralOperatorCapabilities::POOLED_ATTENTION,
+                "pooled_attention",
+            ),
+            (
+                NeuralOperatorCapabilities::POOLED_POSITION_SELECTION,
+                "select_pooled_positions",
+            ),
+            (
+                NeuralOperatorCapabilities::POOLED_MASK_GATHER,
+                "gather_pooled_mask",
+            ),
+            (
+                NeuralOperatorCapabilities::ATTENTION_SINKS,
+                "attention_sinks",
+            ),
+            (
+                NeuralOperatorCapabilities::RELATIVE_ATTENTION,
+                "relative_attention",
+            ),
+            (
+                NeuralOperatorCapabilities::JOINT_EXPERT_ROUTING,
+                "joint_expert_routing",
+            ),
+            (
+                NeuralOperatorCapabilities::RMS_NORM_WITHOUT_WEIGHT,
+                "rms_norm_without_weight",
+            ),
+            (NeuralOperatorCapabilities::GROUPED_LINEAR, "grouped_linear"),
+            (NeuralOperatorCapabilities::SUM_PARALLEL, "sum_parallel"),
+        ];
+        NAMES
+            .iter()
+            .filter_map(|(capability, name)| {
+                (required.contains(*capability) && !self.contains(*capability)).then_some(*name)
+            })
+            .collect()
+    }
+}
+
 /// General neural-operator family selected by a shared architecture.
 ///
 /// Associated concrete types make calls statically dispatched. Implementations
 /// retain ownership of tensor storage, fusion, quantization, and collectives.
 pub trait NeuralBackend: Sized + 'static {
+    /// Optional forward operators explicitly supported by this backend.
+    const OPERATOR_CAPABILITIES: NeuralOperatorCapabilities = NeuralOperatorCapabilities::NONE;
+
     /// Backend tensor handle.
     type Tensor: Tensor;
     /// Native affine projection, including packed quantized variants.
@@ -2502,6 +2644,22 @@ pub trait NeuralBackend: Sized + 'static {
     type Rotary: RotaryOperator<Self::Tensor>;
     /// Backend collective context used by tensor-parallel execution.
     type ParallelContext: ?Sized;
+
+    /// Rejects an architecture before module construction when an optional
+    /// forward operator is unavailable.
+    fn require_operator_capabilities(
+        architecture: &'static str,
+        required: NeuralOperatorCapabilities,
+    ) -> Result<(), Error> {
+        let available = Self::OPERATOR_CAPABILITIES;
+        if available.contains(required) {
+            return Ok(());
+        }
+        Err(Error::backend(format!(
+            "{architecture} requires unsupported backend operators: {}",
+            available.missing_names(required).join(", ")
+        )))
+    }
 
     /// Builds one affine projection.
     fn linear(

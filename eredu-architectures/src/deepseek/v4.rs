@@ -472,6 +472,10 @@ where
 
     /// Builds unloaded pinned V4 modules.
     pub fn new(args: V4Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "DeepSeek-V4",
+            crate::operator_requirements::DEEPSEEK_V4,
+        )?;
         args.validate().map_err(Error::backend)?;
         let text = TextStaticModules::from_spec(text_static_spec(&args), context)?;
         Ok(Self {
@@ -488,6 +492,11 @@ where
         geometry: super::parallel::V4LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "DeepSeek-V4",
+            crate::operator_requirements::DEEPSEEK_V4
+                .union(eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL),
+        )?;
         args.validate().map_err(Error::backend)?;
         geometry.validate_for(&args).map_err(Error::backend)?;
         let text = TextStaticModules::from_parallel_spec(

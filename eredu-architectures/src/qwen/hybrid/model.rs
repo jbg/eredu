@@ -181,6 +181,10 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         config: HybridConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Qwen hybrid",
+            crate::operator_requirements::QWEN_HYBRID,
+        )?;
         config.validate().map_err(Error::backend)?;
         let target_layers = usize::try_from(config.num_hidden_layers).map_err(Error::backend)?;
         let prediction_steps =
@@ -327,6 +331,10 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Qwen hybrid tensor parallelism",
+            eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
+        )?;
         geometry.validate_for(&config).map_err(Error::backend)?;
         let mut model = Self::new(config.clone(), context)?;
         *model.decoder.static_modules_mut() = crate::decoder::StaticModules::from_parallel_spec(

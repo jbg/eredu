@@ -15,6 +15,8 @@
 
 /// Portable model capabilities and scalar runtime-state estimates.
 pub mod capability;
+/// Optional backend operators required by each architecture family.
+pub mod operator_requirements;
 
 /// Shared decoder mechanics used by backend-neutral text architectures.
 pub mod decoder;

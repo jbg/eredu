@@ -1560,6 +1560,9 @@ impl ParameterBackend for MlxBackend {
 }
 
 impl NeuralBackend for MlxBackend {
+    const OPERATOR_CAPABILITIES: eredu_nn::NeuralOperatorCapabilities =
+        eredu_nn::NeuralOperatorCapabilities::ALL;
+
     type Tensor = MlxTensor;
     type Linear = MlxLinear;
     type Embedding = MlxEmbedding;
@@ -2999,6 +3002,7 @@ impl eredu_nn::AuxiliaryConvolutionState<MlxTensor>
 #[cfg(test)]
 mod neutral_semantic_operator_tests {
     use eredu_architectures::decoder::{MultiTableEmbedding, NamedEmbeddingSpec};
+    use eredu_architectures::operator_requirements;
     use eredu_checkpoint::{AffineQuantization, LinearFormat, WeightQuantization};
     use eredu_nn::{
         reference_expand_heads, reference_segmented_attention, EmbeddingLookupPolicy,
@@ -3017,6 +3021,25 @@ mod neutral_semantic_operator_tests {
     use crate::backend::mlx::nn::tensor::TokenValidationScope;
 
     use super::{MlxBackend, MlxEmbedding, MlxLinear, MlxTensor};
+
+    #[test]
+    fn mlx_declares_every_supported_architecture_operator_set() {
+        let declared = <MlxBackend as NeuralBackend>::OPERATOR_CAPABILITIES;
+        for required in [
+            operator_requirements::KIMI_LINEAR,
+            operator_requirements::QWEN_HYBRID,
+            operator_requirements::NEMOTRON_H,
+            operator_requirements::QWEN_VISION,
+            operator_requirements::DEEPSEEK_V4,
+            operator_requirements::INKLING,
+            operator_requirements::GEMMA4,
+            operator_requirements::MUSE_GLIMMER,
+            eredu_nn::NeuralOperatorCapabilities::ATTENTION_SINKS,
+            eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
+        ] {
+            assert!(declared.contains(required));
+        }
+    }
 
     fn close(actual: &MlxTensor, expected: &[f32], tolerance: f32) {
         let actual = actual.as_array().evaluated().unwrap();

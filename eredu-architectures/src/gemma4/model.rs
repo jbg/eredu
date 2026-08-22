@@ -422,6 +422,10 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         args: FamilyConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Gemma 4",
+            crate::operator_requirements::GEMMA4,
+        )?;
         let text = model_text::StaticTextModules::new(&args.text, context)?;
         Self::with_text(args, text, None, context)
     }
@@ -432,6 +436,10 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Gemma 4",
+            crate::operator_requirements::GEMMA4,
+        )?;
         args.validate().map_err(Error::backend)?;
         geometry.validate_for(&args).map_err(Error::backend)?;
         let text = model_text::StaticTextModules::new_parallel(&args.text, &geometry, context)?;

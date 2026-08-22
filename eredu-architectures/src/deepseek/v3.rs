@@ -213,6 +213,10 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
         geometry: super::parallel::V3LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "DeepSeek-V3 tensor parallelism",
+            eredu_nn::NeuralOperatorCapabilities::SUM_PARALLEL,
+        )?;
         args.validate().map_err(Error::backend)?;
         geometry.validate_for(&args).map_err(Error::backend)?;
         let static_modules = StaticModules::from_parallel_spec(

@@ -458,6 +458,10 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
 
     /// Builds unloaded modules with their canonical checkpoint identities.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Qwen3-VL",
+            crate::operator_requirements::QWEN_VISION,
+        )?;
         let text = qwen::StaticModules::new(&args.text, context)?;
         let vision = VisionStatic::new_with_root(
             args.vision.clone(),
@@ -478,6 +482,10 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Qwen3-VL",
+            crate::operator_requirements::QWEN_VISION,
+        )?;
         geometry.validate_for(&args).map_err(Error::backend)?;
         let text = qwen::StaticModules::new_parallel(&args.text, geometry.text(), context)?;
         let vision = VisionStatic::new_parallel_with_root(

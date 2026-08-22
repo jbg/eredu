@@ -73,6 +73,10 @@ where
 {
     /// Builds unloaded static modules and validates the complete schedule.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Kimi Linear",
+            crate::operator_requirements::KIMI_LINEAR,
+        )?;
         args.validate().map_err(Error::backend)?;
         let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
         let static_modules = StaticModules::from_spec(Self::static_spec(&args), context)?;
@@ -91,6 +95,10 @@ where
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Kimi Linear",
+            crate::operator_requirements::KIMI_LINEAR,
+        )?;
         args.validate().map_err(Error::backend)?;
         geometry.validate_for(&args).map_err(Error::backend)?;
         let layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;

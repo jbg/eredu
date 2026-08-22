@@ -926,6 +926,12 @@ impl<B: NeuralBackend> Attention<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        if config.learned_attention_sinks() {
+            crate::operator_requirements::require::<B>(
+                "shared decoder attention sinks",
+                eredu_nn::NeuralOperatorCapabilities::ATTENTION_SINKS,
+            )?;
+        }
         let fields = config.block_parameter_fields().validate()?;
         let prefix = format!(
             "{}.layers.{layer}.{}",
@@ -2684,6 +2690,12 @@ where
     /// Builds unloaded pinned modules from normalized architecture arguments.
     pub fn new(args: C, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
         args.validate_config()?;
+        if args.learned_attention_sinks() {
+            crate::operator_requirements::require::<B>(
+                "shared decoder attention sinks",
+                eredu_nn::NeuralOperatorCapabilities::ATTENTION_SINKS,
+            )?;
+        }
         let static_modules = StaticModules::new(&args, context)?;
         Ok(Self {
             args,
@@ -2700,6 +2712,12 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         args.validate_config()?;
+        if args.learned_attention_sinks() {
+            crate::operator_requirements::require::<B>(
+                "shared decoder attention sinks",
+                eredu_nn::NeuralOperatorCapabilities::ATTENTION_SINKS,
+            )?;
+        }
         geometry.validate_for(&args).map_err(Error::backend)?;
         let static_modules = StaticModules::new_parallel(&args, &geometry, context)?;
         Ok(Self {

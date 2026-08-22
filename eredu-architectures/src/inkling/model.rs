@@ -335,6 +335,10 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
 
     /// Builds unloaded pinned modules from normalized family configuration.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Inkling",
+            crate::operator_requirements::INKLING,
+        )?;
         let static_modules = StaticModules::new(&args, context)?;
         Ok(Self {
             args,
@@ -349,6 +353,10 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         geometry: Arc<LocalGeometry>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Inkling",
+            crate::operator_requirements::INKLING,
+        )?;
         geometry.validate_for(&args).map_err(Error::backend)?;
         let static_modules = StaticModules::new_parallel(&args, &geometry, context)?;
         Ok(Self {

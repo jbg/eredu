@@ -192,6 +192,10 @@ pub struct LayeredModel<B: RoutedNeuralBackend> {
 impl<B: RoutedNeuralBackend> LayeredModel<B> {
     /// Builds unloaded static modules and validates target plus MTP schedules.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Nemotron-H",
+            crate::operator_requirements::NEMOTRON_H,
+        )?;
         args.validate().map_err(Error::backend)?;
         let (target_units, prediction_steps, prediction_pattern) = Self::schedule(&args)?;
         let static_modules = StaticModules::from_spec(Self::static_spec(&args), context)?;
@@ -219,6 +223,10 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Nemotron-H",
+            crate::operator_requirements::NEMOTRON_H,
+        )?;
         args.validate().map_err(Error::backend)?;
         geometry.validate_for(&args).map_err(Error::backend)?;
         let (target_units, prediction_steps, prediction_pattern) = Self::schedule(&args)?;

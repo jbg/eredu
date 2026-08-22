@@ -156,6 +156,10 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         args: DecoderConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Muse-Glimmer",
+            crate::operator_requirements::MUSE_GLIMMER,
+        )?;
         let static_modules = StaticModules {
             text: TextStaticModules::new(&args, context)?,
             vision: VisionStatic::new(args.vision_config.clone(), context)?,
@@ -173,6 +177,10 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         geometry: LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Muse-Glimmer",
+            crate::operator_requirements::MUSE_GLIMMER,
+        )?;
         geometry.validate_for(&args).map_err(Error::backend)?;
         let static_modules = StaticModules {
             text: TextStaticModules::new_parallel(&args, &geometry, context)?,

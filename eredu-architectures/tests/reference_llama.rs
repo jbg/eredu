@@ -1152,18 +1152,15 @@ fn shared_decoder_parallel_geometry_rejects_cross_config_reuse() {
         "swiglu_limit": 7.0
     }))
     .unwrap();
-    let gpt_model = gpt_oss::LayeredModel::<ReferenceBackend>::new(gpt_args.clone(), &()).unwrap();
-    let mut gpt_groups =
-        gpt_oss::static_parameter_groups(gpt_model.static_modules(), &gpt_args).unwrap();
-    let gpt_unit = gpt_model.construct_unit(0, &()).unwrap();
-    gpt_groups.extend(gpt_oss::layer_parallel_parameter_groups(&gpt_unit, &gpt_args, 0).unwrap());
-    let gpt_geometry =
-        gpt_oss::local_geometry(&gpt_args, &replicated_parallel_layout(&gpt_groups)).unwrap();
-    let mut changed_gpt = gpt_args;
-    changed_gpt.rms_norm_eps = 0.00002;
-    assert_geometry_identity_error(
-        gpt_oss::LayeredModel::<ReferenceBackend>::new_parallel(changed_gpt, gpt_geometry, &()),
-        "GPT-OSS",
+    let error = match gpt_oss::LayeredModel::<ReferenceBackend>::new(gpt_args, &()) {
+        Ok(_) => panic!("GPT-OSS unexpectedly composed without attention-sink support"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("requires unsupported backend operators: attention_sinks"),
+        "unexpected capability error: {error}"
     );
 }
 

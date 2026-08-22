@@ -74,6 +74,13 @@ backends select the loaded architecture estimate, apply their physical state
 scalar width, and add live allocator, residency, and system-memory
 observations; they do not reconstruct family state geometry.
 
+Backend types also declare the optional neural forward operators they support.
+Architecture constructors preflight family-owned operator requirement sets
+before allocating modules or loading parameters, so a missing recurrent scan,
+sparse-attention primitive, normalization, activation, or collective rejects
+composition instead of failing on the first forward pass. Concrete backends
+must keep that declaration aligned with their `NeuralBackend` implementation.
+
 A backend owns runtime-specific resources and computation:
 
 - tensors, neural operators, queues or streams, random state, and sampling math;

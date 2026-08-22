@@ -502,6 +502,11 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
         parsed: ParsedHybridConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Qwen hybrid conditional",
+            crate::operator_requirements::QWEN_HYBRID
+                .union(crate::operator_requirements::QWEN_VISION),
+        )?;
         let vision = parsed
             .vision
             .clone()
@@ -575,6 +580,11 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
         geometry: ConditionalLocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::operator_requirements::require::<B>(
+            "Qwen hybrid conditional",
+            crate::operator_requirements::QWEN_HYBRID
+                .union(crate::operator_requirements::QWEN_VISION),
+        )?;
         geometry.validate_for(&parsed).map_err(Error::backend)?;
         let vision_config = parsed
             .vision

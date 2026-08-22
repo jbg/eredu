@@ -2662,6 +2662,9 @@ impl BlockwiseAttentionBackend for NumericBackend {
 }
 
 impl NeuralBackend for NumericBackend {
+    const OPERATOR_CAPABILITIES: eredu_nn::NeuralOperatorCapabilities =
+        eredu_nn::NeuralOperatorCapabilities::ALL;
+
     type Tensor = NumericTensor;
     type Linear = NumericLinear;
     type Embedding = NumericEmbedding;
