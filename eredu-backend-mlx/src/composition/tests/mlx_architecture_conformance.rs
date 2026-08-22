@@ -1,17 +1,116 @@
 //! MLX composition conformance for backend-neutral architecture operators.
 
 use eredu_nn::Tensor;
-use eredu_runtime::{LayeredArchitecture, LayeredForwardState};
+use eredu_runtime::{DeviceState, LayeredArchitecture, LayeredForwardState};
 use safemlx::{Array, Device, DeviceType, ExecutionContext};
+use std::sync::OnceLock;
 
 use crate::backend::mlx::{
     nn::shared::MlxBackend,
-    runtime::cache::state::{MlxHybridState, MlxKeyValueState},
+    runtime::cache::{
+        state::{MlxHybridState, MlxKeyValueState, MlxPoolingAttentionStateFactory},
+        CompressedLatentCache,
+    },
 };
 use crate::MlxTensor;
 
+fn mlx_execution() -> Option<ExecutionContext> {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    let available = AVAILABLE.get_or_init(|| {
+        match safemlx::metal::is_available() {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => panic!("MLX Metal availability probe failed: {error}"),
+        }
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        match safemlx::ops::zeros::<f32>(&[1], execution.stream())
+            .and_then(|probe| probe.evaluated().map(|_| ()))
+        {
+            Ok(()) => true,
+            Err(error) if error.what().contains("No Metal device available") => false,
+            Err(error) => panic!("MLX execution probe failed: {error}"),
+        }
+    });
+    if !available {
+        eprintln!("skipping MLX execution conformance: native device initialization failed");
+        return None;
+    }
+    Some(ExecutionContext::new(Device::new(DeviceType::Cpu, 0)))
+}
+
+macro_rules! execute_target_group {
+    ($architecture_ty:ty, $state_ty:ty, $architecture:expr, $state:expr, $input:expr, $shape:expr, $stream:expr) => {{
+        let LayeredForwardState {
+            hidden: initial,
+            mut context,
+        } = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::begin_forward(
+            &mut $architecture,
+            $input,
+            &mut $state,
+            $stream,
+        )
+        .unwrap();
+        let mut hidden = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::begin_execution_group(
+            &mut $architecture,
+            0,
+            &initial,
+            &[],
+            &mut $state,
+            &mut context,
+            $stream,
+        )
+        .unwrap();
+        let unit_count =
+            <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::group_unit_count(
+                &$architecture,
+                0,
+            )
+            .unwrap();
+        for index in 0..unit_count {
+            let mut unit =
+                <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::build_unit(
+                    &$architecture,
+                    0,
+                    index,
+                    $stream,
+                )
+                .unwrap();
+            hidden =
+                <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::forward_unit(
+                    &mut $architecture,
+                    0,
+                    index,
+                    &mut unit,
+                    &hidden,
+                    &mut $state,
+                    &mut context,
+                    $stream,
+                )
+                .unwrap();
+        }
+        hidden = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::complete_execution_group(
+            &mut $architecture,
+            0,
+            &hidden,
+            &mut $state,
+            &mut context,
+            $stream,
+        )
+        .unwrap();
+        let logits = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::finish_forward(
+            &mut $architecture,
+            &hidden,
+            &mut $state,
+            &context,
+            $stream,
+        )
+        .unwrap();
+        assert_eq!(logits.shape(), $shape);
+        logits.as_array().evaluated().unwrap();
+    }};
+}
+
 #[test]
-#[ignore = "initializes MLX and executes a neutral family forward"]
 fn neutral_gemma4_text_forward_monomorphizes_on_mlx() {
     type Architecture = eredu_architectures::gemma4::LayeredModel<MlxBackend>;
     let args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
@@ -26,7 +125,9 @@ fn neutral_gemma4_text_forward_monomorphizes_on_mlx() {
         .unwrap(),
     )
     .unwrap();
-    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -92,7 +193,6 @@ fn neutral_gemma4_text_forward_monomorphizes_on_mlx() {
 }
 
 #[test]
-#[ignore = "initializes MLX and executes a neutral family forward"]
 fn neutral_inkling_text_forward_monomorphizes_on_mlx() {
     type Architecture = eredu_architectures::inkling::LayeredModel<MlxBackend>;
     let args = eredu_architectures::inkling::ModelArgs::from_hf_json(
@@ -108,7 +208,9 @@ fn neutral_inkling_text_forward_monomorphizes_on_mlx() {
         .unwrap(),
     )
     .unwrap();
-    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -173,7 +275,6 @@ fn neutral_inkling_text_forward_monomorphizes_on_mlx() {
 }
 
 #[test]
-#[ignore = "initializes MLX and executes a neutral family forward"]
 fn neutral_muse_glimmer_text_forward_monomorphizes_on_mlx() {
     type Architecture = eredu_architectures::muse_glimmer::LayeredModel<MlxBackend>;
     let args = eredu_architectures::muse_glimmer::DecoderConfig::from_hf_json(
@@ -200,7 +301,9 @@ fn neutral_muse_glimmer_text_forward_monomorphizes_on_mlx() {
         .unwrap(),
     )
     .unwrap();
-    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
     let stream = execution.stream();
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut state =
@@ -264,4 +367,332 @@ fn neutral_muse_glimmer_text_forward_monomorphizes_on_mlx() {
         .unwrap();
     assert_eq!(logits.shape(), &[1, 2, 32]);
     logits.as_array().evaluated().unwrap();
+}
+
+#[test]
+fn neutral_llama_forward_executes_on_mlx() {
+    type Architecture = eredu_architectures::llama::LayeredModel<MlxBackend>;
+    let args = eredu_architectures::llama::model_args_from_config_value(&serde_json::json!({
+        "model_type":"llama","hidden_size":16,"num_hidden_layers":1,
+        "intermediate_size":32,"num_attention_heads":4,"num_key_value_heads":2,
+        "head_dim":4,"rms_norm_eps":1e-5,"vocab_size":32,
+        "max_position_embeddings":64,"rope_theta":10000.0,"tie_word_embeddings":true
+    }))
+    .unwrap();
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
+    let stream = execution.stream();
+    let mut architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut state =
+        MlxKeyValueState::device(eredu_architectures::llama::state_layout(&args).unwrap()).unwrap();
+    let tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
+    execute_target_group!(
+        Architecture,
+        MlxKeyValueState,
+        architecture,
+        state,
+        eredu_architectures::llama::LayeredInput {
+            tokens: &tokens,
+            mask: None,
+        },
+        &[1, 2, 32],
+        stream
+    );
+}
+
+#[test]
+fn neutral_qwen_forward_executes_on_mlx() {
+    type Architecture = eredu_architectures::qwen::LayeredModel<MlxBackend>;
+    let args = eredu_architectures::qwen::model_args_from_config_value(&serde_json::json!({
+        "model_type":"qwen3","hidden_size":16,"num_hidden_layers":1,
+        "intermediate_size":32,"num_attention_heads":4,"num_key_value_heads":2,
+        "head_dim":4,"rms_norm_eps":1e-6,"vocab_size":32,
+        "max_position_embeddings":64,"rope_theta":1000000.0,"tie_word_embeddings":true
+    }))
+    .unwrap();
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
+    let stream = execution.stream();
+    let mut architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut state =
+        MlxKeyValueState::device(eredu_architectures::qwen::state_layout(&args).unwrap()).unwrap();
+    let tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
+    execute_target_group!(
+        Architecture,
+        MlxKeyValueState,
+        architecture,
+        state,
+        eredu_architectures::qwen::LayeredInput {
+            tokens: &tokens,
+            mask: None,
+        },
+        &[1, 2, 32],
+        stream
+    );
+}
+
+#[test]
+fn neutral_gpt_oss_forward_executes_on_mlx() {
+    type Architecture = eredu_architectures::gpt_oss::LayeredModel<MlxBackend>;
+    let args = eredu_architectures::gpt_oss::model_args_from_config_value(&serde_json::json!({
+        "model_type":"gpt_oss","hidden_size":32,"intermediate_size":32,
+        "num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":2,
+        "head_dim":8,"vocab_size":32,"num_local_experts":2,
+        "num_experts_per_tok":1,"rms_norm_eps":1e-5,"sliding_window":8,
+        "max_position_embeddings":64,"rope_theta":10000.0,
+        "quantization_config":{"quant_method":"mxfp4"},"swiglu_limit":7.0,
+        "layer_types":["full_attention"]
+    }))
+    .unwrap();
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
+    let stream = execution.stream();
+    let mut architecture =
+        eredu_architectures::gpt_oss::new_layered_model::<MlxBackend>(args.clone(), stream)
+            .unwrap();
+    let mut state =
+        MlxKeyValueState::device(eredu_architectures::gpt_oss::state_layout(&args).unwrap())
+            .unwrap();
+    let tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
+    execute_target_group!(
+        Architecture,
+        MlxKeyValueState,
+        architecture,
+        state,
+        eredu_architectures::decoder::LayeredInput {
+            tokens: &tokens,
+            mask: None,
+        },
+        &[1, 2, 32],
+        stream
+    );
+}
+
+#[test]
+fn neutral_kimi_linear_forward_executes_on_mlx() {
+    type Architecture = eredu_architectures::kimi_linear::LayeredModel<MlxBackend>;
+    let args = eredu_architectures::kimi_linear::model_args_from_config_value(&serde_json::json!({
+        "model_type":"kimi_linear","vocab_size":32,"hidden_size":12,
+        "num_hidden_layers":2,"num_attention_heads":3,"num_key_value_heads":3,
+        "intermediate_size":17,"head_dim":4,"model_max_length":64,
+        "linear_attn_config":{"kda_layers":[1],"full_attn_layers":[2],
+            "num_heads":3,"head_dim":4,"short_conv_kernel_size":3},
+        "num_experts":2,"moe_intermediate_size":9,"kv_lora_rank":6,
+        "qk_nope_head_dim":4,"qk_rope_head_dim":2,"v_head_dim":4,
+        "mla_use_nope":true,"num_experts_per_token":1,"num_shared_experts":1,
+        "routed_scaling_factor":1.0,"first_k_dense_replace":1,
+        "num_expert_group":1,"topk_group":1
+    }))
+    .unwrap();
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
+    let stream = execution.stream();
+    let mut architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut state =
+        MlxHybridState::device(eredu_architectures::kimi_linear::state_layout(&args).unwrap())
+            .unwrap();
+    let tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
+    execute_target_group!(
+        Architecture,
+        MlxHybridState,
+        architecture,
+        state,
+        eredu_architectures::decoder::LayeredInput {
+            tokens: &tokens,
+            mask: None,
+        },
+        &[1, 2, 32],
+        stream
+    );
+}
+
+#[test]
+fn neutral_lfm2_forward_executes_on_mlx() {
+    type Architecture = eredu_architectures::lfm2::LayeredModel<MlxBackend>;
+    let args = eredu_architectures::lfm2::model_args_from_config_value(&serde_json::json!({
+        "model_type":"lfm2","vocab_size":32,"hidden_size":16,
+        "intermediate_size":32,"num_hidden_layers":2,"num_attention_heads":4,
+        "num_key_value_heads":2,"max_position_embeddings":64,
+        "layer_types":["conv","full_attention"],"conv_L_cache":3,
+        "block_multiple_of":8,"block_ffn_dim_multiplier":1.0,
+        "block_auto_adjust_ff_dim":true,"tie_word_embeddings":false
+    }))
+    .unwrap();
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
+    let stream = execution.stream();
+    let mut architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut state =
+        MlxHybridState::device(eredu_architectures::lfm2::state_layout(&args).unwrap()).unwrap();
+    let tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
+    execute_target_group!(
+        Architecture,
+        MlxHybridState,
+        architecture,
+        state,
+        eredu_architectures::decoder::LayeredInput {
+            tokens: &tokens,
+            mask: None,
+        },
+        &[1, 2, 32],
+        stream
+    );
+}
+
+#[test]
+fn neutral_nemotron_h_forward_executes_on_mlx() {
+    type Architecture = eredu_architectures::nemotron_h::LayeredModel<MlxBackend>;
+    let args = eredu_architectures::nemotron_h::model_args_from_config_value(&serde_json::json!({
+        "model_type":"nemotron_h","vocab_size":32,"hidden_size":16,
+        "intermediate_size":24,"num_hidden_layers":4,
+        "hybrid_override_pattern":"M*-E","num_attention_heads":4,
+        "num_key_value_heads":2,"head_dim":4,"mamba_num_heads":4,
+        "n_groups":2,"mamba_head_dim":4,"ssm_state_size":3,"conv_kernel":3,
+        "n_routed_experts":4,"n_shared_experts":1,"moe_intermediate_size":8,
+        "moe_shared_expert_intermediate_size":8,"num_experts_per_tok":2,
+        "n_group":2,"topk_group":1,"num_nextn_predict_layers":1,
+        "mtp_hybrid_override_pattern":"*E"
+    }))
+    .unwrap();
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
+    let stream = execution.stream();
+    let mut architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut state =
+        MlxHybridState::device(eredu_architectures::nemotron_h::state_layout(&args).unwrap())
+            .unwrap();
+    let tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
+    execute_target_group!(
+        Architecture,
+        MlxHybridState,
+        architecture,
+        state,
+        eredu_architectures::nemotron_h::EmbeddedInput::target(&tokens, None),
+        &[1, 2, 32],
+        stream
+    );
+}
+
+#[test]
+fn neutral_deepseek_v3_forward_executes_on_mlx() {
+    type Architecture = eredu_architectures::deepseek::v3::Model<MlxBackend>;
+    type State = DeviceState<MlxBackend, CompressedLatentCache>;
+    let args = eredu_architectures::deepseek::parse_v3_config(&serde_json::json!({
+        "hidden_size":8,"intermediate_size":16,"moe_intermediate_size":8,
+        "num_hidden_layers":2,"num_attention_heads":2,"vocab_size":31,
+        "max_position_embeddings":64,"kv_lora_rank":4,"qk_nope_head_dim":2,
+        "qk_rope_head_dim":2,"v_head_dim":2,"first_k_dense_replace":1,
+        "n_routed_experts":4,"n_shared_experts":1,"num_experts_per_tok":2,
+        "n_group":2,"topk_group":1,"num_nextn_predict_layers":1,
+        "tie_word_embeddings":false
+    }))
+    .unwrap();
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
+    let stream = execution.stream();
+    let mut architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut state = State::create(
+        eredu_architectures::deepseek::v3::state_layout(&args).unwrap(),
+        |_, _| Ok::<_, std::convert::Infallible>(CompressedLatentCache::new()),
+    )
+    .unwrap();
+    let tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
+    execute_target_group!(
+        Architecture,
+        State,
+        architecture,
+        state,
+        eredu_architectures::deepseek::mtp::EmbeddedInput::target(&tokens, None),
+        &[1, 2, 31],
+        stream
+    );
+}
+
+#[test]
+fn neutral_deepseek_v4_forward_executes_on_mlx() {
+    type Architecture = eredu_architectures::deepseek::v4::Model<MlxBackend>;
+    type State = crate::backend::mlx::runtime::cache::state::MlxPoolingAttentionState;
+    let args = eredu_architectures::deepseek::parse_v4_config(&serde_json::json!({
+        "hidden_size":8,"moe_intermediate_size":8,"num_hidden_layers":3,
+        "num_attention_heads":2,"head_dim":4,"qk_rope_head_dim":2,
+        "q_lora_rank":4,"o_lora_rank":2,"o_groups":2,"vocab_size":31,
+        "max_position_embeddings":64,"sliding_window":8,
+        "compress_ratios":[0,4,128,0],"index_n_heads":2,"index_head_dim":4,
+        "index_topk":1,"hc_mult":2,"hc_sinkhorn_iters":2,
+        "n_routed_experts":4,"num_experts_per_tok":2,
+        "scoring_func":"sqrtsoftplus","topk_method":"noaux_tc",
+        "norm_topk_prob":true,"num_nextn_predict_layers":1
+    }))
+    .unwrap();
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
+    let stream = execution.stream();
+    let mut architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut state = MlxPoolingAttentionStateFactory::device(
+        eredu_architectures::deepseek::v4::state_layout(&args).unwrap(),
+    )
+    .unwrap();
+    let tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
+    execute_target_group!(
+        Architecture,
+        State,
+        architecture,
+        state,
+        eredu_architectures::deepseek::mtp::EmbeddedInput::target(&tokens, None),
+        &[1, 2, 31],
+        stream
+    );
+}
+
+#[test]
+fn neutral_moshi_forward_executes_on_mlx() {
+    type Architecture = eredu_architectures::moshi::LayeredModel<MlxBackend>;
+    let config = eredu_architectures::moshi::MoshiConfig::from_json(
+        r#"{
+            "model_type":"moshi","dim":16,"text_card":31,
+            "n_q":4,"dep_q":3,"generated_audio_codebooks":2,"card":32,
+            "num_heads":4,"num_layers":1,"dim_feedforward":24,
+            "causal":true,"context":7,"max_period":10000.0,
+            "positional_embedding":"rope","depformer_dim":16,
+            "depformer_dim_feedforward":24,"depformer_num_heads":4,
+            "depformer_num_layers":1,"depformer_context":3,
+            "depformer_max_period":10000.0,"depformer_pos_emb":"none",
+            "delays":[0,0,1,2,1]
+        }"#,
+    )
+    .unwrap();
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
+    let stream = execution.stream();
+    let mut architecture = Architecture::new(config.clone(), stream).unwrap();
+    let mut state =
+        MlxKeyValueState::device(eredu_architectures::moshi::state_layout(&config).unwrap())
+            .unwrap();
+    let text = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
+    let audio_tokens = (0..4)
+        .map(|_| MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2])))
+        .collect::<Vec<_>>();
+    let audio = audio_tokens.iter().collect::<Vec<_>>();
+    execute_target_group!(
+        Architecture,
+        MlxKeyValueState,
+        architecture,
+        state,
+        eredu_architectures::moshi::Input {
+            text: &text,
+            audio: &audio,
+            mask: None,
+        },
+        &[1, 2, 31],
+        stream
+    );
 }
