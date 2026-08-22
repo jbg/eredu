@@ -78,6 +78,14 @@ impl HybridVariant {
             Self::Qwen3Next => "qwen3_next",
         }
     }
+
+    fn from_qwen35_model_type(model_type: &str) -> Option<Self> {
+        match model_type {
+            "qwen3_5" | "qwen3_5_text" => Some(Self::Qwen35Dense),
+            "qwen3_5_moe" | "qwen3_5_moe_text" => Some(Self::Qwen35Moe),
+            _ => None,
+        }
+    }
 }
 
 /// Normalized Qwen3-Next/Qwen3.5 text configuration.
@@ -532,14 +540,16 @@ pub fn model_args_from_config_value(
     };
     let (source, variant) = match top_model_type.as_str() {
         "qwen3_5" | "qwen3_5_moe" => {
-            let variant = if top_model_type == "qwen3_5" {
-                HybridVariant::Qwen35Dense
-            } else {
-                HybridVariant::Qwen35Moe
-            };
             let source = top.text_config.take().ok_or_else(|| {
                 invalid(format!("{top_model_type} config is missing text_config"))
             })?;
+            let variant =
+                HybridVariant::from_qwen35_model_type(&source.model_type).ok_or_else(|| {
+                    invalid(format!(
+                        "{top_model_type} has unsupported nested text model type {:?}",
+                        source.model_type
+                    ))
+                })?;
             (source, variant)
         }
         "qwen3_5_text" | "qwen3_5_moe_text" => {
@@ -563,7 +573,12 @@ pub fn model_args_from_config_value(
         .ok()
         .filter(|count| *count > 0)
         .ok_or_else(|| invalid("num_hidden_layers must be positive"))?;
-    if source.model_type != variant.model_type() {
+    let matching_source_type = if variant == HybridVariant::Qwen3Next {
+        source.model_type == variant.model_type()
+    } else {
+        HybridVariant::from_qwen35_model_type(&source.model_type) == Some(variant)
+    };
+    if !matching_source_type {
         return Err(invalid(format!(
             "{} requires nested text model type {:?}, got {:?}",
             top_model_type,
@@ -1323,6 +1338,20 @@ mod tests {
         let conditional = model_args_from_config_value(&conditional).unwrap();
         assert_eq!(conditional.text.variant, HybridVariant::Qwen35Moe);
         assert!(conditional.vision.is_some());
+    }
+
+    #[test]
+    fn generic_qwen35_wrapper_uses_nested_moe_architecture() {
+        let mut nested = text_config("qwen3_5_moe");
+        nested["intermediate_size"] = json!(0);
+        let parsed = model_args_from_config_value(&json!({
+            "model_type": "qwen3_5",
+            "text_config": nested
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.text.variant, HybridVariant::Qwen35Moe);
+        assert!(parsed.text.is_moe());
     }
 
     #[test]

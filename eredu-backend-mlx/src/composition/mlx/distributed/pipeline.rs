@@ -13347,6 +13347,85 @@ where
     })
 }
 
+fn validate_pipeline_parallel_capabilities(
+    plan: eredu_architectures::preparation::ParallelCapabilityPlan,
+    topology: MlxParallelContext,
+    expert_cache: bool,
+    artifact: &str,
+    architecture: &str,
+) -> Result<(), Error> {
+    let unsupported = |capability: &str| {
+        Error::Parallel(format!(
+            "{artifact} architecture {architecture:?} has no architecture-owned {capability} plan; no checkpoint payload was materialized"
+        ))
+    };
+    if !plan.pipeline_parallel() {
+        return Err(unsupported("pipeline-parallel"));
+    }
+    if topology.tensor_parallel_size > 1 && !plan.tensor_parallel() {
+        return Err(unsupported("tensor-parallel"));
+    }
+    if topology.expert_parallel_size > 1 && !plan.expert_parallel() {
+        return Err(unsupported("expert-parallel"));
+    }
+    if expert_cache && !plan.independent_expert_residency() {
+        return Err(unsupported("independent expert-residency"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
+    let config = serde_json::json!({
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_moe",
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "max_position_embeddings": 128,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 8,
+            "linear_value_head_dim": 8,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "intermediate_size": 0,
+            "moe_intermediate_size": 16,
+            "shared_expert_intermediate_size": 24,
+            "num_experts_per_tok": 2,
+            "num_experts": 8,
+            "layer_types": [
+                "linear_attention", "linear_attention", "linear_attention", "full_attention"
+            ]
+        }
+    });
+    let resolved = eredu_core::resolve_model_configuration(&config).unwrap();
+    assert_eq!(resolved.effective_model_type, "qwen3_5_moe");
+    let capabilities =
+        eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config).unwrap();
+    let topology = MlxParallelContext::for_rank(
+        0,
+        2,
+        2,
+        2,
+        crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+    )
+    .unwrap();
+
+    validate_pipeline_parallel_capabilities(
+        capabilities.parallel_plan(),
+        topology,
+        true,
+        "SafeTensors",
+        &resolved.effective_model_type,
+    )
+    .unwrap();
+}
+
 /// Materializes an executable rank-local Cartesian pipeline stage for the MLX backend.
 ///
 /// Llama/Mistral, DeepSeek-V3/R1/V4, Inkling, Kimi Linear, Qwen, Qwen3-VL, GPT-OSS,
@@ -13396,109 +13475,16 @@ pub fn load_pipeline_model_with_options(
         let checkpoint = GgufCheckpoint::open(model_dir)?;
         let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let architecture = pipeline_gguf_architecture(&metadata)?;
-        if expert_cache.is_some()
-            && !matches!(
-                architecture,
-                eredu_core::GgufArchitecture::DeepSeek2
-                    | eredu_core::GgufArchitecture::DeepSeek4
-                    | eredu_core::GgufArchitecture::Qwen3Moe
-                    | eredu_core::GgufArchitecture::Qwen3VlMoe
-                    | eredu_core::GgufArchitecture::KimiLinear
-                    | eredu_core::GgufArchitecture::Inkling
-                    | eredu_core::GgufArchitecture::GptOss
-                    | eredu_core::GgufArchitecture::Gemma4
-                    | eredu_core::GgufArchitecture::Lfm2Moe
-                    | eredu_core::GgufArchitecture::NemotronHMoe
-                    | eredu_core::GgufArchitecture::Qwen35Moe
-                    | eredu_core::GgufArchitecture::Qwen3Next
-                    | eredu_core::GgufArchitecture::MuseGlimmer
-            )
-        {
-            return Err(Error::Parallel(format!(
-                "pipeline independent expert caching has registered DeepSeek-V3/R1/V4, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
-                architecture.metadata_name()
-            )));
-        }
-        if topology.tensor_parallel_size > 1
-            && topology.pipeline_parallel_size > 1
-            && topology.expert_parallel_size > 1
-            && !matches!(
-                architecture,
-                eredu_core::GgufArchitecture::DeepSeek2
-                    | eredu_core::GgufArchitecture::DeepSeek4
-                    | eredu_core::GgufArchitecture::Qwen3Moe
-                    | eredu_core::GgufArchitecture::Qwen3VlMoe
-                    | eredu_core::GgufArchitecture::KimiLinear
-                    | eredu_core::GgufArchitecture::Inkling
-                    | eredu_core::GgufArchitecture::GptOss
-                    | eredu_core::GgufArchitecture::Gemma4
-                    | eredu_core::GgufArchitecture::Lfm2Moe
-                    | eredu_core::GgufArchitecture::NemotronHMoe
-                    | eredu_core::GgufArchitecture::Qwen35Moe
-                    | eredu_core::GgufArchitecture::Qwen3Next
-                    | eredu_core::GgufArchitecture::MuseGlimmer
-            )
-        {
-            return Err(Error::Parallel(format!(
-                "TP+PP+EP preflight has registered DeepSeek-V3/R1/V4, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
-                architecture.metadata_name()
-            )));
-        }
-        if topology.expert_parallel_size > 1
-            && !matches!(
-                architecture,
-                eredu_core::GgufArchitecture::KimiLinear
-                    | eredu_core::GgufArchitecture::Inkling
-                    | eredu_core::GgufArchitecture::DeepSeek2
-                    | eredu_core::GgufArchitecture::DeepSeek4
-                    | eredu_core::GgufArchitecture::Qwen3Moe
-                    | eredu_core::GgufArchitecture::Qwen3Vl
-                    | eredu_core::GgufArchitecture::Qwen3VlMoe
-                    | eredu_core::GgufArchitecture::GptOss
-                    | eredu_core::GgufArchitecture::Gemma4
-                    | eredu_core::GgufArchitecture::Lfm2Moe
-                    | eredu_core::GgufArchitecture::NemotronHMoe
-                    | eredu_core::GgufArchitecture::Qwen35Moe
-                    | eredu_core::GgufArchitecture::Qwen3Next
-                    | eredu_core::GgufArchitecture::MuseGlimmer
-            )
-        {
-            return Err(Error::Parallel(format!(
-                "PP+EP preflight has no stage-local expert plan for GGUF architecture {}; no checkpoint payload was materialized",
-                architecture.metadata_name()
-            )));
-        }
-        if topology.tensor_parallel_size > 1
-            && !matches!(
-                architecture,
-                eredu_core::GgufArchitecture::KimiLinear
-                    | eredu_core::GgufArchitecture::Inkling
-                    | eredu_core::GgufArchitecture::DeepSeek2
-                    | eredu_core::GgufArchitecture::DeepSeek4
-                    | eredu_core::GgufArchitecture::Llama
-                    | eredu_core::GgufArchitecture::Mistral
-                    | eredu_core::GgufArchitecture::Qwen2
-                    | eredu_core::GgufArchitecture::Qwen3
-                    | eredu_core::GgufArchitecture::Qwen3Moe
-                    | eredu_core::GgufArchitecture::Qwen3Vl
-                    | eredu_core::GgufArchitecture::Qwen3VlMoe
-                    | eredu_core::GgufArchitecture::GptOss
-                    | eredu_core::GgufArchitecture::Gemma4
-                    | eredu_core::GgufArchitecture::Lfm2
-                    | eredu_core::GgufArchitecture::Lfm2Moe
-                    | eredu_core::GgufArchitecture::NemotronH
-                    | eredu_core::GgufArchitecture::NemotronHMoe
-                    | eredu_core::GgufArchitecture::Qwen35
-                    | eredu_core::GgufArchitecture::Qwen35Moe
-                    | eredu_core::GgufArchitecture::Qwen3Next
-                    | eredu_core::GgufArchitecture::MuseGlimmer
-            )
-        {
-            return Err(Error::Parallel(format!(
-                "TP+PP preflight has no shared semantic stage plan for GGUF architecture {}; no checkpoint payload was materialized",
-                architecture.metadata_name()
-            )));
-        }
+        let capabilities =
+            eredu_architectures::preparation::gguf_capabilities(architecture, &checkpoint)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        validate_pipeline_parallel_capabilities(
+            capabilities.parallel_plan(),
+            topology,
+            expert_cache.is_some(),
+            "GGUF",
+            architecture.metadata_name(),
+        )?;
         let mut structural_options = options;
         // The explicit pipeline loader has already validated its topology;
         // complete-model structural policy must not reject the PP coordinate.
@@ -13814,159 +13800,27 @@ pub fn load_pipeline_model_with_options(
 
     let config: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
-    let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
-    let kind = model_type
-        .and_then(|model_type| ModelKind::from_model_type(model_type).ok())
-        .or_else(|| {
-            crate::composition::mlx::resolve_model_config(&config)
-                .ok()
-                .map(|resolved| resolved.kind)
-        });
-    if kind.is_some_and(ModelKind::requires_realtime_loader) {
+    let resolved = eredu_core::resolve_model_configuration(&config)?;
+    if resolved.kind.requires_realtime_loader() {
         return Err(Error::UnsupportedArchitecture(
             "Moshi-family models use a realtime multi-stream temporal/depth contract, not the decoder pipeline"
                 .into(),
         ));
     }
-    if expert_cache.is_some()
-        && !matches!(
-            model_type,
-            Some(
-                "deepseek_v3"
-                    | "deepseek_v4"
-                    | "qwen3_moe"
-                    | "qwen3_vl_moe"
-                    | "qwen3_vl_moe_text"
-                    | "kimi_linear"
-                    | "inkling_mm_model"
-                    | "gpt_oss"
-                    | "gemma4"
-                    | "gemma4_text"
-                    | "gemma4_unified"
-                    | "gemma4_unified_text"
-                    | "lfm2_moe"
-                    | "nemotron_h"
-                    | "qwen3_next"
-                    | "qwen3_5_moe"
-                    | "qwen3_5_moe_text"
-                    | "muse_glimmer"
-                    | "muse_glimmer_text"
-            )
-        )
-    {
-        return Err(Error::Parallel(format!(
-            "pipeline independent expert caching has registered DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
-        )));
-    }
-    if topology.tensor_parallel_size > 1
-        && topology.pipeline_parallel_size > 1
-        && topology.expert_parallel_size > 1
-        && !matches!(
-            model_type,
-            Some(
-                "deepseek_v3"
-                    | "deepseek_v4"
-                    | "qwen3_moe"
-                    | "qwen3_vl_moe"
-                    | "qwen3_vl_moe_text"
-                    | "kimi_linear"
-                    | "inkling_mm_model"
-                    | "gpt_oss"
-                    | "gemma4"
-                    | "gemma4_text"
-                    | "gemma4_unified"
-                    | "gemma4_unified_text"
-                    | "lfm2_moe"
-                    | "nemotron_h"
-                    | "qwen3_next"
-                    | "qwen3_5_moe"
-                    | "qwen3_5_moe_text"
-                    | "muse_glimmer"
-                    | "muse_glimmer_text"
-            )
-        )
-    {
-        return Err(Error::Parallel(format!(
-            "TP+PP+EP preflight has registered DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
-            model_type
-        )));
-    }
-    if topology.expert_parallel_size > 1
-        && !matches!(
-            model_type,
-            Some(
-                "deepseek_v3"
-                    | "deepseek_v4"
-                    | "kimi_linear"
-                    | "inkling_mm_model"
-                    | "qwen3_moe"
-                    | "qwen3_vl_moe"
-                    | "qwen3_vl_moe_text"
-                    | "gpt_oss"
-                    | "gemma4"
-                    | "gemma4_text"
-                    | "gemma4_unified"
-                    | "gemma4_unified_text"
-                    | "lfm2_moe"
-                    | "nemotron_h"
-                    | "qwen3_next"
-                    | "qwen3_5"
-                    | "qwen3_5_text"
-                    | "qwen3_5_moe"
-                    | "qwen3_5_moe_text"
-                    | "muse_glimmer"
-                    | "muse_glimmer_text"
-            )
-        )
-    {
-        return Err(Error::Parallel(format!(
-            "PP+EP preflight has no stage-local expert plan for SafeTensors model_type {:?}; no checkpoint payload was materialized",
-            model_type
-        )));
-    }
-    if topology.tensor_parallel_size > 1
-        && !matches!(
-            model_type,
-            Some(
-                "deepseek_v3"
-                    | "deepseek_v4"
-                    | "kimi_linear"
-                    | "inkling_mm_model"
-                    | "llama"
-                    | "mistral"
-                    | "qwen2"
-                    | "qwen3"
-                    | "qwen3_moe"
-                    | "qwen3_vl"
-                    | "qwen3_vl_text"
-                    | "qwen3_vl_moe"
-                    | "qwen3_vl_moe_text"
-                    | "gpt_oss"
-                    | "gemma4"
-                    | "gemma4_text"
-                    | "gemma4_unified"
-                    | "gemma4_unified_text"
-                    | "lfm2"
-                    | "lfm2_moe"
-                    | "nemotron_h"
-                    | "qwen3_next"
-                    | "qwen3_5"
-                    | "qwen3_5_text"
-                    | "qwen3_5_moe"
-                    | "qwen3_5_moe_text"
-                    | "muse_glimmer"
-                    | "muse_glimmer_text"
-            )
-        )
-    {
-        return Err(Error::Parallel(format!(
-            "TP+PP preflight has no shared semantic stage plan for SafeTensors model_type {:?}; no checkpoint payload was materialized",
-            model_type
-        )));
-    }
+    let capabilities =
+        eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    validate_pipeline_parallel_capabilities(
+        capabilities.parallel_plan(),
+        topology,
+        expert_cache.is_some(),
+        "SafeTensors",
+        &resolved.effective_model_type,
+    )?;
+    let model_type = resolved.effective_model_type.as_str();
     let store = open_safetensors_weight_store(model_dir, max_mapped_shards)?;
     match model_type {
-        Some("llama" | "mistral") => {
+        "llama" | "mistral" => {
             let config = std::fs::File::open(model_dir.join("config.json"))?;
             let args = eredu_architectures::llama::model_args_from_config_reader(config)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -13980,7 +13834,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("deepseek_v3") => {
+        "deepseek_v3" => {
             let value: serde_json::Value = serde_json::from_reader(std::fs::File::open(
                 model_dir.join("config.json"),
             )?)?;
@@ -14000,7 +13854,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("deepseek_v4") => {
+        "deepseek_v4" => {
             let value: serde_json::Value = serde_json::from_reader(std::fs::File::open(
                 model_dir.join("config.json"),
             )?)?;
@@ -14020,7 +13874,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text") => {
+        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
             let args = crate::composition::gemma4::load_pipeline_config(model_dir)?;
             let store = crate::composition::gemma4::resolve_pipeline_store(store, &args)?;
             load_neutral_gemma4_pipeline(
@@ -14034,7 +13888,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("qwen2" | "qwen3" | "qwen3_moe") => {
+        "qwen2" | "qwen3" | "qwen3_moe" => {
             let args = crate::composition::qwen::load_model_args(model_dir)?;
             load_qwen_pipeline(
                 args,
@@ -14047,7 +13901,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("muse_glimmer" | "muse_glimmer_text") => {
+        "muse_glimmer" | "muse_glimmer_text" => {
             let args = crate::composition::muse_glimmer::load_pipeline_config(model_dir)?;
             load_muse_glimmer_pipeline(
                 args,
@@ -14060,7 +13914,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("qwen3_vl" | "qwen3_vl_text" | "qwen3_vl_moe" | "qwen3_vl_moe_text") => {
+        "qwen3_vl" | "qwen3_vl_text" | "qwen3_vl_moe" | "qwen3_vl_moe_text" => {
             let value: serde_json::Value = serde_json::from_reader(std::fs::File::open(
                 model_dir.join("config.json"),
             )?)?;
@@ -14077,7 +13931,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("gpt_oss") => {
+        "gpt_oss" => {
             load_gpt_oss_pipeline(
                 neutral_gpt_oss::load_model_args(model_dir)?,
                 store,
@@ -14089,7 +13943,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("lfm2" | "lfm2_moe") => {
+        "lfm2" | "lfm2_moe" => {
             load_lfm2_pipeline(
                 crate::composition::lfm2::load_model_args(model_dir)?,
                 store,
@@ -14101,7 +13955,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("nemotron_h") => {
+        "nemotron_h" => {
             load_nemotron_h_pipeline(
                 crate::composition::nemotron_h::load_model_args(model_dir)?,
                 store,
@@ -14113,7 +13967,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("qwen3_next") => {
+        "qwen3_next" => {
             let parsed = crate::composition::qwen::hybrid::load_parsed_config(model_dir)?;
             load_neutral_qwen_hybrid_pipeline(
                 parsed.text,
@@ -14126,7 +13980,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text") => {
+        "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
             let parsed = crate::composition::qwen::hybrid::load_parsed_config(model_dir)?;
             if parsed.vision.is_none() {
                 load_neutral_qwen_hybrid_pipeline(
@@ -14152,7 +14006,7 @@ pub fn load_pipeline_model_with_options(
                 )
             }
         }
-        Some("kimi_linear") => {
+        "kimi_linear" => {
             load_kimi_linear_pipeline(
                 eredu_architectures::kimi_linear::model_args_from_config_reader(
                     std::fs::File::open(model_dir.join("config.json"))?,
@@ -14167,7 +14021,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some("inkling_mm_model") => {
+        "inkling_mm_model" => {
             let args = crate::composition::inkling::load_pipeline_config(model_dir)?;
             let store = crate::composition::inkling::resolve_pipeline_store(store, &args)?;
             load_neutral_inkling_pipeline(
@@ -14181,12 +14035,9 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        Some(model_type) => Err(Error::UnsupportedArchitecture(format!(
+        model_type => Err(Error::UnsupportedArchitecture(format!(
             "pipeline execution supports Llama-compatible, DeepSeek-V3/R1, Gemma 4, Qwen2/Qwen3/Qwen3-MoE, Qwen3-VL/Qwen3-VL-MoE, GPT-OSS, LFM2/LFM2-MoE, Nemotron-H, Kimi Linear, Qwen3-Next/Qwen3.5 text, and Inkling models, not {model_type}"
         ))),
-        None => Err(Error::UnsupportedArchitecture(
-            "pipeline model config is missing model_type".into(),
-        )),
     }
 }
 

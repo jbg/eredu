@@ -9,14 +9,19 @@ use serde_json::Value;
 /// Preparation-relevant facts derived from one exact normalized architecture.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ArchitectureCapabilities {
-    independently_addressable_experts: bool,
+    parallel: ParallelCapabilityPlan,
     input_modalities: InputModalities,
 }
 
 impl ArchitectureCapabilities {
     /// Whether routed expert parameters can be managed independently.
     pub const fn independently_addressable_experts(self) -> bool {
-        self.independently_addressable_experts
+        self.parallel.independent_expert_residency()
+    }
+
+    /// Distributed semantics supported by this exact normalized architecture.
+    pub const fn parallel_plan(self) -> ParallelCapabilityPlan {
+        self.parallel
     }
 
     /// Input modalities admitted by the exact normalized architecture.
@@ -25,11 +30,17 @@ impl ArchitectureCapabilities {
     }
 
     const fn new(
+        kind: ModelKind,
         independently_addressable_experts: bool,
         input_modalities: InputModalities,
     ) -> Self {
         Self {
-            independently_addressable_experts,
+            parallel: ParallelCapabilityPlan::new(
+                true,
+                !matches!(kind, ModelKind::Moshi),
+                independently_addressable_experts,
+                independently_addressable_experts,
+            ),
             input_modalities,
         }
     }
@@ -37,7 +48,55 @@ impl ArchitectureCapabilities {
 
 impl Default for ArchitectureCapabilities {
     fn default() -> Self {
-        Self::new(false, InputModalities::TEXT)
+        Self {
+            parallel: ParallelCapabilityPlan::default(),
+            input_modalities: InputModalities::TEXT,
+        }
+    }
+}
+
+/// Architecture-owned distributed capabilities for one normalized model.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct ParallelCapabilityPlan {
+    tensor_parallel: bool,
+    pipeline_parallel: bool,
+    expert_parallel: bool,
+    independent_expert_residency: bool,
+}
+
+impl ParallelCapabilityPlan {
+    const fn new(
+        tensor_parallel: bool,
+        pipeline_parallel: bool,
+        expert_parallel: bool,
+        independent_expert_residency: bool,
+    ) -> Self {
+        Self {
+            tensor_parallel,
+            pipeline_parallel,
+            expert_parallel,
+            independent_expert_residency,
+        }
+    }
+
+    /// Whether the architecture declares tensor-sharded parameter and execution semantics.
+    pub const fn tensor_parallel(self) -> bool {
+        self.tensor_parallel
+    }
+
+    /// Whether the architecture can be partitioned into pipeline stages.
+    pub const fn pipeline_parallel(self) -> bool {
+        self.pipeline_parallel
+    }
+
+    /// Whether routed experts can be partitioned across expert ranks.
+    pub const fn expert_parallel(self) -> bool {
+        self.expert_parallel
+    }
+
+    /// Whether routed expert parameters can be materialized independently.
+    pub const fn independent_expert_residency(self) -> bool {
+        self.independent_expert_residency
     }
 }
 
@@ -158,7 +217,11 @@ pub fn safetensors_capabilities(
         ),
         ModelKind::Llama => (false, InputModalities::TEXT),
     };
-    Ok(ArchitectureCapabilities::new(routed, input_modalities))
+    Ok(ArchitectureCapabilities::new(
+        kind,
+        routed,
+        input_modalities,
+    ))
 }
 
 struct GemmaCatalog<'a>(&'a GgufCheckpoint);
@@ -231,5 +294,9 @@ pub fn gguf_capabilities(
         },
         _ => InputModalities::TEXT,
     };
-    Ok(ArchitectureCapabilities::new(routed, input_modalities))
+    Ok(ArchitectureCapabilities::new(
+        architecture.model_kind(),
+        routed,
+        input_modalities,
+    ))
 }

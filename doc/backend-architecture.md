@@ -99,7 +99,10 @@ architecture reports whether independently addressable routed experts exist;
 the selected backend intersects that fact with its expert-cache
 materializers. Core selects the neutral expert-cache route but does not infer
 support from `ModelKind`, because one kind may contain both dense and MoE
-variants.
+variants. The same architecture capability report carries a typed parallel
+plan for tensor sharding, pipeline staging, expert partitioning, and independent
+expert residency. Distributed backend preflight consumes that exact normalized
+plan instead of reconstructing support from raw or wrapper `model_type` values.
 
 Artifact inspection also consumes architecture-derived input modalities from
 that exact normalized configuration. Backends translate those neutral flags
