@@ -1061,14 +1061,78 @@ impl ModelCache {
     pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
         match self {
             Self::DeepSeek(cache) => cache.residency_report(),
-            Self::MuseGlimmer(cache) => cache.residency_report(),
-            Self::Llama(cache) => cache
-                .residency_report()
-                .map_err(|error| Exception::custom(error.to_string())),
             Self::GptOss(cache) => cache.residency_report(),
-            Self::Hybrid(cache) => cache.residency_report(),
             Self::Inkling(cache) => cache.target().residency_report(),
-            _ => Ok(None),
+            Self::MuseGlimmer(cache) | Self::Llama(cache) | Self::Qwen(cache) => {
+                cache.residency_report()
+            }
+            Self::Qwen3Vl(cache)
+            | Self::Qwen3VlMoe(cache)
+            | Self::Hybrid(cache)
+            | Self::Qwen35(cache)
+            | Self::Qwen3Next(cache) => cache.residency_report(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::mlx::runtime::cache::{
+        residency::CacheResidencyManager,
+        state::{MlxHybridState, MlxKeyValueState},
+    };
+    use eredu_core::{cache::LayerCachePolicy, AttentionPolicy};
+    use eredu_runtime::StateLayout;
+
+    fn paged_state_layout() -> StateLayout {
+        StateLayout::new(
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap()],
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn cache_residency_manager() -> CacheResidencyManager {
+        CacheResidencyManager::new(
+            PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn qwen_cache_variants_forward_paged_residency_reports() {
+        let layout = paged_state_layout();
+        let manager = cache_residency_manager();
+        let caches = [
+            (
+                "Qwen",
+                ModelCache::Qwen(
+                    MlxKeyValueState::paged(layout.clone(), manager.clone(), None).unwrap(),
+                ),
+            ),
+            (
+                "Qwen3-Next",
+                ModelCache::Qwen3Next(
+                    MlxHybridState::paged(layout.clone(), manager.clone(), None).unwrap(),
+                ),
+            ),
+            (
+                "Qwen3.5",
+                ModelCache::Qwen35(MlxHybridState::paged(layout, manager, None).unwrap()),
+            ),
+        ];
+
+        for (family, cache) in caches {
+            assert!(
+                cache.residency_report().unwrap().is_some(),
+                "{family} paged-cache telemetry should be available"
+            );
         }
     }
 }
