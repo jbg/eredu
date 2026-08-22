@@ -102,6 +102,14 @@ backends select the loaded architecture estimate, apply their physical state
 scalar width, and add live allocator, residency, and system-memory
 observations; they do not reconstruct family state geometry.
 
+For SafeTensors materialization, architecture preparation also identifies the
+checkpoint parameter that establishes runtime-state dtype and resolves its
+schema-declared physical aliases against the inspected catalog. A concrete
+backend maps that resolved dtype to its physical scalar width; generic backend
+composition must not recognize family checkpoint names or silently choose a
+width when the declared source is missing. Backend-native encoded formats may
+instead report their known materialized activation dtype.
+
 Runtime state follows the same contract at materialization time. Architecture
 `StateLayout` values are authoritative for per-layer attention windows,
 append-only pooling streams, and named segment boundaries and lifetimes.

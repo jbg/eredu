@@ -2,6 +2,8 @@
 
 use std::{collections::HashMap, fmt::Display};
 
+use eredu_checkpoint::schema::SafetensorsCheckpointPlan;
+use eredu_core::checkpoint::{TensorCatalog, TensorDtype};
 use eredu_core::{GgufArchitecture, InputModalities, ModelKind};
 use eredu_gguf::{Checkpoint as GgufCheckpoint, MetadataValue};
 use serde_json::Value;
@@ -202,6 +204,193 @@ pub struct PreparationCapabilityError(String);
 
 fn invalid(error: impl Display) -> PreparationCapabilityError {
     PreparationCapabilityError(error.to_string())
+}
+
+/// Architecture-resolved source of the scalar dtype used by mutable runtime
+/// state.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RuntimeStateDtypeSource {
+    parameter: String,
+    checkpoint_tensor: String,
+    dtype: TensorDtype,
+}
+
+impl RuntimeStateDtypeSource {
+    /// Architecture-declared checkpoint parameter whose loaded values establish
+    /// the ordinary decoder activation dtype.
+    pub fn parameter(&self) -> &str {
+        &self.parameter
+    }
+
+    /// Physical tensor name selected from the architecture's admitted aliases.
+    pub fn checkpoint_tensor(&self) -> &str {
+        &self.checkpoint_tensor
+    }
+
+    /// Inspected scalar dtype of the selected physical tensor.
+    pub fn dtype(&self) -> &TensorDtype {
+        &self.dtype
+    }
+}
+
+fn resolve_runtime_state_dtype_source(
+    plan: &SafetensorsCheckpointPlan,
+    parameter: &str,
+    tensors: &TensorCatalog,
+) -> Result<RuntimeStateDtypeSource, PreparationCapabilityError> {
+    let constraint = plan
+        .common_tensors
+        .iter()
+        .find(|constraint| constraint.key == parameter)
+        .ok_or_else(|| {
+            invalid(format!(
+                "architecture checkpoint plan {:?} does not declare runtime-state dtype source {parameter:?} as a common tensor",
+                plan.identity
+            ))
+        })?;
+    let present = std::iter::once(constraint.key.as_str())
+        .chain(constraint.aliases.iter().map(String::as_str))
+        .filter_map(|name| tensors.get(name))
+        .collect::<Vec<_>>();
+    match present.as_slice() {
+        [tensor] => Ok(RuntimeStateDtypeSource {
+            parameter: parameter.into(),
+            checkpoint_tensor: tensor.name.clone(),
+            dtype: tensor.dtype.clone(),
+        }),
+        [] => Err(invalid(format!(
+            "architecture checkpoint plan {:?} did not find runtime-state dtype source {parameter:?} or any of its declared aliases",
+            plan.identity
+        ))),
+        tensors => Err(invalid(format!(
+            "architecture checkpoint plan {:?} found multiple physical aliases for runtime-state dtype source {parameter:?}: {:?}",
+            plan.identity,
+            tensors
+                .iter()
+                .map(|tensor| tensor.name.as_str())
+                .collect::<Vec<_>>()
+        ))),
+    }
+}
+
+/// Resolves the physical SafeTensors value that establishes runtime-state
+/// scalar dtype from the exact normalized architecture and its checkpoint
+/// schema.
+///
+/// This deliberately fails if the architecture-declared source is absent or
+/// ambiguous. Backends must not guess from family-name conventions or apply a
+/// default width for an unrecognized valid alias.
+pub fn safetensors_runtime_state_dtype_source(
+    kind: ModelKind,
+    config: &Value,
+    tensors: &TensorCatalog,
+) -> Result<RuntimeStateDtypeSource, PreparationCapabilityError> {
+    let (plan, parameter) = match kind {
+        ModelKind::DeepSeekV3 => {
+            let args = crate::deepseek::parse_v3_config(config).map_err(invalid)?;
+            (
+                crate::deepseek::v3_safetensors_plan(&args, true).map_err(invalid)?,
+                "model.embed_tokens.weight".into(),
+            )
+        }
+        ModelKind::DeepSeekV4 => {
+            let args = crate::deepseek::parse_v4_config(config).map_err(invalid)?;
+            (
+                crate::deepseek::v4_safetensors_plan(&args).map_err(invalid)?,
+                "model.embed_tokens.weight".into(),
+            )
+        }
+        ModelKind::Gemma4 => {
+            let bytes = serde_json::to_vec(config).map_err(invalid)?;
+            let family = crate::gemma4::FamilyConfig::from_hf_json(&bytes).map_err(invalid)?;
+            (
+                crate::gemma4::safetensors_plan(&family).map_err(invalid)?,
+                "model.language_model.embed_tokens.weight".into(),
+            )
+        }
+        ModelKind::GptOss => {
+            let args = crate::gpt_oss::model_args_from_config_value(config).map_err(invalid)?;
+            let parameter = format!("{}.embed_tokens.weight", args.parameter_root);
+            (
+                crate::gpt_oss::safetensors_plan(&args).map_err(invalid)?,
+                parameter,
+            )
+        }
+        ModelKind::Inkling => {
+            let bytes = serde_json::to_vec(config).map_err(invalid)?;
+            let args = crate::inkling::ModelArgs::from_hf_json(&bytes).map_err(invalid)?;
+            (
+                crate::inkling::safetensors_plan(&args).map_err(invalid)?,
+                "model.llm.embed.weight".into(),
+            )
+        }
+        ModelKind::KimiLinear => {
+            let args = crate::kimi_linear::model_args_from_config_value(config).map_err(invalid)?;
+            (
+                crate::kimi_linear::safetensors_plan(&args).map_err(invalid)?,
+                "model.embed_tokens.weight".into(),
+            )
+        }
+        ModelKind::Lfm2 => {
+            let args = crate::lfm2::model_args_from_config_value(config).map_err(invalid)?;
+            (
+                crate::lfm2::safetensors_plan(&args, true).map_err(invalid)?,
+                "model.embed_tokens.weight".into(),
+            )
+        }
+        ModelKind::Llama => {
+            let args = crate::llama::model_args_from_config_value(config).map_err(invalid)?;
+            (
+                crate::llama::safetensors_plan(&args).map_err(invalid)?,
+                "model.embed_tokens.weight".into(),
+            )
+        }
+        ModelKind::MuseGlimmer => {
+            let args =
+                crate::muse_glimmer::DecoderConfig::from_hf_value(config).map_err(invalid)?;
+            (
+                crate::muse_glimmer::safetensors_plan(&args).map_err(invalid)?,
+                "model.language_model.embed_tokens.weight".into(),
+            )
+        }
+        ModelKind::NemotronH => {
+            let args = crate::nemotron_h::model_args_from_config_value(config).map_err(invalid)?;
+            (
+                crate::nemotron_h::safetensors_plan(&args).map_err(invalid)?,
+                "backbone.embeddings.weight".into(),
+            )
+        }
+        ModelKind::Qwen2 | ModelKind::Qwen3 => {
+            let args = crate::qwen::model_args_from_config_value(config).map_err(invalid)?;
+            let parameter = format!("{}.embed_tokens.weight", args.parameter_root);
+            (
+                crate::qwen::safetensors_plan(&args).map_err(invalid)?,
+                parameter,
+            )
+        }
+        ModelKind::Qwen3Next | ModelKind::Qwen35 => {
+            let args =
+                crate::qwen::hybrid::model_args_from_config_value(config).map_err(invalid)?;
+            (
+                crate::qwen::hybrid::safetensors_plan(&args.text).map_err(invalid)?,
+                "model.embed_tokens.weight".into(),
+            )
+        }
+        ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
+            let args = crate::qwen::vl::model_args_from_config_value(config).map_err(invalid)?;
+            let parameter = format!("{}.embed_tokens.weight", args.text.parameter_root);
+            (
+                crate::qwen::vl::safetensors_plan(&args).map_err(invalid)?,
+                parameter,
+            )
+        }
+        ModelKind::Moshi => {
+            return Err(invalid(
+                "Moshi runtime-state dtype belongs to the realtime loader contract",
+            ));
+        }
+    };
+    resolve_runtime_state_dtype_source(&plan, &parameter, tensors)
 }
 
 /// Derives preparation capabilities from a normalized SafeTensors family
@@ -512,6 +701,32 @@ pub fn gguf_capabilities(
 mod tests {
     use super::*;
 
+    fn dtype_source_plan() -> SafetensorsCheckpointPlan {
+        SafetensorsCheckpointPlan::new(
+            "test architecture",
+            vec![
+                eredu_checkpoint::schema::SafetensorsTensorConstraint::required(
+                    "released.embedding.weight",
+                    vec![32, 16],
+                    eredu_checkpoint::schema::StoredDtypeConstraint::Floating,
+                )
+                .with_aliases(["canonical.embedding.weight"]),
+            ],
+            Vec::new(),
+            eredu_checkpoint::schema::CatalogPolicy::strict(),
+        )
+        .unwrap()
+    }
+
+    fn tensor(name: &str, dtype: TensorDtype) -> eredu_core::checkpoint::TensorDescriptor {
+        eredu_core::checkpoint::TensorDescriptor {
+            name: name.into(),
+            shape: vec![32, 16],
+            dtype,
+            storage: None,
+        }
+    }
+
     fn qwen35_text_config(model_type: &str) -> Value {
         serde_json::json!({
             "model_type": model_type,
@@ -561,6 +776,62 @@ mod tests {
         assert!(!realtime.parallel_plan().pipeline_parallel());
         assert!(!realtime.parallel_plan().expert_parallel());
         assert!(!realtime.independently_addressable_experts());
+    }
+
+    #[test]
+    fn runtime_state_dtype_source_uses_architecture_declared_aliases() {
+        let catalog =
+            TensorCatalog::new([tensor("canonical.embedding.weight", TensorDtype::Bf16)]).unwrap();
+        let source = resolve_runtime_state_dtype_source(
+            &dtype_source_plan(),
+            "released.embedding.weight",
+            &catalog,
+        )
+        .unwrap();
+
+        assert_eq!(source.parameter(), "released.embedding.weight");
+        assert_eq!(source.checkpoint_tensor(), "canonical.embedding.weight");
+        assert_eq!(source.dtype(), &TensorDtype::Bf16);
+    }
+
+    #[test]
+    fn normalized_architecture_selects_its_state_dtype_parameter() {
+        let config = qwen35_text_config("qwen3_5_text");
+        let catalog =
+            TensorCatalog::new([tensor("model.embed_tokens.weight", TensorDtype::F16)]).unwrap();
+
+        let source =
+            safetensors_runtime_state_dtype_source(ModelKind::Qwen35, &config, &catalog).unwrap();
+        assert_eq!(source.parameter(), "model.embed_tokens.weight");
+        assert_eq!(source.checkpoint_tensor(), "model.embed_tokens.weight");
+        assert_eq!(source.dtype(), &TensorDtype::F16);
+    }
+
+    #[test]
+    fn runtime_state_dtype_source_rejects_missing_or_ambiguous_names() {
+        let unknown = TensorCatalog::new([tensor("new.valid.name", TensorDtype::F16)]).unwrap();
+        let error = resolve_runtime_state_dtype_source(
+            &dtype_source_plan(),
+            "released.embedding.weight",
+            &unknown,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("did not find runtime-state dtype source"));
+
+        let ambiguous = TensorCatalog::new([
+            tensor("released.embedding.weight", TensorDtype::F16),
+            tensor("canonical.embedding.weight", TensorDtype::F16),
+        ])
+        .unwrap();
+        let error = resolve_runtime_state_dtype_source(
+            &dtype_source_plan(),
+            "released.embedding.weight",
+            &ambiguous,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("multiple physical aliases"));
     }
 
     #[test]

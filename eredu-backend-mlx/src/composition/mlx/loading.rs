@@ -265,8 +265,7 @@ pub fn materialize_model_plan(
     weights_stream: &Stream,
 ) -> Result<MlxModel, Error> {
     validate_plan_options(&plan, options)?;
-    let runtime_state_dtype_bytes =
-        inspected_runtime_state_dtype_bytes(plan.inspection().tensors());
+    let runtime_state_dtype_bytes = inspected_runtime_state_dtype_bytes(plan.inspection())?;
     let (artifact, _policy, _route) = plan.into_parts();
     if let Some(topology) = options
         .parallel
@@ -350,73 +349,90 @@ pub fn materialize_model_plan(
 }
 
 fn inspected_runtime_state_dtype_bytes(
-    tensors: &eredu_core::checkpoint::TensorCatalog,
-) -> std::num::NonZeroU8 {
-    // Token embeddings establish the ordinary decoder activation dtype, and
-    // MLX caches retain those activations without casting. Encoded embeddings
-    // have no portable runtime width, so keep the conservative FP32 fallback.
-    let embedding = tensors.descriptors().find(|tensor| {
-        tensor.name == "model.embed_tokens.weight"
-            || tensor.name.ends_with(".embed_tokens.weight")
-            || matches!(
-                tensor.name.as_str(),
-                "model.llm.embed.weight"
-                    | "backbone.embeddings.weight"
-                    | "model.embeddings.weight"
-                    | "embed.weight"
-            )
-    });
-    let bytes = match embedding.map(|tensor| &tensor.dtype) {
-        Some(
-            eredu_core::checkpoint::TensorDtype::F16 | eredu_core::checkpoint::TensorDtype::Bf16,
-        ) => 2,
-        Some(
-            eredu_core::checkpoint::TensorDtype::F64
-            | eredu_core::checkpoint::TensorDtype::Complex64,
-        ) => 8,
-        _ => 4,
+    inspection: &eredu_core::ArtifactInspection,
+) -> Result<std::num::NonZeroU8, Error> {
+    if inspection.format() == eredu_core::ArtifactFormat::Gguf {
+        // MLX native GGUF embeddings dequantize to Float32. Their catalog dtype
+        // describes packed storage rather than the resulting activation.
+        return Ok(std::num::NonZeroU8::new(4).expect("Float32 width is nonzero"));
+    }
+    let configuration = inspection.configuration();
+    let config = configuration.json.as_ref().ok_or_else(|| {
+        Error::UnsupportedArchitecture(
+            "SafeTensors inspection omitted normalized JSON configuration".into(),
+        )
+    })?;
+    let source = eredu_architectures::preparation::safetensors_runtime_state_dtype_source(
+        configuration.kind,
+        config,
+        inspection.tensors(),
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    mlx_runtime_state_dtype_bytes(source.dtype()).map_err(|dtype| {
+        Error::UnsupportedArchitecture(format!(
+            "runtime-state dtype source {:?} has unsupported MLX activation dtype {dtype:?}",
+            source.checkpoint_tensor()
+        ))
+    })
+}
+
+fn mlx_runtime_state_dtype_bytes(
+    dtype: &eredu_core::checkpoint::TensorDtype,
+) -> Result<std::num::NonZeroU8, eredu_core::checkpoint::TensorDtype> {
+    use eredu_core::checkpoint::TensorDtype;
+
+    let bytes = match dtype {
+        TensorDtype::F16 | TensorDtype::Bf16 => 2,
+        TensorDtype::F32 => 4,
+        TensorDtype::F64 | TensorDtype::Complex64 => 8,
+        // MLX materializes supported packed SafeTensors embeddings as Float32
+        // activations. These cases are reached only after the architecture
+        // schema resolved the exact embedding parameter; they are not a
+        // fallback for an unknown checkpoint name.
+        TensorDtype::U32 | TensorDtype::Encoded(_) => 4,
+        dtype => return Err(dtype.clone()),
     };
-    std::num::NonZeroU8::new(bytes).expect("supported MLX activation widths are nonzero")
+    Ok(std::num::NonZeroU8::new(bytes).expect("supported MLX activation widths are nonzero"))
 }
 
 #[cfg(test)]
 mod runtime_state_dtype_tests {
-    use super::inspected_runtime_state_dtype_bytes;
-    use eredu_core::checkpoint::{TensorCatalog, TensorDescriptor, TensorDtype};
-
-    fn catalog(name: &str, dtype: TensorDtype) -> TensorCatalog {
-        TensorCatalog::new([TensorDescriptor {
-            name: name.into(),
-            shape: vec![32, 16],
-            dtype,
-            storage: None,
-        }])
-        .unwrap()
-    }
+    use super::mlx_runtime_state_dtype_bytes;
+    use eredu_core::checkpoint::TensorDtype;
 
     #[test]
-    fn floating_text_embedding_width_selects_runtime_state_width() {
-        for dtype in [TensorDtype::F16, TensorDtype::Bf16] {
-            assert_eq!(
-                inspected_runtime_state_dtype_bytes(&catalog(
-                    "model.language_model.embed_tokens.weight",
-                    dtype,
-                ))
-                .get(),
-                2
-            );
+    fn resolved_floating_dtype_selects_runtime_state_width() {
+        for (dtype, bytes) in [
+            (TensorDtype::F16, 2),
+            (TensorDtype::Bf16, 2),
+            (TensorDtype::F32, 4),
+            (TensorDtype::F64, 8),
+        ] {
+            assert_eq!(mlx_runtime_state_dtype_bytes(&dtype).unwrap().get(), bytes);
         }
     }
 
     #[test]
-    fn encoded_embedding_keeps_conservative_fp32_width() {
+    fn packed_embedding_dtype_uses_known_mlx_materialization_width() {
         assert_eq!(
-            inspected_runtime_state_dtype_bytes(&catalog(
-                "model.embed_tokens.weight",
-                TensorDtype::Encoded("Q4_K".into()),
-            ))
-            .get(),
+            mlx_runtime_state_dtype_bytes(&TensorDtype::Encoded("F8_E4M3".into()))
+                .unwrap()
+                .get(),
             4
+        );
+        assert_eq!(
+            mlx_runtime_state_dtype_bytes(&TensorDtype::U32)
+                .unwrap()
+                .get(),
+            4
+        );
+    }
+
+    #[test]
+    fn invalid_activation_dtype_does_not_silently_default() {
+        assert_eq!(
+            mlx_runtime_state_dtype_bytes(&TensorDtype::U8),
+            Err(TensorDtype::U8)
         );
     }
 }
