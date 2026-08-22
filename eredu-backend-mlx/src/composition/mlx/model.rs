@@ -81,6 +81,9 @@ impl Model {
     /// Reports how this model architecture exposes MTP weights.
     pub fn mtp_capability(&self) -> MtpCapability {
         match self {
+            Self::Gemma4(_) | Self::MuseGlimmer(_) => MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Separate,
+            },
             Self::DeepSeek(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
             },

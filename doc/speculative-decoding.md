@@ -12,8 +12,10 @@ without MTP.
 ## Assistants
 
 An external assistant is loaded separately and validated against the target's
-tokenizer, vocabulary, and model-specific interface. Gemma assistant artifacts
-are supported through this path.
+tokenizer, vocabulary, and model-specific interface. Gemma 4 assistant and
+Muse-Glimmer DFlash artifacts are supported through this path. Prepared Gemma 4
+and Muse-Glimmer targets advertise a separate-checkpoint capability so automatic
+execution-plan realization can load and validate the matching assistant.
 
 Embedded MTP is available for registered checkpoints with executable prediction
 weights, including supported DeepSeek, Inkling, Nemotron-H, Qwen3-Next, and
