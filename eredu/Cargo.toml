@@ -137,10 +137,7 @@ features = ["mlx-image", "mlx-audio"]
 [features]
 default = ["mlx", "onig", "esaxx_fast"]
 
-mlx = [
-    "dep:eredu-backend-mlx",
-    "eredu-backend-mlx/test-support",
-]
+mlx = ["dep:eredu-backend-mlx"]
 cuda = ["mlx", "eredu-backend-mlx/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "eredu-text/esaxx_fast"]
 onig = ["tokenizers/onig", "eredu-text/onig"]
@@ -175,6 +172,7 @@ toktrie_hf_tokenizers = "=1.7.6"
 [dev-dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+eredu-backend-mlx = { workspace = true, features = ["test-support"] }
 lazy_static = "1"
 safetensors = "0.8"
 tempfile.workspace = true

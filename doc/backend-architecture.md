@@ -23,7 +23,9 @@ The `eredu` facade is also portable when built with
 `default-features = false`. Its default `mlx` feature selects the optional
 `eredu-backend-mlx` crate. Compatibility re-exports keep MLX capabilities
 available under `eredu::backend::mlx` and family adapters under
-`eredu::composition`.
+`eredu::composition`. Backend fixture APIs are activated only by the facade's
+development dependency; the production `mlx` feature does not enable backend
+`test-support`.
 
 The facade root and `api` namespace expose portable application concepts.
 Backend-native types remain in their backend namespace.
