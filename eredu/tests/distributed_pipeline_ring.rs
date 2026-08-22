@@ -334,6 +334,10 @@ impl FixtureFamily {
                 | Self::MuseGlimmer
                 | Self::Qwen2
                 | Self::Qwen3
+                | Self::Qwen3Next
+                | Self::Qwen35
+                | Self::Qwen35Multimodal
+                | Self::Qwen3Vl
                 | Self::DeepSeek
                 | Self::DeepSeekV4
         )
@@ -576,11 +580,12 @@ fn pipeline_ring_worker() {
             serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap())
                 .unwrap();
         let outer_model_type = config["model_type"].as_str().unwrap();
-        let effective_model_type = if outer_model_type == "muse_glimmer" {
-            config["text_config"]["model_type"].as_str().unwrap()
-        } else {
-            outer_model_type
-        };
+        let effective_model_type =
+            if matches!(outer_model_type, "muse_glimmer" | "qwen3_5" | "qwen3_5_moe") {
+                config["text_config"]["model_type"].as_str().unwrap()
+            } else {
+                outer_model_type
+            };
         let model_family = match outer_model_type {
             "gemma4" | "gemma4_unified" => "gemma4",
             "gpt_oss" => "gpt_oss",
@@ -588,6 +593,10 @@ fn pipeline_ring_worker() {
             "mistral" => "mistral",
             "muse_glimmer" => "muse_glimmer",
             "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
+            "qwen3_next" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
+                "qwen_hybrid"
+            }
+            "qwen3_vl" | "qwen3_vl_text" | "qwen3_vl_moe" | "qwen3_vl_moe_text" => "qwen3_vl",
             "deepseek_v3" | "deepseek_v4" => "deepseek",
             _ => "inkling",
         };
@@ -5367,6 +5376,56 @@ fn ring_two_process_qwen35_dense_stream_pipeline() {
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_four_process_qwen3_next_tensor_pipeline() {
     run_ring_cartesian_pipeline(true, FixtureFamily::Qwen3Next, "tp-pp");
+}
+
+/// Compares Qwen3-Next TP=2 prefill and decode with the replicated public
+/// loader, covering the placed-stage route without a pipeline or expert axis.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Qwen3-Next fixture"]
+fn ring_two_process_qwen3_next_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Next,
+        "tp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Covers pure TP loading and execution for the Qwen3.5 hybrid architecture.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Qwen3.5 fixture"]
+fn ring_two_process_qwen35_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen35,
+        "tp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Covers pure TP loading and text execution through the conditional Qwen3.5
+/// graph, including its vision-aware static parameter topology.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic multimodal Qwen3.5 fixture"]
+fn ring_two_process_qwen35_multimodal_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen35Multimodal,
+        "tp",
+        WorkerMode::OpaqueSession,
+    );
+}
+
+/// Covers pure TP loading and text execution for the Qwen3-VL architecture.
+#[test]
+#[ignore = "requires the MLX Ring backend, two loopback CPU ranks, and the synthetic Qwen3-VL fixture"]
+fn ring_two_process_qwen3_vl_tensor_parallel_opaque_session() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Vl,
+        "tp",
+        WorkerMode::OpaqueSession,
+    );
 }
 
 /// Verifies Qwen3.5-MoE TP=2 + PP=2 with tensor-sharded routed/shared

@@ -164,6 +164,43 @@ pub fn build_module_bindings_with_recipes(
     build_module_binding_plan_with_recipes(module, prefix, store, recipes)?.build_bindings(store)
 }
 
+/// Readdresses fully qualified semantic bindings to one module's local
+/// parameter names while preserving their architecture-logical targets.
+pub fn localize_module_bindings(
+    module: &impl ModuleParameters,
+    bindings: Vec<WeightBinding>,
+) -> Result<Vec<WeightBinding>, ModuleBindingError> {
+    let parameters = module.parameters().flatten();
+    let local_names = parameters
+        .iter()
+        .filter(|(name, parameter)| is_materialized_module_parameter(name, parameter, &parameters))
+        .map(|(name, _)| name.to_string())
+        .collect::<BTreeSet<_>>();
+    bindings
+        .into_iter()
+        .map(|binding| {
+            let candidates = local_names
+                .iter()
+                .filter(|local| {
+                    binding.name() == local.as_str()
+                        || binding
+                            .name()
+                            .strip_suffix(local.as_str())
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if candidates.len() != 1 {
+                return Err(ModuleBindingError::LocalParameterTarget {
+                    binding: binding.name().to_owned(),
+                    candidates,
+                });
+            }
+            Ok(binding.with_name(&candidates[0])?)
+        })
+        .collect()
+}
+
 /// A declarative module binding plan plus fully qualified logical targets.
 pub struct ModuleBindingPlan {
     plan: BindingPlan,
@@ -757,6 +794,14 @@ pub enum ModuleBindingError {
     MissingParameter {
         /// Full module parameter name.
         destination: String,
+    },
+    /// A semantic binding did not identify exactly one module-local parameter.
+    #[error("binding {binding:?} resolves to module-local parameters {candidates:?}, expected exactly one")]
+    LocalParameterTarget {
+        /// Fully qualified semantic binding.
+        binding: String,
+        /// Matching module-local parameter names.
+        candidates: Vec<String>,
     },
     /// Two parameters resolved to one checkpoint tensor.
     #[error("checkpoint tensor {checkpoint_key:?} resolves to both {first:?} and {second:?}")]

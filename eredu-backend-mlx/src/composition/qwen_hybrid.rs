@@ -67,8 +67,8 @@ use crate::backend::mlx::{
         },
         checkpoint::binding::{
             build_module_bindings, build_module_bindings_with_recipes,
-            build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
-            parameter_role_targets, populate_module_from_lease_excluding,
+            build_module_bindings_with_recipes_excluding, localize_module_bindings,
+            parameter_name_in_targets, parameter_role_targets, populate_module_from_lease_excluding,
         },
         checkpoint::binding_plan::{BindingPlan, PlannedBinding},
         checkpoint::{
@@ -444,32 +444,35 @@ impl QwenConditionalPipelineBindings {
             }
         }
         if select("qwen_conditional.static.embedding") {
+            let bindings = build_module_bindings_with_recipes(
+                &MlxModule::new(modules.text.embeddings.clone()),
+                "",
+                store,
+                recipes.clone(),
+            )?;
             units.push(StaticUnitBindings::new(
                 "qwen_conditional.static.embedding",
-                build_module_bindings_with_recipes(
-                    &MlxModule::new(modules.text.embeddings.clone()),
-                    "",
-                    store,
-                    recipes.clone(),
-                )?,
+                localize_module_bindings(&modules.text.embeddings, bindings)?,
             )?);
         }
         if select("qwen_conditional.static.norm") {
+            let bindings = build_module_bindings_with_recipes(
+                &MlxModule::new(modules.text.norm.clone()),
+                "",
+                store,
+                recipes,
+            )?;
             units.push(StaticUnitBindings::new(
                 "qwen_conditional.static.norm",
-                build_module_bindings_with_recipes(
-                    &MlxModule::new(modules.text.norm.clone()),
-                    "",
-                    store,
-                    recipes,
-                )?,
+                localize_module_bindings(&modules.text.norm, bindings)?,
             )?);
         }
         if select("qwen_conditional.static.output") {
             if let Some(head) = &modules.text.lm_head {
+                let bindings = build_module_bindings(&MlxModule::new(head.clone()), "", store)?;
                 units.push(StaticUnitBindings::new(
                     "qwen_conditional.static.output",
-                    build_module_bindings(&MlxModule::new(head.clone()), "", store)?,
+                    localize_module_bindings(head, bindings)?,
                 )?);
             }
         }
@@ -655,32 +658,36 @@ impl QwenHybridPipelineBindings {
         let recipes = hybrid::static_recipes(store).map_err(Error::UnsupportedArchitecture)?;
         let mut units = Vec::new();
         if select("qwen_hybrid.static.embedding") {
+            let bindings = build_module_bindings_with_recipes(
+                &MlxModule::new(modules.embeddings.clone()),
+                "",
+                store,
+                recipes.clone(),
+            )?;
             units.push(StaticUnitBindings::new(
                 "qwen_hybrid.static.embedding",
-                build_module_bindings_with_recipes(
-                    &MlxModule::new(modules.embeddings.clone()),
-                    "",
-                    store,
-                    recipes.clone(),
-                )?,
+                localize_module_bindings(&modules.embeddings, bindings)?,
             )?);
         }
         if select("qwen_hybrid.static.norm") {
+            let bindings = build_module_bindings_with_recipes(
+                &MlxModule::new(modules.norm.clone()),
+                "",
+                store,
+                recipes,
+            )?;
             units.push(StaticUnitBindings::new(
                 "qwen_hybrid.static.norm",
-                build_module_bindings_with_recipes(
-                    &MlxModule::new(modules.norm.clone()),
-                    "",
-                    store,
-                    recipes,
-                )?,
+                localize_module_bindings(&modules.norm, bindings)?,
             )?);
         }
         if select("qwen_hybrid.static.output") {
             if let Some(head) = &modules.lm_head {
+                let bindings =
+                    build_module_bindings(&MlxModule::new(head.clone()), "", store)?;
                 units.push(StaticUnitBindings::new(
                     "qwen_hybrid.static.output",
-                    build_module_bindings(&MlxModule::new(head.clone()), "", store)?,
+                    localize_module_bindings(head, bindings)?,
                 )?);
             }
         }

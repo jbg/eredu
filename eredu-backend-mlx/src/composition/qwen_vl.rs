@@ -60,7 +60,7 @@ use crate::backend::mlx::{
         },
         checkpoint::binding::{
             build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
-            parameter_name_in_targets, parameter_role_targets,
+            localize_module_bindings, parameter_name_in_targets, parameter_role_targets,
             populate_module_from_lease_excluding,
         },
         checkpoint::{
@@ -408,14 +408,15 @@ impl QwenVlPipelineBindings {
             )?);
         }
         if select("qwen_vl.static.embedding") {
+            let bindings = build_module_bindings_with_recipes(
+                &MlxModule::new(modules.text.embeddings.clone()),
+                "",
+                store,
+                BTreeMap::new(),
+            )?;
             units.push(StaticUnitBindings::new(
                 "qwen_vl.static.embedding",
-                build_module_bindings_with_recipes(
-                    &MlxModule::new(modules.text.embeddings.clone()),
-                    "",
-                    store,
-                    BTreeMap::new(),
-                )?,
+                localize_module_bindings(&modules.text.embeddings, bindings)?,
             )?);
         }
         if select("qwen_vl.static.norm") {
@@ -431,14 +432,15 @@ impl QwenVlPipelineBindings {
         }
         if select("qwen_vl.static.output") {
             if let Some(head) = &modules.text.lm_head {
+                let bindings = build_module_bindings_with_recipes(
+                    &MlxModule::new(head.clone()),
+                    "",
+                    store,
+                    BTreeMap::new(),
+                )?;
                 units.push(StaticUnitBindings::new(
                     "qwen_vl.static.output",
-                    build_module_bindings_with_recipes(
-                        &MlxModule::new(head.clone()),
-                        "",
-                        store,
-                        BTreeMap::new(),
-                    )?,
+                    localize_module_bindings(head, bindings)?,
                 )?);
             }
         }

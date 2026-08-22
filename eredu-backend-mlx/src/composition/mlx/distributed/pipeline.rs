@@ -56,7 +56,10 @@ use std::collections::HashMap;
 use crate::backend::mlx::runtime::checkpoint::quantization::quantize_tensor;
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::nn::shared::{MlxBackend, MlxModule, MlxModuleRef},
+    backend::mlx::nn::{
+        shared::{MlxBackend, MlxModule, MlxModuleRef},
+        tensor::{TokenValidationBatch, TokenValidationScope},
+    },
     backend::mlx::runtime::cache::residency::{
         load_prompt_cache_state_tensors, open_prompt_cache, CacheResidencyManager,
         PromptCacheStateArray,
@@ -1079,14 +1082,21 @@ fn recv_prepared_input(
 /// Submitted completion for one rank-local pipeline stage.
 pub struct PipelineStageCompletion {
     inner: DistributedCompletion<Option<Array>>,
+    token_validations: TokenValidationBatch,
 }
 
 impl PipelineStageCompletion {
-    fn submit(logits: Option<Array>, retained: Vec<Array>) -> Result<Self, Error> {
+    fn submit(
+        logits: Option<Array>,
+        retained: Vec<Array>,
+        token_validations: TokenValidationBatch,
+    ) -> Result<Self, Error> {
         let mut outputs = retained;
         outputs.extend(logits.iter().cloned());
+        outputs.extend(token_validations.arrays().cloned());
         Ok(Self {
             inner: DistributedCompletion::submit(logits, outputs.iter())?,
+            token_validations,
         })
     }
 
@@ -1102,7 +1112,9 @@ impl PipelineStageCompletion {
 
     /// Blocks the host for the exact stage completion.
     pub fn synchronize(&self) -> Result<(), Error> {
-        self.inner.synchronize()
+        self.inner.synchronize()?;
+        self.token_validations.validate_completed()?;
+        Ok(())
     }
 
     fn into_submitted_logits(self) -> Option<Array> {
@@ -1128,8 +1140,11 @@ impl PendingPipelineStageCompletion {
         self.retained.push(array);
     }
 
-    fn submit(self) -> Result<PipelineStageCompletion, Error> {
-        PipelineStageCompletion::submit(self.logits, self.retained)
+    fn submit(
+        self,
+        token_validations: TokenValidationBatch,
+    ) -> Result<PipelineStageCompletion, Error> {
+        PipelineStageCompletion::submit(self.logits, self.retained, token_validations)
     }
 }
 
@@ -2799,11 +2814,9 @@ impl<A, P, C, U> GroupedPredictionPipelineRealization<A, P, C, U> {
         A: LayeredArchitecture<MlxBackend, MlxHybridState>,
         A::Error: std::fmt::Display,
     {
-        architecture_partition_range::<A, MlxHybridState, P>(
-            &self.architecture,
-            &self.partition,
-            eredu_runtime::ArchitectureGroupKind::Decoder,
-        )
+        let group = architecture_decoder_group::<A, MlxHybridState>(&self.architecture)
+            .expect("validated prediction architecture target group");
+        architecture_partition_group_range(&self.partition, group)
     }
 }
 
@@ -4135,6 +4148,13 @@ where
 {
     let group = architecture_group_by_kind::<A, S>(architecture, kind)
         .expect("validated architecture transport group");
+    architecture_partition_group_range(partition, group)
+}
+
+fn architecture_partition_group_range<P>(partition: &P, group: usize) -> Range<usize>
+where
+    P: GroupedPartition,
+{
     partition
         .groups()
         .iter()
@@ -8476,7 +8496,9 @@ impl QwenConditionalPipelinePartition {
     }
 
     fn range(&self) -> Range<usize> {
-        self.media_range::<MlxHybridState>(eredu_runtime::ArchitectureGroupKind::Decoder)
+        let group = architecture_decoder_group::<_, MlxHybridState>(&self.architecture)
+            .expect("validated conditional Qwen target decoder group");
+        architecture_partition_group_range(&self.partition, group)
     }
 
     fn vision_range(&self) -> Range<usize> {
@@ -10609,6 +10631,7 @@ impl PipelineModel {
             .then(|| execution.tensor_context())
             .transpose()?;
         let stream = execution.stream();
+        let token_validation_scope = TokenValidationScope::begin()?;
         let mut output = self.forward_pipeline_on_group(
             tokens.map(PipelineIngress::Tokens),
             step,
@@ -10635,7 +10658,7 @@ impl PipelineModel {
             let barrier = distributed::all_sum(&Array::from_f32(0.0), pipeline, stream)?;
             output.retain(barrier);
         }
-        output.submit()
+        output.submit(token_validation_scope.finish())
     }
 
     /// Runs typed multimodal prefill through the selected distributed session.
@@ -10667,6 +10690,7 @@ impl PipelineModel {
             .then(|| execution.tensor_context())
             .transpose()?;
         let stream = execution.stream();
+        let token_validation_scope = TokenValidationScope::begin()?;
         let mut output = self.forward_pipeline_on_group(
             input.map(PipelineIngress::ModelInput),
             step,
@@ -10688,7 +10712,7 @@ impl PipelineModel {
             let barrier = distributed::all_sum(&Array::from_f32(0.0), pipeline, stream)?;
             output.retain(barrier);
         }
-        output.submit()
+        output.submit(token_validation_scope.finish())
     }
 
     /// Reports whether this pipeline stage participates in checkpoint-embedded
@@ -12055,13 +12079,37 @@ impl PipelineEmbeddedMtpTarget<'_> {
     }
 }
 
-fn validate_pipeline_topology(topology: MlxParallelContext) -> Result<(), Error> {
-    if topology.pipeline_parallel_size <= 1 && topology.expert_parallel_size <= 1 {
+fn validate_distributed_stage_topology(topology: MlxParallelContext) -> Result<(), Error> {
+    if topology.is_replicated() {
         return Err(Error::Parallel(
-            "Cartesian stage loading requires a pipeline or expert axis".into(),
+            "distributed stage loading requires an active parallel axis".into(),
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn distributed_stage_topology_accepts_pure_tensor_parallelism() {
+    let tensor_parallel = MlxParallelContext::for_rank(
+        0,
+        2,
+        1,
+        1,
+        crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+    )
+    .unwrap();
+    validate_distributed_stage_topology(tensor_parallel).unwrap();
+
+    let replicated = MlxParallelContext::for_rank(
+        0,
+        1,
+        1,
+        1,
+        crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+    )
+    .unwrap();
+    assert!(validate_distributed_stage_topology(replicated).is_err());
 }
 
 fn base_info(
@@ -13485,7 +13533,7 @@ where
     })
 }
 
-fn validate_pipeline_parallel_capabilities(
+fn validate_distributed_stage_capabilities(
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
     topology: MlxParallelContext,
     expert_cache: bool,
@@ -13498,7 +13546,7 @@ fn validate_pipeline_parallel_capabilities(
             "{artifact} architecture {architecture:?} has no architecture-owned {capability} plan; no checkpoint payload was materialized"
         ))
     };
-    if !plan.pipeline_parallel() {
+    if topology.pipeline_parallel_size > 1 && !plan.pipeline_parallel() {
         return Err(unsupported("pipeline-parallel"));
     }
     if topology.tensor_parallel_size > 1 && !plan.tensor_parallel() {
@@ -13555,7 +13603,7 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
     )
     .unwrap();
 
-    validate_pipeline_parallel_capabilities(
+    validate_distributed_stage_capabilities(
         capabilities,
         topology,
         true,
@@ -13570,7 +13618,7 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
     assert_eq!(resolved.effective_model_type, "qwen3_5_text");
     let capabilities =
         eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config).unwrap();
-    let error = validate_pipeline_parallel_capabilities(
+    let error = validate_distributed_stage_capabilities(
         capabilities,
         topology,
         false,
@@ -13588,7 +13636,7 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
         crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
     )
     .unwrap();
-    let error = validate_pipeline_parallel_capabilities(
+    let error = validate_distributed_stage_capabilities(
         capabilities,
         topology,
         true,
@@ -13599,7 +13647,11 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
     assert!(error.to_string().contains("independent expert-residency"));
 }
 
-/// Materializes an executable rank-local Cartesian pipeline stage for the MLX backend.
+/// Materializes an executable rank-local distributed stage for the MLX backend.
+///
+/// The placed stage adapter also owns pure tensor-parallel materialization for
+/// Qwen3-Next, Qwen3.5, and Qwen3-VL; those families share the same semantic
+/// parameter placement for TP-only and Cartesian execution.
 ///
 /// Llama/Mistral, DeepSeek-V3/R1/V4, Inkling, Kimi Linear, Qwen, Qwen3-VL, GPT-OSS,
 /// LFM2, Nemotron-H, Qwen3-Next/Qwen3.5, and Gemma 4 text TP+PP stages, plus
@@ -13625,9 +13677,9 @@ pub fn load_pipeline_model_with_options(
 ) -> Result<PipelineModel, Error> {
     let model_dir = model_dir.as_ref();
     let topology = options.parallel.ok_or_else(|| {
-        Error::Parallel("pipeline loading requires ModelLoadOptions::parallel".into())
+        Error::Parallel("distributed stage loading requires ModelLoadOptions::parallel".into())
     })?;
-    validate_pipeline_topology(topology)?;
+    validate_distributed_stage_topology(topology)?;
     topology.validate_execution_stream(stream)?;
     let expert_cache = options.weight_residency.expert_cache();
     let dense_stream = match options.weight_residency.layers() {
@@ -13646,8 +13698,9 @@ pub fn load_pipeline_model_with_options(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
         let mut structural_options = options;
-        // The explicit pipeline loader has already validated its topology;
-        // complete-model structural policy must not reject the PP coordinate.
+        // The explicit distributed-stage loader has already validated its
+        // topology; complete-model structural policy must not reject a
+        // non-replicated coordinate.
         structural_options.parallel = None;
         // Stage-local residency and bounded materialization are validated by
         // the pipeline planner below. Whole-model GGUF policy must therefore
@@ -13662,7 +13715,7 @@ pub fn load_pipeline_model_with_options(
         let capabilities =
             eredu_architectures::preparation::gguf_capabilities(architecture, &checkpoint)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        validate_pipeline_parallel_capabilities(
+        validate_distributed_stage_capabilities(
             capabilities,
             topology,
             expert_cache.is_some(),
@@ -13973,7 +14026,7 @@ pub fn load_pipeline_model_with_options(
     let capabilities =
         eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    validate_pipeline_parallel_capabilities(
+    validate_distributed_stage_capabilities(
         capabilities,
         topology,
         expert_cache.is_some(),
@@ -15487,6 +15540,9 @@ fn load_neutral_qwen_vl_pipeline(
     } else {
         ModelKind::Qwen3Vl
     };
+    let binding_architecture =
+        eredu_architectures::qwen::vl::LayeredModel::new(target_args.clone(), stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut architecture =
         eredu_architectures::qwen::vl::LayeredModel::new(target_args.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -15494,7 +15550,7 @@ fn load_neutral_qwen_vl_pipeline(
         <eredu_architectures::qwen::vl::LayeredModel<MlxBackend> as LayeredArchitecture<
             MlxBackend,
             MlxHybridState,
-        >>::static_modules(&architecture);
+        >>::static_modules(&binding_architecture);
     let mut parameter_groups =
         eredu_architectures::qwen::static_parallel_parameter_groups::<MlxBackend>(
             &static_modules.text.embeddings,
@@ -15510,12 +15566,12 @@ fn load_neutral_qwen_vl_pipeline(
         )?,
     );
     let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
-        &architecture,
+        &binding_architecture,
         eredu_runtime::ArchitectureGroupKind::VisionEncoder,
     )?;
-    let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&architecture)?;
+    let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&binding_architecture)?;
     for index in 0..target_args.vision.layer_count() {
-        let unit = architecture
+        let unit = binding_architecture
             .construct_unit(vision_group, index, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let eredu_architectures::qwen::vl::Unit::Vision(block) = unit else {
@@ -15531,7 +15587,7 @@ fn load_neutral_qwen_vl_pipeline(
         );
     }
     for index in 0..target_args.text.num_hidden_layers as usize {
-        let unit = architecture
+        let unit = binding_architecture
             .construct_unit(decoder_group, index, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let eredu_architectures::qwen::vl::Unit::Text(block) = unit else {
@@ -15636,24 +15692,16 @@ fn load_neutral_qwen_vl_pipeline(
     let need_embedding = static_roles.contains(&"embedding");
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
-            let source_architecture = match stage.architecture.shared_parallel_geometry() {
-                Some(geometry) => {
-                    eredu_architectures::qwen::vl::LayeredModel::<MlxBackend>::new_parallel(
-                        source_args.clone(),
-                        (*geometry).clone(),
-                        stream,
-                    )
-                }
-                None => eredu_architectures::qwen::vl::LayeredModel::<MlxBackend>::new(
+            let source_architecture =
+                eredu_architectures::qwen::vl::LayeredModel::<MlxBackend>::new(
                     source_args.clone(),
                     stream,
-                ),
-            }
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                )
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let source_quantization =
                 BoundPipelineBindings::new(&binding_adapter, &source_architecture);
             let target_quantization =
-                BoundPipelineBindings::new(&target_adapter, &stage.architecture);
+                BoundPipelineBindings::new(&target_adapter, &binding_architecture);
             let (store, report) = quantize_pipeline_stage_store(
                 store,
                 &source_quantization,
@@ -15683,7 +15731,7 @@ fn load_neutral_qwen_vl_pipeline(
     };
     info.materialization = materialization;
     let static_units = pipeline_binding_units(
-        &BoundPipelineBindings::new(binding_adapter, &stage.architecture),
+        &BoundPipelineBindings::new(binding_adapter, &binding_architecture),
         &stage.partition,
         store.as_ref(),
         &static_roles,
@@ -15767,11 +15815,15 @@ fn load_neutral_qwen_vl_pipeline(
     }
     if dense_stream.is_none() {
         for (index, layer) in stage.vision_range().clone().zip(&mut stage.vision_layers) {
+            let binding_layer = binding_architecture
+                .construct_unit(vision_group, index, stream)
+                .map(MlxModule::new)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
-                &stage.architecture,
+                &binding_architecture,
                 vision_group,
                 index,
-                layer,
+                &binding_layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
                 None,
@@ -15791,11 +15843,15 @@ fn load_neutral_qwen_vl_pipeline(
             )?;
         }
         for (index, layer) in stage.range().clone().zip(&mut stage.layers) {
+            let binding_layer = binding_architecture
+                .construct_unit(decoder_group, index, stream)
+                .map(MlxModule::new)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
-                &stage.architecture,
+                &binding_architecture,
                 decoder_group,
                 index,
-                layer,
+                &binding_layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
@@ -15867,23 +15923,32 @@ fn load_neutral_qwen_vl_pipeline(
                     .map(MlxModule::new)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
             },
-            |ordinal, layer, store| {
+            |ordinal, _layer, store| {
                 if ordinal < vision_count {
+                    let binding_layer = binding_architecture
+                        .construct_unit(vision_group, vision_start + ordinal, stream)
+                        .map(MlxModule::new)
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
                     adapter.cartesian_layer_bindings(
-                        architecture,
+                        &binding_architecture,
                         vision_group,
                         vision_start + ordinal,
-                        layer,
+                        &binding_layer,
                         store,
                         layout.as_ref(),
                         None,
                     )
                 } else {
+                    let index = text_start + ordinal - vision_count;
+                    let binding_layer = binding_architecture
+                        .construct_unit(decoder_group, index, stream)
+                        .map(MlxModule::new)
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
                     adapter.cartesian_layer_bindings(
-                        architecture,
+                        &binding_architecture,
                         decoder_group,
-                        text_start + ordinal - vision_count,
-                        layer,
+                        index,
+                        &binding_layer,
                         store,
                         layout.as_ref(),
                         assignment.as_ref(),
@@ -19892,6 +19957,11 @@ fn load_neutral_qwen_hybrid_pipeline(
     } else {
         ModelKind::Qwen35
     };
+    let binding_architecture = eredu_architectures::qwen::hybrid::LayeredModel::<MlxBackend>::new(
+        target_args.clone(),
+        stream,
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut architecture = eredu_architectures::qwen::hybrid::LayeredModel::<MlxBackend>::new(
         target_args.clone(),
         stream,
@@ -19899,18 +19969,18 @@ fn load_neutral_qwen_hybrid_pipeline(
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut parameter_groups =
         eredu_architectures::decoder::static_parallel_parameter_groups::<MlxBackend>(
-            &architecture.static_modules().embeddings,
-            &architecture.static_modules().norm,
-            architecture.static_modules().lm_head.as_ref(),
+            &binding_architecture.static_modules().embeddings,
+            &binding_architecture.static_modules().norm,
+            binding_architecture.static_modules().lm_head.as_ref(),
             "model",
         )?;
-    let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&architecture)?;
+    let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&binding_architecture)?;
     for layer in 0..target_args.num_hidden_layers as usize {
         let unit =
             <eredu_architectures::qwen::hybrid::LayeredModel<MlxBackend> as LayeredArchitecture<
                 MlxBackend,
                 MlxHybridState,
-            >>::build_unit(&architecture, decoder_group, layer, stream)
+            >>::build_unit(&binding_architecture, decoder_group, layer, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         parameter_groups.extend(
             eredu_architectures::qwen::hybrid::unit_parallel_parameter_groups(
@@ -19923,12 +19993,12 @@ fn load_neutral_qwen_hybrid_pipeline(
     }
     for depth in 0..target_args.mtp_num_hidden_layers as usize {
         let prediction_group =
-            architecture_prediction_group::<_, MlxHybridState>(&architecture, depth)?;
+            architecture_prediction_group::<_, MlxHybridState>(&binding_architecture, depth)?;
         let unit =
             <eredu_architectures::qwen::hybrid::LayeredModel<MlxBackend> as LayeredArchitecture<
                 MlxBackend,
                 MlxHybridState,
-            >>::build_unit(&architecture, prediction_group, 0, stream)
+            >>::build_unit(&binding_architecture, prediction_group, 0, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         parameter_groups.extend(
             eredu_architectures::qwen::hybrid::unit_parallel_parameter_groups(
@@ -20053,9 +20123,9 @@ fn load_neutral_qwen_hybrid_pipeline(
                 }
             }
             let source_quantization =
-                BoundPipelineBindings::new(&binding_adapter, &stage.architecture);
+                BoundPipelineBindings::new(&binding_adapter, &binding_architecture);
             let target_quantization =
-                BoundPipelineBindings::new(&target_binding_adapter, &stage.architecture);
+                BoundPipelineBindings::new(&target_binding_adapter, &binding_architecture);
             let (store, report) = quantize_pipeline_stage_store(
                 store,
                 &source_quantization,
@@ -20081,7 +20151,7 @@ fn load_neutral_qwen_hybrid_pipeline(
     };
     info.materialization = materialization;
     let static_units = pipeline_binding_units(
-        &BoundPipelineBindings::new(binding_adapter, &stage.architecture),
+        &BoundPipelineBindings::new(binding_adapter, &binding_architecture),
         &stage.partition,
         store.as_ref(),
         &static_roles,
@@ -20143,11 +20213,15 @@ fn load_neutral_qwen_hybrid_pipeline(
     if dense_stream.is_none() {
         let architecture = &stage.architecture;
         for (global_layer, layer) in stage.range().clone().zip(&mut stage.layers) {
+            let binding_layer = binding_architecture
+                .construct_unit(decoder_group, global_layer, stream)
+                .map(MlxModule::new)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
-                architecture,
+                &binding_architecture,
                 decoder_group,
                 global_layer,
-                layer,
+                &binding_layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
@@ -20189,11 +20263,15 @@ fn load_neutral_qwen_hybrid_pipeline(
         for (depth, layers) in stage.prediction_layers.iter_mut().enumerate() {
             let prediction_group = prediction_groups[depth];
             let layer = &mut layers[0];
+            let binding_layer = binding_architecture
+                .construct_unit(prediction_group, 0, stream)
+                .map(MlxModule::new)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
-                architecture,
+                &binding_architecture,
                 prediction_group,
                 0,
-                layer,
+                &binding_layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
@@ -20256,12 +20334,16 @@ fn load_neutral_qwen_hybrid_pipeline(
                     .map(MlxModule::new)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
             },
-            |global_layer, layer, store| {
+            |global_layer, _layer, store| {
+                let binding_layer = binding_architecture
+                    .construct_unit(decoder_group, global_layer, stream)
+                    .map(MlxModule::new)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
                 binding_adapter.cartesian_layer_bindings(
-                    streamed_architecture,
+                    &binding_architecture,
                     decoder_group,
                     global_layer,
-                    layer,
+                    &binding_layer,
                     store,
                     streamed_layout.as_ref(),
                     streamed_assignment.as_ref(),
@@ -20399,13 +20481,16 @@ fn load_neutral_qwen_conditional_pipeline(
         QwenConditionalPipelineBindings::new()
     };
     let range = topology.layer_range(source.text.num_hidden_layers as usize)?;
+    let binding_architecture =
+        eredu_architectures::qwen::hybrid::ConditionalLayeredModel::new(target.clone(), stream)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut architecture =
         eredu_architectures::qwen::hybrid::ConditionalLayeredModel::new(target.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let static_modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend> as LayeredArchitecture<
         MlxBackend,
         MlxHybridState,
-    >>::static_modules(&architecture);
+    >>::static_modules(&binding_architecture);
     let mut parameter_groups =
         eredu_architectures::decoder::static_parallel_parameter_groups::<MlxBackend>(
             &static_modules.text.embeddings,
@@ -20425,12 +20510,12 @@ fn load_neutral_qwen_conditional_pipeline(
         )?,
     );
     let vision_group = architecture_group_by_kind::<_, MlxHybridState>(
-        &architecture,
+        &binding_architecture,
         eredu_runtime::ArchitectureGroupKind::VisionEncoder,
     )?;
-    let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&architecture)?;
+    let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&binding_architecture)?;
     for index in 0..vision.layer_count() {
-        let unit = architecture
+        let unit = binding_architecture
             .construct_unit(vision_group, index, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let eredu_architectures::qwen::hybrid::ConditionalUnit::Vision(block) = unit else {
@@ -20446,7 +20531,7 @@ fn load_neutral_qwen_conditional_pipeline(
         );
     }
     for index in 0..target.text.num_hidden_layers as usize {
-        let unit = architecture
+        let unit = binding_architecture
             .construct_unit(decoder_group, index, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let eredu_architectures::qwen::hybrid::ConditionalUnit::Target(block) = unit else {
@@ -20463,8 +20548,8 @@ fn load_neutral_qwen_conditional_pipeline(
     }
     for depth in 0..target.text.mtp_num_hidden_layers.max(0) as usize {
         let prediction_group =
-            architecture_prediction_group::<_, MlxHybridState>(&architecture, depth)?;
-        let unit = architecture
+            architecture_prediction_group::<_, MlxHybridState>(&binding_architecture, depth)?;
+        let unit = binding_architecture
             .construct_unit(prediction_group, 0, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let eredu_architectures::qwen::hybrid::ConditionalUnit::Prediction(unit) = unit else {
@@ -20616,9 +20701,9 @@ fn load_neutral_qwen_conditional_pipeline(
                 }
             }
             let source_quantization =
-                BoundPipelineBindings::new(&binding_adapter, &stage.architecture);
+                BoundPipelineBindings::new(&binding_adapter, &binding_architecture);
             let target_quantization =
-                BoundPipelineBindings::new(&target_adapter, &stage.architecture);
+                BoundPipelineBindings::new(&target_adapter, &binding_architecture);
             let (store, report) = quantize_pipeline_stage_store(
                 store,
                 &source_quantization,
@@ -20644,7 +20729,7 @@ fn load_neutral_qwen_conditional_pipeline(
     };
     info.materialization = materialization;
     let static_units = pipeline_binding_units(
-        &BoundPipelineBindings::new(binding_adapter, &stage.architecture),
+        &BoundPipelineBindings::new(binding_adapter, &binding_architecture),
         &stage.partition,
         store.as_ref(),
         &static_roles,
@@ -20729,11 +20814,15 @@ fn load_neutral_qwen_conditional_pipeline(
     if dense_stream.is_none() {
         let architecture = &stage.architecture;
         for (index, layer) in stage.vision_range().clone().zip(&mut stage.vision_layers) {
+            let binding_layer = binding_architecture
+                .construct_unit(vision_group, index, stream)
+                .map(MlxModule::new)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
-                architecture,
+                &binding_architecture,
                 vision_group,
                 index,
-                layer,
+                &binding_layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
             )?;
@@ -20752,11 +20841,15 @@ fn load_neutral_qwen_conditional_pipeline(
             )?;
         }
         for (index, layer) in stage.range().clone().zip(&mut stage.layers) {
+            let binding_layer = binding_architecture
+                .construct_unit(decoder_group, index, stream)
+                .map(MlxModule::new)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
-                architecture,
+                &binding_architecture,
                 decoder_group,
                 index,
-                layer,
+                &binding_layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
             )?;
@@ -20798,11 +20891,15 @@ fn load_neutral_qwen_conditional_pipeline(
             let prediction_group =
                 architecture_prediction_group::<_, MlxHybridState>(architecture, depth)?;
             let layer = &mut layers[0];
+            let binding_layer = binding_architecture
+                .construct_unit(prediction_group, 0, stream)
+                .map(MlxModule::new)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
-                architecture,
+                &binding_architecture,
                 prediction_group,
                 0,
-                layer,
+                &binding_layer,
                 store.as_ref(),
                 parallel_layout.as_ref(),
             )?;
@@ -20846,7 +20943,7 @@ fn load_neutral_qwen_conditional_pipeline(
         let vision_count = stage.vision_range().len();
         let text_start = stage.range().start;
         let adapter = &stage.adapter;
-        let binding_architecture = &stage.architecture;
+        let streamed_architecture = &stage.architecture;
         let dense = build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.partition.parameter_bindings(),
@@ -20867,31 +20964,29 @@ fn load_neutral_qwen_conditional_pipeline(
                 } else {
                     (decoder_group, text_start + ordinal - vision_count)
                 };
-                binding_architecture
+                streamed_architecture
                     .construct_unit(group, index, stream)
                     .map(MlxModule::new)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
             },
-            |ordinal, layer, store| {
-                if ordinal < vision_count {
-                    adapter.cartesian_layer_bindings(
-                        binding_architecture,
-                        vision_group,
-                        vision_start + ordinal,
-                        layer,
-                        store,
-                        layout.as_ref(),
-                    )
+            |ordinal, _layer, store| {
+                let (group, index) = if ordinal < vision_count {
+                    (vision_group, vision_start + ordinal)
                 } else {
-                    adapter.cartesian_layer_bindings(
-                        binding_architecture,
-                        decoder_group,
-                        text_start + ordinal - vision_count,
-                        layer,
-                        store,
-                        layout.as_ref(),
-                    )
-                }
+                    (decoder_group, text_start + ordinal - vision_count)
+                };
+                let binding_layer = binding_architecture
+                    .construct_unit(group, index, stream)
+                    .map(MlxModule::new)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                adapter.cartesian_layer_bindings(
+                    &binding_architecture,
+                    group,
+                    index,
+                    &binding_layer,
+                    store,
+                    layout.as_ref(),
+                )
             },
             |ordinal| {
                 let (group, index) = if ordinal < vision_count {
@@ -20900,7 +20995,7 @@ fn load_neutral_qwen_conditional_pipeline(
                     (decoder_group, text_start + ordinal - vision_count)
                 };
                 architecture_parameter_unit_owner::<_, MlxHybridState>(
-                    binding_architecture,
+                    streamed_architecture,
                     group,
                     index,
                 )

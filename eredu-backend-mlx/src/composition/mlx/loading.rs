@@ -278,20 +278,7 @@ pub fn materialize_model_plan(
             ModelArtifact::Gguf { configuration, .. }
             | ModelArtifact::SafeTensors { configuration, .. } => configuration.kind,
         };
-        if topology.pipeline_parallel_size > 1
-            || (topology.expert_parallel_size > 1
-                && matches!(
-                    kind,
-                    ModelKind::Gemma4 | ModelKind::MuseGlimmer | ModelKind::Inkling
-                ))
-            || matches!(
-                kind,
-                ModelKind::Qwen3Next
-                    | ModelKind::Qwen35
-                    | ModelKind::Qwen3Vl
-                    | ModelKind::Qwen3VlMoe
-            )
-        {
+        if requires_distributed_stage_loader(kind, topology) {
             let model =
                 crate::composition::mlx::distributed::pipeline::load_pipeline_model_with_options(
                     path,
@@ -348,6 +335,22 @@ pub fn materialize_model_plan(
     }
 }
 
+fn requires_distributed_stage_loader(
+    kind: ModelKind,
+    topology: crate::backend::mlx::MlxParallelContext,
+) -> bool {
+    topology.pipeline_parallel_size > 1
+        || (topology.expert_parallel_size > 1
+            && matches!(
+                kind,
+                ModelKind::Gemma4 | ModelKind::MuseGlimmer | ModelKind::Inkling
+            ))
+        || matches!(
+            kind,
+            ModelKind::Qwen3Next | ModelKind::Qwen35 | ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe
+        )
+}
+
 fn inspected_runtime_state_dtype_bytes(
     inspection: &eredu_core::ArtifactInspection,
 ) -> Result<std::num::NonZeroU8, Error> {
@@ -397,8 +400,29 @@ fn mlx_runtime_state_dtype_bytes(
 
 #[cfg(test)]
 mod runtime_state_dtype_tests {
-    use super::mlx_runtime_state_dtype_bytes;
-    use eredu_core::checkpoint::TensorDtype;
+    use super::{mlx_runtime_state_dtype_bytes, requires_distributed_stage_loader};
+    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
+    use eredu_core::{checkpoint::TensorDtype, ModelKind};
+    use safemlx::DeviceType;
+
+    #[test]
+    fn specialized_qwen_tp_uses_distributed_stage_loader() {
+        let topology =
+            MlxParallelContext::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap();
+        for kind in [
+            ModelKind::Qwen3Next,
+            ModelKind::Qwen35,
+            ModelKind::Qwen3Vl,
+            ModelKind::Qwen3VlMoe,
+        ] {
+            assert!(requires_distributed_stage_loader(kind, topology));
+        }
+        assert!(!requires_distributed_stage_loader(
+            ModelKind::Qwen3,
+            topology
+        ));
+    }
 
     #[test]
     fn resolved_floating_dtype_selects_runtime_state_width() {
