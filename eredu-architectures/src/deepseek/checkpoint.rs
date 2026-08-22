@@ -190,6 +190,37 @@ pub fn translate_v4_gguf_weight_name(name: &str) -> String {
     name.to_string()
 }
 
+/// Adds canonical fused runtime aliases for translated DeepSeek-V3 GGUF formats.
+pub fn normalize_v3_weight_formats<V: Clone>(args: &V3Args, formats: &mut BTreeMap<String, V>) {
+    for layer in 0..args.layer_schedule.len() {
+        let root = format!("model.layers.{layer}.mlp");
+        if let Some(format) = formats.get(&format!("{root}.experts.gate_proj")).cloned() {
+            formats.insert(format!("{root}.experts.gate_up_proj"), format);
+        }
+    }
+}
+
+/// Adds canonical fused runtime aliases for translated DeepSeek-V4 GGUF formats.
+pub fn normalize_v4_weight_formats<V: Clone>(args: &V4Args, formats: &mut BTreeMap<String, V>) {
+    for layer in 0..args.attention_schedule.len() {
+        let root = format!("layers.{layer}.ffn");
+        if let Some(format) = formats
+            .get(&format!("{root}.expert_banks.w1.weight"))
+            .or_else(|| formats.get(&format!("{root}.expert_banks.w1")))
+            .cloned()
+        {
+            formats.insert(format!("{root}.switch_mlp.gate_up_proj"), format);
+        }
+        if let Some(format) = formats
+            .get(&format!("{root}.expert_banks.w2.weight"))
+            .or_else(|| formats.get(&format!("{root}.expert_banks.w2")))
+            .cloned()
+        {
+            formats.insert(format!("{root}.switch_mlp.down_proj"), format);
+        }
+    }
+}
+
 /// Builds the canonical llama.cpp DeepSeek2 GGUF plan. Fused and split MLA
 /// KV-B storage are one global alternative layout so a checkpoint cannot mix
 /// the two representations across layers.
@@ -1921,6 +1952,12 @@ mod tests {
         assert_eq!(plan.layout_groups[0].variants[0].tensors.len(), 2);
         assert_eq!(plan.layout_groups[0].variants[1].tensors.len(), 4);
 
+        let prefix = "model.layers.1.mlp.experts";
+        let mut formats = BTreeMap::from([(format!("{prefix}.gate_proj"), 1)]);
+        normalize_v3_weight_formats(&args, &mut formats);
+        assert_eq!(formats.get(&format!("{prefix}.gate_up_proj")), Some(&1));
+        assert_eq!(formats.get(&format!("{prefix}.gate_proj")), Some(&1));
+
         struct Catalog(std::collections::BTreeMap<String, eredu_checkpoint::store::TensorMetadata>);
         impl eredu_checkpoint::recipe::RecipeCatalog for Catalog {
             fn tensor_metadata(
@@ -2035,6 +2072,21 @@ mod tests {
         assert_eq!(
             tensor("blk.1.indexer_compressor_ape.weight").shape,
             vec![4, 32]
+        );
+
+        let root = "layers.1.ffn";
+        let mut formats = BTreeMap::from([
+            (format!("{root}.expert_banks.w1.weight"), 1),
+            (format!("{root}.expert_banks.w2"), 2),
+        ]);
+        normalize_v4_weight_formats(&args, &mut formats);
+        assert_eq!(
+            formats.get(&format!("{root}.switch_mlp.gate_up_proj")),
+            Some(&1)
+        );
+        assert_eq!(
+            formats.get(&format!("{root}.switch_mlp.down_proj")),
+            Some(&2)
         );
     }
 }

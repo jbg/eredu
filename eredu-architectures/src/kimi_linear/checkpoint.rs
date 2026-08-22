@@ -1,6 +1,6 @@
 //! Pure Kimi Linear checkpoint plans, naming, and derived-weight recipes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use eredu_checkpoint::schema::{
     AlternativeLayoutGroup, CatalogPolicy, DepthwiseConvolutionSchema, GgufCheckpointPlan,
@@ -1116,6 +1116,20 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
     name.to_owned()
 }
 
+/// Rehomes split expert GGUF formats onto the canonical fused runtime weights.
+pub fn normalize_weight_formats<V>(args: &ModelArgs, formats: &mut HashMap<String, V>) {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
+            continue;
+        }
+        let prefix = format!("model.layers.{layer}.mlp.experts");
+        if let Some(format) = formats.remove(&format!("{prefix}.gate_proj")) {
+            formats.remove(&format!("{prefix}.up_proj"));
+            formats.insert(format!("{prefix}.gate_up_proj"), format);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1235,7 +1249,8 @@ mod tests {
 
     #[test]
     fn gguf_plan_and_translation_cover_hybrid_physical_names() {
-        let plan = gguf_plan(&fixture(false, None)).unwrap();
+        let args = fixture(false, None);
+        let plan = gguf_plan(&args).unwrap();
         let names = plan
             .common_tensors
             .iter()
@@ -1252,6 +1267,16 @@ mod tests {
             translate_gguf_weight_name("blk.1.ffn_gate_exps.scales"),
             "model.layers.1.mlp.experts.gate_proj_scales"
         );
+
+        let prefix = "model.layers.1.mlp.experts";
+        let mut formats = HashMap::from([
+            (format!("{prefix}.gate_proj"), 1),
+            (format!("{prefix}.up_proj"), 2),
+        ]);
+        normalize_weight_formats(&args, &mut formats);
+        assert_eq!(formats.get(&format!("{prefix}.gate_up_proj")), Some(&1));
+        assert!(!formats.contains_key(&format!("{prefix}.gate_proj")));
+        assert!(!formats.contains_key(&format!("{prefix}.up_proj")));
     }
 
     #[test]

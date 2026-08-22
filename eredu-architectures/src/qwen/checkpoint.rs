@@ -1,6 +1,6 @@
 //! Pure checkpoint schemas, name translation, and recipes for Qwen text models.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use eredu_checkpoint::schema::{
     matrix_for_linear_format, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
@@ -744,6 +744,20 @@ pub fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
     name.to_string()
 }
 
+/// Rehomes split expert GGUF formats onto the canonical fused runtime weights.
+pub fn normalize_weight_formats<V>(args: &ModelArgs, formats: &mut HashMap<String, V>) {
+    if !args.is_moe() {
+        return;
+    }
+    for layer in 0..args.num_hidden_layers {
+        let prefix = format!("model.layers.{layer}.mlp.experts");
+        if let Some(format) = formats.remove(&format!("{prefix}.gate_proj.weight")) {
+            formats.remove(&format!("{prefix}.up_proj.weight"));
+            formats.insert(format!("{prefix}.gate_up_proj"), format);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -849,6 +863,17 @@ mod tests {
             translate_gguf_weight_name("blk.1.ffn_gate_exps.weight", true),
             "model.layers.1.mlp.experts.gate_proj.weight"
         );
+
+        let args = args("qwen3_moe", false);
+        let prefix = "model.layers.1.mlp.experts";
+        let mut formats = HashMap::from([
+            (format!("{prefix}.gate_proj.weight"), 1),
+            (format!("{prefix}.up_proj.weight"), 2),
+        ]);
+        normalize_weight_formats(&args, &mut formats);
+        assert_eq!(formats.get(&format!("{prefix}.gate_up_proj")), Some(&1));
+        assert!(!formats.contains_key(&format!("{prefix}.gate_proj.weight")));
+        assert!(!formats.contains_key(&format!("{prefix}.up_proj.weight")));
     }
 
     #[test]

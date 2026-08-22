@@ -1516,16 +1516,7 @@ pub fn prepare_gguf(
         .translated_outputs(translate)
         .map_err(safemlx::error::IoError::from)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != eredu_architectures::kimi_linear::FeedForwardPolicy::SparseMoe {
-            continue;
-        }
-        let prefix = format!("model.layers.{layer}.mlp.experts");
-        if let Some(config) = configs.remove(&format!("{prefix}.gate_proj")) {
-            configs.remove(&format!("{prefix}.up_proj"));
-            configs.insert(format!("{prefix}.gate_up_proj"), config);
-        }
-    }
+    eredu_architectures::kimi_linear::normalize_weight_formats(&args, &mut configs);
     args.quantized_weight_configs = Some(configs);
     args.weight_quantization = None;
     args.validate()

@@ -77,6 +77,9 @@ name discovery or recipe construction into backend composition.
 Architecture checkpoint APIs also derive rank-local independently resident
 expert recipes, including segmented fused-projection selection; backend
 composition binds those recipes without reconstructing the segment equation.
+They also normalize physical checkpoint format metadata onto canonical runtime
+parameters, including fused expert projections, so each backend consumes the
+same family-specific quantization identities.
 
 Routed expert banks retain and expose their architecture-owned construction
 specification. Resident, cached, distributed, and future backend execution

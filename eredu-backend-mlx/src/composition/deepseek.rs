@@ -2811,32 +2811,13 @@ fn load_gguf_internal(
     let model = if family_v4 {
         let mut args = deepseek::parse_v4_gguf(&portable_metadata)
             .map_err(|error| unsupported(error.to_string()))?;
-        args.linear_formats =
+        let mut linear_formats =
             gguf_quantization_configs(checkpoint, deepseek::translate_v4_gguf_weight_name)?
                 .into_iter()
                 .map(|(name, format)| (name, format.into()))
                 .collect();
-        for layer in 0..args.attention_schedule.len() {
-            let root = format!("layers.{layer}.ffn");
-            if let Some(format) = args
-                .linear_formats
-                .get(&format!("{root}.expert_banks.w1.weight"))
-                .or_else(|| args.linear_formats.get(&format!("{root}.expert_banks.w1")))
-                .copied()
-            {
-                args.linear_formats
-                    .insert(format!("{root}.switch_mlp.gate_up_proj"), format);
-            }
-            if let Some(format) = args
-                .linear_formats
-                .get(&format!("{root}.expert_banks.w2.weight"))
-                .or_else(|| args.linear_formats.get(&format!("{root}.expert_banks.w2")))
-                .copied()
-            {
-                args.linear_formats
-                    .insert(format!("{root}.switch_mlp.down_proj"), format);
-            }
-        }
+        deepseek::normalize_v4_weight_formats(&args, &mut linear_formats);
+        args.linear_formats = linear_formats;
         let plan = deepseek::v4_gguf_plan(&args).map_err(unsupported)?;
         let store = Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
@@ -2866,22 +2847,13 @@ fn load_gguf_internal(
         let catalog = PortableCatalog(checkpoint.catalog());
         let mut args = deepseek::parse_v3_gguf(&catalog, &portable_metadata)
             .map_err(|error| unsupported(error.to_string()))?;
-        args.linear_formats =
+        let mut linear_formats =
             gguf_quantization_configs(checkpoint, deepseek::translate_v3_gguf_weight_name)?
                 .into_iter()
                 .map(|(name, format)| (name, format.into()))
                 .collect();
-        for layer in 0..args.layer_schedule.len() {
-            let root = format!("model.layers.{layer}.mlp");
-            if let Some(format) = args
-                .linear_formats
-                .get(&format!("{root}.experts.gate_proj"))
-                .copied()
-            {
-                args.linear_formats
-                    .insert(format!("{root}.experts.gate_up_proj"), format);
-            }
-        }
+        deepseek::normalize_v3_weight_formats(&args, &mut linear_formats);
+        args.linear_formats = linear_formats;
         let plan = deepseek::v3_gguf_plan(&args).map_err(unsupported)?;
         let store = Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),

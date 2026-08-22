@@ -1386,15 +1386,7 @@ pub fn prepare_qwen_gguf_checkpoint(
         .translated_outputs(translate)
         .map_err(safemlx::error::IoError::from)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
-    if is_moe {
-        for layer in 0..args.num_hidden_layers {
-            let prefix = format!("model.layers.{layer}.mlp.experts");
-            if let Some(config) = configs.remove(&format!("{prefix}.gate_proj.weight")) {
-                configs.remove(&format!("{prefix}.up_proj.weight"));
-                configs.insert(format!("{prefix}.gate_up_proj"), config);
-            }
-        }
-    }
+    eredu_architectures::qwen::normalize_weight_formats(&args, &mut configs);
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
