@@ -2,8 +2,6 @@
 
 use std::{fs, path::Path};
 
-#[cfg(feature = "image")]
-use eredu_core::VideoSampling as PortableVideoSampling;
 use eredu_core::{Media as PortableMedia, TokenizedMultimodalRequest, TokenizedMultimodalSegment};
 
 #[cfg(feature = "image")]
@@ -85,18 +83,10 @@ impl<'a> PortableMediaView<'a> {
                             RgbImageView::packed(frame.pixels(), frame.width(), frame.height())
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    let sampling = match video.sampling() {
-                        PortableVideoSampling::ProcessorDefault => VideoSampling::ProcessorDefault,
-                        PortableVideoSampling::Fps(fps) => VideoSampling::Fps(fps),
-                        PortableVideoSampling::FrameCount(count) => {
-                            VideoSampling::FrameCount(count)
-                        }
-                        PortableVideoSampling::All => VideoSampling::All,
-                    };
                     Ok(Self::Video {
                         frames,
                         source_fps: video.source_fps(),
-                        sampling,
+                        sampling: video.sampling(),
                     })
                 }
                 #[cfg(not(feature = "image"))]

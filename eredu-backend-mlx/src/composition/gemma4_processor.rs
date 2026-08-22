@@ -2,238 +2,57 @@
 
 use std::{fs, path::Path};
 
+#[cfg(feature = "image")]
+use eredu_architectures::processor_plan::{
+    Gemma4ImagePlan, Gemma4VideoPlan, RgbResample, RgbTransformPlan,
+};
+use eredu_architectures::processor_plan::{Gemma4ProcessorPlan, ProcessorPlanError};
+use eredu_architectures::processor_plan::{
+    PROCESSOR_CONFIG_FILENAME, VIDEO_PROCESSOR_CONFIG_FILENAME,
+};
 #[cfg(any(feature = "image", feature = "audio"))]
 use safemlx::Array;
-use serde::Deserialize;
 
 use crate::backend::mlx::error::Error;
 #[cfg(feature = "audio")]
 use crate::backend::mlx::runtime::media::audio::{extract_log_mel, LogMelConfig};
 #[cfg(feature = "image")]
 use crate::backend::mlx::runtime::media::image::{
-    rescale_and_normalize_rgb8, resize_rgb8_bicubic, NormalizedImage,
+    rescale_and_normalize_rgb8, resize_rgb8_bicubic, resize_rgb8_lanczos3, NormalizedImage,
+    RgbImage, RgbImageView,
 };
 #[cfg(any(feature = "image", feature = "audio"))]
 use crate::backend::mlx::runtime::media::input::Modality;
 #[cfg(feature = "image")]
-use crate::backend::mlx::runtime::media::video::{
-    format_mm_ss, frame_timestamps, sampled_frame_count, uniform_sample_indices,
-    validate_rgb_frames,
-};
+use crate::backend::mlx::runtime::media::video::validate_rgb_frames;
+#[cfg(feature = "image")]
+use crate::backend::mlx::runtime::media::VideoFrames;
 use crate::backend::mlx::runtime::media::{
     prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
     ProcessorInput, ProcessorPreparationError,
 };
 #[cfg(any(feature = "image", feature = "audio"))]
 use crate::backend::mlx::runtime::media::{MediaPayload, OwnedInputMetadata};
-#[cfg(feature = "image")]
-use crate::backend::mlx::runtime::media::{VideoFrames, VideoSampling};
-
-#[derive(Debug, Clone, Deserialize)]
-struct Gemma4ModelConfig {
-    #[cfg(feature = "image")]
-    boi_token_id: Option<u32>,
-    #[cfg(feature = "image")]
-    eoi_token_id: Option<u32>,
-    #[cfg(feature = "audio")]
-    boa_token_id: Option<u32>,
-    #[cfg(feature = "audio")]
-    eoa_token_id: Option<u32>,
-    #[cfg(feature = "image")]
-    #[serde(default = "default_soft_tokens")]
-    vision_soft_tokens_per_image: usize,
-    #[cfg(feature = "image")]
-    vision_config: Option<Gemma4VisionProcessorConfig>,
-    #[cfg(feature = "audio")]
-    audio_config: Option<serde_json::Value>,
-}
-
-#[cfg(feature = "image")]
-#[derive(Debug, Clone, Deserialize)]
-struct Gemma4VisionProcessorConfig {
-    #[serde(default = "default_patch_size")]
-    patch_size: usize,
-    #[serde(default = "default_pooling_kernel_size")]
-    pooling_kernel_size: usize,
-}
-
-#[cfg(feature = "image")]
-#[derive(Debug, Clone, Default, Deserialize)]
-struct Gemma4PreprocessorConfig {
-    #[serde(default)]
-    patch_size: Option<usize>,
-    #[serde(default)]
-    pooling_kernel_size: Option<usize>,
-    #[serde(default)]
-    max_soft_tokens: Option<usize>,
-}
-
-#[cfg(feature = "image")]
-#[derive(Debug, Clone, Deserialize)]
-struct Gemma4VideoPreprocessorConfig {
-    #[serde(default = "default_patch_size")]
-    patch_size: usize,
-    #[serde(default = "default_pooling_kernel_size")]
-    pooling_kernel_size: usize,
-    #[serde(default = "default_video_soft_tokens")]
-    max_soft_tokens: usize,
-    #[serde(default = "default_video_frames")]
-    num_frames: usize,
-}
-
-#[cfg(feature = "image")]
-impl Default for Gemma4VideoPreprocessorConfig {
-    fn default() -> Self {
-        Self {
-            patch_size: default_patch_size(),
-            pooling_kernel_size: default_pooling_kernel_size(),
-            max_soft_tokens: default_video_soft_tokens(),
-            num_frames: default_video_frames(),
-        }
-    }
-}
-
-#[cfg(feature = "image")]
-fn default_patch_size() -> usize {
-    16
-}
-
-#[cfg(feature = "image")]
-fn default_pooling_kernel_size() -> usize {
-    3
-}
-
-#[cfg(feature = "image")]
-fn default_soft_tokens() -> usize {
-    280
-}
-
-#[cfg(feature = "image")]
-fn default_video_soft_tokens() -> usize {
-    70
-}
-
-#[cfg(feature = "image")]
-fn default_video_frames() -> usize {
-    32
-}
 
 #[derive(Debug, Clone)]
 pub struct Gemma4Processor {
-    #[cfg(feature = "image")]
-    patch_size: usize,
-    #[cfg(feature = "image")]
-    pooling_kernel_size: usize,
-    #[cfg(feature = "image")]
-    max_soft_tokens: usize,
-    #[cfg(feature = "image")]
-    boi_token_id: Option<u32>,
-    #[cfg(feature = "image")]
-    eoi_token_id: Option<u32>,
-    #[cfg(feature = "image")]
-    video_patch_size: usize,
-    #[cfg(feature = "image")]
-    video_pooling_kernel_size: usize,
-    #[cfg(feature = "image")]
-    video_max_soft_tokens: usize,
-    #[cfg(feature = "image")]
-    video_num_frames: usize,
-    #[cfg(feature = "audio")]
-    boa_token_id: Option<u32>,
-    #[cfg(feature = "audio")]
-    eoa_token_id: Option<u32>,
+    plan: Gemma4ProcessorPlan,
 }
 
 impl Gemma4Processor {
     pub fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
-        let config: Gemma4ModelConfig =
-            serde_json::from_slice(&fs::read(model_dir.join("config.json"))?)?;
-        #[cfg(not(any(feature = "image", feature = "audio")))]
-        let _ = &config;
-        #[cfg(feature = "image")]
-        let has_image_processor = config.vision_config.is_some();
-        #[cfg(not(feature = "image"))]
-        let has_image_processor = false;
-        #[cfg(feature = "audio")]
-        let has_audio_processor = config.audio_config.is_some();
-        #[cfg(not(feature = "audio"))]
-        let has_audio_processor = false;
-        let has_supported_processor = has_image_processor || has_audio_processor;
-        if !has_supported_processor {
+        let model = fs::read(model_dir.join("config.json"))?;
+        let image = read_optional(&model_dir.join(PROCESSOR_CONFIG_FILENAME))?;
+        let video = read_optional(&model_dir.join(VIDEO_PROCESSOR_CONFIG_FILENAME))?;
+        let Some(plan) =
+            Gemma4ProcessorPlan::from_hf_json(&model, image.as_deref(), video.as_deref())
+                .map_err(processor_error)?
+        else {
             return Ok(None);
-        }
-        #[cfg(feature = "image")]
-        let processor_path = model_dir.join("preprocessor_config.json");
-        #[cfg(feature = "image")]
-        let processor = if processor_path.exists() {
-            serde_json::from_slice(&fs::read(processor_path)?)?
-        } else {
-            Gemma4PreprocessorConfig::default()
         };
-        #[cfg(feature = "image")]
-        let video_processor_path = model_dir.join("video_preprocessor_config.json");
-        #[cfg(feature = "image")]
-        let video_processor = if video_processor_path.exists() {
-            serde_json::from_slice(&fs::read(video_processor_path)?)?
-        } else {
-            Gemma4VideoPreprocessorConfig::default()
-        };
-        #[cfg(feature = "image")]
-        let max_soft_tokens = processor
-            .max_soft_tokens
-            .unwrap_or(config.vision_soft_tokens_per_image);
-        #[cfg(feature = "image")]
-        if config.vision_config.is_some() && !matches!(max_soft_tokens, 70 | 140 | 280 | 560 | 1120)
-        {
-            return Err(Error::Processor(format!(
-                "Gemma 4 max_soft_tokens must be one of 70, 140, 280, 560, or 1120, got {max_soft_tokens}"
-            )));
-        }
-        #[cfg(feature = "image")]
-        if !matches!(video_processor.max_soft_tokens, 70 | 140 | 280 | 560 | 1120)
-            || video_processor.num_frames == 0
-        {
-            return Err(Error::Processor(format!(
-                "Gemma 4 video processor requires a supported soft-token budget and positive frame count, got {} tokens and {} frames",
-                video_processor.max_soft_tokens, video_processor.num_frames
-            )));
-        }
-        Ok(Some(Self {
-            #[cfg(feature = "image")]
-            patch_size: processor.patch_size.unwrap_or_else(|| {
-                config
-                    .vision_config
-                    .as_ref()
-                    .map_or(default_patch_size(), |vision| vision.patch_size)
-            }),
-            #[cfg(feature = "image")]
-            pooling_kernel_size: processor.pooling_kernel_size.unwrap_or_else(|| {
-                config
-                    .vision_config
-                    .as_ref()
-                    .map_or(default_pooling_kernel_size(), |vision| {
-                        vision.pooling_kernel_size
-                    })
-            }),
-            #[cfg(feature = "image")]
-            max_soft_tokens,
-            #[cfg(feature = "image")]
-            boi_token_id: config.boi_token_id,
-            #[cfg(feature = "image")]
-            eoi_token_id: config.eoi_token_id,
-            #[cfg(feature = "image")]
-            video_patch_size: video_processor.patch_size,
-            #[cfg(feature = "image")]
-            video_pooling_kernel_size: video_processor.pooling_kernel_size,
-            #[cfg(feature = "image")]
-            video_max_soft_tokens: video_processor.max_soft_tokens,
-            #[cfg(feature = "image")]
-            video_num_frames: video_processor.num_frames,
-            #[cfg(feature = "audio")]
-            boa_token_id: config.boa_token_id,
-            #[cfg(feature = "audio")]
-            eoa_token_id: config.eoa_token_id,
-        }))
+        let supported = cfg!(feature = "image") && plan.has_image()
+            || cfg!(feature = "audio") && plan.has_audio();
+        Ok(supported.then_some(Self { plan }))
     }
 
     #[cfg(any(feature = "image", feature = "audio"))]
@@ -241,94 +60,9 @@ impl Gemma4Processor {
         model_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
         projector_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
     ) -> Result<Self, Error> {
-        use safemlx::ops::GgufMetadataValue;
-        #[cfg(not(feature = "image"))]
-        let _ = projector_metadata;
-
-        let optional_u32 = |metadata: &std::collections::HashMap<String, GgufMetadataValue>,
-                            key: &str|
-         -> Result<Option<u32>, Error> {
-            let value = match metadata.get(key) {
-                Some(value) => {
-                    let values = value.to_i64_vec().ok_or_else(|| {
-                        Error::Processor(format!(
-                            "Gemma 4 GGUF metadata key {key:?} has the wrong type"
-                        ))
-                    })?;
-                    if values.len() != 1 {
-                        return Err(Error::Processor(format!(
-                            "Gemma 4 GGUF metadata key {key:?} must be scalar"
-                        )));
-                    }
-                    values.into_iter().next()
-                }
-                None => None,
-            };
-            value
-                .map(|value| {
-                    u32::try_from(value).map_err(|_| {
-                        Error::Processor(format!("Gemma 4 GGUF metadata key {key:?} must fit u32"))
-                    })
-                })
-                .transpose()
-        };
-        #[cfg(feature = "image")]
-        let patch_size = optional_u32(projector_metadata, "clip.vision.patch_size")?
-            .unwrap_or(default_patch_size() as u32) as usize;
-        #[cfg(feature = "image")]
-        let pooling_kernel_size =
-            optional_u32(projector_metadata, "clip.vision.pooling_kernel_size")?
-                .unwrap_or(default_pooling_kernel_size() as u32) as usize;
-        #[cfg(feature = "image")]
-        let max_soft_tokens = optional_u32(projector_metadata, "clip.vision.max_soft_tokens")?
-            .unwrap_or(default_soft_tokens() as u32) as usize;
-        #[cfg(feature = "image")]
-        if !matches!(max_soft_tokens, 70 | 140 | 280 | 560 | 1120) {
-            return Err(Error::Processor(format!(
-                "Gemma 4 GGUF max_soft_tokens must be one of 70, 140, 280, 560, or 1120, got {max_soft_tokens}"
-            )));
-        }
-        #[cfg(feature = "image")]
-        let video_max_soft_tokens =
-            optional_u32(projector_metadata, "clip.vision.video.max_soft_tokens")?
-                .unwrap_or(default_video_soft_tokens() as u32) as usize;
-        #[cfg(feature = "image")]
-        let video_num_frames = optional_u32(projector_metadata, "clip.vision.video.frame_count")?
-            .unwrap_or(default_video_frames() as u32) as usize;
-        #[cfg(feature = "image")]
-        if !matches!(video_max_soft_tokens, 70 | 140 | 280 | 560 | 1120) || video_num_frames == 0 {
-            return Err(Error::Processor(format!(
-                "Gemma 4 GGUF video processor requires a supported soft-token budget and positive frame count, got {video_max_soft_tokens} tokens and {video_num_frames} frames"
-            )));
-        }
         Ok(Self {
-            #[cfg(feature = "image")]
-            patch_size,
-            #[cfg(feature = "image")]
-            pooling_kernel_size,
-            #[cfg(feature = "image")]
-            max_soft_tokens,
-            #[cfg(feature = "image")]
-            boi_token_id: optional_u32(model_metadata, "gemma4.boi_token_id")?,
-            #[cfg(feature = "image")]
-            eoi_token_id: optional_u32(model_metadata, "gemma4.eoi_token_id")?,
-            #[cfg(feature = "image")]
-            video_patch_size: optional_u32(projector_metadata, "clip.vision.video.patch_size")?
-                .unwrap_or(patch_size as u32) as usize,
-            #[cfg(feature = "image")]
-            video_pooling_kernel_size: optional_u32(
-                projector_metadata,
-                "clip.vision.video.pooling_kernel_size",
-            )?
-            .unwrap_or(pooling_kernel_size as u32) as usize,
-            #[cfg(feature = "image")]
-            video_max_soft_tokens,
-            #[cfg(feature = "image")]
-            video_num_frames,
-            #[cfg(feature = "audio")]
-            boa_token_id: optional_u32(model_metadata, "gemma4.boa_token_id")?,
-            #[cfg(feature = "audio")]
-            eoa_token_id: optional_u32(model_metadata, "gemma4.eoa_token_id")?,
+            plan: Gemma4ProcessorPlan::from_gguf_metadata(model_metadata, projector_metadata)
+                .map_err(processor_error)?,
         })
     }
 
@@ -364,19 +98,13 @@ impl Gemma4Processor {
         match (item.modality, item.payload) {
             #[cfg(feature = "image")]
             (Modality::Image, MediaPayload::Rgb8(image)) => {
-                push_text_token_ids(
-                    parts,
-                    &[self.boi_token_id.ok_or_else(|| {
-                        Error::Processor("Gemma 4 image processor requires boi_token_id".into())
-                    })?],
-                );
-                parts.push(self.process_image(image)?);
-                push_text_token_ids(
-                    parts,
-                    &[self.eoi_token_id.ok_or_else(|| {
-                        Error::Processor("Gemma 4 image processor requires eoi_token_id".into())
-                    })?],
-                );
+                let plan = self
+                    .plan
+                    .image(image.height() as usize, image.width() as usize)
+                    .map_err(processor_error)?;
+                push_text_token_ids(parts, &[plan.framing.start_token_id]);
+                parts.push(self.process_image(image, &plan)?);
+                push_text_token_ids(parts, &[plan.framing.end_token_id]);
                 Ok(())
             }
             #[cfg(feature = "image")]
@@ -386,19 +114,10 @@ impl Gemma4Processor {
             }
             #[cfg(feature = "audio")]
             (Modality::Audio, MediaPayload::AudioF32(waveform)) => {
-                push_text_token_ids(
-                    parts,
-                    &[self.boa_token_id.ok_or_else(|| {
-                        Error::Processor("Gemma 4 audio processor requires boa_token_id".into())
-                    })?],
-                );
-                parts.push(self.process_audio(waveform)?);
-                push_text_token_ids(
-                    parts,
-                    &[self.eoa_token_id.ok_or_else(|| {
-                        Error::Processor("Gemma 4 audio processor requires eoa_token_id".into())
-                    })?],
-                );
+                let plan = self.plan.audio().map_err(processor_error)?;
+                push_text_token_ids(parts, &[plan.framing.start_token_id]);
+                parts.push(self.process_audio(waveform, &plan)?);
+                push_text_token_ids(parts, &[plan.framing.end_token_id]);
                 Ok(())
             }
             _ => Err(Error::Processor(format!(
@@ -412,24 +131,18 @@ impl Gemma4Processor {
     #[cfg(feature = "image")]
     fn process_image(
         &self,
-        image: crate::backend::mlx::runtime::media::image::RgbImageView<'_>,
+        image: RgbImageView<'_>,
+        plan: &Gemma4ImagePlan,
     ) -> Result<PreparedInputPart, Error> {
-        let max_patches = self
-            .max_soft_tokens
-            .checked_mul(self.pooling_kernel_size * self.pooling_kernel_size)
-            .ok_or_else(|| Error::Processor("Gemma 4 patch budget overflow".into()))?;
-        let (height, width) = aspect_ratio_preserving_size(
-            image.height() as usize,
-            image.width() as usize,
-            self.patch_size,
-            max_patches,
-            self.pooling_kernel_size,
+        let resized = resize_rgb8(image, plan.transform)?;
+        let normalized = rescale_and_normalize_rgb8(
+            resized.as_view(),
+            plan.transform.rescale_factor,
+            plan.transform.mean,
+            plan.transform.std,
         )?;
-        let resized = resize_rgb8_bicubic(image, width as u32, height as u32)?;
-        let normalized =
-            rescale_and_normalize_rgb8(resized.as_view(), 1.0 / 255.0, [0.0; 3], [1.0; 3])?;
         let (patches, positions, grid, extent) =
-            pack_patches(&normalized, self.patch_size, max_patches)?;
+            pack_patches(&normalized, plan.patch_size, plan.max_patches)?;
         Ok(PreparedInputPart::media_tensor(
             Modality::Image,
             patches,
@@ -443,70 +156,51 @@ impl Gemma4Processor {
         video: VideoFrames<'_>,
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
     ) -> Result<Vec<PreparedInputPart>, ProcessorPreparationError<E>> {
-        let boi_token_id = self.boi_token_id.ok_or_else(|| {
-            Error::Processor("Gemma 4 video processor requires boi_token_id".into())
-        })?;
-        let eoi_token_id = self.eoi_token_id.ok_or_else(|| {
-            Error::Processor("Gemma 4 video processor requires eoi_token_id".into())
-        })?;
         let (width, height) = validate_rgb_frames(video.frames)?;
-        let source_fps = video.source_fps.unwrap_or(24.0);
-        let total_frames = video.frames.len();
-        let sample_count = match video.sampling {
-            VideoSampling::ProcessorDefault => self.video_num_frames.min(total_frames),
-            VideoSampling::All => total_frames,
-            VideoSampling::FrameCount(count) => count.clamp(1, total_frames),
-            VideoSampling::Fps(target_fps) => sampled_frame_count(
-                total_frames,
-                source_fps,
-                target_fps,
-                1,
-                self.video_num_frames,
-            )?,
-        };
-        let indices = uniform_sample_indices(total_frames, sample_count)?;
-        let timestamps = frame_timestamps(&indices, source_fps)?;
-        let max_patches = self
-            .video_max_soft_tokens
-            .checked_mul(self.video_pooling_kernel_size * self.video_pooling_kernel_size)
-            .ok_or_else(|| Error::Processor("Gemma 4 video patch budget overflow".into()))?;
-        let (resized_height, resized_width) = aspect_ratio_preserving_size(
-            height as usize,
-            width as usize,
-            self.video_patch_size,
-            max_patches,
-            self.video_pooling_kernel_size,
-        )?;
-        let mut replacement = Vec::with_capacity(indices.len() * 3);
-        for (frame_index, (source_index, timestamp)) in
-            indices.into_iter().zip(timestamps).enumerate()
-        {
-            let timestamp = format_mm_ss(timestamp)?;
-            let timestamp_text = if frame_index == 0 {
-                format!("{timestamp} ")
-            } else {
-                format!(" {timestamp} ")
-            };
+        let plan = self
+            .plan
+            .video(
+                video.frames.len(),
+                height as usize,
+                width as usize,
+                video.source_fps,
+                video.sampling,
+            )
+            .map_err(processor_error)?;
+        self.materialize_video(video, &plan, encode_text)
+    }
+
+    #[cfg(feature = "image")]
+    fn materialize_video<E>(
+        &self,
+        video: VideoFrames<'_>,
+        plan: &Gemma4VideoPlan,
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, E>,
+    ) -> Result<Vec<PreparedInputPart>, ProcessorPreparationError<E>> {
+        let mut replacement = Vec::with_capacity(plan.frames.len() * 3);
+        for frame in &plan.frames {
             let mut prefix =
-                encode_text(&timestamp_text).map_err(ProcessorPreparationError::Text)?;
-            prefix.push(boi_token_id);
+                encode_text(&frame.timestamp_text).map_err(ProcessorPreparationError::Text)?;
+            prefix.push(plan.framing.start_token_id);
             replacement.push(PreparedInputPart::text_token_ids(&prefix));
 
-            let resized = resize_rgb8_bicubic(
-                video.frames[source_index],
-                resized_width as u32,
-                resized_height as u32,
+            let resized = resize_rgb8(video.frames[frame.source_index], plan.transform)?;
+            let normalized = rescale_and_normalize_rgb8(
+                resized.as_view(),
+                plan.transform.rescale_factor,
+                plan.transform.mean,
+                plan.transform.std,
             )?;
-            let normalized =
-                rescale_and_normalize_rgb8(resized.as_view(), 1.0 / 255.0, [0.0; 3], [1.0; 3])?;
             let (patches, positions, grid, extent) =
-                pack_patches(&normalized, self.video_patch_size, max_patches)?;
+                pack_patches(&normalized, plan.patch_size, plan.max_patches)?;
             replacement.push(PreparedInputPart::media_tensor(
                 Modality::Video,
                 patches,
                 OwnedInputMetadata::patch_layout(grid, positions, extent),
             ));
-            replacement.push(PreparedInputPart::text_token_ids(&[eoi_token_id]));
+            replacement.push(PreparedInputPart::text_token_ids(&[plan
+                .framing
+                .end_token_id]));
         }
         Ok(replacement)
     }
@@ -515,20 +209,21 @@ impl Gemma4Processor {
     fn process_audio(
         &self,
         waveform: crate::backend::mlx::runtime::media::audio::AudioWaveform<'_>,
+        plan: &eredu_architectures::processor_plan::Gemma4AudioPlan,
     ) -> Result<PreparedInputPart, Error> {
         let features = extract_log_mel(
             waveform,
             &LogMelConfig {
-                sample_rate: 16_000,
-                frame_length: 320,
-                hop_length: 160,
-                fft_length: 512,
-                mel_bins: 128,
-                min_frequency: 0.0,
-                max_frequency: 8_000.0,
-                mel_floor: 1e-3,
-                max_samples: 480_000,
-                pad_to_multiple: 128,
+                sample_rate: plan.sample_rate,
+                frame_length: plan.frame_length,
+                hop_length: plan.hop_length,
+                fft_length: plan.fft_length,
+                mel_bins: plan.mel_bins,
+                min_frequency: plan.min_frequency,
+                max_frequency: plan.max_frequency,
+                mel_floor: plan.mel_floor,
+                max_samples: plan.max_samples,
+                pad_to_multiple: plan.pad_to_multiple,
             },
         )?;
         let tensor = Array::from_slice(
@@ -545,45 +240,23 @@ impl Gemma4Processor {
     }
 }
 
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, Error> {
+    path.exists()
+        .then(|| fs::read(path))
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn processor_error(error: ProcessorPlanError) -> Error {
+    Error::Processor(error.to_string())
+}
+
 #[cfg(feature = "image")]
-fn aspect_ratio_preserving_size(
-    height: usize,
-    width: usize,
-    patch_size: usize,
-    max_patches: usize,
-    pooling_kernel_size: usize,
-) -> Result<(usize, usize), Error> {
-    if patch_size == 0 || pooling_kernel_size == 0 || max_patches == 0 {
-        return Err(Error::Processor(
-            "Gemma 4 image processor dimensions must be positive".into(),
-        ));
+fn resize_rgb8(image: RgbImageView<'_>, plan: RgbTransformPlan) -> Result<RgbImage, Error> {
+    match plan.resample {
+        RgbResample::Bicubic => resize_rgb8_bicubic(image, plan.width as u32, plan.height as u32),
+        RgbResample::Lanczos3 => resize_rgb8_lanczos3(image, plan.width as u32, plan.height as u32),
     }
-    let target_pixels = max_patches as f64 * (patch_size * patch_size) as f64;
-    let factor = (target_pixels / (height * width) as f64).sqrt();
-    let side_multiple = patch_size * pooling_kernel_size;
-    let mut target_height =
-        ((factor * height as f64).floor() as usize / side_multiple) * side_multiple;
-    let mut target_width =
-        ((factor * width as f64).floor() as usize / side_multiple) * side_multiple;
-    let max_side = (max_patches / (pooling_kernel_size * pooling_kernel_size)) * side_multiple;
-    if target_height == 0 && target_width == 0 {
-        return Err(Error::Processor(format!(
-            "Gemma 4 image is too small for resize multiple {side_multiple}"
-        )));
-    }
-    if target_height == 0 {
-        target_height = side_multiple;
-        target_width = (width / height).saturating_mul(side_multiple).min(max_side);
-    } else if target_width == 0 {
-        target_width = side_multiple;
-        target_height = (height / width).saturating_mul(side_multiple).min(max_side);
-    }
-    if target_height * target_width > max_patches * patch_size * patch_size {
-        return Err(Error::Processor(format!(
-            "Gemma 4 resize {target_height}x{target_width} exceeds the {max_patches}-patch budget"
-        )));
-    }
-    Ok((target_height, target_width))
 }
 
 #[cfg(feature = "image")]
@@ -642,21 +315,30 @@ fn pack_patches(
 mod tests {
     use std::collections::HashMap;
 
+    use eredu_architectures::processor_plan::Gemma4ProcessorPlan;
     use safemlx::ops::GgufMetadataValue;
 
-    use super::{aspect_ratio_preserving_size, Gemma4Processor};
+    use super::Gemma4Processor;
     use crate::{
         backend::mlx::runtime::media::input::{InputPayload, Modality},
         backend::mlx::runtime::media::{MediaInput, ProcessorInput, RgbImageView, VideoSampling},
     };
 
-    #[test]
-    fn resize_preserves_budget_and_pooling_multiple() {
-        let (height, width) = aspect_ratio_preserving_size(320, 480, 16, 2520, 3).unwrap();
-        assert_eq!((height, width), (624, 960));
-        assert_eq!(height % 48, 0);
-        assert_eq!(width % 48, 0);
-        assert!(height * width <= 2520 * 16 * 16);
+    fn tiny_processor() -> Gemma4Processor {
+        let model = br#"{
+            "boi_token_id":43,"eoi_token_id":44,
+            "vision_soft_tokens_per_image":70,
+            "vision_config":{"patch_size":2,"pooling_kernel_size":1}
+        }"#;
+        let video = br#"{
+            "patch_size":2,"pooling_kernel_size":1,
+            "max_soft_tokens":70,"num_frames":32
+        }"#;
+        Gemma4Processor {
+            plan: Gemma4ProcessorPlan::from_hf_json(model, None, Some(video))
+                .unwrap()
+                .unwrap(),
+        }
     }
 
     #[test]
@@ -680,30 +362,16 @@ mod tests {
             ),
         ]);
         let processor = Gemma4Processor::from_gguf(&model, &projector).unwrap();
-        assert_eq!(processor.patch_size, 2);
-        assert_eq!(processor.pooling_kernel_size, 2);
-        assert_eq!(processor.max_soft_tokens, 280);
-        assert_eq!(processor.boi_token_id, Some(43));
-        assert_eq!(processor.eoi_token_id, Some(44));
+        let plan = processor.plan.image(4, 4).unwrap();
+        assert_eq!(plan.patch_size, 2);
+        assert_eq!(plan.max_patches, 1120);
+        assert_eq!(plan.framing.start_token_id, 43);
+        assert_eq!(plan.framing.end_token_id, 44);
     }
 
     #[test]
     fn processor_wraps_ordered_image_with_boundary_tokens() {
-        let processor = Gemma4Processor {
-            patch_size: 2,
-            pooling_kernel_size: 1,
-            max_soft_tokens: 70,
-            boi_token_id: Some(43),
-            eoi_token_id: Some(44),
-            video_patch_size: 2,
-            video_pooling_kernel_size: 1,
-            video_max_soft_tokens: 70,
-            video_num_frames: 32,
-            #[cfg(feature = "audio")]
-            boa_token_id: None,
-            #[cfg(feature = "audio")]
-            eoa_token_id: None,
-        };
+        let processor = tiny_processor();
         let pixels = vec![128u8; 4 * 4 * 3];
         let image = RgbImageView::packed(&pixels, 4, 4).unwrap();
         let prepared = processor
@@ -725,21 +393,7 @@ mod tests {
 
     #[test]
     fn processor_interleaves_timestamped_video_frames() {
-        let processor = Gemma4Processor {
-            patch_size: 2,
-            pooling_kernel_size: 1,
-            max_soft_tokens: 70,
-            boi_token_id: Some(43),
-            eoi_token_id: Some(44),
-            video_patch_size: 2,
-            video_pooling_kernel_size: 1,
-            video_max_soft_tokens: 70,
-            video_num_frames: 32,
-            #[cfg(feature = "audio")]
-            boa_token_id: None,
-            #[cfg(feature = "audio")]
-            eoa_token_id: None,
-        };
+        let processor = tiny_processor();
         let pixels = vec![128u8; 4 * 4 * 3];
         let frames = [
             RgbImageView::packed(&pixels, 4, 4).unwrap(),
@@ -778,6 +432,8 @@ mod tests {
 
 #[cfg(all(test, feature = "audio"))]
 mod audio_tests {
+    use eredu_architectures::processor_plan::Gemma4ProcessorPlan;
+
     use super::Gemma4Processor;
     use crate::{
         backend::mlx::runtime::media::input::{InputPayload, Modality},
@@ -786,27 +442,13 @@ mod audio_tests {
 
     #[test]
     fn processor_wraps_ordered_audio_with_boundary_tokens() {
+        let model = br#"{
+            "boa_token_id":43,"eoa_token_id":44,"audio_config":{}
+        }"#;
         let processor = Gemma4Processor {
-            #[cfg(feature = "image")]
-            patch_size: 16,
-            #[cfg(feature = "image")]
-            pooling_kernel_size: 3,
-            #[cfg(feature = "image")]
-            max_soft_tokens: 280,
-            #[cfg(feature = "image")]
-            boi_token_id: None,
-            #[cfg(feature = "image")]
-            eoi_token_id: None,
-            #[cfg(feature = "image")]
-            video_patch_size: 16,
-            #[cfg(feature = "image")]
-            video_pooling_kernel_size: 3,
-            #[cfg(feature = "image")]
-            video_max_soft_tokens: 70,
-            #[cfg(feature = "image")]
-            video_num_frames: 32,
-            boa_token_id: Some(43),
-            eoa_token_id: Some(44),
+            plan: Gemma4ProcessorPlan::from_hf_json(model, None, None)
+                .unwrap()
+                .unwrap(),
         };
         let samples = vec![0.0f32; 16_000];
         let audio = MediaInput::audio_f32(&samples, 16_000).unwrap();

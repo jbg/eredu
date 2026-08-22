@@ -5,9 +5,13 @@ use std::path::Path;
 #[cfg(feature = "media")]
 use std::collections::HashMap;
 
+#[cfg(feature = "audio")]
+use eredu_architectures::processor_plan::InklingAudioPlan;
+#[cfg(feature = "image")]
+use eredu_architectures::processor_plan::InklingImagePlan;
+use eredu_architectures::processor_plan::{InklingProcessorPlan, ProcessorPlanError};
 #[cfg(any(feature = "image", feature = "audio"))]
-use safemlx::{ops::GgufMetadataValue, Array};
-use serde::Deserialize;
+use safemlx::Array;
 
 use crate::backend::mlx::error::Error;
 #[cfg(any(feature = "image", feature = "audio"))]
@@ -22,89 +26,22 @@ use crate::backend::mlx::runtime::media::{MediaPayload, OwnedInputMetadata};
 
 #[derive(Debug, Clone)]
 pub struct InklingProcessor {
-    #[cfg(feature = "image")]
-    image_bos_token_id: u32,
-    #[cfg(feature = "audio")]
-    audio_bos_token_id: u32,
-    #[cfg(feature = "audio")]
-    dmel_bins: usize,
-    #[cfg(feature = "audio")]
-    dmel_min: f32,
-    #[cfg(feature = "audio")]
-    dmel_max: f32,
+    plan: InklingProcessorPlan,
 }
 
 impl InklingProcessor {
     pub fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
-        #[derive(Deserialize)]
-        struct Config {
-            model_type: String,
-            #[cfg(feature = "image")]
-            #[serde(default = "default_image_bos")]
-            image_bos_token_id: u32,
-            #[cfg(feature = "audio")]
-            #[serde(default = "default_audio_bos")]
-            audio_bos_token_id: u32,
-            #[cfg(feature = "audio")]
-            #[serde(default)]
-            audio_config: Option<AudioConfig>,
-        }
-        #[cfg(feature = "audio")]
-        #[derive(Deserialize)]
-        struct AudioConfig {
-            #[serde(default = "default_dmel_bins")]
-            mel_vocab_size: usize,
-            #[serde(default = "default_dmel_min")]
-            dmel_min_value: f32,
-            #[serde(default = "default_dmel_max")]
-            dmel_max_value: f32,
-        }
-        let config: Config =
-            serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)?;
-        if config.model_type != "inkling_mm_model" {
-            return Ok(None);
-        }
-        #[cfg(feature = "audio")]
-        let audio = config.audio_config.unwrap_or(AudioConfig {
-            mel_vocab_size: default_dmel_bins(),
-            dmel_min_value: default_dmel_min(),
-            dmel_max_value: default_dmel_max(),
-        });
-        Ok(Some(Self {
-            #[cfg(feature = "image")]
-            image_bos_token_id: config.image_bos_token_id,
-            #[cfg(feature = "audio")]
-            audio_bos_token_id: config.audio_bos_token_id,
-            #[cfg(feature = "audio")]
-            dmel_bins: audio.mel_vocab_size,
-            #[cfg(feature = "audio")]
-            dmel_min: audio.dmel_min_value,
-            #[cfg(feature = "audio")]
-            dmel_max: audio.dmel_max_value,
-        }))
+        InklingProcessorPlan::from_hf_json(&std::fs::read(model_dir.join("config.json"))?)
+            .map_err(processor_error)
+            .map(|plan| plan.map(|plan| Self { plan }))
     }
 
     #[cfg(feature = "media")]
     pub fn from_gguf(
         metadata: &HashMap<String, safemlx::ops::GgufMetadataValue>,
     ) -> Result<Self, Error> {
-        #[cfg(not(any(feature = "image", feature = "audio")))]
-        let _ = metadata;
         Ok(Self {
-            #[cfg(feature = "image")]
-            image_bos_token_id: gguf_token_id(metadata, "<|content_image|>", default_image_bos())?,
-            #[cfg(feature = "audio")]
-            audio_bos_token_id: gguf_token_id(
-                metadata,
-                "<|content_audio_input|>",
-                default_audio_bos(),
-            )?,
-            #[cfg(feature = "audio")]
-            dmel_bins: default_dmel_bins(),
-            #[cfg(feature = "audio")]
-            dmel_min: default_dmel_min(),
-            #[cfg(feature = "audio")]
-            dmel_max: default_dmel_max(),
+            plan: InklingProcessorPlan::from_gguf_metadata(metadata).map_err(processor_error)?,
         })
     }
 
@@ -131,14 +68,19 @@ impl InklingProcessor {
         match (media.modality, media.payload) {
             #[cfg(feature = "image")]
             (Modality::Image, MediaPayload::Rgb8(image)) => {
-                push_text_token_ids(_parts, &[self.image_bos_token_id]);
-                _parts.push(process_image(image)?);
+                let plan = self
+                    .plan
+                    .image(image.height() as usize, image.width() as usize)
+                    .map_err(processor_error)?;
+                push_text_token_ids(_parts, &[plan.start_token_id]);
+                _parts.push(process_image(image, plan)?);
                 Ok(())
             }
             #[cfg(feature = "audio")]
             (Modality::Audio, MediaPayload::AudioF32(waveform)) => {
-                push_text_token_ids(_parts, &[self.audio_bos_token_id]);
-                _parts.push(self.process_audio(waveform)?);
+                let plan = self.plan.audio();
+                push_text_token_ids(_parts, &[plan.start_token_id]);
+                _parts.push(self.process_audio(waveform, plan)?);
                 Ok(())
             }
             _ => Err(Error::Processor(format!(
@@ -152,21 +94,17 @@ impl InklingProcessor {
     fn process_audio(
         &self,
         waveform: crate::backend::mlx::runtime::media::audio::AudioWaveform<'_>,
+        plan: InklingAudioPlan,
     ) -> Result<PreparedInputPart, Error> {
-        let features = inkling_log_mel(waveform)?;
-        let span = (self.dmel_max - self.dmel_min) as f64;
-        if self.dmel_bins < 2 || span <= 0.0 {
-            return Err(Error::Processor(
-                "invalid Inkling dMel bin configuration".into(),
-            ));
-        }
-        let centers = (0..self.dmel_bins)
-            .map(|index| self.dmel_min as f64 + span * index as f64 / (self.dmel_bins - 1) as f64)
+        let features = inkling_log_mel(waveform, plan)?;
+        let span = (plan.dmel_max - plan.dmel_min) as f64;
+        let centers = (0..plan.dmel_bins)
+            .map(|index| plan.dmel_min as f64 + span * index as f64 / (plan.dmel_bins - 1) as f64)
             .collect::<Vec<_>>();
         let ids = features
             .iter()
             .map(|value| {
-                let value = (*value as f64).clamp(self.dmel_min as f64, self.dmel_max as f64);
+                let value = (*value as f64).clamp(plan.dmel_min as f64, plan.dmel_max as f64);
                 centers
                     .iter()
                     .enumerate()
@@ -177,8 +115,8 @@ impl InklingProcessor {
                     .unwrap_or(0)
             })
             .collect::<Vec<_>>();
-        let frames = ids.len() / 80;
-        let tensor = Array::from_slice(&ids, &[1, frames as i32, 80]);
+        let frames = ids.len() / plan.mel_bins;
+        let tensor = Array::from_slice(&ids, &[1, frames as i32, plan.mel_bins as i32]);
         let mask = Array::from_slice(&vec![true; frames], &[1, frames as i32]);
         Ok(PreparedInputPart::media_tensor(
             Modality::Audio,
@@ -188,139 +126,101 @@ impl InklingProcessor {
     }
 }
 
-#[cfg(any(feature = "image", feature = "audio"))]
-fn gguf_token_id(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    token: &str,
-    fallback: u32,
-) -> Result<u32, Error> {
-    let Some(tokens) = metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(GgufMetadataValue::as_strings)
-    else {
-        return Ok(fallback);
-    };
-    let Some(index) = tokens.iter().position(|candidate| candidate == token) else {
-        return Err(Error::Processor(format!(
-            "Inkling GGUF tokenizer is missing media marker {token:?}"
-        )));
-    };
-    u32::try_from(index).map_err(|_| Error::Processor("Inkling media token id exceeds u32".into()))
-}
-
-#[cfg(feature = "image")]
-fn default_image_bos() -> u32 {
-    200_005
-}
-
-#[cfg(feature = "audio")]
-fn default_audio_bos() -> u32 {
-    200_020
-}
-
-#[cfg(feature = "audio")]
-fn default_dmel_bins() -> usize {
-    16
-}
-
-#[cfg(feature = "audio")]
-fn default_dmel_min() -> f32 {
-    -7.0
-}
-
-#[cfg(feature = "audio")]
-fn default_dmel_max() -> f32 {
-    2.0
+fn processor_error(error: ProcessorPlanError) -> Error {
+    Error::Processor(error.to_string())
 }
 
 #[cfg(feature = "image")]
 fn process_image(
     image: crate::backend::mlx::runtime::media::image::RgbImageView<'_>,
+    plan: InklingImagePlan,
 ) -> Result<PreparedInputPart, Error> {
-    const PATCH: usize = 40;
-    const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
-    const STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
     let width = image.width() as usize;
     let height = image.height() as usize;
     let pixels = image.packed_pixels();
-    let (rows, cols) = image_patch_grid(height, width);
-    let mut output = Vec::with_capacity(rows * cols * 2 * PATCH * PATCH * 3);
-    for row in 0..rows {
-        for col in 0..cols {
-            let mut patch = vec![0.0f32; 2 * PATCH * PATCH * 3];
-            for time in 0..2 {
-                for y in 0..PATCH {
-                    for x in 0..PATCH {
-                        let source_y = row * PATCH + y;
-                        let source_x = col * PATCH + x;
+    let patch = plan.patch_size;
+    let mut output = Vec::with_capacity(
+        plan.patch_rows * plan.patch_columns * plan.temporal_patch_size * patch * patch * 3,
+    );
+    for row in 0..plan.patch_rows {
+        for col in 0..plan.patch_columns {
+            let mut values = vec![0.0f32; plan.temporal_patch_size * patch * patch * 3];
+            for time in 0..plan.temporal_patch_size {
+                for y in 0..patch {
+                    for x in 0..patch {
+                        let source_y = row * patch + y;
+                        let source_x = col * patch + x;
                         for channel in 0..3 {
                             let raw = if source_y < height && source_x < width {
                                 pixels[(source_y * width + source_x) * 3 + channel] as f32
                             } else {
-                                -1.0
+                                plan.padding_value
                             };
-                            let normalized = (raw / 255.0 - MEAN[channel]) / STD[channel];
-                            patch[((time * PATCH + y) * PATCH + x) * 3 + channel] = normalized;
+                            let normalized = (raw * plan.rescale_factor - plan.mean[channel])
+                                / plan.std[channel];
+                            values[((time * patch + y) * patch + x) * 3 + channel] = normalized;
                         }
                     }
                 }
             }
-            output.extend(patch);
+            output.extend(values);
         }
     }
     Ok(PreparedInputPart::media_tensor(
         Modality::Image,
-        Array::from_slice(&output, &[(rows * cols) as i32, 2, 40, 40, 3]),
+        Array::from_slice(
+            &output,
+            &[
+                (plan.patch_rows * plan.patch_columns) as i32,
+                plan.temporal_patch_size as i32,
+                patch as i32,
+                patch as i32,
+                3,
+            ],
+        ),
         OwnedInputMetadata::default(),
     ))
-}
-
-#[cfg(feature = "image")]
-fn image_patch_grid(height: usize, width: usize) -> (usize, usize) {
-    // The reference deliberately includes a final partial/empty column when
-    // width is an exact multiple of the patch size.
-    (height.div_ceil(40), width / 40 + 1)
 }
 
 #[cfg(feature = "audio")]
 fn inkling_log_mel(
     waveform: crate::backend::mlx::runtime::media::audio::AudioWaveform<'_>,
+    plan: InklingAudioPlan,
 ) -> Result<Vec<f32>, Error> {
     use rustfft::{num_complex::Complex32, FftPlanner};
 
-    const SAMPLE_RATE: u32 = 16_000;
-    const FFT: usize = 1_600;
-    const HOP: usize = 800;
-    const MELS: usize = 80;
-    if waveform.sample_rate() != SAMPLE_RATE {
+    if waveform.sample_rate() != plan.sample_rate {
         return Err(Error::Processor(format!(
-            "Inkling audio requires {SAMPLE_RATE} Hz PCM, got {} Hz",
+            "Inkling audio requires {} Hz PCM, got {} Hz",
+            plan.sample_rate,
             waveform.sample_rate()
         )));
     }
     let samples = waveform.samples();
-    let frames = samples.len().div_ceil(HOP);
-    let mut padded = vec![0.0f32; HOP + frames * HOP];
-    padded[HOP..HOP + samples.len()].copy_from_slice(samples);
-    let filters = slaney_mel_filters(FFT, SAMPLE_RATE as usize, MELS);
+    let frames = samples.len().div_ceil(plan.hop_length);
+    let mut padded = vec![0.0f32; plan.hop_length + frames * plan.hop_length];
+    padded[plan.hop_length..plan.hop_length + samples.len()].copy_from_slice(samples);
+    let filters = slaney_mel_filters(plan.fft_length, plan.sample_rate as usize, plan.mel_bins);
     let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(FFT);
-    let mut spectrum = vec![Complex32::default(); FFT];
-    let mut output = vec![0.0f32; frames * MELS];
+    let fft = planner.plan_fft_forward(plan.fft_length);
+    let mut spectrum = vec![Complex32::default(); plan.fft_length];
+    let mut output = vec![0.0f32; frames * plan.mel_bins];
     for frame in 0..frames {
         spectrum.fill(Complex32::default());
-        let start = frame * HOP;
-        for index in 0..FFT {
-            let window = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * index as f32 / FFT as f32).cos();
+        let start = frame * plan.hop_length;
+        for index in 0..plan.fft_length {
+            let window = 0.5
+                - 0.5 * (2.0 * std::f32::consts::PI * index as f32 / plan.fft_length as f32).cos();
             spectrum[index].re = padded[start + index] * window;
         }
         fft.process(&mut spectrum);
-        for mel in 0..MELS {
+        for mel in 0..plan.mel_bins {
             let mut energy = 0.0f32;
-            for frequency in 0..=FFT / 2 {
-                energy += spectrum[frequency].norm() * filters[mel * (FFT / 2 + 1) + frequency];
+            for frequency in 0..=plan.fft_length / 2 {
+                energy += spectrum[frequency].norm()
+                    * filters[mel * (plan.fft_length / 2 + 1) + frequency];
             }
-            output[frame * MELS + mel] = energy.max(1e-10).log10();
+            output[frame * plan.mel_bins + mel] = energy.max(plan.energy_floor).log10();
         }
     }
     Ok(output)
@@ -379,16 +279,23 @@ mod tests {
         )]);
         let processor = super::InklingProcessor::from_gguf(&metadata).unwrap();
         #[cfg(feature = "image")]
-        assert_eq!(processor.image_bos_token_id, 1);
+        assert_eq!(processor.plan.image(40, 40).unwrap().start_token_id, 1);
         #[cfg(feature = "audio")]
-        assert_eq!(processor.audio_bos_token_id, 0);
+        assert_eq!(processor.plan.audio().start_token_id, 0);
     }
 
     #[cfg(feature = "image")]
     #[test]
     fn exact_patch_width_keeps_reference_extra_column() {
-        assert_eq!(super::image_patch_grid(40, 40), (1, 2));
-        assert_eq!(super::image_patch_grid(41, 39), (2, 1));
+        let plan = eredu_architectures::processor_plan::InklingProcessorPlan::from_hf_json(
+            br#"{"model_type":"inkling_mm_model"}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let exact = plan.image(40, 40).unwrap();
+        assert_eq!((exact.patch_rows, exact.patch_columns), (1, 2));
+        let partial = plan.image(41, 39).unwrap();
+        assert_eq!((partial.patch_rows, partial.patch_columns), (2, 1));
     }
 
     #[cfg(feature = "audio")]
@@ -397,7 +304,13 @@ mod tests {
         let samples = vec![0.0f32; 801];
         let waveform =
             crate::backend::mlx::runtime::media::AudioWaveform::new(&samples, 16_000).unwrap();
-        let features = super::inkling_log_mel(waveform).unwrap();
+        let plan = eredu_architectures::processor_plan::InklingProcessorPlan::from_hf_json(
+            br#"{"model_type":"inkling_mm_model"}"#,
+        )
+        .unwrap()
+        .unwrap()
+        .audio();
+        let features = super::inkling_log_mel(waveform, plan).unwrap();
         assert_eq!(features.len(), 2 * 80);
         assert!(features.iter().all(|value| (*value + 10.0).abs() < 1e-6));
     }

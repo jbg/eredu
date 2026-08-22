@@ -94,20 +94,9 @@ pub enum ProcessorInput<'a> {
     Media(MediaInput<'a>),
 }
 
-/// Frame-selection policy for decoded video input.
 #[cfg(feature = "image")]
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub enum VideoSampling {
-    /// Uses the model processor's default frame rate and limits.
-    #[default]
-    ProcessorDefault,
-    /// Uniformly samples approximately this many frames per second.
-    Fps(f64),
-    /// Uniformly samples exactly this many frames, capped by the source length.
-    FrameCount(usize),
-    /// Uses every decoded source frame.
-    All,
-}
+/// Portable frame-selection policy shared with architecture processor plans.
+pub use eredu_core::VideoSampling;
 
 /// Borrowed sequence of decoded RGB8 video frames.
 #[cfg(feature = "image")]

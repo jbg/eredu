@@ -95,12 +95,21 @@ materializers. Core selects the neutral expert-cache route but does not infer
 support from `ModelKind`, because one kind may contain both dense and MoE
 variants.
 
-Prepared-media admission follows the same boundary. Architecture media plans
-validate family payload shapes, patch/window/pooling geometry, valid-position
-masks, and artifact-specific modality policy, then report decoder positions
-and conservative scalar workspace. Concrete backends only extract shapes and
-small metadata values from native arrays, apply physical scalar widths, and
-account for the arrays' actual byte sizes.
+Multimodal preprocessing starts with an architecture-owned processor plan.
+That neutral plan parses family model and processor metadata, selects released
+defaults, declares framing token IDs and text, chooses frame sampling and
+grouping, and derives resize, normalization, patch, and signal-feature policy.
+Concrete backends execute those declarations: they resize pixels, extract
+features, pack patches, and construct native tensors. A new backend therefore
+consumes the same family protocol instead of reimplementing it.
+
+Prepared-media admission follows the same boundary after tensor construction.
+Architecture media plans validate family payload shapes,
+patch/window/pooling geometry, valid-position masks, and artifact-specific
+modality policy, then report decoder positions and conservative scalar
+workspace. Concrete backends only extract shapes and small metadata values
+from native arrays, apply physical scalar widths, and account for the arrays'
+actual byte sizes.
 
 Backend types also declare the optional neural forward operators they support.
 Architecture constructors preflight family-owned operator requirement sets
@@ -177,7 +186,9 @@ stop and EOS precedence, cancellation, grammar state, and semantic events.
 `MultimodalPreparationBackend` accepts portable ordered text, token, image,
 audio, and video inputs and produces the backend's ordinary opaque prompt.
 Image resizing, signal processing, feature extraction, tensor construction,
-and placement remain backend operations.
+and placement remain backend operations, while architecture processor plans
+declare the family-specific transforms, sampling, framing, and packing
+geometry those operations implement.
 
 The facade owns tokenizer and chat-template discovery. A backend may request
 tokenization of checkpoint-defined framing text through typed callbacks, but it
