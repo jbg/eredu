@@ -1,7 +1,7 @@
 use std::process::Command;
 
 #[test]
-fn no_default_features_dependency_graph_has_no_concrete_backend() {
+fn no_default_features_test_graph_has_no_concrete_backend() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let output = Command::new(env!("CARGO"))
         .args([
@@ -10,7 +10,7 @@ fn no_default_features_dependency_graph_has_no_concrete_backend() {
             manifest.to_str().unwrap(),
             "--no-default-features",
             "--edges",
-            "normal",
+            "all",
             "--prefix",
             "none",
         ])

@@ -89,11 +89,6 @@ path = "examples/tensor_parallel_generate.rs"
 required-features = ["mlx"]
 
 [[test]]
-name = "automatic_planner_api"
-path = "tests/automatic_planner_api.rs"
-required-features = ["mlx"]
-
-[[test]]
 name = "backend_conformance"
 path = "tests/backend_conformance.rs"
 
@@ -104,26 +99,6 @@ path = "tests/core_types.rs"
 [[test]]
 name = "dependency_boundary"
 path = "tests/dependency_boundary.rs"
-
-[[test]]
-name = "distributed_pipeline_ring"
-path = "tests/distributed_pipeline_ring_target.rs"
-required-features = ["mlx"]
-
-[[test]]
-name = "distributed_realtime_ring"
-path = "tests/distributed_realtime_ring.rs"
-required-features = ["mlx"]
-
-[[test]]
-name = "facade_compatibility"
-path = "tests/facade_compatibility.rs"
-required-features = ["mlx"]
-
-[[test]]
-name = "native_tool_checkpoints"
-path = "tests/native_tool_checkpoints.rs"
-required-features = ["mlx"]
 
 [[test]]
 name = "portable_facade"
@@ -138,6 +113,9 @@ features = ["mlx-image", "mlx-audio"]
 default = ["mlx", "onig", "esaxx_fast"]
 
 mlx = ["dep:eredu-backend-mlx"]
+# Test packages use this explicitly to compile facade-owned MLX unit suites
+# against backend test helpers without adding a native facade dev-dependency.
+mlx-test-support = ["mlx", "eredu-backend-mlx/test-support"]
 cuda = ["mlx", "eredu-backend-mlx/cuda"]
 esaxx_fast = ["tokenizers/esaxx_fast", "eredu-text/esaxx_fast"]
 onig = ["tokenizers/onig", "eredu-text/onig"]
@@ -172,7 +150,6 @@ toktrie_hf_tokenizers = "=1.7.6"
 [dev-dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-eredu-backend-mlx = { workspace = true, features = ["test-support"] }
 lazy_static = "1"
 safetensors = "0.8"
 tempfile.workspace = true

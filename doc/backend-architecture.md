@@ -340,7 +340,10 @@ The repository mechanically verifies stable dependency and behavior boundaries:
   dependencies;
 - `eredu-backend-mlx` dependency-graph tests reject a dependency on `eredu`;
 - the feature-disabled `portable_facade` and `backend_conformance` suites compile
-  and exercise the public contracts through mock backends; and
+  and exercise the public contracts through mock backends, with the facade's
+  complete normal, build, and development dependency graph remaining free of
+  MLX; MLX-specific facade tests are owned by the separate `eredu-mlx-tests`
+  package; and
 - architecture, runtime, and backend conformance tests cover the relevant
   production contracts.
 

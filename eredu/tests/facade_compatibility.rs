@@ -2,17 +2,16 @@ use std::{path::Path, process::Command};
 
 #[test]
 fn retained_mlx_facade_paths_compile_for_a_downstream_crate() {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/facade_compatibility/lib.rs");
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("test package is a workspace member");
+    let facade_dir = workspace_root.join("eredu");
+    let fixture = facade_dir.join("tests/fixtures/facade_compatibility/lib.rs");
     let project = tempfile::tempdir().expect("temporary downstream project");
     let source = project.path().join("src");
     std::fs::create_dir(&source).expect("downstream source directory");
     std::fs::copy(fixture, source.join("lib.rs")).expect("copy downstream fixture");
 
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = Path::new(manifest_dir)
-        .parent()
-        .expect("eredu is a workspace member");
     std::fs::write(
         project.path().join("Cargo.toml"),
         format!(
@@ -24,7 +23,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-eredu = {{ path = {manifest_dir:?}, default-features = false, features = ["mlx"] }}
+eredu = {{ path = {facade_dir:?}, default-features = false, features = ["mlx"] }}
 "#,
         ),
     )

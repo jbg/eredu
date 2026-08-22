@@ -978,6 +978,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "eredu-mlx-tests"
+version = "0.1.1"
+dependencies = [
+ "eredu",
+ "eredu-architectures",
+ "eredu-backend-mlx",
+ "eredu-runtime",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "eredu-nn"
 version = "0.1.0"
 dependencies = [

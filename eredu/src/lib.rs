@@ -74,20 +74,20 @@ pub use eredu_core::{
     VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
     EXECUTION_PLAN_SCHEMA_VERSION,
 };
-#[cfg(all(test, feature = "mlx"))]
+#[cfg(all(test, feature = "mlx-test-support"))]
 mod test_utils;
-#[cfg(all(test, feature = "mlx"))]
+#[cfg(all(test, feature = "mlx-test-support"))]
 extern crate self as eredu;
-#[cfg(all(test, feature = "mlx"))]
+#[cfg(all(test, feature = "mlx-test-support"))]
 #[path = "../tests/distributed_cartesian_ring.rs"]
 mod distributed_cartesian_ring;
-#[cfg(all(test, feature = "mlx"))]
+#[cfg(all(test, feature = "mlx-test-support"))]
 #[path = "../tests/distributed_expert_exchange_ring.rs"]
 mod distributed_expert_exchange_ring;
-#[cfg(all(test, feature = "mlx"))]
+#[cfg(all(test, feature = "mlx-test-support"))]
 #[path = "../tests/distributed_partition_ring.rs"]
 mod distributed_partition_ring;
-#[cfg(all(test, feature = "mlx"))]
+#[cfg(all(test, feature = "mlx-test-support"))]
 #[path = "../tests/distributed_pipeline_ring.rs"]
 mod distributed_pipeline_ring;
 

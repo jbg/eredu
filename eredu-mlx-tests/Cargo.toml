@@ -1,0 +1,39 @@
+[package]
+name = "eredu-mlx-tests"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "MLX-specific integration tests for the Eredu facade"
+autotests = false
+
+[[test]]
+name = "automatic_planner_api"
+path = "../eredu/tests/automatic_planner_api.rs"
+
+[[test]]
+name = "distributed_pipeline_ring"
+path = "../eredu/tests/distributed_pipeline_ring_target.rs"
+
+[[test]]
+name = "distributed_realtime_ring"
+path = "../eredu/tests/distributed_realtime_ring.rs"
+
+[[test]]
+name = "facade_compatibility"
+path = "../eredu/tests/facade_compatibility.rs"
+
+[[test]]
+name = "native_tool_checkpoints"
+path = "../eredu/tests/native_tool_checkpoints.rs"
+
+[dependencies]
+eredu = { path = "../eredu", default-features = false, features = ["mlx-test-support"] }
+eredu-architectures.workspace = true
+eredu-backend-mlx = { workspace = true, features = ["test-support"] }
+eredu-runtime.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
