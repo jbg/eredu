@@ -7,7 +7,8 @@ use std::{
 };
 
 use eredu_architectures::gemma4::{
-    AudioInput, DecoderInputPart, FamilyConfig, LayeredModel as Architecture, ModelInput, Unit,
+    AudioIngressBatchPlan, AudioIngressPartPlan, AudioInput, DecoderInputPart, FamilyConfig,
+    LayeredModel as Architecture, ModelInput, Unit, VisionIngressBatchPlan, VisionIngressPartPlan,
     VisionInput,
 };
 use eredu_checkpoint::{
@@ -27,7 +28,7 @@ use safemlx::{
         indexing::{NewAxis, TryIndexOp},
         maximum, pad, GgufCheckpoint, GgufMetadataValue, PadWidth,
     },
-    Array, Dtype, Stream,
+    Array, Stream,
 };
 
 use crate::backend::mlx::{
@@ -1212,8 +1213,7 @@ struct PreparedVision {
 struct PreparedVisionPart {
     patches: crate::MlxTensor,
     positions: crate::MlxTensor,
-    height: i32,
-    width: i32,
+    plan: VisionIngressPartPlan,
 }
 
 struct PreparedAudio {
@@ -1226,7 +1226,7 @@ struct PreparedAudio {
 struct PreparedAudioPart {
     features: crate::MlxTensor,
     mask: crate::MlxTensor,
-    valid_frames: i32,
+    plan: AudioIngressPartPlan,
 }
 
 pub struct PreparedParts {
@@ -1326,23 +1326,17 @@ impl PreparedParts {
                 modality.as_str()
             ))
         })?;
-        if time != 1 {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Gemma 4 {} parts must contain one prepared frame; got {time}",
-                modality.as_str()
-            )));
-        }
-        let pool = args
+        let vision = args
             .vision
             .as_ref()
-            .ok_or_else(|| Error::UnsupportedArchitecture("Gemma 4 has no vision tower".into()))?
-            .pooling_kernel_size;
-        let count = (height / pool) * (width / pool);
+            .ok_or_else(|| Error::UnsupportedArchitecture("Gemma 4 has no vision tower".into()))?;
+        let plan = VisionIngressPartPlan::new(vision, [time, height, width], patches.dim(1))
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let token = modality_token(args, modality)?;
         self.tokens
             .push(crate::MlxTensor::from_array(Array::from_slice(
-                &vec![token; count as usize],
-                &[1, count],
+                &vec![token; plan.decoder_positions as usize],
+                &[1, plan.decoder_positions],
             )));
         self.modalities.push(modality);
         self.projected.push(None);
@@ -1350,8 +1344,7 @@ impl PreparedParts {
         self.vision_parts.push(PreparedVisionPart {
             patches: crate::MlxTensor::from_array(patches.clone()),
             positions: crate::MlxTensor::from_array(positions.clone()),
-            height,
-            width,
+            plan,
         });
         Ok(())
     }
@@ -1360,12 +1353,15 @@ impl PreparedParts {
         if self.vision_parts.is_empty() {
             return Ok(());
         }
-        let max_patches = self
-            .vision_parts
-            .iter()
-            .map(|part| part.patches.dim(1))
-            .max()
-            .unwrap_or(0);
+        let plan = VisionIngressBatchPlan::new(
+            &self
+                .vision_parts
+                .iter()
+                .map(|part| part.plan.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let max_patches = plan.padded_patches;
         let patches = self
             .vision_parts
             .iter()
@@ -1380,30 +1376,19 @@ impl PreparedParts {
         let position_refs = positions.iter().collect::<Vec<_>>();
         let patches = concatenate_axis(&patch_refs, 0, stream)?;
         let positions = concatenate_axis(&position_refs, 0, stream)?;
-        let x = positions.try_index_device((.., .., 0), stream)?;
-        let y = positions.try_index_device((.., .., 1), stream)?;
-        let padding = x
-            .eq(Array::from_int(-1), stream)?
-            .logical_and(&y.eq(Array::from_int(-1), stream)?, stream)?;
         let sanitized = maximum(positions.clone(), Array::from_int(0), stream)?;
-        let valid = padding
-            .logical_not(stream)?
-            .as_dtype(Dtype::Float32, stream)?
-            .try_index_device((.., .., NewAxis), stream)?;
-        let key_mask = padding
-            .try_index_device((.., NewAxis, NewAxis, ..), stream)?
-            .as_dtype(Dtype::Float32, stream)?
-            .multiply(Array::from_f32(-1.0e9), stream)?;
         self.vision = Some(PreparedVision {
             patches: crate::MlxTensor::from_array(patches),
             positions: crate::MlxTensor::from_array(sanitized),
-            valid: crate::MlxTensor::from_array(valid),
-            key_mask: crate::MlxTensor::from_array(key_mask),
-            grid_extents: self
-                .vision_parts
-                .iter()
-                .map(|part| (part.height, part.width))
-                .collect(),
+            valid: crate::MlxTensor::from_array(Array::from_slice(
+                &plan.position_valid_values,
+                &plan.position_valid_shape(),
+            )),
+            key_mask: crate::MlxTensor::from_array(Array::from_slice(
+                &plan.key_mask_values,
+                &plan.key_mask_shape(),
+            )),
+            grid_extents: plan.grid_extents,
         });
         Ok(())
     }
@@ -1422,12 +1407,13 @@ impl PreparedParts {
                 "Gemma 4 audio input requires a host-known valid-frame extent".into(),
             )
         })?;
-        let valid = (valid_frames + 3) / 4;
+        let plan = AudioIngressPartPlan::new(valid_frames, features.dim(1))
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let token = modality_token(args, input::Modality::Audio)?;
         self.tokens
             .push(crate::MlxTensor::from_array(Array::from_slice(
-                &vec![token; valid as usize],
-                &[1, valid],
+                &vec![token; plan.decoder_positions as usize],
+                &[1, plan.decoder_positions],
             )));
         self.modalities.push(input::Modality::Audio);
         self.projected.push(None);
@@ -1435,7 +1421,7 @@ impl PreparedParts {
         self.audio_parts.push(PreparedAudioPart {
             features: crate::MlxTensor::from_array(features.clone()),
             mask: crate::MlxTensor::from_array(mask.clone()),
-            valid_frames,
+            plan,
         });
         Ok(())
     }
@@ -1444,12 +1430,15 @@ impl PreparedParts {
         if self.audio_parts.is_empty() {
             return Ok(());
         }
-        let max_frames = self
-            .audio_parts
-            .iter()
-            .map(|part| part.features.dim(1))
-            .max()
-            .unwrap_or(0);
+        let plan = AudioIngressBatchPlan::new(
+            &self
+                .audio_parts
+                .iter()
+                .map(|part| part.plan.clone())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let max_frames = plan.padded_frames;
         let features = self
             .audio_parts
             .iter()
@@ -1480,31 +1469,14 @@ impl PreparedParts {
         let input_mask = mask
             .as_dtype(features.dtype(), stream)?
             .try_index_device((.., .., NewAxis), stream)?;
-        let first_frames = (max_frames + 1) / 2;
-        let first_stage = self
-            .audio_parts
-            .iter()
-            .map(|part| {
-                let first_valid = (part.valid_frames + 1) / 2;
-                let mut mask = vec![0.0f32; first_frames as usize];
-                mask[..first_valid as usize].fill(1.0);
-                Array::from_slice(&mask, &[1, first_frames, 1, 1])
-            })
-            .collect::<Vec<_>>();
-        let first_refs = first_stage.iter().collect::<Vec<_>>();
         self.audio = Some(PreparedAudio {
             features: crate::MlxTensor::from_array(features),
             input_mask: crate::MlxTensor::from_array(input_mask),
-            first_stage_mask: crate::MlxTensor::from_array(concatenate_axis(
-                &first_refs,
-                0,
-                stream,
-            )?),
-            valid: self
-                .audio_parts
-                .iter()
-                .map(|part| (part.valid_frames + 3) / 4)
-                .collect(),
+            first_stage_mask: crate::MlxTensor::from_array(Array::from_slice(
+                &plan.first_stage_mask_values,
+                &plan.first_stage_mask_shape(),
+            )),
+            valid: plan.valid_subsampled_frames,
         });
         Ok(())
     }

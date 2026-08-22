@@ -209,6 +209,14 @@ and placement remain backend operations, while architecture processor plans
 declare the family-specific transforms, sampling, framing, and packing
 geometry those operations implement.
 
+Architecture-owned ingress plans also bridge prepared media into generic model
+inputs. They derive family-specific placeholder spans, pooling geometry,
+padding logits, and subsampling masks from portable extents. Concrete backends
+materialize those declared values and may perform generic padding or dtype
+conversion, but must not independently reconstruct family mask or geometry
+policy. Gemma 4 exposes this contract through its vision and audio ingress
+part/batch plans.
+
 The facade owns tokenizer and chat-template discovery. A backend may request
 tokenization of checkpoint-defined framing text through typed callbacks, but it
 does not implement a parallel tokenizer or chat lifecycle.

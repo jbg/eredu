@@ -159,8 +159,9 @@ impl AudioConfig {
     }
 }
 
-/// Prepared batch-one audio input. Validity is supplied by preprocessing so
-/// tower execution never synchronizes a backend mask to the host.
+/// Prepared audio input. Subsampling validity materializes the
+/// architecture-owned [`super::AudioIngressBatchPlan`] so tower execution
+/// never synchronizes a backend mask to the host.
 pub struct AudioInput<'a, T> {
     /// Filter-bank features shaped `[1, frames, 128]`.
     pub features: &'a T,

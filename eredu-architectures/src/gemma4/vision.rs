@@ -244,8 +244,9 @@ impl<B: NeuralBackend> ClippedLinear<B> {
 }
 
 /// Prepared image patch request. Position IDs must already replace padded
-/// negative coordinates with zero; `position_valid` and `key_mask` preserve
-/// the padding semantics without backend-to-host inspection.
+/// negative coordinates with zero; `position_valid` and `key_mask` materialize
+/// the architecture-owned [`super::VisionIngressBatchPlan`] without
+/// backend-to-host inspection.
 pub struct VisionInput<'a, T> {
     /// Flattened RGB patches shaped `[batch, patches, 3 * patch_size^2]`.
     pub patches: &'a T,

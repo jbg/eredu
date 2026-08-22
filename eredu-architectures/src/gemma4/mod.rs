@@ -6,6 +6,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod family;
 pub mod graph;
+pub mod ingress;
 pub mod media;
 pub mod model;
 pub mod parallel;
@@ -26,6 +27,10 @@ pub use checkpoint::{
 pub use config::{ConfigError, FeedForwardPolicy, GgufTensorCatalog, LayerPolicy, ModelArgs};
 pub use family::{FamilyConfig, FamilyConfigError};
 pub use graph::{component_graph, state_layout, ComponentOptions};
+pub use ingress::{
+    AudioIngressBatchPlan, AudioIngressPartPlan, IngressPlanError, VisionIngressBatchPlan,
+    VisionIngressPartPlan, VISION_ATTENTION_INVALID_LOGIT,
+};
 pub use media::ModalityProjector;
 pub use model::{
     DecoderInputPart, ForwardContext, LayeredModel, ModelInput, StaticModules, TextBoundary,
