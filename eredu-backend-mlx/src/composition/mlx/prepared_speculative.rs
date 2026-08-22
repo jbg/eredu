@@ -24,7 +24,7 @@ impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
     type Drafter = MlxDrafter;
 
     fn mtp_capability(runtime: &ModelRuntime<Self>) -> MtpCapability {
-        runtime.session().complete_model().mtp_capability()
+        runtime.session().mtp_capability()
     }
 
     fn execute_speculative<C, F>(

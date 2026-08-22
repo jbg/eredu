@@ -29,7 +29,7 @@ use crate::{
 use crate::{backend::mlx::runtime::media::PreparedModelInput, composition::mlx::ModelProcessor};
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
 use eredu_core::generation::MtpConfig;
-use eredu_core::MtpStats;
+use eredu_core::{MtpCapability, MtpStats};
 use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
 
 use super::{
@@ -351,6 +351,15 @@ impl<'a> MlxModelSession<'a> {
             MlxSessionKind::Complete(model, _) => model.model_type(),
             MlxSessionKind::Pipeline(model, _) => model.stage_info().model_kind.model_type_name(),
             MlxSessionKind::Expert(model, _) => model.info().model_kind.model_type_name(),
+        }
+    }
+
+    /// Reports how the session-owned model exposes speculative weights.
+    pub fn mtp_capability(&self) -> MtpCapability {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model.mtp_capability(),
+            MlxSessionKind::Pipeline(model, _) => model.mtp_capability(),
+            MlxSessionKind::Expert(model, _) => model.mtp_capability(),
         }
     }
 

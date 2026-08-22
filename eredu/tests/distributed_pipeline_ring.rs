@@ -20,7 +20,8 @@ use eredu::{
         media::{input::InputPayload, PreparedModelInput},
     },
     backend::mlx::{
-        DeviceAssignment, MlxBackend, MlxDistributedSession, MlxParallelContext, ModelLoadOptions,
+        DeviceAssignment, MlxBackend, MlxDistributedSession, MlxModelKind, MlxParallelContext,
+        ModelLoadOptions,
     },
     composition::mlx::distributed::pipeline::{
         load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
@@ -413,7 +414,17 @@ fn pipeline_ring_worker() {
             ModelLoadOptions::with_parallel(topology)
         };
         let model = load_model(&backend, &checkpoint, load_options).unwrap();
-        let mut session = backend.create_session(model).unwrap();
+        let expected_mtp_capability = match &model.inner {
+            MlxModelKind::Complete(model) => model.mtp_capability(),
+            MlxModelKind::Pipeline(model) => model.mtp_capability(),
+            MlxModelKind::Expert(model) => model.mtp_capability(),
+        };
+        let mut runtime = eredu::ModelRuntime::from_prepared(backend, model).unwrap();
+        assert_eq!(
+            <MlxBackend<'_> as eredu::SpeculativeGenerationBackend>::mtp_capability(&runtime),
+            expected_mtp_capability
+        );
+        let (backend, session) = runtime.parts_mut();
         let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
             .unwrap()
             .with_full_attention(true);
@@ -4649,6 +4660,25 @@ fn ring_eight_process_deepseek_triple_axis() {
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_deepseek_v4_pipeline_persistence_and_mtp() {
     run_ring_pipeline(false, FixtureFamily::DeepSeekV4);
+}
+
+/// Ensures the backend-generic speculative capability query delegates to the
+/// distributed session instead of assuming a replicated complete model.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_deepseek_v4_prepared_speculative_capability() {
+    run_ring_pipeline_mode(false, FixtureFamily::DeepSeekV4, WorkerMode::OpaqueSession);
+}
+
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_deepseek_v4_expert_prepared_speculative_capability() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeekV4,
+        "ep",
+        WorkerMode::OpaqueSession,
+    );
 }
 
 /// Verifies V4 output-group/head sharding and pipeline transport together.
