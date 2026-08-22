@@ -13324,12 +13324,13 @@ where
 }
 
 fn validate_pipeline_parallel_capabilities(
-    plan: eredu_architectures::preparation::ParallelCapabilityPlan,
+    capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
     topology: MlxParallelContext,
     expert_cache: bool,
     artifact: &str,
     architecture: &str,
 ) -> Result<(), Error> {
+    let plan = capabilities.parallel_plan();
     let unsupported = |capability: &str| {
         Error::Parallel(format!(
             "{artifact} architecture {architecture:?} has no architecture-owned {capability} plan; no checkpoint payload was materialized"
@@ -13344,7 +13345,7 @@ fn validate_pipeline_parallel_capabilities(
     if topology.expert_parallel_size > 1 && !plan.expert_parallel() {
         return Err(unsupported("expert-parallel"));
     }
-    if expert_cache && !plan.independent_expert_residency() {
+    if expert_cache && !capabilities.independently_addressable_experts() {
         return Err(unsupported("independent expert-residency"));
     }
     Ok(())
@@ -13353,7 +13354,7 @@ fn validate_pipeline_parallel_capabilities(
 #[cfg(test)]
 #[test]
 fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "model_type": "qwen3_5",
         "text_config": {
             "model_type": "qwen3_5_moe",
@@ -13393,13 +13394,47 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
     .unwrap();
 
     validate_pipeline_parallel_capabilities(
-        capabilities.parallel_plan(),
+        capabilities,
         topology,
         true,
         "SafeTensors",
         &resolved.effective_model_type,
     )
     .unwrap();
+
+    config["text_config"]["model_type"] = serde_json::json!("qwen3_5_text");
+    config["text_config"]["intermediate_size"] = serde_json::json!(48);
+    let resolved = eredu_core::resolve_model_configuration(&config).unwrap();
+    assert_eq!(resolved.effective_model_type, "qwen3_5_text");
+    let capabilities =
+        eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config).unwrap();
+    let error = validate_pipeline_parallel_capabilities(
+        capabilities,
+        topology,
+        false,
+        "SafeTensors",
+        &resolved.effective_model_type,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("expert-parallel"));
+
+    let topology = MlxParallelContext::for_rank(
+        0,
+        2,
+        2,
+        1,
+        crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+    )
+    .unwrap();
+    let error = validate_pipeline_parallel_capabilities(
+        capabilities,
+        topology,
+        true,
+        "SafeTensors",
+        &resolved.effective_model_type,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("independent expert-residency"));
 }
 
 /// Materializes an executable rank-local Cartesian pipeline stage for the MLX backend.
@@ -13455,7 +13490,7 @@ pub fn load_pipeline_model_with_options(
             eredu_architectures::preparation::gguf_capabilities(architecture, &checkpoint)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         validate_pipeline_parallel_capabilities(
-            capabilities.parallel_plan(),
+            capabilities,
             topology,
             expert_cache.is_some(),
             "GGUF",
@@ -13787,7 +13822,7 @@ pub fn load_pipeline_model_with_options(
         eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     validate_pipeline_parallel_capabilities(
-        capabilities.parallel_plan(),
+        capabilities,
         topology,
         expert_cache.is_some(),
         "SafeTensors",
