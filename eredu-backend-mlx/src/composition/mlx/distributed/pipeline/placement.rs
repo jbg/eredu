@@ -60,56 +60,6 @@ impl ActiveParallelSubgroup {
     }
 }
 
-/// One tensor in a routed group payload.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct PayloadField {
-    /// Stable semantic name.
-    pub name: String,
-    /// Symbolic shape resolved from request/config geometry.
-    pub shape: Vec<String>,
-    /// Whether the field is absent when a modality is absent.
-    pub optional: bool,
-}
-
-impl PayloadField {
-    /// Creates a required symbolic field.
-    pub fn required(
-        name: impl Into<String>,
-        shape: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            shape: shape.into_iter().map(Into::into).collect(),
-            optional: false,
-        }
-    }
-
-    /// Marks the field request-optional.
-    pub const fn optional(mut self) -> Self {
-        self.optional = true;
-        self
-    }
-}
-
-/// Ordered payload contract at a group boundary.
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct PayloadSchema {
-    /// Schema identity used for route compatibility.
-    pub id: String,
-    /// Ordered tensor fields.
-    pub fields: Vec<PayloadField>,
-}
-
-impl PayloadSchema {
-    /// Creates a named schema.
-    pub fn new(id: impl Into<String>, fields: Vec<PayloadField>) -> Self {
-        Self {
-            id: id.into(),
-            fields,
-        }
-    }
-}
-
 /// One PP owner and its contiguous group-global unit interval.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PlacedUnitRange {
@@ -154,10 +104,6 @@ pub struct ExecutionGroupPlacement {
     pub active_subgroup: ActiveParallelSubgroup,
     /// Unique static tensor ownership.
     pub static_tensors: Vec<StaticTensorOwnership>,
-    /// Input payload contract.
-    pub input_schema: PayloadSchema,
-    /// Output payload contract.
-    pub output_schema: PayloadSchema,
     /// PP coordinate responsible for the consumer merge.
     pub merge_destination: usize,
     /// Residency binding.
@@ -196,10 +142,6 @@ pub struct ExecutionGroupPlacementRequest {
     pub first_owner_static_roles: Vec<String>,
     /// Static roles assigned to the terminal owner.
     pub last_owner_static_roles: Vec<String>,
-    /// Input payload contract.
-    pub input_schema: PayloadSchema,
-    /// Output payload contract.
-    pub output_schema: PayloadSchema,
     /// Explicit merge coordinate; defaults to the terminal owner.
     pub merge_destination: Option<usize>,
     /// Residency binding.
@@ -221,8 +163,6 @@ pub struct PlacementRoute {
     pub to_pp_rank: usize,
     /// Ordered topology path including endpoints.
     pub pp_path: Vec<usize>,
-    /// Payload carried by the route.
-    pub payload_schema: PayloadSchema,
 }
 
 /// One validated authoritative placed execution-group DAG.
@@ -297,8 +237,6 @@ impl PlacedExecutionDag {
         for request in requests {
             let id = request.spec.id().to_string();
             validate_rank_path(&id, pp_rank_count, &request.rank_path)?;
-            validate_schema(&id, "input", &request.input_schema)?;
-            validate_schema(&id, "output", &request.output_schema)?;
             let owners = balanced_ranges(request.unit_count, &request.rank_path);
             let first = owners
                 .first()
@@ -325,8 +263,6 @@ impl PlacedExecutionDag {
                 owners,
                 active_subgroup: request.active_subgroup,
                 static_tensors,
-                input_schema: request.input_schema,
-                output_schema: request.output_schema,
                 merge_destination,
                 residency: request.residency,
             });
@@ -347,7 +283,6 @@ impl PlacedExecutionDag {
                     from_pp_rank: from,
                     to_pp_rank: to,
                     pp_path: vec![from, to],
-                    payload_schema: group.output_schema.clone(),
                 });
             }
         }
@@ -355,12 +290,6 @@ impl PlacedExecutionDag {
             let to = consumer.first_owner().unwrap_or(consumer.merge_destination);
             for dependency in &consumer.dependencies {
                 let producer = &groups[*by_id.get(dependency.as_str()).expect("validated DAG")];
-                if producer.output_schema != consumer.input_schema {
-                    return Err(Error::Parallel(format!(
-                        "execution-group payload mismatch: {:?} outputs {:?}, but {:?} expects {:?}",
-                        producer.id, producer.output_schema.id, consumer.id, consumer.input_schema.id
-                    )));
-                }
                 let from = producer.merge_destination;
                 routes.push(PlacementRoute {
                     from_group: producer.id.clone(),
@@ -372,7 +301,6 @@ impl PlacedExecutionDag {
                     } else {
                         vec![from, to]
                     },
-                    payload_schema: producer.output_schema.clone(),
                 });
             }
         }
@@ -591,28 +519,6 @@ fn static_owners(
         .into_iter()
         .map(|(role, pp_rank)| StaticTensorOwnership { role, pp_rank })
         .collect())
-}
-
-fn validate_schema(group: &str, direction: &str, schema: &PayloadSchema) -> Result<(), Error> {
-    if schema.id.is_empty() {
-        return Err(Error::Parallel(format!(
-            "execution group {group:?} has an empty {direction} schema id"
-        )));
-    }
-    let mut names = BTreeSet::new();
-    for field in &schema.fields {
-        if field.name.is_empty()
-            || !names.insert(field.name.as_str())
-            || field.shape.is_empty()
-            || field.shape.iter().any(String::is_empty)
-        {
-            return Err(Error::Parallel(format!(
-                "execution group {group:?} has malformed {direction} payload field {:?}",
-                field.name
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Validate physical `(group, rank)` nodes. Ranks are not collapsed because a
@@ -884,24 +790,12 @@ mod tests {
         )
     }
 
-    fn schema(id: &str) -> PayloadSchema {
-        PayloadSchema::new(
-            id,
-            vec![PayloadField::required(
-                "hidden",
-                ["batch", "sequence", "hidden"],
-            )],
-        )
-    }
-
     fn request(
         id: &str,
         dependencies: &[&str],
         kind: ExecutionGroupKind,
         units: usize,
         ranks: &[usize],
-        input: &str,
-        output: &str,
     ) -> ExecutionGroupPlacementRequest {
         ExecutionGroupPlacementRequest {
             spec: if dependencies.is_empty() {
@@ -919,8 +813,6 @@ mod tests {
             },
             first_owner_static_roles: vec![format!("{id}.input")],
             last_owner_static_roles: vec![format!("{id}.output")],
-            input_schema: schema(input),
-            output_schema: schema(output),
             merge_destination: None,
             residency: ResidencyBinding {
                 unit_prefix: id.into(),
@@ -958,24 +850,8 @@ mod tests {
         PlacedExecutionDag::plan(
             2,
             vec![
-                request(
-                    "vision",
-                    &[],
-                    ExecutionGroupKind::VisionEncoder,
-                    4,
-                    &[0, 1],
-                    "pixels",
-                    "encoded",
-                ),
-                request(
-                    "text",
-                    &["vision"],
-                    ExecutionGroupKind::Decoder,
-                    2,
-                    &[1],
-                    "encoded",
-                    "logits",
-                ),
+                request("vision", &[], ExecutionGroupKind::VisionEncoder, 4, &[0, 1]),
+                request("text", &["vision"], ExecutionGroupKind::Decoder, 2, &[1]),
             ],
             "text",
         )
@@ -1063,27 +939,11 @@ mod tests {
 
     #[test]
     fn output_owned_prediction_selects_untied_shared_embedding_through_mtp_role() {
-        let mut target = request(
-            "target",
-            &[],
-            ExecutionGroupKind::Decoder,
-            4,
-            &[0, 1],
-            "tokens",
-            "hidden",
-        );
+        let mut target = request("target", &[], ExecutionGroupKind::Decoder, 4, &[0, 1]);
         target.first_owner_static_roles = vec!["embedding".into()];
         target.last_owner_static_roles = vec!["norm".into(), "output".into()];
 
-        let mut prediction = request(
-            "mtp_0",
-            &["target"],
-            ExecutionGroupKind::Decoder,
-            1,
-            &[1],
-            "hidden",
-            "draft",
-        );
+        let mut prediction = request("mtp_0", &["target"], ExecutionGroupKind::Decoder, 1, &[1]);
         prediction.first_owner_static_roles = vec!["mtp".into()];
         prediction.last_owner_static_roles.clear();
 
@@ -1109,26 +969,10 @@ mod tests {
             std::slice::from_ref(&embedding)
         );
 
-        let mut target = request(
-            "target",
-            &[],
-            ExecutionGroupKind::Decoder,
-            4,
-            &[0, 1],
-            "tokens",
-            "hidden",
-        );
+        let mut target = request("target", &[], ExecutionGroupKind::Decoder, 4, &[0, 1]);
         target.first_owner_static_roles = vec!["embedding".into()];
         target.last_owner_static_roles = vec!["norm".into(), "output".into()];
-        let mut prediction = request(
-            "mtp_0",
-            &["target"],
-            ExecutionGroupKind::Decoder,
-            1,
-            &[1],
-            "hidden",
-            "draft",
-        );
+        let mut prediction = request("mtp_0", &["target"], ExecutionGroupKind::Decoder, 1, &[1]);
         prediction.first_owner_static_roles.clear();
         prediction.last_owner_static_roles.clear();
         let missing_role = PlacedExecutionDag::plan(2, vec![target, prediction], "mtp_0").unwrap();
@@ -1201,8 +1045,6 @@ mod tests {
                     ExecutionGroupKind::VisionEncoder,
                     7,
                     &[0, 1, 2],
-                    "pixels",
-                    "encoded",
                 ),
                 request(
                     "projector",
@@ -1210,8 +1052,6 @@ mod tests {
                     ExecutionGroupKind::Projector,
                     1,
                     &[3],
-                    "encoded",
-                    "decoder",
                 ),
                 request(
                     "text",
@@ -1219,8 +1059,6 @@ mod tests {
                     ExecutionGroupKind::Decoder,
                     8,
                     &[1, 2, 3],
-                    "decoder",
-                    "logits",
                 ),
             ],
             "text",
@@ -1261,8 +1099,6 @@ mod tests {
                 ExecutionGroupKind::VisionEncoder,
                 1,
                 &[0, 1, 2, 3],
-                "pixels",
-                "encoded",
             )],
             "vision",
         )
@@ -1277,8 +1113,6 @@ mod tests {
                 ExecutionGroupKind::VisionEncoder,
                 2,
                 &[0, 2],
-                "pixels",
-                "encoded",
             )],
             "vision",
         )
@@ -1289,32 +1123,14 @@ mod tests {
     #[test]
     fn differently_ordered_encoder_paths_do_not_form_a_synthetic_rank_cycle() {
         let conflicting = vec![
-            request(
-                "vision",
-                &[],
-                ExecutionGroupKind::VisionEncoder,
-                2,
-                &[0, 1],
-                "media",
-                "media",
-            ),
-            request(
-                "audio",
-                &[],
-                ExecutionGroupKind::AudioEncoder,
-                2,
-                &[1, 0],
-                "media",
-                "media",
-            ),
+            request("vision", &[], ExecutionGroupKind::VisionEncoder, 2, &[0, 1]),
+            request("audio", &[], ExecutionGroupKind::AudioEncoder, 2, &[1, 0]),
             request(
                 "merge",
                 &["vision", "audio"],
                 ExecutionGroupKind::Merger,
                 1,
                 &[0],
-                "media",
-                "media",
             ),
         ];
         let graph = PlacedExecutionDag::plan(2, conflicting, "merge").unwrap();
@@ -1327,32 +1143,14 @@ mod tests {
         let graph = PlacedExecutionDag::plan(
             2,
             vec![
-                request(
-                    "vision",
-                    &[],
-                    ExecutionGroupKind::VisionEncoder,
-                    2,
-                    &[0, 1],
-                    "media",
-                    "encoded",
-                ),
-                request(
-                    "audio",
-                    &[],
-                    ExecutionGroupKind::AudioEncoder,
-                    2,
-                    &[0, 1],
-                    "media",
-                    "encoded",
-                ),
+                request("vision", &[], ExecutionGroupKind::VisionEncoder, 2, &[0, 1]),
+                request("audio", &[], ExecutionGroupKind::AudioEncoder, 2, &[0, 1]),
                 request(
                     "merge",
                     &["vision", "audio"],
                     ExecutionGroupKind::Merger,
                     1,
                     &[0],
-                    "encoded",
-                    "encoded",
                 ),
             ],
             "merge",
@@ -1390,71 +1188,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cycle_disconnect_ambiguous_owner_and_payload_mismatch() {
+    fn rejects_cycle_disconnect_and_ambiguous_owner() {
         let cycle = vec![
-            request(
-                "a",
-                &["b"],
-                ExecutionGroupKind::VisionEncoder,
-                1,
-                &[0],
-                "x",
-                "x",
-            ),
-            request("b", &["a"], ExecutionGroupKind::Decoder, 1, &[1], "x", "x"),
+            request("a", &["b"], ExecutionGroupKind::VisionEncoder, 1, &[0]),
+            request("b", &["a"], ExecutionGroupKind::Decoder, 1, &[1]),
         ];
         assert!(PlacedExecutionDag::plan(2, cycle, "b").is_err());
         let disconnected = vec![
-            request(
-                "unused",
-                &[],
-                ExecutionGroupKind::AudioEncoder,
-                1,
-                &[0],
-                "audio",
-                "audio",
-            ),
-            request(
-                "text",
-                &[],
-                ExecutionGroupKind::Decoder,
-                1,
-                &[1],
-                "text",
-                "logits",
-            ),
+            request("unused", &[], ExecutionGroupKind::AudioEncoder, 1, &[0]),
+            request("text", &[], ExecutionGroupKind::Decoder, 1, &[1]),
         ];
         assert!(PlacedExecutionDag::plan(2, disconnected, "text").is_err());
-        let ambiguous = request(
-            "text",
-            &[],
-            ExecutionGroupKind::Decoder,
-            2,
-            &[0, 0],
-            "text",
-            "logits",
-        );
+        let ambiguous = request("text", &[], ExecutionGroupKind::Decoder, 2, &[0, 0]);
         assert!(PlacedExecutionDag::plan(2, vec![ambiguous], "text").is_err());
-        let mismatch = vec![
-            request(
-                "vision",
-                &[],
-                ExecutionGroupKind::VisionEncoder,
-                1,
-                &[0],
-                "pixels",
-                "encoded",
-            ),
-            request(
-                "text",
-                &["vision"],
-                ExecutionGroupKind::Decoder,
-                1,
-                &[1],
-                "wrong",
-                "logits",
-            ),
-        ];
-        assert!(PlacedExecutionDag::plan(2, mismatch, "text").is_err());
     }
 }

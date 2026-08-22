@@ -365,6 +365,11 @@ resolves batch and sequence dimensions. A concrete backend only maps the
 logical activation or exact integer dtype to its native dtype, allocates the
 declared receive buffers, validates produced tensors, and transports them. It
 must not reconstruct boundary geometry from model-family arguments.
+Distributed placement dependency routes consume that same schema directly. A
+concrete backend must reject inactive dependency routes with tensors and active
+routes whose exact cardinality, ordered shapes, or physical dtypes differ from
+the resolved architecture boundary; backend-local string or optional-field
+schemas are not an alternate wire contract.
 
 `DistributedSession` is an optional capability of the selected model session.
 It exposes high-level sum, gather, variable-count exchange, point-to-point, and

@@ -25,9 +25,8 @@ use ref_cast::RefCast;
 mod placement;
 
 pub use placement::{
-    ActiveParallelSubgroup, ExecutionGroupKind, ExecutionGroupPlacementRequest, PayloadField,
-    PayloadSchema, PlacedExecutionDag, PlacedGroupConcurrencyPolicy, PlacedGroupSerialReason,
-    PlacementRoute, ResidencyBinding,
+    ActiveParallelSubgroup, ExecutionGroupKind, ExecutionGroupPlacementRequest, PlacedExecutionDag,
+    PlacedGroupConcurrencyPolicy, PlacedGroupSerialReason, PlacementRoute, ResidencyBinding,
 };
 
 use std::{
@@ -839,7 +838,6 @@ const PIPELINE_SAMPLE_ROUTE: usize = 0x004d_5453;
 #[derive(Debug, Clone)]
 struct PlacedGroupPayload {
     producer: usize,
-    schema: String,
     arrays: Vec<Array>,
 }
 
@@ -848,8 +846,11 @@ impl PlacedGroupPayload {
         &self,
         placement: &PlacedExecutionDag,
         producer: usize,
-        schema: &PayloadSchema,
         active: bool,
+        info: &PipelineStageInfo,
+        step: PipelineStep,
+        schema: &eredu_runtime::BoundaryWireSchema,
+        auxiliary_specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
     ) -> Result<(), Error> {
         if self.producer != producer {
             return Err(Error::Parallel(format!(
@@ -857,21 +858,20 @@ impl PlacedGroupPayload {
                 self.producer
             )));
         }
-        if self.schema != schema.id {
+        if active {
+            validate_pipeline_payload_arrays(
+                info,
+                &self.arrays,
+                step,
+                schema.identity(),
+                auxiliary_specs,
+                &format!("placed payload from {:?}", placement.groups()[producer].id),
+            )?;
+        } else if !self.arrays.is_empty() {
             return Err(Error::Parallel(format!(
-                "placed payload from {:?} has schema {:?}, expected {:?}",
+                "inactive placed payload from {:?} contains {} tensors",
                 placement.groups()[producer].id,
-                self.schema,
-                schema.id
-            )));
-        }
-        let required = schema.fields.iter().filter(|field| !field.optional).count();
-        if active && self.arrays.len() < required {
-            return Err(Error::Parallel(format!(
-                "placed payload from {:?} has {} tensors, schema {:?} requires at least {required}",
-                placement.groups()[producer].id,
-                self.arrays.len(),
-                schema.id
+                self.arrays.len()
             )));
         }
         Ok(())
@@ -900,6 +900,10 @@ impl PlacedPayloadStore {
         placement: &PlacedExecutionDag,
         consumer: usize,
         active: &[bool],
+        info: &PipelineStageInfo,
+        step: PipelineStep,
+        schema: &eredu_runtime::BoundaryWireSchema,
+        auxiliary_specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
     ) -> Result<Vec<PlacedGroupPayload>, Error> {
         placement
             .dependency_indices(consumer)
@@ -916,8 +920,11 @@ impl PlacedPayloadStore {
                 payload.validate_for(
                     placement,
                     producer,
-                    &placement.groups()[consumer].input_schema,
                     active[producer],
+                    info,
+                    step,
+                    schema,
+                    auxiliary_specs,
                 )?;
                 Ok(payload)
             })
@@ -10895,6 +10902,10 @@ impl PipelineModel {
         retained: &mut Vec<Array>,
     ) -> Result<Option<PipelinePayload>, Error> {
         let placement = Arc::clone(&self.info.placement);
+        let boundary_schema = self.stage.boundary_wire_schema()?;
+        let auxiliary_specs = boundary_schema
+            .resolve(step.batch_size, step.sequence_length)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
         if self.info.pipeline_stage == 0 {
             self.stage.begin_placed_ingress(input, tensor, stream)?;
         } else {
@@ -10977,7 +10988,15 @@ impl PipelineModel {
                     continue;
                 }
                 if placed.first_owner() == Some(self.info.pipeline_stage) {
-                    let dependencies = payloads.ordered_dependencies(&placement, index, &active)?;
+                    let dependencies = payloads.ordered_dependencies(
+                        &placement,
+                        index,
+                        &active,
+                        &self.info,
+                        step,
+                        &boundary_schema,
+                        &auxiliary_specs,
+                    )?;
                     let arrays = dependencies
                         .into_iter()
                         .flat_map(|payload| payload.arrays)
@@ -11160,14 +11179,16 @@ impl PipelineModel {
                     if self.info.pipeline_stage == route.to_pp_rank {
                         let payload = PlacedGroupPayload {
                             producer: index,
-                            schema: route.payload_schema.id.clone(),
                             arrays,
                         };
                         payload.validate_for(
                             &placement,
                             index,
-                            &route.payload_schema,
                             active[index],
+                            &self.info,
+                            step,
+                            &boundary_schema,
+                            &auxiliary_specs,
                         )?;
                         payloads.insert(consumer, payload)?;
                         if active[index] && !schedule.routed_transfers.contains(route) {
@@ -12159,21 +12180,9 @@ fn base_info(
     }
 }
 
-fn decoder_payload_schema(id: &str) -> PayloadSchema {
-    PayloadSchema::new(
-        id,
-        vec![PayloadField::required(
-            "hidden",
-            ["batch", "sequence", "hidden"],
-        )],
-    )
-}
-
 fn architecture_transport_placement<A, S>(
     architecture: &A,
     pipeline_stages: usize,
-    input_schema: PayloadSchema,
-    output_schema: PayloadSchema,
 ) -> Result<PlacedExecutionDag, Error>
 where
     A: LayeredArchitecture<MlxBackend, S>,
@@ -12230,8 +12239,6 @@ where
             active_subgroup,
             first_owner_static_roles: transport.first_owner_static_roles,
             last_owner_static_roles: transport.last_owner_static_roles,
-            input_schema: input_schema.clone(),
-            output_schema: output_schema.clone(),
             merge_destination,
             residency: ResidencyBinding {
                 unit_prefix: spec.id().into(),
@@ -12262,26 +12269,19 @@ where
             graph.groups().len()
         )));
     }
-    architecture_transport_placement(
-        architecture,
-        pipeline_stages,
-        decoder_payload_schema("decoder_hidden"),
-        decoder_payload_schema("logits"),
-    )
+    architecture_transport_placement(architecture, pipeline_stages)
 }
 
 fn prediction_architecture_transport<A, S>(
     architecture: &A,
     pipeline_stages: usize,
-    payload_id: &str,
 ) -> Result<PlacedExecutionDag, Error>
 where
     A: LayeredArchitecture<MlxBackend, S>,
     A::Error: std::fmt::Display,
     S: eredu_runtime::RuntimeState<MlxBackend>,
 {
-    let payload = decoder_payload_schema(payload_id);
-    architecture_transport_placement(architecture, pipeline_stages, payload.clone(), payload)
+    architecture_transport_placement(architecture, pipeline_stages)
 }
 
 fn media_architecture_transport<A, S>(
@@ -12293,8 +12293,7 @@ where
     A::Error: std::fmt::Display,
     S: eredu_runtime::RuntimeState<MlxBackend>,
 {
-    let payload = decoder_payload_schema("multimodal_hidden");
-    architecture_transport_placement(architecture, pipeline_stages, payload.clone(), payload)
+    architecture_transport_placement(architecture, pipeline_stages)
 }
 
 #[cfg(test)]
@@ -12334,6 +12333,76 @@ fn validate_stage_input(
                 "pipeline stage {} requires hidden states, not token ids",
                 info.pipeline_stage
             )))
+        }
+    }
+    Ok(())
+}
+
+fn validate_pipeline_payload_arrays(
+    info: &PipelineStageInfo,
+    arrays: &[Array],
+    step: PipelineStep,
+    boundary_identity: &str,
+    auxiliary_specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
+    context: &str,
+) -> Result<(), Error> {
+    let metadata = arrays
+        .iter()
+        .map(|array| PipelinePayloadTensorMetadata {
+            shape: array.shape(),
+            dtype: array.dtype(),
+        })
+        .collect::<Vec<_>>();
+    validate_pipeline_payload_metadata(
+        &step.activation_shape(info.activation_hidden_size),
+        info.activation_dtype,
+        &metadata,
+        boundary_identity,
+        auxiliary_specs,
+        context,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct PipelinePayloadTensorMetadata<'a> {
+    shape: &'a [i32],
+    dtype: Dtype,
+}
+
+fn validate_pipeline_payload_metadata(
+    expected_hidden_shape: &[i32],
+    activation_dtype: Dtype,
+    tensors: &[PipelinePayloadTensorMetadata<'_>],
+    boundary_identity: &str,
+    auxiliary_specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
+    context: &str,
+) -> Result<(), Error> {
+    let expected = auxiliary_specs.len() + 1;
+    if tensors.len() != expected {
+        return Err(Error::Parallel(format!(
+            "{context} violates architecture boundary {boundary_identity:?}: expected exactly {expected} tensors (hidden plus {} auxiliary), got {}",
+            auxiliary_specs.len(),
+            tensors.len()
+        )));
+    }
+    let hidden = tensors[0];
+    if hidden.shape != expected_hidden_shape || hidden.dtype != activation_dtype {
+        return Err(Error::Parallel(format!(
+            "{context} violates architecture boundary {boundary_identity:?}: hidden tensor has shape {:?} and {:?}, expected {:?} and {:?}",
+            hidden.shape, hidden.dtype, expected_hidden_shape, activation_dtype
+        )));
+    }
+    for (index, (tensor, spec)) in tensors[1..].iter().zip(auxiliary_specs).enumerate() {
+        let expected_dtype = mlx_boundary_dtype(spec.dtype(), activation_dtype);
+        if tensor.shape != spec.shape() || tensor.dtype != expected_dtype {
+            return Err(Error::Parallel(format!(
+                "{context} violates architecture boundary {boundary_identity:?}: auxiliary tensor {index} ({:?}) has shape {:?} and {:?}, expected {:?} and {:?}",
+                spec.role(),
+                tensor.shape,
+                tensor.dtype,
+                spec.shape(),
+                expected_dtype
+            )));
         }
     }
     Ok(())
@@ -13238,6 +13307,78 @@ mod binding_authority_tests {
             mlx_boundary_dtype(specs[2].dtype(), Dtype::Bfloat16),
             Dtype::Int32
         );
+
+        let hidden_shape = [2, 3, 8];
+        let tokens_shape = [2, 3];
+        let capture_shape = [2, 3, 16];
+        let delta_shape = [1];
+        let valid = vec![
+            PipelinePayloadTensorMetadata {
+                shape: &hidden_shape,
+                dtype: Dtype::Float16,
+            },
+            PipelinePayloadTensorMetadata {
+                shape: &tokens_shape,
+                dtype: Dtype::Uint32,
+            },
+            PipelinePayloadTensorMetadata {
+                shape: &capture_shape,
+                dtype: Dtype::Float16,
+            },
+            PipelinePayloadTensorMetadata {
+                shape: &delta_shape,
+                dtype: Dtype::Int32,
+            },
+        ];
+        validate_pipeline_payload_metadata(
+            &hidden_shape,
+            Dtype::Float16,
+            &valid,
+            schema.identity(),
+            &specs,
+            "test payload",
+        )
+        .unwrap();
+
+        let cardinality = validate_pipeline_payload_metadata(
+            &hidden_shape,
+            Dtype::Float16,
+            &valid[..3],
+            schema.identity(),
+            &specs,
+            "test payload",
+        )
+        .unwrap_err();
+        assert!(cardinality
+            .to_string()
+            .contains("expected exactly 4 tensors"));
+
+        let wrong_capture_shape = [2, 3, 15];
+        let mut wrong_shape = valid.clone();
+        wrong_shape[2].shape = &wrong_capture_shape;
+        let shape = validate_pipeline_payload_metadata(
+            &hidden_shape,
+            Dtype::Float16,
+            &wrong_shape,
+            schema.identity(),
+            &specs,
+            "test payload",
+        )
+        .unwrap_err();
+        assert!(shape.to_string().contains("capture.0"));
+
+        let mut wrong_dtype = valid;
+        wrong_dtype[1].dtype = Dtype::Int32;
+        let dtype = validate_pipeline_payload_metadata(
+            &hidden_shape,
+            Dtype::Float16,
+            &wrong_dtype,
+            schema.identity(),
+            &specs,
+            "test payload",
+        )
+        .unwrap_err();
+        assert!(dtype.to_string().contains("tokens"));
     }
 }
 
@@ -18688,7 +18829,6 @@ fn load_nemotron_h_pipeline(
     let neutral_placement = Arc::new(prediction_architecture_transport::<_, MlxHybridState>(
         &architecture,
         topology.pipeline_parallel_size,
-        "nemotron_h_hidden",
     )?);
     let mut info = base_info(
         topology,
@@ -20021,7 +20161,6 @@ fn load_neutral_qwen_hybrid_pipeline(
     let placement = Arc::new(prediction_architecture_transport::<_, MlxHybridState>(
         &architecture,
         topology.pipeline_parallel_size,
-        "qwen_hybrid_hidden",
     )?);
     let mut info = base_info(
         topology,
@@ -22947,7 +23086,6 @@ fn load_neutral_deepseek_v3_pipeline(
     let placement = Arc::new(prediction_architecture_transport::<_, MlxHybridState>(
         &architecture,
         topology.pipeline_parallel_size,
-        "deepseek_hidden",
     )?);
     let mut info = base_info(
         topology,
@@ -23368,11 +23506,7 @@ fn load_neutral_deepseek_v4_pipeline(
     let placement = Arc::new(prediction_architecture_transport::<
         _,
         eredu_runtime::DeviceState<MlxBackend, MlxPoolingAttentionCache>,
-    >(
-        &architecture,
-        topology.pipeline_parallel_size,
-        "deepseek_hidden",
-    )?);
+    >(&architecture, topology.pipeline_parallel_size)?);
     let mut info = base_info(
         topology,
         range.clone(),
