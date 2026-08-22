@@ -3,7 +3,7 @@
 use std::{collections::BTreeSet, ops::Range};
 
 use eredu_architectures::deepseek::{self, LayerPolicy, V3Args, V4Args};
-use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
+use eredu_checkpoint::{expert::GatedProductExpertRecipes, recipe::DerivedWeightRecipe};
 use eredu_nn::GatedProductExpertBankSpec;
 use eredu_runtime::{ExpertIdentity, OffloadUnit, WeightBinding};
 
@@ -36,15 +36,7 @@ pub fn v3_catalog(
         }
         let recipes = deepseek::v3_expert_recipes(store, args, layer)
             .map_err(Error::UnsupportedArchitecture)?;
-        append_entries(
-            &mut entries,
-            layer,
-            experts,
-            recipes.gate_up,
-            recipes.down,
-            None,
-            store,
-        )?;
+        append_entries(&mut entries, layer, experts, recipes, None, store)?;
     }
     Ok(entries)
 }
@@ -113,8 +105,7 @@ fn v3_catalog_with_intermediate(
             &mut entries,
             layer,
             experts,
-            recipes.gate_up,
-            recipes.down,
+            recipes,
             intermediate.clone(),
             store,
         )?;
@@ -134,15 +125,7 @@ pub fn v4_catalog(
     for layer in 0..total {
         let recipes = deepseek::v4_expert_recipes(store, args, layer)
             .map_err(Error::UnsupportedArchitecture)?;
-        append_entries(
-            &mut entries,
-            layer,
-            experts,
-            recipes.gate_up,
-            recipes.down,
-            None,
-            store,
-        )?;
+        append_entries(&mut entries, layer, experts, recipes, None, store)?;
     }
     Ok(entries)
 }
@@ -187,8 +170,7 @@ pub fn v4_parallel_catalog(
             &mut entries,
             layer,
             experts,
-            recipes.gate_up,
-            recipes.down,
+            recipes,
             Some(intermediate.clone()),
             store,
         )?;
@@ -200,69 +182,16 @@ fn append_entries(
     entries: &mut Vec<ExpertCatalogEntry>,
     layer: usize,
     experts: usize,
-    gate_up: DerivedWeightRecipe,
-    down: DerivedWeightRecipe,
+    bank: GatedProductExpertRecipes,
     intermediate: Option<Range<usize>>,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<(), Error> {
     for expert in 0..experts {
-        let selection = TensorSelection::Range {
-            axis: 0,
-            start: expert,
-            end: expert + 1,
-        };
-        let mut gate_up = gate_up.clone().select_bounded(store, selection.clone())?;
-        let mut down = down.clone().select_bounded(store, selection)?;
-        if let Some(intermediate) = &intermediate {
-            let metadata = gate_up.infer(store)?;
-            let fused = *metadata.shape().get(1).ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "DeepSeek expert gate/up recipe is not rank three".into(),
-                )
-            })?;
-            if fused % 2 != 0
-                || intermediate.start >= intermediate.end
-                || intermediate.end > fused / 2
-            {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "DeepSeek expert intermediate range {intermediate:?} is outside 0..{}",
-                    fused / 2
-                )));
-            }
-            let width = fused / 2;
-            gate_up = DerivedWeightRecipe::Concatenate {
-                axis: 1,
-                inputs: vec![
-                    gate_up.clone().select_bounded(
-                        store,
-                        TensorSelection::Range {
-                            axis: 1,
-                            start: intermediate.start,
-                            end: intermediate.end,
-                        },
-                    )?,
-                    gate_up.select_bounded(
-                        store,
-                        TensorSelection::Range {
-                            axis: 1,
-                            start: width + intermediate.start,
-                            end: width + intermediate.end,
-                        },
-                    )?,
-                ],
-            };
-            down = down.select_bounded(
-                store,
-                TensorSelection::Range {
-                    axis: 2,
-                    start: intermediate.start,
-                    end: intermediate.end,
-                },
-            )?;
-        }
+        let recipes = deepseek::expert_unit_recipes(store, &bank, expert, intermediate.clone())
+            .map_err(Error::UnsupportedArchitecture)?;
         let bindings = vec![
-            recipe_binding("gate_up_proj", gate_up, store)?,
-            recipe_binding("down_proj", down, store)?,
+            recipe_binding("gate_up_proj", recipes.gate_up, store)?,
+            recipe_binding("down_proj", recipes.down, store)?,
         ];
         let bytes = bindings.iter().try_fold(0u64, |total, binding| {
             total.checked_add(binding.expected_bytes()).ok_or_else(|| {

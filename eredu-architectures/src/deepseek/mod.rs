@@ -22,9 +22,9 @@ pub mod v3;
 pub mod v4;
 
 pub use checkpoint::{
-    translate_v3_gguf_weight_name, translate_v4_gguf_weight_name, v3_expert_recipes,
-    v3_gguf_kv_b_recipe, v3_gguf_plan, v3_safetensors_plan, v3_unit_recipes, v4_expert_recipes,
-    v4_gguf_plan, v4_safetensors_plan,
+    expert_unit_recipes, translate_v3_gguf_weight_name, translate_v4_gguf_weight_name,
+    v3_expert_recipes, v3_gguf_kv_b_recipe, v3_gguf_plan, v3_safetensors_plan, v3_unit_recipes,
+    v4_expert_recipes, v4_gguf_plan, v4_safetensors_plan, ExpertUnitRecipes,
 };
 pub use config::{
     parse_v3_config, parse_v3_gguf, parse_v4_config, parse_v4_gguf, v3_architecture_fingerprint,

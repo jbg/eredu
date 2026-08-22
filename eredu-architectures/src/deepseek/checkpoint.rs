@@ -1,6 +1,6 @@
 //! Pure checkpoint naming, schemas, and derived-weight recipes for DeepSeek.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ops::Range};
 
 use eredu_checkpoint::schema::{
     matrix_for_linear_format, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
@@ -18,6 +18,15 @@ use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
 use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat, StoredDtype};
 
 use super::config::{ExpertFormat, LayerPolicy, V3Args, V4Args, V4AttentionPolicy};
+
+/// Recipes for one independently resident DeepSeek routed expert.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExpertUnitRecipes {
+    /// Fused gate/up projection, optionally restricted to one rank's channels.
+    pub gate_up: DerivedWeightRecipe,
+    /// Down projection, optionally restricted to one rank's input channels.
+    pub down: DerivedWeightRecipe,
+}
 
 /// Translates canonical llama.cpp DeepSeek2/V3 tensor names to neutral model
 /// parameter identities.
@@ -573,6 +582,89 @@ pub fn v4_expert_recipes<C: RecipeCatalog + ?Sized>(
         },
     )
     .map_err(|error| error.to_string())
+}
+
+/// Derives one independently resident expert from a canonical DeepSeek bank.
+///
+/// When `intermediate` is present, its semantic range is applied independently
+/// to the gate and up segments and to the down-projection input axis. This is
+/// the recipe counterpart of the architecture's `PartitionedSegments` plan;
+/// concrete backends only materialize the recipes returned here.
+pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    bank: &GatedProductExpertRecipes,
+    expert: usize,
+    intermediate: Option<Range<usize>>,
+) -> Result<ExpertUnitRecipes, String> {
+    let expert_selection = TensorSelection::Range {
+        axis: 0,
+        start: expert,
+        end: expert
+            .checked_add(1)
+            .ok_or_else(|| "DeepSeek expert index overflowed".to_string())?,
+    };
+    let mut gate_up = bank
+        .gate_up
+        .select_bounded(catalog, expert_selection.clone())
+        .map_err(|error| error.to_string())?;
+    let mut down = bank
+        .down
+        .select_bounded(catalog, expert_selection)
+        .map_err(|error| error.to_string())?;
+
+    if let Some(intermediate) = intermediate {
+        let metadata = gate_up.infer(catalog).map_err(|error| error.to_string())?;
+        let fused = *metadata
+            .shape()
+            .get(1)
+            .ok_or_else(|| "DeepSeek expert gate/up recipe is not rank three".to_string())?;
+        if fused % 2 != 0 || intermediate.start >= intermediate.end || intermediate.end > fused / 2
+        {
+            return Err(format!(
+                "DeepSeek expert intermediate range {intermediate:?} is outside 0..{}",
+                fused / 2
+            ));
+        }
+        let width = fused / 2;
+        gate_up = DerivedWeightRecipe::Concatenate {
+            axis: 1,
+            inputs: vec![
+                gate_up
+                    .clone()
+                    .select_bounded(
+                        catalog,
+                        TensorSelection::Range {
+                            axis: 1,
+                            start: intermediate.start,
+                            end: intermediate.end,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?,
+                gate_up
+                    .select_bounded(
+                        catalog,
+                        TensorSelection::Range {
+                            axis: 1,
+                            start: width + intermediate.start,
+                            end: width + intermediate.end,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?,
+            ],
+        };
+        down = down
+            .select_bounded(
+                catalog,
+                TensorSelection::Range {
+                    axis: 2,
+                    start: intermediate.start,
+                    end: intermediate.end,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(ExpertUnitRecipes { gate_up, down })
 }
 
 /// Builds the canonical DeepSeek-V3/R1 SafeTensors catalog plan.
@@ -1593,6 +1685,55 @@ fn checked_add(left: usize, right: usize, name: &str) -> Result<usize, String> {
 mod tests {
     use super::*;
     use crate::deepseek::{parse_v3_config, parse_v4_config};
+
+    #[test]
+    fn expert_unit_recipe_owns_segmented_rank_local_selection() {
+        struct Catalog(BTreeMap<String, eredu_checkpoint::store::TensorMetadata>);
+        impl RecipeCatalog for Catalog {
+            fn tensor_metadata(
+                &self,
+                key: &str,
+            ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError>
+            {
+                self.0.get(key).cloned().ok_or_else(|| {
+                    eredu_checkpoint::store::StoreError::UnknownTensor { key: key.into() }
+                })
+            }
+        }
+        let metadata = |name: &str, shape: Vec<usize>| eredu_checkpoint::store::TensorMetadata {
+            name: name.into(),
+            encoded_byte_len: shape.iter().product::<usize>() as u64 * 4,
+            physical_shape: shape.clone(),
+            logical_shape: shape,
+            stored_dtype: StoredDtype::F32,
+            backing_shard: None,
+        };
+        let catalog = Catalog(
+            [
+                ("gate_up".into(), metadata("gate_up", vec![4, 128, 96])),
+                ("down".into(), metadata("down", vec![4, 96, 64])),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let bank = GatedProductExpertRecipes {
+            target_gate_up: "experts.gate_up_proj".into(),
+            target_down: "experts.down_proj".into(),
+            layout: eredu_checkpoint::expert::GatedProductExpertStorageLayout::Packed,
+            gate_up: DerivedWeightRecipe::source("gate_up", TensorSelection::Full),
+            down: DerivedWeightRecipe::source("down", TensorSelection::Full),
+        };
+
+        let local = expert_unit_recipes(&catalog, &bank, 2, Some(16..48)).unwrap();
+        assert_eq!(local.gate_up.infer(&catalog).unwrap().shape(), [1, 64, 96]);
+        assert_eq!(local.down.infer(&catalog).unwrap().shape(), [1, 96, 32]);
+        assert!(matches!(
+            local.gate_up,
+            DerivedWeightRecipe::Concatenate { axis: 1, ref inputs }
+                if inputs.len() == 2
+        ));
+        assert!(expert_unit_recipes(&catalog, &bank, 2, Some(48..65)).is_err());
+    }
 
     #[test]
     fn translates_v3_fused_split_and_expert_names() {
