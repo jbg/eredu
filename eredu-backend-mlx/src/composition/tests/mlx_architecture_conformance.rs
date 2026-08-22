@@ -2,11 +2,11 @@
 
 use eredu_nn::Tensor;
 use eredu_runtime::{DeviceState, LayeredArchitecture, LayeredForwardState};
-use safemlx::{Array, Device, DeviceType, ExecutionContext};
+use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext};
 use std::sync::OnceLock;
 
 use crate::backend::mlx::{
-    nn::shared::MlxBackend,
+    nn::{shared::MlxBackend, tensor::TokenValidationScope},
     runtime::cache::{
         state::{MlxHybridState, MlxKeyValueState, MlxPoolingAttentionStateFactory},
         CompressedLatentCache,
@@ -40,6 +40,7 @@ fn mlx_execution() -> Option<ExecutionContext> {
 
 macro_rules! execute_target_group {
     ($architecture_ty:ty, $state_ty:ty, $architecture:expr, $state:expr, $input:expr, $shape:expr, $stream:expr) => {{
+        let token_validation_scope = TokenValidationScope::begin().unwrap();
         let LayeredForwardState {
             hidden: initial,
             mut context,
@@ -106,7 +107,14 @@ macro_rules! execute_target_group {
         )
         .unwrap();
         assert_eq!(logits.shape(), $shape);
-        logits.as_array().evaluated().unwrap();
+        let token_validations = token_validation_scope.finish();
+        async_eval_with_event(
+            std::iter::once(logits.as_array()).chain(token_validations.arrays()),
+        )
+        .unwrap()
+        .synchronize()
+        .unwrap();
+        token_validations.validate_completed().unwrap();
     }};
 }
 
