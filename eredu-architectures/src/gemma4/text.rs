@@ -476,9 +476,6 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
             let top_k = args
                 .top_k_experts
                 .ok_or_else(|| Error::backend("Gemma 4 sparse block has no top-k count"))?;
-            let expert_width = args
-                .moe_intermediate_size
-                .ok_or_else(|| Error::backend("Gemma 4 sparse block has no expert width"))?;
             let router_prefix = format!("{prefix}.router");
             let router_weight = format!("{router_prefix}.proj.weight");
             let router = B::top_k_router(
@@ -507,30 +504,8 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
                 },
                 context,
             )?;
-            let experts_prefix = format!("{prefix}.experts.switch_glu");
-            let gate_up_name = format!("{experts_prefix}.gate_up_proj");
-            let down_name = format!("{experts_prefix}.down_proj");
             let experts = B::gated_product_expert_bank(
-                GatedProductExpertBankSpec {
-                    expert_count,
-                    input_dimensions: args.hidden_size,
-                    intermediate_dimensions: expert_width,
-                    output_dimensions: args.hidden_size,
-                    policy: eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
-                    layout: GatedProductExpertLayout::Packed {
-                        gate_up: ExpertProjectionSpec {
-                            weight: ParameterSpec::trainable(&gate_up_name)
-                                .map_err(Error::backend)?,
-                            bias: None,
-                            format: args.linear_format_for(&gate_up_name),
-                        },
-                        down: ExpertProjectionSpec {
-                            weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
-                            bias: None,
-                            format: args.linear_format_for(&down_name),
-                        },
-                    },
-                },
+                expert_bank_spec_at(args, &format!("{prefix}.experts.switch_glu"))?,
                 context,
             )?;
             (Some(router), Some(experts))
@@ -783,4 +758,48 @@ impl<B: RoutedNeuralBackend> DenseBlock<B> {
         let mut provider = ResidentExpertProvider;
         self.forward_parallel_with_provider(input, pass, &mut provider, parallel, context)
     }
+}
+
+/// Returns the architecture-owned routed expert specification for one sparse layer.
+pub fn expert_bank_spec(
+    args: &ModelArgs,
+    layer: usize,
+) -> Result<GatedProductExpertBankSpec, Error> {
+    expert_bank_spec_at(
+        args,
+        &format!("model.language_model.layers.{layer}.experts.switch_glu"),
+    )
+}
+
+fn expert_bank_spec_at(
+    args: &ModelArgs,
+    experts_prefix: &str,
+) -> Result<GatedProductExpertBankSpec, Error> {
+    let expert_count = args
+        .num_experts
+        .ok_or_else(|| Error::backend("Gemma 4 sparse layer has no expert count"))?;
+    let expert_width = args
+        .moe_intermediate_size
+        .ok_or_else(|| Error::backend("Gemma 4 sparse layer has no expert width"))?;
+    let gate_up_name = format!("{experts_prefix}.gate_up_proj");
+    let down_name = format!("{experts_prefix}.down_proj");
+    Ok(GatedProductExpertBankSpec {
+        expert_count,
+        input_dimensions: args.hidden_size,
+        intermediate_dimensions: expert_width,
+        output_dimensions: args.hidden_size,
+        policy: eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
+        layout: GatedProductExpertLayout::Packed {
+            gate_up: ExpertProjectionSpec {
+                weight: ParameterSpec::trainable(&gate_up_name).map_err(Error::backend)?,
+                bias: None,
+                format: args.linear_format_for(&gate_up_name),
+            },
+            down: ExpertProjectionSpec {
+                weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
+                bias: None,
+                format: args.linear_format_for(&down_name),
+            },
+        },
+    })
 }

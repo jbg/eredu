@@ -86,7 +86,7 @@ use crate::backend::mlx::{
         media::input,
         residency::{
             expert_cache::{ExpertCache, ExpertCatalogEntry},
-            expert_provider::{CachedGatedProductBankSpec, CachedGatedProductExpertProvider},
+            expert_provider::CachedGatedProductExpertProvider,
         },
     },
 };
@@ -860,36 +860,11 @@ fn planned_expert_binding(
     })
 }
 
-pub fn cached_expert_spec(
-    config: &HybridConfig,
-    layer: usize,
-) -> crate::backend::mlx::runtime::residency::expert_provider::CachedGatedProductBankSpec {
-    let target = config.num_hidden_layers as usize;
-    let root = if layer < target {
-        format!("model.layers.{layer}.mlp.experts")
-    } else {
-        format!("mtp.layers.{}.mlp.experts", layer - target)
-    };
-    crate::backend::mlx::runtime::residency::expert_provider::CachedGatedProductBankSpec {
-        hidden_dimensions: config.hidden_size,
-        intermediate_dimensions: config.moe_intermediate_size,
-        gate_up_quantization: config
-            .linear_format(&format!("{root}.gate_up_proj"))
-            .weight_quantization(),
-        down_quantization: config
-            .linear_format(&format!("{root}.down_proj"))
-            .weight_quantization(),
-        gate_up_bias: false,
-        down_bias: false,
-        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-    }
-}
-
-fn cached_provider<'a>(
+const fn cached_provider<'a>(
     cache: &'a ExpertCache,
-    config: &'a HybridConfig,
-) -> CachedGatedProductExpertProvider<'a, impl FnMut(usize) -> CachedGatedProductBankSpec + 'a> {
-    CachedGatedProductExpertProvider::new(cache, move |layer| cached_expert_spec(config, layer))
+    _config: &HybridConfig,
+) -> CachedGatedProductExpertProvider<'a> {
+    CachedGatedProductExpertProvider::new(cache)
 }
 
 struct HybridGgufCatalog<'a>(&'a GgufCheckpoint);

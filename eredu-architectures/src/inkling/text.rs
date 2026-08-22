@@ -11,7 +11,7 @@ use eredu_nn::{
 };
 use eredu_runtime::{ExpertPass, RoutedExpertProvider, RoutedExpertRequest};
 
-use super::{FeedForwardPolicy, LayerPolicy, TextArgs};
+use super::{FeedForwardPolicy, LayerPolicy, ModelArgs, TextArgs};
 
 /// Four bounded causal histories owned by every Inkling decoder layer.
 #[derive(Debug, Clone)]
@@ -580,32 +580,8 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let prefix = format!("{block_root}.moe");
-        let intermediate = args.moe_intermediate_size();
         let bank = |field: &str, count| {
-            let gate_up = format!("{prefix}.{field}.gate_up_proj");
-            let down = format!("{prefix}.{field}.down_proj");
-            B::gated_product_expert_bank(
-                GatedProductExpertBankSpec {
-                    expert_count: count,
-                    input_dimensions: args.hidden_size,
-                    intermediate_dimensions: intermediate,
-                    output_dimensions: args.hidden_size,
-                    policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-                    layout: GatedProductExpertLayout::Packed {
-                        gate_up: ExpertProjectionSpec {
-                            weight: ParameterSpec::trainable(&gate_up).map_err(Error::backend)?,
-                            bias: None,
-                            format: args.linear_format_for(&gate_up),
-                        },
-                        down: ExpertProjectionSpec {
-                            weight: ParameterSpec::trainable(&down).map_err(Error::backend)?,
-                            bias: None,
-                            format: args.linear_format_for(&down),
-                        },
-                    },
-                },
-                context,
-            )
+            B::gated_product_expert_bank(expert_bank_spec_at(args, &prefix, field, count)?, context)
         };
         Ok(Self {
             routed_count: args.n_routed_experts,
@@ -891,6 +867,58 @@ impl<B: RoutedNeuralBackend> SparseMlp<B> {
             eredu_runtime::combine_routed_expert_tensor_parallel::<B>(routed, shared, context)?;
         eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
     }
+}
+
+/// Returns the architecture-owned routed or shared expert specification for one cache layer.
+pub fn expert_bank_spec(
+    args: &ModelArgs,
+    cache_layer: usize,
+) -> Result<GatedProductExpertBankSpec, Error> {
+    let layers = args.text_config.num_hidden_layers as usize;
+    let (layer, field, count) = if cache_layer < layers {
+        (cache_layer, "experts", args.text_config.n_routed_experts)
+    } else {
+        (
+            cache_layer - layers,
+            "shared_experts",
+            args.text_config.n_shared_experts,
+        )
+    };
+    expert_bank_spec_at(
+        &args.text_config,
+        &format!("model.layers.{layer}.moe"),
+        field,
+        count,
+    )
+}
+
+fn expert_bank_spec_at(
+    args: &TextArgs,
+    prefix: &str,
+    field: &str,
+    count: i32,
+) -> Result<GatedProductExpertBankSpec, Error> {
+    let gate_up = format!("{prefix}.{field}.gate_up_proj");
+    let down = format!("{prefix}.{field}.down_proj");
+    Ok(GatedProductExpertBankSpec {
+        expert_count: count,
+        input_dimensions: args.hidden_size,
+        intermediate_dimensions: args.moe_intermediate_size(),
+        output_dimensions: args.hidden_size,
+        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+        layout: GatedProductExpertLayout::Packed {
+            gate_up: ExpertProjectionSpec {
+                weight: ParameterSpec::trainable(&gate_up).map_err(Error::backend)?,
+                bias: None,
+                format: args.linear_format_for(&gate_up),
+            },
+            down: ExpertProjectionSpec {
+                weight: ParameterSpec::trainable(&down).map_err(Error::backend)?,
+                bias: None,
+                format: args.linear_format_for(&down),
+            },
+        },
+    })
 }
 
 /// Dense or sparse feed-forward branch selected by the normalized schedule.

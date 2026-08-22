@@ -4,6 +4,7 @@ use std::{collections::BTreeSet, ops::Range};
 
 use eredu_architectures::deepseek::{self, LayerPolicy, V3Args, V4Args};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
+use eredu_nn::GatedProductExpertBankSpec;
 use eredu_runtime::{ExpertIdentity, OffloadUnit, WeightBinding};
 
 use crate::backend::mlx::{
@@ -12,7 +13,7 @@ use crate::backend::mlx::{
         checkpoint::binding_plan::{BindingPlan, PlannedBinding},
         residency::{
             expert_cache::{ExpertCache, ExpertCatalogEntry},
-            expert_provider::{CachedGatedProductBankSpec, CachedGatedProductExpertProvider},
+            expert_provider::CachedGatedProductExpertProvider,
         },
     },
 };
@@ -295,57 +296,25 @@ fn recipe_binding(
     Ok(bindings.pop().expect("one expert binding"))
 }
 
-pub fn v3_provider<'a>(
+pub const fn v3_provider<'a>(
     cache: &'a ExpertCache,
-    args: &'a V3Args,
-) -> CachedGatedProductExpertProvider<'a, impl FnMut(usize) -> CachedGatedProductBankSpec + 'a> {
-    CachedGatedProductExpertProvider::new(cache, move |layer| v3_spec(args, layer))
+    _args: &V3Args,
+) -> CachedGatedProductExpertProvider<'a> {
+    CachedGatedProductExpertProvider::new(cache)
 }
 
-pub fn v4_provider<'a>(
+pub const fn v4_provider<'a>(
     cache: &'a ExpertCache,
-    args: &'a V4Args,
-) -> CachedGatedProductExpertProvider<'a, impl FnMut(usize) -> CachedGatedProductBankSpec + 'a> {
-    CachedGatedProductExpertProvider::new(cache, move |layer| v4_spec(args, layer))
+    _args: &V4Args,
+) -> CachedGatedProductExpertProvider<'a> {
+    CachedGatedProductExpertProvider::new(cache)
 }
 
-pub fn v3_spec(args: &V3Args, layer: usize) -> CachedGatedProductBankSpec {
-    let root = format!("model.layers.{layer}.mlp.experts");
-    CachedGatedProductBankSpec {
-        hidden_dimensions: args.hidden_size,
-        intermediate_dimensions: args.moe_intermediate_size,
-        gate_up_quantization: args
-            .linear_format_for(&format!("{root}.gate_up_proj"))
-            .weight_quantization(),
-        down_quantization: args
-            .linear_format_for(&format!("{root}.down_proj"))
-            .weight_quantization(),
-        gate_up_bias: false,
-        down_bias: false,
-        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-    }
+pub fn v3_spec(args: &V3Args, layer: usize) -> Result<GatedProductExpertBankSpec, Error> {
+    let policy = deepseek::v3::moe_policy(args, layer)?;
+    Ok(deepseek::moe::expert_bank_spec(&policy)?)
 }
 
-pub fn v4_spec(args: &V4Args, layer: usize) -> CachedGatedProductBankSpec {
-    let root = if layer < args.num_hidden_layers as usize {
-        format!("layers.{layer}.ffn.switch_mlp")
-    } else {
-        format!(
-            "mtp.{}.ffn.switch_mlp",
-            layer - args.num_hidden_layers as usize
-        )
-    };
-    CachedGatedProductBankSpec {
-        hidden_dimensions: args.hidden_size,
-        intermediate_dimensions: args.moe_intermediate_size,
-        gate_up_quantization: args
-            .linear_format_for(&format!("{root}.gate_up_proj"))
-            .weight_quantization(),
-        down_quantization: args
-            .linear_format_for(&format!("{root}.down_proj"))
-            .weight_quantization(),
-        gate_up_bias: false,
-        down_bias: false,
-        policy: args.swiglu_limit.unwrap_or_default(),
-    }
+pub fn v4_spec(args: &V4Args, layer: usize) -> Result<GatedProductExpertBankSpec, Error> {
+    Ok(deepseek::v4::expert_bank_spec(args, layer)?)
 }

@@ -392,8 +392,6 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
         let prefix = format!("model.layers.{layer}.mlp");
-        let gate_up = format!("{prefix}.experts.gate_up_proj");
-        let down = format!("{prefix}.experts.down_proj");
         Ok(Self {
             router: B::top_k_router(
                 TopKRouterSpec {
@@ -416,28 +414,7 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
                 },
                 context,
             )?,
-            experts: B::gated_product_expert_bank(
-                GatedProductExpertBankSpec {
-                    expert_count: args.num_experts,
-                    input_dimensions: args.hidden_size,
-                    intermediate_dimensions: args.moe_intermediate_size,
-                    output_dimensions: args.hidden_size,
-                    policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-                    layout: GatedProductExpertLayout::Packed {
-                        gate_up: ExpertProjectionSpec {
-                            weight: ParameterSpec::trainable(&gate_up).map_err(Error::backend)?,
-                            bias: None,
-                            format: args.linear_format_for(&gate_up),
-                        },
-                        down: ExpertProjectionSpec {
-                            weight: ParameterSpec::trainable(&down).map_err(Error::backend)?,
-                            bias: None,
-                            format: args.linear_format_for(&down),
-                        },
-                    },
-                },
-                context,
-            )?,
+            experts: B::gated_product_expert_bank(expert_bank_spec(args, layer)?, context)?,
             hidden_size: args.hidden_size,
         })
     }
@@ -552,6 +529,35 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
             eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)?;
         output.reshape(&shape, context)
     }
+}
+
+/// Returns the architecture-owned routed expert specification for one layer.
+pub fn expert_bank_spec(
+    args: &DecoderConfig,
+    layer: usize,
+) -> Result<GatedProductExpertBankSpec, Error> {
+    let prefix = format!("model.layers.{layer}.mlp.experts");
+    let gate_up = format!("{prefix}.gate_up_proj");
+    let down = format!("{prefix}.down_proj");
+    Ok(GatedProductExpertBankSpec {
+        expert_count: args.num_experts,
+        input_dimensions: args.hidden_size,
+        intermediate_dimensions: args.moe_intermediate_size,
+        output_dimensions: args.hidden_size,
+        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+        layout: GatedProductExpertLayout::Packed {
+            gate_up: ExpertProjectionSpec {
+                weight: ParameterSpec::trainable(&gate_up).map_err(Error::backend)?,
+                bias: None,
+                format: args.linear_format_for(&gate_up),
+            },
+            down: ExpertProjectionSpec {
+                weight: ParameterSpec::trainable(&down).map_err(Error::backend)?,
+                bias: None,
+                format: args.linear_format_for(&down),
+            },
+        },
+    })
 }
 
 /// Dense or routed feed-forward branch selected by normalized checkpoint geometry.

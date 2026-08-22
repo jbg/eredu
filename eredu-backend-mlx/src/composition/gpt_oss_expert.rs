@@ -1,7 +1,8 @@
 // MLX residency adapter for the neutral GPT-OSS routed-expert graph.
 
 use eredu_architectures::gpt_oss::{expert_recipes, ModelArgs};
-use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection, WeightQuantization};
+use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
+use eredu_nn::{GatedProductExpertBankOperator, GatedProductExpertBankSpec};
 use eredu_runtime::{
     ExpertIdentity, ExpertPass, OffloadUnit, RoutedExpertProvider, RoutedExpertRequest,
     RoutedExpertTensorParallelOutput, WeightBinding,
@@ -23,8 +24,7 @@ use crate::backend::mlx::{
             expert_cache::{ExpertCache, ExpertCatalogEntry},
             expert_provider::{
                 execute_cached_gated_product_dispatched,
-                execute_cached_gated_product_tensor_parallel, CachedGatedProductBankSpec,
-                CachedGatedProductExpertProvider,
+                execute_cached_gated_product_tensor_parallel, CachedGatedProductExpertProvider,
             },
         },
     },
@@ -101,33 +101,18 @@ pub fn expert_catalog_cartesian(
     Ok(entries)
 }
 
-/// Exact cached-bank equation and physical format for one GPT-OSS layer.
-pub fn cached_bank_spec(args: &ModelArgs, _layer: usize) -> CachedGatedProductBankSpec {
-    CachedGatedProductBankSpec {
-        hidden_dimensions: args.hidden_size,
-        intermediate_dimensions: args.intermediate_size,
-        // Checkpoint-native expert bindings are always MXFP4. Keeping this
-        // explicit makes their format win over cache-global load-time policy.
-        gate_up_quantization: Some(WeightQuantization::MxFp4),
-        down_quantization: Some(WeightQuantization::MxFp4),
-        gate_up_bias: true,
-        down_bias: true,
-        policy: args.gated_product_policy,
-    }
-}
-
 /// Adapts an expert cache to the neutral routed-provider contract.
-pub fn cached_provider<'a>(
+pub const fn cached_provider<'a>(
     cache: &'a ExpertCache,
-    args: &'a ModelArgs,
-) -> CachedGatedProductExpertProvider<'a, impl FnMut(usize) -> CachedGatedProductBankSpec + 'a> {
-    CachedGatedProductExpertProvider::new(cache, move |layer| cached_bank_spec(args, layer))
+    _args: &ModelArgs,
+) -> CachedGatedProductExpertProvider<'a> {
+    CachedGatedProductExpertProvider::new(cache)
 }
 
 /// Executes rows already compacted by an EP dispatcher.
 pub fn execute_cached_dispatched(
     cache: &ExpertCache,
-    args: &ModelArgs,
+    spec: &GatedProductExpertBankSpec,
     layer: usize,
     hidden: &Array,
     global_expert_ids: &Array,
@@ -136,7 +121,7 @@ pub fn execute_cached_dispatched(
 ) -> Result<Array, Error> {
     execute_cached_gated_product_dispatched(
         cache,
-        cached_bank_spec(args, layer),
+        spec,
         layer,
         hidden,
         global_expert_ids,
@@ -149,7 +134,7 @@ pub fn execute_cached_dispatched(
 /// reducible projection and add routed down bias exactly once afterwards.
 pub fn execute_cached_dispatched_tensor_parallel(
     cache: &ExpertCache,
-    args: &ModelArgs,
+    spec: &GatedProductExpertBankSpec,
     layer: usize,
     hidden: &Array,
     global_expert_ids: &Array,
@@ -166,7 +151,7 @@ pub fn execute_cached_dispatched_tensor_parallel(
     let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
     execute_cached_gated_product_tensor_parallel(
         cache,
-        cached_bank_spec(args, layer),
+        spec,
         layer,
         hidden,
         &expert_ids,
@@ -184,14 +169,13 @@ pub fn execute_cached_dispatched_tensor_parallel(
 /// reducible projection and routed replicated down bias distinct so the model
 /// can all-sum the former and add the latter exactly once.
 pub fn distributed_provider<'a>(
-    args: &'a ModelArgs,
+    _args: &'a ModelArgs,
     assignment: &'a ExpertAssignment,
     expert_group: Option<&'a Group>,
     cache: &'a ExpertCache,
     statistics: &'a mut RoutingStatistics,
 ) -> impl RoutedExpertProvider<MlxBackend, Error = Error> + 'a {
     DistributedCachedProvider {
-        args,
         assignment,
         expert_group,
         cache,
@@ -200,7 +184,6 @@ pub fn distributed_provider<'a>(
 }
 
 struct DistributedCachedProvider<'a> {
-    args: &'a ModelArgs,
     assignment: &'a ExpertAssignment,
     expert_group: Option<&'a Group>,
     cache: &'a ExpertCache,
@@ -208,7 +191,7 @@ struct DistributedCachedProvider<'a> {
 }
 
 struct CachedLocalBank<'a> {
-    args: &'a ModelArgs,
+    spec: &'a GatedProductExpertBankSpec,
     layer: usize,
     pass: ExpertPass,
     cache: &'a ExpertCache,
@@ -237,7 +220,7 @@ impl LocalExpertBank for CachedLocalBank<'_> {
     ) -> Result<Array, Error> {
         execute_cached_dispatched(
             self.cache,
-            self.args,
+            self.spec,
             self.layer,
             hidden,
             &self.global_ids(local_expert_ids, stream)?,
@@ -255,7 +238,7 @@ impl LocalExpertBank for CachedLocalBank<'_> {
     ) -> Result<eredu_nn::TensorParallelExpertOutput<Array>, Error> {
         execute_cached_dispatched_tensor_parallel(
             self.cache,
-            self.args,
+            self.spec,
             self.layer,
             hidden,
             &self.global_ids(local_expert_ids, stream)?,
@@ -271,7 +254,7 @@ impl RoutedExpertProvider<MlxBackend> for DistributedCachedProvider<'_> {
 
     fn forward_routed(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, crate::MlxTensor>,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Self::Error> {
@@ -285,7 +268,7 @@ impl RoutedExpertProvider<MlxBackend> for DistributedCachedProvider<'_> {
         let execute = |routes: &DispatchedRoutes, stream: &Stream| {
             execute_cached_dispatched(
                 self.cache,
-                self.args,
+                resident_bank.spec(),
                 request.layer,
                 &routes.hidden,
                 &routes.global_expert_ids,
@@ -320,7 +303,7 @@ impl RoutedExpertProvider<MlxBackend> for DistributedCachedProvider<'_> {
 
     fn forward_routed_tensor_parallel(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, crate::MlxTensor>,
         partitions: usize,
         stream: &Stream,
@@ -333,7 +316,7 @@ impl RoutedExpertProvider<MlxBackend> for DistributedCachedProvider<'_> {
         let expert_ids = expert_ids_input.reshape(&[-1, expert_ids_input.dim(-1)], stream)?;
         let weights = route_weights.reshape(&[-1, route_weights.dim(-1)], stream)?;
         let mut bank = CachedLocalBank {
-            args: self.args,
+            spec: resident_bank.spec(),
             layer: request.layer,
             pass: request.pass,
             cache: self.cache,
@@ -447,11 +430,20 @@ mod tests {
     #[test]
     fn cached_bank_freezes_native_format_biases_and_exact_policy() {
         let args = args();
-        let spec = cached_bank_spec(&args, 0);
-        assert_eq!(spec.gate_up_quantization, Some(WeightQuantization::MxFp4));
-        assert_eq!(spec.down_quantization, Some(WeightQuantization::MxFp4));
-        assert!(spec.gate_up_bias);
-        assert!(spec.down_bias);
+        let spec = eredu_architectures::gpt_oss::moe::expert_bank_spec(&args, 0).unwrap();
+        let eredu_nn::GatedProductExpertLayout::Packed { gate_up, down } = &spec.layout else {
+            panic!("GPT-OSS experts must use packed architecture geometry");
+        };
+        assert_eq!(
+            gate_up.format.weight_quantization(),
+            Some(eredu_checkpoint::WeightQuantization::MxFp4)
+        );
+        assert_eq!(
+            down.format.weight_quantization(),
+            Some(eredu_checkpoint::WeightQuantization::MxFp4)
+        );
+        assert!(gate_up.bias.is_some());
+        assert!(down.bias.is_some());
         assert_eq!(spec.policy, args.gated_product_policy);
         assert_eq!(spec.policy.sigmoid_multiplier(), 1.702);
         assert_eq!(spec.policy.up_offset(), 1.0);

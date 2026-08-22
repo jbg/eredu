@@ -3,7 +3,10 @@
 use std::time::Instant;
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_nn::TensorParallelExpertOutput;
+use eredu_nn::{
+    GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
+    TensorParallelExpertOutput,
+};
 use eredu_runtime::{
     ExpertPass, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
 };
@@ -22,18 +25,6 @@ fn wrap_parallel_output(
         reducible: MlxTensor::from_array(output.reducible),
         post_reduce: output.post_reduce.map(MlxTensor::from_array),
     }
-}
-
-/// Backend geometry, equation, and physical encoding for one cached gated-product bank.
-#[derive(Debug, Clone, Copy)]
-pub struct CachedGatedProductBankSpec {
-    pub hidden_dimensions: i32,
-    pub intermediate_dimensions: i32,
-    pub gate_up_quantization: Option<WeightQuantization>,
-    pub down_quantization: Option<WeightQuantization>,
-    pub gate_up_bias: bool,
-    pub down_bias: bool,
-    pub policy: eredu_nn::GatedProductPolicy,
 }
 
 /// Backend geometry and physical encoding for one cached ReLU2 bank.
@@ -97,36 +88,29 @@ where
     }
 }
 
-/// Executes independently cached gated-product experts through a layer-spec factory.
-pub struct CachedGatedProductExpertProvider<'a, F> {
+/// Executes independently cached gated-product experts with resident-bank semantics.
+pub struct CachedGatedProductExpertProvider<'a> {
     cache: &'a ExpertCache,
-    spec_for_layer: F,
 }
 
-impl<'a, F> CachedGatedProductExpertProvider<'a, F> {
-    pub const fn new(cache: &'a ExpertCache, spec_for_layer: F) -> Self {
-        Self {
-            cache,
-            spec_for_layer,
-        }
+impl<'a> CachedGatedProductExpertProvider<'a> {
+    pub const fn new(cache: &'a ExpertCache) -> Self {
+        Self { cache }
     }
 }
 
-impl<F> RoutedExpertProvider<MlxBackend> for CachedGatedProductExpertProvider<'_, F>
-where
-    F: FnMut(usize) -> CachedGatedProductBankSpec,
-{
+impl RoutedExpertProvider<MlxBackend> for CachedGatedProductExpertProvider<'_> {
     type Error = Error;
 
     fn forward_routed(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
         execute_cached_gated_product(
             self.cache,
-            (self.spec_for_layer)(request.layer),
+            resident_bank.spec(),
             request.layer,
             request.input.as_array(),
             request.routes.expert_ids.as_array(),
@@ -139,14 +123,14 @@ where
 
     fn forward_routed_tensor_parallel(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         partitions: usize,
         stream: &Stream,
     ) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, Self::Error> {
         execute_cached_gated_product_tensor_parallel(
             self.cache,
-            (self.spec_for_layer)(request.layer),
+            resident_bank.spec(),
             request.layer,
             request.input.as_array(),
             request.routes.expert_ids.as_array(),
@@ -353,7 +337,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub fn execute_cached_gated_product(
     cache: &ExpertCache,
-    spec: CachedGatedProductBankSpec,
+    spec: &GatedProductExpertBankSpec,
     layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -378,7 +362,7 @@ pub fn execute_cached_gated_product(
 #[allow(clippy::too_many_arguments)]
 pub fn execute_cached_gated_product_tensor_parallel(
     cache: &ExpertCache,
-    spec: CachedGatedProductBankSpec,
+    spec: &GatedProductExpertBankSpec,
     layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -399,18 +383,20 @@ pub fn execute_cached_gated_product_tensor_parallel(
         Some(partitions),
         stream,
     )?;
-    let hidden_dimensions = spec.hidden_dimensions;
-    let packed = packed.reshape(&[-1, 2 * hidden_dimensions], stream)?;
+    let output_dimensions = spec.output_dimensions;
+    let packed = packed.reshape(&[-1, 2 * output_dimensions], stream)?;
     let reducible = packed
-        .try_index_device((.., ..hidden_dimensions), stream)?
+        .try_index_device((.., ..output_dimensions), stream)?
         .reshape(&original_shape, stream)?;
     Ok(TensorParallelExpertOutput {
         reducible,
-        post_reduce: spec
-            .down_bias
+        post_reduce: packed_gated_product_projections(spec)?
+            .1
+            .bias
+            .is_some()
             .then(|| {
                 packed
-                    .try_index_device((.., hidden_dimensions..), stream)?
+                    .try_index_device((.., output_dimensions..), stream)?
                     .reshape(&original_shape, stream)
             })
             .transpose()?,
@@ -420,7 +406,7 @@ pub fn execute_cached_gated_product_tensor_parallel(
 #[allow(clippy::too_many_arguments)]
 fn execute_cached_gated_product_inner(
     cache: &ExpertCache,
-    spec: CachedGatedProductBankSpec,
+    spec: &GatedProductExpertBankSpec,
     layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -429,6 +415,13 @@ fn execute_cached_gated_product_inner(
     partitions: Option<usize>,
     stream: &Stream,
 ) -> Result<Array, Error> {
+    spec.validate()?;
+    if spec.input_dimensions != spec.output_dimensions {
+        return Err(Error::UnsupportedArchitecture(
+            "MLX cached gated-product experts require equal input and output dimensions".into(),
+        ));
+    }
+    let (gate_up, down) = packed_gated_product_projections(spec)?;
     // The neutral router reports one row per token while decoder hidden state
     // retains its leading batch/sequence dimensions. Resident expert banks
     // flatten and restore those dimensions as part of their operator contract;
@@ -443,11 +436,11 @@ fn execute_cached_gated_product_inner(
             let load_time = cache.weight_quantization();
             let mut bank = PackedGatedProductExperts::new(
                 acquired.identities().len() as i32,
-                spec.hidden_dimensions,
+                spec.input_dimensions,
                 spec.intermediate_dimensions,
-                spec.gate_up_quantization.or(load_time),
-                spec.down_quantization.or(load_time),
-                [spec.gate_up_bias, spec.down_bias],
+                gate_up.format.weight_quantization().or(load_time),
+                down.format.weight_quantization().or(load_time),
+                [gate_up.bias.is_some(), down.bias.is_some()],
                 stream,
             )?
             .with_policy(spec.policy)?;
@@ -587,7 +580,7 @@ pub fn execute_cached_relu2_dispatched(
 /// bank must use a unit weight and return one unweighted output row per input.
 pub fn execute_cached_gated_product_dispatched(
     cache: &ExpertCache,
-    spec: CachedGatedProductBankSpec,
+    spec: &GatedProductExpertBankSpec,
     layer: usize,
     hidden: &Array,
     global_expert_ids: &Array,
@@ -606,4 +599,21 @@ pub fn execute_cached_gated_product_dispatched(
         pass,
         stream,
     )
+}
+
+fn packed_gated_product_projections(
+    spec: &GatedProductExpertBankSpec,
+) -> Result<
+    (
+        &eredu_nn::ExpertProjectionSpec,
+        &eredu_nn::ExpertProjectionSpec,
+    ),
+    Error,
+> {
+    match &spec.layout {
+        GatedProductExpertLayout::Packed { gate_up, down } => Ok((gate_up, down)),
+        GatedProductExpertLayout::Independent(_) => Err(Error::UnsupportedArchitecture(
+            "MLX compact cached banks require a packed architecture expert specification".into(),
+        )),
+    }
 }

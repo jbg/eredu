@@ -99,28 +99,7 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
             },
             context,
         )?;
-        let experts = B::gated_product_expert_bank(
-            GatedProductExpertBankSpec {
-                expert_count: policy.expert_count,
-                input_dimensions: policy.hidden,
-                intermediate_dimensions: policy.expert_width,
-                output_dimensions: policy.hidden,
-                policy: policy.limit.unwrap_or_default(),
-                layout: GatedProductExpertLayout::Packed {
-                    gate_up: ExpertProjectionSpec {
-                        weight: parameter(&policy.expert_gate_up)?,
-                        bias: None,
-                        format: policy.expert_gate_up_format,
-                    },
-                    down: ExpertProjectionSpec {
-                        weight: parameter(&policy.expert_down)?,
-                        bias: None,
-                        format: policy.expert_down_format,
-                    },
-                },
-            },
-            context,
-        )?;
+        let experts = B::gated_product_expert_bank(expert_bank_spec(policy)?, context)?;
         let shared = |weight: &str, input, output, format| {
             B::linear(
                 LinearSpec {
@@ -297,6 +276,29 @@ impl<B: RoutedNeuralBackend> RoutedPlusShared<B> {
         })?;
         observe_and_intervene(observer, &format!("{path}.output"), &combined)
     }
+}
+
+/// Returns the architecture-owned routed expert specification for one policy.
+pub fn expert_bank_spec(policy: &MoePolicy) -> Result<GatedProductExpertBankSpec, Error> {
+    Ok(GatedProductExpertBankSpec {
+        expert_count: policy.expert_count,
+        input_dimensions: policy.hidden,
+        intermediate_dimensions: policy.expert_width,
+        output_dimensions: policy.hidden,
+        policy: policy.limit.unwrap_or_default(),
+        layout: GatedProductExpertLayout::Packed {
+            gate_up: ExpertProjectionSpec {
+                weight: parameter(&policy.expert_gate_up)?,
+                bias: None,
+                format: policy.expert_gate_up_format,
+            },
+            down: ExpertProjectionSpec {
+                weight: parameter(&policy.expert_down)?,
+                bias: None,
+                format: policy.expert_down_format,
+            },
+        },
+    })
 }
 
 fn parameter(name: &str) -> Result<ParameterSpec, Error> {

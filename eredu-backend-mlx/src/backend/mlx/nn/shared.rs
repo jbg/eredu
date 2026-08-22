@@ -1153,6 +1153,7 @@ impl RoutingOperator<MlxTensor> for MlxTopKRouter {
 /// MLX packed execution bank for backend-neutral routed gated-product experts.
 #[derive(Debug, Clone)]
 pub struct MlxGatedProductExpertBank {
+    spec: GatedProductExpertBankSpec,
     module: MlxNamedModule<common::moe::PackedGatedProductExperts>,
 }
 
@@ -1175,6 +1176,10 @@ impl Parameterized<MlxTensor> for MlxGatedProductExpertBank {
 }
 
 impl GatedProductExpertBankOperator<MlxTensor> for MlxGatedProductExpertBank {
+    fn spec(&self) -> &GatedProductExpertBankSpec {
+        &self.spec
+    }
+
     fn forward_routed(
         &mut self,
         input: &MlxTensor,
@@ -2783,7 +2788,7 @@ impl RoutedNeuralBackend for MlxBackend {
             ));
         }
         let policy = spec.policy;
-        let GatedProductExpertLayout::Packed { gate_up, down } = spec.layout else {
+        let GatedProductExpertLayout::Packed { gate_up, down } = &spec.layout else {
             return Err(ComputeError::backend(
                 "independent expert units must be acquired through a runtime expert provider",
             ));
@@ -2839,11 +2844,11 @@ impl RoutedNeuralBackend for MlxBackend {
             ("gate_up_proj", gate_up.weight.clone()),
             ("down_proj", down.weight.clone()),
         ];
-        if let Some(bias) = gate_up.bias {
-            topology.push(("gate_up_proj_bias", bias));
+        if let Some(bias) = &gate_up.bias {
+            topology.push(("gate_up_proj_bias", bias.clone()));
         }
-        if let Some(bias) = down.bias {
-            topology.push(("down_proj_bias", bias));
+        if let Some(bias) = &down.bias {
+            topology.push(("down_proj_bias", bias.clone()));
         }
         if native_fp8
             || gate_up
@@ -2888,6 +2893,7 @@ impl RoutedNeuralBackend for MlxBackend {
             ));
         }
         Ok(MlxGatedProductExpertBank {
+            spec,
             module: MlxNamedModule::with_exact_topology(module, topology)?,
         })
     }

@@ -18,11 +18,10 @@ use std::{
 };
 
 #[cfg(test)]
-use safemlx::module::ModuleParameters;
+use safemlx::module::{ModuleParameters, Param};
 use safemlx::{
     distributed::Group,
     error::Exception,
-    module::Param,
     ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     Array, Stream,
 };
@@ -42,8 +41,7 @@ use crate::{
     backend::mlx::runtime::generation::sampler::SpeculativeSampler,
     backend::mlx::runtime::media::input as runtime_input,
     backend::mlx::runtime::residency::expert_cache::{
-        AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
-        ExpertRouteBatch,
+        ExpertCache, ExpertCacheReport, ExpertCatalogEntry,
     },
     backend::mlx::{MlxParallelContext, ModelLoadOptions},
     composition::mlx::speculative::embedded::{
@@ -60,6 +58,7 @@ use eredu_runtime::{
     LayerWeightResidency, PagedCacheOptions, WeightResidency,
 };
 
+#[cfg(test)]
 use crate::backend::mlx::nn::moe::PackedGatedProductExperts;
 
 pub use crate::backend::mlx::runtime::distributed::expert::*;
@@ -1753,12 +1752,12 @@ fn execute_cached_neutral_deepseek(
     stream: &Stream,
 ) -> Result<Array, Error> {
     let spec = match args {
-        NeutralDeepSeekArgs::V3(args) => crate::composition::deepseek_expert::v3_spec(args, layer),
-        NeutralDeepSeekArgs::V4(args) => crate::composition::deepseek_expert::v4_spec(args, layer),
+        NeutralDeepSeekArgs::V3(args) => crate::composition::deepseek_expert::v3_spec(args, layer)?,
+        NeutralDeepSeekArgs::V4(args) => crate::composition::deepseek_expert::v4_spec(args, layer)?,
     };
     crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
         cache,
-        spec,
+        &spec,
         layer,
         &routes.hidden,
         &routes.global_expert_ids,
@@ -1775,26 +1774,10 @@ pub fn execute_cached_neutral_gemma4(
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let prefix = format!("model.language_model.layers.{layer}.experts.switch_glu");
-    let spec =
-        crate::backend::mlx::runtime::residency::expert_provider::CachedGatedProductBankSpec {
-            hidden_dimensions: args.hidden_size,
-            intermediate_dimensions: args.moe_intermediate_size.ok_or_else(|| {
-                Error::UnsupportedArchitecture("Gemma 4 sparse layer has no expert width".into())
-            })?,
-            gate_up_quantization: args
-                .linear_format_for(&format!("{prefix}.gate_up_proj"))
-                .weight_quantization(),
-            down_quantization: args
-                .linear_format_for(&format!("{prefix}.down_proj"))
-                .weight_quantization(),
-            gate_up_bias: false,
-            down_bias: false,
-            policy: eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
-        };
+    let spec = eredu_architectures::gemma4::text::expert_bank_spec(args, layer)?;
     crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
         cache,
-        spec,
+        &spec,
         layer,
         &routes.hidden,
         &routes.global_expert_ids,
@@ -1811,46 +1794,16 @@ pub fn execute_cached_kimi_linear(
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    Ok(cache.execute_routes_bounded(
-        ExpertRouteBatch::new(
-            layer,
-            &routes.hidden,
-            &routes.global_expert_ids,
-            &routes.weights,
-            pass,
-        ),
+    let spec = kimi_linear_arch::moe::expert_bank_spec(args, layer)?;
+    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
+        cache,
+        &spec,
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        pass,
         stream,
-        |hidden, acquired, _weights, stream| {
-            let started = Instant::now();
-            let prefix = format!("model.layers.{layer}.mlp.experts");
-            let mut bank = PackedGatedProductExperts::new(
-                acquired.identities().len() as i32,
-                args.hidden_size,
-                args.moe_intermediate_size,
-                args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
-                args.weight_quantization_for(&format!("{prefix}.down_proj")),
-                [false, false],
-                stream,
-            )?;
-            bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
-            bank.gate_up_proj_scales =
-                Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
-            bank.gate_up_proj_biases =
-                Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
-            bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
-            bank.down_proj_scales =
-                Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
-            bank.down_proj_biases =
-                Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
-            cache.record_compact_bank(
-                acquired.pass(),
-                acquired.scratch_bytes(),
-                started.elapsed(),
-            )?;
-            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
-            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
-        },
-    )?)
+    )
 }
 
 pub fn execute_cached_neutral_qwen3(
@@ -1880,30 +1833,10 @@ pub fn execute_cached_neutral_inkling(
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let layers = args.text_config.num_hidden_layers as usize;
-    let (layer, bank) = if cache_layer < layers {
-        (cache_layer, "experts")
-    } else {
-        (cache_layer - layers, "shared_experts")
-    };
-    let prefix = format!("model.layers.{layer}.moe.{bank}");
+    let spec = eredu_architectures::inkling::text::expert_bank_spec(args, cache_layer)?;
     crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
         cache,
-        crate::backend::mlx::runtime::residency::expert_provider::CachedGatedProductBankSpec {
-            hidden_dimensions: args.text_config.hidden_size,
-            intermediate_dimensions: args.text_config.moe_intermediate_size(),
-            gate_up_quantization: args
-                .text_config
-                .linear_format_for(&format!("{prefix}.gate_up_proj"))
-                .weight_quantization(),
-            down_quantization: args
-                .text_config
-                .linear_format_for(&format!("{prefix}.down_proj"))
-                .weight_quantization(),
-            gate_up_bias: false,
-            down_bias: false,
-            policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-        },
+        &spec,
         cache_layer,
         &routes.hidden,
         &routes.global_expert_ids,
@@ -1920,37 +1853,16 @@ pub fn execute_cached_lfm2(
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    Ok(cache.execute_routes_bounded(
-        ExpertRouteBatch::new(
-            layer,
-            &routes.hidden,
-            &routes.global_expert_ids,
-            &routes.weights,
-            pass,
-        ),
+    let spec = eredu_architectures::lfm2::moe::expert_bank_spec(args, layer)?;
+    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
+        cache,
+        &spec,
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        pass,
         stream,
-        |hidden, acquired, _weights, stream| {
-            let started = Instant::now();
-            let prefix = format!("model.layers.{layer}.feed_forward.experts");
-            let mut bank = PackedGatedProductExperts::new(
-                acquired.identities().len() as i32,
-                args.hidden_size,
-                args.moe_intermediate_size,
-                args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
-                args.weight_quantization_for(&format!("{prefix}.down_proj")),
-                [false, false],
-                stream,
-            )?;
-            populate_gated_product_bank(&mut bank, acquired, stream)?;
-            cache.record_compact_bank(
-                acquired.pass(),
-                acquired.scratch_bytes(),
-                started.elapsed(),
-            )?;
-            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
-            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
-        },
-    )?)
+    )
 }
 
 pub fn execute_cached_muse_glimmer(
@@ -1961,22 +1873,10 @@ pub fn execute_cached_muse_glimmer(
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let prefix = format!("model.layers.{layer}.mlp.experts");
+    let spec = eredu_architectures::muse_glimmer::text::expert_bank_spec(args, layer)?;
     crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
         cache,
-        crate::backend::mlx::runtime::residency::expert_provider::CachedGatedProductBankSpec {
-            hidden_dimensions: args.hidden_size,
-            intermediate_dimensions: args.moe_intermediate_size,
-            gate_up_quantization: args
-                .linear_format_for(&format!("{prefix}.gate_up_proj"))
-                .weight_quantization(),
-            down_quantization: args
-                .linear_format_for(&format!("{prefix}.down_proj"))
-                .weight_quantization(),
-            gate_up_bias: false,
-            down_bias: false,
-            policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-        },
+        &spec,
         layer,
         &routes.hidden,
         &routes.global_expert_ids,
@@ -2015,27 +1915,6 @@ pub fn execute_cached_nemotron_h(
         pass,
         stream,
     )
-}
-
-fn populate_gated_product_bank(
-    bank: &mut PackedGatedProductExperts,
-    acquired: &AcquiredExperts,
-    stream: &Stream,
-) -> Result<(), ExpertCacheError> {
-    bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
-    bank.gate_up_proj_bias =
-        Param::new(acquired.optional_compact_binding("gate_up_proj_bias", stream)?);
-    bank.gate_up_proj_scales =
-        Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
-    bank.gate_up_proj_biases =
-        Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
-    bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
-    bank.down_proj_bias = Param::new(acquired.optional_compact_binding("down_proj_bias", stream)?);
-    bank.down_proj_scales =
-        Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
-    bank.down_proj_biases =
-        Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
-    Ok(())
 }
 
 #[cfg(test)]

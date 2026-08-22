@@ -71,6 +71,12 @@ or recurrent-weight transformations. This includes format-dependent recipes
 such as fused projection assembly and recurrent transition conversion; backend
 composition may inspect recipe outputs but does not construct their equations.
 
+Routed expert banks retain and expose their architecture-owned construction
+specification. Resident, cached, distributed, and future backend execution
+paths all consume that same geometry, projection encoding, bias layout, and
+activation policy; backend residency adapters must not reconstruct a parallel
+family descriptor from model arguments.
+
 Architecture capability estimates likewise own native and effective context,
 accepted modalities, cache ownership and sharing, attention windows,
 recurrent-state geometry, and backend-neutral scalar state layouts. Concrete

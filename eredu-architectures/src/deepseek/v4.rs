@@ -2664,6 +2664,19 @@ pub fn moe_policy(args: &V4Args, layer: usize) -> Result<MoePolicy, Error> {
     moe_policy_at(args, layer, &format!("layers.{layer}.ffn"))
 }
 
+/// Returns the architecture-owned routed expert specification for a target or MTP layer.
+pub fn expert_bank_spec(
+    args: &V4Args,
+    layer: usize,
+) -> Result<eredu_nn::GatedProductExpertBankSpec, Error> {
+    let root = if layer < args.num_hidden_layers as usize {
+        format!("layers.{layer}.ffn")
+    } else {
+        format!("mtp.{}.ffn", layer - args.num_hidden_layers as usize)
+    };
+    crate::deepseek::moe::expert_bank_spec(&moe_policy_at(args, layer, &root)?)
+}
+
 pub(crate) fn moe_policy_at(args: &V4Args, layer: usize, root: &str) -> Result<MoePolicy, Error> {
     if layer
         >= usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)

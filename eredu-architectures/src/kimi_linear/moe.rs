@@ -120,29 +120,8 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
             },
             context,
         )?;
-        let experts_prefix = format!("{prefix}.experts");
-        let gate_up_name = format!("{experts_prefix}.gate_up_proj");
-        let down_name = format!("{experts_prefix}.down_proj");
         let experts = B::gated_product_expert_bank(
-            GatedProductExpertBankSpec {
-                expert_count: args.num_experts,
-                input_dimensions: args.hidden_size,
-                intermediate_dimensions: routed_intermediate,
-                output_dimensions: args.hidden_size,
-                policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-                layout: GatedProductExpertLayout::Packed {
-                    gate_up: ExpertProjectionSpec {
-                        weight: ParameterSpec::trainable(&gate_up_name).map_err(Error::backend)?,
-                        bias: None,
-                        format: args.weight_quantization_for(&gate_up_name).into(),
-                    },
-                    down: ExpertProjectionSpec {
-                        weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
-                        bias: None,
-                        format: args.weight_quantization_for(&down_name).into(),
-                    },
-                },
-            },
+            expert_bank_spec_with_width(args, layer, routed_intermediate)?,
             context,
         )?;
         Ok(Self {
@@ -157,6 +136,43 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
             )?,
         })
     }
+}
+
+/// Returns the architecture-owned routed expert specification for one sparse layer.
+pub fn expert_bank_spec(
+    args: &ModelArgs,
+    layer: usize,
+) -> Result<GatedProductExpertBankSpec, Error> {
+    expert_bank_spec_with_width(args, layer, args.moe_intermediate_size)
+}
+
+fn expert_bank_spec_with_width(
+    args: &ModelArgs,
+    layer: usize,
+    intermediate: i32,
+) -> Result<GatedProductExpertBankSpec, Error> {
+    let experts_prefix = format!("model.layers.{layer}.mlp.experts");
+    let gate_up_name = format!("{experts_prefix}.gate_up_proj");
+    let down_name = format!("{experts_prefix}.down_proj");
+    Ok(GatedProductExpertBankSpec {
+        expert_count: args.num_experts,
+        input_dimensions: args.hidden_size,
+        intermediate_dimensions: intermediate,
+        output_dimensions: args.hidden_size,
+        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+        layout: GatedProductExpertLayout::Packed {
+            gate_up: ExpertProjectionSpec {
+                weight: ParameterSpec::trainable(&gate_up_name).map_err(Error::backend)?,
+                bias: None,
+                format: args.weight_quantization_for(&gate_up_name).into(),
+            },
+            down: ExpertProjectionSpec {
+                weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
+                bias: None,
+                format: args.weight_quantization_for(&down_name).into(),
+            },
+        },
+    })
 }
 
 /// Per-layer dense-prefix or sparse Kimi feed-forward policy.

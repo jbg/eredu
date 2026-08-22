@@ -1831,6 +1831,13 @@ pub struct TensorParallelExpertOutput<T> {
 
 /// Statically dispatched routed gated-product expert bank.
 pub trait GatedProductExpertBankOperator<T: Tensor>: Clone + Debug + Parameterized<T> {
+    /// Returns the architecture-owned construction specification used by this bank.
+    ///
+    /// Runtime providers use this metadata when they substitute cached or remote
+    /// parameters for the resident bank, so every execution path retains the
+    /// same geometry, encoding, bias, and activation policy.
+    fn spec(&self) -> &GatedProductExpertBankSpec;
+
     /// Executes selected experts and combines their outputs by route weight.
     fn forward_routed(
         &mut self,

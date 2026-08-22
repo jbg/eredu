@@ -17,7 +17,7 @@ use crate::backend::mlx::{
         },
         residency::{
             expert_cache::{ExpertCache, ExpertCatalogEntry},
-            expert_provider::{CachedGatedProductBankSpec, CachedGatedProductExpertProvider},
+            expert_provider::CachedGatedProductExpertProvider,
         },
     },
 };
@@ -215,24 +215,9 @@ pub fn expert_catalog(
     Ok(entries)
 }
 
-pub fn cached_provider<'a>(
+pub const fn cached_provider<'a>(
     cache: &'a ExpertCache,
-    args: &'a DecoderConfig,
-) -> CachedGatedProductExpertProvider<'a, impl FnMut(usize) -> CachedGatedProductBankSpec + 'a> {
-    CachedGatedProductExpertProvider::new(cache, move |layer| {
-        let prefix = format!("model.layers.{layer}.mlp.experts");
-        CachedGatedProductBankSpec {
-            hidden_dimensions: args.hidden_size,
-            intermediate_dimensions: args.moe_intermediate_size,
-            gate_up_quantization: args
-                .linear_format_for(&format!("{prefix}.gate_up_proj"))
-                .weight_quantization(),
-            down_quantization: args
-                .linear_format_for(&format!("{prefix}.down_proj"))
-                .weight_quantization(),
-            gate_up_bias: false,
-            down_bias: false,
-            policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-        }
-    })
+    _args: &DecoderConfig,
+) -> CachedGatedProductExpertProvider<'a> {
+    CachedGatedProductExpertProvider::new(cache)
 }

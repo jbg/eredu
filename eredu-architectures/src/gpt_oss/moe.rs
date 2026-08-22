@@ -116,37 +116,7 @@ impl<B: RoutedNeuralBackend> RoutedMlp<B> {
             context,
         )?;
 
-        let expert_prefix = format!("{prefix}.experts");
-        let gate_up_weight = format!("{expert_prefix}.gate_up_proj");
-        let gate_up_bias = format!("{expert_prefix}.gate_up_proj_bias");
-        let down_weight = format!("{expert_prefix}.down_proj");
-        let down_bias = format!("{expert_prefix}.down_proj_bias");
-        let policy = args.gated_product_policy;
-        let experts = B::gated_product_expert_bank(
-            GatedProductExpertBankSpec {
-                expert_count: args.num_local_experts,
-                input_dimensions: args.hidden_size,
-                intermediate_dimensions: args.intermediate_size,
-                output_dimensions: args.hidden_size,
-                policy,
-                layout: GatedProductExpertLayout::Packed {
-                    gate_up: ExpertProjectionSpec {
-                        weight: ParameterSpec::trainable(&gate_up_weight)
-                            .map_err(Error::backend)?,
-                        bias: Some(
-                            ParameterSpec::trainable(&gate_up_bias).map_err(Error::backend)?,
-                        ),
-                        format: WeightQuantization::MxFp4.into(),
-                    },
-                    down: ExpertProjectionSpec {
-                        weight: ParameterSpec::trainable(&down_weight).map_err(Error::backend)?,
-                        bias: Some(ParameterSpec::trainable(&down_bias).map_err(Error::backend)?),
-                        format: WeightQuantization::MxFp4.into(),
-                    },
-                },
-            },
-            context,
-        )?;
+        let experts = B::gated_product_expert_bank(expert_bank_spec(args, layer)?, context)?;
         Ok(Self {
             layer,
             router,
@@ -210,6 +180,37 @@ impl<B: RoutedNeuralBackend> RoutedMlp<B> {
             .map_err(Error::backend)?;
         eredu_runtime::reduce_routed_expert_tensor_parallel::<B>(output, parallel, context)
     }
+}
+
+/// Returns the architecture-owned routed expert specification for one layer.
+pub fn expert_bank_spec(
+    args: &ModelArgs,
+    layer: usize,
+) -> Result<GatedProductExpertBankSpec, Error> {
+    let expert_prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
+    let gate_up_weight = format!("{expert_prefix}.gate_up_proj");
+    let gate_up_bias = format!("{expert_prefix}.gate_up_proj_bias");
+    let down_weight = format!("{expert_prefix}.down_proj");
+    let down_bias = format!("{expert_prefix}.down_proj_bias");
+    Ok(GatedProductExpertBankSpec {
+        expert_count: args.num_local_experts,
+        input_dimensions: args.hidden_size,
+        intermediate_dimensions: args.intermediate_size,
+        output_dimensions: args.hidden_size,
+        policy: args.gated_product_policy,
+        layout: GatedProductExpertLayout::Packed {
+            gate_up: ExpertProjectionSpec {
+                weight: ParameterSpec::trainable(&gate_up_weight).map_err(Error::backend)?,
+                bias: Some(ParameterSpec::trainable(&gate_up_bias).map_err(Error::backend)?),
+                format: WeightQuantization::MxFp4.into(),
+            },
+            down: ExpertProjectionSpec {
+                weight: ParameterSpec::trainable(&down_weight).map_err(Error::backend)?,
+                bias: Some(ParameterSpec::trainable(&down_bias).map_err(Error::backend)?),
+                format: WeightQuantization::MxFp4.into(),
+            },
+        },
+    })
 }
 
 #[cfg(test)]

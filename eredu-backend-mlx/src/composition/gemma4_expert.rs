@@ -17,7 +17,7 @@ use crate::backend::mlx::{
         },
         residency::{
             expert_cache::{ExpertCache, ExpertCatalogEntry},
-            expert_provider::{CachedGatedProductBankSpec, CachedGatedProductExpertProvider},
+            expert_provider::CachedGatedProductExpertProvider,
         },
     },
 };
@@ -113,26 +113,9 @@ pub fn expert_catalog(
     Ok(entries)
 }
 
-pub fn cached_provider<'a>(
+pub const fn cached_provider<'a>(
     cache: &'a ExpertCache,
-    args: &'a ModelArgs,
-) -> CachedGatedProductExpertProvider<'a, impl FnMut(usize) -> CachedGatedProductBankSpec + 'a> {
-    CachedGatedProductExpertProvider::new(cache, move |layer| {
-        let prefix = format!("model.language_model.layers.{layer}.experts.switch_glu");
-        CachedGatedProductBankSpec {
-            hidden_dimensions: args.hidden_size,
-            intermediate_dimensions: args
-                .moe_intermediate_size
-                .expect("validated sparse Gemma 4 expert width"),
-            gate_up_quantization: args
-                .linear_format_for(&format!("{prefix}.gate_up_proj"))
-                .weight_quantization(),
-            down_quantization: args
-                .linear_format_for(&format!("{prefix}.down_proj"))
-                .weight_quantization(),
-            gate_up_bias: false,
-            down_bias: false,
-            policy: eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
-        }
-    })
+    _args: &ModelArgs,
+) -> CachedGatedProductExpertProvider<'a> {
+    CachedGatedProductExpertProvider::new(cache)
 }

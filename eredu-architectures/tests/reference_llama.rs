@@ -244,6 +244,7 @@ struct ReferenceLinear {
     output: i32,
     weight: ReferenceTensor,
     metadata: ParameterMetadata,
+    expert_spec: Option<GatedProductExpertBankSpec>,
 }
 
 impl Parameterized<ReferenceTensor> for ReferenceLinear {
@@ -309,6 +310,12 @@ impl RoutingOperator<ReferenceTensor> for ReferenceLinear {
 }
 
 impl GatedProductExpertBankOperator<ReferenceTensor> for ReferenceLinear {
+    fn spec(&self) -> &GatedProductExpertBankSpec {
+        self.expert_spec
+            .as_ref()
+            .expect("reference expert bank retains its construction spec")
+    }
+
     fn forward_routed(
         &mut self,
         input: &ReferenceTensor,
@@ -458,6 +465,7 @@ impl NeuralBackend for ReferenceBackend {
             output: spec.output,
             weight: ReferenceTensor(vec![spec.output, spec.input]),
             metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+            expert_spec: None,
         })
     }
     fn embedding(spec: EmbeddingSpec, _: &()) -> Result<Self::Embedding, Error> {
@@ -491,6 +499,7 @@ impl NeuralBackend for ReferenceBackend {
             output: spec.output,
             weight: ReferenceTensor(vec![range.local.len() as i32, spec.input]),
             metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+            expert_spec: None,
         })
     }
     fn vocabulary_parallel_lookup(
@@ -600,6 +609,7 @@ impl RoutedNeuralBackend for ReferenceBackend {
             output: spec.routing.top_k(),
             weight: ReferenceTensor(vec![spec.routing.expert_count(), spec.input_dimensions]),
             metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
+            expert_spec: None,
         })
     }
 
@@ -607,10 +617,10 @@ impl RoutedNeuralBackend for ReferenceBackend {
         spec: GatedProductExpertBankSpec,
         _: &(),
     ) -> Result<Self::GatedProductExpertBank, Error> {
-        let weight = match spec.layout {
-            eredu_nn::GatedProductExpertLayout::Packed { gate_up, .. } => gate_up.weight,
-            eredu_nn::GatedProductExpertLayout::Independent(mut experts) => {
-                experts.remove(0).gate.weight
+        let weight = match &spec.layout {
+            eredu_nn::GatedProductExpertLayout::Packed { gate_up, .. } => gate_up.weight.clone(),
+            eredu_nn::GatedProductExpertLayout::Independent(experts) => {
+                experts[0].gate.weight.clone()
             }
         };
         Ok(ReferenceLinear {
@@ -621,6 +631,7 @@ impl RoutedNeuralBackend for ReferenceBackend {
                 spec.input_dimensions,
             ]),
             metadata: ParameterMetadata::from_spec(&weight, weight.trainable),
+            expert_spec: Some(spec),
         })
     }
 
@@ -637,6 +648,7 @@ impl RoutedNeuralBackend for ReferenceBackend {
                 spec.hidden_dimensions,
             ]),
             metadata: ParameterMetadata::from_spec(&spec.up.weight, spec.up.weight.trainable),
+            expert_spec: None,
         })
     }
 }

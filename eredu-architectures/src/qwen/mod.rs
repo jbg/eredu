@@ -18,7 +18,7 @@ pub use config::{
     prompt_cache_architecture_fingerprint, ConfigError, GgufTensorCatalog, ModelArgs, QwenVariant,
     TextConfigContext,
 };
-pub use moe::{FeedForward, RoutedGatedProduct};
+pub use moe::{expert_bank_spec, FeedForward, RoutedGatedProduct};
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_args, local_geometry, local_key_value_heads,
     parameter_description, LocalGeometry,

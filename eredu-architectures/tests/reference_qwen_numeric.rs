@@ -4268,6 +4268,35 @@ struct NumericExpertBank {
     experts: Vec<NumericExpert>,
     parameters: Vec<(NumericTensor, ParameterMetadata)>,
     policy: eredu_nn::GatedProductPolicy,
+    spec: GatedProductExpertBankSpec,
+}
+
+fn numeric_expert_bank_spec(
+    expert_count: i32,
+    hidden: i32,
+    intermediate: i32,
+    policy: GatedProductPolicy,
+) -> GatedProductExpertBankSpec {
+    let parameter = |name| ParameterSpec::trainable(name).unwrap();
+    GatedProductExpertBankSpec {
+        expert_count,
+        input_dimensions: hidden,
+        intermediate_dimensions: intermediate,
+        output_dimensions: hidden,
+        policy,
+        layout: GatedProductExpertLayout::Packed {
+            gate_up: eredu_nn::ExpertProjectionSpec {
+                weight: parameter("test.experts.gate_up_proj"),
+                bias: None,
+                format: eredu_nn::LinearFormat::Dense,
+            },
+            down: eredu_nn::ExpertProjectionSpec {
+                weight: parameter("test.experts.down_proj"),
+                bias: None,
+                format: eredu_nn::LinearFormat::Dense,
+            },
+        },
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4393,6 +4422,10 @@ impl Parameterized<NumericTensor> for NumericExpertBank {
 }
 
 impl GatedProductExpertBankOperator<NumericTensor> for NumericExpertBank {
+    fn spec(&self) -> &GatedProductExpertBankSpec {
+        &self.spec
+    }
+
     fn forward_routed(
         &mut self,
         input: &NumericTensor,
@@ -4771,6 +4804,7 @@ impl RoutedNeuralBackend for NumericBackend {
         context: &NumericContext,
     ) -> Result<Self::GatedProductExpertBank, Error> {
         spec.validate()?;
+        let construction_spec = spec.clone();
         let expert_count = spec.expert_count as usize;
         let hidden = spec.input_dimensions;
         let intermediate = spec.intermediate_dimensions;
@@ -4981,6 +5015,7 @@ impl RoutedNeuralBackend for NumericBackend {
             experts,
             parameters,
             policy,
+            spec: construction_spec,
         })
     }
 
@@ -10442,6 +10477,7 @@ fn reference_router_and_packed_experts_match_analytical_values() {
         ],
         parameters: Vec::new(),
         policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+        spec: numeric_expert_bank_spec(2, 2, 1, eredu_nn::GatedProductPolicy::ordinary_silu()),
     };
     let routes = RoutingResult {
         expert_ids: NumericTensor::new(vec![1, 2], vec![0.0, 1.0]),
@@ -10516,6 +10552,7 @@ fn external_expert_provider_preserves_route_order_weights_bias_and_telemetry() {
         ],
         parameters: Vec::new(),
         policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+        spec: numeric_expert_bank_spec(2, 2, 1, eredu_nn::GatedProductPolicy::ordinary_silu()),
     };
     let input = NumericTensor::new(vec![2, 2], vec![2.0, 1.0, -1.0, 3.0]);
     let routes = RoutingResult {
@@ -10669,6 +10706,12 @@ fn routed_gated_experts_support_approximate_gelu() {
         }],
         parameters: Vec::new(),
         policy: eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
+        spec: numeric_expert_bank_spec(
+            1,
+            1,
+            1,
+            eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
+        ),
     };
     let routes = RoutingResult {
         expert_ids: NumericTensor::new(vec![1, 1], vec![0.0]),

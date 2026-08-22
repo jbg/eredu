@@ -8,7 +8,7 @@ use safemlx::{Array, Stream};
 
 use crate::backend::mlx::runtime::residency::expert_cache::ExpertCache;
 use crate::backend::mlx::runtime::residency::expert_provider::{
-    execute_cached_gated_product_dispatched, CachedGatedProductBankSpec, CachedGatedProductExpertProvider,
+    execute_cached_gated_product_dispatched, CachedGatedProductExpertProvider,
 };
 use crate::backend::mlx::{
     error::Error,
@@ -26,24 +26,11 @@ pub fn expert_catalog(
     expert_catalog_cartesian(args, store, None)
 }
 
-pub fn cached_provider<'a>(
+pub const fn cached_provider<'a>(
     cache: &'a ExpertCache,
-    args: &'a ModelArgs,
-) -> CachedGatedProductExpertProvider<'a, impl FnMut(usize) -> CachedGatedProductBankSpec + 'a> {
-    CachedGatedProductExpertProvider::new(cache, move |layer| cached_bank_spec(args, layer))
-}
-
-fn cached_bank_spec(args: &ModelArgs, layer: usize) -> CachedGatedProductBankSpec {
-    let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
-    CachedGatedProductBankSpec {
-        hidden_dimensions: args.hidden_size,
-        intermediate_dimensions: args.moe_intermediate_size,
-        gate_up_quantization: args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
-        down_quantization: args.weight_quantization_for(&format!("{prefix}.down_proj")),
-        gate_up_bias: false,
-        down_bias: false,
-        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-    }
+    _args: &ModelArgs,
+) -> CachedGatedProductExpertProvider<'a> {
+    CachedGatedProductExpertProvider::new(cache)
 }
 
 pub fn execute_cached_dispatched(
@@ -55,9 +42,10 @@ pub fn execute_cached_dispatched(
     pass: ExpertPass,
     stream: &Stream,
 ) -> Result<Array, Error> {
+    let spec = eredu_architectures::qwen::expert_bank_spec(args, layer)?;
     execute_cached_gated_product_dispatched(
         cache,
-        cached_bank_spec(args, layer),
+        &spec,
         layer,
         hidden,
         global_expert_ids,

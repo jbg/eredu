@@ -69,29 +69,8 @@ impl<B: RoutedNeuralBackend> SharedRoutedGatedProduct<B> {
             },
             context,
         )?;
-        let expert_prefix = format!("{prefix}.experts");
-        let gate_up_name = format!("{expert_prefix}.gate_up_proj");
-        let down_name = format!("{expert_prefix}.down_proj");
         let experts = B::gated_product_expert_bank(
-            GatedProductExpertBankSpec {
-                expert_count: config.num_experts,
-                input_dimensions: config.hidden_size,
-                intermediate_dimensions: config.moe_intermediate_size,
-                output_dimensions: config.hidden_size,
-                policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-                layout: GatedProductExpertLayout::Packed {
-                    gate_up: ExpertProjectionSpec {
-                        weight: parameter(&gate_up_name)?,
-                        bias: None,
-                        format: config.linear_format(&gate_up_name),
-                    },
-                    down: ExpertProjectionSpec {
-                        weight: parameter(&down_name)?,
-                        bias: None,
-                        format: config.linear_format(&down_name),
-                    },
-                },
-            },
+            expert_bank_spec_at(config, &format!("{prefix}.experts"))?,
             context,
         )?;
         Ok(Self {
@@ -186,6 +165,47 @@ impl<B: RoutedNeuralBackend> SharedRoutedGatedProduct<B> {
             }
         }
     }
+}
+
+/// Returns the architecture-owned routed expert specification for a target or MTP layer.
+pub fn expert_bank_spec(
+    config: &HybridConfig,
+    layer: usize,
+) -> Result<GatedProductExpertBankSpec, Error> {
+    let target = config.num_hidden_layers as usize;
+    let root = if layer < target {
+        format!("model.layers.{layer}.mlp.experts")
+    } else {
+        format!("mtp.layers.{}.mlp.experts", layer - target)
+    };
+    expert_bank_spec_at(config, &root)
+}
+
+fn expert_bank_spec_at(
+    config: &HybridConfig,
+    expert_prefix: &str,
+) -> Result<GatedProductExpertBankSpec, Error> {
+    let gate_up_name = format!("{expert_prefix}.gate_up_proj");
+    let down_name = format!("{expert_prefix}.down_proj");
+    Ok(GatedProductExpertBankSpec {
+        expert_count: config.num_experts,
+        input_dimensions: config.hidden_size,
+        intermediate_dimensions: config.moe_intermediate_size,
+        output_dimensions: config.hidden_size,
+        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
+        layout: GatedProductExpertLayout::Packed {
+            gate_up: ExpertProjectionSpec {
+                weight: parameter(&gate_up_name)?,
+                bias: None,
+                format: config.linear_format(&gate_up_name),
+            },
+            down: ExpertProjectionSpec {
+                weight: parameter(&down_name)?,
+                bias: None,
+                format: config.linear_format(&down_name),
+            },
+        },
+    })
 }
 
 /// Dense or routed/shared-expert feed-forward policy selected by configuration.

@@ -17155,7 +17155,7 @@ fn execute_pipeline_cached_neutral_deepseek_v3(
     stream: &Stream,
 ) -> Result<Array, Error> {
     execute_pipeline_cached_neutral_deepseek(
-        crate::composition::deepseek_expert::v3_spec(args, global_layer),
+        crate::composition::deepseek_expert::v3_spec(args, global_layer)?,
         global_layer,
         hidden,
         expert_ids,
@@ -17184,7 +17184,7 @@ fn execute_pipeline_cached_neutral_deepseek_v4(
     stream: &Stream,
 ) -> Result<Array, Error> {
     execute_pipeline_cached_neutral_deepseek(
-        crate::composition::deepseek_expert::v4_spec(args, global_layer),
+        crate::composition::deepseek_expert::v4_spec(args, global_layer)?,
         global_layer,
         hidden,
         expert_ids,
@@ -17200,7 +17200,7 @@ fn execute_pipeline_cached_neutral_deepseek_v4(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_neutral_deepseek(
-    spec: crate::backend::mlx::runtime::residency::expert_provider::CachedGatedProductBankSpec,
+    spec: eredu_nn::GatedProductExpertBankSpec,
     global_layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -17217,7 +17217,7 @@ fn execute_pipeline_cached_neutral_deepseek(
                    stream: &Stream| {
         crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
             cache,
-            spec,
+            &spec,
             global_layer,
             &routes.hidden,
             &routes.global_expert_ids,
@@ -17308,12 +17308,12 @@ fn execute_pipeline_cached_neutral_qwen_hybrid(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let spec = crate::composition::qwen::hybrid::cached_expert_spec(args, global_layer);
+    let spec = eredu_architectures::qwen::hybrid::expert_bank_spec(args, global_layer)?;
     let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
             cache,
-            spec,
+            &spec,
             global_layer,
             &routes.hidden,
             &routes.global_expert_ids,
