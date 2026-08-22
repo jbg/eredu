@@ -4,7 +4,6 @@ pub mod artifact;
 pub mod automatic;
 mod capability;
 pub mod distributed;
-mod family;
 mod inspection;
 pub mod loading;
 mod model;
@@ -17,9 +16,6 @@ pub mod speculative;
 pub mod structural;
 
 pub use capability::available_memory;
-#[cfg(any(test, feature = "test-support"))]
-pub use family::ResolvedModelConfig;
-pub use family::{resolve_model_config, ModelConfigResolutionError};
 pub use inspection::{inspect_model, MlxInspectionOptions};
 pub use loading::{gguf_eos_token_ids, validate_gguf_quantization_source};
 pub use model::{Model, ModelCache};

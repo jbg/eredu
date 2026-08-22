@@ -259,32 +259,13 @@ impl ModelProcessor {
 
 /// Loads a supported media processor without loading model weights.
 pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcessor>, Error> {
-    #[derive(serde::Deserialize)]
-    struct Metadata {
-        model_type: String,
-        #[serde(default)]
-        text_config: Option<TextMetadata>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct TextMetadata {
-        #[serde(default)]
-        model_type: Option<String>,
-    }
-
     let model_dir = model_dir.as_ref();
-    let metadata: Metadata = serde_json::from_slice(&fs::read(model_dir.join("config.json"))?)?;
-    let effective_type = metadata
-        .text_config
-        .as_ref()
-        .and_then(|text| text.model_type.as_deref())
-        .unwrap_or(&metadata.model_type);
-    match effective_type {
-        "inkling_mm_model" => ModelProcessor::load_inkling(model_dir),
-        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
-            ModelProcessor::load_gemma4(model_dir)
-        }
-        "muse_glimmer" | "muse_glimmer_text" => {
+    let config = serde_json::from_slice(&fs::read(model_dir.join("config.json"))?)?;
+    let configuration = eredu_architectures::configuration::resolve_model_configuration(&config)?;
+    match configuration.kind {
+        eredu_core::ModelKind::Inkling => ModelProcessor::load_inkling(model_dir),
+        eredu_core::ModelKind::Gemma4 => ModelProcessor::load_gemma4(model_dir),
+        eredu_core::ModelKind::MuseGlimmer => {
             #[cfg(feature = "image")]
             {
                 ModelProcessor::load_muse_glimmer(model_dir)
@@ -294,8 +275,9 @@ pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcess
                 Ok(None)
             }
         }
-        "qwen3_vl" | "qwen3_vl_text" | "qwen3_vl_moe" | "qwen3_vl_moe_text" | "qwen3_5"
-        | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
+        eredu_core::ModelKind::Qwen3Vl
+        | eredu_core::ModelKind::Qwen3VlMoe
+        | eredu_core::ModelKind::Qwen35 => {
             #[cfg(feature = "image")]
             {
                 ModelProcessor::load_qwen(model_dir)

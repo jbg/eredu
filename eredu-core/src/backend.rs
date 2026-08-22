@@ -6,7 +6,7 @@ use std::{fmt::Debug, path::Path};
 use crate::{
     artifact::{
         inspect_artifact, plan_model_preparation, ArtifactError, ArtifactInspection,
-        ModelPreparationPlan, PreparationPolicy,
+        ModelConfigurationResolver, ModelPreparationPlan, PreparationPolicy,
     },
     capability::{
         CapabilityError, InputTokenCount, ModelCapabilities, RuntimeStateEstimate,
@@ -287,6 +287,12 @@ pub trait ModelLoadingBackend: BackendProvider {
     /// Backend load policy exposed to a generic caller.
     type LoadOptions;
 
+    /// Architecture registry selected by this backend adapter.
+    type ConfigurationResolver: ModelConfigurationResolver;
+
+    /// Returns the architecture-owned model configuration registry.
+    fn configuration_resolver(&self) -> &Self::ConfigurationResolver;
+
     /// Resolves backend options into the policy used during neutral planning.
     fn preparation_policy(
         &self,
@@ -334,7 +340,7 @@ pub fn load_model<B: ModelLoadingBackend>(
     artifact: impl AsRef<Path>,
     options: B::LoadOptions,
 ) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
-    let inspection = inspect_artifact(artifact)?;
+    let inspection = inspect_artifact(artifact, backend.configuration_resolver())?;
     prepare_inspected_model(backend, inspection, options)
 }
 
@@ -1118,6 +1124,26 @@ mod tests {
     struct LoadingMock;
     struct LoadingMockSession;
 
+    struct LoadingConfigurationResolver;
+
+    impl ModelConfigurationResolver for LoadingConfigurationResolver {
+        fn resolve(
+            &self,
+            json: &serde_json::Value,
+        ) -> Result<crate::ModelConfiguration, ArtifactError> {
+            Ok(crate::ModelConfiguration {
+                declared_model_type: "llama".into(),
+                effective_model_type: "llama".into(),
+                kind: crate::ModelKind::Llama,
+                json: Some(json.clone()),
+                gguf_architecture: None,
+            })
+        }
+    }
+
+    static LOADING_CONFIGURATION_RESOLVER: LoadingConfigurationResolver =
+        LoadingConfigurationResolver;
+
     impl BackendProvider for LoadingMock {
         type ModelConfig = (ModelPreparationPlan, u32);
         type Model = u32;
@@ -1200,6 +1226,11 @@ mod tests {
 
     impl ModelLoadingBackend for LoadingMock {
         type LoadOptions = u32;
+        type ConfigurationResolver = LoadingConfigurationResolver;
+
+        fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
+            &LOADING_CONFIGURATION_RESOLVER
+        }
 
         fn preparation_policy(
             &self,

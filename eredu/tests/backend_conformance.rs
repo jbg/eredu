@@ -452,6 +452,11 @@ impl ModelCapabilityBackend for MockBackend {
 
 impl ModelLoadingBackend for MockBackend {
     type LoadOptions = ();
+    type ConfigurationResolver = eredu_architectures::configuration::ModelConfigurations;
+
+    fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
+        &eredu_architectures::configuration::MODEL_CONFIGURATIONS
+    }
 
     fn preparation_policy(
         &self,

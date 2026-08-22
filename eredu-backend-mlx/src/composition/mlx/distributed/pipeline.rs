@@ -13590,7 +13590,8 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
             ]
         }
     });
-    let resolved = eredu_core::resolve_model_configuration(&config).unwrap();
+    let resolved =
+        eredu_architectures::configuration::resolve_model_configuration(&config).unwrap();
     assert_eq!(resolved.effective_model_type, "qwen3_5_moe");
     let capabilities =
         eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config).unwrap();
@@ -13614,7 +13615,8 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
 
     config["text_config"]["model_type"] = serde_json::json!("qwen3_5_text");
     config["text_config"]["intermediate_size"] = serde_json::json!(48);
-    let resolved = eredu_core::resolve_model_configuration(&config).unwrap();
+    let resolved =
+        eredu_architectures::configuration::resolve_model_configuration(&config).unwrap();
     assert_eq!(resolved.effective_model_type, "qwen3_5_text");
     let capabilities =
         eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config).unwrap();
@@ -14016,7 +14018,7 @@ pub fn load_pipeline_model_with_options(
 
     let config: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
-    let resolved = eredu_core::resolve_model_configuration(&config)?;
+    let resolved = eredu_architectures::configuration::resolve_model_configuration(&config)?;
     if resolved.kind.requires_realtime_loader() {
         return Err(Error::UnsupportedArchitecture(
             "Moshi-family models use a realtime multi-stream temporal/depth contract, not the decoder pipeline"
@@ -14033,10 +14035,9 @@ pub fn load_pipeline_model_with_options(
         "SafeTensors",
         &resolved.effective_model_type,
     )?;
-    let model_type = resolved.effective_model_type.as_str();
     let store = open_safetensors_weight_store(model_dir, max_mapped_shards)?;
-    match model_type {
-        "llama" | "mistral" => {
+    match resolved.kind {
+        ModelKind::Llama => {
             let config = std::fs::File::open(model_dir.join("config.json"))?;
             let args = eredu_architectures::llama::model_args_from_config_reader(config)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -14050,10 +14051,9 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        "deepseek_v3" => {
-            let value: serde_json::Value = serde_json::from_reader(std::fs::File::open(
-                model_dir.join("config.json"),
-            )?)?;
+        ModelKind::DeepSeekV3 => {
+            let value: serde_json::Value =
+                serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
             let args = eredu_architectures::deepseek::parse_v3_config(&value)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let plan = eredu_architectures::deepseek::v3_safetensors_plan(&args, true)
@@ -14070,10 +14070,9 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        "deepseek_v4" => {
-            let value: serde_json::Value = serde_json::from_reader(std::fs::File::open(
-                model_dir.join("config.json"),
-            )?)?;
+        ModelKind::DeepSeekV4 => {
+            let value: serde_json::Value =
+                serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
             let args = eredu_architectures::deepseek::parse_v4_config(&value)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let plan = eredu_architectures::deepseek::v4_safetensors_plan(&args)
@@ -14090,7 +14089,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
+        ModelKind::Gemma4 => {
             let args = crate::composition::gemma4::load_pipeline_config(model_dir)?;
             let store = crate::composition::gemma4::resolve_pipeline_store(store, &args)?;
             load_neutral_gemma4_pipeline(
@@ -14104,7 +14103,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        "qwen2" | "qwen3" | "qwen3_moe" => {
+        ModelKind::Qwen2 | ModelKind::Qwen3 => {
             let args = crate::composition::qwen::load_model_args(model_dir)?;
             load_qwen_pipeline(
                 args,
@@ -14117,7 +14116,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        "muse_glimmer" | "muse_glimmer_text" => {
+        ModelKind::MuseGlimmer => {
             let args = crate::composition::muse_glimmer::load_pipeline_config(model_dir)?;
             load_muse_glimmer_pipeline(
                 args,
@@ -14130,10 +14129,9 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        "qwen3_vl" | "qwen3_vl_text" | "qwen3_vl_moe" | "qwen3_vl_moe_text" => {
-            let value: serde_json::Value = serde_json::from_reader(std::fs::File::open(
-                model_dir.join("config.json"),
-            )?)?;
+        ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
+            let value: serde_json::Value =
+                serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
             let args = eredu_architectures::qwen::vl::model_args_from_config_value(&value)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             load_neutral_qwen_vl_pipeline(
@@ -14147,43 +14145,37 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        "gpt_oss" => {
-            load_gpt_oss_pipeline(
-                neutral_gpt_oss::load_model_args(model_dir)?,
-                store,
-                topology,
-                options.quantization,
-                dense_stream,
-                expert_cache,
-                stream,
-                weights_stream,
-            )
-        }
-        "lfm2" | "lfm2_moe" => {
-            load_lfm2_pipeline(
-                crate::composition::lfm2::load_model_args(model_dir)?,
-                store,
-                topology,
-                options.quantization,
-                dense_stream,
-                expert_cache,
-                stream,
-                weights_stream,
-            )
-        }
-        "nemotron_h" => {
-            load_nemotron_h_pipeline(
-                crate::composition::nemotron_h::load_model_args(model_dir)?,
-                store,
-                topology,
-                options.quantization,
-                dense_stream,
-                expert_cache,
-                stream,
-                weights_stream,
-            )
-        }
-        "qwen3_next" => {
+        ModelKind::GptOss => load_gpt_oss_pipeline(
+            neutral_gpt_oss::load_model_args(model_dir)?,
+            store,
+            topology,
+            options.quantization,
+            dense_stream,
+            expert_cache,
+            stream,
+            weights_stream,
+        ),
+        ModelKind::Lfm2 => load_lfm2_pipeline(
+            crate::composition::lfm2::load_model_args(model_dir)?,
+            store,
+            topology,
+            options.quantization,
+            dense_stream,
+            expert_cache,
+            stream,
+            weights_stream,
+        ),
+        ModelKind::NemotronH => load_nemotron_h_pipeline(
+            crate::composition::nemotron_h::load_model_args(model_dir)?,
+            store,
+            topology,
+            options.quantization,
+            dense_stream,
+            expert_cache,
+            stream,
+            weights_stream,
+        ),
+        ModelKind::Qwen3Next => {
             let parsed = crate::composition::qwen::hybrid::load_parsed_config(model_dir)?;
             load_neutral_qwen_hybrid_pipeline(
                 parsed.text,
@@ -14196,7 +14188,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
+        ModelKind::Qwen35 => {
             let parsed = crate::composition::qwen::hybrid::load_parsed_config(model_dir)?;
             if parsed.vision.is_none() {
                 load_neutral_qwen_hybrid_pipeline(
@@ -14222,22 +14214,20 @@ pub fn load_pipeline_model_with_options(
                 )
             }
         }
-        "kimi_linear" => {
-            load_kimi_linear_pipeline(
-                eredu_architectures::kimi_linear::model_args_from_config_reader(
-                    std::fs::File::open(model_dir.join("config.json"))?,
-                )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-                store,
-                topology,
-                options.quantization,
-                dense_stream,
-                expert_cache,
-                stream,
-                weights_stream,
-            )
-        }
-        "inkling_mm_model" => {
+        ModelKind::KimiLinear => load_kimi_linear_pipeline(
+            eredu_architectures::kimi_linear::model_args_from_config_reader(std::fs::File::open(
+                model_dir.join("config.json"),
+            )?)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            store,
+            topology,
+            options.quantization,
+            dense_stream,
+            expert_cache,
+            stream,
+            weights_stream,
+        ),
+        ModelKind::Inkling => {
             let args = crate::composition::inkling::load_pipeline_config(model_dir)?;
             let store = crate::composition::inkling::resolve_pipeline_store(store, &args)?;
             load_neutral_inkling_pipeline(
@@ -14251,9 +14241,9 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        model_type => Err(Error::UnsupportedArchitecture(format!(
-            "pipeline execution supports Llama-compatible, DeepSeek-V3/R1, Gemma 4, Qwen2/Qwen3/Qwen3-MoE, Qwen3-VL/Qwen3-VL-MoE, GPT-OSS, LFM2/LFM2-MoE, Nemotron-H, Kimi Linear, Qwen3-Next/Qwen3.5 text, and Inkling models, not {model_type}"
-        ))),
+        ModelKind::Moshi => Err(Error::UnsupportedArchitecture(
+            "Moshi-family models do not use the decoder pipeline".into(),
+        )),
     }
 }
 

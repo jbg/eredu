@@ -35,8 +35,8 @@ remains available only from its owning implementation crate.
 
 Portable crates split tensor-independent ownership by responsibility:
 
-- artifact identity, header inspection, model-family resolution, tensor
-  catalogs, and preparation plans;
+- artifact identity, header inspection, the model-configuration resolver
+  contract, tensor catalogs, and preparation plans;
 - validated attention schedules and parallel topologies;
 - model capabilities, resource requirements, admission decisions, execution
   plans, and telemetry schemas;
@@ -62,6 +62,15 @@ parameter topology, module construction, state geometry, parallel semantic
 plans, and the complete embedding/layer/output lifecycle. Architecture code is
 generic over `NeuralBackend` and passes backend-native tensor handles through
 unchanged.
+
+The architecture configuration registry is the sole owner of Hugging Face
+family aliases, nested-wrapper normalization, assistant-family identity, and
+the exhaustive dispatch to family parsers. `eredu-core` accepts that registry
+through `ModelConfigurationResolver` while inspecting SafeTensors artifacts;
+it does not recognize family strings. Facades and concrete backend adapters
+select the shared `eredu-architectures` registry. Backend composition consumes
+the resolved `ModelKind` and architecture parser outputs, never a second raw
+`model_type` dispatch table.
 
 Architecture checkpoint modules also own canonical name translation and the
 complete derived-weight recipe catalogs for static modules, execution units,

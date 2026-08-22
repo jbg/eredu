@@ -119,21 +119,22 @@ impl MlxDrafter {
         } else {
             let config: serde_json::Value =
                 serde_json::from_reader(std::fs::File::open(source.join("config.json"))?)?;
-            match config
-                .get("model_type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-            {
-                "muse_glimmer_assistant" => MlxDrafterModel::MuseGlimmerDFlash(Box::new(
-                    load_dflash_safetensors(source, options, stream, weights_stream)?,
-                )),
-                "gemma4_assistant" => MlxDrafterModel::Gemma4(Box::new(
-                    load_assistant_safetensors(source, options, stream, weights_stream)?,
-                )),
-                other => {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "unsupported safetensors drafter model_type {other:?}"
-                    )))
+            match eredu_architectures::configuration::resolve_assistant_model_kind(&config)? {
+                eredu_architectures::configuration::AssistantModelKind::MuseGlimmer => {
+                    MlxDrafterModel::MuseGlimmerDFlash(Box::new(load_dflash_safetensors(
+                        source,
+                        options,
+                        stream,
+                        weights_stream,
+                    )?))
+                }
+                eredu_architectures::configuration::AssistantModelKind::Gemma4 => {
+                    MlxDrafterModel::Gemma4(Box::new(load_assistant_safetensors(
+                        source,
+                        options,
+                        stream,
+                        weights_stream,
+                    )?))
                 }
             }
         };

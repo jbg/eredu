@@ -2228,7 +2228,7 @@ pub fn open_pipeline_gguf_store(
         .filter_map(|token| u32::try_from(token).ok())
         .collect::<std::collections::BTreeSet<_>>();
         eredu_architectures::gemma4::Gemma4ArtifactConfig {
-            unified: args.model_type == "gemma4_unified",
+            unified: args.is_unified(),
             hidden_size: args.text.hidden_size as usize,
             image_token_id: args.image_token_id.and_then(|token| token.try_into().ok()),
             video_token_id: args.video_token_id.and_then(|token| token.try_into().ok()),

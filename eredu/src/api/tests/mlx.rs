@@ -1,6 +1,9 @@
 use eredu_checkpoint::AffineQuantization;
 
-use eredu_architectures::kimi_linear;
+use eredu_architectures::{
+    configuration::{resolve_model_config, ResolvedModelConfig},
+    kimi_linear,
+};
 use eredu_backend_mlx::MlxTensor;
 use eredu_checkpoint::WeightQuantization;
 
@@ -26,9 +29,7 @@ use eredu_backend_mlx::{
     backend::mlx::runtime::generation::sampler::{ConstrainedSampler, DefaultSampler},
     backend::mlx::runtime::media::input,
     backend::mlx::ModelLoadOptions,
-    composition::mlx::{
-        resolve_model_config, validate_gguf_quantization_source, Model, ResolvedModelConfig,
-    },
+    composition::mlx::{validate_gguf_quantization_source, Model},
 };
 use eredu_gguf::{GgmlType, MetadataValue as GgufWriterMetadata, TensorInput, Writer};
 use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized};
@@ -3435,7 +3436,7 @@ fn resolve_model_config_reports_qwen3_5_moe_missing_text_config() {
     assert!(!support.is_ok());
     assert_eq!(
         support.unwrap_err().to_string(),
-        "unsupported model architecture: qwen3_5_moe config is missing text_config"
+        "invalid model artifact: invalid qwen3_5 configuration: qwen3_5_moe config is missing text_config"
     );
 }
 

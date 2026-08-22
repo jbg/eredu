@@ -133,7 +133,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
     };
 
     if let Some(config) = &config {
-        match crate::composition::mlx::resolve_model_config(config) {
+        match eredu_architectures::configuration::resolve_model_config(config) {
             Ok(supported) => {
                 report.model_kind = Some(supported.kind);
                 report.architecture = Some(supported.effective_model_type);
@@ -172,9 +172,9 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
             }
             Err(error) => {
                 report.architecture_support = match &error {
-                    crate::composition::mlx::ModelConfigResolutionError::Loader(
-                        Error::UnsupportedModelType(_),
-                    ) => InspectionReadiness::Unsupported,
+                    eredu_core::artifact::ArtifactError::UnsupportedModelType(_) => {
+                        InspectionReadiness::Unsupported
+                    }
                     _ => InspectionReadiness::Invalid,
                 };
                 report.model_loadability = report.architecture_support;
@@ -182,9 +182,9 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
                 report.requested_load = report.model_loadability;
                 report.issue(
                     match &error {
-                        crate::composition::mlx::ModelConfigResolutionError::Loader(
-                            Error::UnsupportedModelType(_),
-                        ) => InspectionIssueCode::UnsupportedArchitecture,
+                        eredu_core::artifact::ArtifactError::UnsupportedModelType(_) => {
+                            InspectionIssueCode::UnsupportedArchitecture
+                        }
                         _ => InspectionIssueCode::InvalidConfiguration,
                     },
                     InspectionSeverity::Error,
@@ -313,7 +313,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
 
 fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionReport {
     let mut report = ModelInspectionReport::unverified(path, ArtifactFormat::Gguf);
-    let portable = match eredu_core::inspect_artifact(path) {
+    let portable = match eredu_architectures::configuration::inspect_artifact(path) {
         Ok(inspection) => inspection,
         Err(error) => {
             reject_portable_gguf(&mut report, path, &error);

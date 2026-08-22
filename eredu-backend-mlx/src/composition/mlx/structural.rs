@@ -60,7 +60,7 @@ pub(crate) fn admit_gguf_path(
     path: &Path,
     options: ModelLoadOptions,
 ) -> Result<AdmittedGguf, Error> {
-    let inspection = eredu_core::inspect_artifact(path)?;
+    let inspection = eredu_architectures::configuration::inspect_artifact(path)?;
     let validated = inspection.validated_gguf().ok_or_else(|| {
         Error::UnsupportedArchitecture("GGUF admission received a non-GGUF artifact".into())
     })?;
@@ -571,7 +571,7 @@ fn validate_neutral_lfm2_gguf(
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    let is_moe = args.model_type == "lfm2_moe";
+    let is_moe = args.has_sparse_moe_layers();
     if let Err(error) = checkpoint.catalog().translated_outputs(|name| {
         eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe)
     }) {

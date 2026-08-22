@@ -79,6 +79,11 @@ pub struct FamilyConfig {
 }
 
 impl FamilyConfig {
+    /// Whether this configuration uses the unified multimodal family identity.
+    pub fn is_unified(&self) -> bool {
+        self.model_type == "gemma4_unified"
+    }
+
     /// Returns the input modalities admitted by this exact family variant.
     pub const fn input_modalities(&self) -> InputModalities {
         InputModalities {

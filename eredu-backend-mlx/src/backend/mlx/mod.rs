@@ -311,6 +311,11 @@ impl<'a> BackendProvider for MlxBackend<'a> {
 
 impl ModelLoadingBackend for MlxBackend<'_> {
     type LoadOptions = ModelLoadOptions;
+    type ConfigurationResolver = eredu_architectures::configuration::ModelConfigurations;
+
+    fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
+        &eredu_architectures::configuration::MODEL_CONFIGURATIONS
+    }
 
     fn preparation_policy(
         &self,

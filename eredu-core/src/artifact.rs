@@ -76,30 +76,6 @@ impl ModelKind {
         Self::Qwen35,
     ];
 
-    /// Resolves a Hugging Face `model_type` without consulting a backend.
-    pub fn from_model_type(model_type: &str) -> Result<Self, ArtifactError> {
-        match model_type {
-            "deepseek_v3" => Ok(Self::DeepSeekV3),
-            "deepseek_v4" => Ok(Self::DeepSeekV4),
-            "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
-            "gpt_oss" => Ok(Self::GptOss),
-            "inkling_mm_model" => Ok(Self::Inkling),
-            "kimi_linear" => Ok(Self::KimiLinear),
-            "llama" | "mistral" => Ok(Self::Llama),
-            "muse_glimmer" | "muse_glimmer_text" => Ok(Self::MuseGlimmer),
-            "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
-            "nemotron_h" => Ok(Self::NemotronH),
-            "moshi" | "personaplex" => Ok(Self::Moshi),
-            "qwen2" => Ok(Self::Qwen2),
-            "qwen3" | "qwen3_moe" => Ok(Self::Qwen3),
-            "qwen3_next" => Ok(Self::Qwen3Next),
-            "qwen3_vl" | "qwen3_vl_text" => Ok(Self::Qwen3Vl),
-            "qwen3_vl_moe" | "qwen3_vl_moe_text" => Ok(Self::Qwen3VlMoe),
-            "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35),
-            other => Err(ArtifactError::UnsupportedModelType(other.into())),
-        }
-    }
-
     /// Stable diagnostic name for this family.
     pub const fn model_type_name(self) -> &'static str {
         match self {
@@ -286,18 +262,13 @@ pub struct ModelConfiguration {
     pub gguf_architecture: Option<GgufArchitecture>,
 }
 
-/// Resolves portable Hugging Face model identity from a raw `config.json` value.
-pub fn resolve_model_configuration(json: &Value) -> Result<ModelConfiguration, ArtifactError> {
-    let metadata: ConfigMetadata = serde_json::from_value(json.clone())?;
-    let effective_model_type = effective_model_type(&metadata);
-    let kind = ModelKind::from_model_type(&effective_model_type)?;
-    Ok(ModelConfiguration {
-        declared_model_type: metadata.model_type,
-        effective_model_type,
-        kind,
-        json: Some(json.clone()),
-        gguf_architecture: None,
-    })
+/// Architecture-owned resolver used by neutral artifact inspection.
+///
+/// Core owns the transport contract but deliberately does not recognize model
+/// family aliases or nested configuration wrappers.
+pub trait ModelConfigurationResolver {
+    /// Resolves one Hugging Face `config.json` value to its canonical family.
+    fn resolve(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError>;
 }
 
 /// Parses an optional GGUF integer metadata value as lossless `u32` values.
@@ -493,12 +464,15 @@ pub enum ModelArtifact {
 }
 
 /// Inspect a local artifact without loading tensor payloads.
-pub fn inspect_artifact(path: impl AsRef<Path>) -> Result<ArtifactInspection, ArtifactError> {
+pub fn inspect_artifact(
+    path: impl AsRef<Path>,
+    resolver: &impl ModelConfigurationResolver,
+) -> Result<ArtifactInspection, ArtifactError> {
     let path = path.as_ref();
     if is_gguf(path) {
         inspect_gguf(path)
     } else if path.is_dir() {
-        inspect_safetensors(path)
+        inspect_safetensors(path, resolver)
     } else if !path.exists() {
         Err(ArtifactError::MissingArtifact(path.to_path_buf()))
     } else {
@@ -654,47 +628,13 @@ fn validate_gguf_floor(
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct ConfigMetadata {
-    model_type: String,
-    #[serde(default)]
-    text_config: Option<TextConfigMetadata>,
-}
-
-#[derive(Deserialize)]
-struct TextConfigMetadata {
-    #[serde(default)]
-    model_type: Option<String>,
-}
-
-fn effective_model_type(metadata: &ConfigMetadata) -> String {
-    if metadata.model_type == "inkling_mm_model" {
-        return metadata.model_type.clone();
-    }
-    if matches!(
-        metadata.model_type.as_str(),
-        "gemma4" | "gemma4_unified" | "qwen3_vl" | "qwen3_vl_moe" | "qwen3_5" | "qwen3_5_moe"
-    ) {
-        metadata
-            .text_config
-            .as_ref()
-            .and_then(|text| text.model_type.clone())
-            .unwrap_or_else(|| metadata.model_type.clone())
-    } else if ModelKind::from_model_type(&metadata.model_type).is_ok() {
-        metadata.model_type.clone()
-    } else {
-        metadata
-            .text_config
-            .as_ref()
-            .and_then(|text| text.model_type.clone())
-            .unwrap_or_else(|| metadata.model_type.clone())
-    }
-}
-
-fn inspect_safetensors(path: &Path) -> Result<ArtifactInspection, ArtifactError> {
+fn inspect_safetensors(
+    path: &Path,
+    resolver: &impl ModelConfigurationResolver,
+) -> Result<ArtifactInspection, ArtifactError> {
     let config_path = path.join("config.json");
     let json: Value = serde_json::from_reader(File::open(&config_path)?)?;
-    let configuration = resolve_model_configuration(&json)?;
+    let configuration = resolver.resolve(&json)?;
     let shards = safetensors_shards(path)?;
     let mut descriptors = Vec::new();
     let mut names = BTreeSet::new();
@@ -909,6 +849,29 @@ mod tests {
     use eredu_gguf::{GgmlType, MetadataArray, TensorInput, Writer};
     use std::io::Write;
 
+    struct FixtureResolver;
+
+    impl ModelConfigurationResolver for FixtureResolver {
+        fn resolve(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError> {
+            let model_type = json
+                .get("model_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ArtifactError::InvalidArtifact("missing model_type".into()))?;
+            let kind = match model_type {
+                "llama" => ModelKind::Llama,
+                "gemma4" => ModelKind::Gemma4,
+                other => return Err(ArtifactError::UnsupportedModelType(other.into())),
+            };
+            Ok(ModelConfiguration {
+                declared_model_type: model_type.into(),
+                effective_model_type: model_type.into(),
+                kind,
+                json: Some(json.clone()),
+                gguf_architecture: None,
+            })
+        }
+    }
+
     fn write_safetensors_fixture(root: &Path, model_type: &str) {
         std::fs::write(
             root.join("config.json"),
@@ -925,28 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn model_configuration_resolution_is_portable_and_nested() {
-        let json = serde_json::json!({
-            "model_type": "qwen3_5",
-            "text_config": { "model_type": "qwen3_5_moe" }
-        });
-        let resolved = resolve_model_configuration(&json).unwrap();
-        assert_eq!(resolved.kind, ModelKind::Qwen35);
-        assert_eq!(resolved.declared_model_type, "qwen3_5");
-        assert_eq!(resolved.effective_model_type, "qwen3_5_moe");
-        assert_eq!(resolved.json.as_ref(), Some(&json));
-    }
-
-    #[test]
-    fn moshi_family_identity_covers_native_and_personaplex_metadata() {
-        assert_eq!(
-            ModelKind::from_model_type("moshi").unwrap(),
-            ModelKind::Moshi
-        );
-        assert_eq!(
-            ModelKind::from_model_type("personaplex").unwrap(),
-            ModelKind::Moshi
-        );
+    fn model_kind_retains_only_backend_neutral_runtime_policy() {
         assert!(ModelKind::Moshi.requires_realtime_loader());
         assert_eq!(
             serde_json::to_value(ModelKind::Moshi).unwrap(),
@@ -983,7 +925,7 @@ mod tests {
     fn safetensors_inspection_and_planning_are_backend_neutral() {
         let root = tempfile::tempdir().unwrap();
         write_safetensors_fixture(root.path(), "llama");
-        let inspection = inspect_artifact(root.path()).unwrap();
+        let inspection = inspect_artifact(root.path(), &FixtureResolver).unwrap();
         assert_eq!(inspection.configuration().kind, ModelKind::Llama);
         assert_eq!(inspection.tensors().len(), 1);
         let plan = plan_model_preparation(inspection, PreparationPolicy::default()).unwrap();
@@ -1009,7 +951,7 @@ mod tests {
         file.write_all(header).unwrap();
         file.write_all(&0.0_f32.to_le_bytes()).unwrap();
 
-        let inspection = inspect_artifact(root.path()).unwrap();
+        let inspection = inspect_artifact(root.path(), &FixtureResolver).unwrap();
         assert_eq!(
             inspection.tensors().get("clip.output_max").unwrap().shape,
             Vec::<usize>::new()
@@ -1025,7 +967,11 @@ mod tests {
             ..PreparationPolicy::default()
         };
 
-        let plan = plan_model_preparation(inspect_artifact(root.path()).unwrap(), policy).unwrap();
+        let plan = plan_model_preparation(
+            inspect_artifact(root.path(), &FixtureResolver).unwrap(),
+            policy,
+        )
+        .unwrap();
 
         assert_eq!(plan.policy(), policy);
         assert_eq!(plan.route(), MaterializationRoute::Resident);
@@ -1036,7 +982,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_safetensors_fixture(root.path(), "llama");
         let plan = plan_model_preparation(
-            inspect_artifact(root.path()).unwrap(),
+            inspect_artifact(root.path(), &FixtureResolver).unwrap(),
             PreparationPolicy {
                 residency: ResidencyRequest::ExpertCache,
                 ..PreparationPolicy::default()
@@ -1072,7 +1018,7 @@ mod tests {
             )
             .unwrap();
 
-        let inspection = inspect_artifact(&path).unwrap();
+        let inspection = inspect_artifact(&path, &FixtureResolver).unwrap();
         let validated = inspection.validated_gguf().unwrap();
         assert_eq!(validated.architecture(), GgufArchitecture::Llama);
         assert_eq!(validated.checkpoint().physical_tensor_count(), 1);

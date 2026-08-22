@@ -131,7 +131,7 @@ pub(super) fn read_model_configuration(
     let config_path = model_dir.join("config.json");
     let file = std::fs::File::open(config_path)?;
     let json = serde_json::from_reader(file)?;
-    Ok(eredu_core::resolve_model_configuration(&json)?)
+    Ok(eredu_architectures::configuration::resolve_model_configuration(&json)?)
 }
 
 pub(crate) fn is_gguf_file(path: &Path) -> bool {

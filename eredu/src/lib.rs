@@ -22,10 +22,11 @@ pub mod api;
 /// Backend-independent chat and committed-generation orchestration.
 pub mod runtime;
 pub use api::{inspect_text_model, PlannedModelLoadError, TextInspectionOptions};
+pub use eredu_architectures::configuration::inspect_artifact;
 /// Canonical backend-neutral runtime types.
 pub use eredu_core as core;
 pub use eredu_core::artifact::{
-    inspect_artifact, plan_model_preparation, ArtifactFormat, ArtifactInspection, GgufArchitecture,
+    plan_model_preparation, ArtifactFormat, ArtifactInspection, GgufArchitecture,
     MaterializationRoute, ModelArtifact, ModelConfiguration, ModelKind, ModelPreparationPlan,
     PreparationPolicy, QuantizationRequest, ResidencyRequest,
 };

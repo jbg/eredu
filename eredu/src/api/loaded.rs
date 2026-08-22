@@ -543,8 +543,8 @@ where
         F: eredu_core::ExecutionPlanBackendFactory<Backend = B>,
     {
         let artifact = artifact.as_ref();
-        let inspection =
-            eredu_core::inspect_artifact(artifact).map_err(LoadedModelLoadError::Artifact)?;
+        let inspection = eredu_architectures::configuration::inspect_artifact(artifact)
+            .map_err(LoadedModelLoadError::Artifact)?;
         let (tokenizer, config) =
             loaded_text_artifact(&inspection).map_err(LoadedModelLoadError::Metadata)?;
         let target_tokenizer_fingerprint =
@@ -606,7 +606,7 @@ where
         options: B::LoadOptions,
     ) -> Result<Self, LoadedModelLoadError<B::Error>> {
         let artifact = artifact.as_ref();
-        let inspection = eredu_core::inspect_artifact(artifact)?;
+        let inspection = eredu_architectures::configuration::inspect_artifact(artifact)?;
         let (tokenizer, config) = loaded_text_artifact(&inspection)?;
         Self::from_inspected(backend, inspection, options, tokenizer, config)
     }

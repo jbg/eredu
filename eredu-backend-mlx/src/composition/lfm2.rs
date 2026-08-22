@@ -1538,7 +1538,7 @@ pub(crate) fn load_lfm2_gguf_model(
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
     let expert_options = residency.expert_cache();
-    let is_moe = prepared.args.model_type == "lfm2_moe";
+    let is_moe = prepared.args.has_sparse_moe_layers();
     let plan = eredu_architectures::lfm2::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
@@ -1580,7 +1580,7 @@ pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
 ) -> Result<(Lfm2Model, Vec<u32>), Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
-    let is_moe = prepared.args.model_type == "lfm2_moe";
+    let is_moe = prepared.args.has_sparse_moe_layers();
     let plan = eredu_architectures::lfm2::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
