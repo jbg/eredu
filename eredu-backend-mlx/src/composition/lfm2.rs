@@ -287,7 +287,9 @@ impl Lfm2Bindings {
             .map_err(|error| Error::Parallel(error.to_string()))?,
             ParameterRole::ExpertIntermediate,
         );
-        let mut recipes = unit_recipes(store, architecture.args(), index)?;
+        let mut recipes =
+            eredu_architectures::lfm2::unit_recipes(store, architecture.args(), index)
+                .map_err(Error::UnsupportedArchitecture)?;
         if self.external_experts {
             recipes.retain(|name, _| !parameter_name_in_targets(name, &expert_targets));
         }
@@ -422,120 +424,6 @@ fn resolve_store(
     ))
 }
 
-fn expert_source(
-    store: &dyn CheckpointSource,
-    prefix: &str,
-    expert: i32,
-    projections: &[&str],
-) -> Result<DerivedWeightRecipe, Error> {
-    let keys = store.source_keys();
-    let key = projections
-        .iter()
-        .map(|projection| format!("{prefix}.{expert}.{projection}.weight"))
-        .find(|candidate| keys.contains(candidate))
-        .ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
-                "LFM2 checkpoint is missing expert {expert} projection under {prefix}"
-            ))
-        })?;
-    Ok(DerivedWeightRecipe::source(
-        key,
-        eredu_checkpoint::store::TensorSelection::Full,
-    ))
-}
-
-fn unit_recipes(
-    store: &dyn CheckpointSource,
-    args: &ModelArgs,
-    layer: usize,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
-    use eredu_checkpoint::store::TensorSelection;
-
-    let mut recipes = BTreeMap::new();
-    let root = format!("model.layers.{layer}");
-    let conv = format!("{root}.conv.conv.weight");
-    if let Ok(metadata) = store.source_metadata(&conv) {
-        let expected = vec![args.hidden_size as usize, 1, args.conv_l_cache as usize];
-        let recipe = if metadata.logical_shape.len() == 2 {
-            Some(DerivedWeightRecipe::Reshape {
-                input: Box::new(DerivedWeightRecipe::source(&conv, TensorSelection::Full)),
-                shape: expected.clone(),
-            })
-        } else if metadata.logical_shape == [expected[0], expected[2], expected[1]]
-            && metadata.logical_shape != expected
-        {
-            Some(DerivedWeightRecipe::Transpose {
-                input: Box::new(DerivedWeightRecipe::source(&conv, TensorSelection::Full)),
-                axes: vec![0, 2, 1],
-            })
-        } else {
-            None
-        };
-        if let Some(recipe) = recipe {
-            recipes.insert(conv.clone(), recipe);
-        }
-    }
-    let policy = args.layer_policy(layer).ok_or_else(|| {
-        Error::UnsupportedArchitecture(format!("LFM2 has no layer policy {layer}"))
-    })?;
-    if policy.feed_forward != eredu_architectures::lfm2::FeedForwardPolicy::SparseMoe {
-        return Ok(recipes);
-    }
-    let prefix = format!("{root}.feed_forward.experts");
-    let keys = store.source_keys();
-    let gate_up = format!("{prefix}.gate_up_proj");
-    let down = format!("{prefix}.down_proj");
-    if keys.contains(&gate_up) {
-        return Ok(recipes);
-    }
-    if keys.contains(&format!("{prefix}.gate_proj")) && keys.contains(&format!("{prefix}.up_proj"))
-    {
-        recipes.insert(
-            gate_up,
-            DerivedWeightRecipe::Concatenate {
-                axis: 1,
-                inputs: ["gate_proj", "up_proj"]
-                    .into_iter()
-                    .map(|name| {
-                        DerivedWeightRecipe::source(
-                            format!("{prefix}.{name}"),
-                            TensorSelection::Full,
-                        )
-                    })
-                    .collect(),
-            },
-        );
-        return Ok(recipes);
-    }
-    let mut gate_up_inputs = Vec::new();
-    let mut down_inputs = Vec::new();
-    for expert in 0..args.num_experts {
-        gate_up_inputs.push(DerivedWeightRecipe::Concatenate {
-            axis: 0,
-            inputs: vec![
-                expert_source(store, &prefix, expert, &["w1", "gate_proj"])?,
-                expert_source(store, &prefix, expert, &["w3", "up_proj"])?,
-            ],
-        });
-        down_inputs.push(expert_source(store, &prefix, expert, &["w2", "down_proj"])?);
-    }
-    recipes.insert(
-        gate_up,
-        DerivedWeightRecipe::Stack {
-            axis: 0,
-            inputs: gate_up_inputs,
-        },
-    );
-    recipes.insert(
-        down,
-        DerivedWeightRecipe::Stack {
-            axis: 0,
-            inputs: down_inputs,
-        },
-    );
-    Ok(recipes)
-}
-
 fn planned_expert_binding(
     name: impl Into<String>,
     recipe: DerivedWeightRecipe,
@@ -554,139 +442,23 @@ pub fn expert_catalog(
     args: &ModelArgs,
     store: &dyn CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    use eredu_checkpoint::store::TensorSelection;
-
     if !args.has_sparse_moe_layers() {
         return Err(Error::UnsupportedArchitecture(
             "independent expert caching requires LFM2-MoE".into(),
         ));
     }
-    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut entries = Vec::new();
     for (layer, policy) in args.layer_schedule.iter().enumerate() {
         if policy.feed_forward != eredu_architectures::lfm2::FeedForwardPolicy::SparseMoe {
             continue;
         }
-        let prefix = format!("model.layers.{layer}.feed_forward.experts");
-        let packed_gate_up = format!("{prefix}.gate_up_proj");
-        let packed_down = format!("{prefix}.down_proj");
         for expert in 0..args.num_experts as usize {
             let identity = ExpertIdentity::new(layer, expert);
-            let selection = TensorSelection::Range {
-                axis: 0,
-                start: expert,
-                end: expert + 1,
-            };
-            let mut planned = Vec::new();
-            if keys.contains(&packed_gate_up) && keys.contains(&packed_down) {
-                for (name, key) in [
-                    ("gate_up_proj", packed_gate_up.clone()),
-                    ("down_proj", packed_down.clone()),
-                ] {
-                    planned.push(planned_expert_binding(
-                        name,
-                        DerivedWeightRecipe::source(key, selection.clone()),
-                        store,
-                    )?);
-                }
-                for (name, key) in [
-                    ("gate_up_proj_scales", format!("{packed_gate_up}_scales")),
-                    ("gate_up_proj_biases", format!("{packed_gate_up}_biases")),
-                    ("down_proj_scales", format!("{packed_down}_scales")),
-                    ("down_proj_biases", format!("{packed_down}_biases")),
-                ] {
-                    if keys.contains(&key) {
-                        planned.push(planned_expert_binding(
-                            name,
-                            DerivedWeightRecipe::source(key, selection.clone()),
-                            store,
-                        )?);
-                    }
-                }
-            } else if keys.contains(&format!("{prefix}.gate_proj"))
-                && keys.contains(&format!("{prefix}.up_proj"))
-                && keys.contains(&packed_down)
-            {
-                planned.push(planned_expert_binding(
-                    "gate_up_proj",
-                    DerivedWeightRecipe::Concatenate {
-                        axis: 1,
-                        inputs: vec![
-                            DerivedWeightRecipe::source(
-                                format!("{prefix}.gate_proj"),
-                                selection.clone(),
-                            ),
-                            DerivedWeightRecipe::source(
-                                format!("{prefix}.up_proj"),
-                                selection.clone(),
-                            ),
-                        ],
-                    },
-                    store,
-                )?);
-                planned.push(planned_expert_binding(
-                    "down_proj",
-                    DerivedWeightRecipe::source(packed_down.clone(), selection.clone()),
-                    store,
-                )?);
-                for suffix in ["_scales", "_biases"] {
-                    let gate = format!("{prefix}.gate_proj{suffix}");
-                    let up = format!("{prefix}.up_proj{suffix}");
-                    if keys.contains(&gate) && keys.contains(&up) {
-                        planned.push(planned_expert_binding(
-                            format!("gate_up_proj{suffix}"),
-                            DerivedWeightRecipe::Concatenate {
-                                axis: 1,
-                                inputs: vec![
-                                    DerivedWeightRecipe::source(gate, selection.clone()),
-                                    DerivedWeightRecipe::source(up, selection.clone()),
-                                ],
-                            },
-                            store,
-                        )?);
-                    }
-                    let down = format!("{packed_down}{suffix}");
-                    if keys.contains(&down) {
-                        planned.push(planned_expert_binding(
-                            format!("down_proj{suffix}"),
-                            DerivedWeightRecipe::source(down, selection.clone()),
-                            store,
-                        )?);
-                    }
-                }
-            } else {
-                if args.weight_quantization_for(&packed_gate_up).is_some()
-                    || args.weight_quantization_for(&packed_down).is_some()
-                {
-                    return Err(Error::Quantization(
-                        "split LFM2 experts cannot be lazily load-time quantized".into(),
-                    ));
-                }
-                let gate = expert_source(store, &prefix, expert as i32, &["w1", "gate_proj"])?;
-                let up = expert_source(store, &prefix, expert as i32, &["w3", "up_proj"])?;
-                let down = expert_source(store, &prefix, expert as i32, &["w2", "down_proj"])?;
-                planned.extend([
-                    planned_expert_binding(
-                        "gate_up_proj",
-                        DerivedWeightRecipe::Stack {
-                            axis: 0,
-                            inputs: vec![DerivedWeightRecipe::Concatenate {
-                                axis: 0,
-                                inputs: vec![gate, up],
-                            }],
-                        },
-                        store,
-                    )?,
-                    planned_expert_binding(
-                        "down_proj",
-                        DerivedWeightRecipe::Stack {
-                            axis: 0,
-                            inputs: vec![down],
-                        },
-                        store,
-                    )?,
-                ]);
-            }
+            let planned = eredu_architectures::lfm2::expert_recipes(store, args, layer, expert)
+                .map_err(Error::UnsupportedArchitecture)?
+                .into_iter()
+                .map(|(name, recipe)| planned_expert_binding(name, recipe, store))
+                .collect::<Result<Vec<_>, _>>()?;
             let bindings = BindingPlan::new(planned)
                 .and_then(|plan| plan.build_bindings(store))
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -772,7 +544,8 @@ fn load_neutral(
                 if external_experts {
                     BTreeMap::new()
                 } else {
-                    unit_recipes(store, &binding_args, index)?
+                    eredu_architectures::lfm2::unit_recipes(store, &binding_args, index)
+                        .map_err(Error::UnsupportedArchitecture)?
                 },
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )
@@ -873,7 +646,8 @@ fn load_neutral_parallel(
             if external_experts {
                 BTreeMap::new()
             } else {
-                unit_recipes(store.as_ref(), &args, layer)?
+                eredu_architectures::lfm2::unit_recipes(store.as_ref(), &args, layer)
+                    .map_err(Error::UnsupportedArchitecture)?
             },
             |name| external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
@@ -917,7 +691,8 @@ fn load_neutral_parallel(
                 if external_experts {
                     BTreeMap::new()
                 } else {
-                    unit_recipes(store, &binding_args, layer)?
+                    eredu_architectures::lfm2::unit_recipes(store, &binding_args, layer)
+                        .map_err(Error::UnsupportedArchitecture)?
                 },
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
@@ -1778,18 +1553,7 @@ pub fn prepare_gguf(
         .translated_outputs(translate)
         .map_err(safemlx::error::IoError::from)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
-    if is_moe {
-        for (layer, policy) in args.layer_schedule.iter().enumerate() {
-            if policy.feed_forward != eredu_architectures::lfm2::FeedForwardPolicy::SparseMoe {
-                continue;
-            }
-            let prefix = format!("model.layers.{layer}.feed_forward.experts");
-            if let Some(config) = configs.remove(&format!("{prefix}.gate_proj")) {
-                configs.remove(&format!("{prefix}.up_proj"));
-                configs.insert(format!("{prefix}.gate_up_proj"), config);
-            }
-        }
-    }
+    eredu_architectures::lfm2::normalize_weight_formats(&args, &mut configs);
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     args.weight_quantization = None;

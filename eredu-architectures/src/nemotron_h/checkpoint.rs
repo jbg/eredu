@@ -1,6 +1,11 @@
 //! Pure Nemotron-H SafeTensors and GGUF checkpoint plans.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+use eredu_checkpoint::{
+    recipe::DerivedWeightRecipe,
+    store::{CheckpointSource, TensorSelection},
+};
 
 use eredu_checkpoint::schema::{
     AlternativeLayoutGroup, CatalogPolicy, DepthwiseConvolutionSchema, FusedProjectionSegment,
@@ -11,6 +16,347 @@ use eredu_checkpoint::schema::{
 use eredu_checkpoint::{StoredDtype, WeightQuantization};
 
 use super::{LayerPolicy, ModelArgs};
+
+fn unit_root(
+    args: &ModelArgs,
+    group: usize,
+    index: usize,
+) -> Result<(LayerPolicy, String, usize), String> {
+    if group == 0 {
+        let policy = args
+            .layer_schedule
+            .get(index)
+            .copied()
+            .ok_or_else(|| format!("Nemotron-H has no target layer {index}"))?;
+        return Ok((policy, format!("model.layers.{index}"), index));
+    }
+    let steps = usize::try_from(args.num_nextn_predict_layers)
+        .map_err(|_| "invalid Nemotron-H MTP count".to_string())?;
+    if group > steps || steps == 0 {
+        return Err(format!("Nemotron-H has no MTP group {group}"));
+    }
+    let policies = args.mtp_policies().map_err(|error| error.to_string())?;
+    let pattern = policies.len() / steps;
+    if index >= pattern {
+        return Err(format!(
+            "Nemotron-H has no MTP unit {index} in group {group}"
+        ));
+    }
+    let physical = (group - 1) * pattern + index;
+    Ok((
+        policies[physical],
+        format!("model.mtp.layers.{physical}"),
+        args.num_hidden_layers as usize + physical,
+    ))
+}
+
+/// Resolves all released Nemotron-H names to canonical runtime names.
+pub fn normalized_checkpoint_keys(
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+) -> Result<BTreeMap<String, String>, String> {
+    let mtp = args.mtp_policies().map_err(|error| error.to_string())?;
+    let mut normalized = BTreeMap::new();
+    for raw in store.source_keys() {
+        let runtime = if let Some(rest) = raw.strip_prefix("backbone.embeddings.") {
+            format!("model.embeddings.{rest}")
+        } else if let Some(rest) = raw.strip_prefix("backbone.norm_f.") {
+            format!("model.norm_f.{rest}")
+        } else if let Some(rest) = raw.strip_prefix("backbone.layers.") {
+            let (layer_text, suffix) = rest
+                .split_once('.')
+                .ok_or_else(|| format!("invalid Nemotron-H checkpoint key {raw:?}"))?;
+            let layer = layer_text
+                .parse::<usize>()
+                .map_err(|error| format!("invalid Nemotron-H layer in {raw:?}: {error}"))?;
+            if let Some(suffix) = suffix.strip_prefix("mixer.") {
+                let field = match args.layer_schedule.get(layer) {
+                    Some(LayerPolicy::Mamba) => "mamba",
+                    Some(LayerPolicy::SelfAttention(_)) => "attention",
+                    Some(LayerPolicy::DenseMlp) => "mlp",
+                    Some(LayerPolicy::SparseMoe) => "moe",
+                    None => {
+                        return Err(format!(
+                            "checkpoint layer {layer} is outside Nemotron-H schedule"
+                        ))
+                    }
+                };
+                format!("model.layers.{layer}.{field}.{suffix}")
+            } else {
+                format!("model.layers.{layer}.{suffix}")
+            }
+        } else if let Some(rest) = raw
+            .strip_prefix("mtp.layers.")
+            .or_else(|| raw.strip_prefix("model.mtp.layers."))
+        {
+            let (layer_text, suffix) = rest
+                .split_once('.')
+                .ok_or_else(|| format!("invalid Nemotron-H MTP checkpoint key {raw:?}"))?;
+            let physical = layer_text
+                .parse::<usize>()
+                .map_err(|error| format!("invalid Nemotron-H MTP layer in {raw:?}: {error}"))?;
+            if physical >= mtp.len() {
+                return Err(format!(
+                    "checkpoint MTP layer {physical} is outside Nemotron-H schedule"
+                ));
+            }
+            format!("model.mtp.layers.{physical}.{suffix}")
+        } else {
+            raw.clone()
+        };
+        normalized.insert(runtime, raw);
+    }
+    Ok(normalized)
+}
+
+/// Returns canonical recipes for selected Nemotron-H static modules.
+pub fn static_recipes(
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+    root: Option<&str>,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    Ok(normalized_checkpoint_keys(store, args)?
+        .into_iter()
+        .filter(|(runtime, raw)| {
+            runtime != raw
+                && root.is_none_or(|root| runtime.starts_with(root))
+                && (runtime.starts_with("model.embeddings.")
+                    || runtime.starts_with("model.norm_f.")
+                    || runtime.starts_with("lm_head."))
+        })
+        .map(|(runtime, raw)| {
+            (
+                runtime,
+                DerivedWeightRecipe::source(raw, TensorSelection::Full),
+            )
+        })
+        .collect())
+}
+
+/// Returns the complete recipe catalog for one Nemotron-H execution unit.
+pub fn unit_recipes(
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+    group: usize,
+    index: usize,
+    include_experts: bool,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let (policy, root, _) = unit_root(args, group, index)?;
+    let normalized = normalized_checkpoint_keys(store, args)?;
+    let mut recipes = normalized
+        .iter()
+        .filter(|(runtime, raw)| runtime.starts_with(&root) && *runtime != *raw)
+        .map(|(runtime, raw)| {
+            (
+                runtime.clone(),
+                DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if policy == LayerPolicy::Mamba {
+        let a_log = format!("{root}.mamba.A_log");
+        if let Some(raw) = normalized.get(&a_log) {
+            recipes.insert(
+                a_log,
+                DerivedWeightRecipe::NegLog {
+                    input: Box::new(DerivedWeightRecipe::source(
+                        raw.clone(),
+                        TensorSelection::Full,
+                    )),
+                },
+            );
+        }
+        let conv = format!("{root}.mamba.conv1d.weight");
+        if let Some(raw) = normalized.get(&conv) {
+            let recipe = DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full);
+            let channels = usize::try_from(
+                args.mamba_num_heads * args.mamba_head_dim
+                    + 2 * args.n_groups * args.ssm_state_size,
+            )
+            .map_err(|_| "invalid Mamba channels".to_string())?;
+            let expected = vec![channels, 1, args.conv_kernel as usize];
+            if recipe
+                .infer(store)
+                .map_err(|error| error.to_string())?
+                .shape()
+                != expected
+            {
+                recipes.insert(
+                    conv,
+                    DerivedWeightRecipe::Reshape {
+                        input: Box::new(recipe),
+                        shape: expected,
+                    },
+                );
+            }
+        }
+    }
+    if policy != LayerPolicy::SparseMoe || !include_experts {
+        return Ok(recipes);
+    }
+    let expert_root = if group == 0 {
+        format!("{root}.moe.experts")
+    } else {
+        format!("{root}.mixer.experts")
+    };
+    let split_prefix = format!("{expert_root}.");
+    recipes.retain(|name, _| {
+        name.strip_prefix(&split_prefix)
+            .and_then(|suffix| suffix.split_once('.'))
+            .is_none_or(|(segment, _)| segment.parse::<usize>().is_err())
+    });
+    for projection in ["up_proj", "down_proj"] {
+        let packed = format!("{expert_root}.{projection}");
+        for suffix in ["scales", "biases"] {
+            if let Some(raw) = normalized.get(&format!("{packed}.{suffix}")) {
+                recipes.insert(
+                    format!("{packed}_{suffix}"),
+                    DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
+                );
+            }
+        }
+        if normalized.contains_key(&packed) {
+            continue;
+        }
+        let inputs = (0..args.n_routed_experts)
+            .map(|expert| {
+                normalized
+                    .get(&format!("{expert_root}.{expert}.{projection}.weight"))
+                    .cloned()
+                    .map(|raw| DerivedWeightRecipe::source(raw, TensorSelection::Full))
+                    .ok_or_else(|| {
+                        format!("Nemotron-H checkpoint is missing expert {expert} {projection}")
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        recipes.insert(packed, DerivedWeightRecipe::Stack { axis: 0, inputs });
+    }
+    Ok(recipes)
+}
+
+/// Returns the unit recipe catalog for one flat target/MTP residency ordinal.
+pub fn unit_recipes_flat(
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+    flat: usize,
+    include_experts: bool,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let target = args.num_hidden_layers as usize;
+    if flat < target {
+        return unit_recipes(store, args, 0, flat, include_experts);
+    }
+    let steps = args.num_nextn_predict_layers as usize;
+    if steps == 0 {
+        return Err(format!(
+            "Nemotron-H flat unit {flat} is outside the target schedule"
+        ));
+    }
+    let pattern = args
+        .mtp_policies()
+        .map_err(|error| error.to_string())?
+        .len()
+        / steps;
+    if pattern == 0 {
+        return Err("Nemotron-H MTP operator pattern cannot be empty".into());
+    }
+    let physical = flat - target;
+    unit_recipes(
+        store,
+        args,
+        physical / pattern + 1,
+        physical % pattern,
+        include_experts,
+    )
+}
+
+/// Returns canonical lazy-loading recipes for one Nemotron-H routed expert.
+pub fn expert_recipes(
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+    identity_layer: usize,
+    expert: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    if expert >= args.n_routed_experts as usize {
+        return Err(format!(
+            "Nemotron-H has no expert {expert} in layer {identity_layer}"
+        ));
+    }
+    let target = args.num_hidden_layers as usize;
+    let (policy, prefix) = if identity_layer < target {
+        (
+            args.layer_schedule
+                .get(identity_layer)
+                .copied()
+                .ok_or_else(|| format!("Nemotron-H has no layer {identity_layer}"))?,
+            format!("model.layers.{identity_layer}.moe.experts"),
+        )
+    } else {
+        let physical = identity_layer - target;
+        let policies = args.mtp_policies().map_err(|error| error.to_string())?;
+        (
+            *policies
+                .get(physical)
+                .ok_or_else(|| format!("Nemotron-H has no MTP layer {physical}"))?,
+            format!("model.mtp.layers.{physical}.mixer.experts"),
+        )
+    };
+    if policy != LayerPolicy::SparseMoe {
+        return Err(format!(
+            "Nemotron-H layer {identity_layer} is not sparse MoE"
+        ));
+    }
+    let normalized = normalized_checkpoint_keys(store, args)?;
+    let packed = normalized.contains_key(&format!("{prefix}.up_proj"));
+    let mut recipes = BTreeMap::new();
+    for projection in ["up_proj", "down_proj"] {
+        let runtime = format!("{prefix}.{projection}");
+        let recipe = if packed {
+            DerivedWeightRecipe::source(
+                normalized
+                    .get(&runtime)
+                    .ok_or_else(|| format!("missing packed Nemotron-H tensor {runtime}"))?
+                    .clone(),
+                TensorSelection::Range {
+                    axis: 0,
+                    start: expert,
+                    end: expert + 1,
+                },
+            )
+        } else {
+            DerivedWeightRecipe::Stack {
+                axis: 0,
+                inputs: vec![DerivedWeightRecipe::source(
+                    normalized
+                        .get(&format!("{prefix}.{expert}.{projection}.weight"))
+                        .ok_or_else(|| {
+                            format!("missing split Nemotron-H expert {expert} {projection}")
+                        })?
+                        .clone(),
+                    TensorSelection::Full,
+                )],
+            }
+        };
+        recipes.insert(projection.into(), recipe);
+        if packed {
+            for suffix in ["scales", "biases"] {
+                if let Some(raw) = normalized.get(&format!("{runtime}.{suffix}")) {
+                    recipes.insert(
+                        format!("{projection}_{suffix}"),
+                        DerivedWeightRecipe::source(
+                            raw.clone(),
+                            TensorSelection::Range {
+                                axis: 0,
+                                start: expert,
+                                end: expert + 1,
+                            },
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    Ok(recipes)
+}
 
 /// Builds the strict SafeTensors catalog plan for target and MTP units.
 pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
@@ -939,7 +1285,18 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use eredu_checkpoint::store::MemoryWeightStore;
+    use safetensors::tensor::Dtype;
+
     use super::*;
+
+    fn memory_store(tensors: impl IntoIterator<Item = (String, Vec<usize>)>) -> MemoryWeightStore {
+        MemoryWeightStore::from_safetensors(tensors.into_iter().map(|(name, shape)| {
+            let bytes = vec![0; shape.iter().product::<usize>() * 2];
+            (name, Dtype::F16, shape, bytes)
+        }))
+        .unwrap()
+    }
 
     fn fixture() -> ModelArgs {
         super::super::config::model_args_from_config_value(&serde_json::json!({
@@ -1017,5 +1374,33 @@ mod tests {
             translate_gguf_weight_name("blk.3.ffn_up_exps.scales"),
             "model.layers.3.moe.experts.up_proj_scales"
         );
+    }
+
+    #[test]
+    fn neutral_catalog_owns_released_names_and_split_expert_stacking() {
+        let args = fixture();
+        let mut tensors = vec![("backbone.embeddings.weight".into(), vec![32, 16])];
+        for expert in 0..args.n_routed_experts {
+            tensors.extend([
+                (
+                    format!("backbone.layers.3.mixer.experts.{expert}.up_proj.weight"),
+                    vec![16, 16],
+                ),
+                (
+                    format!("backbone.layers.3.mixer.experts.{expert}.down_proj.weight"),
+                    vec![16, 8],
+                ),
+            ]);
+        }
+        let store = memory_store(tensors);
+        assert!(static_recipes(&store, &args, None)
+            .unwrap()
+            .contains_key("model.embeddings.weight"));
+        let units = unit_recipes(&store, &args, 0, 3, true).unwrap();
+        assert!(matches!(
+            units.get("model.layers.3.moe.experts.up_proj"),
+            Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 4
+        ));
+        assert_eq!(expert_recipes(&store, &args, 3, 1).unwrap().len(), 2);
     }
 }

@@ -1,10 +1,6 @@
 //! Neutral Nemotron-H/Nemotron-H composition over MLX execution policies.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use eredu_architectures::nemotron_h::{Block, LayeredModel, ModelArgs, PredictionUnit, Unit};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, WeightQuantization};
@@ -247,7 +243,12 @@ impl NemotronHBindings {
                     &MlxModule::new(static_modules.embeddings.clone()),
                     "",
                     store,
-                    static_recipes(store, args, Some("model.embeddings."))?,
+                    eredu_architectures::nemotron_h::static_recipes(
+                        store,
+                        args,
+                        Some("model.embeddings."),
+                    )
+                    .map_err(Error::UnsupportedArchitecture)?,
                 )?,
             )?);
         }
@@ -258,7 +259,12 @@ impl NemotronHBindings {
                     &MlxModule::new(static_modules.norm.clone()),
                     "",
                     store,
-                    static_recipes(store, args, Some("model.norm_f."))?,
+                    eredu_architectures::nemotron_h::static_recipes(
+                        store,
+                        args,
+                        Some("model.norm_f."),
+                    )
+                    .map_err(Error::UnsupportedArchitecture)?,
                 )?,
             )?);
         }
@@ -294,13 +300,14 @@ impl NemotronHBindings {
             )?,
             ParameterRole::ExpertIntermediate,
         );
-        let recipes = unit_recipes(
+        let recipes = eredu_architectures::nemotron_h::unit_recipes(
             store,
             architecture.args(),
             group,
             index,
             !self.external_experts,
-        )?;
+        )
+        .map_err(Error::UnsupportedArchitecture)?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
             self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
@@ -471,257 +478,6 @@ fn resolve_store(
     ))
 }
 
-fn unit_root(
-    args: &ModelArgs,
-    group: usize,
-    index: usize,
-) -> Result<(eredu_architectures::nemotron_h::LayerPolicy, String, usize), Error> {
-    if group == 0 {
-        let policy = args.layer_schedule.get(index).copied().ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!("Nemotron-H has no target layer {index}"))
-        })?;
-        return Ok((policy, format!("model.layers.{index}"), index));
-    }
-    let steps = usize::try_from(args.num_nextn_predict_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Nemotron-H MTP count".into()))?;
-    if group > steps {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "Nemotron-H has no MTP group {group}"
-        )));
-    }
-    let policies = args
-        .mtp_policies()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let pattern = policies.len() / steps;
-    if index >= pattern {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "Nemotron-H has no MTP unit {index} in group {group}"
-        )));
-    }
-    let physical = (group - 1) * pattern + index;
-    Ok((
-        policies[physical],
-        format!("model.mtp.layers.{physical}"),
-        args.num_hidden_layers as usize + physical,
-    ))
-}
-
-fn normalized_checkpoint_keys(
-    store: &dyn CheckpointSource,
-    args: &ModelArgs,
-) -> Result<BTreeMap<String, String>, Error> {
-    let mtp = args
-        .mtp_policies()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let mut normalized = BTreeMap::new();
-    for raw in store.source_keys() {
-        let runtime = if let Some(rest) = raw.strip_prefix("backbone.embeddings.") {
-            format!("model.embeddings.{rest}")
-        } else if let Some(rest) = raw.strip_prefix("backbone.norm_f.") {
-            format!("model.norm_f.{rest}")
-        } else if let Some(rest) = raw.strip_prefix("backbone.layers.") {
-            let (layer_text, suffix) = rest.split_once('.').ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!("invalid Nemotron-H checkpoint key {raw:?}"))
-            })?;
-            let layer = layer_text.parse::<usize>().map_err(|error| {
-                Error::UnsupportedArchitecture(format!(
-                    "invalid Nemotron-H layer in {raw:?}: {error}"
-                ))
-            })?;
-            if let Some(suffix) = suffix.strip_prefix("mixer.") {
-                let field = match args.layer_schedule.get(layer) {
-                    Some(eredu_architectures::nemotron_h::LayerPolicy::Mamba) => "mamba",
-                    Some(eredu_architectures::nemotron_h::LayerPolicy::SelfAttention(_)) => {
-                        "attention"
-                    }
-                    Some(eredu_architectures::nemotron_h::LayerPolicy::DenseMlp) => "mlp",
-                    Some(eredu_architectures::nemotron_h::LayerPolicy::SparseMoe) => "moe",
-                    None => {
-                        return Err(Error::UnsupportedArchitecture(format!(
-                            "checkpoint layer {layer} is outside Nemotron-H schedule"
-                        )))
-                    }
-                };
-                format!("model.layers.{layer}.{field}.{suffix}")
-            } else {
-                format!("model.layers.{layer}.{suffix}")
-            }
-        } else if let Some(rest) = raw
-            .strip_prefix("mtp.layers.")
-            .or_else(|| raw.strip_prefix("model.mtp.layers."))
-        {
-            let (layer_text, suffix) = rest.split_once('.').ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "invalid Nemotron-H MTP checkpoint key {raw:?}"
-                ))
-            })?;
-            let physical = layer_text.parse::<usize>().map_err(|error| {
-                Error::UnsupportedArchitecture(format!(
-                    "invalid Nemotron-H MTP layer in {raw:?}: {error}"
-                ))
-            })?;
-            if physical >= mtp.len() {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "checkpoint MTP layer {physical} is outside Nemotron-H schedule"
-                )));
-            }
-            format!("model.mtp.layers.{physical}.{suffix}")
-        } else {
-            raw.clone()
-        };
-        normalized.insert(runtime, raw);
-    }
-    Ok(normalized)
-}
-
-fn static_recipes(
-    store: &dyn CheckpointSource,
-    args: &ModelArgs,
-    root: Option<&str>,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
-    use eredu_checkpoint::store::TensorSelection;
-    Ok(normalized_checkpoint_keys(store, args)?
-        .into_iter()
-        .filter(|(runtime, raw)| {
-            runtime != raw
-                && root.is_none_or(|root| runtime.starts_with(root))
-                && (runtime.starts_with("model.embeddings.")
-                    || runtime.starts_with("model.norm_f.")
-                    || runtime.starts_with("lm_head."))
-        })
-        .map(|(runtime, raw)| {
-            (
-                runtime,
-                DerivedWeightRecipe::source(raw, TensorSelection::Full),
-            )
-        })
-        .collect())
-}
-
-fn unit_recipes(
-    store: &dyn CheckpointSource,
-    args: &ModelArgs,
-    group: usize,
-    index: usize,
-    include_experts: bool,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
-    use eredu_checkpoint::store::TensorSelection;
-    let (policy, root, _) = unit_root(args, group, index)?;
-    let normalized = normalized_checkpoint_keys(store, args)?;
-    let mut recipes = normalized
-        .iter()
-        .filter(|(runtime, raw)| runtime.starts_with(&root) && *runtime != *raw)
-        .map(|(runtime, raw)| {
-            (
-                runtime.clone(),
-                DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    if policy == eredu_architectures::nemotron_h::LayerPolicy::Mamba {
-        let a_log = format!("{root}.mamba.A_log");
-        if let Some(raw) = normalized.get(&a_log) {
-            recipes.insert(
-                a_log,
-                DerivedWeightRecipe::NegLog {
-                    input: Box::new(DerivedWeightRecipe::source(
-                        raw.clone(),
-                        TensorSelection::Full,
-                    )),
-                },
-            );
-        }
-        let conv = format!("{root}.mamba.conv1d.weight");
-        if let Some(raw) = normalized.get(&conv) {
-            let recipe = DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full);
-            let channels = usize::try_from(
-                args.mamba_num_heads * args.mamba_head_dim
-                    + 2 * args.n_groups * args.ssm_state_size,
-            )
-            .map_err(|_| Error::UnsupportedArchitecture("invalid Mamba channels".into()))?;
-            let expected = vec![channels, 1, args.conv_kernel as usize];
-            if recipe.infer(store)?.shape() != expected {
-                recipes.insert(
-                    conv,
-                    DerivedWeightRecipe::Reshape {
-                        input: Box::new(recipe),
-                        shape: expected,
-                    },
-                );
-            }
-        }
-    }
-    if policy != eredu_architectures::nemotron_h::LayerPolicy::SparseMoe || !include_experts {
-        return Ok(recipes);
-    }
-    let expert_root = if group == 0 {
-        format!("{root}.moe.experts")
-    } else {
-        format!("{root}.mixer.experts")
-    };
-    let split_prefix = format!("{expert_root}.");
-    recipes.retain(|name, _| {
-        name.strip_prefix(&split_prefix)
-            .and_then(|suffix| suffix.split_once('.'))
-            .is_none_or(|(segment, _)| segment.parse::<usize>().is_err())
-    });
-    for projection in ["up_proj", "down_proj"] {
-        let packed = format!("{expert_root}.{projection}");
-        for suffix in ["scales", "biases"] {
-            if let Some(raw) = normalized.get(&format!("{packed}.{suffix}")) {
-                recipes.insert(
-                    format!("{packed}_{suffix}"),
-                    DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
-                );
-            }
-        }
-        if normalized.contains_key(&packed) {
-            continue;
-        }
-        let inputs = (0..args.n_routed_experts)
-            .map(|expert| {
-                normalized
-                    .get(&format!("{expert_root}.{expert}.{projection}.weight"))
-                    .cloned()
-                    .map(|raw| DerivedWeightRecipe::source(raw, TensorSelection::Full))
-                    .ok_or_else(|| {
-                        Error::UnsupportedArchitecture(format!(
-                            "Nemotron-H checkpoint is missing expert {expert} {projection}"
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        recipes.insert(packed, DerivedWeightRecipe::Stack { axis: 0, inputs });
-    }
-    Ok(recipes)
-}
-
-fn unit_recipes_flat(
-    store: &dyn CheckpointSource,
-    args: &ModelArgs,
-    flat: usize,
-    include_experts: bool,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
-    let target = args.num_hidden_layers as usize;
-    if flat < target {
-        return unit_recipes(store, args, 0, flat, include_experts);
-    }
-    let steps = args.num_nextn_predict_layers as usize;
-    let pattern = args
-        .mtp_policies()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
-        .len()
-        / steps;
-    let physical = flat - target;
-    unit_recipes(
-        store,
-        args,
-        physical / pattern + 1,
-        physical % pattern,
-        include_experts,
-    )
-}
-
 fn planned_expert_binding(
     name: impl Into<String>,
     recipe: DerivedWeightRecipe,
@@ -748,18 +504,16 @@ pub fn expert_catalog_selected(
     store: &dyn CheckpointSource,
     mut include_layer: impl FnMut(usize) -> bool,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    use eredu_checkpoint::store::TensorSelection;
     if !args.has_sparse_moe_layers() {
         return Err(Error::UnsupportedArchitecture(
             "independent expert caching requires sparse Nemotron-H units".into(),
         ));
     }
-    let normalized = normalized_checkpoint_keys(store, args)?;
     let mut sparse = Vec::new();
     for (layer, policy) in args.layer_schedule.iter().copied().enumerate() {
         if policy == eredu_architectures::nemotron_h::LayerPolicy::SparseMoe && include_layer(layer)
         {
-            sparse.push((layer, format!("model.layers.{layer}.moe.experts")));
+            sparse.push(layer);
         }
     }
     for (physical, policy) in args
@@ -772,72 +526,23 @@ pub fn expert_catalog_selected(
         if policy == eredu_architectures::nemotron_h::LayerPolicy::SparseMoe
             && include_layer(identity_layer)
         {
-            sparse.push((
-                identity_layer,
-                format!("model.mtp.layers.{physical}.mixer.experts"),
-            ));
+            sparse.push(identity_layer);
         }
     }
     let mut entries = Vec::new();
-    for (identity_layer, prefix) in sparse {
-        let packed = normalized.contains_key(&format!("{prefix}.up_proj"));
+    for identity_layer in sparse {
         for expert in 0..args.n_routed_experts as usize {
             let identity = ExpertIdentity::new(identity_layer, expert);
-            let mut planned = Vec::new();
-            for projection in ["up_proj", "down_proj"] {
-                let runtime = format!("{prefix}.{projection}");
-                let recipe = if packed {
-                    DerivedWeightRecipe::source(
-                        normalized
-                            .get(&runtime)
-                            .ok_or_else(|| {
-                                Error::UnsupportedArchitecture(format!(
-                                    "missing packed Nemotron-H tensor {runtime}"
-                                ))
-                            })?
-                            .clone(),
-                        TensorSelection::Range {
-                            axis: 0,
-                            start: expert,
-                            end: expert + 1,
-                        },
-                    )
-                } else {
-                    DerivedWeightRecipe::Stack {
-                        axis: 0,
-                        inputs: vec![DerivedWeightRecipe::source(
-                            normalized
-                                .get(&format!("{prefix}.{expert}.{projection}.weight"))
-                                .ok_or_else(|| {
-                                    Error::UnsupportedArchitecture(format!(
-                                        "missing split Nemotron-H expert {expert} {projection}"
-                                    ))
-                                })?
-                                .clone(),
-                            TensorSelection::Full,
-                        )],
-                    }
-                };
-                planned.push(planned_expert_binding(projection, recipe, store)?);
-                if packed {
-                    for suffix in ["scales", "biases"] {
-                        if let Some(raw) = normalized.get(&format!("{runtime}.{suffix}")) {
-                            planned.push(planned_expert_binding(
-                                format!("{projection}_{suffix}"),
-                                DerivedWeightRecipe::source(
-                                    raw.clone(),
-                                    TensorSelection::Range {
-                                        axis: 0,
-                                        start: expert,
-                                        end: expert + 1,
-                                    },
-                                ),
-                                store,
-                            )?);
-                        }
-                    }
-                }
-            }
+            let planned = eredu_architectures::nemotron_h::expert_recipes(
+                store,
+                args,
+                identity_layer,
+                expert,
+            )
+            .map_err(Error::UnsupportedArchitecture)?
+            .into_iter()
+            .map(|(name, recipe)| planned_expert_binding(name, recipe, store))
+            .collect::<Result<Vec<_>, _>>()?;
             let bindings = BindingPlan::new(planned)
                 .and_then(|plan| plan.build_bindings(store))
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -920,7 +625,8 @@ fn load_neutral(
                 &MlxModule::new(modules.clone()),
                 "",
                 store,
-                static_recipes(store, &static_binding_args, None)?,
+                eredu_architectures::nemotron_h::static_recipes(store, &static_binding_args, None)
+                    .map_err(Error::UnsupportedArchitecture)?,
             )
             .map_err(Into::into)
         },
@@ -929,7 +635,13 @@ fn load_neutral(
                 &MlxModule::new(unit),
                 "",
                 store,
-                unit_recipes_flat(store, &binding_args, index, !external_experts)?,
+                eredu_architectures::nemotron_h::unit_recipes_flat(
+                    store,
+                    &binding_args,
+                    index,
+                    !external_experts,
+                )
+                .map_err(Error::UnsupportedArchitecture)?,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )
             .map_err(Into::into)
@@ -1026,7 +738,8 @@ fn load_neutral_parallel(
         &global_static,
         "",
         store.as_ref(),
-        static_recipes(store.as_ref(), &args, None)?,
+        eredu_architectures::nemotron_h::static_recipes(store.as_ref(), &args, None)
+            .map_err(Error::UnsupportedArchitecture)?,
     )?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
     for layer in 0..count {
@@ -1035,7 +748,13 @@ fn load_neutral_parallel(
             &MlxModule::new(unit),
             "",
             store.as_ref(),
-            unit_recipes_flat(store.as_ref(), &args, layer, !external_experts)?,
+            eredu_architectures::nemotron_h::unit_recipes_flat(
+                store.as_ref(),
+                &args,
+                layer,
+                !external_experts,
+            )
+            .map_err(Error::UnsupportedArchitecture)?,
             |name| external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
         global_parameter_bytes = global_parameter_bytes
@@ -1072,7 +791,8 @@ fn load_neutral_parallel(
                 &global,
                 "",
                 store,
-                static_recipes(store, &static_binding_args, None)?,
+                eredu_architectures::nemotron_h::static_recipes(store, &static_binding_args, None)
+                    .map_err(Error::UnsupportedArchitecture)?,
             )?;
             shard_layer_bindings(bindings, "", store, &static_layout)
         },
@@ -1082,7 +802,13 @@ fn load_neutral_parallel(
                 &MlxModule::new(global),
                 "",
                 store,
-                unit_recipes_flat(store, &binding_args, layer, !external_experts)?,
+                eredu_architectures::nemotron_h::unit_recipes_flat(
+                    store,
+                    &binding_args,
+                    layer,
+                    !external_experts,
+                )
+                .map_err(Error::UnsupportedArchitecture)?,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
             let target = binding_args.num_hidden_layers as usize;
@@ -1198,7 +924,8 @@ fn quantize_store(
                 modules,
                 "",
                 store,
-                static_recipes(store, &static_binding_args, None)?,
+                eredu_architectures::nemotron_h::static_recipes(store, &static_binding_args, None)
+                    .map_err(Error::UnsupportedArchitecture)?,
             )
             .map_err(Into::into)
         },
@@ -1207,7 +934,13 @@ fn quantize_store(
                 unit,
                 "",
                 store,
-                unit_recipes_flat(store, &binding_args, index, true)?,
+                eredu_architectures::nemotron_h::unit_recipes_flat(
+                    store,
+                    &binding_args,
+                    index,
+                    true,
+                )
+                .map_err(Error::UnsupportedArchitecture)?,
             )
             .map_err(Into::into)
         },

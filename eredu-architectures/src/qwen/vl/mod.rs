@@ -6,7 +6,10 @@ mod model;
 mod parallel;
 mod positions;
 
-pub use checkpoint::safetensors_plan;
+pub use checkpoint::{
+    normalize_text_weight_formats, safetensors_plan, static_recipes,
+    translate_text_gguf_weight_name, translate_vision_gguf_weight_name, unit_recipes,
+};
 pub use config::{
     model_args_from_config_value, model_args_from_gguf_parts,
     prompt_cache_architecture_fingerprint, state_identity, state_layout,

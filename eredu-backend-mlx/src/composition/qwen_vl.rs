@@ -8,7 +8,6 @@ use std::{
 
 use eredu_architectures::qwen::{self, vision, vl};
 use eredu_checkpoint::{
-    recipe::{DerivedWeightRecipe, RecipeCatalog},
     store::{CheckpointSource, CompositeCheckpointSource, TensorSelection},
     WeightQuantization,
 };
@@ -155,55 +154,6 @@ impl vision::VisionGgufCatalog for VisionGgufCatalog<'_> {
                     .ok()
             })
     }
-}
-
-fn translate_vision_gguf(name: &str, deepstack: &[i32]) -> String {
-    match name {
-        "v.patch_embd.weight" => "model.visual.patch_embed.proj.weight.0".into(),
-        "v.patch_embd.weight.1" => "model.visual.patch_embed.proj.weight.1".into(),
-        _ => vision::translate_gguf_weight_name(name, deepstack),
-    }
-}
-
-fn static_recipes(store: &dyn CheckpointSource) -> BTreeMap<String, DerivedWeightRecipe> {
-    let mut recipes = BTreeMap::new();
-    let first = "model.visual.patch_embed.proj.weight.0";
-    let second = "model.visual.patch_embed.proj.weight.1";
-    if store.tensor_metadata(first).is_ok() && store.tensor_metadata(second).is_ok() {
-        recipes.insert(
-            "model.visual.patch_embed.proj.weight".into(),
-            DerivedWeightRecipe::Stack {
-                axis: 2,
-                inputs: vec![
-                    DerivedWeightRecipe::source(first, TensorSelection::Full),
-                    DerivedWeightRecipe::source(second, TensorSelection::Full),
-                ],
-            },
-        );
-    }
-    recipes
-}
-
-fn unit_recipes(
-    store: &dyn CheckpointSource,
-    args: &vl::ModelArgs,
-    flat: usize,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
-    let vision_layers = args.vision.layer_count();
-    if flat < vision_layers || !args.text.is_moe() {
-        return Ok(BTreeMap::new());
-    }
-    let resolved = qwen::expert_recipes(
-        store,
-        &args.text,
-        &args.text.parameter_root,
-        flat - vision_layers,
-    )
-    .map_err(Error::UnsupportedArchitecture)?;
-    Ok(BTreeMap::from([
-        (resolved.target_gate_up, resolved.gate_up),
-        (resolved.target_down, resolved.down),
-    ]))
 }
 
 #[derive(Clone)]
@@ -420,7 +370,8 @@ impl QwenVlPipelineBindings {
         let recipes =
             if group_kind(architecture, group) == eredu_runtime::ArchitectureGroupKind::Decoder {
                 let args = architecture.args();
-                unit_recipes(store, args, args.vision.layer_count() + index)?
+                vl::unit_recipes(store, args, args.vision.layer_count() + index)
+                    .map_err(Error::UnsupportedArchitecture)?
             } else {
                 BTreeMap::new()
             };
@@ -443,7 +394,7 @@ impl QwenVlPipelineBindings {
             <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
                 architecture,
             );
-        let recipes = static_recipes(store);
+        let recipes = vl::static_recipes(store);
         let mut units = Vec::new();
         if select("qwen_vl.static.vision") {
             units.push(StaticUnitBindings::new(
@@ -547,7 +498,8 @@ impl QwenVlPipelineBindings {
                 let recipes = if self.external_experts {
                     BTreeMap::new()
                 } else {
-                    unit_recipes(store, args, args.vision.layer_count() + index)?
+                    vl::unit_recipes(store, args, args.vision.layer_count() + index)
+                        .map_err(Error::UnsupportedArchitecture)?
                 };
                 let mut bindings = build_module_bindings_with_recipes_excluding(
                     global_layer,
@@ -1200,26 +1152,13 @@ pub fn prepare_gguf_pipeline(
     )
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let is_moe = text.is_moe();
-    let translate_text = |name: &str| {
-        let name = qwen::translate_gguf_weight_name(name, is_moe);
-        name.strip_prefix("model.")
-            .map(|name| format!("model.language_model.{name}"))
-            .unwrap_or(name)
-    };
+    let translate_text = |name: &str| vl::translate_text_gguf_weight_name(name, is_moe);
     checkpoint
         .catalog()
         .translated_outputs(translate_text)
         .map_err(safemlx::error::IoError::from)?;
     let mut text_formats = gguf_quantization_configs(checkpoint, translate_text)?;
-    if is_moe {
-        for layer in 0..text.num_hidden_layers {
-            let root = format!("model.language_model.layers.{layer}.mlp.experts");
-            if let Some(format) = text_formats.remove(&format!("{root}.gate_proj.weight")) {
-                text_formats.remove(&format!("{root}.up_proj.weight"));
-                text_formats.insert(format!("{root}.gate_up_proj"), format);
-            }
-        }
-    }
+    vl::normalize_text_weight_formats(&text, &mut text_formats);
     text.quantized_weights = Some(text_formats.keys().cloned().collect());
     text.quantized_weight_configs = Some(text_formats);
     text.quantization = None;
@@ -1239,7 +1178,7 @@ pub fn prepare_gguf_pipeline(
         vision::config_from_gguf_catalog(&VisionGgufCatalog(&projector), &projector_metadata)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let deepstack = vision.deepstack_layers();
-    let translate_vision = |name: &str| translate_vision_gguf(name, &deepstack);
+    let translate_vision = |name: &str| vl::translate_vision_gguf_weight_name(name, &deepstack);
     projector
         .catalog()
         .translated_outputs(translate_vision)
@@ -1309,26 +1248,13 @@ pub fn load_gguf(
     )
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let is_moe = text.is_moe();
-    let translate_text = |name: &str| {
-        let name = qwen::translate_gguf_weight_name(name, is_moe);
-        name.strip_prefix("model.")
-            .map(|name| format!("model.language_model.{name}"))
-            .unwrap_or(name)
-    };
+    let translate_text = |name: &str| vl::translate_text_gguf_weight_name(name, is_moe);
     checkpoint
         .catalog()
         .translated_outputs(translate_text)
         .map_err(safemlx::error::IoError::from)?;
     let mut text_formats = gguf_quantization_configs(checkpoint, translate_text)?;
-    if is_moe {
-        for layer in 0..text.num_hidden_layers {
-            let root = format!("model.language_model.layers.{layer}.mlp.experts");
-            if let Some(format) = text_formats.remove(&format!("{root}.gate_proj.weight")) {
-                text_formats.remove(&format!("{root}.up_proj.weight"));
-                text_formats.insert(format!("{root}.gate_up_proj"), format);
-            }
-        }
-    }
+    vl::normalize_text_weight_formats(&text, &mut text_formats);
     text.quantized_weights = Some(text_formats.keys().cloned().collect());
     text.quantized_weight_configs = Some(text_formats);
     text.quantization = None;
@@ -1349,7 +1275,7 @@ pub fn load_gguf(
         vision::config_from_gguf_catalog(&VisionGgufCatalog(&projector), &projector_metadata)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let deepstack = vision.deepstack_layers();
-    let translate_vision = |name: &str| translate_vision_gguf(name, &deepstack);
+    let translate_vision = |name: &str| vl::translate_vision_gguf_weight_name(name, &deepstack);
     projector
         .catalog()
         .translated_outputs(translate_vision)
@@ -1538,7 +1464,7 @@ fn load_store(
                 &MlxModule::new(modules.clone()),
                 "",
                 store,
-                static_recipes(store),
+                vl::static_recipes(store),
             )
             .map_err(Into::into)
         },
@@ -1547,7 +1473,8 @@ fn load_store(
                 &MlxModule::new(unit),
                 "",
                 store,
-                unit_recipes(store, &binding_args, flat)?,
+                vl::unit_recipes(store, &binding_args, flat)
+                    .map_err(Error::UnsupportedArchitecture)?,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )
             .map_err(Into::into)

@@ -1,15 +1,263 @@
 //! Pure SafeTensors and GGUF checkpoint plans for LFM2.
 
+use std::collections::{BTreeMap, HashMap};
+
 use eredu_checkpoint::schema::{
     AlternativeLayoutGroup, CatalogPolicy, DepthwiseConvolutionSchema, FusedProjectionSegment,
     FusedSegmentedProjectionSchema, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
     LayoutVariant, SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
     TensorOperation,
 };
+use eredu_checkpoint::{
+    recipe::DerivedWeightRecipe,
+    store::{CheckpointSource, TensorSelection},
+};
 use eredu_checkpoint::{StoredDtype, WeightQuantization};
 use eredu_core::AttentionPolicy;
 
 use super::config::{FeedForwardPolicy, ModelArgs, OperatorPolicy};
+
+fn expert_source(
+    store: &dyn CheckpointSource,
+    prefix: &str,
+    expert: i32,
+    projections: &[&str],
+) -> Result<DerivedWeightRecipe, String> {
+    let keys = store.source_keys();
+    let key = projections
+        .iter()
+        .map(|projection| format!("{prefix}.{expert}.{projection}.weight"))
+        .find(|candidate| keys.contains(candidate))
+        .ok_or_else(|| {
+            format!("LFM2 checkpoint is missing expert {expert} projection under {prefix}")
+        })?;
+    Ok(DerivedWeightRecipe::source(key, TensorSelection::Full))
+}
+
+/// Returns the complete derived-weight catalog for one LFM2 execution unit.
+pub fn unit_recipes(
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+    layer: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let mut recipes = BTreeMap::new();
+    let root = format!("model.layers.{layer}");
+    let conv = format!("{root}.conv.conv.weight");
+    if let Ok(metadata) = store.source_metadata(&conv) {
+        let expected = vec![args.hidden_size as usize, 1, args.conv_l_cache as usize];
+        let recipe = if metadata.logical_shape.len() == 2 {
+            Some(DerivedWeightRecipe::Reshape {
+                input: Box::new(DerivedWeightRecipe::source(&conv, TensorSelection::Full)),
+                shape: expected.clone(),
+            })
+        } else if metadata.logical_shape == [expected[0], expected[2], expected[1]]
+            && metadata.logical_shape != expected
+        {
+            Some(DerivedWeightRecipe::Transpose {
+                input: Box::new(DerivedWeightRecipe::source(&conv, TensorSelection::Full)),
+                axes: vec![0, 2, 1],
+            })
+        } else {
+            None
+        };
+        if let Some(recipe) = recipe {
+            recipes.insert(conv.clone(), recipe);
+        }
+    }
+    let policy = args
+        .layer_policy(layer)
+        .ok_or_else(|| format!("LFM2 has no layer policy {layer}"))?;
+    if policy.feed_forward != FeedForwardPolicy::SparseMoe {
+        return Ok(recipes);
+    }
+    let prefix = format!("{root}.feed_forward.experts");
+    let keys = store.source_keys();
+    let gate_up = format!("{prefix}.gate_up_proj");
+    let down = format!("{prefix}.down_proj");
+    if keys.contains(&gate_up) {
+        return Ok(recipes);
+    }
+    if keys.contains(&format!("{prefix}.gate_proj")) && keys.contains(&format!("{prefix}.up_proj"))
+    {
+        recipes.insert(
+            gate_up,
+            DerivedWeightRecipe::Concatenate {
+                axis: 1,
+                inputs: ["gate_proj", "up_proj"]
+                    .into_iter()
+                    .map(|name| {
+                        DerivedWeightRecipe::source(
+                            format!("{prefix}.{name}"),
+                            TensorSelection::Full,
+                        )
+                    })
+                    .collect(),
+            },
+        );
+        return Ok(recipes);
+    }
+    let mut gate_up_inputs = Vec::new();
+    let mut down_inputs = Vec::new();
+    for expert in 0..args.num_experts {
+        gate_up_inputs.push(DerivedWeightRecipe::Concatenate {
+            axis: 0,
+            inputs: vec![
+                expert_source(store, &prefix, expert, &["w1", "gate_proj"])?,
+                expert_source(store, &prefix, expert, &["w3", "up_proj"])?,
+            ],
+        });
+        down_inputs.push(expert_source(store, &prefix, expert, &["w2", "down_proj"])?);
+    }
+    recipes.insert(
+        gate_up,
+        DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: gate_up_inputs,
+        },
+    );
+    recipes.insert(
+        down,
+        DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: down_inputs,
+        },
+    );
+    Ok(recipes)
+}
+
+/// Returns canonical lazy-loading recipes for one LFM2 routed expert.
+pub fn expert_recipes(
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+    layer: usize,
+    expert: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let policy = args
+        .layer_policy(layer)
+        .ok_or_else(|| format!("LFM2 has no layer policy {layer}"))?;
+    if policy.feed_forward != FeedForwardPolicy::SparseMoe {
+        return Err(format!("LFM2 layer {layer} is not sparse MoE"));
+    }
+    if expert >= args.num_experts as usize {
+        return Err(format!("LFM2 has no expert {expert} in layer {layer}"));
+    }
+    let prefix = format!("model.layers.{layer}.feed_forward.experts");
+    let packed_gate_up = format!("{prefix}.gate_up_proj");
+    let packed_down = format!("{prefix}.down_proj");
+    let keys = store.source_keys();
+    let selection = TensorSelection::Range {
+        axis: 0,
+        start: expert,
+        end: expert + 1,
+    };
+    let mut recipes = BTreeMap::new();
+    if keys.contains(&packed_gate_up) && keys.contains(&packed_down) {
+        for (name, key) in [
+            ("gate_up_proj", packed_gate_up.clone()),
+            ("down_proj", packed_down.clone()),
+        ] {
+            recipes.insert(
+                name.into(),
+                DerivedWeightRecipe::source(key, selection.clone()),
+            );
+        }
+        for (name, key) in [
+            ("gate_up_proj_scales", format!("{packed_gate_up}_scales")),
+            ("gate_up_proj_biases", format!("{packed_gate_up}_biases")),
+            ("down_proj_scales", format!("{packed_down}_scales")),
+            ("down_proj_biases", format!("{packed_down}_biases")),
+        ] {
+            if keys.contains(&key) {
+                recipes.insert(
+                    name.into(),
+                    DerivedWeightRecipe::source(key, selection.clone()),
+                );
+            }
+        }
+    } else if keys.contains(&format!("{prefix}.gate_proj"))
+        && keys.contains(&format!("{prefix}.up_proj"))
+        && keys.contains(&packed_down)
+    {
+        recipes.insert(
+            "gate_up_proj".into(),
+            DerivedWeightRecipe::Concatenate {
+                axis: 1,
+                inputs: vec![
+                    DerivedWeightRecipe::source(format!("{prefix}.gate_proj"), selection.clone()),
+                    DerivedWeightRecipe::source(format!("{prefix}.up_proj"), selection.clone()),
+                ],
+            },
+        );
+        recipes.insert(
+            "down_proj".into(),
+            DerivedWeightRecipe::source(packed_down.clone(), selection.clone()),
+        );
+        for suffix in ["_scales", "_biases"] {
+            let gate = format!("{prefix}.gate_proj{suffix}");
+            let up = format!("{prefix}.up_proj{suffix}");
+            if keys.contains(&gate) && keys.contains(&up) {
+                recipes.insert(
+                    format!("gate_up_proj{suffix}"),
+                    DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![
+                            DerivedWeightRecipe::source(gate, selection.clone()),
+                            DerivedWeightRecipe::source(up, selection.clone()),
+                        ],
+                    },
+                );
+            }
+            let down = format!("{packed_down}{suffix}");
+            if keys.contains(&down) {
+                recipes.insert(
+                    format!("down_proj{suffix}"),
+                    DerivedWeightRecipe::source(down, selection.clone()),
+                );
+            }
+        }
+    } else {
+        if args.weight_quantization_for(&packed_gate_up).is_some()
+            || args.weight_quantization_for(&packed_down).is_some()
+        {
+            return Err("split LFM2 experts cannot be lazily load-time quantized".into());
+        }
+        let gate = expert_source(store, &prefix, expert as i32, &["w1", "gate_proj"])?;
+        let up = expert_source(store, &prefix, expert as i32, &["w3", "up_proj"])?;
+        let down = expert_source(store, &prefix, expert as i32, &["w2", "down_proj"])?;
+        recipes.insert(
+            "gate_up_proj".into(),
+            DerivedWeightRecipe::Stack {
+                axis: 0,
+                inputs: vec![DerivedWeightRecipe::Concatenate {
+                    axis: 0,
+                    inputs: vec![gate, up],
+                }],
+            },
+        );
+        recipes.insert(
+            "down_proj".into(),
+            DerivedWeightRecipe::Stack {
+                axis: 0,
+                inputs: vec![down],
+            },
+        );
+    }
+    Ok(recipes)
+}
+
+/// Rehomes split expert GGUF formats onto their canonical fused runtime weights.
+pub fn normalize_weight_formats<V>(args: &ModelArgs, formats: &mut HashMap<String, V>) {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
+            continue;
+        }
+        let prefix = format!("model.layers.{layer}.feed_forward.experts");
+        if let Some(format) = formats.remove(&format!("{prefix}.gate_proj")) {
+            formats.remove(&format!("{prefix}.up_proj"));
+            formats.insert(format!("{prefix}.gate_up_proj"), format);
+        }
+    }
+}
 
 /// Builds the complete alternative-layout SafeTensors contract.
 pub fn safetensors_plan(
@@ -644,7 +892,18 @@ pub fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    use eredu_checkpoint::store::MemoryWeightStore;
+    use safetensors::tensor::Dtype;
+
     use super::*;
+
+    fn memory_store(tensors: impl IntoIterator<Item = (String, Vec<usize>)>) -> MemoryWeightStore {
+        MemoryWeightStore::from_safetensors(tensors.into_iter().map(|(name, shape)| {
+            let bytes = vec![0; shape.iter().product::<usize>() * 2];
+            (name, Dtype::F16, shape, bytes)
+        }))
+        .unwrap()
+    }
 
     fn fixture() -> ModelArgs {
         super::super::config::model_args_from_config_value(&serde_json::json!({
@@ -696,5 +955,36 @@ mod tests {
             translate_gguf_weight_name("blk.2.ffn_gate_exps.weight", true),
             "model.layers.2.feed_forward.experts.gate_proj"
         );
+    }
+
+    #[test]
+    fn neutral_catalog_owns_split_expert_stacking() {
+        let args = fixture();
+        let prefix = "model.layers.1.feed_forward.experts";
+        let mut tensors = Vec::new();
+        for expert in 0..args.num_experts {
+            for (name, shape) in [
+                ("w1", vec![8, 16]),
+                ("w3", vec![8, 16]),
+                ("w2", vec![16, 8]),
+            ] {
+                tensors.push((format!("{prefix}.{expert}.{name}.weight"), shape));
+            }
+        }
+        let store = memory_store(tensors);
+        let units = unit_recipes(&store, &args, 1).unwrap();
+        assert!(matches!(
+            units.get(&format!("{prefix}.gate_up_proj")),
+            Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 4
+        ));
+        let expert = expert_recipes(&store, &args, 1, 2).unwrap();
+        assert_eq!(expert.len(), 2);
+
+        let mut formats = HashMap::from([
+            (format!("{prefix}.gate_proj"), 1),
+            (format!("{prefix}.up_proj"), 2),
+        ]);
+        normalize_weight_formats(&args, &mut formats);
+        assert_eq!(formats.get(&format!("{prefix}.gate_up_proj")), Some(&1));
     }
 }

@@ -1,6 +1,12 @@
 //! Composite SafeTensors contract for Qwen3-VL text and shared vision.
 
-use eredu_checkpoint::schema::{CatalogPolicy, SafetensorsCheckpointPlan};
+use std::collections::{BTreeMap, HashMap};
+
+use eredu_checkpoint::{
+    recipe::{DerivedWeightRecipe, RecipeCatalog},
+    schema::{CatalogPolicy, SafetensorsCheckpointPlan},
+    store::TensorSelection,
+};
 
 use super::ModelArgs;
 use crate::qwen::{self, vision};
@@ -21,11 +27,114 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
     .map_err(|error| error.to_string())
 }
 
+/// Translates one Qwen3-VL text GGUF name into the composite runtime namespace.
+pub fn translate_text_gguf_weight_name(name: &str, is_moe: bool) -> String {
+    let name = qwen::translate_gguf_weight_name(name, is_moe);
+    name.strip_prefix("model.")
+        .map(|name| format!("model.language_model.{name}"))
+        .unwrap_or(name)
+}
+
+/// Translates one Qwen3-VL projector GGUF name, including split patch weights.
+pub fn translate_vision_gguf_weight_name(name: &str, deepstack: &[i32]) -> String {
+    match name {
+        "v.patch_embd.weight" => "model.visual.patch_embed.proj.weight.0".into(),
+        "v.patch_embd.weight.1" => "model.visual.patch_embed.proj.weight.1".into(),
+        _ => vision::translate_gguf_weight_name(name, deepstack),
+    }
+}
+
+/// Rehomes split expert GGUF formats onto their canonical fused runtime weights.
+pub fn normalize_text_weight_formats<V>(args: &qwen::ModelArgs, formats: &mut HashMap<String, V>) {
+    if !args.is_moe() {
+        return;
+    }
+    for layer in 0..args.num_hidden_layers {
+        let root = format!("model.language_model.layers.{layer}.mlp.experts");
+        if let Some(format) = formats.remove(&format!("{root}.gate_proj.weight")) {
+            formats.remove(&format!("{root}.up_proj.weight"));
+            formats.insert(format!("{root}.gate_up_proj"), format);
+        }
+    }
+}
+
+/// Returns all derived recipes owned by the composite static modules.
+pub fn static_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+) -> BTreeMap<String, DerivedWeightRecipe> {
+    let first = "model.visual.patch_embed.proj.weight.0";
+    let second = "model.visual.patch_embed.proj.weight.1";
+    if catalog.tensor_metadata(first).is_err() || catalog.tensor_metadata(second).is_err() {
+        return BTreeMap::new();
+    }
+    BTreeMap::from([(
+        "model.visual.patch_embed.proj.weight".into(),
+        DerivedWeightRecipe::Stack {
+            axis: 2,
+            inputs: vec![
+                DerivedWeightRecipe::source(first, TensorSelection::Full),
+                DerivedWeightRecipe::source(second, TensorSelection::Full),
+            ],
+        },
+    )])
+}
+
+/// Returns all derived recipes for one flat vision/text execution unit.
+pub fn unit_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &ModelArgs,
+    flat: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let vision_layers = args.vision.layer_count();
+    if flat < vision_layers || !args.text.is_moe() {
+        return Ok(BTreeMap::new());
+    }
+    let resolved = qwen::expert_recipes(
+        catalog,
+        &args.text,
+        &args.text.parameter_root,
+        flat - vision_layers,
+    )?;
+    Ok(BTreeMap::from([
+        (resolved.target_gate_up, resolved.gate_up),
+        (resolved.target_down, resolved.down),
+    ]))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use eredu_checkpoint::{
+        recipe::RecipeCatalog,
+        store::{StoreError, TensorMetadata},
+        StoredDtype,
+    };
     use serde_json::json;
 
     use super::*;
+
+    struct Catalog(BTreeMap<String, TensorMetadata>);
+
+    impl RecipeCatalog for Catalog {
+        fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+            self.0
+                .get(key)
+                .cloned()
+                .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
+        }
+    }
+
+    fn metadata(name: &str, shape: Vec<usize>) -> TensorMetadata {
+        TensorMetadata {
+            name: name.into(),
+            encoded_byte_len: shape.iter().product::<usize>() as u64 * 2,
+            logical_shape: shape.clone(),
+            physical_shape: shape,
+            stored_dtype: StoredDtype::F16,
+            backing_shard: None,
+        }
+    }
 
     #[test]
     fn composite_plan_contains_one_text_and_one_shared_vision_namespace() {
@@ -55,5 +164,24 @@ mod tests {
             .common_tensors
             .iter()
             .any(|tensor| tensor.key.starts_with("patch_embed.")));
+    }
+
+    #[test]
+    fn neutral_catalog_owns_split_patch_translation_and_stacking() {
+        assert_eq!(
+            translate_vision_gguf_weight_name("v.patch_embd.weight", &[0]),
+            "model.visual.patch_embed.proj.weight.0"
+        );
+        let first = "model.visual.patch_embed.proj.weight.0";
+        let second = "model.visual.patch_embed.proj.weight.1";
+        let catalog = Catalog(BTreeMap::from([
+            (first.into(), metadata(first, vec![2, 3, 4])),
+            (second.into(), metadata(second, vec![2, 3, 4])),
+        ]));
+        let recipes = static_recipes(&catalog);
+        assert!(matches!(
+            recipes.get("model.visual.patch_embed.proj.weight"),
+            Some(DerivedWeightRecipe::Stack { axis: 2, inputs }) if inputs.len() == 2
+        ));
     }
 }

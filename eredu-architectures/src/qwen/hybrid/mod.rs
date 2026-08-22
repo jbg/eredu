@@ -11,7 +11,8 @@ mod parallel;
 
 pub use block::{Block, FeedForward, SharedRoutedGatedProduct, TokenMixer};
 pub use checkpoint::{
-    gguf_plan, qwen3_next_fused_recipes, safetensors_plan, translate_gguf_weight_name,
+    expert_recipes, gguf_plan, qwen3_next_fused_recipes, safetensors_plan, static_recipes,
+    translate_gguf_weight_name, translate_vision_gguf_weight_name, unit_recipes,
 };
 pub use conditional::{
     ConditionalForwardContext, ConditionalInput, ConditionalLayeredModel,

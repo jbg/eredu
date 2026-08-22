@@ -1,5 +1,7 @@
 //! SafeTensors contracts and fused-projection recipes for the hybrid decoder.
 
+use std::collections::BTreeMap;
+
 use eredu_checkpoint::{
     recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeCatalog},
     schema::{
@@ -8,12 +10,507 @@ use eredu_checkpoint::{
         SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
         TensorOperation,
     },
-    store::TensorSelection,
+    store::{CheckpointSource, TensorSelection, WeightStoreBackend},
 };
+
+/// Returns all derived recipes owned by Qwen hybrid static modules.
+pub fn static_recipes(
+    store: &dyn CheckpointSource,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let mut recipes = BTreeMap::new();
+    let patch0 = "model.visual.patch_embed.proj.weight.0";
+    let patch1 = "model.visual.patch_embed.proj.weight.1";
+    if store.source_metadata(patch0).is_ok() && store.source_metadata(patch1).is_ok() {
+        recipes.insert(
+            "model.visual.patch_embed.proj.weight".into(),
+            DerivedWeightRecipe::Stack {
+                axis: 2,
+                inputs: vec![
+                    DerivedWeightRecipe::source(patch0, TensorSelection::Full),
+                    DerivedWeightRecipe::source(patch1, TensorSelection::Full),
+                ],
+            },
+        );
+    }
+    if store
+        .source_diagnostics()
+        .map_err(|error| error.to_string())?
+        .backend
+        == WeightStoreBackend::Gguf
+    {
+        let name = "model.norm.weight";
+        if store.source_metadata(name).is_ok() {
+            recipes.insert(
+                name.into(),
+                DerivedWeightRecipe::SubtractOne {
+                    input: Box::new(DerivedWeightRecipe::source(name, TensorSelection::Full)),
+                },
+            );
+        }
+    }
+    Ok(recipes)
+}
+
+/// Returns the complete derived-weight catalog for one target or MTP unit.
+pub fn unit_recipes(
+    store: &dyn CheckpointSource,
+    config: &HybridConfig,
+    flat: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let target_layers = usize::try_from(config.num_hidden_layers)
+        .map_err(|_| "invalid Qwen hybrid layer count".to_string())?;
+    let mut recipes = BTreeMap::new();
+    if flat < target_layers
+        && config.variant == HybridVariant::Qwen3Next
+        && matches!(
+            config.layer_schedule.get(flat),
+            Some(HybridLayerPolicy::LinearAttention)
+        )
+    {
+        let fused = format!("model.layers.{flat}.linear_attn.in_proj_qkvz.weight");
+        if store.tensor_metadata(&fused).is_ok() {
+            recipes.extend(
+                qwen3_next_fused_recipes(store, config, flat)?
+                    .iter()
+                    .map(|(name, recipe)| (name.to_owned(), recipe.clone())),
+            );
+        }
+    }
+    if store
+        .source_diagnostics()
+        .map_err(|error| error.to_string())?
+        .backend
+        == WeightStoreBackend::Gguf
+    {
+        add_gguf_unit_transforms(&mut recipes, store, config, flat)?;
+    }
+    if !config.is_moe() {
+        return Ok(recipes);
+    }
+    let root = if flat < target_layers {
+        format!("model.layers.{flat}.mlp.experts")
+    } else {
+        format!("mtp.layers.{}.mlp.experts", flat - target_layers)
+    };
+    let gate_up = format!("{root}.gate_up_proj");
+    if store.tensor_metadata(&gate_up).is_err() {
+        let gate = format!("{root}.gate_proj");
+        let up = format!("{root}.up_proj");
+        if store.tensor_metadata(&gate).is_ok() && store.tensor_metadata(&up).is_ok() {
+            recipes.insert(
+                gate_up,
+                DerivedWeightRecipe::Concatenate {
+                    axis: 1,
+                    inputs: vec![
+                        DerivedWeightRecipe::source(gate, TensorSelection::Full),
+                        DerivedWeightRecipe::source(up, TensorSelection::Full),
+                    ],
+                },
+            );
+        } else {
+            let inputs = (0..config.num_experts)
+                .map(|expert| DerivedWeightRecipe::Concatenate {
+                    axis: 0,
+                    inputs: vec![
+                        DerivedWeightRecipe::source(
+                            format!("{root}.{expert}.gate_proj.weight"),
+                            TensorSelection::Full,
+                        ),
+                        DerivedWeightRecipe::source(
+                            format!("{root}.{expert}.up_proj.weight"),
+                            TensorSelection::Full,
+                        ),
+                    ],
+                })
+                .collect();
+            recipes.insert(gate_up, DerivedWeightRecipe::Stack { axis: 0, inputs });
+        }
+    }
+    let down = format!("{root}.down_proj");
+    if store.tensor_metadata(&down).is_err() {
+        recipes.insert(
+            down,
+            DerivedWeightRecipe::Stack {
+                axis: 0,
+                inputs: (0..config.num_experts)
+                    .map(|expert| {
+                        DerivedWeightRecipe::source(
+                            format!("{root}.{expert}.down_proj.weight"),
+                            TensorSelection::Full,
+                        )
+                    })
+                    .collect(),
+            },
+        );
+    }
+    Ok(recipes)
+}
+
+/// Returns canonical lazy-loading recipes for one routed target or MTP expert.
+pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    config: &HybridConfig,
+    layer: usize,
+    expert: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    if !config.is_moe() {
+        return Err("independent expert recipes require a routed Qwen hybrid model".into());
+    }
+    let target = config.num_hidden_layers as usize;
+    let total = target
+        .checked_add(config.mtp_num_hidden_layers as usize)
+        .ok_or_else(|| "Qwen hybrid layer count overflowed".to_string())?;
+    if layer >= total {
+        return Err(format!("Qwen hybrid has no routed layer {layer}"));
+    }
+    if expert >= config.num_experts as usize {
+        return Err(format!(
+            "Qwen hybrid has no expert {expert} in layer {layer}"
+        ));
+    }
+    let root = if layer < target {
+        format!("model.layers.{layer}.mlp.experts")
+    } else {
+        format!("mtp.layers.{}.mlp.experts", layer - target)
+    };
+    let selection = TensorSelection::Range {
+        axis: 0,
+        start: expert,
+        end: expert + 1,
+    };
+    let packed = catalog
+        .tensor_metadata(&format!("{root}.gate_up_proj"))
+        .is_ok();
+    let split_banks = ["gate_proj", "up_proj", "down_proj"]
+        .into_iter()
+        .all(|name| catalog.tensor_metadata(&format!("{root}.{name}")).is_ok());
+    let mut recipes = BTreeMap::new();
+    if packed {
+        for (target_name, required) in [
+            ("gate_up_proj", true),
+            ("gate_up_proj_scale_inv", false),
+            ("gate_up_proj_scales", false),
+            ("gate_up_proj_biases", false),
+            ("down_proj", true),
+            ("down_proj_scale_inv", false),
+            ("down_proj_scales", false),
+            ("down_proj_biases", false),
+        ] {
+            let source = format!("{root}.{target_name}");
+            if catalog.tensor_metadata(&source).is_err() {
+                if required {
+                    return Err(format!("missing packed Qwen hybrid expert tensor {source}"));
+                }
+                continue;
+            }
+            recipes.insert(
+                target_name.into(),
+                DerivedWeightRecipe::source(source, selection.clone()),
+            );
+        }
+    } else if split_banks {
+        recipes.insert(
+            "gate_up_proj".into(),
+            DerivedWeightRecipe::Concatenate {
+                axis: 1,
+                inputs: ["gate_proj", "up_proj"]
+                    .into_iter()
+                    .map(|name| {
+                        DerivedWeightRecipe::source(format!("{root}.{name}"), selection.clone())
+                    })
+                    .collect(),
+            },
+        );
+        recipes.insert(
+            "down_proj".into(),
+            DerivedWeightRecipe::source(format!("{root}.down_proj"), selection.clone()),
+        );
+        for suffix in ["scales", "biases", "scale_inv"] {
+            let gate = format!("{root}.gate_proj_{suffix}");
+            let up = format!("{root}.up_proj_{suffix}");
+            if catalog.tensor_metadata(&gate).is_ok() && catalog.tensor_metadata(&up).is_ok() {
+                recipes.insert(
+                    format!("gate_up_proj_{suffix}"),
+                    DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![
+                            DerivedWeightRecipe::source(gate, selection.clone()),
+                            DerivedWeightRecipe::source(up, selection.clone()),
+                        ],
+                    },
+                );
+            }
+            let down = format!("{root}.down_proj_{suffix}");
+            if catalog.tensor_metadata(&down).is_ok() {
+                recipes.insert(
+                    format!("down_proj_{suffix}"),
+                    DerivedWeightRecipe::source(down, selection.clone()),
+                );
+            }
+        }
+    } else {
+        let projection = |names: &[&str], suffix: &str| {
+            names
+                .iter()
+                .map(|name| format!("{root}.{expert}.{name}.{suffix}"))
+                .find(|name| catalog.tensor_metadata(name).is_ok())
+                .map(|name| DerivedWeightRecipe::source(name, TensorSelection::Full))
+                .ok_or_else(|| {
+                    format!("missing split Qwen hybrid expert {expert} tensor under {root}")
+                })
+        };
+        let gate = projection(&["gate_proj", "w1"], "weight")?;
+        let up = projection(&["up_proj", "w3"], "weight")?;
+        let down = projection(&["down_proj", "w2"], "weight")?;
+        recipes.insert(
+            "gate_up_proj".into(),
+            DerivedWeightRecipe::Stack {
+                axis: 0,
+                inputs: vec![DerivedWeightRecipe::Concatenate {
+                    axis: 0,
+                    inputs: vec![gate, up],
+                }],
+            },
+        );
+        recipes.insert(
+            "down_proj".into(),
+            DerivedWeightRecipe::Stack {
+                axis: 0,
+                inputs: vec![down],
+            },
+        );
+        if let (Ok(gate), Ok(up), Ok(down)) = (
+            projection(&["gate_proj", "w1"], "weight_scale_inv"),
+            projection(&["up_proj", "w3"], "weight_scale_inv"),
+            projection(&["down_proj", "w2"], "weight_scale_inv"),
+        ) {
+            recipes.insert(
+                "gate_up_proj_scale_inv".into(),
+                DerivedWeightRecipe::Stack {
+                    axis: 0,
+                    inputs: vec![DerivedWeightRecipe::Concatenate {
+                        axis: 0,
+                        inputs: vec![gate, up],
+                    }],
+                },
+            );
+            recipes.insert(
+                "down_proj_scale_inv".into(),
+                DerivedWeightRecipe::Stack {
+                    axis: 0,
+                    inputs: vec![down],
+                },
+            );
+        }
+    }
+    Ok(recipes)
+}
+
+fn add_gguf_unit_transforms(
+    recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
+    store: &dyn CheckpointSource,
+    config: &HybridConfig,
+    flat: usize,
+) -> Result<(), String> {
+    let target_layers = usize::try_from(config.num_hidden_layers)
+        .map_err(|_| "invalid Qwen hybrid layer count".to_string())?;
+    let root = if flat < target_layers {
+        format!("model.layers.{flat}")
+    } else {
+        format!("mtp.layers.{}", flat - target_layers)
+    };
+    for suffix in [
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+    ] {
+        let name = format!("{root}.{suffix}");
+        if store.source_metadata(&name).is_ok() {
+            recipes.insert(
+                name.clone(),
+                DerivedWeightRecipe::SubtractOne {
+                    input: Box::new(DerivedWeightRecipe::source(name, TensorSelection::Full)),
+                },
+            );
+        }
+    }
+    let a_log = format!("{root}.linear_attn.A_log");
+    if store.source_metadata(&a_log).is_ok() {
+        recipes.insert(
+            a_log.clone(),
+            DerivedWeightRecipe::NegLog {
+                input: Box::new(DerivedWeightRecipe::source(a_log, TensorSelection::Full)),
+            },
+        );
+    }
+    let shared_gate = format!("{root}.mlp.shared_expert_gate.weight");
+    if let Ok(metadata) = store.source_metadata(&shared_gate) {
+        if metadata.logical_shape.len() == 1 {
+            recipes.insert(
+                shared_gate.clone(),
+                DerivedWeightRecipe::Reshape {
+                    input: Box::new(DerivedWeightRecipe::source(
+                        shared_gate,
+                        TensorSelection::Full,
+                    )),
+                    shape: vec![1, metadata.logical_shape[0]],
+                },
+            );
+        }
+    }
+    let conv = format!("{root}.linear_attn.conv1d.weight");
+    if let Ok(metadata) = store.source_metadata(&conv) {
+        if metadata.logical_shape.len() == 2 {
+            let source = DerivedWeightRecipe::source(conv.clone(), TensorSelection::Full);
+            let source = if config.variant == HybridVariant::Qwen3Next {
+                source
+            } else {
+                qwen35_value_head_recipe(
+                    "linear_attn.in_proj_qkv.weight",
+                    source,
+                    &metadata.logical_shape,
+                    config,
+                )?
+                .unwrap_or_else(|| DerivedWeightRecipe::source(&conv, TensorSelection::Full))
+            };
+            recipes.insert(
+                conv.clone(),
+                DerivedWeightRecipe::Reshape {
+                    input: Box::new(source),
+                    shape: vec![metadata.logical_shape[0], 1, metadata.logical_shape[1]],
+                },
+            );
+        }
+    }
+    if config.variant == HybridVariant::Qwen3Next {
+        return Ok(());
+    }
+    for suffix in [
+        "linear_attn.in_proj_qkv.weight",
+        "linear_attn.in_proj_z.weight",
+        "linear_attn.in_proj_a.weight",
+        "linear_attn.in_proj_b.weight",
+        "linear_attn.dt_bias",
+        "linear_attn.A_log",
+        "linear_attn.out_proj.weight",
+    ] {
+        let name = format!("{root}.{suffix}");
+        let Ok(metadata) = store.source_metadata(&name) else {
+            continue;
+        };
+        let base = recipes
+            .remove(&name)
+            .unwrap_or_else(|| DerivedWeightRecipe::source(name.clone(), TensorSelection::Full));
+        if let Some(recipe) =
+            qwen35_value_head_recipe(suffix, base, &metadata.logical_shape, config)?
+        {
+            recipes.insert(name, recipe);
+        }
+    }
+    Ok(())
+}
+
+fn qwen35_value_head_recipe(
+    suffix: &str,
+    recipe: DerivedWeightRecipe,
+    shape: &[usize],
+    config: &HybridConfig,
+) -> Result<Option<DerivedWeightRecipe>, String> {
+    let num_k = usize::try_from(config.linear_num_key_heads)
+        .map_err(|_| "invalid Qwen3.5 key-head count".to_string())?;
+    let num_v = usize::try_from(config.linear_num_value_heads)
+        .map_err(|_| "invalid Qwen3.5 value-head count".to_string())?;
+    if num_k == 0 || num_v == 0 || num_v % num_k != 0 {
+        return Err("invalid Qwen3.5 value-head grouping".into());
+    }
+    let repeats = num_v / num_k;
+    let reorder =
+        |input: DerivedWeightRecipe, axis: usize, head_width: usize, original: Vec<usize>| {
+            let mut expanded = original.clone();
+            expanded.splice(axis..=axis, [repeats, num_k, head_width]);
+            let mut axes = (0..expanded.len()).collect::<Vec<_>>();
+            axes.swap(axis, axis + 1);
+            DerivedWeightRecipe::Reshape {
+                input: Box::new(DerivedWeightRecipe::Transpose {
+                    input: Box::new(DerivedWeightRecipe::Reshape {
+                        input: Box::new(input),
+                        shape: expanded,
+                    }),
+                    axes,
+                }),
+                shape: original,
+            }
+        };
+    if suffix.ends_with("in_proj_qkv.weight") {
+        if shape.len() != 2 {
+            return Ok(None);
+        }
+        let prefix = 2usize
+            .checked_mul(num_k)
+            .and_then(|value| value.checked_mul(config.linear_key_head_dim as usize))
+            .ok_or_else(|| "Qwen3.5 value-tail width overflow".to_string())?;
+        if prefix >= shape[0] || !(shape[0] - prefix).is_multiple_of(num_v) {
+            return Ok(None);
+        }
+        let leading = DerivedWeightRecipe::Select {
+            input: Box::new(recipe.clone()),
+            selection: TensorSelection::Range {
+                axis: 0,
+                start: 0,
+                end: prefix,
+            },
+        };
+        let tail = DerivedWeightRecipe::Select {
+            input: Box::new(recipe),
+            selection: TensorSelection::Range {
+                axis: 0,
+                start: prefix,
+                end: shape[0],
+            },
+        };
+        return Ok(Some(DerivedWeightRecipe::Concatenate {
+            axis: 0,
+            inputs: vec![
+                leading,
+                reorder(
+                    tail,
+                    0,
+                    (shape[0] - prefix) / num_v,
+                    vec![shape[0] - prefix, shape[1]],
+                ),
+            ],
+        }));
+    }
+    let axis = if suffix.ends_with("out_proj.weight") {
+        1
+    } else {
+        0
+    };
+    if axis >= shape.len() || !shape[axis].is_multiple_of(num_v) {
+        return Ok(None);
+    }
+    let admitted = suffix.ends_with("in_proj_z.weight")
+        || suffix.ends_with("in_proj_a.weight")
+        || suffix.ends_with("in_proj_b.weight")
+        || suffix.ends_with("dt_bias")
+        || suffix.ends_with("A_log")
+        || suffix.ends_with("out_proj.weight");
+    Ok(admitted.then(|| reorder(recipe, axis, shape[axis] / num_v, shape.to_vec())))
+}
 
 use super::{
     fp8_block_row_widths, fused_projection_widths, HybridConfig, HybridLayerPolicy, HybridVariant,
 };
+
+/// Translates one hybrid projector GGUF name, including split patch weights.
+pub fn translate_vision_gguf_weight_name(name: &str, deepstack: &[i32]) -> String {
+    match name {
+        "v.patch_embd.weight" => "model.visual.patch_embed.proj.weight.0".into(),
+        "v.patch_embd.weight.1" => "model.visual.patch_embed.proj.weight.1".into(),
+        _ => crate::qwen::vision::translate_gguf_weight_name(name, deepstack),
+    }
+}
 
 /// Builds the strict hybrid text SafeTensors catalog.
 pub fn safetensors_plan(config: &HybridConfig) -> Result<SafetensorsCheckpointPlan, String> {
@@ -866,9 +1363,10 @@ mod tests {
 
     use eredu_checkpoint::{
         recipe::RecipeCatalog,
-        store::{StoreError, TensorMetadata},
+        store::{MemoryWeightStore, StoreError, TensorMetadata},
         StoredDtype,
     };
+    use safetensors::tensor::Dtype;
     use serde_json::json;
 
     use super::*;
@@ -916,6 +1414,14 @@ mod tests {
         }))
         .unwrap()
         .text
+    }
+
+    fn memory_store(tensors: impl IntoIterator<Item = (String, Vec<usize>)>) -> MemoryWeightStore {
+        MemoryWeightStore::from_safetensors(tensors.into_iter().map(|(name, shape)| {
+            let bytes = vec![0; shape.iter().product::<usize>() * 2];
+            (name, Dtype::F16, shape, bytes)
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -974,6 +1480,32 @@ mod tests {
                 .unwrap()
                 .shape(),
             &[32, 32]
+        );
+    }
+
+    #[test]
+    fn neutral_unit_catalog_owns_fused_recurrent_transforms() {
+        let config = config();
+        let prefix = "model.layers.0.linear_attn";
+        let store = memory_store([
+            (format!("{prefix}.in_proj_qkvz.weight"), vec![96, 32]),
+            (format!("{prefix}.in_proj_ba.weight"), vec![8, 32]),
+        ]);
+        let recipes = unit_recipes(&store, &config, 0).unwrap();
+        for suffix in [
+            "in_proj_qkv.weight",
+            "in_proj_z.weight",
+            "in_proj_a.weight",
+            "in_proj_b.weight",
+        ] {
+            assert!(
+                recipes.contains_key(&format!("{prefix}.{suffix}")),
+                "missing {suffix}"
+            );
+        }
+        assert_eq!(
+            translate_vision_gguf_weight_name("v.patch_embd.weight.1", &[0]),
+            "model.visual.patch_embed.proj.weight.1"
         );
     }
 

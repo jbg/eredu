@@ -60,6 +60,13 @@ plans, and the complete embedding/layer/output lifecycle. Architecture code is
 generic over `NeuralBackend` and passes backend-native tensor handles through
 unchanged.
 
+Architecture checkpoint modules also own canonical name translation and the
+complete derived-weight recipe catalogs for static modules, execution units,
+and independently resident experts. Concrete backends consume those neutral
+recipes for binding, materialization, sharding, and transfer; they do not
+redeclare family-specific stacking, concatenation, reshaping, normalization,
+or recurrent-weight transformations.
+
 A backend owns runtime-specific resources and computation:
 
 - tensors, neural operators, queues or streams, random state, and sampling math;

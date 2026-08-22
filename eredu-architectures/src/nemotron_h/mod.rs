@@ -12,7 +12,10 @@ pub mod parallel;
 
 pub use attention::{new_attention, new_attention_at};
 pub use block::{Block, Operator};
-pub use checkpoint::{gguf_plan, safetensors_plan, translate_gguf_weight_name};
+pub use checkpoint::{
+    expert_recipes, gguf_plan, normalized_checkpoint_keys, safetensors_plan, static_recipes,
+    translate_gguf_weight_name, unit_recipes, unit_recipes_flat,
+};
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,
     prompt_cache_architecture_fingerprint, state_layout, state_layout_with_geometry, ConfigError,
