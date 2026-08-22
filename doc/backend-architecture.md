@@ -132,6 +132,13 @@ execution plan. Distributed backend preflight consumes both facts from that
 exact normalized report instead of reconstructing support from raw or wrapper
 `model_type` values.
 
+The MLX backend materializes every active expert-parallel axis through its
+single distributed-stage loader. Pure EP, PP+EP, TP+EP, and TP+PP+EP therefore
+share architecture capability validation, expert assignment, residency, and
+execution; there is no separate family-dispatched EP model loader. The same
+path covers every architecture whose neutral parallel plan declares EP,
+including multimodal and hybrid-state MoE families.
+
 Artifact inspection also consumes architecture-derived input modalities from
 that exact normalized configuration. Backends translate those neutral flags
 into report and build-feature readiness, but do not infer image, audio, or

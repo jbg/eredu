@@ -19,13 +19,14 @@ use eredu_backend_mlx::native::{
 use eredu_backend_mlx::{
     backend::mlx::error::Error,
     backend::mlx::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
-    backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
-    backend::mlx::runtime::residency::expert_cache::{
-        ExpertCache, ExpertCatalogEntry, ExpertRouteBatch,
-    },
-    composition::mlx::distributed::expert::{
-        dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
-        DispatchedRoutes, ExpertAssignment, LocalExpertBank, RoutedTransport, ShardedRouteBlocks,
+    backend::mlx::runtime::{
+        checkpoint::store::{SafetensorsWeightStore, TensorSelection},
+        distributed::expert::{
+            dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings,
+            AllToAllVPlan, DispatchedRoutes, ExpertAssignment, LocalExpertBank, RoutedTransport,
+            ShardedRouteBlocks,
+        },
+        residency::expert_cache::{ExpertCache, ExpertCatalogEntry, ExpertRouteBatch},
     },
 };
 use eredu_runtime::{

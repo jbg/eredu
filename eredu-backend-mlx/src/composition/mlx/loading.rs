@@ -289,17 +289,6 @@ pub fn materialize_model_plan(
                 .map(|model| MlxModel::pipeline(model, runtime_state_dtype_bytes))?;
             return attach_artifact_processor(model, &artifact);
         }
-        if topology.expert_parallel_size > 1 {
-            let model =
-                crate::composition::mlx::distributed::expert::load_expert_parallel_model_with_options(
-                    path,
-                    options,
-                    stream,
-                    weights_stream,
-                )
-                .map(|model| MlxModel::expert(model, runtime_state_dtype_bytes))?;
-            return attach_artifact_processor(model, &artifact);
-        }
         if let ModelArtifact::SafeTensors {
             path,
             configuration,
@@ -340,11 +329,7 @@ fn requires_distributed_stage_loader(
     topology: crate::backend::mlx::MlxParallelContext,
 ) -> bool {
     topology.pipeline_parallel_size > 1
-        || (topology.expert_parallel_size > 1
-            && matches!(
-                kind,
-                ModelKind::Gemma4 | ModelKind::MuseGlimmer | ModelKind::Inkling
-            ))
+        || topology.expert_parallel_size > 1
         || matches!(
             kind,
             ModelKind::Qwen3Next | ModelKind::Qwen35 | ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe
@@ -420,6 +405,17 @@ mod runtime_state_dtype_tests {
         }
         assert!(!requires_distributed_stage_loader(
             ModelKind::Qwen3,
+            topology
+        ));
+    }
+
+    #[test]
+    fn expert_parallel_topology_unconditionally_uses_distributed_stage_loader() {
+        let topology =
+            MlxParallelContext::for_rank(0, 1, 1, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap();
+        assert!(requires_distributed_stage_loader(
+            ModelKind::Llama,
             topology
         ));
     }

@@ -421,7 +421,6 @@ fn pipeline_ring_worker() {
         let expected_mtp_capability = match &model.inner {
             MlxModelKind::Complete(model) => model.mtp_capability(),
             MlxModelKind::Pipeline(model) => model.mtp_capability(),
-            MlxModelKind::Expert(model) => model.mtp_capability(),
         };
         let mut runtime = eredu::ModelRuntime::from_prepared(backend, model).unwrap();
         assert_eq!(

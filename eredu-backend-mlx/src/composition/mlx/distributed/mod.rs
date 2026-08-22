@@ -1,6 +1,6 @@
 //! Architecture-neutral distributed MLX model composition.
 
-/// Executable expert-parallel model adapters.
-pub mod expert;
-/// Executable pipeline-parallel model adapters.
+/// Routed-expert execution shared by distributed stages.
+pub(crate) mod expert;
+/// Executable distributed-stage adapters for TP, PP, EP, and Cartesian layouts.
 pub mod pipeline;

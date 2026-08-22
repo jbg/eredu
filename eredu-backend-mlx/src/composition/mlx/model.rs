@@ -195,7 +195,7 @@ impl Model {
         let topology = execution.topology();
         if topology.pipeline_parallel_size != 1 || topology.expert_parallel_size != 1 {
             return Err(Exception::custom(
-                "architecture-erased distributed MTP requires a non-pipeline, non-EP model; use PipelineModel or ExpertParallelModel for active PP/EP axes",
+                "architecture-erased distributed MTP requires a non-distributed model; use PipelineModel for active PP/EP axes",
             ));
         }
         if self.parallel_info().map(|info| info.topology()) != Some(topology) {

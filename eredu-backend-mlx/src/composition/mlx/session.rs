@@ -19,9 +19,8 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
     backend::mlx::runtime::media::input,
-    composition::mlx::distributed::{
-        expert::ExpertParallelCache,
-        pipeline::{PipelineCache, PipelineStageCompletion, PipelineStep},
+    composition::mlx::distributed::pipeline::{
+        PipelineCache, PipelineStageCompletion, PipelineStep,
     },
     MlxTensor,
 };
@@ -285,10 +284,6 @@ enum MlxSessionKind {
         crate::composition::mlx::distributed::pipeline::PipelineModel,
         PipelineCache,
     ),
-    Expert(
-        crate::composition::mlx::distributed::expert::ExpertParallelModel,
-        ExpertParallelCache,
-    ),
 }
 
 impl<'a> MlxModelSession<'a> {
@@ -329,10 +324,6 @@ impl<'a> MlxModelSession<'a> {
                 let cache = model.new_cache()?;
                 MlxSessionKind::Pipeline(model, cache)
             }
-            MlxModelKind::Expert(model) => {
-                let cache = model.new_cache();
-                MlxSessionKind::Expert(model, cache)
-            }
         };
         Ok(Self {
             inner,
@@ -357,7 +348,6 @@ impl<'a> MlxModelSession<'a> {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.model_type(),
             MlxSessionKind::Pipeline(model, _) => model.stage_info().model_kind.model_type_name(),
-            MlxSessionKind::Expert(model, _) => model.info().model_kind.model_type_name(),
         }
     }
 
@@ -366,7 +356,6 @@ impl<'a> MlxModelSession<'a> {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.mtp_capability(),
             MlxSessionKind::Pipeline(model, _) => model.mtp_capability(),
-            MlxSessionKind::Expert(model, _) => model.mtp_capability(),
         }
     }
 
@@ -375,7 +364,6 @@ impl<'a> MlxModelSession<'a> {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.residency_report(),
             MlxSessionKind::Pipeline(model, _) => model.parameter_residency_report(),
-            MlxSessionKind::Expert(_, _) => Ok(None),
         }
     }
 
@@ -386,7 +374,6 @@ impl<'a> MlxModelSession<'a> {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.dense_stream_report(),
             MlxSessionKind::Pipeline(model, _) => model.dense_stream_report(),
-            MlxSessionKind::Expert(model, _) => model.dense_stream_report(),
         }
     }
 
@@ -400,7 +387,6 @@ impl<'a> MlxModelSession<'a> {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.expert_cache_report(),
             MlxSessionKind::Pipeline(model, _) => model.expert_cache_report(),
-            MlxSessionKind::Expert(model, _) => model.expert_cache_report(),
         }
     }
 
@@ -411,7 +397,7 @@ impl<'a> MlxModelSession<'a> {
     ) -> Option<&safemlx::native_quantization::NativeQuantizationStats> {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.native_quantization_stats(),
-            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => None,
+            MlxSessionKind::Pipeline(_, _) => None,
         }
     }
 
@@ -422,9 +408,6 @@ impl<'a> MlxModelSession<'a> {
                 .prompt_cache_architecture_fingerprint()
                 .map_err(Into::into),
             MlxSessionKind::Pipeline(model, _) => Ok(model
-                .prompt_cache_model_identity()?
-                .architecture_fingerprint),
-            MlxSessionKind::Expert(model, _) => Ok(model
                 .prompt_cache_model_identity()?
                 .architecture_fingerprint),
         }
@@ -441,9 +424,6 @@ impl<'a> MlxModelSession<'a> {
             MlxSessionKind::Pipeline(model, _) => {
                 Ok(model.prompt_cache_model_identity()?.layer_layout)
             }
-            MlxSessionKind::Expert(model, _) => {
-                Ok(model.prompt_cache_model_identity()?.layer_layout)
-            }
         }
     }
 
@@ -455,9 +435,6 @@ impl<'a> MlxModelSession<'a> {
                 .map(|layout| layout.len())
                 .map_err(Into::into),
             MlxSessionKind::Pipeline(model, _) => {
-                Ok(model.prompt_cache_model_identity()?.layer_count)
-            }
-            MlxSessionKind::Expert(model, _) => {
                 Ok(model.prompt_cache_model_identity()?.layer_count)
             }
         }
@@ -477,10 +454,6 @@ impl<'a> MlxModelSession<'a> {
                 let identity = model.prompt_cache_model_identity()?;
                 Ok(identity.global_layer_start..identity.global_layer_end)
             }
-            MlxSessionKind::Expert(model, _) => {
-                let identity = model.prompt_cache_model_identity()?;
-                Ok(identity.global_layer_start..identity.global_layer_end)
-            }
         }
     }
 
@@ -493,16 +466,13 @@ impl<'a> MlxModelSession<'a> {
             MlxSessionKind::Pipeline(model, _) => {
                 Ok(model.prompt_cache_model_identity()?.layer_prefix_offsets)
             }
-            MlxSessionKind::Expert(model, _) => {
-                Ok(model.prompt_cache_model_identity()?.layer_prefix_offsets)
-            }
         }
     }
 
     pub fn complete_model(&self) -> &Model {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model,
-            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => {
+            MlxSessionKind::Pipeline(_, _) => {
                 unreachable!("replicated facade contains a distributed MLX session")
             }
         }
@@ -515,7 +485,6 @@ impl<'a> MlxModelSession<'a> {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.architecture_capability_estimate(),
             MlxSessionKind::Pipeline(model, _) => model.capability_estimate(),
-            MlxSessionKind::Expert(model, _) => model.capability_estimate(),
         }
     }
 
@@ -526,14 +495,13 @@ impl<'a> MlxModelSession<'a> {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.prepared_media_plan(input),
             MlxSessionKind::Pipeline(model, _) => model.prepared_media_plan(input),
-            MlxSessionKind::Expert(model, _) => model.prepared_media_plan(input),
         }
     }
 
     pub fn complete_parts_mut(&mut self) -> (&mut Model, &mut ModelCache) {
         match &mut self.inner {
             MlxSessionKind::Complete(model, cache) => (model, cache),
-            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => {
+            MlxSessionKind::Pipeline(_, _) => {
                 unreachable!("replicated facade contains a distributed MLX session")
             }
         }
@@ -547,7 +515,7 @@ impl<'a> MlxModelSession<'a> {
     pub fn test_complete_model(&self) -> &Model {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model,
-            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => {
+            MlxSessionKind::Pipeline(_, _) => {
                 panic!("test expected a replicated MLX model session")
             }
         }
@@ -557,7 +525,7 @@ impl<'a> MlxModelSession<'a> {
     pub fn test_complete_cache(&self) -> &ModelCache {
         match &self.inner {
             MlxSessionKind::Complete(_, cache) => cache,
-            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => {
+            MlxSessionKind::Pipeline(_, _) => {
                 panic!("test expected a replicated MLX model-session cache")
             }
         }
@@ -571,7 +539,6 @@ impl<'a> MlxModelSession<'a> {
                 Ok(())
             }
             MlxSessionKind::Pipeline(_, cache) => cache.reset(),
-            MlxSessionKind::Expert(_, cache) => cache.reset(),
         }
     }
 
@@ -584,7 +551,6 @@ impl<'a> MlxModelSession<'a> {
                 .residency_report()
                 .map_err(|error| Error::Parallel(error.to_string())),
             MlxSessionKind::Pipeline(model, cache) => model.cache_residency_report(cache),
-            MlxSessionKind::Expert(model, cache) => model.cache_residency_report(cache),
         }
     }
 
@@ -598,9 +564,6 @@ impl<'a> MlxModelSession<'a> {
                 *cache = model.new_cache_with_options(policy)?;
             }
             MlxSessionKind::Pipeline(model, cache) => {
-                *cache = model.new_cache_with_options(policy)?;
-            }
-            MlxSessionKind::Expert(model, cache) => {
                 *cache = model.new_cache_with_options(policy)?;
             }
         }
@@ -635,14 +598,6 @@ impl<'a> MlxModelSession<'a> {
                 options,
                 backend.stream(),
             ),
-            MlxSessionKind::Expert(model, cache) => model.save_prompt_cache(
-                cache,
-                root,
-                descriptor,
-                prefix_token_ids,
-                options,
-                backend.stream(),
-            ),
         }
     }
 
@@ -668,17 +623,6 @@ impl<'a> MlxModelSession<'a> {
                 manifest
             }
             MlxSessionKind::Pipeline(model, cache) => {
-                let (loaded_cache, manifest) = model.load_prompt_cache(
-                    root,
-                    expected,
-                    prefix_token_ids,
-                    options,
-                    backend.stream(),
-                )?;
-                *cache = loaded_cache;
-                manifest
-            }
-            MlxSessionKind::Expert(model, cache) => {
                 let (loaded_cache, manifest) = model.load_prompt_cache(
                     root,
                     expected,
@@ -733,20 +677,6 @@ impl<'a> MlxModelSession<'a> {
                     })?,
                 )
                 .map_err(Into::into),
-            MlxSessionKind::Expert(model, cache) => model
-                .generate_embedded_mtp_distributed(
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    sampler,
-                    distributed.ok_or_else(|| {
-                        safemlx::error::Exception::custom(
-                            "expert embedded MTP requires session-owned communication",
-                        )
-                    })?,
-                )
-                .map_err(Into::into),
         })
     }
 
@@ -780,15 +710,14 @@ impl<'a> MlxModelSession<'a> {
                 finished,
                 distributed,
             ),
-            MlxSessionKind::Complete(_, _) | MlxSessionKind::Expert(_, _) => distributed
-                .sample_and_synchronize(
-                    logits,
-                    batch_size,
-                    sampler,
-                    temperature,
-                    prng_state,
-                    finished,
-                ),
+            MlxSessionKind::Complete(_, _) => distributed.sample_and_synchronize(
+                logits,
+                batch_size,
+                sampler,
+                temperature,
+                prng_state,
+                finished,
+            ),
         }
     }
 
@@ -878,11 +807,9 @@ impl<'a> MlxModelSession<'a> {
                 backend.stream(),
                 observer,
             ),
-            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => {
-                Err(Error::UnsupportedArchitecture(
-                    "activation observation is unavailable for distributed MLX sessions".into(),
-                ))
-            }
+            MlxSessionKind::Pipeline(_, _) => Err(Error::UnsupportedArchitecture(
+                "activation observation is unavailable for distributed MLX sessions".into(),
+            )),
         }
     }
 
@@ -978,16 +905,6 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                 })?;
                 pipeline_submission(completion)
             }
-            MlxSessionKind::Expert(model, cache) => {
-                let distributed = self.distributed.as_ref().ok_or_else(|| {
-                    Error::Parallel("expert model session has no communication".into())
-                })?;
-                let output = input.with_borrowed(|borrowed| {
-                    let tokens = input::text_token_ids(borrowed, backend.stream())?;
-                    model.forward(&tokens, None, cache, distributed)
-                })?;
-                model_submission(output)
-            }
         }
     }
 
@@ -1023,12 +940,6 @@ impl<'a> BackendSession<MlxBackend<'a>> for MlxModelSession<'a> {
                     distributed,
                 )?;
                 pipeline_submission(completion)
-            }
-            MlxSessionKind::Expert(model, cache) => {
-                let distributed = self.distributed.as_ref().ok_or_else(|| {
-                    Error::Parallel("expert model session has no communication".into())
-                })?;
-                model_submission(model.forward(&input, None, cache, distributed)?)
             }
         }
     }

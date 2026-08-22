@@ -37,10 +37,7 @@ use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Strea
 use crate::composition::mlx::ModelProcessor;
 use crate::{
     backend::mlx::error::Error,
-    composition::mlx::{
-        distributed::{expert::ExpertParallelModel, pipeline::PipelineModel},
-        MlxModelSession, Model,
-    },
+    composition::mlx::{distributed::pipeline::PipelineModel, MlxModelSession, Model},
 };
 
 /// Opaque MLX executable selected for one complete model session.
@@ -58,7 +55,6 @@ pub struct MlxModel {
 pub enum MlxModelKind {
     Complete(Model),
     Pipeline(PipelineModel),
-    Expert(ExpertParallelModel),
 }
 
 impl MlxModel {
@@ -77,18 +73,6 @@ impl MlxModel {
     ) -> Self {
         Self {
             inner: MlxModelKind::Pipeline(model),
-            runtime_state_dtype_bytes,
-            #[cfg(feature = "media")]
-            processor: None,
-        }
-    }
-
-    pub(crate) const fn expert(
-        model: ExpertParallelModel,
-        runtime_state_dtype_bytes: NonZeroU8,
-    ) -> Self {
-        Self {
-            inner: MlxModelKind::Expert(model),
             runtime_state_dtype_bytes,
             #[cfg(feature = "media")]
             processor: None,
@@ -115,7 +99,7 @@ impl MlxModel {
     pub fn into_complete(self) -> Result<Model, Error> {
         match self.inner {
             MlxModelKind::Complete(model) => Ok(model),
-            MlxModelKind::Pipeline(_) | MlxModelKind::Expert(_) => Err(Error::Parallel(
+            MlxModelKind::Pipeline(_) => Err(Error::Parallel(
                 "the tokenizer/generation facade requires a replicated model; execute distributed models through MlxModelSession"
                     .into(),
             )),
@@ -127,7 +111,6 @@ impl MlxModel {
         match &self.inner {
             MlxModelKind::Complete(model) => model.model_type(),
             MlxModelKind::Pipeline(model) => model.stage_info().model_kind.model_type_name(),
-            MlxModelKind::Expert(model) => model.info().model_kind.model_type_name(),
         }
     }
 
@@ -136,7 +119,6 @@ impl MlxModel {
         match &self.inner {
             MlxModelKind::Complete(model) => model.parallel_info().map(|info| info.topology()),
             MlxModelKind::Pipeline(model) => Some(model.stage_info().topology),
-            MlxModelKind::Expert(model) => Some(model.info().topology),
         }
         .filter(|topology| !topology.is_replicated())
     }
@@ -146,7 +128,6 @@ impl MlxModel {
         match &self.inner {
             MlxModelKind::Complete(model) => model.residency_report(),
             MlxModelKind::Pipeline(model) => model.parameter_residency_report(),
-            MlxModelKind::Expert(_) => Ok(None),
         }
     }
 
@@ -157,7 +138,6 @@ impl MlxModel {
         match &self.inner {
             MlxModelKind::Complete(model) => model.dense_stream_report(),
             MlxModelKind::Pipeline(model) => model.dense_stream_report(),
-            MlxModelKind::Expert(model) => model.dense_stream_report(),
         }
     }
 
@@ -171,7 +151,6 @@ impl MlxModel {
         match &self.inner {
             MlxModelKind::Complete(model) => model.expert_cache_report(),
             MlxModelKind::Pipeline(model) => model.expert_cache_report(),
-            MlxModelKind::Expert(model) => model.expert_cache_report(),
         }
     }
 }
