@@ -1,6 +1,6 @@
 //! MLX checkpoint and residency adapter for neutral Muse-Glimmer experts.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use eredu_architectures::muse_glimmer::{DecoderConfig, TransformerBlock};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
@@ -22,134 +22,16 @@ use crate::backend::mlx::{
     },
 };
 
-fn existing(keys: &BTreeSet<String>, names: impl IntoIterator<Item = String>) -> Option<String> {
-    names.into_iter().find(|name| keys.contains(name))
-}
-
-/// Builds released SafeTensors aliases and expert-layout recipes for one module.
+/// Selects the architecture-owned released-layout recipes used by one module.
 pub fn module_recipes<M: ModuleParameters>(
     module: &M,
     args: &DecoderConfig,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
-    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let parameters = module.parameters().flatten();
-    let mut recipes = BTreeMap::new();
-    for name in parameters.keys() {
-        let released = name
-            .replace("model.layers.", "model.language_model.layers.")
-            .replace("model.embed_tokens.", "model.language_model.embed_tokens.")
-            .replace("model.norm.", "model.language_model.norm.");
-        let released = if let Some(prefix) = released.strip_suffix("_scales") {
-            format!("{prefix}.scales")
-        } else if let Some(prefix) = released.strip_suffix("_biases") {
-            format!("{prefix}.biases")
-        } else {
-            released
-        };
-        if released != name.as_ref() && keys.contains(&released) {
-            recipes.insert(
-                name.to_string(),
-                DerivedWeightRecipe::source(released, TensorSelection::Full),
-            );
-        }
-    }
-    if args.is_moe() {
-        let experts = usize::try_from(args.num_experts)
-            .map_err(|_| Error::UnsupportedArchitecture("invalid expert count".into()))?;
-        for layer in 0..args.num_hidden_layers as usize {
-            let target = format!("model.layers.{layer}.mlp.experts");
-            if !parameters
-                .keys()
-                .any(|name| name.starts_with(&format!("{target}.")))
-            {
-                continue;
-            }
-            let released = format!("model.language_model.layers.{layer}.mlp.experts");
-            let packed_gate_up = existing(
-                &keys,
-                [
-                    format!("{target}.gate_up_proj"),
-                    format!("{released}.gate_up_proj"),
-                    format!("{released}.gate_up_proj.weight"),
-                ],
-            );
-            let gate_up = if let Some(source) = packed_gate_up {
-                Some(DerivedWeightRecipe::source(source, TensorSelection::Full))
-            } else if let (Some(gate), Some(up)) = (
-                existing(
-                    &keys,
-                    [
-                        format!("{target}.gate_proj"),
-                        format!("{target}.gate_proj.weight"),
-                        format!("{released}.gate_proj"),
-                        format!("{released}.gate_proj.weight"),
-                    ],
-                ),
-                existing(
-                    &keys,
-                    [
-                        format!("{target}.up_proj"),
-                        format!("{target}.up_proj.weight"),
-                        format!("{released}.up_proj"),
-                        format!("{released}.up_proj.weight"),
-                    ],
-                ),
-            ) {
-                Some(DerivedWeightRecipe::Concatenate {
-                    axis: 1,
-                    inputs: vec![
-                        DerivedWeightRecipe::source(gate, TensorSelection::Full),
-                        DerivedWeightRecipe::source(up, TensorSelection::Full),
-                    ],
-                })
-            } else {
-                let independent = (0..experts)
-                    .map(|expert| {
-                        let root = format!("{released}.{expert}");
-                        let gate = format!("{root}.gate_proj.weight");
-                        let up = format!("{root}.up_proj.weight");
-                        (keys.contains(&gate) && keys.contains(&up)).then(|| {
-                            DerivedWeightRecipe::Concatenate {
-                                axis: 0,
-                                inputs: vec![
-                                    DerivedWeightRecipe::source(gate, TensorSelection::Full),
-                                    DerivedWeightRecipe::source(up, TensorSelection::Full),
-                                ],
-                            }
-                        })
-                    })
-                    .collect::<Option<Vec<_>>>();
-                independent.map(|inputs| DerivedWeightRecipe::Stack { axis: 0, inputs })
-            };
-            if let Some(gate_up) = gate_up {
-                recipes.insert(format!("{target}.gate_up_proj"), gate_up);
-            }
-            let down = existing(
-                &keys,
-                [
-                    format!("{target}.down_proj"),
-                    format!("{target}.down_proj.weight"),
-                    format!("{released}.down_proj"),
-                    format!("{released}.down_proj.weight"),
-                ],
-            )
-            .map(|source| DerivedWeightRecipe::source(source, TensorSelection::Full))
-            .or_else(|| {
-                (0..experts)
-                    .map(|expert| {
-                        let source = format!("{released}.{expert}.down_proj.weight");
-                        keys.contains(&source)
-                            .then(|| DerivedWeightRecipe::source(source, TensorSelection::Full))
-                    })
-                    .collect::<Option<Vec<_>>>()
-                    .map(|inputs| DerivedWeightRecipe::Stack { axis: 0, inputs })
-            });
-            if let Some(down) = down {
-                recipes.insert(format!("{target}.down_proj"), down);
-            }
-        }
-    }
+    let mut recipes = eredu_architectures::muse_glimmer::safetensors_recipes(args, store)
+        .map_err(Error::UnsupportedArchitecture)?;
+    recipes.retain(|name, _| parameters.contains_key(name.as_str()));
     Ok(recipes)
 }
 

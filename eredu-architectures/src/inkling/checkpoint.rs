@@ -1,5 +1,7 @@
 //! Backend-neutral Inkling checkpoint name normalization and derived recipes.
 
+use std::collections::BTreeMap;
+
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeCatalog},
     schema::{
@@ -901,6 +903,149 @@ pub fn safetensors_aliases(args: &ModelArgs) -> Result<Vec<ParameterAlias>, Stri
     Ok(aliases)
 }
 
+/// Resolves the complete released SafeTensors layout into canonical
+/// architecture parameter recipes.
+///
+/// The catalog covers direct aliases, two-dimensional released convolution
+/// kernels, interleaved dense projections, routed/shared fused experts, and
+/// embedded MTP blocks. Backends may filter these outputs to a module, but do
+/// not recreate the family transformations.
+pub fn safetensors_recipes<C: RecipeCatalog + ?Sized>(
+    args: &ModelArgs,
+    catalog: &C,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let mut recipes = BTreeMap::new();
+    for alias in safetensors_aliases(args)? {
+        if has_tensor(catalog, &alias.source) {
+            recipes.insert(
+                alias.target,
+                DerivedWeightRecipe::source(alias.source, TensorSelection::Full),
+            );
+        }
+    }
+
+    for layer in 0..nonnegative_count(args.text_config.num_hidden_layers, "layer count")? {
+        let canonical = format!("model.layers.{layer}");
+        let released = format!("model.llm.layers.{layer}");
+        add_convolution_recipes(catalog, &released, &canonical, &mut recipes)?;
+        match args
+            .text_config
+            .layer_policy(layer)
+            .ok_or_else(|| format!("Inkling checkpoint layer {layer} is out of range"))?
+            .feed_forward
+        {
+            FeedForwardPolicy::Dense => {
+                add_dense_recipes(catalog, &released, &canonical, &mut recipes)?;
+            }
+            FeedForwardPolicy::SparseMoe => {
+                add_expert_recipes(catalog, &released, &canonical, &mut recipes)?;
+            }
+        }
+    }
+
+    if let Some(mtp) = &args.mtp_config {
+        for depth in
+            0..nonnegative_count(mtp.num_nextn_predict_layers, "MTP prediction depth count")?
+        {
+            let root = format!("model.mtp.layers.{depth}.transformer_block");
+            add_convolution_recipes(catalog, &root, &root, &mut recipes)?;
+            add_dense_recipes(catalog, &root, &root, &mut recipes)?;
+        }
+    }
+    Ok(recipes)
+}
+
+fn add_convolution_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    released: &str,
+    canonical: &str,
+    recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
+) -> Result<(), String> {
+    for (source_suffix, target_suffix) in [
+        ("attn.k_sconv.weight", "self_attn.k_sconv.weight"),
+        ("attn.v_sconv.weight", "self_attn.v_sconv.weight"),
+        ("attn_sconv.weight", "attn_sconv.weight"),
+        ("mlp_sconv.weight", "mlp_sconv.weight"),
+    ] {
+        let released_source = format!("{released}.{source_suffix}");
+        let target = format!("{canonical}.{target_suffix}");
+        let source = if has_tensor(catalog, &released_source) {
+            released_source
+        } else if has_tensor(catalog, &target) {
+            target.clone()
+        } else {
+            continue;
+        };
+        let metadata = catalog
+            .tensor_metadata(&source)
+            .map_err(|error| error.to_string())?;
+        let input = DerivedWeightRecipe::source(&source, TensorSelection::Full);
+        let recipe = match metadata.logical_shape.as_slice() {
+            [channels, kernel] => DerivedWeightRecipe::Reshape {
+                input: Box::new(input),
+                shape: vec![*channels, 1, *kernel],
+            },
+            _ => input,
+        };
+        recipes.insert(target, recipe);
+    }
+    Ok(())
+}
+
+fn add_dense_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    released: &str,
+    canonical: &str,
+    recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
+) -> Result<(), String> {
+    let source = format!("{released}.mlp.w13_dn.weight");
+    if !has_tensor(catalog, &source) {
+        return Ok(());
+    }
+    let split = dense_w13_recipes(catalog, &source)?;
+    recipes.insert(format!("{canonical}.dense.gate_proj.weight"), split.gate);
+    recipes.insert(format!("{canonical}.dense.up_proj.weight"), split.up);
+    Ok(())
+}
+
+fn add_expert_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    released: &str,
+    canonical: &str,
+    recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
+) -> Result<(), String> {
+    for (released_bank, canonical_bank) in [
+        ("mlp.experts.w13_weight", "moe.experts"),
+        ("mlp.shared_experts.shared_w13_weight", "moe.shared_experts"),
+    ] {
+        let source = format!("{released}.{released_bank}");
+        let target = format!("{canonical}.{canonical_bank}.gate_up_proj");
+        if has_tensor(catalog, &source) {
+            recipes.insert(target, expert_w13_recipe(catalog, &source)?);
+            continue;
+        }
+        let gate = format!("{canonical}.{canonical_bank}.gate_proj");
+        let up = format!("{canonical}.{canonical_bank}.up_proj");
+        if has_tensor(catalog, &gate) && has_tensor(catalog, &up) {
+            recipes.insert(
+                target,
+                DerivedWeightRecipe::Concatenate {
+                    axis: 1,
+                    inputs: vec![
+                        DerivedWeightRecipe::source(gate, TensorSelection::Full),
+                        DerivedWeightRecipe::source(up, TensorSelection::Full),
+                    ],
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn has_tensor<C: RecipeCatalog + ?Sized>(catalog: &C, name: &str) -> bool {
+    catalog.tensor_metadata(name).is_ok()
+}
+
 fn block_aliases(released: &str, canonical: &str) -> Vec<ParameterAlias> {
     [
         ("attn_norm.weight", "input_layernorm.weight"),
@@ -1193,7 +1338,7 @@ mod tests {
 
     use super::{
         dense_w13_recipes, expert_w13_recipe, gguf_plan, mmproj_gguf_plan, safetensors_plan,
-        translate_gguf_weight_name, translate_gguf_weight_name_for_model,
+        safetensors_recipes, translate_gguf_weight_name, translate_gguf_weight_name_for_model,
         translate_mmproj_weight_name,
     };
     use crate::inkling::ModelArgs;
@@ -1288,5 +1433,51 @@ mod tests {
             translate_mmproj_weight_name("v.hmlp.0.linear.weight"),
             "visual.layers.0.projection.weight"
         );
+    }
+
+    #[test]
+    fn safetensors_recipes_own_convolution_and_fused_projection_equations() {
+        let args = ModelArgs::from_hf_json(
+            br#"{
+              "model_type":"inkling_mm_model",
+              "text_config":{"hidden_size":16,"num_hidden_layers":2,"vocab_size":64,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+                "sliding_window_size":8,"layer_types":["sliding_attention","full_attention"],
+                "mlp_layer_types":["dense","moe"],"sconv_kernel_size":4,
+                "d_rel":2,"rel_extent":16,"intermediate_size":32,
+                "n_routed_experts":4,"num_experts_per_tok":2,"n_shared_experts":1}
+            }"#,
+        )
+        .unwrap();
+        let convolution = "model.llm.layers.0.attn_sconv.weight";
+        let dense = "model.llm.layers.0.mlp.w13_dn.weight";
+        let routed = "model.llm.layers.1.mlp.experts.w13_weight";
+        let shared = "model.llm.layers.1.mlp.shared_experts.shared_w13_weight";
+        let catalog = Catalog(BTreeMap::from([
+            (convolution.into(), metadata(convolution, vec![16, 4])),
+            (dense.into(), metadata(dense, vec![64, 16])),
+            (routed.into(), metadata(routed, vec![4, 64, 16])),
+            (shared.into(), metadata(shared, vec![1, 64, 16])),
+        ]));
+        let recipes = safetensors_recipes(&args, &catalog).unwrap();
+        assert!(matches!(
+            recipes.get("model.layers.0.attn_sconv.weight"),
+            Some(DerivedWeightRecipe::Reshape { shape, .. }) if shape == &[16, 1, 4]
+        ));
+        assert!(matches!(
+            recipes.get("model.layers.0.dense.gate_proj.weight"),
+            Some(DerivedWeightRecipe::Source {
+                selection: TensorSelection::Indices { axis: 0, indices },
+                ..
+            }) if indices.len() == 32
+        ));
+        assert!(matches!(
+            recipes.get("model.layers.1.moe.experts.gate_up_proj"),
+            Some(DerivedWeightRecipe::Concatenate { axis: 1, .. })
+        ));
+        assert!(matches!(
+            recipes.get("model.layers.1.moe.shared_experts.gate_up_proj"),
+            Some(DerivedWeightRecipe::Concatenate { axis: 1, .. })
+        ));
     }
 }

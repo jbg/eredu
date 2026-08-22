@@ -70,6 +70,10 @@ redeclare family-specific stacking, concatenation, reshaping, normalization,
 or recurrent-weight transformations. This includes format-dependent recipes
 such as fused projection assembly and recurrent transition conversion; backend
 composition may inspect recipe outputs but does not construct their equations.
+These catalogs are model-wide and configuration-derived. Backend adapters may
+filter their outputs to the parameters present in a static module, execution
+unit, or independently resident bank; that filtering does not transfer source
+name discovery or recipe construction into backend composition.
 
 Routed expert banks retain and expose their architecture-owned construction
 specification. Resident, cached, distributed, and future backend execution

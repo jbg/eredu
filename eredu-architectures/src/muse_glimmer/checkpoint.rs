@@ -1,6 +1,6 @@
 //! Composite artifact and checkpoint-name policy for Muse-Glimmer.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eredu_checkpoint::{
     composite::{
@@ -9,14 +9,15 @@ use eredu_checkpoint::{
     },
     expert::{
         resolve_gated_product_expert_recipes, GatedProductExpertLayoutNames,
-        GatedProductExpertRecipes,
+        GatedProductExpertRecipes, IndependentGatedProductExpertNames,
     },
-    recipe::RecipeCatalog,
+    recipe::{DerivedWeightRecipe, RecipeCatalog},
     schema::{
         matrix_for_linear_format, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
         GgufTensorConstraint, GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
         SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
     },
+    store::TensorSelection,
 };
 
 use super::DecoderConfig;
@@ -316,6 +317,147 @@ pub fn safetensors_plan(args: &DecoderConfig) -> Result<SafetensorsCheckpointPla
         CatalogPolicy::strict(),
     )
     .map_err(|error| error.to_string())
+}
+
+/// Resolves every released SafeTensors alias and derived expert layout into
+/// canonical architecture parameter identities.
+///
+/// The returned catalog is intentionally model-wide. Backend composition may
+/// filter it to a static module or execution unit, but does not reconstruct
+/// any family-specific name or tensor equation.
+pub fn safetensors_recipes<C: RecipeCatalog + ?Sized>(
+    args: &DecoderConfig,
+    catalog: &C,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let plan = safetensors_plan(args)?;
+    let constraints = plan.common_tensors.iter().chain(
+        plan.layout_groups
+            .iter()
+            .flat_map(|group| group.variants.iter())
+            .flat_map(|variant| variant.tensors.iter()),
+    );
+    let mut recipes = BTreeMap::new();
+    for tensor in constraints {
+        let source = std::iter::once(tensor.key.clone())
+            .chain(tensor.aliases.iter().cloned())
+            .find(|name| catalog.tensor_metadata(name).is_ok());
+        if let Some(source) = source {
+            recipes.insert(
+                canonical_safetensors_target(&tensor.key),
+                DerivedWeightRecipe::source(source, TensorSelection::Full),
+            );
+        }
+    }
+    if args.is_moe() {
+        for layer in 0..dimension(args.num_hidden_layers, "text layer count")? {
+            let expert = safetensors_expert_recipes(catalog, args, layer)?;
+            recipes.insert(expert.target_gate_up, expert.gate_up);
+            recipes.insert(expert.target_down, expert.down);
+        }
+    }
+    Ok(recipes)
+}
+
+fn canonical_safetensors_target(source: &str) -> String {
+    let canonical = source
+        .replace("model.language_model.layers.", "model.layers.")
+        .replace("model.language_model.embed_tokens.", "model.embed_tokens.")
+        .replace("model.language_model.norm.", "model.norm.");
+    if canonical.contains(".mlp.experts.") {
+        if let Some(prefix) = canonical.strip_suffix(".scales") {
+            return format!("{prefix}_scales");
+        }
+        if let Some(prefix) = canonical.strip_suffix(".biases") {
+            return format!("{prefix}_biases");
+        }
+    }
+    canonical
+}
+
+fn safetensors_expert_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &DecoderConfig,
+    layer: usize,
+) -> Result<GatedProductExpertRecipes, String> {
+    let target = format!("model.layers.{layer}.mlp.experts");
+    let released = format!("model.language_model.layers.{layer}.mlp.experts");
+    let packed_gate_up = first_existing(
+        catalog,
+        [
+            format!("{target}.gate_up_proj"),
+            format!("{released}.gate_up_proj"),
+            format!("{released}.gate_up_proj.weight"),
+        ],
+    );
+    let packed_down = first_existing(
+        catalog,
+        [
+            format!("{target}.down_proj"),
+            format!("{target}.down_proj.weight"),
+            format!("{released}.down_proj"),
+            format!("{released}.down_proj.weight"),
+        ],
+    );
+    let separate_gate = first_existing(
+        catalog,
+        [
+            format!("{target}.gate_proj"),
+            format!("{target}.gate_proj.weight"),
+            format!("{released}.gate_proj"),
+            format!("{released}.gate_proj.weight"),
+        ],
+    );
+    let separate_up = first_existing(
+        catalog,
+        [
+            format!("{target}.up_proj"),
+            format!("{target}.up_proj.weight"),
+            format!("{released}.up_proj"),
+            format!("{released}.up_proj.weight"),
+        ],
+    );
+    let independent = (0..dimension(args.num_experts, "expert count")?)
+        .map(|expert| {
+            let root = format!("{released}.{expert}");
+            IndependentGatedProductExpertNames {
+                gate: format!("{root}.gate_proj.weight"),
+                up: format!("{root}.up_proj.weight"),
+                down: format!("{root}.down_proj.weight"),
+            }
+        })
+        .collect();
+    resolve_gated_product_expert_recipes(
+        catalog,
+        &GatedProductExpertLayoutNames {
+            target_gate_up: format!("{target}.gate_up_proj"),
+            target_down: format!("{target}.down_proj"),
+            packed_gate_up: packed_gate_up.unwrap_or_default(),
+            packed_down: packed_down.unwrap_or_default(),
+            separate_gate: separate_gate.unwrap_or_default(),
+            separate_up: separate_up.unwrap_or_default(),
+            separate_down: first_existing(
+                catalog,
+                [
+                    format!("{target}.down_proj"),
+                    format!("{target}.down_proj.weight"),
+                    format!("{released}.down_proj"),
+                    format!("{released}.down_proj.weight"),
+                ],
+            )
+            .unwrap_or_default(),
+            independent,
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn first_existing<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    names: impl IntoIterator<Item = String>,
+) -> Option<String> {
+    names
+        .into_iter()
+        .find(|name| catalog.tensor_metadata(name).is_ok())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -923,7 +1065,37 @@ pub fn translate_projector_gguf_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use eredu_checkpoint::{
+        recipe::{DerivedWeightRecipe, RecipeCatalog},
+        store::{StoreError, TensorMetadata},
+        StoredDtype,
+    };
+
     use super::*;
+
+    struct Catalog(BTreeMap<String, TensorMetadata>);
+
+    impl RecipeCatalog for Catalog {
+        fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+            self.0
+                .get(key)
+                .cloned()
+                .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
+        }
+    }
+
+    fn metadata(name: &str, shape: Vec<usize>) -> TensorMetadata {
+        TensorMetadata {
+            name: name.into(),
+            logical_shape: shape.clone(),
+            physical_shape: shape.clone(),
+            encoded_byte_len: shape.iter().product::<usize>() as u64 * 2,
+            stored_dtype: StoredDtype::F16,
+            backing_shard: None,
+        }
+    }
 
     fn decoder(moe: bool) -> DecoderConfig {
         let mut value = serde_json::json!({
@@ -1057,5 +1229,39 @@ mod tests {
             .common_tensors
             .iter()
             .any(|tensor| tensor.key == "blk.0.ffn_gate_exps.weight"));
+    }
+
+    #[test]
+    fn safetensors_recipes_own_released_aliases_and_independent_expert_stacking() {
+        let args = decoder(true);
+        let mut tensors = BTreeMap::from([(
+            "model.language_model.embed_tokens.weight".into(),
+            metadata("model.language_model.embed_tokens.weight", vec![32, 32]),
+        )]);
+        for expert in 0..4 {
+            let root = format!("model.language_model.layers.0.mlp.experts.{expert}");
+            for (suffix, shape) in [
+                ("gate_proj.weight", vec![32, 32]),
+                ("up_proj.weight", vec![32, 32]),
+                ("down_proj.weight", vec![32, 32]),
+            ] {
+                let name = format!("{root}.{suffix}");
+                tensors.insert(name.clone(), metadata(&name, shape));
+            }
+        }
+        let recipes = safetensors_recipes(&args, &Catalog(tensors)).unwrap();
+        assert!(matches!(
+            recipes.get("model.embed_tokens.weight"),
+            Some(DerivedWeightRecipe::Source { key, .. })
+                if key == "model.language_model.embed_tokens.weight"
+        ));
+        assert!(matches!(
+            recipes.get("model.layers.0.mlp.experts.gate_up_proj"),
+            Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 4
+        ));
+        assert!(matches!(
+            recipes.get("model.layers.0.mlp.experts.down_proj"),
+            Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 4
+        ));
     }
 }

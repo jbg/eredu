@@ -15,7 +15,7 @@ pub use assistant::{
 };
 pub use checkpoint::{
     expert_recipes, gguf_plan, projector_gguf_plan, safetensors_parameter_names, safetensors_plan,
-    translate_projector_gguf_name, translate_text_gguf_name, ArtifactConfig,
+    safetensors_recipes, translate_projector_gguf_name, translate_text_gguf_name, ArtifactConfig,
 };
 pub use config::{
     ConfigError, DecoderConfig, VisionAttentionPolicy, VisionConfig, WeightConvention,
