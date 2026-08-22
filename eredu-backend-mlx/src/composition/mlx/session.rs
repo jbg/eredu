@@ -508,10 +508,25 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
-    pub(super) fn complete_model_for_capabilities(&self) -> Option<&Model> {
+    pub(super) fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
         match &self.inner {
-            MlxSessionKind::Complete(model, _) => Some(model),
-            MlxSessionKind::Pipeline(_, _) | MlxSessionKind::Expert(_, _) => None,
+            MlxSessionKind::Complete(model, _) => model.architecture_capability_estimate(),
+            MlxSessionKind::Pipeline(model, _) => model.capability_estimate(),
+            MlxSessionKind::Expert(model, _) => model.capability_estimate(),
+        }
+    }
+
+    pub(super) fn prepared_media_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedMediaInput,
+    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model.prepared_media_plan(input),
+            MlxSessionKind::Pipeline(model, _) => model.prepared_media_plan(input),
+            MlxSessionKind::Expert(model, _) => model.prepared_media_plan(input),
         }
     }
 

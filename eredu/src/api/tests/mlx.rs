@@ -241,9 +241,10 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     };
     let runtime = eredu_core::ModelRuntime::from_prepared(
         crate::backend::mlx::MlxBackend::new(stream, stream),
-        eredu_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(Model::Qwen35(
-            qwen,
-        ))),
+        eredu_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete_for_test(
+            Model::Qwen35(qwen),
+            std::num::NonZeroU8::new(4).unwrap(),
+        )),
     )
     .unwrap();
     let mut model = LoadedModel::from_runtime(
@@ -1928,7 +1929,12 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
 
                 let mut runtime = eredu_core::ModelRuntime::from_prepared(
                     crate::backend::mlx::MlxBackend::new(stream, stream),
-                    eredu_core::PreparedModel::new(crate::backend::mlx::MlxModel::complete(dense)),
+                    eredu_core::PreparedModel::new(
+                        crate::backend::mlx::MlxModel::complete_for_test(
+                            dense,
+                            std::num::NonZeroU8::new(4).unwrap(),
+                        ),
+                    ),
                 )
                 .unwrap();
                 let sampling =

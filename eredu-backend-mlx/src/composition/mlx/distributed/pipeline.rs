@@ -2852,6 +2852,17 @@ type InklingPipelinePartition = MediaPipelineRealization<
 trait PipelinePartitionMetadata {
     fn model_kind(&self) -> ModelKind;
 
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>;
+
+    fn prepared_media_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedMediaInput,
+    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
+        eredu_architectures::media_plan::text_only(self.model_kind().model_type_name(), input)
+    }
+
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         eredu_runtime::NoAuxiliaryBoundary
             .wire_schema()
@@ -5569,6 +5580,13 @@ impl PipelinePartitionMetadata for LlamaPipelinePartition {
         ModelKind::Llama
     }
 
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::llama(self.architecture.args())
+    }
+
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -5870,6 +5888,13 @@ impl DeepSeekV3PipelinePartition {
 impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
     fn model_kind(&self) -> ModelKind {
         ModelKind::DeepSeekV3
+    }
+
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::deepseek_v3(self.args())
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -6334,6 +6359,13 @@ impl DeepSeekV4PipelinePartition {
 impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
     fn model_kind(&self) -> ModelKind {
         ModelKind::DeepSeekV4
+    }
+
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::deepseek_v4(self.args())
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -6835,6 +6867,20 @@ impl PipelinePartitionMetadata for Gemma4PipelinePartition {
         ModelKind::Gemma4
     }
 
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::gemma4(self.args())
+    }
+
+    fn prepared_media_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedMediaInput,
+    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
+        eredu_architectures::media_plan::gemma4(self.args(), input)
+    }
+
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         self.partition
             .auxiliary_boundary()
@@ -7020,6 +7066,13 @@ impl PipelinePartitionMetadata for QwenPipelinePartition {
         qwen_model_kind(self.args())
     }
 
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::qwen(self.args())
+    }
+
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -7153,6 +7206,20 @@ impl PipelineForward for QwenPipelinePartition {
 impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
     fn model_kind(&self) -> ModelKind {
         ModelKind::MuseGlimmer
+    }
+
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::muse_glimmer(self.architecture.args())
+    }
+
+    fn prepared_media_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedMediaInput,
+    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
+        eredu_architectures::media_plan::muse_glimmer(self.architecture.args(), input)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -7406,6 +7473,20 @@ impl PipelineForward for MuseGlimmerPipelinePartition {
 impl PipelinePartitionMetadata for InklingPipelinePartition {
     fn model_kind(&self) -> ModelKind {
         ModelKind::Inkling
+    }
+
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::inkling(self.args())
+    }
+
+    fn prepared_media_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedMediaInput,
+    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
+        eredu_architectures::media_plan::inkling(self.args(), input)
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -8120,6 +8201,24 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
         }
     }
 
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::qwen_vl(self.args())
+    }
+
+    fn prepared_media_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedMediaInput,
+    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
+        eredu_architectures::media_plan::qwen_vision(
+            &self.args().vision,
+            input,
+            self.model_kind().model_type_name(),
+        )
+    }
+
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         self.partition
             .auxiliary_boundary()
@@ -8825,6 +8924,24 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
         ModelKind::Qwen35
     }
 
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::qwen_hybrid(self.args())
+    }
+
+    fn prepared_media_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedMediaInput,
+    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
+        eredu_architectures::media_plan::qwen_hybrid_vision(
+            self.args().vision.as_ref(),
+            input,
+            self.model_kind().model_type_name(),
+        )
+    }
+
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
         self.partition
             .auxiliary_boundary()
@@ -9190,6 +9307,13 @@ impl PipelinePartitionMetadata for GptOssPipelinePartition {
         ModelKind::GptOss
     }
 
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::gpt_oss(self.args())
+    }
+
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -9323,6 +9447,13 @@ impl PipelineForward for GptOssPipelinePartition {
 impl PipelinePartitionMetadata for Lfm2PipelinePartition {
     fn model_kind(&self) -> ModelKind {
         ModelKind::Lfm2
+    }
+
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::lfm2(self.args())
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -9473,6 +9604,13 @@ impl PipelineForward for Lfm2PipelinePartition {
 impl PipelinePartitionMetadata for NemotronHPipelinePartition {
     fn model_kind(&self) -> ModelKind {
         ModelKind::NemotronH
+    }
+
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::nemotron_h(self.args())
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -9713,6 +9851,13 @@ impl PipelineForward for NemotronHPipelinePartition {
 impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
     fn model_kind(&self) -> ModelKind {
         ModelKind::KimiLinear
+    }
+
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::kimi_linear(self.args())
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -10063,6 +10208,20 @@ impl PipelineModel {
     /// Returns the immutable stage description.
     pub fn stage_info(&self) -> &PipelineStageInfo {
         &self.info
+    }
+
+    pub(in crate::composition::mlx) fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        self.stage.capability_estimate()
+    }
+
+    pub(in crate::composition::mlx) fn prepared_media_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedMediaInput,
+    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
+        self.stage.prepared_media_plan(input)
     }
 
     /// Returns stage-local disk-stream observations when enabled.
@@ -19483,6 +19642,13 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
         } else {
             ModelKind::Qwen35
         }
+    }
+
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        eredu_architectures::capability::qwen_hybrid_text(self.args())
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {

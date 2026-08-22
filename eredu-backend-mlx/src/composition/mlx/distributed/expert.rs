@@ -134,6 +134,9 @@ impl ExpertParallelCache {
 }
 
 trait NeutralHybridExpertArchitecture {
+    fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>;
     fn dense_stream_report(&self) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error>;
     fn new_cache(&self) -> MlxHybridState;
     fn new_cache_with_options(&self, policy: CacheResidencyPolicy)
@@ -214,8 +217,17 @@ trait NeutralHybridExpertArchitecture {
 }
 
 macro_rules! impl_neutral_hybrid_expert_architecture {
-    ($model:ty, $execute:path $(, $extra:item)*) => {
+    ($model:ty, $execute:path, $capability:path $(, $extra:item)*) => {
         impl NeutralHybridExpertArchitecture for $model {
+            fn capability_estimate(
+                &self,
+            ) -> Result<
+                eredu_architectures::capability::CapabilityEstimate,
+                eredu_core::CapabilityError,
+            > {
+                $capability(self.args())
+            }
+
             fn dense_stream_report(
                 &self,
             ) -> Result<Option<eredu_runtime::DenseDiskStreamReport>, Error> {
@@ -330,11 +342,20 @@ macro_rules! impl_neutral_hybrid_expert_architecture {
     };
 }
 
-impl_neutral_hybrid_expert_architecture!(kimi_linear::KimiLinearModel, execute_cached_kimi_linear);
-impl_neutral_hybrid_expert_architecture!(lfm2::Lfm2Model, execute_cached_lfm2);
+impl_neutral_hybrid_expert_architecture!(
+    kimi_linear::KimiLinearModel,
+    execute_cached_kimi_linear,
+    eredu_architectures::capability::kimi_linear
+);
+impl_neutral_hybrid_expert_architecture!(
+    lfm2::Lfm2Model,
+    execute_cached_lfm2,
+    eredu_architectures::capability::lfm2
+);
 impl_neutral_hybrid_expert_architecture!(
     nemotron_h::NemotronHModel,
     execute_cached_nemotron_h,
+    eredu_architectures::capability::nemotron_h,
     fn mtp_len(&self) -> usize {
         self.mtp_len()
     },
@@ -678,6 +699,35 @@ impl ExpertParallelModel {
     /// Returns placement, assignment, and memory diagnostics.
     pub fn info(&self) -> &ExpertParallelInfo {
         &self.info
+    }
+
+    pub(in crate::composition::mlx) fn capability_estimate(
+        &self,
+    ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>
+    {
+        match &self.architecture {
+            ExpertArchitecture::DeepSeek(model) => {
+                if let Some(args) = model.v3_args() {
+                    eredu_architectures::capability::deepseek_v3(args)
+                } else {
+                    eredu_architectures::capability::deepseek_v4(
+                        model.v4_args().expect("DeepSeek family"),
+                    )
+                }
+            }
+            ExpertArchitecture::NeutralHybrid(model) => model.capability_estimate(),
+            ExpertArchitecture::Qwen(model) => eredu_architectures::capability::qwen(model.args()),
+            ExpertArchitecture::GptOss(model) => {
+                eredu_architectures::capability::gpt_oss(model.args())
+            }
+        }
+    }
+
+    pub(in crate::composition::mlx) fn prepared_media_plan(
+        &self,
+        input: &eredu_architectures::media_plan::PreparedMediaInput,
+    ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
+        eredu_architectures::media_plan::text_only(self.info.model_kind.model_type_name(), input)
     }
 
     /// Reports whether this EP target can perform embedded MTP generation.

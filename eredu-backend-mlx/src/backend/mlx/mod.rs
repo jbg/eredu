@@ -95,6 +95,12 @@ impl MlxModel {
         }
     }
 
+    /// Wraps a directly constructed replicated model for backend integration tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn complete_for_test(model: Model, runtime_state_dtype_bytes: NonZeroU8) -> Self {
+        Self::complete(model, runtime_state_dtype_bytes)
+    }
+
     pub(crate) const fn runtime_state_dtype_bytes(&self) -> NonZeroU8 {
         self.runtime_state_dtype_bytes
     }

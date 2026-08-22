@@ -424,6 +424,46 @@ fn pipeline_ring_worker() {
             <MlxBackend<'_> as eredu::SpeculativeGenerationBackend>::mtp_capability(&runtime),
             expected_mtp_capability
         );
+        use eredu::backend::mlx::runtime::media::input::{
+            InputMetadata, InputPart, InputPayload, Modality, ModelInput,
+        };
+        let capability_tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let capability_parts = [InputPart::text_token_ids(&capability_tokens)];
+        let capability_input = ModelInput::new(&capability_parts).into();
+        let capabilities =
+            <MlxBackend<'_> as eredu::ModelCapabilityBackend>::model_capabilities(&runtime)
+                .unwrap();
+        assert_eq!(capabilities.model_type, family.descriptor_names().1);
+        let counted = <MlxBackend<'_> as eredu::ModelCapabilityBackend>::count_prepared_input(
+            &runtime,
+            &capability_input,
+        )
+        .unwrap();
+        assert_eq!(counted.text_tokens, 2);
+        assert_eq!(counted.model_positions, 2);
+        let state = <MlxBackend<'_> as eredu::ModelCapabilityBackend>::estimate_runtime_state(
+            &runtime, counted, 2, 1,
+        )
+        .unwrap();
+        assert_eq!(state.assumptions.requested_positions, 4);
+        assert!(matches!(
+            eredu::core::apply_admission_policy(
+                &capabilities,
+                eredu::AdmissionRequest {
+                    input: counted,
+                    max_output_tokens: 2,
+                    batch_size: 1,
+                    safety_reserve_bytes: 0,
+                    application_memory_budget_bytes: None,
+                    require_complete_estimate: false,
+                },
+                state,
+                None,
+            )
+            .unwrap(),
+            eredu::AdmissionResult::Admitted(_)
+        ));
+        <MlxBackend<'_> as eredu::ModelCapabilityBackend>::static_memory(&runtime).unwrap();
         let (backend, session) = runtime.parts_mut();
         let paged = PagedCacheOptions::new(1, 32768, 32768, 1)
             .unwrap()
@@ -431,9 +471,6 @@ fn pipeline_ring_worker() {
         session
             .configure_cache(CacheResidencyPolicy::Paged(paged))
             .unwrap();
-        use eredu::backend::mlx::runtime::media::input::{
-            InputMetadata, InputPart, InputPayload, Modality, ModelInput,
-        };
         let image_mode = std::env::var_os(OPAQUE_MUSE_IMAGE).is_some();
         let inkling_media_mode = std::env::var_os(OPAQUE_INKLING_MEDIA).is_some();
         let inkling_mtp_mode = std::env::var_os(OPAQUE_INKLING_MTP).is_some();

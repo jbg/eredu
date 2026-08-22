@@ -1131,6 +1131,16 @@ pub fn qwen_hybrid(
     ))
 }
 
+/// Derives Qwen hybrid capabilities from normalized text-only policy.
+pub fn qwen_hybrid_text(
+    args: &crate::qwen::hybrid::HybridConfig,
+) -> Result<CapabilityEstimate, CapabilityError> {
+    Ok(finish(
+        args.model_type.clone(),
+        qwen_hybrid_spec(args, false)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

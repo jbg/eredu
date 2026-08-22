@@ -66,7 +66,7 @@ fn estimate_mlx_runtime_state(
 }
 
 impl Model {
-    fn architecture_capability_estimate(
+    pub(super) fn architecture_capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, CapabilityError> {
         use eredu_architectures::capability;
@@ -195,7 +195,7 @@ fn four_byte_scalars(scalars: u64, operation: &'static str) -> Result<u64, Capab
 }
 
 impl Model {
-    fn prepared_media_plan(
+    pub(super) fn prepared_media_plan(
         &self,
         input: &PreparedMediaInput,
     ) -> Result<MediaShapePlan, CapabilityError> {
@@ -218,51 +218,53 @@ impl Model {
             | Self::Qwen(_) => media_plan::text_only(self.model_type(), input),
         }
     }
-
-    fn prepared_media_accounting(
-        &self,
-        modality: Modality,
-        payload: &Array,
-        metadata: input::InputMetadata<'_>,
-    ) -> Result<(u64, u64), CapabilityError> {
-        let input = prepared_media_input(modality, payload, metadata)?;
-        let plan = self.prepared_media_plan(&input)?;
-        let mut input_bytes = array_bytes(payload, "prepared media payload bytes")?;
-        for array in [
-            metadata.patch_grid,
-            metadata.patch_positions,
-            metadata.audio_mask,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            input_bytes = checked_add(
-                input_bytes,
-                array_bytes(array, "prepared media metadata bytes")?,
-                "prepared media input bytes",
-            )?;
-        }
-        Ok((
-            plan.decoder_positions,
-            checked_add(
-                input_bytes,
-                four_byte_scalars(
-                    plan.execution_workspace_scalars,
-                    "prepared media execution workspace bytes",
-                )?,
-                "prepared media total workspace bytes",
-            )?,
-        ))
-    }
 }
-pub fn model_capabilities(model: &Model) -> Result<ModelCapabilities, CapabilityError> {
-    model
-        .architecture_capability_estimate()
+fn prepared_media_accounting(
+    session: &MlxModelSession<'_>,
+    modality: Modality,
+    payload: &Array,
+    metadata: input::InputMetadata<'_>,
+) -> Result<(u64, u64), CapabilityError> {
+    let input = prepared_media_input(modality, payload, metadata)?;
+    let plan = session.prepared_media_plan(&input)?;
+    let mut input_bytes = array_bytes(payload, "prepared media payload bytes")?;
+    for array in [
+        metadata.patch_grid,
+        metadata.patch_positions,
+        metadata.audio_mask,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        input_bytes = checked_add(
+            input_bytes,
+            array_bytes(array, "prepared media metadata bytes")?,
+            "prepared media input bytes",
+        )?;
+    }
+    Ok((
+        plan.decoder_positions,
+        checked_add(
+            input_bytes,
+            four_byte_scalars(
+                plan.execution_workspace_scalars,
+                "prepared media execution workspace bytes",
+            )?,
+            "prepared media total workspace bytes",
+        )?,
+    ))
+}
+
+pub fn model_capabilities(
+    session: &MlxModelSession<'_>,
+) -> Result<ModelCapabilities, CapabilityError> {
+    session
+        .capability_estimate()
         .map(|estimate| estimate.into_parts().0)
 }
 
 pub fn count_prepared_input(
-    model: &Model,
+    session: &MlxModelSession<'_>,
     prepared: input::ModelInput<'_>,
     _stream: &Stream,
 ) -> Result<InputTokenCount, CapabilityError> {
@@ -275,7 +277,7 @@ pub fn count_prepared_input(
             (Modality::Text, InputPayload::TokenIds(tokens)) => {
                 if tokens.ndim() != 2 || tokens.dim(0) != 1 {
                     return Err(CapabilityError::UnsupportedInput {
-                        architecture: model.model_type().into(),
+                        architecture: session.model_type().into(),
                         reason: format!(
                             "prepared text token IDs must be [1, sequence], got {:?}",
                             tokens.shape()
@@ -290,14 +292,14 @@ pub fn count_prepared_input(
             }
             (Modality::Text, _) => {
                 return Err(CapabilityError::UnsupportedInput {
-                    architecture: model.model_type().into(),
+                    architecture: session.model_type().into(),
                     reason: "prepared text is not represented by tokenizer IDs".into(),
                 });
             }
             (_modality, InputPayload::Embeddings(embeddings)) => {
                 if embeddings.ndim() != 3 || embeddings.dim(0) != 1 {
                     return Err(CapabilityError::UnsupportedInput {
-                        architecture: model.model_type().into(),
+                        architecture: session.model_type().into(),
                         reason: format!(
                             "prepared media embeddings must be [1, sequence, hidden], got {:?}",
                             embeddings.shape()
@@ -312,7 +314,7 @@ pub fn count_prepared_input(
             }
             (modality, InputPayload::Tensor(tensor)) => {
                 let (positions, workspace_bytes) =
-                    model.prepared_media_accounting(modality, tensor, part.metadata)?;
+                    prepared_media_accounting(session, modality, tensor, part.metadata)?;
                 media_positions =
                     checked_add(media_positions, positions, "prepared media-position total")?;
                 media_execution_workspace_bytes = checked_add(
@@ -324,7 +326,7 @@ pub fn count_prepared_input(
             }
             (_, InputPayload::TokenIds(_)) => {
                 return Err(CapabilityError::UnsupportedInput {
-                    architecture: model.model_type().into(),
+                    architecture: session.model_type().into(),
                     reason: "non-text prepared input cannot contain tokenizer IDs".into(),
                 });
             }
@@ -344,13 +346,13 @@ pub fn count_prepared_input(
 }
 
 pub fn model_runtime_state(
-    model: &Model,
+    session: &MlxModelSession<'_>,
     input: InputTokenCount,
     max_output_tokens: u64,
     batch_size: u64,
     state_dtype_bytes: NonZeroU8,
 ) -> Result<RuntimeStateEstimate, CapabilityError> {
-    let estimate = model.architecture_capability_estimate()?;
+    let estimate = session.capability_estimate()?;
     estimate_mlx_runtime_state_with_dtype(
         estimate.state_layout(),
         input,
@@ -447,28 +449,20 @@ pub fn static_model_memory(
     })
 }
 
-fn complete_model<'a>(session: &'a MlxModelSession<'_>) -> Result<&'a Model, CapabilityError> {
-    session.complete_model_for_capabilities().ok_or_else(|| {
-        CapabilityError::Observation(
-            "MLX capability derivation for distributed model sessions is unavailable".into(),
-        )
-    })
-}
-
 impl<'a> ModelCapabilityBackend for MlxBackend<'a> {
     fn model_capabilities(
         runtime: &ModelRuntime<Self>,
     ) -> Result<ModelCapabilities, CapabilityError> {
-        model_capabilities(complete_model(runtime.session())?)
+        model_capabilities(runtime.session())
     }
 
     fn count_prepared_input(
         runtime: &ModelRuntime<Self>,
         prepared: &MlxModelInput,
     ) -> Result<InputTokenCount, CapabilityError> {
-        let model = complete_model(runtime.session())?;
-        prepared
-            .with_borrowed(|input| count_prepared_input(model, input, runtime.backend().stream()))
+        prepared.with_borrowed(|input| {
+            count_prepared_input(runtime.session(), input, runtime.backend().stream())
+        })
     }
 
     fn estimate_runtime_state(
@@ -478,7 +472,7 @@ impl<'a> ModelCapabilityBackend for MlxBackend<'a> {
         batch_size: u64,
     ) -> Result<RuntimeStateEstimate, CapabilityError> {
         model_runtime_state(
-            complete_model(runtime.session())?,
+            runtime.session(),
             input,
             max_output_tokens,
             batch_size,
