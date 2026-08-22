@@ -2435,22 +2435,6 @@ fn load_conditional_store(
             .map_err(|error| Error::Parallel(error.to_string()))?
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
-    let graph = <ConditionalArchitecture as LayeredArchitecture<
-        MlxBackend,
-        MlxHybridState,
-    >>::execution_graph(&architecture)
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let counts = (0..graph.groups().len())
-        .map(|group| {
-            <ConditionalArchitecture as LayeredArchitecture<
-                MlxBackend,
-                MlxHybridState,
-            >>::group_unit_count(&architecture, group)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let layout = ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let vision_layers = parsed
         .vision
         .as_ref()
@@ -2468,7 +2452,6 @@ fn load_conditional_store(
         &mut architecture,
         factory,
         std::marker::PhantomData::<MlxHybridState>,
-        layout,
         options,
         stream,
         weights_stream,
@@ -2552,7 +2535,6 @@ fn load_store(
             .map_err(|error| Error::Parallel(error.to_string()))?
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
-    let layout = unit_layout(&architecture)?;
     let factory = UnitPopulator {
         external_experts,
         expert_targets: Arc::clone(&expert_targets),
@@ -2565,7 +2547,6 @@ fn load_store(
         &mut architecture,
         factory,
         std::marker::PhantomData::<MlxHybridState>,
-        layout,
         options,
         stream,
         weights_stream,

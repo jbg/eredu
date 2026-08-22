@@ -1495,7 +1495,6 @@ fn load_store(
             expert_targets: Arc::clone(&expert_targets),
         },
         std::marker::PhantomData::<MlxKeyValueState>,
-        layout(&args)?,
         residency,
         stream,
         weights_stream,
@@ -1581,7 +1580,6 @@ fn load_parallel_store(
     let state_layout = architecture
         .runtime_state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let unit_layout = self::layout(&args)?;
     let vision_layers = geometry.vision_layers();
     let total_units = vision_layers
         .checked_add(layer_count)
@@ -1646,7 +1644,6 @@ fn load_parallel_store(
             expert_targets: Arc::new(Default::default()),
         },
         std::marker::PhantomData::<MlxKeyValueState>,
-        unit_layout,
         residency,
         stream,
         weights_stream,

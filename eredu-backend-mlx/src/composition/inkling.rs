@@ -15,7 +15,7 @@ use eredu_checkpoint::{
 };
 use eredu_nn::Tensor;
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, ExecutionGraph, ExecutionUnitLayout, LayerWeightResidency,
+    CacheResidencyPolicy, CausalModel, ExecutionUnitLayout, LayerWeightResidency,
     LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
     RuntimeState, StaticUnitBindings, WeightBinding, WeightResidency,
 };
@@ -1860,7 +1860,6 @@ fn load_store(
             .map_err(|error| Error::Parallel(error.to_string()))?
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
-    let layout = inkling_execution_layout(&args)?;
     let static_args = args.clone();
     let unit_args = args.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
@@ -1873,7 +1872,6 @@ fn load_store(
             expert_targets: Arc::clone(&expert_targets),
         },
         std::marker::PhantomData::<MlxHybridState>,
-        layout,
         layer_policy,
         stream,
         weights_stream,
@@ -1967,13 +1965,6 @@ fn load_parallel_store(
         .runtime_state_layout()
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let vision_layers = geometry.vision_layers();
-    let unit_layout = ExecutionUnitLayout::new(
-        &ExecutionGraph::chain(["vision", "text_decoder"])
-            .map_err(|error| Error::Parallel(error.to_string()))?,
-        [vision_layers, layer_count],
-    )
-    .map_err(|error| Error::Parallel(error.to_string()))?;
-
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let global_static = MlxModule::new(
@@ -2050,7 +2041,6 @@ fn load_parallel_store(
             expert_targets: Arc::new(Default::default()),
         },
         std::marker::PhantomData::<MlxHybridState>,
-        unit_layout,
         layer_policy,
         stream,
         weights_stream,

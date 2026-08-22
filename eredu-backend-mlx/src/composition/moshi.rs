@@ -365,7 +365,6 @@ pub fn load(
     ensure_replicated_load_options(options)?;
 
     let mut architecture = Architecture::new(target_config.clone(), stream)?;
-    let layout = execution_layout(&architecture)?;
     let static_recipes = Arc::clone(&source_recipes);
     let unit_recipes = Arc::clone(&source_recipes);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
@@ -373,7 +372,6 @@ pub fn load(
         &mut architecture,
         (),
         std::marker::PhantomData::<MlxKeyValueState>,
-        layout,
         options.weight_residency.layers(),
         stream,
         weights_stream,
@@ -485,7 +483,6 @@ fn load_parallel(
         &mut composition,
         (),
         std::marker::PhantomData::<MlxKeyValueState>,
-        layout,
         residency,
         stream,
         weights_stream,

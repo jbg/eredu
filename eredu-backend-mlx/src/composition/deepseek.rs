@@ -399,7 +399,6 @@ impl DeepSeekModel {
         external_experts: bool,
     ) -> Result<Self, Error> {
         let mut architecture = V3Architecture::new(args.clone(), stream).map_err(neutral_error)?;
-        let layout = execution_layout::<V3Architecture, V3State>(&architecture)?;
         let expert_targets = Arc::new(
             deepseek::parallel::v3_parameter_description(&args)?
                 .targets_for_role(ParameterRole::ExpertIntermediate),
@@ -421,7 +420,6 @@ impl DeepSeekModel {
             &mut architecture,
             factory,
             std::marker::PhantomData::<V3State>,
-            layout,
             options,
             stream,
             weights_stream,
@@ -479,7 +477,6 @@ impl DeepSeekModel {
         external_experts: bool,
     ) -> Result<Self, Error> {
         let mut architecture = V4Architecture::new(args.clone(), stream).map_err(neutral_error)?;
-        let layout = execution_layout::<V4Architecture, V4State>(&architecture)?;
         let expert_targets = Arc::new(
             deepseek::parallel::v4_parameter_description(&args)?
                 .targets_for_role(ParameterRole::ExpertIntermediate),
@@ -501,7 +498,6 @@ impl DeepSeekModel {
             &mut architecture,
             factory,
             std::marker::PhantomData::<V4State>,
-            layout,
             options,
             stream,
             weights_stream,
@@ -590,13 +586,11 @@ impl DeepSeekModel {
         let static_layout = Arc::new(layout);
         let unit_layout = Arc::clone(&static_layout);
         let binding_args = args.clone();
-        let runtime_layout = execution_layout::<V3Architecture, V3State>(&architecture)?;
         let (policy, _metadata) = prepare_layerwise_policy_with_bindings(
             store,
             &mut architecture,
             factory,
             std::marker::PhantomData::<V3State>,
-            runtime_layout,
             options,
             stream,
             weights_stream,
@@ -676,13 +670,11 @@ impl DeepSeekModel {
         let static_layout = Arc::new(layout);
         let unit_layout = Arc::clone(&static_layout);
         let binding_args = args.clone();
-        let runtime_layout = execution_layout::<V4Architecture, V4State>(&architecture)?;
         let (policy, _metadata) = prepare_layerwise_policy_with_bindings(
             store,
             &mut architecture,
             factory,
             std::marker::PhantomData::<V4State>,
-            runtime_layout,
             options,
             stream,
             weights_stream,

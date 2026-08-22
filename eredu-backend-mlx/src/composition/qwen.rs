@@ -2,8 +2,8 @@
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
-    CausalModel, ExecutionGraph, ExecutionResidency, ExecutionUnitLayout, LayerWeightResidency,
-    LayerwiseRuntime, RuntimeState, WeightResidency,
+    CausalModel, ExecutionResidency, LayerWeightResidency, LayerwiseRuntime, RuntimeState,
+    WeightResidency,
 };
 
 use std::{
@@ -176,13 +176,6 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     }
 }
 
-fn decoder_unit_layout(layer_count: usize) -> Result<ExecutionUnitLayout, Error> {
-    let graph = ExecutionGraph::chain(["decoder"])
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    ExecutionUnitLayout::new(&graph, [layer_count])
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
 pub fn load_model_args(model_dir: &Path) -> Result<ModelArgs, Error> {
     let file = std::fs::File::open(model_dir.join("config.json"))?;
     eredu_architectures::qwen::model_args_from_config_reader(file)
@@ -239,8 +232,6 @@ fn load_neutral_qwen(
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
     external_experts: bool,
 ) -> Result<QwenModel, Error> {
-    let layer_count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Qwen layer count".into()))?;
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let expert_targets = Arc::new(
@@ -248,7 +239,6 @@ fn load_neutral_qwen(
             .map_err(|error| Error::Parallel(error.to_string()))?
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
-    let unit_layout = decoder_unit_layout(layer_count)?;
     let binding_args = args.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
@@ -257,7 +247,6 @@ fn load_neutral_qwen(
         &mut architecture,
         (),
         std::marker::PhantomData::<MlxKeyValueState>,
-        unit_layout,
         options,
         stream,
         weights_stream,
@@ -1198,7 +1187,6 @@ fn load_neutral_qwen_parallel(
     let binding_args = args.clone();
     let global_static_modules = global_architecture.static_modules().clone();
     let binding_layout = layout.clone();
-    let unit_layout = decoder_unit_layout(layer_count)?;
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
@@ -1206,7 +1194,6 @@ fn load_neutral_qwen_parallel(
         &mut architecture,
         (),
         std::marker::PhantomData::<MlxKeyValueState>,
-        unit_layout,
         options,
         stream,
         weights_stream,

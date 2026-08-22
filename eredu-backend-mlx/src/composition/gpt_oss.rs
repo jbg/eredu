@@ -13,10 +13,10 @@ use eredu_nn::{
     ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized, RoutedNeuralBackend,
 };
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionGraph, ExecutionResidency,
-    ExecutionUnitLayout, LayerWeightResidency, LayerwiseModelMetadata, LayerwiseRuntime,
-    PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport, RuntimeState,
-    StaticUnitBindings, WeightBinding, WeightResidency,
+    CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionResidency,
+    LayerWeightResidency, LayerwiseModelMetadata, LayerwiseRuntime, PagedCacheOptions,
+    ParallelModelInfo, ParameterRole, ResidencyReport, RuntimeState, StaticUnitBindings,
+    WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -398,13 +398,6 @@ impl Parameterized<crate::MlxTensor> for DenseUnit {
     }
 }
 
-fn decoder_unit_layout(layer_count: usize) -> Result<ExecutionUnitLayout, Error> {
-    let graph = ExecutionGraph::chain(["decoder"])
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    ExecutionUnitLayout::new(&graph, [layer_count])
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
 /// Reads normalized GPT-OSS arguments from a SafeTensors model directory.
 pub fn load_model_args(model_dir: &Path) -> Result<ModelArgs, Error> {
     let file = std::fs::File::open(model_dir.join("config.json"))?;
@@ -455,20 +448,16 @@ pub fn load_neutral_with_store(
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
     external_experts: bool,
 ) -> Result<GptOssModel, Error> {
-    let layer_count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid GPT-OSS layer count".into()))?;
     let mut architecture =
         eredu_architectures::gpt_oss::new_layered_model::<MlxBackend>(args.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let factory = GptOssUnitPopulator { external_experts };
     let binding_args = args.clone();
-    let unit_layout = decoder_unit_layout(layer_count)?;
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
         &mut architecture,
         factory,
         std::marker::PhantomData::<MlxKeyValueState>,
-        unit_layout,
         options,
         stream,
         weights_stream,
@@ -595,7 +584,6 @@ fn load_neutral_parallel_with_store(
 
     let binding_args = args.clone();
     let global_static_modules = global_architecture.static_modules().clone();
-    let unit_layout = decoder_unit_layout(layer_count)?;
     let local_layout = Arc::new(layout);
     let static_layout = Arc::clone(&local_layout);
     let unit_local_layout = Arc::clone(&local_layout);
@@ -604,7 +592,6 @@ fn load_neutral_parallel_with_store(
         &mut architecture,
         factory,
         std::marker::PhantomData::<MlxKeyValueState>,
-        unit_layout,
         options,
         stream,
         weights_stream,

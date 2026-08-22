@@ -584,22 +584,7 @@ fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error>
     Ok(largest)
 }
 
-fn validate_policy_layout(
-    canonical: ExecutionUnitLayout,
-    supplied: ExecutionUnitLayout,
-) -> Result<ExecutionUnitLayout, Error> {
-    if supplied != canonical {
-        return Err(Error::UnsupportedArchitecture(
-            "layerwise execution layout differs from the architecture-declared layout".into(),
-        ));
-    }
-    Ok(canonical)
-}
-
-fn architecture_policy_layout<A, S>(
-    architecture: &A,
-    supplied: ExecutionUnitLayout,
-) -> Result<ExecutionUnitLayout, Error>
+fn architecture_policy_layout<A, S>(architecture: &A) -> Result<ExecutionUnitLayout, Error>
 where
     A: LayeredArchitecture<MlxBackend, S>,
     S: RuntimeState<MlxBackend>,
@@ -615,9 +600,8 @@ where
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let canonical = ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    validate_policy_layout(canonical, supplied)
+    ExecutionUnitLayout::new(&graph, counts)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 /// Builds a generic MLX layerwise policy from neutral parameter topologies.
@@ -627,7 +611,6 @@ pub fn prepare_layerwise_policy<A, S, P, I>(
     architecture: &mut A,
     populator: P,
     state: std::marker::PhantomData<S>,
-    layout: ExecutionUnitLayout,
     options: LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
@@ -646,7 +629,6 @@ where
         architecture,
         populator,
         state,
-        layout,
         options,
         stream,
         weights_stream,
@@ -671,7 +653,6 @@ pub fn prepare_layerwise_policy_with_bindings<A, S, P, I, SB, UB>(
     architecture: &mut A,
     populator: P,
     _state: std::marker::PhantomData<S>,
-    layout: ExecutionUnitLayout,
     options: LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
@@ -696,7 +677,7 @@ where
         &Stream,
     ) -> Result<Vec<WeightBinding>, Error>,
 {
-    let layout = architecture_policy_layout::<A, S>(architecture, layout)?;
+    let layout = architecture_policy_layout::<A, S>(architecture)?;
     let unit_count = layout.len();
     if unit_count == 0 {
         return Err(Error::Parallel(
@@ -1113,38 +1094,5 @@ impl<U, P> Drop for MlxLayerwisePolicy<U, P> {
         for (event, _) in &self.pending {
             let _ = event.synchronize();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use eredu_runtime::{ExecutionGraph, ExecutionGroupSpec};
-
-    #[test]
-    fn policy_layout_rejects_equal_length_reordered_groups() {
-        let canonical_graph = ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root("vision"),
-                ExecutionGroupSpec::with_dependencies("text", ["vision"]),
-            ],
-            "text",
-        )
-        .unwrap();
-        let supplied_graph = ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root("text"),
-                ExecutionGroupSpec::with_dependencies("vision", ["text"]),
-            ],
-            "vision",
-        )
-        .unwrap();
-        let canonical = ExecutionUnitLayout::new(&canonical_graph, [1, 1]).unwrap();
-        let supplied = ExecutionUnitLayout::new(&supplied_graph, [1, 1]).unwrap();
-
-        let error = validate_policy_layout(canonical, supplied).unwrap_err();
-
-        assert!(matches!(error, Error::UnsupportedArchitecture(message)
-            if message.contains("architecture-declared layout")));
     }
 }

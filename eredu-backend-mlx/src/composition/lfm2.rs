@@ -9,10 +9,9 @@ use std::{
 use eredu_architectures::lfm2::{Block, LayeredModel, ModelArgs};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionGraph, ExecutionUnitLayout,
-    ExpertIdentity, LayerWeightResidency, LayerwiseModelMetadata, LayerwiseRuntime, OffloadUnit,
-    PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport, StaticUnitBindings,
-    WeightBinding, WeightResidency,
+    CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExpertIdentity, LayerWeightResidency,
+    LayerwiseModelMetadata, LayerwiseRuntime, OffloadUnit, PagedCacheOptions, ParallelModelInfo,
+    ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -388,13 +387,6 @@ enum Lfm2Execution {
     TensorParallelLayerwise(Box<ParallelBoundedRuntime>),
 }
 
-fn execution_layout(layer_count: usize) -> Result<ExecutionUnitLayout, Error> {
-    let graph = ExecutionGraph::chain(["target"])
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    ExecutionUnitLayout::new(&graph, [layer_count])
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
 pub fn load_model_args(model_dir: &Path) -> Result<ModelArgs, Error> {
     let file = std::fs::File::open(model_dir.join("config.json"))?;
     eredu_architectures::lfm2::model_args_from_config_reader(file)
@@ -504,8 +496,6 @@ fn load_neutral(
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
     external_experts: bool,
 ) -> Result<Lfm2Model, Error> {
-    let count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid LFM2 layer count".into()))?;
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let expert_targets = Arc::new(
@@ -525,7 +515,6 @@ fn load_neutral(
             expert_targets: Arc::clone(&expert_targets),
         },
         std::marker::PhantomData::<MlxHybridState>,
-        execution_layout(count)?,
         options,
         stream,
         weights_stream,
@@ -668,7 +657,6 @@ fn load_neutral_parallel(
         &mut architecture,
         factory,
         std::marker::PhantomData::<MlxHybridState>,
-        execution_layout(count)?,
         options,
         stream,
         weights_stream,

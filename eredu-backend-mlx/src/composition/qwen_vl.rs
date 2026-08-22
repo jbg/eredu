@@ -1438,7 +1438,6 @@ fn load_store(
             .map_err(|error| Error::Parallel(error.to_string()))?
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
-    let layout = unit_layout(&architecture)?;
     let factory = UnitPopulator {
         external_experts,
         expert_targets: Arc::clone(&expert_targets),
@@ -1451,7 +1450,6 @@ fn load_store(
         &mut architecture,
         factory,
         std::marker::PhantomData::<MlxHybridState>,
-        layout,
         options,
         stream,
         weights_stream,

@@ -233,9 +233,9 @@ internally between reusable backend mechanics and family/backend composition:
 - neural-network modules implement reusable MLX tensor operations;
 - runtime modules implement checkpoint materialization, sampling, caches,
   residency workers, media processing, and collectives;
-- generic layerwise policy construction validates any composition-supplied
-  execution layout against the layout derived from the concrete neutral
-  architecture before binding checkpoint units; and
+- generic layerwise policy construction derives its execution graph and unit
+  layout directly from the concrete neutral architecture before binding
+  checkpoint units; composition cannot supply or reconstruct that layout; and
 - MLX events provide exact completion while retaining arrays and source
   resources required by submitted work.
 

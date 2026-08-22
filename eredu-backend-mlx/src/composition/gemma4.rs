@@ -1819,7 +1819,6 @@ fn load_store(
             expert_targets: Arc::clone(&expert_targets),
         },
         std::marker::PhantomData::<MlxHybridState>,
-        execution_layout(&args)?,
         residency,
         stream,
         weights_stream,
@@ -1945,7 +1944,6 @@ fn load_parallel_store(
     let state_layout = architecture
         .runtime_state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let unit_layout = execution_layout(&args)?;
     let vision_layers = geometry.vision_layers();
     let audio_layers = geometry.audio_layers();
     let text_start = vision_layers + audio_layers;
@@ -2002,7 +2000,6 @@ fn load_parallel_store(
             expert_targets: Arc::new(Default::default()),
         },
         std::marker::PhantomData::<MlxHybridState>,
-        unit_layout,
         residency,
         stream,
         weights_stream,
