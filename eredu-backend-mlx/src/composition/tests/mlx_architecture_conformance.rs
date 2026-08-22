@@ -38,6 +38,59 @@ fn mlx_execution() -> Option<ExecutionContext> {
     Some(ExecutionContext::new(Device::new(DeviceType::Cpu, 0)))
 }
 
+macro_rules! execute_group {
+    ($architecture_ty:ty, $state_ty:ty, $architecture:expr, $state:expr, $context:expr, $group:expr, $initial:expr, $dependencies:expr, $stream:expr) => {{
+        let mut hidden = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::begin_execution_group(
+            &mut $architecture,
+            $group,
+            $initial,
+            $dependencies,
+            &mut $state,
+            &mut $context,
+            $stream,
+        )
+        .unwrap();
+        let unit_count =
+            <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::group_unit_count(
+                &$architecture,
+                $group,
+            )
+            .unwrap();
+        for index in 0..unit_count {
+            let mut unit =
+                <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::build_unit(
+                    &$architecture,
+                    $group,
+                    index,
+                    $stream,
+                )
+                .unwrap();
+            hidden =
+                <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::forward_unit(
+                    &mut $architecture,
+                    $group,
+                    index,
+                    &mut unit,
+                    &hidden,
+                    &mut $state,
+                    &mut $context,
+                    $stream,
+                )
+                .unwrap();
+        }
+        hidden = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::complete_execution_group(
+            &mut $architecture,
+            $group,
+            &hidden,
+            &mut $state,
+            &mut $context,
+            $stream,
+        )
+        .unwrap();
+        hidden
+    }};
+}
+
 macro_rules! execute_target_group {
     ($architecture_ty:ty, $state_ty:ty, $architecture:expr, $state:expr, $input:expr, $shape:expr, $stream:expr) => {{
         let token_validation_scope = TokenValidationScope::begin().unwrap();
@@ -51,69 +104,86 @@ macro_rules! execute_target_group {
             $stream,
         )
         .unwrap();
-        let mut hidden = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::begin_execution_group(
-            &mut $architecture,
+        let hidden = execute_group!(
+            $architecture_ty,
+            $state_ty,
+            $architecture,
+            $state,
+            context,
             0,
             &initial,
             &[],
-            &mut $state,
-            &mut context,
-            $stream,
-        )
-        .unwrap();
-        let unit_count =
-            <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::group_unit_count(
-                &$architecture,
-                0,
+            $stream
+        );
+        let logits =
+            <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::finish_forward(
+                &mut $architecture,
+                &hidden,
+                &mut $state,
+                &context,
+                $stream,
             )
             .unwrap();
-        for index in 0..unit_count {
-            let mut unit =
-                <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::build_unit(
-                    &$architecture,
-                    0,
-                    index,
-                    $stream,
-                )
-                .unwrap();
-            hidden =
-                <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::forward_unit(
-                    &mut $architecture,
-                    0,
-                    index,
-                    &mut unit,
-                    &hidden,
-                    &mut $state,
-                    &mut context,
-                    $stream,
-                )
-                .unwrap();
-        }
-        hidden = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::complete_execution_group(
-            &mut $architecture,
-            0,
-            &hidden,
-            &mut $state,
-            &mut context,
-            $stream,
-        )
-        .unwrap();
-        let logits = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::finish_forward(
-            &mut $architecture,
-            &hidden,
-            &mut $state,
-            &context,
-            $stream,
-        )
-        .unwrap();
         assert_eq!(logits.shape(), $shape);
         let token_validations = token_validation_scope.finish();
-        async_eval_with_event(
-            std::iter::once(logits.as_array()).chain(token_validations.arrays()),
+        async_eval_with_event(std::iter::once(logits.as_array()).chain(token_validations.arrays()))
+            .unwrap()
+            .synchronize()
+            .unwrap();
+        token_validations.validate_completed().unwrap();
+    }};
+}
+
+macro_rules! execute_vision_text_groups {
+    ($architecture_ty:ty, $state_ty:ty, $architecture:expr, $state:expr, $input:expr, $shape:expr, $stream:expr) => {{
+        let token_validation_scope = TokenValidationScope::begin().unwrap();
+        let LayeredForwardState {
+            hidden: initial,
+            mut context,
+        } = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::begin_forward(
+            &mut $architecture,
+            $input,
+            &mut $state,
+            $stream,
         )
-        .unwrap()
-        .synchronize()
         .unwrap();
+        let vision = execute_group!(
+            $architecture_ty,
+            $state_ty,
+            $architecture,
+            $state,
+            context,
+            0,
+            &initial,
+            &[],
+            $stream
+        );
+        let hidden = execute_group!(
+            $architecture_ty,
+            $state_ty,
+            $architecture,
+            $state,
+            context,
+            1,
+            &initial,
+            &[&vision],
+            $stream
+        );
+        let logits =
+            <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::finish_forward(
+                &mut $architecture,
+                &hidden,
+                &mut $state,
+                &context,
+                $stream,
+            )
+            .unwrap();
+        assert_eq!(logits.shape(), $shape);
+        let token_validations = token_validation_scope.finish();
+        async_eval_with_event(std::iter::once(logits.as_array()).chain(token_validations.arrays()))
+            .unwrap()
+            .synchronize()
+            .unwrap();
         token_validations.validate_completed().unwrap();
     }};
 }
@@ -437,6 +507,159 @@ fn neutral_qwen_forward_executes_on_mlx() {
             mask: None,
         },
         &[1, 2, 32],
+        stream
+    );
+}
+
+#[test]
+fn neutral_qwen3_next_hybrid_forward_executes_on_mlx() {
+    type Architecture = eredu_architectures::qwen::hybrid::LayeredModel<MlxBackend>;
+    let args =
+        eredu_architectures::qwen::hybrid::model_args_from_config_value(&serde_json::json!({
+            "model_type":"qwen3_next","vocab_size":32,"hidden_size":16,
+            "num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":2,
+            "head_dim":4,"max_position_embeddings":64,"intermediate_size":32,
+            "num_experts":0,"linear_conv_kernel_dim":2,
+            "linear_key_head_dim":4,"linear_value_head_dim":4,
+            "linear_num_key_heads":2,"linear_num_value_heads":4,
+            "layer_types":["linear_attention","full_attention"],
+            "rope_theta":1000000.0,"partial_rotary_factor":0.5
+        }))
+        .unwrap()
+        .text;
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
+    let stream = execution.stream();
+    let mut architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut state =
+        MlxHybridState::device(eredu_architectures::qwen::hybrid::state_layout(&args).unwrap())
+            .unwrap();
+    let tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
+    execute_target_group!(
+        Architecture,
+        MlxHybridState,
+        architecture,
+        state,
+        eredu_architectures::qwen::hybrid::EmbeddedInput::Target {
+            tokens: &tokens,
+            mask: None,
+        },
+        &[1, 2, 32],
+        stream
+    );
+}
+
+#[test]
+fn neutral_qwen35_conditional_forward_executes_on_mlx() {
+    type Architecture = eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend>;
+    let args =
+        eredu_architectures::qwen::hybrid::model_args_from_config_value(&serde_json::json!({
+            "model_type":"qwen3_5","image_token_id":30,"video_token_id":31,
+            "text_config":{
+                "model_type":"qwen3_5_text","vocab_size":32,"hidden_size":16,
+                "num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":2,
+                "head_dim":4,"max_position_embeddings":64,"intermediate_size":32,
+                "linear_conv_kernel_dim":2,"linear_key_head_dim":4,
+                "linear_value_head_dim":4,"linear_num_key_heads":2,
+                "linear_num_value_heads":4,
+                "layer_types":["linear_attention","full_attention"],
+                "tie_word_embeddings":false
+            },
+            "vision_config":{
+                "depth":1,"hidden_size":8,"intermediate_size":16,"num_heads":2,
+                "num_position_embeddings":16,"in_channels":3,"patch_size":2,
+                "spatial_merge_size":2,"temporal_patch_size":2,"out_hidden_size":16
+            }
+        }))
+        .unwrap();
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
+    let stream = execution.stream();
+    let mut architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut state = MlxHybridState::device(
+        eredu_architectures::qwen::hybrid::state_layout(&args.text).unwrap(),
+    )
+    .unwrap();
+    let text_tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
+    let image_tokens = MlxTensor::from_array(Array::from_slice(&[30_u32], &[1, 1]));
+    let grid = [(1, 2, 2)];
+    let pixels = MlxTensor::from_array(Array::from_slice(&[0.0_f32; 96], &[4, 24]));
+    let parts = [
+        eredu_architectures::qwen::vl::InputPart::Text(&text_tokens),
+        eredu_architectures::qwen::vl::InputPart::Image {
+            tokens: &image_tokens,
+            grid: &grid,
+        },
+    ];
+    execute_vision_text_groups!(
+        Architecture,
+        MlxHybridState,
+        architecture,
+        state,
+        eredu_architectures::qwen::hybrid::ConditionalInput::Target {
+            parts: &parts,
+            pixels: Some(&pixels),
+            mask: None,
+        },
+        &[1, 3, 32],
+        stream
+    );
+}
+
+#[test]
+fn neutral_qwen3_vl_forward_executes_on_mlx() {
+    type Architecture = eredu_architectures::qwen::vl::LayeredModel<MlxBackend>;
+    let args = eredu_architectures::qwen::vl::model_args_from_config_value(&serde_json::json!({
+        "model_type":"qwen3_vl","image_token_id":30,"video_token_id":31,
+        "tie_word_embeddings":false,
+        "text_config":{
+            "model_type":"qwen3_vl_text","hidden_size":16,
+            "num_hidden_layers":1,"intermediate_size":32,
+            "num_attention_heads":2,"num_key_value_heads":2,"head_dim":8,
+            "rms_norm_eps":0.000001,"vocab_size":32,
+            "max_position_embeddings":64,"rope_theta":1000000.0,
+            "rope_scaling":{"mrope_section":[1,1,2],"mrope_interleaved":true}
+        },
+        "vision_config":{
+            "depth":1,"hidden_size":8,"intermediate_size":16,"num_heads":2,
+            "num_position_embeddings":16,"in_channels":3,"patch_size":2,
+            "spatial_merge_size":2,"temporal_patch_size":2,"out_hidden_size":16,
+            "deepstack_visual_indexes":[0]
+        }
+    }))
+    .unwrap();
+    let Some(execution) = mlx_execution() else {
+        return;
+    };
+    let stream = execution.stream();
+    let mut architecture = Architecture::new(args.clone(), stream).unwrap();
+    let mut state =
+        MlxHybridState::device(eredu_architectures::qwen::vl::state_layout(&args).unwrap())
+            .unwrap();
+    let text_tokens = MlxTensor::from_array(Array::from_slice(&[1_u32, 2], &[1, 2]));
+    let image_tokens = MlxTensor::from_array(Array::from_slice(&[30_u32], &[1, 1]));
+    let grid = [(1, 2, 2)];
+    let pixels = MlxTensor::from_array(Array::from_slice(&[0.0_f32; 96], &[4, 24]));
+    let parts = [
+        eredu_architectures::qwen::vl::InputPart::Text(&text_tokens),
+        eredu_architectures::qwen::vl::InputPart::Image {
+            tokens: &image_tokens,
+            grid: &grid,
+        },
+    ];
+    execute_vision_text_groups!(
+        Architecture,
+        MlxHybridState,
+        architecture,
+        state,
+        eredu_architectures::qwen::vl::ModelInput {
+            parts: &parts,
+            pixels: Some(&pixels),
+            mask: None,
+        },
+        &[1, 3, 32],
         stream
     );
 }
