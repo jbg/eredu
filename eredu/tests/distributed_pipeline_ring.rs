@@ -333,6 +333,8 @@ impl FixtureFamily {
                 | Self::MuseGlimmer
                 | Self::Qwen2
                 | Self::Qwen3
+                | Self::DeepSeek
+                | Self::DeepSeekV4
         )
     }
 
@@ -382,6 +384,7 @@ fn pipeline_ring_worker() {
             Some("tp") => (2, 1, 1),
             Some("ep") => (1, 1, 2),
             Some("tp-pp") => (2, 2, 1),
+            Some("tp-ep") => (2, 1, 2),
             Some("pp-ep") => (1, 2, 2),
             Some("tp-pp-ep") => (2, 2, 2),
             Some(other) => panic!("unexpected Cartesian pipeline axes {other:?}"),
@@ -480,7 +483,8 @@ fn pipeline_ring_worker() {
             PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap();
         let reference = (tensor_parallel_size == 2
             && pipeline_parallel_size == 1
-            && expert_parallel_size == 1
+            && (expert_parallel_size == 1
+                || matches!(family, FixtureFamily::DeepSeek | FixtureFamily::DeepSeekV4))
             && family.needs_tp2_opaque_reference())
         .then(|| resident_reference_for_prepared(&checkpoint, &reference_input, &stream));
         let reference_tolerance = if image_mode || gemma4_media_mode {
@@ -536,6 +540,7 @@ fn pipeline_ring_worker() {
             "mistral" => "mistral",
             "muse_glimmer" => "muse_glimmer",
             "qwen2" | "qwen3" | "qwen3_moe" => "qwen",
+            "deepseek_v3" | "deepseek_v4" => "deepseek",
             _ => "inkling",
         };
         let layer_layout = session.prompt_cache_layer_layout().unwrap();
@@ -4696,6 +4701,32 @@ fn ring_eight_process_deepseek_streamed_triple_axis_expert_cache() {
         FixtureFamily::DeepSeek,
         "tp-pp-ep",
         WorkerMode::ExpertCache,
+    );
+}
+
+/// Compares the cache-backed DeepSeek V3 model facade under TP=2 x EP=2 with
+/// the replicated model, covering rank-local expert geometry and exact-once TP.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_deepseek_cached_tensor_expert_model_parity() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeek,
+        "tp-ep",
+        WorkerMode::OpaqueSessionExpertCache,
+    );
+}
+
+/// Applies the same model-level TP+EP parity check to DeepSeek V4, including
+/// its hyper-connection block and independently cached routed expert bank.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_deepseek_v4_cached_tensor_expert_model_parity() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeekV4,
+        "tp-ep",
+        WorkerMode::OpaqueSessionExpertCache,
     );
 }
 

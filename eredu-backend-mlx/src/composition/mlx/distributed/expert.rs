@@ -55,7 +55,7 @@ use eredu_core::{ModelKind, MtpCapability, MtpCheckpointKind, MtpStats};
 use eredu_runtime::NonExpertWeightResidency;
 use eredu_runtime::{
     CacheResidencyPolicy, CacheResidencyReport, ExpertCacheLoadOptions, ExpertPass,
-    LayerWeightResidency, PagedCacheOptions, WeightResidency,
+    LayerWeightResidency, PagedCacheOptions, RoutedExpertTensorParallelOutput, WeightResidency,
 };
 
 #[cfg(test)]
@@ -972,35 +972,18 @@ impl ExpertParallelModel {
                                 .into(),
                         ));
                     }
-                    let args = match (model.v3_args(), model.v4_args()) {
-                        (Some(args), None) => NeutralDeepSeekArgs::V3(args.clone()),
-                        (None, Some(args)) => NeutralDeepSeekArgs::V4(args.clone()),
-                        _ => unreachable!("DeepSeek model has exactly one family policy"),
+                    let mut execute = |execution, stream: &Stream| {
+                        execute_cached_neutral_deepseek(
+                            execution,
+                            pass,
+                            expert_cache,
+                            assignment,
+                            group,
+                            &mut statistics,
+                            stream,
+                        )
+                        .map_err(|error| Exception::custom(error.to_string()))
                     };
-                    let mut execute =
-                        |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                            let returned = dispatch_replicated_with(
-                                hidden,
-                                ids,
-                                weights,
-                                assignment,
-                                group,
-                                stream,
-                                |routes, stream| {
-                                    execute_cached_neutral_deepseek(
-                                        &args,
-                                        layer,
-                                        routes,
-                                        pass,
-                                        expert_cache,
-                                        stream,
-                                    )
-                                },
-                            )
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                            statistics.accumulate(&returned.statistics);
-                            Ok(returned.reduced_output)
-                        };
                     match tensor_group {
                         Some(tensor_group) => model.forward_tensor_expert_parallel(
                             tokens,
@@ -1140,35 +1123,18 @@ impl ExpertParallelModel {
         let mut statistics = RoutingStatistics::default();
         let output = match (&mut self.architecture, cache) {
             (ExpertArchitecture::DeepSeek(model), ExpertParallelCache::DeepSeek(cache)) => {
-                let args = match (model.v3_args(), model.v4_args()) {
-                    (Some(args), None) => NeutralDeepSeekArgs::V3(args.clone()),
-                    (None, Some(args)) => NeutralDeepSeekArgs::V4(args.clone()),
-                    _ => unreachable!("DeepSeek model has exactly one family policy"),
+                let mut execute = |execution, stream: &Stream| {
+                    execute_cached_neutral_deepseek(
+                        execution,
+                        pass,
+                        expert_cache,
+                        assignment,
+                        expert_group,
+                        &mut statistics,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()))
                 };
-                let mut execute =
-                    |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                        let returned = dispatch_replicated_with(
-                            hidden,
-                            ids,
-                            weights,
-                            assignment,
-                            expert_group,
-                            stream,
-                            |routes, stream| {
-                                execute_cached_neutral_deepseek(
-                                    &args,
-                                    layer,
-                                    routes,
-                                    pass,
-                                    expert_cache,
-                                    stream,
-                                )
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                        statistics.accumulate(&returned.statistics);
-                        Ok(returned.reduced_output)
-                    };
                 let input = eredu_architectures::deepseek::mtp::EmbeddedInput::target(tokens, None);
                 let (logits, hidden) = match tensor_group {
                     Some(tensor_group) => model.forward_embedded_tensor_expert_parallel(
@@ -1233,35 +1199,18 @@ impl ExpertParallelModel {
         let mut statistics = RoutingStatistics::default();
         let output = match (&mut self.architecture, cache) {
             (ExpertArchitecture::DeepSeek(model), ExpertParallelMtpDraftCache::DeepSeek(cache)) => {
-                let args = match (model.v3_args(), model.v4_args()) {
-                    (Some(args), None) => NeutralDeepSeekArgs::V3(args.clone()),
-                    (None, Some(args)) => NeutralDeepSeekArgs::V4(args.clone()),
-                    _ => unreachable!("DeepSeek model has exactly one family policy"),
+                let mut execute = |execution, stream: &Stream| {
+                    execute_cached_neutral_deepseek(
+                        execution,
+                        pass,
+                        expert_cache,
+                        assignment,
+                        expert_group,
+                        &mut statistics,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()))
                 };
-                let mut execute =
-                    |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
-                        let returned = dispatch_replicated_with(
-                            hidden,
-                            ids,
-                            weights,
-                            assignment,
-                            expert_group,
-                            stream,
-                            |routes, stream| {
-                                execute_cached_neutral_deepseek(
-                                    &args,
-                                    layer,
-                                    routes,
-                                    pass,
-                                    expert_cache,
-                                    stream,
-                                )
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                        statistics.accumulate(&returned.statistics);
-                        Ok(returned.reduced_output)
-                    };
                 let input =
                     eredu_architectures::deepseek::mtp::EmbeddedInput::draft(tokens, hidden, depth);
                 let (logits, next_hidden) = match tensor_group {
@@ -1738,32 +1687,122 @@ fn parameter_bytes(module: &impl ModuleParameters) -> usize {
         .sum()
 }
 
-enum NeutralDeepSeekArgs {
-    V3(eredu_architectures::deepseek::V3Args),
-    V4(eredu_architectures::deepseek::V4Args),
+struct CachedDeepSeekLocalBank<'a> {
+    spec: &'a eredu_nn::GatedProductExpertBankSpec,
+    layer: usize,
+    pass: ExpertPass,
+    cache: &'a ExpertCache,
+    local_global_expert_ids: &'a [usize],
 }
 
+impl CachedDeepSeekLocalBank<'_> {
+    fn global_ids(&self, local_ids: &Array, stream: &Stream) -> Result<Array, Error> {
+        let ids = self
+            .local_global_expert_ids
+            .iter()
+            .map(|id| i32::try_from(*id))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| Error::Parallel("DeepSeek expert id exceeds i32".into()))?;
+        let lookup = Array::from_slice(&ids, &[ids.len() as i32]);
+        Ok(lookup.take_axis(local_ids, 0, stream)?)
+    }
+}
+
+impl LocalExpertBank for CachedDeepSeekLocalBank<'_> {
+    fn execute_local_routes(
+        &mut self,
+        hidden: &Array,
+        local_expert_ids: &Array,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
+            self.cache,
+            self.spec,
+            self.layer,
+            hidden,
+            &self.global_ids(local_expert_ids, stream)?,
+            self.pass,
+            stream,
+        )
+    }
+
+    fn execute_local_routes_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        local_expert_ids: &Array,
+        partitions: usize,
+        stream: &Stream,
+    ) -> Result<eredu_nn::TensorParallelExpertOutput<Array>, Error> {
+        let expert_ids = self
+            .global_ids(local_expert_ids, stream)?
+            .reshape(&[-1, 1], stream)?;
+        let route_weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+        crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_tensor_parallel(
+            self.cache,
+            self.spec,
+            self.layer,
+            hidden,
+            &expert_ids,
+            &route_weights,
+            self.pass,
+            partitions,
+            stream,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_cached_neutral_deepseek(
-    args: &NeutralDeepSeekArgs,
-    layer: usize,
-    routes: &DispatchedRoutes,
+    execution: crate::backend::mlx::runtime::residency::expert_provider::GatedProductExpertExecution,
     pass: ExpertPass,
     cache: &ExpertCache,
+    assignment: &ExpertAssignment,
+    group: &Group,
+    statistics: &mut RoutingStatistics,
     stream: &Stream,
-) -> Result<Array, Error> {
-    let spec = match args {
-        NeutralDeepSeekArgs::V3(args) => crate::composition::deepseek_expert::v3_spec(args, layer)?,
-        NeutralDeepSeekArgs::V4(args) => crate::composition::deepseek_expert::v4_spec(args, layer)?,
-    };
-    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
-        cache,
-        &spec,
-        layer,
-        &routes.hidden,
-        &routes.global_expert_ids,
+) -> Result<RoutedExpertTensorParallelOutput<Array>, Error> {
+    use crate::backend::mlx::runtime::residency::expert_provider::GatedProductExpertExecutionMode;
+
+    let mut bank = CachedDeepSeekLocalBank {
+        spec: &execution.spec,
+        layer: execution.layer,
         pass,
-        stream,
-    )
+        cache,
+        local_global_expert_ids: assignment.local_global_expert_ids(),
+    };
+    match execution.mode {
+        GatedProductExpertExecutionMode::Complete => {
+            let returned = dispatch_replicated_with(
+                &execution.hidden,
+                &execution.expert_ids,
+                &execution.route_weights,
+                assignment,
+                group,
+                stream,
+                |routes, stream| {
+                    bank.execute_local_routes(&routes.hidden, &routes.local_expert_ids, stream)
+                },
+            )?;
+            statistics.accumulate(&returned.statistics);
+            Ok(RoutedExpertTensorParallelOutput::Complete(
+                returned.reduced_output,
+            ))
+        }
+        GatedProductExpertExecutionMode::TensorParallel { partitions } => {
+            let returned = dispatch_replicated_tensor_parallel(
+                &execution.hidden,
+                &execution.expert_ids,
+                &execution.route_weights,
+                assignment,
+                &mut bank,
+                group,
+                partitions,
+                stream,
+            )?;
+            statistics.accumulate(&returned.statistics);
+            Ok(RoutedExpertTensorParallelOutput::Partial(returned.output))
+        }
+    }
 }
 
 pub fn execute_cached_neutral_gemma4(

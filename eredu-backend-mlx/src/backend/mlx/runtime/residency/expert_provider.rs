@@ -222,12 +222,8 @@ where
         _partitions: usize,
         stream: &Stream,
     ) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, Self::Error> {
-        execute_routed_callback(self.execute, request, stream).map(|reducible| {
-            RoutedExpertTensorParallelOutput::Partial(TensorParallelExpertOutput {
-                reducible,
-                post_reduce: None,
-            })
-        })
+        execute_routed_callback(self.execute, request, stream)
+            .map(RoutedExpertTensorParallelOutput::Complete)
     }
 
     fn forward_relu2_routed(
@@ -246,12 +242,178 @@ where
         _partitions: usize,
         stream: &Stream,
     ) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, Self::Error> {
-        execute_routed_callback(self.execute, request, stream).map(|reducible| {
-            RoutedExpertTensorParallelOutput::Partial(TensorParallelExpertOutput {
-                reducible,
-                post_reduce: None,
-            })
-        })
+        execute_routed_callback(self.execute, request, stream)
+            .map(RoutedExpertTensorParallelOutput::Complete)
+    }
+}
+
+/// Completion contract requested from a gated-product expert callback.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GatedProductExpertExecutionMode {
+    /// Execute the ordinary bank and return a globally complete output.
+    Complete,
+    /// Execute a rank-local TP contribution and preserve its post-reduce term.
+    TensorParallel {
+        /// Partition count supplied by the architecture provider call.
+        partitions: usize,
+    },
+}
+
+/// Architecture-owned geometry and tensors supplied to an expert callback.
+pub struct GatedProductExpertExecution {
+    /// Global decoder layer requesting expert execution.
+    pub layer: usize,
+    /// Rank-local bank specification retained by the architecture module.
+    pub spec: GatedProductExpertBankSpec,
+    /// Flattened token rows submitted to the selected experts.
+    pub hidden: Array,
+    /// Selected global expert identities.
+    pub expert_ids: Array,
+    /// Route weights aligned with `expert_ids`.
+    pub route_weights: Array,
+    /// Required complete or rank-local tensor-parallel result contract.
+    pub mode: GatedProductExpertExecutionMode,
+}
+
+/// Adapts a callback that explicitly preserves complete versus rank-local TP
+/// expert semantics and consumes the architecture-owned local bank geometry.
+pub struct GatedProductExpertExecutorProvider<'a, F> {
+    execute: &'a mut F,
+}
+
+impl<'a, F> GatedProductExpertExecutorProvider<'a, F> {
+    pub const fn new(execute: &'a mut F) -> Self {
+        Self { execute }
+    }
+}
+
+fn reshape_gated_product_callback_output(
+    output: RoutedExpertTensorParallelOutput<Array>,
+    original_shape: &[i32],
+    stream: &Stream,
+) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, safemlx::error::Exception> {
+    match output {
+        RoutedExpertTensorParallelOutput::Complete(output) => output
+            .reshape(original_shape, stream)
+            .map(MlxTensor::from_array)
+            .map(RoutedExpertTensorParallelOutput::Complete),
+        RoutedExpertTensorParallelOutput::Partial(output) => {
+            let reducible = output.reducible.reshape(original_shape, stream)?;
+            let post_reduce = output
+                .post_reduce
+                .map(|value| value.reshape(original_shape, stream))
+                .transpose()?;
+            Ok(RoutedExpertTensorParallelOutput::Partial(
+                TensorParallelExpertOutput {
+                    reducible: MlxTensor::from_array(reducible),
+                    post_reduce: post_reduce.map(MlxTensor::from_array),
+                },
+            ))
+        }
+    }
+}
+
+fn execute_gated_product_callback<F>(
+    execute: &mut F,
+    resident_bank: &<MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+    request: RoutedExpertRequest<'_, MlxTensor>,
+    mode: GatedProductExpertExecutionMode,
+    stream: &Stream,
+) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, safemlx::error::Exception>
+where
+    F: FnMut(
+        GatedProductExpertExecution,
+        &Stream,
+    ) -> Result<RoutedExpertTensorParallelOutput<Array>, safemlx::error::Exception>,
+{
+    if request.input.as_array().ndim() < 2 {
+        return Err(safemlx::error::Exception::custom(format!(
+            "routed expert input must have a hidden dimension, got {:?}",
+            request.input.as_array().shape()
+        )));
+    }
+    let original_shape = request.input.as_array().shape().to_vec();
+    let hidden = request
+        .input
+        .as_array()
+        .reshape(&[-1, request.input.as_array().dim(-1)], stream)?;
+    let expert_ids = request
+        .routes
+        .expert_ids
+        .as_array()
+        .reshape(&[-1, request.routes.expert_ids.as_array().dim(-1)], stream)?;
+    let route_weights = request.routes.route_weights.as_array().reshape(
+        &[-1, request.routes.route_weights.as_array().dim(-1)],
+        stream,
+    )?;
+    let output = execute(
+        GatedProductExpertExecution {
+            layer: request.layer,
+            spec: resident_bank.spec().clone(),
+            hidden,
+            expert_ids,
+            route_weights,
+            mode,
+        },
+        stream,
+    )?;
+    reshape_gated_product_callback_output(output, &original_shape, stream)
+}
+
+impl<F> RoutedExpertProvider<MlxBackend> for GatedProductExpertExecutorProvider<'_, F>
+where
+    F: FnMut(
+        GatedProductExpertExecution,
+        &Stream,
+    ) -> Result<RoutedExpertTensorParallelOutput<Array>, safemlx::error::Exception>,
+{
+    type Error = safemlx::error::Exception;
+
+    fn forward_routed(
+        &mut self,
+        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        request: RoutedExpertRequest<'_, MlxTensor>,
+        stream: &Stream,
+    ) -> Result<MlxTensor, Self::Error> {
+        match execute_gated_product_callback(
+            self.execute,
+            resident_bank,
+            request,
+            GatedProductExpertExecutionMode::Complete,
+            stream,
+        )? {
+            RoutedExpertTensorParallelOutput::Complete(output) => Ok(output),
+            RoutedExpertTensorParallelOutput::Partial(_) => Err(safemlx::error::Exception::custom(
+                "ordinary expert execution returned a rank-local tensor-parallel partial",
+            )),
+        }
+    }
+
+    fn forward_routed_tensor_parallel(
+        &mut self,
+        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        request: RoutedExpertRequest<'_, MlxTensor>,
+        partitions: usize,
+        stream: &Stream,
+    ) -> Result<RoutedExpertTensorParallelOutput<MlxTensor>, Self::Error> {
+        execute_gated_product_callback(
+            self.execute,
+            resident_bank,
+            request,
+            GatedProductExpertExecutionMode::TensorParallel { partitions },
+            stream,
+        )
+    }
+
+    fn forward_relu2_routed(
+        &mut self,
+        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _request: RoutedExpertRequest<'_, MlxTensor>,
+        _stream: &Stream,
+    ) -> Result<MlxTensor, Self::Error> {
+        Err(safemlx::error::Exception::custom(
+            "a gated-product executor cannot execute a ReLU2 expert bank",
+        ))
     }
 }
 

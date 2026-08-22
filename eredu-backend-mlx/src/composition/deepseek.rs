@@ -49,6 +49,9 @@ use crate::backend::mlx::{
         },
         execution::layerwise::quantize_module_store_with_bindings,
         residency::expert_cache::{ExpertCache, ExpertCacheReport},
+        residency::expert_provider::{
+            GatedProductExpertExecution, GatedProductExpertExecutorProvider,
+        },
         residency::manager::ResidentUnitLease,
     },
 };
@@ -1233,17 +1236,18 @@ impl DeepSeekModel {
         stream: &Stream,
     ) -> Result<Array, Error>
     where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+        F: FnMut(
+            GatedProductExpertExecution,
+            &Stream,
+        )
+            -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<Array>, Exception>,
     {
         let pass = if tokens.dim(1) > 1 {
             eredu_runtime::ExpertPass::Prefill
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let mut provider =
-            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
-                execute,
-            );
+        let mut provider = GatedProductExpertExecutorProvider::new(execute);
         match (&mut self.inner, &mut state.inner) {
             (DeepSeekModelInner::V3 { execution, .. }, DeepSeekStateInner::V3(state)) => {
                 Self::run_v3_with_provider(
@@ -1288,17 +1292,18 @@ impl DeepSeekModel {
         stream: &Stream,
     ) -> Result<Array, Error>
     where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+        F: FnMut(
+            GatedProductExpertExecution,
+            &Stream,
+        )
+            -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<Array>, Exception>,
     {
         let pass = if tokens.dim(1) > 1 {
             eredu_runtime::ExpertPass::Prefill
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let mut provider =
-            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
-                execute,
-            );
+        let mut provider = GatedProductExpertExecutorProvider::new(execute);
         match (&mut self.inner, &mut state.inner) {
             (
                 DeepSeekModelInner::V3 {
@@ -1787,7 +1792,11 @@ impl DeepSeekModel {
         stream: &Stream,
     ) -> Result<(Array, Array), Exception>
     where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+        F: FnMut(
+            GatedProductExpertExecution,
+            &Stream,
+        )
+            -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<Array>, Exception>,
     {
         let pass = match &input {
             deepseek::mtp::EmbeddedInput::Target { tokens, .. }
@@ -1810,10 +1819,7 @@ impl DeepSeekModel {
             }
         };
         let input = neutral_embedded_input(input);
-        let mut provider =
-            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
-                execute,
-            );
+        let mut provider = GatedProductExpertExecutorProvider::new(execute);
         match (&mut self.inner, &mut state.inner) {
             (DeepSeekModelInner::V3 { execution, .. }, DeepSeekStateInner::V3(state)) => {
                 let (logits, context) = Self::run_v3_with_provider(
@@ -1864,7 +1870,11 @@ impl DeepSeekModel {
         stream: &Stream,
     ) -> Result<(Array, Array), Exception>
     where
-        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+        F: FnMut(
+            GatedProductExpertExecution,
+            &Stream,
+        )
+            -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<Array>, Exception>,
     {
         let pass = match &input {
             deepseek::mtp::EmbeddedInput::Target { tokens, .. }
@@ -1887,10 +1897,7 @@ impl DeepSeekModel {
             }
         };
         let input = neutral_embedded_input(input);
-        let mut provider =
-            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
-                execute,
-            );
+        let mut provider = GatedProductExpertExecutorProvider::new(execute);
         match (&mut self.inner, &mut state.inner) {
             (
                 DeepSeekModelInner::V3 {
