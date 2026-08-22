@@ -19,12 +19,7 @@ use std::{
 
 #[cfg(test)]
 use safemlx::module::{ModuleParameters, Param};
-use safemlx::{
-    distributed::Group,
-    error::Exception,
-    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
-    Array, Stream,
-};
+use safemlx::{distributed::Group, error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use eredu_core::cache::{
     validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheManifest,
@@ -1408,25 +1403,13 @@ fn load_expert_parallel_model_impl(
         .extension()
         .is_some_and(|extension| extension == "gguf")
     {
-        let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-        let architecture = match metadata.get("general.architecture") {
-            Some(GgufMetadataValue::String(architecture)) => architecture.clone(),
-            Some(_) => {
-                return Err(Error::UnsupportedArchitecture(
-                    "GGUF general.architecture metadata has the wrong type".into(),
-                ))
-            }
-            None => {
-                return Err(Error::UnsupportedArchitecture(
-                    "GGUF is missing general.architecture metadata".into(),
-                ))
-            }
-        };
+        let mut structural_options = options;
+        structural_options.parallel = None;
+        structural_options.weight_residency = WeightResidency::fully_resident();
+        let admitted =
+            crate::composition::mlx::structural::admit_gguf_path(model_dir, structural_options)?;
         return load_gguf_ep(
-            &architecture,
-            &checkpoint,
-            metadata,
+            admitted,
             topology,
             options,
             assignment,
@@ -2032,57 +2015,45 @@ fn load_kimi_linear_ep(
 
 #[allow(clippy::too_many_arguments)]
 fn load_gguf_ep(
-    architecture: &str,
-    checkpoint: &GgufCheckpoint,
-    metadata: std::collections::HashMap<String, GgufMetadataValue>,
+    source: crate::composition::mlx::structural::AdmittedGguf,
     topology: MlxParallelContext,
     options: ModelLoadOptions,
     assignment: Option<ExpertAssignment>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
+    let architecture = source.architecture();
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
     if topology.tensor_parallel_size > 1
         && (!matches!(
             architecture,
-            "kimi-linear"
-                | "deepseek2"
-                | "deepseek4"
-                | "inkling"
-                | "qwen3moe"
-                | "gpt-oss"
-                | "lfm2moe"
-                | "nemotron_h_moe"
+            eredu_core::GgufArchitecture::KimiLinear
+                | eredu_core::GgufArchitecture::DeepSeek2
+                | eredu_core::GgufArchitecture::DeepSeek4
+                | eredu_core::GgufArchitecture::Inkling
+                | eredu_core::GgufArchitecture::Qwen3Moe
+                | eredu_core::GgufArchitecture::GptOss
+                | eredu_core::GgufArchitecture::Lfm2Moe
+                | eredu_core::GgufArchitecture::NemotronHMoe
         ) || !(options.weight_residency.is_fully_resident()
             || options.weight_residency.expert_cache().is_some()))
     {
         return Err(Error::Parallel(format!(
-            "GGUF TP+EP preflight requires kimi-linear, deepseek2, inkling, qwen3moe, gpt-oss, lfm2moe, or nemotron_h_moe with fully resident weights or non-expert residency plus an independent expert cache, got architecture {architecture} and residency {:?}",
+            "GGUF TP+EP preflight requires kimi-linear, deepseek2, inkling, qwen3moe, gpt-oss, lfm2moe, or nemotron_h_moe with fully resident weights or non-expert residency plus an independent expert cache, got architecture {} and residency {:?}",
+            architecture.metadata_name(),
             options.weight_residency
         )));
     }
     crate::composition::mlx::validate_gguf_quantization_source(
         checkpoint,
-        &metadata,
+        metadata,
         options.quantization,
     )?;
-    if architecture == "deepseek4" {
-        let mut structural_options = options;
-        structural_options.parallel = None;
-        structural_options.weight_residency = WeightResidency::fully_resident();
-        crate::composition::mlx::structural::validate_gguf(
-            eredu_core::GgufArchitecture::DeepSeek4,
-            checkpoint,
-            &metadata,
-            structural_options,
-        )
-        .into_loader_result()?;
-    }
     if let Some(expert_options) = options.weight_residency.expert_cache() {
         reject_external_gguf_ep_quantization(options.quantization)?;
         return load_external_gguf_ep(
-            architecture,
-            checkpoint,
-            &metadata,
+            &source,
             topology,
             assignment,
             options.weight_residency.layers(),
@@ -2100,9 +2071,7 @@ fn load_gguf_ep(
     }
     reject_external_gguf_ep_quantization(options.quantization)?;
     load_external_gguf_ep(
-        architecture,
-        checkpoint,
-        &metadata,
+        &source,
         topology,
         assignment,
         LayerWeightResidency::FullyResident,
@@ -2115,9 +2084,7 @@ fn load_gguf_ep(
 
 #[allow(clippy::too_many_arguments)]
 fn load_external_gguf_ep(
-    architecture: &str,
-    checkpoint: &GgufCheckpoint,
-    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     topology: MlxParallelContext,
     assignment: Option<ExpertAssignment>,
     non_expert: LayerWeightResidency,
@@ -2126,9 +2093,11 @@ fn load_external_gguf_ep(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
-    match architecture {
-        "kimi-linear" => {
-            let prepared = kimi_linear::prepare_gguf(checkpoint, metadata)?;
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
+    match source.architecture() {
+        eredu_core::GgufArchitecture::KimiLinear => {
+            let prepared = kimi_linear::prepare_gguf(source)?;
             let args = prepared.args;
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
@@ -2176,7 +2145,7 @@ fn load_external_gguf_ep(
                 weights_stream,
             )
         }
-        "deepseek4" => {
+        eredu_core::GgufArchitecture::DeepSeek4 => {
             let (model, _) = if topology.tensor_parallel_size > 1 {
                 crate::composition::deepseek::load_gguf_external_experts_parallel(
                     checkpoint,
@@ -2223,7 +2192,7 @@ fn load_external_gguf_ep(
                 weights_stream,
             )
         }
-        "deepseek2" => {
+        eredu_core::GgufArchitecture::DeepSeek2 => {
             let (model, _) = if topology.tensor_parallel_size > 1 {
                 crate::composition::deepseek::load_gguf_external_experts_parallel(
                     checkpoint,
@@ -2270,11 +2239,8 @@ fn load_external_gguf_ep(
                 weights_stream,
             )
         }
-        "qwen3moe" => {
-            let prepared = crate::composition::qwen::prepare_qwen_gguf_checkpoint(
-                checkpoint,
-                metadata,
-            )?;
+        eredu_core::GgufArchitecture::Qwen3Moe => {
+            let prepared = crate::composition::qwen::prepare_qwen_gguf_checkpoint(source)?;
             let args = prepared.args;
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
@@ -2317,9 +2283,8 @@ fn load_external_gguf_ep(
                 weights_stream,
             )
         }
-        "gpt-oss" => {
-            let prepared =
-                gpt_oss::prepare_gpt_oss_gguf_checkpoint(checkpoint, metadata)?;
+        eredu_core::GgufArchitecture::GptOss => {
+            let prepared = gpt_oss::prepare_gpt_oss_gguf_checkpoint(source)?;
             let args = prepared.args;
             let assignment = resolve_model_assignment(
                 assignment,
@@ -2368,11 +2333,11 @@ fn load_external_gguf_ep(
                 weights_stream,
             )
         }
-        "inkling" => Err(Error::Parallel(
+        eredu_core::GgufArchitecture::Inkling => Err(Error::Parallel(
             "Inkling expert parallelism is served by the neutral pipeline runtime".into(),
         )),
-        "lfm2moe" => {
-            let prepared = lfm2::prepare_gguf(checkpoint, metadata)?;
+        eredu_core::GgufArchitecture::Lfm2Moe => {
+            let prepared = lfm2::prepare_gguf(source)?;
             let args = prepared.args;
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
@@ -2420,8 +2385,8 @@ fn load_external_gguf_ep(
                 weights_stream,
             )
         }
-        "nemotron_h_moe" => {
-            let prepared = nemotron_h::prepare_gguf(checkpoint, metadata)?;
+        eredu_core::GgufArchitecture::NemotronHMoe => {
+            let prepared = nemotron_h::prepare_gguf(source)?;
             let args = prepared.args;
             let assignment =
                 resolve_model_assignment(assignment, args.n_routed_experts as usize, topology)?;
@@ -2470,7 +2435,8 @@ fn load_external_gguf_ep(
             )
         }
         other => Err(Error::Parallel(format!(
-            "external-expert GGUF architecture {other} is unsupported; registered architectures are kimi-linear, deepseek2, gpt-oss, inkling, qwen3moe, qwen3vlmoe, lfm2moe, nemotron_h_moe, qwen35moe, and qwen3next"
+            "external-expert GGUF architecture {} is unsupported; registered architectures are kimi-linear, deepseek2, gpt-oss, inkling, qwen3moe, qwen3vlmoe, lfm2moe, nemotron_h_moe, qwen35moe, and qwen3next",
+            other.metadata_name()
         ))),
     }
 }

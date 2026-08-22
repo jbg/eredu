@@ -1,10 +1,6 @@
 //! MLX loading and runtime binding for the backend-neutral GPT-OSS decoder.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use eredu_architectures::gpt_oss::ModelArgs;
 use eredu_checkpoint::{store::CheckpointSource, store::TensorSelection, WeightQuantization};
@@ -19,12 +15,7 @@ use eredu_runtime::{
     ParallelModelInfo, ParameterRole, ResidencyReport, RuntimeState, StaticUnitBindings,
     WeightBinding, WeightResidency,
 };
-use safemlx::{
-    error::Exception,
-    ops::indexing::TryIndexOp,
-    ops::{GgufCheckpoint, GgufMetadataValue},
-    Array, Stream,
-};
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::{
     backend::mlx::{
@@ -1723,7 +1714,7 @@ pub fn load_gpt_oss_expert_cache_model(
     )
 }
 
-/// Loads SafeTensors or GGUF through the neutral GPT-OSS tensor-parallel graph.
+/// Loads SafeTensors or an inspected GGUF through the neutral GPT-OSS tensor-parallel graph.
 pub fn load_gpt_oss_tensor_parallel_model(
     model_path: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
@@ -1737,11 +1728,13 @@ pub fn load_gpt_oss_tensor_parallel_model(
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
-        let checkpoint = GgufCheckpoint::open(model_path)?;
-        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let admitted = crate::composition::mlx::structural::admit_gguf_path(
+            model_path,
+            crate::backend::mlx::ModelLoadOptions::default()
+                .with_weight_residency(WeightResidency::with_layers(options)),
+        )?;
         return load_gpt_oss_gguf_tensor_parallel_model(
-            &checkpoint,
-            &metadata,
+            &admitted,
             options,
             build,
             stream,
@@ -1782,36 +1775,23 @@ pub fn load_external_experts_with_store(
 }
 
 /// Header-only results needed to open a portable GGUF GPT-OSS checkpoint.
-pub struct PreparedGptOssGguf {
+pub(crate) struct PreparedGptOssGguf {
     pub args: ModelArgs,
     pub eos_token_ids: Vec<u32>,
 }
 
 /// Validates and normalizes portable GGUF metadata without reading payloads.
-pub fn prepare_gpt_oss_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
 ) -> Result<PreparedGptOssGguf, Error> {
-    let architecture = match metadata.get("general.architecture") {
-        Some(GgufMetadataValue::String(value)) => value.as_str(),
-        _ => {
-            return Err(Error::UnsupportedArchitecture(
-                "GGUF general.architecture must be a string".into(),
-            ))
-        }
-    };
-    if architecture != "gpt-oss" {
+    if source.architecture() != eredu_core::GgufArchitecture::GptOss {
         return Err(Error::UnsupportedArchitecture(format!(
-            "GPT-OSS GGUF loader received architecture {architecture:?}"
+            "GPT-OSS GGUF loader received architecture {:?}",
+            source.architecture()
         )));
     }
-    crate::composition::mlx::structural::validate_gguf(
-        eredu_core::GgufArchitecture::GptOss,
-        checkpoint,
-        metadata,
-        crate::backend::mlx::ModelLoadOptions::default(),
-    )
-    .into_loader_result()?;
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
     let mut args = eredu_architectures::gpt_oss::model_args_from_gguf_catalog(metadata)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     match eredu_architectures::gpt_oss::validate_gguf(checkpoint, &args) {
@@ -1840,15 +1820,15 @@ pub fn prepare_gpt_oss_gguf_checkpoint(
 }
 
 /// Loads a GGUF checkpoint through the same neutral model/runtime object.
-pub fn load_gpt_oss_gguf_model(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn load_gpt_oss_gguf_model(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(GptOssModel, Vec<u32>), Error> {
-    let prepared = prepare_gpt_oss_gguf_checkpoint(checkpoint, metadata)?;
+    let checkpoint = source.checkpoint();
+    let prepared = prepare_gpt_oss_gguf_checkpoint(source)?;
     let plan = eredu_architectures::gpt_oss::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
@@ -1883,18 +1863,15 @@ pub fn load_gpt_oss_gguf_model(
 }
 
 /// Loads a validated GGUF checkpoint through the neutral tensor-parallel graph.
-pub fn load_gpt_oss_gguf_tensor_parallel_model(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     options: LayerWeightResidency,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(GptOssModel, Vec<u32>), Error> {
-    crate::backend::mlx::runtime::execution::layerwise::validate_gguf_layerwise_source(
-        checkpoint, metadata, options,
-    )?;
-    let prepared = prepare_gpt_oss_gguf_checkpoint(checkpoint, metadata)?;
+    let checkpoint = source.checkpoint();
+    let prepared = prepare_gpt_oss_gguf_checkpoint(source)?;
     let plan = eredu_architectures::gpt_oss::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
@@ -1916,20 +1893,12 @@ pub fn load_gpt_oss_gguf_tensor_parallel_model(
 }
 
 /// Loads portable GGUF weights with the requested unified residency policy.
-pub fn load_gpt_oss_gguf_layerwise_model(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn load_gpt_oss_gguf_layerwise_model(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(GptOssModel, Vec<u32>), Error> {
-    load_gpt_oss_gguf_model(
-        checkpoint,
-        metadata,
-        residency,
-        quantization,
-        stream,
-        weights_stream,
-    )
+    load_gpt_oss_gguf_model(source, residency, quantization, stream, weights_stream)
 }

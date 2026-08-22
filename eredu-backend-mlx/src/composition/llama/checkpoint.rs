@@ -145,28 +145,28 @@ fn invalid_geometry(detail: String) -> CheckpointValidation {
     }])
 }
 
-pub struct PreparedLlamaGguf {
+pub(crate) struct PreparedLlamaGguf {
     pub args: ModelArgs,
     pub eos_token_ids: Vec<u32>,
 }
 
-pub fn prepare_llama_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn prepare_llama_gguf_checkpoint(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     quantization: Option<WeightQuantization>,
     _weights_stream: &Stream,
 ) -> Result<PreparedLlamaGguf, Error> {
+    if !matches!(
+        source.architecture(),
+        eredu_core::GgufArchitecture::Llama | eredu_core::GgufArchitecture::Mistral
+    ) {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Llama GGUF loader received architecture {:?}",
+            source.architecture()
+        )));
+    }
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
     let mut args = model_args_from_gguf_catalog(checkpoint, metadata)?;
-    let architecture = args.model_type.clone();
-    let gguf_architecture = eredu_core::GgufArchitecture::resolve(&architecture)?;
-    crate::composition::mlx::structural::validate_gguf(
-        gguf_architecture,
-        checkpoint,
-        metadata,
-        crate::backend::mlx::ModelLoadOptions::default(),
-    )
-    .into_loader_result()?;
-
     checkpoint
         .catalog()
         .translated_outputs(eredu_architectures::llama::translate_gguf_weight_name)

@@ -9,15 +9,10 @@ use eredu_runtime::{
     WeightResidency,
 };
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use eredu_architectures::llama::ModelArgs;
-use safemlx::{
-    error::Exception,
-    ops::indexing::TryIndexOp,
-    ops::{GgufCheckpoint, GgufMetadataValue},
-    Array, Stream,
-};
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use eredu_core::cache::{
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
@@ -828,11 +823,13 @@ pub fn load_llama_tensor_parallel_model(
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
-        let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let admitted = crate::composition::mlx::structural::admit_gguf_path(
+            model_dir,
+            crate::backend::mlx::ModelLoadOptions::default()
+                .with_weight_residency(WeightResidency::with_layers(options)),
+        )?;
         return load_llama_gguf_tensor_parallel_model(
-            &checkpoint,
-            &metadata,
+            &admitted,
             options,
             build,
             stream,
@@ -846,19 +843,15 @@ pub fn load_llama_tensor_parallel_model(
     load_neutral_llama_parallel(store, args, options, build, stream, weights_stream)
 }
 
-pub fn load_llama_gguf_tensor_parallel_model(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn load_llama_gguf_tensor_parallel_model(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     options: LayerWeightResidency,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(LlamaModel, Vec<u32>), Error> {
-    crate::backend::mlx::runtime::execution::layerwise::validate_gguf_layerwise_source(
-        checkpoint, metadata, options,
-    )?;
-    let prepared =
-        checkpoint::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let checkpoint = source.checkpoint();
+    let prepared = checkpoint::prepare_llama_gguf_checkpoint(source, None, weights_stream)?;
     let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
@@ -874,16 +867,15 @@ pub fn load_llama_gguf_tensor_parallel_model(
 }
 
 /// Loads a Llama/Mistral GGUF checkpoint using the selected residency policy.
-pub fn load_llama_gguf_model(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn load_llama_gguf_model(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(LlamaModel, Vec<u32>), Error> {
-    let prepared =
-        checkpoint::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let checkpoint = source.checkpoint();
+    let prepared = checkpoint::prepare_llama_gguf_checkpoint(source, None, weights_stream)?;
     let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =

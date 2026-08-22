@@ -355,6 +355,12 @@ internally between reusable backend mechanics and family/backend composition:
 - neural-network modules implement reusable MLX tensor operations;
 - runtime modules implement checkpoint materialization, sampling, caches,
   residency workers, media processing, and collectives;
+- GGUF family selection and structural admission are composition concerns.
+  Composition consumes the architecture resolved by backend-neutral artifact
+  inspection, validates the native checkpoint once, and passes an admitted
+  source to resident, tensor-parallel, pipeline, or expert family loaders.
+  Reusable backend runtime modules neither parse `general.architecture` nor
+  invoke family composition;
 - generic layerwise policy construction derives its execution graph and unit
   layout directly from the concrete neutral architecture before binding
   checkpoint units; composition cannot supply or reconstruct that layout.

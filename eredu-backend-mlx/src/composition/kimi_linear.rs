@@ -1,10 +1,6 @@
 //! Neutral Kimi Linear/Kimi Linear-MoE composition over MLX execution policies.
 
-use std::{
-    collections::{BTreeSet, HashMap},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 use eredu_architectures::kimi_linear::{Block, LayeredModel, ModelArgs};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, WeightQuantization};
@@ -15,7 +11,7 @@ use eredu_runtime::{
 };
 use safemlx::{
     error::Exception,
-    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
+    ops::{indexing::TryIndexOp, GgufCheckpoint},
     Array, Stream,
 };
 
@@ -1475,36 +1471,22 @@ impl eredu_architectures::kimi_linear::GgufTensorCatalog for GgufCatalog<'_> {
     }
 }
 
-pub struct PreparedGguf {
+pub(crate) struct PreparedGguf {
     pub args: ModelArgs,
     pub eos_token_ids: Vec<u32>,
 }
 
-pub fn prepare_gguf(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn prepare_gguf(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
 ) -> Result<PreparedGguf, Error> {
-    let architecture = match metadata.get("general.architecture") {
-        Some(GgufMetadataValue::String(value)) => value.as_str(),
-        _ => {
-            return Err(Error::UnsupportedArchitecture(
-                "GGUF general.architecture must be a string".into(),
-            ))
-        }
-    };
-    if architecture != "kimi-linear" {
+    if source.architecture() != eredu_core::GgufArchitecture::KimiLinear {
         return Err(Error::UnsupportedArchitecture(format!(
-            "Kimi Linear GGUF loader received architecture {architecture:?}"
+            "Kimi Linear GGUF loader received architecture {:?}",
+            source.architecture()
         )));
     }
-    let gguf_architecture = eredu_core::GgufArchitecture::resolve(architecture)?;
-    crate::composition::mlx::structural::validate_gguf(
-        gguf_architecture,
-        checkpoint,
-        metadata,
-        crate::backend::mlx::ModelLoadOptions::default(),
-    )
-    .into_loader_result()?;
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
     let mut args = eredu_architectures::kimi_linear::model_args_from_gguf_catalog(
         &GgufCatalog(checkpoint),
         metadata,
@@ -1528,15 +1510,15 @@ pub fn prepare_gguf(
 }
 
 /// Loads a GGUF checkpoint through the same neutral Kimi Linear model object.
-pub fn load_kimi_linear_gguf_model(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn load_kimi_linear_gguf_model(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(KimiLinearModel, Vec<u32>), Error> {
-    let prepared = prepare_gguf(checkpoint, metadata)?;
+    let checkpoint = source.checkpoint();
+    let prepared = prepare_gguf(source)?;
     let expert_options = residency.expert_cache();
     let plan = eredu_architectures::kimi_linear::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
@@ -1570,18 +1552,15 @@ pub fn load_kimi_linear_gguf_model(
 }
 
 /// Loads GGUF Kimi Linear with tensor-parallel placement.
-pub fn load_kimi_linear_gguf_tensor_parallel_model(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn load_kimi_linear_gguf_tensor_parallel_model(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     options: LayerWeightResidency,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(KimiLinearModel, Vec<u32>), Error> {
-    crate::backend::mlx::runtime::execution::layerwise::validate_gguf_layerwise_source(
-        checkpoint, metadata, options,
-    )?;
-    let prepared = prepare_gguf(checkpoint, metadata)?;
+    let checkpoint = source.checkpoint();
+    let prepared = prepare_gguf(source)?;
     let plan = eredu_architectures::kimi_linear::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(

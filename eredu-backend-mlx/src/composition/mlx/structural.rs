@@ -1,7 +1,6 @@
 //! MLX architecture binding against portable checkpoint catalogs.
 
 use std::collections::HashMap;
-#[cfg(test)]
 use std::path::Path;
 
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
@@ -18,6 +17,58 @@ pub use eredu_checkpoint::validation::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,
     CheckpointValidation as StructuralValidation,
 };
+
+/// Native GGUF source admitted by composition-level structural validation.
+///
+/// Family composition consumes this type instead of reparsing architecture
+/// metadata or reaching upward from reusable backend runtime code.
+pub(crate) struct AdmittedGguf {
+    architecture: GgufArchitecture,
+    checkpoint: GgufCheckpoint,
+    metadata: HashMap<String, GgufMetadataValue>,
+}
+
+impl AdmittedGguf {
+    pub(crate) const fn architecture(&self) -> GgufArchitecture {
+        self.architecture
+    }
+
+    pub(crate) fn checkpoint(&self) -> &GgufCheckpoint {
+        &self.checkpoint
+    }
+
+    pub(crate) fn metadata(&self) -> &HashMap<String, GgufMetadataValue> {
+        &self.metadata
+    }
+}
+
+pub(crate) fn admit_gguf(
+    architecture: GgufArchitecture,
+    checkpoint: GgufCheckpoint,
+    metadata: HashMap<String, GgufMetadataValue>,
+    options: ModelLoadOptions,
+) -> Result<AdmittedGguf, Error> {
+    validate_gguf(architecture, &checkpoint, &metadata, options).into_loader_result()?;
+    Ok(AdmittedGguf {
+        architecture,
+        checkpoint,
+        metadata,
+    })
+}
+
+pub(crate) fn admit_gguf_path(
+    path: &Path,
+    options: ModelLoadOptions,
+) -> Result<AdmittedGguf, Error> {
+    let inspection = eredu_core::inspect_artifact(path)?;
+    let validated = inspection.validated_gguf().ok_or_else(|| {
+        Error::UnsupportedArchitecture("GGUF admission received a non-GGUF artifact".into())
+    })?;
+    let architecture = validated.architecture();
+    let checkpoint = GgufCheckpoint::from_portable(validated.checkpoint().clone());
+    let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+    admit_gguf(architecture, checkpoint, metadata, options)
+}
 
 const fn mlx_supports_expert_cache(kind: ModelKind) -> bool {
     matches!(

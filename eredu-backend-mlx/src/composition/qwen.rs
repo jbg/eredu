@@ -6,20 +6,11 @@ use eredu_runtime::{
     WeightResidency,
 };
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use eredu_architectures::qwen::ModelArgs;
 use eredu_nn::RoutedNeuralBackend;
-use safemlx::{
-    error::Exception,
-    ops::indexing::TryIndexOp,
-    ops::{GgufCheckpoint, GgufMetadataValue},
-    Array, Stream,
-};
+use safemlx::{error::Exception, ops::indexing::TryIndexOp, ops::GgufCheckpoint, Array, Stream};
 
 use eredu_core::cache::{
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
@@ -1317,11 +1308,13 @@ pub fn load_qwen_tensor_parallel_model(
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
-        let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let admitted = crate::composition::mlx::structural::admit_gguf_path(
+            model_dir,
+            crate::backend::mlx::ModelLoadOptions::default()
+                .with_weight_residency(WeightResidency::with_layers(options)),
+        )?;
         return load_qwen_gguf_tensor_parallel_model(
-            &checkpoint,
-            &metadata,
+            &admitted,
             options,
             build,
             stream,
@@ -1345,31 +1338,27 @@ impl eredu_architectures::qwen::GgufTensorCatalog for QwenGgufCatalog<'_> {
     }
 }
 
-pub struct PreparedQwenGguf {
+pub(crate) struct PreparedQwenGguf {
     pub args: ModelArgs,
     pub eos_token_ids: Vec<u32>,
 }
 
-pub fn prepare_qwen_gguf_checkpoint(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn prepare_qwen_gguf_checkpoint(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
 ) -> Result<PreparedQwenGguf, Error> {
-    let architecture = match metadata.get("general.architecture") {
-        Some(GgufMetadataValue::String(value)) => value.as_str(),
-        _ => {
-            return Err(Error::UnsupportedArchitecture(
-                "GGUF general.architecture must be a string".into(),
-            ))
-        }
-    };
-    let gguf_architecture = eredu_core::GgufArchitecture::resolve(architecture)?;
-    crate::composition::mlx::structural::validate_gguf(
-        gguf_architecture,
-        checkpoint,
-        metadata,
-        crate::backend::mlx::ModelLoadOptions::default(),
-    )
-    .into_loader_result()?;
+    if !matches!(
+        source.architecture(),
+        eredu_core::GgufArchitecture::Qwen2
+            | eredu_core::GgufArchitecture::Qwen3
+            | eredu_core::GgufArchitecture::Qwen3Moe
+    ) {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen GGUF loader received architecture {:?}",
+            source.architecture()
+        )));
+    }
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
     let mut args = eredu_architectures::qwen::model_args_from_gguf_catalog(
         &QwenGgufCatalog(checkpoint),
         metadata,
@@ -1393,18 +1382,15 @@ pub fn prepare_qwen_gguf_checkpoint(
     })
 }
 
-pub fn load_qwen_gguf_tensor_parallel_model(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn load_qwen_gguf_tensor_parallel_model(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     options: LayerWeightResidency,
     build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(QwenModel, Vec<u32>), Error> {
-    crate::backend::mlx::runtime::execution::layerwise::validate_gguf_layerwise_source(
-        checkpoint, metadata, options,
-    )?;
-    let prepared = prepare_qwen_gguf_checkpoint(checkpoint, metadata)?;
+    let checkpoint = source.checkpoint();
+    let prepared = prepare_qwen_gguf_checkpoint(source)?;
     let gguf_plan = eredu_architectures::qwen::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
@@ -1429,15 +1415,15 @@ pub fn load_qwen_gguf_tensor_parallel_model(
 }
 
 /// Loads a Qwen/Mistral GGUF checkpoint using the selected residency policy.
-pub fn load_qwen_gguf_model(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
+pub(crate) fn load_qwen_gguf_model(
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(QwenModel, Vec<u32>), Error> {
-    let prepared = prepare_qwen_gguf_checkpoint(checkpoint, metadata)?;
+    let checkpoint = source.checkpoint();
+    let prepared = prepare_qwen_gguf_checkpoint(source)?;
     let gguf_plan = eredu_architectures::qwen::gguf_plan(&prepared.args)
         .map_err(Error::UnsupportedArchitecture)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =

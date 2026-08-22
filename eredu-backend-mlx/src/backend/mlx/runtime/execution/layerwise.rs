@@ -8,8 +8,7 @@ use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
 use eredu_runtime::OffloadUnit;
 use eredu_runtime::{
     DenseDiskStreamLoadOptions, DenseDiskStreamReport, DenseStreamTelemetry, DenseTransferSchedule,
-    LayerWeightResidency, StaticUnitBindings, WeightBinding, WeightResidency,
-    DENSE_TRANSFER_WINDOW,
+    StaticUnitBindings, WeightBinding, DENSE_TRANSFER_WINDOW,
 };
 
 use std::{
@@ -62,36 +61,6 @@ pub fn open_safetensors_weight_store(
     Ok(Arc::new(
         SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
     ))
-}
-
-pub fn validate_gguf_layerwise_source(
-    checkpoint: &safemlx::ops::GgufCheckpoint,
-    metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
-    options: LayerWeightResidency,
-) -> Result<eredu_core::GgufArchitecture, Error> {
-    let architecture_name = match metadata.get("general.architecture") {
-        Some(safemlx::ops::GgufMetadataValue::String(name)) => name,
-        Some(_) => {
-            return Err(Error::UnsupportedArchitecture(
-                "GGUF metadata key general.architecture has the wrong type".into(),
-            ));
-        }
-        None => {
-            return Err(Error::UnsupportedArchitecture(
-                "GGUF metadata is missing general.architecture".into(),
-            ));
-        }
-    };
-    let architecture = eredu_core::GgufArchitecture::resolve(architecture_name)?;
-    let residency = WeightResidency::with_layers(options);
-    crate::composition::mlx::structural::validate_gguf(
-        architecture,
-        checkpoint,
-        metadata,
-        crate::backend::mlx::ModelLoadOptions::default().with_weight_residency(residency),
-    )
-    .into_loader_result()?;
-    Ok(architecture)
 }
 
 pub struct DenseStreamController {

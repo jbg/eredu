@@ -31,7 +31,7 @@ pub use placement::{
 };
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -45,9 +45,12 @@ use safemlx::{
     distributed::{self, Group},
     error::Exception,
     module::ModuleParameters,
-    ops::{GgufCheckpoint, GgufMetadataValue},
+    ops::GgufCheckpoint,
     Array, Dtype, Stream,
 };
+
+#[cfg(test)]
+use std::collections::HashMap;
 
 #[cfg(test)]
 use crate::backend::mlx::runtime::checkpoint::quantization::quantize_tensor;
@@ -13483,9 +13486,20 @@ pub fn load_pipeline_model_with_options(
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
     {
-        let checkpoint = GgufCheckpoint::open(model_dir)?;
-        let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-        let architecture = pipeline_gguf_architecture(&metadata)?;
+        let mut structural_options = options;
+        // The explicit pipeline loader has already validated its topology;
+        // complete-model structural policy must not reject the PP coordinate.
+        structural_options.parallel = None;
+        // Stage-local residency and bounded materialization are validated by
+        // the pipeline planner below. Whole-model GGUF policy must therefore
+        // validate the artifact geometry without reapplying the standalone
+        // nonresident-loader restriction.
+        structural_options.weight_residency = WeightResidency::fully_resident();
+        let admitted =
+            crate::composition::mlx::structural::admit_gguf_path(model_dir, structural_options)?;
+        let architecture = admitted.architecture();
+        let checkpoint = admitted.checkpoint().clone();
+        let metadata = admitted.metadata().clone();
         let capabilities =
             eredu_architectures::preparation::gguf_capabilities(architecture, &checkpoint)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -13496,22 +13510,6 @@ pub fn load_pipeline_model_with_options(
             "GGUF",
             architecture.metadata_name(),
         )?;
-        let mut structural_options = options;
-        // The explicit pipeline loader has already validated its topology;
-        // complete-model structural policy must not reject the PP coordinate.
-        structural_options.parallel = None;
-        // Stage-local residency and bounded materialization are validated by
-        // the pipeline planner below. Whole-model GGUF policy must therefore
-        // validate the artifact geometry without reapplying the standalone
-        // nonresident-loader restriction.
-        structural_options.weight_residency = WeightResidency::fully_resident();
-        crate::composition::mlx::structural::validate_gguf(
-            architecture,
-            &checkpoint,
-            &metadata,
-            structural_options,
-        )
-        .into_loader_result()?;
         return match architecture {
             eredu_core::GgufArchitecture::DeepSeek4 => {
                 let args = eredu_architectures::deepseek::parse_v4_gguf(&metadata)
@@ -13537,8 +13535,7 @@ pub fn load_pipeline_model_with_options(
             }
             eredu_core::GgufArchitecture::Llama | eredu_core::GgufArchitecture::Mistral => {
                 let prepared = llama_checkpoint::prepare_llama_gguf_checkpoint(
-                    &checkpoint,
-                    &metadata,
+                    &admitted,
                     None,
                     weights_stream,
                 )?;
@@ -13624,8 +13621,7 @@ pub fn load_pipeline_model_with_options(
             | eredu_core::GgufArchitecture::Qwen3
             | eredu_core::GgufArchitecture::Qwen3Moe) => {
                 let is_moe = architecture == eredu_core::GgufArchitecture::Qwen3Moe;
-                let prepared =
-                    crate::composition::qwen::prepare_qwen_gguf_checkpoint(&checkpoint, &metadata)?;
+                let prepared = crate::composition::qwen::prepare_qwen_gguf_checkpoint(&admitted)?;
                 let args = prepared.args;
                 let gguf_plan = eredu_architectures::qwen::gguf_plan(&args)
                     .map_err(Error::UnsupportedArchitecture)?;
@@ -13665,8 +13661,7 @@ pub fn load_pipeline_model_with_options(
                 )
             }
             eredu_core::GgufArchitecture::GptOss => {
-                let prepared =
-                    neutral_gpt_oss::prepare_gpt_oss_gguf_checkpoint(&checkpoint, &metadata)?;
+                let prepared = neutral_gpt_oss::prepare_gpt_oss_gguf_checkpoint(&admitted)?;
                 let gguf_plan =
                     gpt_oss::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
@@ -13688,7 +13683,7 @@ pub fn load_pipeline_model_with_options(
             }
             architecture @ (eredu_core::GgufArchitecture::Lfm2
             | eredu_core::GgufArchitecture::Lfm2Moe) => {
-                let prepared = crate::composition::lfm2::prepare_gguf(&checkpoint, &metadata)?;
+                let prepared = crate::composition::lfm2::prepare_gguf(&admitted)?;
                 let is_moe = architecture == eredu_core::GgufArchitecture::Lfm2Moe;
                 let gguf_plan = eredu_architectures::lfm2::gguf_plan(&prepared.args)
                     .map_err(Error::UnsupportedArchitecture)?;
@@ -13711,8 +13706,7 @@ pub fn load_pipeline_model_with_options(
             }
             architecture @ (eredu_core::GgufArchitecture::NemotronH
             | eredu_core::GgufArchitecture::NemotronHMoe) => {
-                let prepared =
-                    crate::composition::nemotron_h::prepare_gguf(&checkpoint, &metadata)?;
+                let prepared = crate::composition::nemotron_h::prepare_gguf(&admitted)?;
                 let gguf_plan = eredu_architectures::nemotron_h::gguf_plan(&prepared.args)
                     .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
@@ -13767,8 +13761,7 @@ pub fn load_pipeline_model_with_options(
                 }
             }
             eredu_core::GgufArchitecture::KimiLinear => {
-                let prepared =
-                    crate::composition::kimi_linear::prepare_gguf(&checkpoint, &metadata)?;
+                let prepared = crate::composition::kimi_linear::prepare_gguf(&admitted)?;
                 let gguf_plan = eredu_architectures::kimi_linear::gguf_plan(&prepared.args)
                     .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
@@ -14050,25 +14043,6 @@ pub fn load_pipeline_model_with_options(
             "pipeline execution supports Llama-compatible, DeepSeek-V3/R1, Gemma 4, Qwen2/Qwen3/Qwen3-MoE, Qwen3-VL/Qwen3-VL-MoE, GPT-OSS, LFM2/LFM2-MoE, Nemotron-H, Kimi Linear, Qwen3-Next/Qwen3.5 text, and Inkling models, not {model_type}"
         ))),
     }
-}
-
-fn pipeline_gguf_architecture(
-    metadata: &HashMap<String, GgufMetadataValue>,
-) -> Result<eredu_core::GgufArchitecture, Error> {
-    let architecture = match metadata.get("general.architecture") {
-        Some(GgufMetadataValue::String(architecture)) => architecture,
-        Some(_) => {
-            return Err(Error::UnsupportedArchitecture(
-                "GGUF metadata key general.architecture has the wrong type".into(),
-            ));
-        }
-        None => {
-            return Err(Error::UnsupportedArchitecture(
-                "GGUF metadata is missing general.architecture".into(),
-            ));
-        }
-    };
-    Ok(eredu_core::GgufArchitecture::resolve(architecture)?)
 }
 
 fn load_llama_pipeline(

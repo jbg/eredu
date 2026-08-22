@@ -5,10 +5,9 @@ use eredu_checkpoint::WeightQuantization;
 use std::path::Path;
 
 use eredu_core::{GgufArchitecture, ModelArtifact, ModelKind, ModelPreparationPlan};
-use safemlx::{
-    ops::{GgufCheckpoint, GgufMetadataValue},
-    Stream,
-};
+#[cfg(feature = "media")]
+use safemlx::ops::GgufCheckpoint;
+use safemlx::{ops::GgufMetadataValue, Stream};
 
 #[cfg(feature = "media")]
 use crate::composition::mlx::{load_processor, ModelProcessor};
@@ -37,22 +36,21 @@ struct MaterializedGgufModel {
 
 fn materialize_gguf_model(
     gguf_file: &Path,
-    checkpoint: &safemlx::ops::GgufCheckpoint,
-    metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
-    gguf_architecture: GgufArchitecture,
+    source: &structural::AdmittedGguf,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MaterializedGgufModel, Error> {
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
     #[cfg(feature = "media")]
     let mut processor = None;
 
-    let (model, _architecture_eos_token_ids) = match gguf_architecture {
+    let (model, _architecture_eos_token_ids) = match source.architecture() {
         GgufArchitecture::KimiLinear => {
             let (loaded, eos_token_ids) =
                 crate::composition::kimi_linear::load_kimi_linear_gguf_model(
-                    checkpoint,
-                    metadata,
+                    source,
                     options.weight_residency,
                     options.quantization,
                     stream,
@@ -95,8 +93,7 @@ fn materialize_gguf_model(
         GgufArchitecture::GptOss => {
             let (loaded, eos_token_ids) =
                 crate::composition::gpt_oss::load_gpt_oss_gguf_layerwise_model(
-                    checkpoint,
-                    metadata,
+                    source,
                     options.weight_residency,
                     options.quantization,
                     stream,
@@ -155,8 +152,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
             let (loaded, eos_token_ids) = crate::composition::llama::load_llama_gguf_model(
-                checkpoint,
-                metadata,
+                source,
                 options.weight_residency,
                 options.quantization,
                 stream,
@@ -192,8 +188,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
             let (loaded, eos_token_ids) = crate::composition::lfm2::load_lfm2_gguf_model(
-                checkpoint,
-                metadata,
+                source,
                 options.weight_residency,
                 options.quantization,
                 stream,
@@ -204,8 +199,7 @@ fn materialize_gguf_model(
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
             let (loaded, eos_token_ids) =
                 crate::composition::nemotron_h::load_nemotron_h_gguf_model(
-                    checkpoint,
-                    metadata,
+                    source,
                     options.weight_residency,
                     options.quantization,
                     stream,
@@ -215,8 +209,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
             let (loaded, eos_token_ids) = crate::composition::qwen::load_qwen_gguf_model(
-                checkpoint,
-                metadata,
+                source,
                 options.weight_residency,
                 options.quantization,
                 stream,
@@ -234,7 +227,7 @@ fn materialize_gguf_model(
                 stream,
                 weights_stream,
             )?;
-            let variant = if gguf_architecture == GgufArchitecture::Qwen3VlMoe {
+            let variant = if source.architecture() == GgufArchitecture::Qwen3VlMoe {
                 Model::Qwen3VlMoe(loaded)
             } else {
                 Model::Qwen3Vl(loaded)
@@ -244,14 +237,13 @@ fn materialize_gguf_model(
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
             let (loaded, eos_token_ids) = crate::composition::qwen::hybrid::load_gguf(
                 gguf_file,
-                checkpoint,
-                metadata,
+                source,
                 options.weight_residency,
                 options.quantization,
                 stream,
                 weights_stream,
             )?;
-            let model = if gguf_architecture == GgufArchitecture::Qwen3Next {
+            let model = if source.architecture() == GgufArchitecture::Qwen3Next {
                 Model::Qwen3Next(loaded)
             } else {
                 Model::Qwen35(loaded)
@@ -634,22 +626,16 @@ fn materialize_gguf_artifact(
     let architecture = configuration.gguf_architecture.ok_or_else(|| {
         Error::UnsupportedArchitecture("backend-neutral GGUF plan omitted its architecture".into())
     })?;
-    structural::validate_gguf(architecture, &checkpoint, &metadata, options)
-        .into_loader_result()?;
-    validate_gguf_quantization_source(&checkpoint, &metadata, options.quantization)?;
+    let source = structural::admit_gguf(architecture, checkpoint, metadata, options)?;
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
+    validate_gguf_quantization_source(checkpoint, metadata, options.quantization)?;
     if options
         .parallel
         .is_some_and(|topology| !topology.is_replicated())
     {
-        let (model, _eos_token_ids) = materialize_gguf_tensor_parallel(
-            &path,
-            &checkpoint,
-            &metadata,
-            architecture,
-            options,
-            stream,
-            weights_stream,
-        )?;
+        let (model, _eos_token_ids) =
+            materialize_gguf_tensor_parallel(&path, &source, options, stream, weights_stream)?;
         #[cfg(feature = "media")]
         let processor = match architecture {
             GgufArchitecture::Inkling
@@ -704,26 +690,19 @@ fn materialize_gguf_artifact(
             processor,
         });
     }
-    materialize_gguf_model(
-        &path,
-        &checkpoint,
-        &metadata,
-        architecture,
-        options,
-        stream,
-        weights_stream,
-    )
+    materialize_gguf_model(&path, &source, options, stream, weights_stream)
 }
 
 fn materialize_gguf_tensor_parallel(
     gguf_path: &Path,
-    checkpoint: &GgufCheckpoint,
-    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
-    architecture: GgufArchitecture,
+    source: &structural::AdmittedGguf,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(Model, Vec<u32>), Error> {
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
+    let architecture = source.architecture();
     let topology = options.parallel.ok_or_else(|| {
         Error::Parallel("tensor-parallel GGUF materialization requires a topology".into())
     })?;
@@ -742,8 +721,7 @@ fn materialize_gguf_tensor_parallel(
         GgufArchitecture::KimiLinear => {
             let (model, eos) =
                 crate::composition::kimi_linear::load_kimi_linear_gguf_tensor_parallel_model(
-                    checkpoint,
-                    metadata,
+                    source,
                     residency,
                     build,
                     stream,
@@ -765,8 +743,7 @@ fn materialize_gguf_tensor_parallel(
         GgufArchitecture::GptOss => {
             let (model, eos) =
                 crate::composition::gpt_oss::load_gpt_oss_gguf_tensor_parallel_model(
-                    checkpoint,
-                    metadata,
+                    source,
                     residency,
                     build,
                     stream,
@@ -800,8 +777,7 @@ fn materialize_gguf_tensor_parallel(
         }
         GgufArchitecture::Llama | GgufArchitecture::Mistral => {
             let (model, eos) = crate::composition::llama::load_llama_gguf_tensor_parallel_model(
-                checkpoint,
-                metadata,
+                source,
                 residency,
                 build,
                 stream,
@@ -823,8 +799,7 @@ fn materialize_gguf_tensor_parallel(
         }
         GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
             let (model, eos) = crate::composition::lfm2::load_lfm2_gguf_tensor_parallel_model(
-                checkpoint,
-                metadata,
+                source,
                 residency,
                 build,
                 stream,
@@ -835,8 +810,7 @@ fn materialize_gguf_tensor_parallel(
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
             let (model, eos) =
                 crate::composition::nemotron_h::load_nemotron_h_gguf_tensor_parallel_model(
-                    checkpoint,
-                    metadata,
+                    source,
                     residency,
                     build,
                     stream,
@@ -846,8 +820,7 @@ fn materialize_gguf_tensor_parallel(
         }
         GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
             let (model, eos) = crate::composition::qwen::load_qwen_gguf_tensor_parallel_model(
-                checkpoint,
-                metadata,
+                source,
                 residency,
                 build,
                 stream,

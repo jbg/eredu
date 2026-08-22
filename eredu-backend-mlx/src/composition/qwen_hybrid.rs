@@ -969,20 +969,29 @@ pub fn prepare_gguf_pipeline(
 
 /// Loads a llama.cpp Qwen3-Next/Qwen3.5 text artifact through the same
 /// neutral resident/bounded execution graph as SafeTensors.
-pub fn load_gguf(
+pub(crate) fn load_gguf(
     model_path: &Path,
-    checkpoint: &GgufCheckpoint,
-    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+    source: &crate::composition::mlx::structural::AdmittedGguf,
     residency: eredu_runtime::WeightResidency,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(QwenHybridModel, Vec<u32>), Error> {
+    if !matches!(
+        source.architecture(),
+        eredu_core::GgufArchitecture::Qwen35
+            | eredu_core::GgufArchitecture::Qwen35Moe
+            | eredu_core::GgufArchitecture::Qwen3Next
+    ) {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen hybrid GGUF loader received architecture {:?}",
+            source.architecture()
+        )));
+    }
+    let checkpoint = source.checkpoint();
+    let metadata = source.metadata();
     let expert_options = residency.expert_cache();
     let options = residency.layers();
-    crate::backend::mlx::runtime::execution::layerwise::validate_gguf_layerwise_source(
-        checkpoint, metadata, options,
-    )?;
     let (mut parsed, store) = prepare_hybrid_gguf_store(
         model_path,
         checkpoint,
