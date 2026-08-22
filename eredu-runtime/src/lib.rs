@@ -120,8 +120,9 @@ pub use parameter::{
 pub use partition::{
     validate_boundary_tensor_count, ArchitectureBoundary, ArchitectureBoundaryError,
     ArchitectureParameterDescription, ArchitectureParameterError, ArchitecturePartition,
-    ArchitecturePartitionError, NoAuxiliaryBoundary, OwnedParameterGroupSpec, ParameterGroupOwner,
-    PartitionGroup, PartitionOwnership, PartitionState,
+    ArchitecturePartitionError, BoundaryTensorDimension, BoundaryTensorDtype, BoundaryTensorSpec,
+    BoundaryWireSchema, NoAuxiliaryBoundary, OwnedParameterGroupSpec, ParameterGroupOwner,
+    PartitionGroup, PartitionOwnership, PartitionState, ResolvedBoundaryTensorSpec,
 };
 pub use prefetch::{BackgroundPrefetchWorker, BackgroundPrefetchWorkerError};
 pub use realtime::{

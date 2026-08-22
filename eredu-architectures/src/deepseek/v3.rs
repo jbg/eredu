@@ -129,6 +129,21 @@ pub struct TargetBoundary<T> {
     embedded: T,
 }
 
+/// Family-owned wire schema for immutable V3 target context.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TargetBoundarySchema {
+    hidden_size: i32,
+}
+
+impl TargetBoundarySchema {
+    /// Derives the boundary schema from the normalized target configuration.
+    pub const fn from_args(args: &V3Args) -> Self {
+        Self {
+            hidden_size: args.hidden_size,
+        }
+    }
+}
+
 impl<T> TargetBoundary<T> {
     /// Creates the typed target boundary in canonical wire order.
     pub const fn new(tokens: T, embedded: T) -> Self {
@@ -151,21 +166,41 @@ impl<T> TargetBoundary<T> {
     }
 }
 
-impl<T> eredu_runtime::ArchitectureBoundary<T> for TargetBoundary<T> {
+impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
+    type Boundary<T> = TargetBoundary<T>;
+
     const IDENTITY: &'static str = "deepseek_v3.target";
 
-    fn tensor_roles() -> &'static [&'static str] {
-        &["tokens", "embedded"]
+    fn tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
+        use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+        vec![
+            eredu_runtime::BoundaryTensorSpec::new(
+                "tokens",
+                [Dim::Batch, Dim::Sequence],
+                Dtype::Uint32,
+            ),
+            eredu_runtime::BoundaryTensorSpec::new(
+                "embedded",
+                [Dim::Batch, Dim::Sequence, Dim::Fixed(self.hidden_size)],
+                Dtype::Activation,
+            ),
+        ]
     }
 
-    fn encode(self) -> Vec<T> {
-        vec![self.tokens, self.embedded]
+    fn encode<T>(
+        &self,
+        boundary: Self::Boundary<T>,
+    ) -> Result<Vec<T>, eredu_runtime::ArchitectureBoundaryError> {
+        Ok(vec![boundary.tokens, boundary.embedded])
     }
 
-    fn decode(tensors: Vec<T>) -> Result<Self, eredu_runtime::ArchitectureBoundaryError> {
-        eredu_runtime::validate_boundary_tensor_count::<Self, _>(&tensors)?;
+    fn decode<T>(
+        &self,
+        tensors: Vec<T>,
+    ) -> Result<Self::Boundary<T>, eredu_runtime::ArchitectureBoundaryError> {
+        eredu_runtime::validate_boundary_tensor_count(self, &tensors)?;
         let mut tensors = tensors.into_iter();
-        Ok(Self {
+        Ok(TargetBoundary {
             tokens: tensors.next().expect("validated target tokens"),
             embedded: tensors.next().expect("validated target embeddings"),
         })
@@ -1342,4 +1377,21 @@ pub fn state_layout(args: &V3Args) -> Result<StateLayout, Error> {
         .collect::<Result<Vec<_>, _>>()?;
     StateLayout::new(LayerSchedule::new(layers, policies).map_err(Error::backend)?)
         .map_err(Error::backend)
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use eredu_runtime::{ArchitectureBoundary, BoundaryTensorDtype};
+
+    #[test]
+    fn target_wire_geometry_is_architecture_owned() {
+        let schema = TargetBoundarySchema { hidden_size: 16 };
+        let tensors = schema.wire_schema().unwrap().resolve(2, 3).unwrap();
+        assert_eq!(tensors[0].role(), "tokens");
+        assert_eq!(tensors[0].shape(), [2, 3]);
+        assert_eq!(tensors[0].dtype(), BoundaryTensorDtype::Uint32);
+        assert_eq!(tensors[1].shape(), [2, 3, 16]);
+        assert_eq!(tensors[1].dtype(), BoundaryTensorDtype::Activation);
+    }
 }

@@ -146,33 +146,55 @@ pub struct ForwardContext<T> {
 /// Family-owned schema for immutable V4 target context crossing pipeline ranks.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TargetBoundarySchema {
+    hidden_size: i32,
     capture_count: usize,
 }
 
 impl TargetBoundarySchema {
-    /// Creates a schema for the configured DSpark target captures.
-    pub const fn new(capture_count: usize) -> Self {
-        Self { capture_count }
+    /// Derives the schema for the configured DSpark target captures.
+    pub fn from_args(args: &V4Args) -> Self {
+        Self {
+            hidden_size: args.hidden_size,
+            capture_count: args
+                .dspark
+                .as_ref()
+                .map_or(0, |config| config.target_layer_ids.len()),
+        }
     }
 
     /// Returns the number of configured capture tensors.
     pub const fn capture_count(self) -> usize {
         self.capture_count
     }
+}
 
-    /// Decodes tokens followed by configured captures.
-    pub fn decode<T>(
-        self,
+impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
+    type Boundary<T> = TargetBoundary<T>;
+
+    const IDENTITY: &'static str = "deepseek_v4.target";
+
+    fn tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
+        use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+        let mut specs = vec![eredu_runtime::BoundaryTensorSpec::new(
+            "tokens",
+            [Dim::Batch, Dim::Sequence],
+            Dtype::Uint32,
+        )];
+        specs.extend((0..self.capture_count).map(|index| {
+            eredu_runtime::BoundaryTensorSpec::new(
+                format!("capture.{index}"),
+                [Dim::Batch, Dim::Sequence, Dim::Fixed(self.hidden_size)],
+                Dtype::Activation,
+            )
+        }));
+        specs
+    }
+
+    fn decode<T>(
+        &self,
         tensors: Vec<T>,
-    ) -> Result<TargetBoundary<T>, eredu_runtime::ArchitectureBoundaryError> {
-        let expected = 1 + self.capture_count;
-        if tensors.len() != expected {
-            return Err(eredu_runtime::ArchitectureBoundaryError::TensorCount {
-                boundary: "deepseek_v4.target",
-                expected,
-                actual: tensors.len(),
-            });
-        }
+    ) -> Result<Self::Boundary<T>, eredu_runtime::ArchitectureBoundaryError> {
+        eredu_runtime::validate_boundary_tensor_count(self, &tensors)?;
         let mut tensors = tensors.into_iter();
         Ok(TargetBoundary {
             input_ids: tensors.next().expect("validated target token ids"),
@@ -181,8 +203,8 @@ impl TargetBoundarySchema {
     }
 
     /// Encodes tokens followed by configured captures after validation.
-    pub fn encode<T>(
-        self,
+    fn encode<T>(
+        &self,
         boundary: TargetBoundary<T>,
     ) -> Result<Vec<T>, eredu_runtime::ArchitectureBoundaryError> {
         if boundary.captures.len() != self.capture_count {
@@ -2879,4 +2901,24 @@ fn broadcast_streams<B: HyperNeuralBackend>(
         &[hidden.dim(0), hidden.dim(1), args.hc_mult, args.hidden_size],
         context,
     )
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use eredu_runtime::{ArchitectureBoundary, BoundaryTensorDtype};
+
+    #[test]
+    fn configured_capture_count_owns_wire_cardinality() {
+        let schema = TargetBoundarySchema {
+            hidden_size: 24,
+            capture_count: 2,
+        };
+        let tensors = schema.wire_schema().unwrap().resolve(1, 5).unwrap();
+        assert_eq!(tensors.len(), 3);
+        assert_eq!(tensors[0].dtype(), BoundaryTensorDtype::Uint32);
+        assert_eq!(tensors[1].role(), "capture.0");
+        assert_eq!(tensors[1].shape(), [1, 5, 24]);
+        assert_eq!(tensors[2].role(), "capture.1");
+    }
 }

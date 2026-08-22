@@ -232,33 +232,62 @@ impl<T> PipelinePrepared<T> {
 /// Family-owned schema for decoder values transported between pipeline ranks.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct PipelineBoundarySchema {
+    head_dim: i32,
+    hidden_size: i32,
     deepstack_count: usize,
 }
 
 impl PipelineBoundarySchema {
-    /// Creates the boundary schema for one concrete vision configuration.
-    pub const fn new(deepstack_count: usize) -> Self {
-        Self { deepstack_count }
+    /// Derives the boundary schema from the normalized multimodal model.
+    pub fn from_args(args: &ModelArgs) -> Self {
+        Self {
+            head_dim: args.text.head_dim,
+            hidden_size: args.text.hidden_size,
+            deepstack_count: args.vision.deepstack_layer_count(),
+        }
     }
 
     /// Returns the configured number of DeepStack feature tensors.
     pub const fn deepstack_count(self) -> usize {
         self.deepstack_count
     }
+}
 
-    /// Decodes transport tensors in the family's canonical order.
-    pub fn decode<T>(
-        self,
+impl eredu_runtime::ArchitectureBoundary for PipelineBoundarySchema {
+    type Boundary<T> = PipelineBoundary<T>;
+
+    const IDENTITY: &'static str = "qwen_vl.decoder";
+
+    fn tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
+        use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+        let mut specs = vec![
+            eredu_runtime::BoundaryTensorSpec::new(
+                "cosine",
+                [Dim::Fixed(1), Dim::Sequence, Dim::Fixed(self.head_dim)],
+                Dtype::Activation,
+            ),
+            eredu_runtime::BoundaryTensorSpec::new(
+                "sine",
+                [Dim::Fixed(1), Dim::Sequence, Dim::Fixed(self.head_dim)],
+                Dtype::Activation,
+            ),
+            eredu_runtime::BoundaryTensorSpec::new("position_delta", [Dim::Fixed(1)], Dtype::Int32),
+        ];
+        specs.extend((0..self.deepstack_count).map(|index| {
+            eredu_runtime::BoundaryTensorSpec::new(
+                format!("deepstack.{index}"),
+                [Dim::Batch, Dim::Sequence, Dim::Fixed(self.hidden_size)],
+                Dtype::Activation,
+            )
+        }));
+        specs
+    }
+
+    fn decode<T>(
+        &self,
         tensors: Vec<T>,
-    ) -> Result<PipelineBoundary<T>, eredu_runtime::ArchitectureBoundaryError> {
-        let expected = 3 + self.deepstack_count;
-        if tensors.len() != expected {
-            return Err(eredu_runtime::ArchitectureBoundaryError::TensorCount {
-                boundary: "qwen_vl.decoder",
-                expected,
-                actual: tensors.len(),
-            });
-        }
+    ) -> Result<Self::Boundary<T>, eredu_runtime::ArchitectureBoundaryError> {
+        eredu_runtime::validate_boundary_tensor_count(self, &tensors)?;
         let mut tensors = tensors.into_iter();
         Ok(PipelineBoundary {
             cosine: tensors.next().expect("validated mRoPE cosine"),
@@ -269,8 +298,8 @@ impl PipelineBoundarySchema {
     }
 
     /// Encodes a typed boundary after validating its configured cardinality.
-    pub fn encode<T>(
-        self,
+    fn encode<T>(
+        &self,
         boundary: PipelineBoundary<T>,
     ) -> Result<Vec<T>, eredu_runtime::ArchitectureBoundaryError> {
         if boundary.deepstack.len() != self.deepstack_count {
@@ -1910,5 +1939,26 @@ where
                 context,
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use eredu_runtime::{ArchitectureBoundary, BoundaryTensorDtype};
+
+    #[test]
+    fn mrope_and_deepstack_wire_geometry_is_family_owned() {
+        let schema = PipelineBoundarySchema {
+            head_dim: 8,
+            hidden_size: 32,
+            deepstack_count: 2,
+        };
+        let tensors = schema.wire_schema().unwrap().resolve(2, 5).unwrap();
+        assert_eq!(tensors.len(), 5);
+        assert_eq!(tensors[0].shape(), [1, 5, 8]);
+        assert_eq!(tensors[2].dtype(), BoundaryTensorDtype::Int32);
+        assert_eq!(tensors[3].role(), "deepstack.0");
+        assert_eq!(tensors[3].shape(), [2, 5, 32]);
     }
 }

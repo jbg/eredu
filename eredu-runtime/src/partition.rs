@@ -315,47 +315,211 @@ pub enum ArchitectureParameterError {
     UnexpectedOwnership(String),
 }
 
-/// Typed architecture-owned tensor state carried across one partition
-/// boundary.
+/// Logical scalar kind carried by one architecture-owned boundary tensor.
 ///
-/// The runtime and a backend transport may move the encoded tensor vector, but
-/// only the family boundary type assigns semantic roles or reconstructs the
-/// typed value. This avoids backend-owned enums and positional family logic.
-pub trait ArchitectureBoundary<T>: Sized {
+/// `Activation` is resolved by a concrete backend to the execution dtype
+/// selected for the surrounding pipeline activation. Integer kinds are exact.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum BoundaryTensorDtype {
+    /// The selected execution activation dtype.
+    Activation,
+    /// Exact unsigned 32-bit integer values.
+    Uint32,
+    /// Exact signed 32-bit integer values.
+    Int32,
+}
+
+/// One symbolic dimension in an architecture-owned boundary tensor.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum BoundaryTensorDimension {
+    /// Invocation batch size.
+    Batch,
+    /// Invocation sequence length.
+    Sequence,
+    /// Positive architecture-defined extent.
+    Fixed(i32),
+}
+
+/// Semantic role, symbolic shape, and logical dtype of one boundary tensor.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub struct BoundaryTensorSpec {
+    role: String,
+    shape: Vec<BoundaryTensorDimension>,
+    dtype: BoundaryTensorDtype,
+}
+
+impl BoundaryTensorSpec {
+    /// Declares one tensor in canonical transport order.
+    pub fn new(
+        role: impl Into<String>,
+        shape: impl IntoIterator<Item = BoundaryTensorDimension>,
+        dtype: BoundaryTensorDtype,
+    ) -> Self {
+        Self {
+            role: role.into(),
+            shape: shape.into_iter().collect(),
+            dtype,
+        }
+    }
+
+    /// Returns the stable semantic role.
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    /// Returns the symbolic shape.
+    pub fn shape(&self) -> &[BoundaryTensorDimension] {
+        &self.shape
+    }
+
+    /// Returns the logical scalar kind.
+    pub const fn dtype(&self) -> BoundaryTensorDtype {
+        self.dtype
+    }
+}
+
+/// One boundary tensor after invocation-dependent dimensions are resolved.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub struct ResolvedBoundaryTensorSpec {
+    role: String,
+    shape: Vec<i32>,
+    dtype: BoundaryTensorDtype,
+}
+
+impl ResolvedBoundaryTensorSpec {
+    /// Returns the stable semantic role.
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    /// Returns the concrete transport shape.
+    pub fn shape(&self) -> &[i32] {
+        &self.shape
+    }
+
+    /// Returns the logical scalar kind.
+    pub const fn dtype(&self) -> BoundaryTensorDtype {
+        self.dtype
+    }
+}
+
+/// Complete ordered auxiliary wire schema for one architecture boundary.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub struct BoundaryWireSchema {
+    identity: &'static str,
+    tensors: Vec<BoundaryTensorSpec>,
+}
+
+impl BoundaryWireSchema {
+    /// Creates and validates an architecture-owned wire schema.
+    pub fn new(
+        identity: &'static str,
+        tensors: impl IntoIterator<Item = BoundaryTensorSpec>,
+    ) -> Result<Self, ArchitectureBoundaryError> {
+        if identity.trim().is_empty() {
+            return Err(ArchitectureBoundaryError::EmptyIdentity);
+        }
+        let tensors = tensors.into_iter().collect::<Vec<_>>();
+        let mut roles = BTreeSet::new();
+        for tensor in &tensors {
+            if tensor.role.trim().is_empty() {
+                return Err(ArchitectureBoundaryError::EmptyTensorRole { boundary: identity });
+            }
+            if !roles.insert(tensor.role.as_str()) {
+                return Err(ArchitectureBoundaryError::DuplicateTensorRole {
+                    boundary: identity,
+                    role: tensor.role.clone(),
+                });
+            }
+            if tensor.shape.is_empty() {
+                return Err(ArchitectureBoundaryError::EmptyTensorShape {
+                    boundary: identity,
+                    role: tensor.role.clone(),
+                });
+            }
+            if tensor
+                .shape
+                .iter()
+                .any(|dimension| matches!(dimension, BoundaryTensorDimension::Fixed(value) if *value <= 0))
+            {
+                return Err(ArchitectureBoundaryError::InvalidTensorDimension {
+                    boundary: identity,
+                    role: tensor.role.clone(),
+                });
+            }
+        }
+        Ok(Self { identity, tensors })
+    }
+
+    /// Returns the stable schema identity.
+    pub const fn identity(&self) -> &'static str {
+        self.identity
+    }
+
+    /// Returns tensor declarations in canonical transport order.
+    pub fn tensors(&self) -> &[BoundaryTensorSpec] {
+        &self.tensors
+    }
+
+    /// Resolves invocation-dependent dimensions without backend family logic.
+    pub fn resolve(
+        &self,
+        batch_size: i32,
+        sequence_length: i32,
+    ) -> Result<Vec<ResolvedBoundaryTensorSpec>, ArchitectureBoundaryError> {
+        if batch_size <= 0 || sequence_length <= 0 {
+            return Err(ArchitectureBoundaryError::InvalidInvocationGeometry {
+                boundary: self.identity,
+                batch_size,
+                sequence_length,
+            });
+        }
+        Ok(self
+            .tensors
+            .iter()
+            .map(|tensor| ResolvedBoundaryTensorSpec {
+                role: tensor.role.clone(),
+                shape: tensor
+                    .shape
+                    .iter()
+                    .map(|dimension| match dimension {
+                        BoundaryTensorDimension::Batch => batch_size,
+                        BoundaryTensorDimension::Sequence => sequence_length,
+                        BoundaryTensorDimension::Fixed(value) => *value,
+                    })
+                    .collect(),
+                dtype: tensor.dtype,
+            })
+            .collect())
+    }
+}
+
+/// Typed architecture-owned tensor state and wire geometry carried across one
+/// partition boundary.
+///
+/// The runtime and a backend transport may resolve and move the encoded tensor
+/// vector, but only this family schema assigns semantic roles, shape, dtype,
+/// cardinality, or reconstructs the typed value.
+pub trait ArchitectureBoundary: Sized {
+    /// Typed family value transported by this schema.
+    type Boundary<T>;
+
     /// Stable non-empty semantic identity used in diagnostics and wire schema
     /// validation.
     const IDENTITY: &'static str;
 
-    /// Tensor roles in exact encoded order.
-    fn tensor_roles() -> &'static [&'static str];
+    /// Tensor declarations in exact encoded order.
+    fn tensor_specs(&self) -> Vec<BoundaryTensorSpec>;
 
     /// Consumes this typed value into transport-order tensors.
-    fn encode(self) -> Vec<T>;
+    fn encode<T>(&self, boundary: Self::Boundary<T>) -> Result<Vec<T>, ArchitectureBoundaryError>;
 
     /// Reconstructs the typed value from transport-order tensors.
-    fn decode(tensors: Vec<T>) -> Result<Self, ArchitectureBoundaryError>;
+    fn decode<T>(&self, tensors: Vec<T>) -> Result<Self::Boundary<T>, ArchitectureBoundaryError>;
 
-    /// Validates the cold-path boundary declaration independently of any
-    /// backend tensor implementation.
-    fn validate_schema() -> Result<(), ArchitectureBoundaryError> {
-        if Self::IDENTITY.trim().is_empty() {
-            return Err(ArchitectureBoundaryError::EmptyIdentity);
-        }
-        let mut roles = BTreeSet::new();
-        for role in Self::tensor_roles() {
-            if role.trim().is_empty() {
-                return Err(ArchitectureBoundaryError::EmptyTensorRole {
-                    boundary: Self::IDENTITY,
-                });
-            }
-            if !roles.insert(*role) {
-                return Err(ArchitectureBoundaryError::DuplicateTensorRole {
-                    boundary: Self::IDENTITY,
-                    role,
-                });
-            }
-        }
-        Ok(())
+    /// Returns the validated backend-neutral wire schema.
+    fn wire_schema(&self) -> Result<BoundaryWireSchema, ArchitectureBoundaryError> {
+        BoundaryWireSchema::new(Self::IDENTITY, self.tensor_specs())
     }
 }
 
@@ -367,31 +531,35 @@ pub trait ArchitectureBoundary<T>: Sized {
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct NoAuxiliaryBoundary;
 
-impl<T> ArchitectureBoundary<T> for NoAuxiliaryBoundary {
+impl ArchitectureBoundary for NoAuxiliaryBoundary {
+    type Boundary<T> = NoAuxiliaryBoundary;
+
     const IDENTITY: &'static str = "none";
 
-    fn tensor_roles() -> &'static [&'static str] {
-        &[]
-    }
-
-    fn encode(self) -> Vec<T> {
+    fn tensor_specs(&self) -> Vec<BoundaryTensorSpec> {
         Vec::new()
     }
 
-    fn decode(tensors: Vec<T>) -> Result<Self, ArchitectureBoundaryError> {
-        validate_boundary_tensor_count::<Self, _>(&tensors)?;
+    fn encode<T>(&self, _boundary: Self::Boundary<T>) -> Result<Vec<T>, ArchitectureBoundaryError> {
+        Ok(Vec::new())
+    }
+
+    fn decode<T>(&self, tensors: Vec<T>) -> Result<Self::Boundary<T>, ArchitectureBoundaryError> {
+        validate_boundary_tensor_count(self, &tensors)?;
         Ok(Self)
     }
 }
 
 /// Validates the number of tensors before a family boundary decodes any
 /// positional value.
-pub fn validate_boundary_tensor_count<B, T>(tensors: &[T]) -> Result<(), ArchitectureBoundaryError>
+pub fn validate_boundary_tensor_count<B, T>(
+    boundary: &B,
+    tensors: &[T],
+) -> Result<(), ArchitectureBoundaryError>
 where
-    B: ArchitectureBoundary<T>,
+    B: ArchitectureBoundary,
 {
-    B::validate_schema()?;
-    let expected = B::tensor_roles().len();
+    let expected = boundary.wire_schema()?.tensors().len();
     let actual = tensors.len();
     if actual != expected {
         return Err(ArchitectureBoundaryError::TensorCount {
@@ -421,7 +589,35 @@ pub enum ArchitectureBoundaryError {
         /// Stable boundary identity.
         boundary: &'static str,
         /// Repeated semantic tensor role.
-        role: &'static str,
+        role: String,
+    },
+    /// A family boundary declared a rank-zero tensor.
+    #[error("architecture boundary {boundary:?} tensor {role:?} has no dimensions")]
+    EmptyTensorShape {
+        /// Stable boundary identity.
+        boundary: &'static str,
+        /// Tensor semantic role.
+        role: String,
+    },
+    /// A family boundary declared a non-positive fixed dimension.
+    #[error("architecture boundary {boundary:?} tensor {role:?} has a non-positive dimension")]
+    InvalidTensorDimension {
+        /// Stable boundary identity.
+        boundary: &'static str,
+        /// Tensor semantic role.
+        role: String,
+    },
+    /// A caller supplied non-positive invocation dimensions.
+    #[error(
+        "architecture boundary {boundary:?} requires positive invocation geometry, got batch {batch_size} and sequence {sequence_length}"
+    )]
+    InvalidInvocationGeometry {
+        /// Stable boundary identity.
+        boundary: &'static str,
+        /// Invalid batch size.
+        batch_size: i32,
+        /// Invalid sequence length.
+        sequence_length: i32,
     },
     /// A transported payload has the wrong tensor cardinality.
     #[error(
@@ -573,8 +769,8 @@ impl PartitionGroup {
 
 /// Complete backend-neutral realization of one rank's architecture ownership.
 ///
-/// `G` is family-owned local construction geometry. `A` is family-owned,
-/// typed auxiliary state carried at the partition boundary.
+/// `G` is family-owned local construction geometry. `A` is the family-owned
+/// auxiliary wire schema carried by the partition realization.
 #[derive(Debug, Clone)]
 pub struct ArchitecturePartition<G, A> {
     graph: ExecutionGraph,
@@ -611,8 +807,10 @@ impl<G, A> ArchitecturePartition<G, A> {
         M: crate::LayeredArchitecture<B, S>,
         M::Error: std::fmt::Display,
         N: Into<String>,
+        A: ArchitectureBoundary,
     {
         let (graph, unit_layout) = canonical_architecture_layout::<B, S, M>(architecture)?;
+        auxiliary_boundary.wire_schema()?;
         Self::new(
             graph,
             unit_layout,
@@ -749,12 +947,12 @@ impl<G, A> ArchitecturePartition<G, A> {
         &self.local_geometry
     }
 
-    /// Returns typed family-owned auxiliary boundary state.
+    /// Returns the family-owned auxiliary boundary schema.
     pub const fn auxiliary_boundary(&self) -> &A {
         &self.auxiliary_boundary
     }
 
-    /// Mutably returns typed family-owned auxiliary boundary state.
+    /// Mutably returns the family-owned auxiliary boundary schema.
     pub fn auxiliary_boundary_mut(&mut self) -> &mut A {
         &mut self.auxiliary_boundary
     }
@@ -868,6 +1066,9 @@ fn validate_canonical_layout(
 /// Invalid backend-neutral architecture partition declaration.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum ArchitecturePartitionError {
+    /// The architecture supplied an invalid partition-boundary wire schema.
+    #[error("invalid architecture partition boundary: {0}")]
+    InvalidBoundary(#[from] ArchitectureBoundaryError),
     /// The neutral architecture could not declare a canonical graph, unit
     /// count, or unit path.
     #[error("neutral architecture topology is invalid: {0}")]
@@ -975,22 +1176,51 @@ mod tests {
         embedded: T,
     }
 
-    impl<T> ArchitectureBoundary<T> for PairBoundary<T> {
+    #[derive(Debug, Clone, Copy)]
+    struct PairBoundarySchema;
+
+    impl ArchitectureBoundary for PairBoundarySchema {
+        type Boundary<T> = PairBoundary<T>;
+
         const IDENTITY: &'static str = "fixture.target";
 
-        fn tensor_roles() -> &'static [&'static str] {
-            &["tokens", "embedded"]
+        fn tensor_specs(&self) -> Vec<BoundaryTensorSpec> {
+            vec![
+                BoundaryTensorSpec::new(
+                    "tokens",
+                    [
+                        BoundaryTensorDimension::Batch,
+                        BoundaryTensorDimension::Sequence,
+                    ],
+                    BoundaryTensorDtype::Uint32,
+                ),
+                BoundaryTensorSpec::new(
+                    "embedded",
+                    [
+                        BoundaryTensorDimension::Batch,
+                        BoundaryTensorDimension::Sequence,
+                        BoundaryTensorDimension::Fixed(16),
+                    ],
+                    BoundaryTensorDtype::Activation,
+                ),
+            ]
         }
 
-        fn encode(self) -> Vec<T> {
-            vec![self.tokens, self.embedded]
+        fn encode<T>(
+            &self,
+            boundary: Self::Boundary<T>,
+        ) -> Result<Vec<T>, ArchitectureBoundaryError> {
+            Ok(vec![boundary.tokens, boundary.embedded])
         }
 
-        fn decode(mut tensors: Vec<T>) -> Result<Self, ArchitectureBoundaryError> {
-            validate_boundary_tensor_count::<Self, _>(&tensors)?;
+        fn decode<T>(
+            &self,
+            mut tensors: Vec<T>,
+        ) -> Result<Self::Boundary<T>, ArchitectureBoundaryError> {
+            validate_boundary_tensor_count(self, &tensors)?;
             let embedded = tensors.pop().expect("validated embedded tensor");
             let tokens = tensors.pop().expect("validated token tensor");
-            Ok(Self { tokens, embedded })
+            Ok(PairBoundary { tokens, embedded })
         }
     }
 
@@ -1273,21 +1503,71 @@ mod tests {
             tokens: 3,
             embedded: 7,
         };
-        let tensors = boundary.encode();
+        let schema = PairBoundarySchema;
+        let tensors = schema.encode(boundary).unwrap();
         assert_eq!(tensors, [3, 7]);
         assert_eq!(
-            PairBoundary::decode(tensors).unwrap(),
+            schema.decode(tensors).unwrap(),
             PairBoundary {
                 tokens: 3,
                 embedded: 7
             }
         );
+        let resolved = schema.wire_schema().unwrap().resolve(2, 3).unwrap();
+        assert_eq!(resolved[0].shape(), [2, 3]);
+        assert_eq!(resolved[0].dtype(), BoundaryTensorDtype::Uint32);
+        assert_eq!(resolved[1].shape(), [2, 3, 16]);
+        assert_eq!(resolved[1].dtype(), BoundaryTensorDtype::Activation);
         assert_eq!(
-            PairBoundary::<i32>::decode(vec![3]).unwrap_err(),
+            schema.decode(vec![3]).unwrap_err(),
             ArchitectureBoundaryError::TensorCount {
                 boundary: "fixture.target",
                 expected: 2,
                 actual: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn boundary_schema_rejects_role_and_geometry_drift_before_transport() {
+        let duplicate = BoundaryWireSchema::new(
+            "fixture.invalid",
+            [
+                BoundaryTensorSpec::new(
+                    "state",
+                    [BoundaryTensorDimension::Fixed(1)],
+                    BoundaryTensorDtype::Activation,
+                ),
+                BoundaryTensorSpec::new(
+                    "state",
+                    [BoundaryTensorDimension::Fixed(2)],
+                    BoundaryTensorDtype::Activation,
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(
+            duplicate,
+            ArchitectureBoundaryError::DuplicateTensorRole {
+                boundary: "fixture.invalid",
+                role: "state".into(),
+            }
+        );
+
+        let invalid = BoundaryWireSchema::new(
+            "fixture.invalid",
+            [BoundaryTensorSpec::new(
+                "state",
+                [BoundaryTensorDimension::Fixed(0)],
+                BoundaryTensorDtype::Activation,
+            )],
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid,
+            ArchitectureBoundaryError::InvalidTensorDimension {
+                boundary: "fixture.invalid",
+                role: "state".into(),
             }
         );
     }

@@ -212,38 +212,57 @@ impl<T: Clone> ConditionalPipelinePrepared<T> {
 /// Family-owned schema for conditional decoder values crossing pipeline ranks.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ConditionalPipelineBoundarySchema {
+    hidden_size: i32,
     deepstack_count: usize,
 }
 
 impl ConditionalPipelineBoundarySchema {
-    /// Creates the schema for one concrete conditional vision configuration.
-    pub const fn new(deepstack_count: usize) -> Self {
-        Self { deepstack_count }
+    /// Derives the schema from the normalized conditional model.
+    pub fn from_args(args: &ParsedHybridConfig) -> Self {
+        Self {
+            hidden_size: args.text.hidden_size,
+            deepstack_count: args
+                .vision
+                .as_ref()
+                .map_or(0, |vision| vision.deepstack_layer_count()),
+        }
     }
 
     /// Returns the expected number of transported DeepStack tensors.
     pub const fn deepstack_count(self) -> usize {
         self.deepstack_count
     }
+}
 
-    /// Decodes the family's canonical transport order.
-    pub fn decode<T>(
-        self,
+impl eredu_runtime::ArchitectureBoundary for ConditionalPipelineBoundarySchema {
+    type Boundary<T> = ConditionalPipelineBoundary<T>;
+
+    const IDENTITY: &'static str = "qwen_conditional.decoder";
+
+    fn tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
+        use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+        (0..self.deepstack_count)
+            .map(|index| {
+                eredu_runtime::BoundaryTensorSpec::new(
+                    format!("deepstack.{index}"),
+                    [Dim::Batch, Dim::Sequence, Dim::Fixed(self.hidden_size)],
+                    Dtype::Activation,
+                )
+            })
+            .collect()
+    }
+
+    fn decode<T>(
+        &self,
         tensors: Vec<T>,
-    ) -> Result<ConditionalPipelineBoundary<T>, eredu_runtime::ArchitectureBoundaryError> {
-        if tensors.len() != self.deepstack_count {
-            return Err(eredu_runtime::ArchitectureBoundaryError::TensorCount {
-                boundary: "qwen_conditional.decoder",
-                expected: self.deepstack_count,
-                actual: tensors.len(),
-            });
-        }
+    ) -> Result<Self::Boundary<T>, eredu_runtime::ArchitectureBoundaryError> {
+        eredu_runtime::validate_boundary_tensor_count(self, &tensors)?;
         Ok(ConditionalPipelineBoundary { deepstack: tensors })
     }
 
     /// Encodes typed conditional decoder context after validating cardinality.
-    pub fn encode<T>(
-        self,
+    fn encode<T>(
+        &self,
         boundary: ConditionalPipelineBoundary<T>,
     ) -> Result<Vec<T>, eredu_runtime::ArchitectureBoundaryError> {
         if boundary.deepstack.len() != self.deepstack_count {
@@ -1639,7 +1658,20 @@ fn conditional_prediction_group_transport(
 
 #[cfg(test)]
 mod transport_tests {
-    use super::conditional_prediction_group_transport;
+    use super::{conditional_prediction_group_transport, ConditionalPipelineBoundarySchema};
+    use eredu_runtime::ArchitectureBoundary;
+
+    #[test]
+    fn conditional_deepstack_count_owns_wire_cardinality() {
+        let schema = ConditionalPipelineBoundarySchema {
+            hidden_size: 48,
+            deepstack_count: 3,
+        };
+        let tensors = schema.wire_schema().unwrap().resolve(2, 4).unwrap();
+        assert_eq!(tensors.len(), 3);
+        assert_eq!(tensors[0].role(), "deepstack.0");
+        assert_eq!(tensors[2].shape(), [2, 4, 48]);
+    }
 
     #[test]
     fn first_conditional_prediction_group_owns_shared_mtp_embedding_role_once() {

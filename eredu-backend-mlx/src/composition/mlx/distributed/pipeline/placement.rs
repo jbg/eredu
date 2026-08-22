@@ -479,6 +479,7 @@ impl PlacedExecutionDag {
         S: eredu_runtime::RuntimeState<B>,
         M: eredu_runtime::LayeredArchitecture<B, S>,
         M::Error: std::fmt::Display,
+        A: eredu_runtime::ArchitectureBoundary,
     {
         if pp_rank >= self.pp_rank_count {
             return Err(Error::Parallel(format!(
@@ -716,9 +717,9 @@ mod tests {
     };
     use eredu_nn::{ParameterVisitor, ParameterVisitorMut, Parameterized};
     use eredu_runtime::{
-        ExecutionGroupId, LayeredArchitecture, LayeredForwardState, MemberSharding,
-        OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
-        ParameterRole,
+        ArchitectureBoundary, ExecutionGroupId, LayeredArchitecture, LayeredForwardState,
+        MemberSharding, OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec,
+        ParameterMemberSpec, ParameterRole,
     };
     use safemlx::Stream;
 
@@ -865,7 +866,7 @@ mod tests {
         }
     }
 
-    fn realize_partition<G, A>(
+    fn realize_partition<G, A: eredu_runtime::ArchitectureBoundary>(
         placed: &PlacedExecutionDag,
         pp_rank: usize,
         state: Option<(StateLayout, usize)>,
@@ -986,18 +987,13 @@ mod tests {
         #[derive(Debug, Clone, Eq, PartialEq)]
         struct Geometry(&'static str);
 
-        #[derive(Debug, Clone, Eq, PartialEq)]
-        struct Boundary {
-            merge_token: usize,
-        }
-
         let placed = partition_fixture();
         let partition = realize_partition(
             &placed,
             1,
             Some((state_layout(2), 7)),
             Geometry("family-local"),
-            Boundary { merge_token: 11 },
+            eredu_runtime::NoAuxiliaryBoundary,
             [OwnedParameterGroupSpec::new(
                 ParameterGroupOwner::execution_unit(ExecutionGroupId::new("text").unwrap(), 0),
                 parameter("text.layer", "model.layers.0.weight"),
@@ -1029,14 +1025,27 @@ mod tests {
         assert_eq!(partition.state().unwrap().global_layer_offset(), 7);
         assert_eq!(partition.state().unwrap().global_layers(), 7..9);
         assert_eq!(partition.local_geometry(), &Geometry("family-local"));
-        assert_eq!(partition.auxiliary_boundary().merge_token, 11);
+        assert!(partition
+            .auxiliary_boundary()
+            .wire_schema()
+            .unwrap()
+            .tensors()
+            .is_empty());
         assert_eq!(partition.parameter_bindings().len(), 1);
         assert_eq!(
             partition.parameter_bindings()[0].members()[0].target(),
             "model.layers.0.weight"
         );
 
-        let ingress = realize_partition(&placed, 0, None, (), (), std::iter::empty()).unwrap();
+        let ingress = realize_partition(
+            &placed,
+            0,
+            None,
+            (),
+            eredu_runtime::NoAuxiliaryBoundary,
+            std::iter::empty(),
+        )
+        .unwrap();
         assert!(ingress.ownership().owns_input());
         assert!(!ingress.ownership().owns_output());
         assert_eq!(ingress.ownership().static_roles(), ["vision.input"]);
@@ -1083,7 +1092,15 @@ mod tests {
             ParameterGroupOwner::static_any_of(["embedding", "mtp"]),
             parameter("embedding", "model.embed_tokens.weight"),
         );
-        let output = realize_partition(&placed, 1, None, (), (), [embedding.clone()]).unwrap();
+        let output = realize_partition(
+            &placed,
+            1,
+            None,
+            (),
+            eredu_runtime::NoAuxiliaryBoundary,
+            [embedding.clone()],
+        )
+        .unwrap();
         assert!(output.ownership().owns_static_role("mtp"));
         assert!(output.ownership().owns_static_role("output"));
         assert!(!output.ownership().owns_static_role("embedding"));
@@ -1116,7 +1133,14 @@ mod tests {
         prediction.last_owner_static_roles.clear();
         let missing_role = PlacedExecutionDag::plan(2, vec![target, prediction], "mtp_0").unwrap();
         assert!(matches!(
-            realize_partition(&missing_role, 1, None, (), (), [embedding]),
+            realize_partition(
+                &missing_role,
+                1,
+                None,
+                (),
+                eredu_runtime::NoAuxiliaryBoundary,
+                [embedding]
+            ),
             Err(Error::Parallel(message)) if message.contains("non-local parameter owner")
         ));
     }
@@ -1128,8 +1152,8 @@ mod tests {
             &placed,
             1,
             Some((state_layout(2), usize::MAX)),
-            (),
-            (),
+            eredu_runtime::NoAuxiliaryBoundary,
+            eredu_runtime::NoAuxiliaryBoundary,
             std::iter::empty(),
         )
         .unwrap_err();
@@ -1145,7 +1169,7 @@ mod tests {
             1,
             None,
             (),
-            (),
+            eredu_runtime::NoAuxiliaryBoundary,
             [
                 OwnedParameterGroupSpec::new(
                     ParameterGroupOwner::static_role("text.input"),

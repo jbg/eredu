@@ -310,6 +310,15 @@ concrete neutral architecture. Backend placement code supplies rank-local
 ranges and ownership, but cannot substitute a caller-built topology that only
 resembles the architecture it will execute.
 
+The partition also carries an architecture-owned boundary schema. That schema
+declares every auxiliary tensor's stable role, canonical order, symbolic shape,
+logical dtype, and configuration-dependent cardinality, and it owns conversion
+to and from the family's typed boundary value. `eredu-runtime` validates and
+resolves batch and sequence dimensions. A concrete backend only maps the
+logical activation or exact integer dtype to its native dtype, allocates the
+declared receive buffers, validates produced tensors, and transports them. It
+must not reconstruct boundary geometry from model-family arguments.
+
 `DistributedSession` is an optional capability of the selected model session.
 It exposes high-level sum, gather, variable-count exchange, point-to-point, and
 consensus submissions with exact completion. Unsupported operations report an

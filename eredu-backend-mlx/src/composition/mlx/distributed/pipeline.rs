@@ -568,69 +568,12 @@ impl PipelineStep {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum PipelineAuxiliaryDtype {
-    Activation,
-    Uint32,
-    Int32,
-}
-
-impl PipelineAuxiliaryDtype {
-    const fn resolve(self, activation_dtype: Dtype) -> Dtype {
-        match self {
-            Self::Activation => activation_dtype,
-            Self::Uint32 => Dtype::Uint32,
-            Self::Int32 => Dtype::Int32,
-        }
+const fn mlx_boundary_dtype(kind: eredu_runtime::BoundaryTensorDtype, activation: Dtype) -> Dtype {
+    match kind {
+        eredu_runtime::BoundaryTensorDtype::Activation => activation,
+        eredu_runtime::BoundaryTensorDtype::Uint32 => Dtype::Uint32,
+        eredu_runtime::BoundaryTensorDtype::Int32 => Dtype::Int32,
     }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct PipelineAuxiliarySpec {
-    shape: Vec<i32>,
-    dtype: PipelineAuxiliaryDtype,
-}
-
-impl PipelineAuxiliarySpec {
-    fn activation(shape: Vec<i32>) -> Self {
-        Self {
-            shape,
-            dtype: PipelineAuxiliaryDtype::Activation,
-        }
-    }
-
-    fn uint32(shape: Vec<i32>) -> Self {
-        Self {
-            shape,
-            dtype: PipelineAuxiliaryDtype::Uint32,
-        }
-    }
-
-    fn int32(shape: Vec<i32>) -> Self {
-        Self {
-            shape,
-            dtype: PipelineAuxiliaryDtype::Int32,
-        }
-    }
-
-    const fn resolved_dtype(&self, activation_dtype: Dtype) -> Dtype {
-        self.dtype.resolve(activation_dtype)
-    }
-}
-
-fn token_capture_auxiliary_specs(
-    step: PipelineStep,
-    hidden_size: i32,
-    capture_count: usize,
-) -> Vec<PipelineAuxiliarySpec> {
-    let mut specs = vec![PipelineAuxiliarySpec::uint32(vec![
-        step.batch_size,
-        step.sequence_length,
-    ])];
-    specs.extend((0..capture_count).map(|_| {
-        PipelineAuxiliarySpec::activation(vec![step.batch_size, step.sequence_length, hidden_size])
-    }));
-    specs
 }
 
 impl InklingPipelinePartition {
@@ -1582,10 +1525,6 @@ impl Gemma4PipelinePartition {
             .state()
             .map(|state| state.layout().clone())
             .ok_or_else(|| Error::Parallel("Gemma 4 partition has no runtime state".into()))
-    }
-
-    fn per_layer_width(&self) -> i32 {
-        self.partition.local_geometry().per_layer_width()
     }
 
     fn static_modules(&self) -> &eredu_architectures::gemma4::StaticModules<MlxBackend> {
@@ -2673,7 +2612,7 @@ struct PredictionPipelineRealization<A, G, B, U> {
 type DeepSeekV3PipelinePartition = PredictionPipelineRealization<
     NeutralV3Architecture,
     Option<Arc<eredu_architectures::deepseek::parallel::V3LocalGeometry>>,
-    eredu_architectures::deepseek::v3::TargetBoundary<()>,
+    eredu_architectures::deepseek::v3::TargetBoundarySchema,
     NeutralV3Unit,
 >;
 
@@ -2834,7 +2773,7 @@ type NemotronHPipelinePartition = GroupedPredictionPipelineRealization<
     eredu_architectures::nemotron_h::LayeredModel<MlxBackend>,
     eredu_runtime::ArchitecturePartition<
         Arc<eredu_architectures::nemotron_h::LocalGeometry>,
-        eredu_architectures::nemotron_h::TargetBoundary<()>,
+        eredu_architectures::nemotron_h::TargetBoundarySchema,
     >,
     (),
     MlxModule<eredu_architectures::nemotron_h::Unit<MlxBackend>>,
@@ -2910,7 +2849,11 @@ type InklingPipelinePartition = MediaPipelineRealization<
 trait PipelinePartitionMetadata {
     fn model_kind(&self) -> ModelKind;
 
-    fn auxiliary_specs(&self, step: PipelineStep) -> Vec<PipelineAuxiliarySpec>;
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        eredu_runtime::NoAuxiliaryBoundary
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
+    }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage>;
 
@@ -5623,10 +5566,6 @@ impl PipelinePartitionMetadata for LlamaPipelinePartition {
         ModelKind::Llama
     }
 
-    fn auxiliary_specs(&self, _step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        Vec::new()
-    }
-
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -5748,16 +5687,19 @@ impl DeepSeekV3PipelinePartition {
                 )
             }
             PipelineStageInput::Hidden(payload) if !owns_input => {
-                let boundary = eredu_architectures::deepseek::v3::TargetBoundary::decode(
-                    payload
-                        .auxiliary
-                        .tensors()
-                        .iter()
-                        .cloned()
-                        .map(crate::MlxTensor::from_array)
-                        .collect(),
-                )
-                .map_err(|error| Error::Parallel(error.to_string()))?;
+                let boundary = self
+                    .partition
+                    .auxiliary_boundary()
+                    .decode(
+                        payload
+                            .auxiliary
+                            .tensors()
+                            .iter()
+                            .cloned()
+                            .map(crate::MlxTensor::from_array)
+                            .collect(),
+                    )
+                    .map_err(|error| Error::Parallel(error.to_string()))?;
                 eredu_architectures::deepseek::v3::TargetPartitionInput::Hidden {
                     hidden: crate::MlxTensor::from_array(payload.hidden.clone()),
                     boundary,
@@ -5806,8 +5748,10 @@ impl DeepSeekV3PipelinePartition {
         .map_err(|error| Error::Parallel(error.to_string()))?;
         let mut forward = forward;
         let auxiliary = PipelineAuxiliaryState::new(
-            boundary
-                .encode()
+            self.partition
+                .auxiliary_boundary()
+                .encode(boundary)
+                .map_err(|error| Error::Parallel(error.to_string()))?
                 .into_iter()
                 .map(crate::MlxTensor::into_array)
                 .collect(),
@@ -5925,8 +5869,11 @@ impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
         ModelKind::DeepSeekV3
     }
 
-    fn auxiliary_specs(&self, step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        token_capture_auxiliary_specs(step, self.args().hidden_size, 1)
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .auxiliary_boundary()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -6386,15 +6333,11 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
         ModelKind::DeepSeekV4
     }
 
-    fn auxiliary_specs(&self, step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        token_capture_auxiliary_specs(
-            step,
-            self.args().hidden_size,
-            self.args()
-                .dspark
-                .as_ref()
-                .map_or(0, |dspark| dspark.target_layer_ids.len()),
-        )
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .auxiliary_boundary()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -6889,18 +6832,11 @@ impl PipelinePartitionMetadata for Gemma4PipelinePartition {
         ModelKind::Gemma4
     }
 
-    fn auxiliary_specs(&self, step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        (self.args().text.hidden_size_per_layer_input > 0)
-            .then(|| {
-                PipelineAuxiliarySpec::activation(vec![
-                    step.batch_size,
-                    step.sequence_length,
-                    self.args().text.num_hidden_layers() as i32,
-                    self.per_layer_width(),
-                ])
-            })
-            .into_iter()
-            .collect()
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .auxiliary_boundary()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -7081,10 +7017,6 @@ impl PipelinePartitionMetadata for QwenPipelinePartition {
         qwen_model_kind(self.args())
     }
 
-    fn auxiliary_specs(&self, _step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        Vec::new()
-    }
-
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -7218,10 +7150,6 @@ impl PipelineForward for QwenPipelinePartition {
 impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
     fn model_kind(&self) -> ModelKind {
         ModelKind::MuseGlimmer
-    }
-
-    fn auxiliary_specs(&self, _step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        Vec::new()
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -7475,10 +7403,6 @@ impl PipelineForward for MuseGlimmerPipelinePartition {
 impl PipelinePartitionMetadata for InklingPipelinePartition {
     fn model_kind(&self) -> ModelKind {
         ModelKind::Inkling
-    }
-
-    fn auxiliary_specs(&self, _step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        Vec::new()
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -8193,26 +8117,11 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
         }
     }
 
-    fn auxiliary_specs(&self, step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        let mut specs = vec![
-            PipelineAuxiliarySpec::activation(vec![
-                1,
-                step.sequence_length,
-                self.args().text.head_dim,
-            ]),
-            PipelineAuxiliarySpec::activation(vec![
-                1,
-                step.sequence_length,
-                self.args().text.head_dim,
-            ]),
-            PipelineAuxiliarySpec::int32(vec![1]),
-        ];
-        specs.extend((0..self.args().vision.deepstack_layer_count()).map(|_| {
-            PipelineAuxiliarySpec::activation(
-                step.activation_shape(self.args().text.hidden_size).to_vec(),
-            )
-        }));
-        specs
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .auxiliary_boundary()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -8913,19 +8822,11 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
         ModelKind::Qwen35
     }
 
-    fn auxiliary_specs(&self, step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        (0..self
-            .args()
-            .vision
-            .as_ref()
-            .expect("validated vision")
-            .deepstack_layer_count())
-            .map(|_| {
-                PipelineAuxiliarySpec::activation(
-                    step.activation_shape(self.args().text.hidden_size).to_vec(),
-                )
-            })
-            .collect()
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .auxiliary_boundary()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -9286,10 +9187,6 @@ impl PipelinePartitionMetadata for GptOssPipelinePartition {
         ModelKind::GptOss
     }
 
-    fn auxiliary_specs(&self, _step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        Vec::new()
-    }
-
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
@@ -9423,10 +9320,6 @@ impl PipelineForward for GptOssPipelinePartition {
 impl PipelinePartitionMetadata for Lfm2PipelinePartition {
     fn model_kind(&self) -> ModelKind {
         ModelKind::Lfm2
-    }
-
-    fn auxiliary_specs(&self, _step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        Vec::new()
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -9579,8 +9472,11 @@ impl PipelinePartitionMetadata for NemotronHPipelinePartition {
         ModelKind::NemotronH
     }
 
-    fn auxiliary_specs(&self, step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        token_capture_auxiliary_specs(step, self.args().hidden_size, 1)
+    fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
+        self.partition
+            .auxiliary_boundary()
+            .wire_schema()
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -9814,10 +9710,6 @@ impl PipelineForward for NemotronHPipelinePartition {
 impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
     fn model_kind(&self) -> ModelKind {
         ModelKind::KimiLinear
-    }
-
-    fn auxiliary_specs(&self, _step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        Vec::new()
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -10155,8 +10047,14 @@ impl PipelineModel {
         })
     }
 
-    fn auxiliary_specs(&self, step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        self.stage.auxiliary_specs(step)
+    fn resolved_boundary_specs(
+        &self,
+        step: PipelineStep,
+    ) -> Result<Vec<eredu_runtime::ResolvedBoundaryTensorSpec>, Error> {
+        self.stage
+            .boundary_wire_schema()?
+            .resolve(step.batch_size, step.sequence_length)
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     /// Returns the immutable stage description.
@@ -11356,12 +11254,12 @@ impl PipelineModel {
                 ))
             })?;
             let received_auxiliary = self
-                    .auxiliary_specs(step)
+                    .resolved_boundary_specs(step)?
                     .into_iter()
                     .map(|spec| {
-                        let dtype = spec.resolved_dtype(self.info.activation_dtype);
+                        let dtype = mlx_boundary_dtype(spec.dtype(), self.info.activation_dtype);
                         let value = distributed::recv(
-                            &spec.shape,
+                            spec.shape(),
                             dtype,
                             peer,
                             group,
@@ -11370,7 +11268,7 @@ impl PipelineModel {
                         .map_err(|error| {
                             Error::Parallel(format!(
                                 "stage {} failed to receive auxiliary {:?} {:?} from rank {peer}: {error}",
-                                self.info.pipeline_stage, spec.shape, dtype
+                                self.info.pipeline_stage, spec.shape(), dtype
                             ))
                         })?;
                         Ok(value)
@@ -11394,7 +11292,12 @@ impl PipelineModel {
             match stage_input.expect("first stage ingress") {
                 PipelineIngress::Tokens(tokens) => {
                     let input = PipelineStageInput::Tokens(tokens);
-                    validate_stage_input(&self.info, &input, step, &self.auxiliary_specs(step))?;
+                    validate_stage_input(
+                        &self.info,
+                        &input,
+                        step,
+                        &self.resolved_boundary_specs(step)?,
+                    )?;
                     self.stage.forward_with_execution(
                         input,
                         step,
@@ -11436,7 +11339,12 @@ impl PipelineModel {
                     .as_ref()
                     .expect("non-first stage received payload"),
             );
-            validate_stage_input(&self.info, &input, step, &self.auxiliary_specs(step))?;
+            validate_stage_input(
+                &self.info,
+                &input,
+                step,
+                &self.resolved_boundary_specs(step)?,
+            )?;
             self.stage.forward_with_execution(
                 input,
                 step,
@@ -11470,7 +11378,7 @@ impl PipelineModel {
                 validate_auxiliary_tensors(
                     &self.info,
                     payload.auxiliary.tensors(),
-                    &self.auxiliary_specs(step),
+                    &self.resolved_boundary_specs(step)?,
                 )?;
                 let peer = successor.expect("non-final successor");
                 let sent = distributed::send(hidden, peer, group, stream).map_err(|error| {
@@ -11569,7 +11477,12 @@ impl PipelineModel {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         self.topology.validate_execution_stream(stream)?;
-        validate_stage_input(&self.info, &input, step, &self.auxiliary_specs(step))?;
+        validate_stage_input(
+            &self.info,
+            &input,
+            step,
+            &self.resolved_boundary_specs(step)?,
+        )?;
         if cache.model_kind != self.info.model_kind {
             return Err(Error::Parallel(format!(
                 "pipeline cache architecture {:?} does not match stage {:?}",
@@ -12184,7 +12097,7 @@ fn validate_stage_input(
     info: &PipelineStageInfo,
     input: &PipelineStageInput<'_>,
     step: PipelineStep,
-    auxiliary_specs: &[PipelineAuxiliarySpec],
+    auxiliary_specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
 ) -> Result<(), Error> {
     match (info.is_first, input) {
         (true, PipelineStageInput::Tokens(tokens)) => {
@@ -12219,7 +12132,7 @@ fn validate_stage_input(
 fn validate_auxiliary_tensors(
     info: &PipelineStageInfo,
     values: &[Array],
-    specs: &[PipelineAuxiliarySpec],
+    specs: &[eredu_runtime::ResolvedBoundaryTensorSpec],
 ) -> Result<(), Error> {
     if values.len() != specs.len() {
         return Err(Error::Parallel(format!(
@@ -12230,14 +12143,15 @@ fn validate_auxiliary_tensors(
         )));
     }
     for (index, (value, spec)) in values.iter().zip(specs).enumerate() {
-        let expected_dtype = spec.resolved_dtype(info.activation_dtype);
-        if value.shape() != spec.shape || value.dtype() != expected_dtype {
+        let expected_dtype = mlx_boundary_dtype(spec.dtype(), info.activation_dtype);
+        if value.shape() != spec.shape() || value.dtype() != expected_dtype {
             return Err(Error::Parallel(format!(
-                "pipeline stage {} auxiliary tensor {index} has shape {:?} and {:?}, expected {:?} and {:?}",
+                "pipeline stage {} auxiliary tensor {index} ({:?}) has shape {:?} and {:?}, expected {:?} and {:?}",
                 info.pipeline_stage,
+                spec.role(),
                 value.shape(),
                 value.dtype(),
-                spec.shape,
+                spec.shape(),
                 expected_dtype
             )));
         }
@@ -13072,17 +12986,48 @@ mod binding_authority_tests {
 
     #[test]
     fn mixed_auxiliary_wire_specs_preserve_integer_boundary_dtypes() {
-        let step = PipelineStep::new(2, 3).unwrap();
-        let specs = token_capture_auxiliary_specs(step, 16, 2);
+        use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Kind};
+        let schema = eredu_runtime::BoundaryWireSchema::new(
+            "test.boundary",
+            [
+                eredu_runtime::BoundaryTensorSpec::new(
+                    "tokens",
+                    [Dim::Batch, Dim::Sequence],
+                    Kind::Uint32,
+                ),
+                eredu_runtime::BoundaryTensorSpec::new(
+                    "capture.0",
+                    [Dim::Batch, Dim::Sequence, Dim::Fixed(16)],
+                    Kind::Activation,
+                ),
+                eredu_runtime::BoundaryTensorSpec::new(
+                    "position_delta",
+                    [Dim::Fixed(1)],
+                    Kind::Int32,
+                ),
+            ],
+        )
+        .unwrap();
+        let specs = schema.resolve(2, 3).unwrap();
         assert_eq!(specs.len(), 3);
-        assert_eq!(specs[0].shape, [2, 3]);
-        assert_eq!(specs[0].resolved_dtype(Dtype::Float16), Dtype::Uint32);
-        assert_ne!(specs[0].resolved_dtype(Dtype::Float16), Dtype::Float32);
-        assert_eq!(specs[1].shape, [2, 3, 16]);
-        assert_eq!(specs[1].resolved_dtype(Dtype::Float16), Dtype::Float16);
-
-        let position_delta = PipelineAuxiliarySpec::int32(vec![1]);
-        assert_eq!(position_delta.resolved_dtype(Dtype::Bfloat16), Dtype::Int32);
+        assert_eq!(specs[0].shape(), [2, 3]);
+        assert_eq!(
+            mlx_boundary_dtype(specs[0].dtype(), Dtype::Float16),
+            Dtype::Uint32
+        );
+        assert_ne!(
+            mlx_boundary_dtype(specs[0].dtype(), Dtype::Float16),
+            Dtype::Float32
+        );
+        assert_eq!(specs[1].shape(), [2, 3, 16]);
+        assert_eq!(
+            mlx_boundary_dtype(specs[1].dtype(), Dtype::Float16),
+            Dtype::Float16
+        );
+        assert_eq!(
+            mlx_boundary_dtype(specs[2].dtype(), Dtype::Bfloat16),
+            Dtype::Int32
+        );
     }
 }
 
@@ -15477,9 +15422,7 @@ fn load_neutral_qwen_vl_pipeline(
             info.pipeline_stage,
             None,
             architecture.shared_parallel_geometry(),
-            eredu_architectures::qwen::vl::PipelineBoundarySchema::new(
-                target_args.vision.deepstack_layer_count(),
-            ),
+            eredu_architectures::qwen::vl::PipelineBoundarySchema::from_args(&target_args),
             std::iter::empty(),
         )?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
@@ -15495,9 +15438,7 @@ fn load_neutral_qwen_vl_pipeline(
             info.pipeline_stage,
             Some((local_state, range.start)),
             architecture.shared_parallel_geometry(),
-            eredu_architectures::qwen::vl::PipelineBoundarySchema::new(
-                target_args.vision.deepstack_layer_count(),
-            ),
+            eredu_architectures::qwen::vl::PipelineBoundarySchema::from_args(&target_args),
             local_parameter_groups,
         )?;
     let mut stage = QwenVlPipelinePartition::new(architecture, partition, external_experts)?;
@@ -18539,7 +18480,7 @@ fn load_nemotron_h_pipeline(
             topology.pipeline_parallel_rank,
             None,
             Arc::clone(&geometry),
-            eredu_architectures::nemotron_h::TargetBoundary::new((), ()),
+            eredu_architectures::nemotron_h::TargetBoundarySchema::from_args(&target_args),
             std::iter::empty(),
         )?;
     let owned_state_end = if range.end == target_units {
@@ -18559,7 +18500,7 @@ fn load_nemotron_h_pipeline(
             topology.pipeline_parallel_rank,
             Some((local_state, range.start)),
             Arc::clone(&geometry),
-            eredu_architectures::nemotron_h::TargetBoundary::new((), ()),
+            eredu_architectures::nemotron_h::TargetBoundarySchema::from_args(&target_args),
             local_parameter_groups,
         )?;
     let mut stage = NemotronHPipelinePartition::new(architecture, partition, external_experts)?;
@@ -18898,7 +18839,7 @@ impl NemotronHPipelinePartition {
         architecture: eredu_architectures::nemotron_h::LayeredModel<MlxBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Arc<eredu_architectures::nemotron_h::LocalGeometry>,
-            eredu_architectures::nemotron_h::TargetBoundary<()>,
+            eredu_architectures::nemotron_h::TargetBoundarySchema,
         >,
         external_experts: bool,
     ) -> Result<Self, Error> {
@@ -18972,16 +18913,19 @@ impl NemotronHPipelinePartition {
                 )
             }
             PipelineStageInput::Hidden(payload) if !owns_input => {
-                let boundary = eredu_architectures::nemotron_h::TargetBoundary::decode(
-                    payload
-                        .auxiliary
-                        .tensors()
-                        .iter()
-                        .cloned()
-                        .map(crate::MlxTensor::from_array)
-                        .collect(),
-                )
-                .map_err(|error| Error::Parallel(error.to_string()))?;
+                let boundary = self
+                    .partition
+                    .auxiliary_boundary()
+                    .decode(
+                        payload
+                            .auxiliary
+                            .tensors()
+                            .iter()
+                            .cloned()
+                            .map(crate::MlxTensor::from_array)
+                            .collect(),
+                    )
+                    .map_err(|error| Error::Parallel(error.to_string()))?;
                 eredu_architectures::nemotron_h::TargetPartitionInput::Hidden {
                     hidden: crate::MlxTensor::from_array(payload.hidden.clone()),
                     boundary,
@@ -19030,8 +18974,10 @@ impl NemotronHPipelinePartition {
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let mut forward = forward;
         let auxiliary = PipelineAuxiliaryState::new(
-            boundary
-                .encode()
+            self.partition
+                .auxiliary_boundary()
+                .encode(boundary)
+                .map_err(|error| Error::Parallel(error.to_string()))?
                 .into_iter()
                 .map(crate::MlxTensor::into_array)
                 .collect(),
@@ -19528,10 +19474,6 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
         } else {
             ModelKind::Qwen35
         }
-    }
-
-    fn auxiliary_specs(&self, _step: PipelineStep) -> Vec<PipelineAuxiliarySpec> {
-        Vec::new()
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -20407,12 +20349,8 @@ fn load_neutral_qwen_conditional_pipeline(
             info.pipeline_stage,
             None,
             architecture.shared_parallel_geometry(),
-            eredu_architectures::qwen::hybrid::ConditionalPipelineBoundarySchema::new(
-                target
-                    .vision
-                    .as_ref()
-                    .expect("validated vision")
-                    .deepstack_layer_count(),
+            eredu_architectures::qwen::hybrid::ConditionalPipelineBoundarySchema::from_args(
+                &target,
             ),
             std::iter::empty(),
         )?;
@@ -20434,12 +20372,8 @@ fn load_neutral_qwen_conditional_pipeline(
             info.pipeline_stage,
             Some((local_state, range.start)),
             architecture.shared_parallel_geometry(),
-            eredu_architectures::qwen::hybrid::ConditionalPipelineBoundarySchema::new(
-                target
-                    .vision
-                    .as_ref()
-                    .expect("validated vision")
-                    .deepstack_layer_count(),
+            eredu_architectures::qwen::hybrid::ConditionalPipelineBoundarySchema::from_args(
+                &target,
             ),
             local_parameter_groups,
         )?;
@@ -22040,8 +21974,9 @@ fn load_neutral_gemma4_pipeline(
             topology.pipeline_parallel_rank,
             None,
             Arc::clone(&geometry),
-            eredu_architectures::gemma4::TextBoundarySchema::new(
-                target_args.text.hidden_size_per_layer_input > 0,
+            eredu_architectures::gemma4::TextBoundarySchema::from_args(
+                &target_args.text,
+                &geometry,
             ),
             std::iter::empty(),
         )?;
@@ -22057,8 +21992,9 @@ fn load_neutral_gemma4_pipeline(
             topology.pipeline_parallel_rank,
             Some((local_state, range.start)),
             Arc::clone(&geometry),
-            eredu_architectures::gemma4::TextBoundarySchema::new(
-                target_args.text.hidden_size_per_layer_input > 0,
+            eredu_architectures::gemma4::TextBoundarySchema::from_args(
+                &target_args.text,
+                &geometry,
             ),
             local_parameter_groups,
         )?;
@@ -22783,7 +22719,7 @@ fn load_neutral_deepseek_v3_pipeline(
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
             geometry.clone(),
-            eredu_architectures::deepseek::v3::TargetBoundary::new((), ()),
+            eredu_architectures::deepseek::v3::TargetBoundarySchema::from_args(&args),
             std::iter::empty(),
         )?;
     let parameter_description =
@@ -22798,7 +22734,7 @@ fn load_neutral_deepseek_v3_pipeline(
             info.pipeline_stage,
             Some((local_state, range.start)),
             geometry,
-            eredu_architectures::deepseek::v3::TargetBoundary::new((), ()),
+            eredu_architectures::deepseek::v3::TargetBoundarySchema::from_args(&args),
             local_parameter_groups,
         )?;
     let (static_targets, vocabulary_targets) =
@@ -23215,11 +23151,7 @@ fn load_neutral_deepseek_v4_pipeline(
         info.pipeline_stage,
         Some((local_state.clone(), range.start)),
         geometry.clone(),
-        eredu_architectures::deepseek::v4::TargetBoundarySchema::new(
-            args.dspark
-                .as_ref()
-                .map_or(0, |config| config.target_layer_ids.len()),
-        ),
+        eredu_architectures::deepseek::v4::TargetBoundarySchema::from_args(&args),
         std::iter::empty(),
     )?;
     let parameter_description =
@@ -23238,11 +23170,7 @@ fn load_neutral_deepseek_v4_pipeline(
         info.pipeline_stage,
         Some((local_state, range.start)),
         geometry,
-        eredu_architectures::deepseek::v4::TargetBoundarySchema::new(
-            args.dspark
-                .as_ref()
-                .map_or(0, |config| config.target_layer_ids.len()),
-        ),
+        eredu_architectures::deepseek::v4::TargetBoundarySchema::from_args(&args),
         local_parameter_groups,
     )?;
     let (static_targets, vocabulary_targets) =

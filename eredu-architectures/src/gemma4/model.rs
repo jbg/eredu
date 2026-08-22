@@ -63,6 +63,24 @@ fn text_static_parameter_ownership(
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+    use eredu_runtime::{ArchitectureBoundary, BoundaryTensorDtype};
+
+    #[test]
+    fn optional_per_layer_input_owns_complete_wire_geometry() {
+        let present = TextBoundarySchema {
+            per_layer_geometry: Some((4, 8)),
+        };
+        let tensors = present.wire_schema().unwrap().resolve(2, 3).unwrap();
+        assert_eq!(tensors.len(), 1);
+        assert_eq!(tensors[0].role(), "per_layer_input");
+        assert_eq!(tensors[0].shape(), [2, 3, 4, 8]);
+        assert_eq!(tensors[0].dtype(), BoundaryTensorDtype::Activation);
+
+        let absent = TextBoundarySchema {
+            per_layer_geometry: None,
+        };
+        assert!(absent.wire_schema().unwrap().tensors().is_empty());
+    }
 
     #[test]
     fn per_layer_projection_has_independent_static_owner() {
@@ -268,42 +286,61 @@ impl<T> ForwardContext<T> {
 /// Family-owned schema for decoder-wide per-layer input transport.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TextBoundarySchema {
-    carries_per_layer_input: bool,
+    per_layer_geometry: Option<(i32, i32)>,
 }
 
 impl TextBoundarySchema {
-    /// Creates the schema for one concrete text configuration.
-    pub const fn new(carries_per_layer_input: bool) -> Self {
+    /// Derives the schema from normalized text and rank-local geometry.
+    pub fn from_args(args: &super::ModelArgs, geometry: &LocalGeometry) -> Self {
         Self {
-            carries_per_layer_input,
+            per_layer_geometry: (args.hidden_size_per_layer_input > 0)
+                .then(|| (args.num_hidden_layers() as i32, geometry.per_layer_width())),
         }
+    }
+}
+
+impl eredu_runtime::ArchitectureBoundary for TextBoundarySchema {
+    type Boundary<T> = TextBoundary<T>;
+
+    const IDENTITY: &'static str = "gemma4.text";
+
+    fn tensor_specs(&self) -> Vec<eredu_runtime::BoundaryTensorSpec> {
+        use eredu_runtime::{BoundaryTensorDimension as Dim, BoundaryTensorDtype as Dtype};
+        self.per_layer_geometry
+            .map(|(layers, width)| {
+                eredu_runtime::BoundaryTensorSpec::new(
+                    "per_layer_input",
+                    [
+                        Dim::Batch,
+                        Dim::Sequence,
+                        Dim::Fixed(layers),
+                        Dim::Fixed(width),
+                    ],
+                    Dtype::Activation,
+                )
+            })
+            .into_iter()
+            .collect()
     }
 
     /// Decodes the optional per-layer input without positional guessing.
-    pub fn decode<T>(
-        self,
+    fn decode<T>(
+        &self,
         tensors: Vec<T>,
-    ) -> Result<TextBoundary<T>, eredu_runtime::ArchitectureBoundaryError> {
-        let expected = usize::from(self.carries_per_layer_input);
-        if tensors.len() != expected {
-            return Err(eredu_runtime::ArchitectureBoundaryError::TensorCount {
-                boundary: "gemma4.text",
-                expected,
-                actual: tensors.len(),
-            });
-        }
+    ) -> Result<Self::Boundary<T>, eredu_runtime::ArchitectureBoundaryError> {
+        eredu_runtime::validate_boundary_tensor_count(self, &tensors)?;
         Ok(TextBoundary {
             per_layer_input: tensors.into_iter().next(),
         })
     }
 
     /// Encodes the optional per-layer input after validating the family schema.
-    pub fn encode<T>(
-        self,
+    fn encode<T>(
+        &self,
         boundary: TextBoundary<T>,
     ) -> Result<Vec<T>, eredu_runtime::ArchitectureBoundaryError> {
         let actual = usize::from(boundary.per_layer_input.is_some());
-        let expected = usize::from(self.carries_per_layer_input);
+        let expected = usize::from(self.per_layer_geometry.is_some());
         if actual != expected {
             return Err(eredu_runtime::ArchitectureBoundaryError::TensorCount {
                 boundary: "gemma4.text",
