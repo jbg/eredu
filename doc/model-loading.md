@@ -6,8 +6,8 @@ cache, and paging a cache does not change where model weights live.
 
 ## Preflight
 
-Run `eredu_backend_mlx::composition::mlx::inspect_model` with the same
-`MlxInspectionOptions` you intend to load on MLX.
+Applications run `eredu::api::inspect_local_model` with the same
+`LocalInspectionOptions` they intend to load.
 Inspection validates the artifact, architecture, requested quantization,
 residency policy, topology, processor, and media companion files without
 materializing weights. It is the cheapest place to reject an incompatible
@@ -15,9 +15,8 @@ backend request. Apply `api::inspect_text_model` to that report when admission
 also requires tokenizer, chat-template, EOS, semantic-streaming, or native-tool
 readiness.
 
-The MLX backend's `eredu_backend_mlx::backend::mlx::ModelLoadOptions` contain
-two independent choices. The facade's `eredu::backend::mlx` path remains a
-compatibility re-export:
+The selected local backend's `eredu::api::LocalLoadOptions` contain two
+independent choices:
 
 - `quantization`: an optional transformation for eligible dense weights; and
 - `weight_residency`: the static parameter placement policy.

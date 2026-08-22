@@ -3,7 +3,6 @@
 //! Tests never download data. Set the named environment variable to a local
 //! model directory or GGUF and run the exact ignored test on a Metal host.
 
-use eredu::backend::mlx::ModelLoadOptions;
 use eredu::{
     api::{
         LoadedModel, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
@@ -12,6 +11,7 @@ use eredu::{
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
     FinishReason, SemanticEvent,
 };
+use eredu_backend_mlx::backend::mlx::ModelLoadOptions;
 use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
 use serde_json::json;
 
@@ -37,7 +37,7 @@ fn smoke_with_options(environment: &str, expected_profile_prefix: &str, options:
         .unwrap_or_else(|_| panic!("{environment} must name a local checkpoint"));
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let mut model = LoadedModel::load(
-        eredu::backend::mlx::MlxBackend::new(execution.stream(), execution.stream()),
+        eredu_backend_mlx::backend::mlx::MlxBackend::new(execution.stream(), execution.stream()),
         &path,
         options,
     )

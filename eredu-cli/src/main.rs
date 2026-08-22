@@ -13,20 +13,15 @@ use anyhow::{bail, Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use eredu::{
     api::{
-        LoadedModel, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-        PreparedChatInput, PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest,
-        ResidencyPlan, TextDecoder, TextModelError,
+        discover_local_hardware, inspect_local_model, local_expert_cache_telemetry,
+        local_mtp_telemetry, local_residency_telemetry, LoadedModel, LocalBackend,
+        LocalBackendFactory, LocalExpertPassStatistics, LocalExpertTierStatistics, LocalInputPart,
+        LocalInspectionOptions, LocalMirostatV2Sampler, LocalModelInput,
+        LocalMtpComponentTimingGuard, LocalPreparedModelInput, LocalSampler,
+        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
+        PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, ResidencyPlan,
+        TextDecoder, TextModelError,
     },
-    backend::mlx::runtime::generation::sampler::{MirostatV2Sampler, Sampler},
-    backend::mlx::runtime::media::input::{InputPart, ModelInput},
-    backend::mlx::runtime::residency::expert_cache::{ExpertPassStatistics, ExpertTierStatistics},
-    backend::mlx::{MlxBackend, ModelLoadOptions},
-    composition::mlx::automatic::{
-        discover_hardware, expert_cache_telemetry, mtp_telemetry, residency_telemetry,
-        MlxBackendFactory,
-    },
-    composition::mlx::speculative::MtpComponentTimingGuard,
-    composition::mlx::{inspect_model, MlxInspectionOptions, MlxModelInput},
     core::residency::{CacheEvictionPolicy, MemoryTier, TransferDirection},
     core::speculative::MtpStats,
     runtime::chat::{
@@ -40,7 +35,9 @@ use eredu::{
     SemanticEvent, TextGenerationConfig, TimingTelemetry, TokenOutput, WeightTransformationPlan,
     EXECUTION_PLAN_SCHEMA_VERSION,
 };
-use eredu_backend_mlx::native::{
+use eredu_checkpoint::{AffineQuantization, WeightQuantization};
+use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
+use safemlx::{
     memory::{active_memory, cache_memory, peak_memory, reset_peak_memory, set_cache_limit},
     ops::indexing::{NewAxis, TryIndexOp},
     random::{key, RandomState},
@@ -48,9 +45,7 @@ use eredu_backend_mlx::native::{
     Array, Stream,
 };
 #[cfg(test)]
-use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
-use eredu_checkpoint::{AffineQuantization, WeightQuantization};
-use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
+use safemlx::{Device, DeviceType, ExecutionContext};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1248,17 +1243,17 @@ fn cached_plan_resource_admitted(observations: &ExecutionPlanReport, plan: &Exec
     }
 }
 
-fn candidate_load_options(plan: &ExecutionPlan) -> Result<ModelLoadOptions> {
+fn candidate_load_options(plan: &ExecutionPlan) -> Result<eredu::api::LocalLoadOptions> {
     let realization =
-        eredu::core::realize_execution_plan_target(&MlxBackendFactory::default(), plan)?;
+        eredu::core::realize_execution_plan_target(&LocalBackendFactory::default(), plan)?;
     let (_, options) = realization.into_parts();
     Ok(options)
 }
 
 fn inspect_candidate(model_path: &Path, plan: &ExecutionPlan) -> Result<AutoCandidate> {
-    let report = inspect_model(
+    let report = inspect_local_model(
         model_path,
-        MlxInspectionOptions {
+        LocalInspectionOptions {
             load: candidate_load_options(plan)?,
         },
     )?;
@@ -1375,10 +1370,10 @@ fn choose_automatic_residency(
 }
 
 fn automatic_observations(model_path: &Path, device: CliDevice) -> Result<ExecutionPlanReport> {
-    let hardware = discover_hardware();
+    let hardware = discover_local_hardware();
     let selected_device = device_plan(device);
     validate_automatic_device(&hardware, &selected_device)?;
-    let resources = inspect_model(model_path, MlxInspectionOptions::default())?.resources;
+    let resources = inspect_local_model(model_path, LocalInspectionOptions::default())?.resources;
     Ok(ExecutionPlanReport {
         schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
         hardware,
@@ -1426,7 +1421,7 @@ fn automatic_plan(
     let request = AutomaticPlanRequest::new(model_path, device_plan(device))
         .with_prior_telemetry(prior_telemetry.iter().cloned());
     AutomaticPlanner::default()
-        .plan(&MlxBackendFactory::default(), &request)
+        .plan(&LocalBackendFactory::default(), &request)
         .map_err(Into::into)
 }
 
@@ -1759,11 +1754,11 @@ fn exact_automatic_report(model_path: &Path, plan: ExecutionPlan) -> Result<Exec
             EXECUTION_PLAN_SCHEMA_VERSION
         );
     }
-    let hardware = discover_hardware();
+    let hardware = discover_local_hardware();
     validate_automatic_device(&hardware, &plan.device)?;
-    let inspection = inspect_model(
+    let inspection = inspect_local_model(
         model_path,
-        MlxInspectionOptions {
+        LocalInspectionOptions {
             load: candidate_load_options(&plan)?,
         },
     )?;
@@ -2074,7 +2069,11 @@ fn main() -> Result<()> {
     let hardware_profile = automatic_report
         .as_ref()
         .map(|report| report.hardware.clone())
-        .or_else(|| args.telemetry_json.as_ref().map(|_| discover_hardware()));
+        .or_else(|| {
+            args.telemetry_json
+                .as_ref()
+                .map(|_| discover_local_hardware())
+        });
     if let Some(bytes) = args.mlx_cache_limit_bytes {
         let bytes = usize::try_from(bytes).context("--mlx-cache-limit-bytes exceeds usize")?;
         set_cache_limit(bytes).context("failed to set the MLX allocator-cache limit")?;
@@ -2115,9 +2114,9 @@ fn main() -> Result<()> {
         Some(report.resources.clone())
     } else if args.telemetry_json.is_some() {
         Some(
-            inspect_model(
+            inspect_local_model(
                 &model_path,
-                MlxInspectionOptions {
+                LocalInspectionOptions {
                     load: candidate_load_options(&execution_plan)?,
                 },
             )?
@@ -2128,7 +2127,7 @@ fn main() -> Result<()> {
     };
     let load_started = Instant::now();
     let factory =
-        MlxBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
+        LocalBackendFactory::default().with_residency_diagnostics(args.verbose, args.verbose);
     let planned = LoadedModel::load_execution_plan(&factory, &model_path, &execution_plan)
         .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let (mut model, mut drafting) = planned.into_parts();
@@ -2276,7 +2275,7 @@ fn main() -> Result<()> {
     let mut stderr = stderr.lock();
 
     let drafting_enabled = !matches!(&drafting, eredu::RealizedDrafting::Disabled);
-    let _component_timing_guard = args.verbose.then(MtpComponentTimingGuard::enable);
+    let _component_timing_guard = args.verbose.then(LocalMtpComponentTimingGuard::enable);
     let scheduler_options = MtpSchedulerOptions {
         adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
         ..MtpSchedulerOptions::default()
@@ -2383,15 +2382,16 @@ fn main() -> Result<()> {
             "speculative generation requires a prepared chat with executable semantic support; raw and unrecognized-template fallbacks use ordinary generation"
         );
     } else if args.mirostat_v2 {
-        let mut sampler = MirostatV2Sampler::new(args.mirostat_tau, args.mirostat_eta)?.penalties(
-            args.repeat_penalty,
-            args.repeat_last_n,
-            args.frequency_penalty,
-            args.presence_penalty,
-        );
+        let mut sampler = LocalMirostatV2Sampler::new(args.mirostat_tau, args.mirostat_eta)?
+            .penalties(
+                args.repeat_penalty,
+                args.repeat_last_n,
+                args.frequency_penalty,
+                args.presence_penalty,
+            );
         let mut random = RandomState::from_key(key(args.seed)?);
-        let parts = [InputPart::text_token_ids(&tokens)];
-        let prompt = MlxModelInput::from(ModelInput::new(&parts));
+        let parts = [LocalInputPart::text_token_ids(&tokens)];
+        let prompt = LocalPreparedModelInput::from(LocalModelInput::new(&parts));
         let mut logits = model
             .runtime_mut()
             .prefill(prompt)?
@@ -2676,13 +2676,13 @@ fn main() -> Result<()> {
             .session()
             .residency_report()?
             .as_ref()
-            .map(residency_telemetry);
+            .map(local_residency_telemetry);
         let expert_cache = model
             .runtime()
             .session()
             .expert_cache_report()?
             .as_ref()
-            .map(expert_cache_telemetry);
+            .map(local_expert_cache_telemetry);
         let telemetry = ExecutionTelemetry {
             schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
             model_type: model.model_type().into(),
@@ -2703,7 +2703,7 @@ fn main() -> Result<()> {
             allocator: allocator_telemetry,
             residency,
             expert_cache,
-            mtp: mtp_stats.as_ref().map(mtp_telemetry),
+            mtp: mtp_stats.as_ref().map(local_mtp_telemetry),
         };
         let json = serde_json::to_vec_pretty(&telemetry)
             .context("failed to serialize execution telemetry")?;
@@ -2822,7 +2822,7 @@ fn format_bytes(bytes: usize) -> String {
 }
 
 fn format_weight_store_diagnostics(
-    diagnostics: &eredu::backend::mlx::runtime::checkpoint::store::WeightStoreDiagnostics,
+    diagnostics: &eredu_checkpoint::store::WeightStoreDiagnostics,
 ) -> String {
     format!(
         "backend={:?}, mapping_hits={}, mapping_misses={}, evictions={}, currently_mapped_shards={}, touched_shards={}, physical_reads={}, physical_read_bytes={}, coalesced_group_hits={}",
@@ -2840,8 +2840,8 @@ fn format_weight_store_diagnostics(
 
 #[derive(Clone, Copy)]
 struct ExpertBenchmarkSnapshot {
-    prefill: ExpertPassStatistics,
-    decode: ExpertPassStatistics,
+    prefill: LocalExpertPassStatistics,
+    decode: LocalExpertPassStatistics,
     host_experts: usize,
     device_experts: usize,
     host_bytes: u64,
@@ -2849,7 +2849,7 @@ struct ExpertBenchmarkSnapshot {
 }
 
 fn expert_benchmark_snapshot(
-    model: &LoadedModel<MlxBackend<'static>>,
+    model: &LoadedModel<LocalBackend<'static>>,
 ) -> Result<ExpertBenchmarkSnapshot> {
     let report = model
         .runtime()
@@ -2866,8 +2866,11 @@ fn expert_benchmark_snapshot(
     })
 }
 
-fn tier_delta(after: ExpertTierStatistics, before: ExpertTierStatistics) -> ExpertTierStatistics {
-    ExpertTierStatistics {
+fn tier_delta(
+    after: LocalExpertTierStatistics,
+    before: LocalExpertTierStatistics,
+) -> LocalExpertTierStatistics {
+    LocalExpertTierStatistics {
         requests: after.requests.saturating_sub(before.requests),
         hits: after.hits.saturating_sub(before.hits),
         misses: after.misses.saturating_sub(before.misses),
@@ -2879,8 +2882,8 @@ fn tier_delta(after: ExpertTierStatistics, before: ExpertTierStatistics) -> Expe
 fn print_expert_benchmark_result(
     label: &str,
     elapsed: std::time::Duration,
-    before: ExpertPassStatistics,
-    after: ExpertPassStatistics,
+    before: LocalExpertPassStatistics,
+    after: LocalExpertPassStatistics,
     occupancy: ExpertBenchmarkSnapshot,
 ) {
     let host = tier_delta(after.host, before.host);
@@ -2911,12 +2914,12 @@ fn print_expert_benchmark_result(
 }
 
 fn run_expert_cache_benchmark(
-    model: &mut LoadedModel<MlxBackend<'static>>,
+    model: &mut LoadedModel<LocalBackend<'static>>,
     tokens: &Array,
     stream: &Stream,
 ) -> Result<()> {
-    let parts = [InputPart::text_token_ids(tokens)];
-    let prompt = MlxModelInput::from(ModelInput::new(&parts));
+    let parts = [LocalInputPart::text_token_ids(tokens)];
+    let prompt = LocalPreparedModelInput::from(LocalModelInput::new(&parts));
 
     let before_cold = expert_benchmark_snapshot(model)?;
     model.runtime_mut().session_mut().reset()?;
@@ -3609,18 +3612,14 @@ mod tests {
     };
 
     use clap::{CommandFactory, FromArgMatches, Parser};
-    use eredu::{
-        composition::mlx::speculative::MtpExecutionStreams,
-        core::speculative::SpeculativeExecutionTopology,
-    };
     use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
 
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
         cached_automatic_report, choose_automatic_residency, cli_execution_plan, device_plan,
-        discover_hardware, embedded_mtp_count, eval, format_bytes, format_weight_store_diagnostics,
-        median, model_advertises_embedded_mtp, read_automatic_feedback,
-        requested_load_quantization, select_cached_gguf_from_revisions,
+        discover_local_hardware, embedded_mtp_count, eval, format_bytes,
+        format_weight_store_diagnostics, median, model_advertises_embedded_mtp,
+        read_automatic_feedback, requested_load_quantization, select_cached_gguf_from_revisions,
         select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
         select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
         use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
@@ -3714,7 +3713,7 @@ mod tests {
         let model_path = directory.path().join("model.gguf");
         std::fs::write(&model_path, b"fixture").unwrap();
         let device = device_plan(CliDevice::Cpu);
-        let hardware = discover_hardware();
+        let hardware = discover_local_hardware();
         let resources = eredu::ModelResourceProfile {
             schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
             path: model_path.clone(),
@@ -4462,47 +4461,6 @@ mod tests {
         eval([&values]).unwrap();
         context.stream().synchronize().unwrap();
         assert_eq!(values.evaluated().unwrap().as_slice::<f32>(), &[1.0, 2.0]);
-
-        let target = super::ExecutionContext::new(CliDevice::Cpu.mlx());
-        let draft = super::ExecutionContext::new(CliDevice::Cpu.mlx());
-        assert_ne!(target.stream(), draft.stream());
-        assert_eq!(
-            MtpExecutionStreams::new(target.stream(), draft.stream())
-                .unwrap()
-                .topology(),
-            SpeculativeExecutionTopology::SameDeviceSplit
-        );
-    }
-
-    #[test]
-    #[ignore = "requires an MLX Metal device"]
-    fn gpu_device_selectors_build_requested_mtp_topologies() {
-        let target = super::ExecutionContext::new(CliDevice::Gpu(0).mlx());
-        let draft = super::ExecutionContext::new(CliDevice::Gpu(0).mlx());
-        assert_eq!(
-            MtpExecutionStreams::new(target.stream(), draft.stream())
-                .unwrap()
-                .topology(),
-            SpeculativeExecutionTopology::SameDeviceSplit
-        );
-
-        let target = super::ExecutionContext::new(CliDevice::Gpu(0).mlx());
-        let draft = super::ExecutionContext::new(CliDevice::Cpu.mlx());
-        assert_eq!(
-            MtpExecutionStreams::new(target.stream(), draft.stream())
-                .unwrap()
-                .topology(),
-            SpeculativeExecutionTopology::CrossDeviceSplit
-        );
-
-        let target = super::ExecutionContext::new(CliDevice::Cpu.mlx());
-        let draft = super::ExecutionContext::new(CliDevice::Gpu(0).mlx());
-        assert_eq!(
-            MtpExecutionStreams::new(target.stream(), draft.stream())
-                .unwrap()
-                .topology(),
-            SpeculativeExecutionTopology::CrossDeviceSplit
-        );
     }
 
     #[test]
@@ -4886,9 +4844,8 @@ mod tests {
 
     #[test]
     fn concise_weight_store_diagnostics_omit_shard_paths() {
-        let diagnostics = eredu::backend::mlx::runtime::checkpoint::store::WeightStoreDiagnostics {
-            backend:
-                eredu::backend::mlx::runtime::checkpoint::store::WeightStoreBackend::Safetensors,
+        let diagnostics = eredu_checkpoint::store::WeightStoreDiagnostics {
+            backend: eredu_checkpoint::store::WeightStoreBackend::Safetensors,
             mapping_hits: 17,
             mapping_misses: 2,
             evictions: 1,

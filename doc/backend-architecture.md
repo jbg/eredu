@@ -21,14 +21,15 @@ eredu-core        eredu-checkpoint        eredu-nn
 The neutral crates contain no native accelerator dependency under any feature.
 The `eredu` facade is also portable when built with
 `default-features = false`. Its default `mlx` feature selects the optional
-`eredu-backend-mlx` crate. Compatibility re-exports keep MLX capabilities
-available under `eredu::backend::mlx` and family adapters under
-`eredu::composition`. Backend fixture APIs are activated only by the facade's
-development dependency; the production `mlx` feature does not enable backend
-`test-support`.
+`eredu-backend-mlx` crate. The facade exposes a flat, application-facing local
+adapter under `eredu::api`; it does not reproduce the implementation crate's
+backend or composition module tree. Backend fixture APIs are activated only by
+the facade's development dependency; the production `mlx` feature does not
+enable backend `test-support`.
 
-The facade root and `api` namespace expose portable application concepts.
-Backend-native types remain in their backend namespace.
+The facade root and `api` namespace expose portable application concepts plus
+the narrow selected-backend adapter. The complete backend-native module tree
+remains available only from its owning implementation crate.
 
 ## Ownership boundary
 
@@ -374,8 +375,8 @@ internally between reusable backend mechanics and family/backend composition:
 Model-family definitions, equations, checkpoint schemas, and state geometry
 remain in `eredu-architectures`. The backend crate owns only the MLX binding,
 materialization, and execution adapters. `eredu` delegates through neutral
-contracts and may re-export backend APIs for compatibility, but the backend
-crate never depends upward on the facade.
+contracts and exposes only the narrow selected-backend types needed by
+applications; the backend crate never depends upward on the facade.
 
 The adapter translates native failures into structured backend errors and
 populates portable capability, inspection, memory, admission, and telemetry

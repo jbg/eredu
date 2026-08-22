@@ -8,14 +8,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eredu::{
-    backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
-    backend::mlx::runtime::distributed::topology::load_safetensors_partition,
-    backend::mlx::{DeviceAssignment, MlxParallelContext, PlacementPlan},
-};
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     DeviceType, Stream,
+};
+use eredu_backend_mlx::{
+    backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
+    backend::mlx::runtime::distributed::topology::load_safetensors_partition,
+    backend::mlx::{DeviceAssignment, MlxParallelContext, PlacementPlan},
 };
 use eredu_runtime::TensorPlacement;
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};

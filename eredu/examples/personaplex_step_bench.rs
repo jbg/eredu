@@ -1,13 +1,15 @@
 use std::{path::PathBuf, time::Instant};
 
 use eredu::{
-    backend::mlx::ModelLoadOptions,
-    composition::mlx::realtime::{personaplex_prompt, MlxRealtimeBackend, MlxRealtimeInput},
     load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
     RealtimeScheduler, RequestId, SchedulerLimits,
 };
 use eredu_backend_mlx::native::{
     transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
+};
+use eredu_backend_mlx::{
+    backend::mlx::ModelLoadOptions,
+    composition::mlx::realtime::{personaplex_prompt, MlxRealtimeBackend, MlxRealtimeInput},
 };
 use eredu_checkpoint::AffineQuantization;
 

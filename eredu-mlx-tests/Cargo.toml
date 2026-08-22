@@ -23,10 +23,6 @@ name = "distributed_realtime_ring"
 path = "../eredu/tests/distributed_realtime_ring.rs"
 
 [[test]]
-name = "facade_compatibility"
-path = "../eredu/tests/facade_compatibility.rs"
-
-[[test]]
 name = "native_tool_checkpoints"
 path = "../eredu/tests/native_tool_checkpoints.rs"
 

@@ -9,23 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eredu::composition::{
-    kimi_linear as neutral_kimi_linear, lfm2, nemotron_h as neutral_nemotron_h,
-};
 use eredu::{
-    backend::mlx::runtime::generation::sampler::DefaultSampler,
-    backend::mlx::runtime::{
-        checkpoint::binding::canonical_checkpoint_name,
-        execution::layerwise::open_safetensors_weight_store,
-        media::{input::InputPayload, PreparedModelInput},
-    },
-    backend::mlx::{
-        DeviceAssignment, MlxBackend, MlxDistributedSession, MlxModelKind, MlxParallelContext,
-        ModelLoadOptions,
-    },
-    composition::mlx::distributed::pipeline::{
-        load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
-    },
     core::{residency::OffloadConfig, BackendProvider as _, BackendSession as _},
     load_model, DenseDiskStreamLoadOptions, ExpertCacheLoadOptions, LayerwiseLoadOptions,
     MtpCapability, MtpCheckpointKind, MtpConfig, NonExpertWeightResidency, PromptCacheDescriptor,
@@ -41,6 +25,22 @@ use eredu_backend_mlx::native::{
     Array, Device, DeviceType, Dtype as MlxDtype, ExecutionContext, Stream,
 };
 use eredu_backend_mlx::MlxTensor;
+use eredu_backend_mlx::{
+    backend::mlx::runtime::generation::sampler::DefaultSampler,
+    backend::mlx::runtime::{
+        checkpoint::binding::canonical_checkpoint_name,
+        execution::layerwise::open_safetensors_weight_store,
+        media::{input::InputPayload, PreparedModelInput},
+    },
+    backend::mlx::{
+        DeviceAssignment, MlxBackend, MlxDistributedSession, MlxModelKind, MlxParallelContext,
+        ModelLoadOptions,
+    },
+    composition::mlx::distributed::pipeline::{
+        load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
+    },
+    composition::{kimi_linear as neutral_kimi_linear, lfm2, nemotron_h as neutral_nemotron_h},
+};
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_gguf::{GgmlType, TensorInput, Writer};
 use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized};
@@ -424,7 +424,7 @@ fn pipeline_ring_worker() {
             <MlxBackend<'_> as eredu::SpeculativeGenerationBackend>::mtp_capability(&runtime),
             expected_mtp_capability
         );
-        use eredu::backend::mlx::runtime::media::input::{
+        use eredu_backend_mlx::backend::mlx::runtime::media::input::{
             InputMetadata, InputPart, InputPayload, Modality, ModelInput,
         };
         let capability_tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
@@ -1176,13 +1176,16 @@ fn pipeline_ring_worker() {
             usize::from(pipeline_rank == 1)
         );
         let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-        let parts =
-            [eredu::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
+        let parts = [
+            eredu_backend_mlx::backend::mlx::runtime::media::input::InputPart::text_token_ids(
+                &prompt,
+            ),
+        ];
         let mut mtp_cache = model.new_cache().unwrap();
         let (generated, stats) = model
             .generate_embedded_mtp_distributed(
                 &mut mtp_cache,
-                eredu::backend::mlx::runtime::media::input::ModelInput::new(&parts),
+                eredu_backend_mlx::backend::mlx::runtime::media::input::ModelInput::new(&parts),
                 &MtpConfig {
                     max_tokens: 3,
                     max_draft_tokens: 1,
@@ -1220,10 +1223,12 @@ fn resident_reference_quantized(
         .unwrap();
     let mut cache = model.new_cache();
     let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-    let parts = [eredu::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
+    let parts = [
+        eredu_backend_mlx::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt),
+    ];
     let prefill = model
         .submit_prefill(
-            eredu::backend::mlx::runtime::media::input::ModelInput::new(&parts),
+            eredu_backend_mlx::backend::mlx::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
@@ -1262,7 +1267,7 @@ fn resident_reference_for_prepared(
     let parts = prepared.input_parts();
     let prefill = model
         .submit_prefill(
-            eredu::backend::mlx::runtime::media::input::ModelInput::new(&parts),
+            eredu_backend_mlx::backend::mlx::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
@@ -1287,7 +1292,7 @@ fn resident_reference_for_prepared(
 }
 
 fn inkling_multimodal_prepared_input() -> PreparedModelInput {
-    use eredu::backend::mlx::runtime::media::input::{
+    use eredu_backend_mlx::backend::mlx::runtime::media::input::{
         InputMetadata, InputPart, Modality, ModelInput,
     };
 
@@ -1308,7 +1313,9 @@ fn inkling_multimodal_prepared_input() -> PreparedModelInput {
 }
 
 fn qwen35_multimodal_prepared_input() -> PreparedModelInput {
-    use eredu::backend::mlx::runtime::media::input::{InputMetadata, InputPart, ModelInput};
+    use eredu_backend_mlx::backend::mlx::runtime::media::input::{
+        InputMetadata, InputPart, ModelInput,
+    };
 
     let text = Array::from_slice(&[1u32, 2], &[1, 2]);
     let grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
@@ -1321,7 +1328,9 @@ fn qwen35_multimodal_prepared_input() -> PreparedModelInput {
 }
 
 fn qwen3_vl_prepared_input() -> PreparedModelInput {
-    use eredu::backend::mlx::runtime::media::input::{InputMetadata, InputPart, ModelInput};
+    use eredu_backend_mlx::backend::mlx::runtime::media::input::{
+        InputMetadata, InputPart, ModelInput,
+    };
 
     let text = Array::from_slice(&[1u32, 2], &[1, 2]);
     let grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
@@ -1360,7 +1369,7 @@ fn multimodal_resident_reference(
     let parts = prepared.input_parts();
     let prefill = model
         .submit_prefill(
-            eredu::backend::mlx::runtime::media::input::ModelInput::new(&parts),
+            eredu_backend_mlx::backend::mlx::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
@@ -1399,10 +1408,10 @@ fn assert_final_logits_close(actual: &Array, expected: &[f32], tolerance: f32) {
 }
 
 fn forward_pipeline_model(
-    model: &mut eredu::composition::mlx::distributed::pipeline::PipelineModel,
+    model: &mut eredu_backend_mlx::composition::mlx::distributed::pipeline::PipelineModel,
     tokens: Option<&Array>,
     step: PipelineStep,
-    cache: &mut eredu::composition::mlx::distributed::pipeline::PipelineCache,
+    cache: &mut eredu_backend_mlx::composition::mlx::distributed::pipeline::PipelineCache,
     execution: &MlxDistributedSession<'_>,
 ) -> Option<Array> {
     model
@@ -1415,12 +1424,12 @@ fn forward_pipeline_model(
 fn assert_family_cache(
     family: FixtureFamily,
     rank: usize,
-    cache: &eredu::composition::mlx::distributed::pipeline::PipelineCache,
+    cache: &eredu_backend_mlx::composition::mlx::distributed::pipeline::PipelineCache,
     expected_offset: i32,
 ) {
     let populated = expected_offset > 0;
     let assert_slots =
-        |slots: &[eredu::composition::mlx::distributed::pipeline::PipelineStateSlot], count| {
+        |slots: &[eredu_backend_mlx::composition::mlx::distributed::pipeline::PipelineStateSlot], count| {
             assert_eq!(slots.len(), count);
             for slot in slots {
                 assert_eq!(slot.value().is_some(), populated);
@@ -1716,7 +1725,7 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
             self.arrays.push((name, value));
         }
     }
-    type Backend = eredu::backend::mlx::nn::MlxNeuralBackend;
+    type Backend = eredu_backend_mlx::backend::mlx::nn::MlxNeuralBackend;
     let architecture =
         eredu_architectures::deepseek::v3::Model::<Backend>::new(args.clone(), stream).unwrap();
     let mut collector = Collector {
@@ -1889,9 +1898,10 @@ fn write_gemma_fixture(directory: &Path) {
         &serde_json::to_vec(&config).unwrap(),
     )
     .unwrap();
-    type Architecture =
-        eredu_architectures::gemma4::LayeredModel<eredu::backend::mlx::nn::shared::MlxBackend>;
-    type State = eredu::backend::mlx::runtime::cache::state::MlxHybridState;
+    type Architecture = eredu_architectures::gemma4::LayeredModel<
+        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+    >;
+    type State = eredu_backend_mlx::backend::mlx::runtime::cache::state::MlxHybridState;
     struct Collector<'a> {
         stream: &'a Stream,
         arrays: Vec<(String, Array)>,
@@ -1913,19 +1923,19 @@ fn write_gemma_fixture(directory: &Path) {
         arrays: Vec::new(),
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     for group in 0..3 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -2033,7 +2043,7 @@ fn qwen_fixture_arrays(
     }
 
     let architecture = eredu_architectures::qwen::LayeredModel::<
-        eredu::backend::mlx::nn::MlxNeuralBackend,
+        eredu_backend_mlx::backend::mlx::nn::MlxNeuralBackend,
     >::new(args.clone(), stream)
     .unwrap();
     let mut collector = Collector {
@@ -2044,7 +2054,7 @@ fn qwen_fixture_arrays(
         .static_modules()
         .visit_parameters(&mut collector);
     for layer in 0..args.num_hidden_layers as usize {
-        eredu_architectures::qwen::new_block::<eredu::backend::mlx::nn::MlxNeuralBackend>(
+        eredu_architectures::qwen::new_block::<eredu_backend_mlx::backend::mlx::nn::MlxNeuralBackend>(
             args, layer, stream,
         )
         .unwrap()
@@ -2475,7 +2485,7 @@ fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::lfm2::model_args_from_config_value(&config).unwrap();
-    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+    let mut model = eredu_backend_mlx::backend::mlx::nn::MlxModule::new(
         lfm2::Lfm2CheckpointTemplate::new(args, stream).unwrap(),
     );
     for (name, parameter) in model.parameters_mut().flatten() {
@@ -2538,7 +2548,7 @@ fn write_lfm2_moe_gguf_fixture(path: &Path) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::lfm2::model_args_from_config_value(&config).unwrap();
-    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+    let mut model = eredu_backend_mlx::backend::mlx::nn::MlxModule::new(
         lfm2::Lfm2CheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
     initialize_fixture(&mut model, stream);
@@ -2805,7 +2815,7 @@ fn write_kimi_linear_fixture(directory: &Path) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::kimi_linear::model_args_from_config_value(&config).unwrap();
-    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+    let mut model = eredu_backend_mlx::backend::mlx::nn::MlxModule::new(
         neutral_kimi_linear::KimiLinearCheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
     initialize_fixture(&mut model, stream);
@@ -2957,7 +2967,7 @@ fn write_nemotron_fixture_with_config(directory: &Path, config: serde_json::Valu
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::nemotron_h::model_args_from_config_value(&config).unwrap();
-    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+    let mut model = eredu_backend_mlx::backend::mlx::nn::MlxModule::new(
         neutral_nemotron_h::NemotronHCheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
     initialize_fixture(&mut model, stream);
@@ -2998,7 +3008,7 @@ fn write_nemotron_h_moe_gguf_fixture(path: &Path) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::nemotron_h::model_args_from_config_value(&config).unwrap();
-    let mut model = eredu::backend::mlx::nn::MlxModule::new(
+    let mut model = eredu_backend_mlx::backend::mlx::nn::MlxModule::new(
         neutral_nemotron_h::NemotronHCheckpointTemplate::new(args.clone(), stream).unwrap(),
     );
     initialize_fixture(&mut model, stream);
@@ -3164,9 +3174,12 @@ fn write_qwen_hybrid_fixture(directory: &Path, model_type: &str) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
-    let mut model = eredu::backend::mlx::nn::MlxModule::new(
-        crate::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(parsed.text, stream)
-            .unwrap(),
+    let mut model = eredu_backend_mlx::backend::mlx::nn::MlxModule::new(
+        eredu_backend_mlx::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
+            parsed.text,
+            stream,
+        )
+        .unwrap(),
     );
     initialize_fixture(&mut model, stream);
     save_parameter_fixture(directory, &config, &model);
@@ -3177,9 +3190,12 @@ fn write_qwen_hybrid_moe_fixture(directory: &Path, model_type: &str) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
-    let mut model = eredu::backend::mlx::nn::MlxModule::new(
-        crate::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(parsed.text, stream)
-            .unwrap(),
+    let mut model = eredu_backend_mlx::backend::mlx::nn::MlxModule::new(
+        eredu_backend_mlx::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
+            parsed.text,
+            stream,
+        )
+        .unwrap(),
     );
     initialize_fixture(&mut model, stream);
     save_parameter_fixture(directory, &config, &model);
@@ -3223,9 +3239,11 @@ fn write_qwen35_multimodal_fixture(directory: &Path, moe: bool) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let parsed = qwen_hybrid::model_args_from_config_value(&config).unwrap();
-    let mut model = eredu::backend::mlx::nn::MlxModule::new(
-        crate::composition::qwen::hybrid::QwenConditionalCheckpointTemplate::new(parsed, stream)
-            .unwrap(),
+    let mut model = eredu_backend_mlx::backend::mlx::nn::MlxModule::new(
+        eredu_backend_mlx::composition::qwen::hybrid::QwenConditionalCheckpointTemplate::new(
+            parsed, stream,
+        )
+        .unwrap(),
     );
     initialize_fixture(&mut model, stream);
     save_parameter_fixture(directory, &config, &model);
@@ -3274,8 +3292,9 @@ fn write_qwen3_vl_fixture(directory: &Path, moe: bool) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = eredu_architectures::qwen::vl::model_args_from_config_value(&config).unwrap();
-    let mut model = eredu::backend::mlx::nn::MlxModule::new(
-        crate::composition::qwen::vl::QwenVlCheckpointTemplate::new(args, stream).unwrap(),
+    let mut model = eredu_backend_mlx::backend::mlx::nn::MlxModule::new(
+        eredu_backend_mlx::composition::qwen::vl::QwenVlCheckpointTemplate::new(args, stream)
+            .unwrap(),
     );
     initialize_fixture(&mut model, stream);
     let arrays = model
@@ -3460,9 +3479,10 @@ fn write_inkling_mtp_fixture(directory: &Path) {
         &serde_json::to_vec(&config).unwrap(),
     )
     .unwrap();
-    type Architecture =
-        eredu_architectures::inkling::LayeredModel<eredu::backend::mlx::nn::shared::MlxBackend>;
-    type State = eredu::backend::mlx::runtime::cache::state::MlxHybridState;
+    type Architecture = eredu_architectures::inkling::LayeredModel<
+        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+    >;
+    type State = eredu_backend_mlx::backend::mlx::runtime::cache::state::MlxHybridState;
     let architecture = Architecture::new(args, stream).unwrap();
     let mut arrays = Vec::<(String, Array)>::new();
     struct Collector<'a> {
@@ -3488,24 +3508,24 @@ fn write_inkling_mtp_fixture(directory: &Path) {
         arrays: &mut arrays,
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     let graph = <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
         State,
     >>::execution_graph(&architecture)
     .unwrap();
     for group in 0..graph.groups().len() {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -3605,9 +3625,10 @@ fn write_gemma4_tensor_parallel_fixture_with_options(
         &serde_json::to_vec(&config).unwrap(),
     )
     .unwrap();
-    type Architecture =
-        eredu_architectures::gemma4::LayeredModel<eredu::backend::mlx::nn::shared::MlxBackend>;
-    type State = eredu::backend::mlx::runtime::cache::state::MlxHybridState;
+    type Architecture = eredu_architectures::gemma4::LayeredModel<
+        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+    >;
+    type State = eredu_backend_mlx::backend::mlx::runtime::cache::state::MlxHybridState;
     let architecture = Architecture::new(args, stream).unwrap();
     let mut arrays = Vec::<(String, Array)>::new();
     struct Collector<'a> {
@@ -3633,19 +3654,19 @@ fn write_gemma4_tensor_parallel_fixture_with_options(
         arrays: &mut arrays,
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     for group in 0..3 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -3738,9 +3759,9 @@ fn write_muse_glimmer_tensor_parallel_fixture(directory: &Path) {
     )
     .unwrap();
     type Architecture = eredu_architectures::muse_glimmer::LayeredModel<
-        eredu::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
     >;
-    type State = eredu::backend::mlx::runtime::cache::state::MlxKeyValueState;
+    type State = eredu_backend_mlx::backend::mlx::runtime::cache::state::MlxKeyValueState;
     let architecture = Architecture::new(args, stream).unwrap();
     let mut arrays = Vec::<(String, Array)>::new();
     struct Collector<'a> {
@@ -3766,19 +3787,19 @@ fn write_muse_glimmer_tensor_parallel_fixture(directory: &Path) {
         arrays: &mut arrays,
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     for group in 0..2 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -3808,9 +3829,10 @@ fn initialized_inkling_parameters(
     eredu_architectures::inkling::ModelArgs,
     BTreeMap<String, Array>,
 ) {
-    type Architecture =
-        eredu_architectures::inkling::LayeredModel<eredu::backend::mlx::nn::shared::MlxBackend>;
-    type State = eredu::backend::mlx::runtime::cache::state::MlxHybridState;
+    type Architecture = eredu_architectures::inkling::LayeredModel<
+        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
+    >;
+    type State = eredu_backend_mlx::backend::mlx::runtime::cache::state::MlxHybridState;
 
     struct Initializer<'a> {
         stream: &'a Stream,
@@ -3853,7 +3875,7 @@ fn initialized_inkling_parameters(
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut parameters = BTreeMap::new();
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
         State,
     >>::static_modules_mut(&mut architecture)
     .visit_parameters_mut(&mut Initializer {
@@ -3861,19 +3883,19 @@ fn initialized_inkling_parameters(
         parameters: &mut parameters,
     });
     let graph = <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
         State,
     >>::execution_graph(&architecture)
     .unwrap();
     for group in 0..graph.groups().len() {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             let mut unit = <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::backend::mlx::nn::shared::MlxBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap();
@@ -5755,11 +5777,13 @@ fn inkling_mtp_prompt_round_trip() {
         .configure_cache(CacheResidencyPolicy::Paged(paged.clone()))
         .unwrap();
     let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
-    let parts = [eredu::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt)];
+    let parts = [
+        eredu_backend_mlx::backend::mlx::runtime::media::input::InputPart::text_token_ids(&prompt),
+    ];
     let (generated, _) = session
         .generate_embedded_mtp(
             &backend,
-            eredu::backend::mlx::runtime::media::input::ModelInput::new(&parts).into(),
+            eredu_backend_mlx::backend::mlx::runtime::media::input::ModelInput::new(&parts).into(),
             &MtpConfig {
                 max_tokens: 1,
                 max_draft_tokens: 1,

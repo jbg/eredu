@@ -1,16 +1,16 @@
 //! Backend-neutral language-model facade.
 //!
 //! This module is available without an execution backend. Enabling the
-//! default `mlx` feature adds the concrete MLX loader, model implementations,
-//! prepared-chat execution, and native runtime diagnostics.
-//! MLX executable, cache, load-policy, and generation types live under
-//! `backend::mlx`, not in this namespace.
+//! default `mlx` feature adds the selected local execution adapter.
 
 mod media;
 mod metadata;
 mod portable;
 mod request;
 mod tokenizer;
+
+#[cfg(feature = "mlx")]
+mod selected;
 
 pub use crate::runtime::chat::constraints::ConstraintError;
 pub use crate::runtime::chat::{
@@ -23,6 +23,8 @@ pub use request::{
     PreparedChatMtpBatchRequest, PreparedChatMtpError, PreparedChatMtpGenerationOptions,
     PreparedChatMtpGenerationRequest, PreparedChatSpeculativeConstraint,
 };
+#[cfg(feature = "mlx")]
+pub use selected::*;
 pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
 
 mod capability;

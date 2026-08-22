@@ -17,10 +17,8 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use eredu::{
-    composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
-    load_realtime_model, RealtimeSampling, RealtimeScheduler, RequestId, SchedulerLimits,
-};
+use eredu::{load_realtime_model, RealtimeSampling, RealtimeScheduler, RequestId, SchedulerLimits};
+use eredu_backend_mlx::composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput};
 use eredu_backend_mlx::native::{
     ops::{indexing::TryIndexOp, stack_axis},
     Array, Device, DeviceType, ExecutionContext, Stream,

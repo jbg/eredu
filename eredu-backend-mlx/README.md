@@ -12,8 +12,8 @@ without placing accelerator code in `eredu-nn` and without violating Rust's
 orphan rules.
 
 Applications that use only loading, chat, and generation should normally use
-the `eredu` facade. Applications that name concrete MLX types or configure
-devices should depend on both crates and import the implementation directly:
+the `eredu` facade. The implementation crate is a direct dependency only for
+backend development and backend-specific low-level tooling:
 
 ```toml
 [dependencies]
@@ -39,10 +39,6 @@ The `native` module is a deliberate escape hatch for device, stream, allocator,
 random-state, low-level array, and platform setup needed by concrete MLX
 applications. Backend-neutral APIs exchange `MlxTensor` instead of raw arrays.
 
-With the facade's `mlx` feature enabled, `eredu::backend::mlx` and
-`eredu::composition::mlx` remain compatibility re-exports. New concrete-backend
-code should prefer `eredu_backend_mlx` paths.
-
 ## Features
 
 All features are opt-in; the default build contains tensor, checkpoint,
@@ -56,7 +52,7 @@ execution, distributed, and model-composition support.
 | `codec` | MLX Mimi integration and codec examples; implies `audio` |
 | `cuda` | SafeMLX CUDA execution |
 | `nccl` | NCCL collectives; implies `cuda` |
-| `test-support` | Cross-crate facade compatibility fixtures; not application API |
+| `test-support` | Cross-crate backend fixtures; not application API |
 
 The packaged `mimi_realtime_bench`, `personaplex_full_path_bench`, and
 `personaplex_quantization_eval` examples require `codec`.
@@ -69,9 +65,7 @@ at Eredu's neutral trait boundary is now `eredu_backend_mlx::MlxTensor`, not
 `MlxTensor::into_array` at native integration boundaries; these conversions do
 not evaluate or copy the lazy MLX handle.
 
-The former `eredu-nn/mlx` and `eredu-codec/mlx` features were removed. Depend
-on `eredu-backend-mlx` directly for concrete tensor or Mimi integration, and
-enable its `codec` feature for Mimi. Existing facade imports under
-`eredu::backend::mlx` and `eredu::composition::mlx` remain compatibility
-re-exports when `eredu`'s `mlx` feature is enabled, but new backend-specific
-code should import the owning crate directly.
+The former `eredu-nn/mlx` and `eredu-codec/mlx` features were removed. Backend
+code depends on `eredu-backend-mlx` directly for concrete tensor or Mimi
+integration and enables its `codec` feature for Mimi. Application code uses
+the selected adapter exposed by `eredu::api`.

@@ -10,10 +10,11 @@ use std::{
 };
 
 use eredu::{
-    api::LoadedModel, backend::mlx::MlxBackend, runtime::chat::ChatTemplateRequest,
+    api::{LoadedModel, LocalBackend},
+    runtime::chat::ChatTemplateRequest,
     GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
-use eredu_backend_mlx::native::{metal::set_metallib_path, Device, DeviceType, ExecutionContext};
+use safemlx::{metal::set_metallib_path, Device, DeviceType, ExecutionContext};
 
 /// Receives one UTF-8 text fragment. The bytes are valid only during the call.
 pub type TextCallback = unsafe extern "C" fn(*const u8, usize, *mut c_void);
@@ -82,7 +83,7 @@ fn publish_error(out: *mut *mut c_char, message: String) {
 }
 
 fn generate(
-    model: &mut LoadedModel<MlxBackend<'static>>,
+    model: &mut LoadedModel<LocalBackend<'static>>,
     prompt: &str,
     callback: TextCallback,
     context: usize,
@@ -162,7 +163,7 @@ fn worker_main(
         let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let mut model = LoadedModel::load(
-            MlxBackend::new(execution.stream(), weights.stream()),
+            LocalBackend::new(execution.stream(), weights.stream()),
             &model_path,
             Default::default(),
         )

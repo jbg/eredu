@@ -3,10 +3,6 @@ use eredu::api::{
     DevicePlan, LoadedModel, LoadedTextModelConfig, TextInspectionOptions,
     AUTOMATIC_SCHEMA_VERSION,
 };
-// Resolving this import in the no-default-features test build proves that the
-// implementation namespace exists independently of any selected backend.
-#[allow(unused_imports)]
-use eredu::backend as _;
 use eredu::{
     ArtifactFormat, BackendCapabilities, BackendDescriptor, BackendProvider, BackendSession,
     Completion, DeviceDescriptor, GenerationConfigOverrides, InspectionReadiness,

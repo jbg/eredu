@@ -1,7 +1,7 @@
 use eredu::{
-    composition::mlx::automatic::MlxBackendFactory, core::realize_execution_plan_target,
-    AutomaticPlanRequest, AutomaticPlanner, AutomaticPlannerPolicy, BackendProvider, DevicePlan,
-    ExecutionPlan, AUTOMATIC_SCHEMA_VERSION,
+    api::LocalBackendFactory, core::realize_execution_plan_target, AutomaticPlanRequest,
+    AutomaticPlanner, AutomaticPlannerPolicy, BackendProvider, DevicePlan, ExecutionPlan,
+    AUTOMATIC_SCHEMA_VERSION,
 };
 
 #[test]
@@ -21,7 +21,8 @@ fn portable_planner_realizes_an_owned_mlx_backend() {
     assert_eq!(decoded, request);
 
     let plan = ExecutionPlan::fully_resident(device);
-    let realization = realize_execution_plan_target(&MlxBackendFactory::default(), &plan).unwrap();
+    let realization =
+        realize_execution_plan_target(&LocalBackendFactory::default(), &plan).unwrap();
     let (backend, _) = realization.into_parts();
     assert_eq!(backend.descriptor().name, "mlx");
     assert_eq!(backend.devices().unwrap()[0].0.id, "cpu:0");

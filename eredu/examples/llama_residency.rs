@@ -4,12 +4,12 @@ use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
 use eredu::{
-    backend::mlx::nn::generation::sample,
-    backend::mlx::runtime::media::input,
-    backend::mlx::{MlxBackend, ModelLoadOptions},
     core::residency::{MemoryTier, OffloadConfig, TransferDirection},
     core::{BackendProvider as _, BackendSession as _},
     load_model, DenseDiskStreamLoadOptions, LayerwiseLoadOptions, WeightResidency,
+};
+use eredu_backend_mlx::backend::mlx::{
+    nn::generation::sample, runtime::media::input, MlxBackend, ModelLoadOptions,
 };
 use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
 

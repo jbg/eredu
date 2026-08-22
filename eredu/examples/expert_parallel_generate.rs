@@ -1,10 +1,12 @@
 //! Minimal sparse-cache Ring expert-parallel generation probe for supported MoE models.
 
 use eredu::{
-    backend::mlx::runtime::{generation::sampler::DefaultSampler, media::input},
-    backend::mlx::{DeviceAssignment, MlxBackend, MlxParallelContext, ModelLoadOptions},
     core::{BackendProvider as _, BackendSession as _},
     load_model, ExpertCacheLoadOptions, NonExpertWeightResidency, WeightResidency,
+};
+use eredu_backend_mlx::backend::mlx::{
+    runtime::{generation::sampler::DefaultSampler, media::input},
+    DeviceAssignment, MlxBackend, MlxParallelContext, ModelLoadOptions,
 };
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},

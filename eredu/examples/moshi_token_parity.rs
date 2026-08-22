@@ -13,10 +13,8 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use eredu::{
-    composition::mlx::realtime::{generate_encoded_greedy, MlxRealtimeBackend},
-    load_realtime_model,
-};
+use eredu::load_realtime_model;
+use eredu_backend_mlx::composition::mlx::realtime::{generate_encoded_greedy, MlxRealtimeBackend};
 use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
 
 fn main() -> anyhow::Result<()> {

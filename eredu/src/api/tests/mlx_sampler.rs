@@ -9,10 +9,6 @@ use eredu_backend_mlx::{
 };
 use serde_json::json;
 
-use crate::backend::mlx::runtime::generation::sampler::{
-    ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler, MlxSamplingBackend,
-    Sampler, SpeculativeSampler,
-};
 use crate::runtime::chat::constraints::{
     advance_trigger_prefix, completes_trigger, ConstraintController, ConstraintError,
 };
@@ -23,6 +19,10 @@ use crate::{
         GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout, DECLARATIVE_DIALECT,
     },
     runtime::chat::{GenerationRuntimePlan, ParallelToolCallPolicy, ToolChoice},
+};
+use eredu_backend_mlx::backend::mlx::runtime::generation::sampler::{
+    ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler, MlxSamplingBackend,
+    Sampler, SpeculativeSampler,
 };
 use eredu_core::generation::{FinishReason, SemanticEvent};
 

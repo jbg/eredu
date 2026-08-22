@@ -931,9 +931,9 @@ dependencies = [
  "anyhow",
  "clap",
  "eredu",
- "eredu-backend-mlx",
  "eredu-checkpoint",
  "hf-hub",
+ "safemlx",
  "serde",
  "serde_json",
  "tempfile",
@@ -973,7 +973,7 @@ name = "eredu-ios"
 version = "0.1.0"
 dependencies = [
  "eredu",
- "eredu-backend-mlx",
+ "safemlx",
  "serde_json",
 ]
 

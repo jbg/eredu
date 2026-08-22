@@ -7,16 +7,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eredu::{
-    backend::mlx::{DeviceAssignment, MlxBackend, MlxParallelContext},
-    composition::mlx::distributed::expert::{AllToAllVPlan, RoutedTransport},
-    core::{CollectiveScope, DistributedSession},
-};
+use eredu::core::{CollectiveScope, DistributedSession};
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     Array, Device, DeviceType, Stream,
 };
 use eredu_backend_mlx::MlxTensor;
+use eredu_backend_mlx::{
+    backend::mlx::{DeviceAssignment, MlxBackend, MlxParallelContext},
+    composition::mlx::distributed::expert::{AllToAllVPlan, RoutedTransport},
+};
 
 const WORKER_ENV: &str = "SAFEMLX_CARTESIAN_RING_WORKER";
 const TRIPLE_WORKER_ENV: &str = "SAFEMLX_CARTESIAN_TRIPLE_RING_WORKER";

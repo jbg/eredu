@@ -4,11 +4,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use eredu::{
-    api::LoadedModel,
-    backend::mlx::runtime::media::input::{InputPart, ModelInput},
-    AttentionPolicy, CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor,
-    PromptCacheOptions, PromptCacheTopology,
+    api::LoadedModel, AttentionPolicy, CacheResidencyPolicy, PagedCacheOptions,
+    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
 };
+use eredu_backend_mlx::backend::mlx::runtime::media::input::{InputPart, ModelInput};
 use eredu_backend_mlx::native::{
     transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext,
 };
@@ -57,10 +56,10 @@ struct Args {
 
 fn prefill_tokens(
     tokens: &Array,
-    model: &mut LoadedModel<eredu::backend::mlx::MlxBackend<'static>>,
+    model: &mut LoadedModel<eredu_backend_mlx::backend::mlx::MlxBackend<'static>>,
 ) -> anyhow::Result<Array> {
     let parts = [InputPart::text_token_ids(tokens)];
-    let input = eredu::composition::mlx::MlxModelInput::from(ModelInput::new(&parts));
+    let input = eredu_backend_mlx::composition::mlx::MlxModelInput::from(ModelInput::new(&parts));
     model
         .runtime_mut()
         .prefill(input)?
@@ -71,7 +70,7 @@ fn prefill_tokens(
 
 fn decode_tokens(
     tokens: &Array,
-    model: &mut LoadedModel<eredu::backend::mlx::MlxBackend<'static>>,
+    model: &mut LoadedModel<eredu_backend_mlx::backend::mlx::MlxBackend<'static>>,
 ) -> anyhow::Result<Array> {
     model
         .runtime_mut()
@@ -87,7 +86,7 @@ fn main() -> anyhow::Result<()> {
     let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let mut model = LoadedModel::load(
-        eredu::backend::mlx::MlxBackend::new(stream, weights.stream()),
+        eredu_backend_mlx::backend::mlx::MlxBackend::new(stream, weights.stream()),
         &args.model_dir,
         Default::default(),
     )?;

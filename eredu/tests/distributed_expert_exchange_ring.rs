@@ -8,7 +8,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eredu::{
+use eredu::core::residency::OffloadConfig;
+use eredu_backend_mlx::native::{
+    distributed::{self, Backend},
+    module::Param,
+    ops::concatenate_axis,
+    transforms::{async_eval_with_event, eval},
+    Array, Device, DeviceType, Stream,
+};
+use eredu_backend_mlx::{
     backend::mlx::error::Error,
     backend::mlx::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
     backend::mlx::runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
@@ -19,14 +27,6 @@ use eredu::{
         dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings, AllToAllVPlan,
         DispatchedRoutes, ExpertAssignment, LocalExpertBank, RoutedTransport, ShardedRouteBlocks,
     },
-    core::residency::OffloadConfig,
-};
-use eredu_backend_mlx::native::{
-    distributed::{self, Backend},
-    module::Param,
-    ops::concatenate_axis,
-    transforms::{async_eval_with_event, eval},
-    Array, Device, DeviceType, Stream,
 };
 use eredu_runtime::{
     ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, OffloadUnit, WeightBinding,

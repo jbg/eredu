@@ -10,8 +10,6 @@ use std::{
 };
 
 use eredu::{
-    backend::mlx::{DeviceAssignment, MlxParallelContext, ModelLoadOptions},
-    composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
     load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
     RealtimeScheduler, RequestId, SchedulerLimits,
 };
@@ -19,6 +17,10 @@ use eredu_architectures::moshi::{MoshiCollectiveCount, MoshiConfig};
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     Array, Device, DeviceType, Stream,
+};
+use eredu_backend_mlx::{
+    backend::mlx::{DeviceAssignment, MlxParallelContext, ModelLoadOptions},
+    composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
 };
 
 const WORKER_RANK: &str = "EREDU_MOSHI_RING_WORKER";
