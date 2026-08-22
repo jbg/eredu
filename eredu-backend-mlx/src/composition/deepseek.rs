@@ -405,6 +405,11 @@ impl DeepSeekModel {
                 .targets_for_role(ParameterRole::ExpertIntermediate),
         );
         let binding_args = args.clone();
+        let excluded_expert_sources = if external_experts {
+            crate::composition::deepseek_expert::v3_checkpoint_keys(&args, store.as_ref())?
+        } else {
+            Default::default()
+        };
         let factory = V3UnitPopulator {
             external_experts,
             expert_targets: Arc::clone(&expert_targets),
@@ -423,6 +428,7 @@ impl DeepSeekModel {
             move |key| {
                 key.starts_with("rope_freqs.")
                     || key.ends_with("rotary_emb.inv_freq")
+                    || excluded_expert_sources.contains(key)
                     || (external_experts
                         && parameter_name_in_targets(key, &excluded_expert_targets))
             },
@@ -479,6 +485,11 @@ impl DeepSeekModel {
                 .targets_for_role(ParameterRole::ExpertIntermediate),
         );
         let binding_args = args.clone();
+        let excluded_expert_sources = if external_experts {
+            crate::composition::deepseek_expert::v4_checkpoint_keys(&args, store.as_ref())?
+        } else {
+            Default::default()
+        };
         let factory = V4UnitPopulator {
             external_experts,
             expert_targets: Arc::clone(&expert_targets),
@@ -496,6 +507,7 @@ impl DeepSeekModel {
             weights_stream,
             move |key| {
                 key.ends_with("rotary_emb.inv_freq")
+                    || excluded_expert_sources.contains(key)
                     || (external_experts
                         && parameter_name_in_targets(key, &excluded_expert_targets))
             },

@@ -1,6 +1,6 @@
 //! MLX expert-residency binding for the neutral DeepSeek architectures.
 
-use std::ops::Range;
+use std::{collections::BTreeSet, ops::Range};
 
 use eredu_architectures::deepseek::{self, LayerPolicy, V3Args, V4Args};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
@@ -46,6 +46,39 @@ pub fn v3_catalog(
         )?;
     }
     Ok(entries)
+}
+
+/// Physical checkpoint keys owned by the independent V3 expert cache.
+///
+/// These come from the architecture-declared expert recipes rather than from
+/// runtime parameter names, because packed checkpoints may realize one logical
+/// projection from multiple source tensors.
+pub fn v3_checkpoint_keys(
+    args: &V3Args,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<BTreeSet<String>, Error> {
+    let target = usize::try_from(args.num_hidden_layers)
+        .map_err(|_| Error::UnsupportedArchitecture("invalid V3 layer count".into()))?;
+    let total = target
+        + usize::try_from(args.num_nextn_predict_layers)
+            .map_err(|_| Error::UnsupportedArchitecture("invalid V3 prediction count".into()))?;
+    let mut keys = BTreeSet::new();
+    for layer in 0..total {
+        if layer < target && args.layer_schedule.get(layer) != Some(&LayerPolicy::SparseMoe) {
+            continue;
+        }
+        let recipes = deepseek::v3_expert_recipes(store, args, layer)
+            .map_err(Error::UnsupportedArchitecture)?;
+        keys.extend(
+            recipes
+                .gate_up
+                .source_keys()
+                .into_iter()
+                .chain(recipes.down.source_keys())
+                .map(str::to_owned),
+        );
+    }
+    Ok(keys)
 }
 
 pub fn v3_parallel_catalog(
@@ -111,6 +144,29 @@ pub fn v4_catalog(
         )?;
     }
     Ok(entries)
+}
+
+/// Physical checkpoint keys owned by the independent V4 expert cache.
+pub fn v4_checkpoint_keys(
+    args: &V4Args,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<BTreeSet<String>, Error> {
+    let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
+        .map_err(|_| Error::UnsupportedArchitecture("invalid V4 layer count".into()))?;
+    let mut keys = BTreeSet::new();
+    for layer in 0..total {
+        let recipes = deepseek::v4_expert_recipes(store, args, layer)
+            .map_err(Error::UnsupportedArchitecture)?;
+        keys.extend(
+            recipes
+                .gate_up
+                .source_keys()
+                .into_iter()
+                .chain(recipes.down.source_keys())
+                .map(str::to_owned),
+        );
+    }
+    Ok(keys)
 }
 
 pub fn v4_parallel_catalog(

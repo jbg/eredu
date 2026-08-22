@@ -1,7 +1,7 @@
 //! Neutral Gemma 4 binding to MLX storage, state, and residency policy.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::Arc,
 };
@@ -1771,6 +1771,35 @@ fn load_store(
             .map_err(|error| Error::Parallel(error.to_string()))?
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
+    let external_expert_source_keys = if external_experts {
+        let mut keys = BTreeSet::new();
+        for layer in 0..args.text.num_hidden_layers() {
+            if args.text.layer_policy(layer).is_none_or(|policy| {
+                policy.feed_forward
+                    != eredu_architectures::gemma4::FeedForwardPolicy::DenseWithSparseMoe
+            }) {
+                continue;
+            }
+            let resolved = eredu_architectures::gemma4::expert_recipes(
+                store.as_ref(),
+                &args.text,
+                "model.language_model.layers",
+                layer,
+            )
+            .map_err(Error::UnsupportedArchitecture)?;
+            keys.extend(
+                resolved
+                    .gate_up
+                    .source_keys()
+                    .into_iter()
+                    .map(str::to_owned),
+            );
+            keys.extend(resolved.down.source_keys().into_iter().map(str::to_owned));
+        }
+        keys
+    } else {
+        BTreeSet::new()
+    };
     let vision_layers = args
         .vision
         .as_ref()
@@ -1781,7 +1810,6 @@ fn load_store(
         .map_or(0, |config| config.num_hidden_layers as usize);
     let binding_args = args.text.clone();
     let text_start = vision_layers + audio_layers;
-    let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
@@ -1795,7 +1823,7 @@ fn load_store(
         residency,
         stream,
         weights_stream,
-        move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
+        move |key| external_expert_source_keys.contains(key),
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
