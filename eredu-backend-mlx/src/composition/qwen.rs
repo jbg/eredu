@@ -258,7 +258,8 @@ fn load_neutral_qwen(
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
-        move |index, unit, store, _stream| {
+        move |address, _path, unit, store, _stream| {
+            let index = address.index();
             let recipes = if external_experts {
                 BTreeMap::new()
             } else {
@@ -1207,7 +1208,8 @@ fn load_neutral_qwen_parallel(
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, "", store, &binding_layout)
         },
-        |index, _local, store, stream| {
+        |address, path, _local, store, stream| {
+            let index = address.index();
             let global =
                 eredu_architectures::qwen::new_block::<MlxBackend>(&binding_args, index, stream)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -1223,12 +1225,7 @@ fn load_neutral_qwen_parallel(
                 recipes,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
-            shard_layer_bindings(
-                bindings,
-                &format!("{}.layers.{index}", binding_args.parameter_root),
-                store,
-                &layout,
-            )
+            shard_layer_bindings(bindings, path, store, &layout)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

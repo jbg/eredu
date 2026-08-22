@@ -2410,11 +2410,6 @@ fn load_conditional_store(
             .map_err(|error| Error::Parallel(error.to_string()))?
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
-    let vision_layers = parsed
-        .vision
-        .as_ref()
-        .expect("validated vision")
-        .layer_count();
     let factory = ConditionalUnitPopulator {
         external_experts,
         expert_targets: Arc::clone(&expert_targets),
@@ -2443,11 +2438,16 @@ fn load_conditional_store(
             )
             .map_err(Into::into)
         },
-        move |flat, unit, store, _| {
-            let recipes = if flat < vision_layers {
+        move |address, _path, unit, store, _| {
+            let recipes = if address.group() == 0 {
                 BTreeMap::new()
             } else {
-                hybrid::unit_recipes(store, &binding, flat - vision_layers)
+                let flat = if address.group() == 1 {
+                    address.index()
+                } else {
+                    binding.num_hidden_layers as usize + address.group() - 2
+                };
+                hybrid::unit_recipes(store, &binding, flat)
                     .map_err(Error::UnsupportedArchitecture)?
             };
             build_module_bindings_with_recipes_excluding(
@@ -2535,7 +2535,12 @@ fn load_store(
             build_module_bindings_with_recipes(&MlxModule::new(modules.clone()), "", store, recipes)
                 .map_err(Into::into)
         },
-        move |flat, unit, store, _| {
+        move |address, _path, unit, store, _| {
+            let flat = if address.group() == 0 {
+                address.index()
+            } else {
+                binding_config.num_hidden_layers as usize + address.group() - 1
+            };
             let recipes = hybrid::unit_recipes(store, &binding_config, flat)
                 .map_err(Error::UnsupportedArchitecture)?;
             build_module_bindings_with_recipes_excluding(

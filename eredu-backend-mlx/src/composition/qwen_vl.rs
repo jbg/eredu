@@ -1466,7 +1466,12 @@ fn load_store(
             )
             .map_err(Into::into)
         },
-        move |flat, unit, store, _| {
+        move |address, _path, unit, store, _| {
+            let flat = if address.group() == 0 {
+                address.index()
+            } else {
+                binding_args.vision.layer_count() + address.index()
+            };
             build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(unit),
                 "",

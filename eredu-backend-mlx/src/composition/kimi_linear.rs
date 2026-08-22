@@ -503,7 +503,8 @@ fn load_neutral(
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
-        move |index, unit, store, _| {
+        move |address, _path, unit, store, _| {
+            let index = address.index();
             build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(unit),
                 "",
@@ -639,7 +640,8 @@ fn load_neutral_parallel(
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, "", store, &static_layout)
         },
-        move |layer, _local, store, stream| {
+        move |address, path, _local, store, stream| {
+            let layer = address.index();
             let global = Block::<MlxBackend>::new(&binding_args, layer, stream)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bindings = build_module_bindings_with_recipes_excluding(
@@ -649,12 +651,7 @@ fn load_neutral_parallel(
                 unit_recipes(store, &binding_args, layer, !external_experts)?,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
-            shard_layer_bindings(
-                bindings,
-                &format!("model.layers.{layer}"),
-                store,
-                &unit_layout,
-            )
+            shard_layer_bindings(bindings, path, store, &unit_layout)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

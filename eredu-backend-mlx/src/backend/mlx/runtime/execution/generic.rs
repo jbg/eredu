@@ -636,7 +636,7 @@ where
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
-        |_index, unit, store, _stream| {
+        |_address, _path, unit, store, _stream| {
             build_module_bindings(&MlxModule::new(unit), "", store).map_err(Into::into)
         },
     )
@@ -646,7 +646,9 @@ where
 ///
 /// Parallel composition uses this entry point to provide rank-local checkpoint
 /// selections while retaining the same residency, overlap, and completion
-/// algorithm used by replicated execution.
+/// algorithm used by replicated execution. The unit-binding callback receives
+/// the architecture's validated group-local address and canonical unit path;
+/// callers must not reconstruct either identity from residency order.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_layerwise_policy_with_bindings<A, S, P, I, SB, UB>(
     store: SharedCheckpointSource,
@@ -671,7 +673,8 @@ where
         &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error>,
     UB: FnMut(
-        usize,
+        ExecutionUnitAddress,
+        &str,
         A::Unit,
         &dyn eredu_checkpoint::store::CheckpointSource,
         &Stream,
@@ -717,10 +720,13 @@ where
         let address = layout
             .address(index)
             .expect("validated layout covers every flat unit");
+        let path = architecture
+            .unit_path(address.group(), address.index())
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let unit = architecture
             .build_unit(address.group(), address.index(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let bindings = unit_bindings(index, unit, store.as_ref(), stream)?;
+        let bindings = unit_bindings(address, &path, unit, store.as_ref(), stream)?;
         let bytes = binding_bytes(&bindings)?;
         layer_parameter_bytes = layer_parameter_bytes
             .checked_add(bytes)
@@ -735,9 +741,6 @@ where
                 .iter()
                 .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
         );
-        let address = layout
-            .address(index)
-            .expect("validated layout covers every flat unit");
         let group_id = layout
             .group_id(address.group())
             .expect("validated layout names every execution group");

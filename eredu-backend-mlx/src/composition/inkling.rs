@@ -1883,7 +1883,7 @@ fn load_store(
             build_module_bindings_with_recipes_excluding(&module, "", store, recipes, |_| false)
                 .map_err(Into::into)
         },
-        move |_ordinal, unit, store, _stream| {
+        move |_address, _path, unit, store, _stream| {
             let module = MlxModule::new(unit);
             let recipes =
                 crate::composition::inkling_expert::module_recipes(&module, &unit_args, store)?;
@@ -1964,7 +1964,6 @@ fn load_parallel_store(
     let state_layout = architecture
         .runtime_state_layout()
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let vision_layers = geometry.vision_layers();
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let global_static = MlxModule::new(
@@ -2048,36 +2047,29 @@ fn load_parallel_store(
         move |_modules, store| {
             shard_layer_bindings(global_static_bindings, "", store, &static_layout)
         },
-        move |index, _local, store, stream| {
-            let (global, prefix) = if index < vision_layers {
+        move |address, path, _local, store, stream| {
+            let global = if address.group() == 0 {
                 let vision = binding_args.vision_config.as_ref().ok_or_else(|| {
                     Error::UnsupportedArchitecture("Inkling vision config is missing".into())
                 })?;
-                (
-                    MlxModule::new(NeutralUnit::Vision(
-                        eredu_architectures::inkling::VisionLayer::<MlxBackend>::new(
-                            vision,
-                            index,
-                            vision.layer_specs()[index],
-                            stream,
-                        )
-                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-                    )),
-                    format!("visual.layers.{index}"),
-                )
+                MlxModule::new(NeutralUnit::Vision(
+                    eredu_architectures::inkling::VisionLayer::<MlxBackend>::new(
+                        vision,
+                        address.index(),
+                        vision.layer_specs()[address.index()],
+                        stream,
+                    )
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                ))
             } else {
-                let text_index = index - vision_layers;
-                (
-                    MlxModule::new(NeutralUnit::Text(
-                        eredu_architectures::inkling::DecoderLayer::<MlxBackend>::new(
-                            &binding_args.text_config,
-                            text_index,
-                            stream,
-                        )
-                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-                    )),
-                    format!("model.layers.{text_index}"),
-                )
+                MlxModule::new(NeutralUnit::Text(
+                    eredu_architectures::inkling::DecoderLayer::<MlxBackend>::new(
+                        &binding_args.text_config,
+                        address.index(),
+                        stream,
+                    )
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                ))
             };
             let recipes =
                 crate::composition::inkling_expert::module_recipes(&global, &binding_args, store)?;
@@ -2085,7 +2077,7 @@ fn load_parallel_store(
                 build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |_| {
                     false
                 })?;
-            shard_layer_bindings(bindings, &prefix, store, &unit_sharding)
+            shard_layer_bindings(bindings, path, store, &unit_sharding)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

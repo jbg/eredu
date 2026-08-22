@@ -6,9 +6,9 @@ use eredu_architectures::nemotron_h::{Block, LayeredModel, ModelArgs, Prediction
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
     ActivationObserver, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionGraph,
-    ExecutionUnitLayout, ExpertIdentity, LayerWeightResidency, LayerwiseModelMetadata,
-    LayerwiseRuntime, OffloadUnit, PagedCacheOptions, ParallelModelInfo, ParameterRole,
-    ResidencyReport, StaticUnitBindings, WeightBinding, WeightResidency,
+    ExecutionUnitAddress, ExecutionUnitLayout, ExpertIdentity, LayerWeightResidency,
+    LayerwiseModelMetadata, LayerwiseRuntime, OffloadUnit, PagedCacheOptions, ParallelModelInfo,
+    ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -405,6 +405,21 @@ fn build_unit(args: &ModelArgs, index: usize, stream: &Stream) -> Result<Neutral
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
+fn build_addressed_unit(
+    args: &ModelArgs,
+    address: ExecutionUnitAddress,
+    stream: &Stream,
+) -> Result<NeutralBlock, Error> {
+    if address.group() == 0 {
+        return Block::new(args, address.index(), stream)
+            .map(Unit::Target)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()));
+    }
+    PredictionUnit::new(args, address.group() - 1, address.index(), stream)
+        .map(Unit::Prediction)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
 #[derive(Clone)]
 struct NemotronHParallelUnitPopulator {
     external_experts: bool,
@@ -629,15 +644,16 @@ fn load_neutral(
             )
             .map_err(Into::into)
         },
-        move |index, unit, store, _| {
+        move |address, _path, unit, store, _| {
             build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(unit),
                 "",
                 store,
-                eredu_architectures::nemotron_h::unit_recipes_flat(
+                eredu_architectures::nemotron_h::unit_recipes(
                     store,
                     &binding_args,
-                    index,
+                    address.group(),
+                    address.index(),
                     !external_experts,
                 )
                 .map_err(Error::UnsupportedArchitecture)?,
@@ -794,28 +810,23 @@ fn load_neutral_parallel(
             )?;
             shard_layer_bindings(bindings, "", store, &static_layout)
         },
-        move |layer, _local, store, stream| {
-            let global = build_unit(&binding_args, layer, stream)?;
+        move |address, path, _local, store, stream| {
+            let global = build_addressed_unit(&binding_args, address, stream)?;
             let bindings = build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(global),
                 "",
                 store,
-                eredu_architectures::nemotron_h::unit_recipes_flat(
+                eredu_architectures::nemotron_h::unit_recipes(
                     store,
                     &binding_args,
-                    layer,
+                    address.group(),
+                    address.index(),
                     !external_experts,
                 )
                 .map_err(Error::UnsupportedArchitecture)?,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
-            let target = binding_args.num_hidden_layers as usize;
-            let prefix = if layer < target {
-                format!("model.layers.{layer}")
-            } else {
-                format!("model.mtp.layers.{}", layer - target)
-            };
-            shard_layer_bindings(bindings, &prefix, store, &unit_layout)
+            shard_layer_bindings(bindings, path, store, &unit_layout)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

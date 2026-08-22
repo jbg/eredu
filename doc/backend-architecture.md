@@ -287,7 +287,11 @@ internally between reusable backend mechanics and family/backend composition:
   residency workers, media processing, and collectives;
 - generic layerwise policy construction derives its execution graph and unit
   layout directly from the concrete neutral architecture before binding
-  checkpoint units; composition cannot supply or reconstruct that layout; and
+  checkpoint units; composition cannot supply or reconstruct that layout.
+  Unit-binding adapters receive the validated group-local address and the
+  architecture's canonical `unit_path`, rather than a flattened residency
+  ordinal, so heterogeneous group boundaries and parameter roots remain
+  architecture-owned; and
 - MLX events provide exact completion while retaining arrays and source
   resources required by submitted work.
 

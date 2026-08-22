@@ -469,7 +469,8 @@ pub fn load_neutral_with_store(
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
-        move |index, unit, store, _stream| {
+        move |address, _path, unit, store, _stream| {
+            let index = address.index();
             let recipes = if external_experts {
                 BTreeMap::new()
             } else {
@@ -605,7 +606,8 @@ fn load_neutral_parallel_with_store(
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, "", store, &static_layout)
         },
-        move |layer, _local, store, stream| {
+        move |address, path, _local, store, stream| {
+            let layer = address.index();
             let global =
                 eredu_architectures::gpt_oss::new_block::<MlxBackend>(&binding_args, layer, stream)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -621,12 +623,7 @@ fn load_neutral_parallel_with_store(
                 recipes,
                 |name| external_experts && name.contains(".mlp.experts."),
             )?;
-            shard_layer_bindings(
-                bindings,
-                &format!("{}.layers.{layer}", binding_args.parameter_root),
-                store,
-                &unit_local_layout,
-            )
+            shard_layer_bindings(bindings, path, store, &unit_local_layout)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

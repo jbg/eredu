@@ -383,7 +383,7 @@ pub fn load(
                 static_recipes.as_ref(),
             )
         },
-        move |_ordinal, unit, store, _stream| {
+        move |_address, _path, unit, store, _stream| {
             bindings(&MlxModule::new(unit), store, unit_recipes.as_ref())
         },
     )?;
@@ -446,7 +446,6 @@ fn load_parallel(
         ShardingPolicy::Require,
     );
     let global = Architecture::new(target_config.clone(), stream)?;
-    let layout = execution_layout(&global)?;
     let mut planner = build.planner();
     crate::composition::moshi_parallel::register_parallel_parameters(
         &global,
@@ -475,7 +474,6 @@ fn load_parallel(
     let static_recipes = Arc::clone(&source_recipes);
     let static_sharding = Arc::clone(&local_layout);
     let unit_config = target_config.clone();
-    let unit_layout = layout.clone();
     let unit_recipes = Arc::clone(&source_recipes);
     let unit_sharding = Arc::clone(&local_layout);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
@@ -495,8 +493,8 @@ fn load_parallel(
                 static_sharding.as_ref(),
             )
         },
-        move |ordinal, _local, store, stream| {
-            let global = build_unit(&unit_config, &unit_layout, ordinal, stream)?;
+        move |address, _path, _local, store, stream| {
+            let global = build_addressed_unit(&unit_config, address, stream)?;
             shard_layer_bindings(
                 bindings(&MlxModule::new(global), store, unit_recipes.as_ref())?,
                 "",
@@ -699,6 +697,14 @@ fn build_unit(
             layout.len()
         ))
     })?;
+    build_addressed_unit(config, address, stream)
+}
+
+fn build_addressed_unit(
+    config: &MoshiConfig,
+    address: eredu_runtime::ExecutionUnitAddress,
+    stream: &Stream,
+) -> Result<MoshiUnit, Error> {
     let architecture = Architecture::new(config.clone(), stream)?;
     <Architecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::build_unit(
         &architecture,

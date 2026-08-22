@@ -753,11 +753,12 @@ fn load_neutral_llama_parallel(
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, "", store, &binding_layout)
         },
-        |index, _local, store, stream| {
+        |address, path, _local, store, stream| {
+            let index = address.index();
             let global = NeutralBlock::new(&binding_args, index, stream)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bindings = build_module_bindings(&MlxModule::new(global), "", store)?;
-            shard_layer_bindings(bindings, &format!("model.layers.{index}"), store, &layout)
+            shard_layer_bindings(bindings, path, store, &layout)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

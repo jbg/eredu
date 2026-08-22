@@ -1509,7 +1509,7 @@ fn load_store(
             build_module_bindings_with_recipes_excluding(&module, "", store, recipes, |_| false)
                 .map_err(Into::into)
         },
-        move |_ordinal, unit, store, _stream| {
+        move |_address, _path, unit, store, _stream| {
             let module = MlxModule::new(unit);
             let recipes = crate::composition::muse_glimmer_expert::module_recipes(
                 &module, &unit_args, store,
@@ -1651,8 +1651,8 @@ fn load_parallel_store(
         move |_modules, store| {
             shard_layer_bindings(global_static_bindings, "", store, &static_layout)
         },
-        move |ordinal, local, store, stream| {
-            if ordinal < vision_layers {
+        move |address, path, local, store, stream| {
+            if address.group() == 0 {
                 let module = MlxModule::new(local.clone());
                 let recipes = crate::composition::muse_glimmer_expert::module_recipes(
                     &module,
@@ -1668,7 +1668,7 @@ fn load_parallel_store(
                 )
                 .map_err(Into::into);
             }
-            let index = ordinal - vision_layers;
+            let index = address.index();
             let global = MlxModule::new(NeutralUnit::Text(
                 eredu_architectures::muse_glimmer::TransformerBlock::<MlxBackend>::new(
                     &binding_args,
@@ -1686,12 +1686,7 @@ fn load_parallel_store(
                 build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |_| {
                     false
                 })?;
-            shard_layer_bindings(
-                bindings,
-                &format!("model.layers.{index}"),
-                store,
-                &unit_sharding,
-            )
+            shard_layer_bindings(bindings, path, store, &unit_sharding)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

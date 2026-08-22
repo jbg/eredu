@@ -1800,16 +1800,7 @@ fn load_store(
     } else {
         BTreeSet::new()
     };
-    let vision_layers = args
-        .vision
-        .as_ref()
-        .map_or(0, |config| config.num_hidden_layers as usize);
-    let audio_layers = args
-        .audio
-        .as_ref()
-        .map_or(0, |config| config.num_hidden_layers as usize);
     let binding_args = args.text.clone();
-    let text_start = vision_layers + audio_layers;
     let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
@@ -1826,9 +1817,9 @@ fn load_store(
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
-        move |ordinal, unit, store, _stream| {
-            let recipes = if !external_experts && ordinal >= text_start {
-                let layer = ordinal - text_start;
+        move |address, _path, unit, store, _stream| {
+            let recipes = if !external_experts && address.group() == 2 {
+                let layer = address.index();
                 if binding_args.layer_policy(layer).is_some_and(|policy| {
                     policy.feed_forward
                         == eredu_architectures::gemma4::FeedForwardPolicy::DenseWithSparseMoe
@@ -2007,12 +1998,12 @@ fn load_parallel_store(
         move |_modules, store| {
             shard_layer_bindings(global_static_bindings, "", store, &static_layout)
         },
-        move |ordinal, local, store, stream| {
-            if ordinal < text_start {
+        move |address, path, local, store, stream| {
+            if address.group() != 2 {
                 return build_module_bindings(&MlxModule::new(local.clone()), "", store)
                     .map_err(Into::into);
             }
-            let layer = ordinal - text_start;
+            let layer = address.index();
             let global = MlxModule::new(NeutralUnit::Text(
                 eredu_architectures::gemma4::DenseBlock::<MlxBackend>::new(
                     &binding_family.text,
@@ -2026,12 +2017,7 @@ fn load_parallel_store(
                 build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |_| {
                     false
                 })?;
-            shard_layer_bindings(
-                bindings,
-                &format!("model.language_model.layers.{layer}"),
-                store,
-                &unit_sharding,
-            )
+            shard_layer_bindings(bindings, path, store, &unit_sharding)
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

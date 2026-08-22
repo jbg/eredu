@@ -437,7 +437,8 @@ impl DeepSeekModel {
                 build_module_bindings(&MlxModule::new(modules.clone()), "", store)
                     .map_err(Into::into)
             },
-            move |ordinal, unit, store, _| {
+            move |address, _path, unit, store, _| {
+                let ordinal = address.index();
                 let recipes = v3_unit_recipes(store, &binding_args, ordinal, external_experts)?;
                 build_module_bindings_with_recipes_excluding(
                     &MlxModule::new(unit),
@@ -514,7 +515,8 @@ impl DeepSeekModel {
                 build_module_bindings(&MlxModule::new(modules.clone()), "", store)
                     .map_err(Into::into)
             },
-            move |ordinal, unit, store, _| {
+            move |address, _path, unit, store, _| {
+                let ordinal = address.index();
                 let recipes = if external_experts {
                     BTreeMap::new()
                 } else {
@@ -610,7 +612,8 @@ impl DeepSeekModel {
                     build_module_bindings(&MlxModule::new(global_static.clone()), "", store)?;
                 shard_layer_bindings(bindings, "", store, &static_layout)
             },
-            move |ordinal, _unit, store, stream| {
+            move |address, _path, _unit, store, stream| {
+                let ordinal = address.index();
                 let probe = new_v3_unit(&binding_args, ordinal, true, stream)?;
                 let bindings = v3_unit_bindings(&binding_args, ordinal, &probe, store, true)?;
                 shard_layer_bindings(bindings, "", store, &unit_layout)
@@ -693,7 +696,8 @@ impl DeepSeekModel {
                     build_module_bindings(&MlxModule::new(global_static.clone()), "", store)?;
                 shard_layer_bindings(bindings, "", store, &static_layout)
             },
-            move |ordinal, _unit, store, stream| {
+            move |address, _path, _unit, store, stream| {
+                let ordinal = address.index();
                 let probe = new_v4_unit(&binding_args, ordinal, true, stream)?;
                 let bindings = v4_unit_bindings(&binding_args, ordinal, &probe, store, true)?;
                 shard_layer_bindings(bindings, "", store, &unit_layout)
