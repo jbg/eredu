@@ -1932,22 +1932,10 @@ pub fn execute_cached_nemotron_h(
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let prefix = if layer < args.num_hidden_layers as usize {
-        format!("model.layers.{layer}.moe.experts")
-    } else {
-        format!(
-            "model.mtp.layers.{}.mixer.experts",
-            layer - args.num_hidden_layers as usize
-        )
-    };
+    let spec = eredu_architectures::nemotron_h::expert_bank_spec(args, layer)?;
     crate::backend::mlx::runtime::residency::expert_provider::execute_cached_relu2_dispatched(
         cache,
-        crate::backend::mlx::runtime::residency::expert_provider::CachedRelu2BankSpec {
-            hidden_dimensions: args.hidden_size,
-            intermediate_dimensions: args.moe_intermediate_size,
-            up_quantization: args.weight_quantization_for(&format!("{prefix}.up_proj")),
-            down_quantization: args.weight_quantization_for(&format!("{prefix}.down_proj")),
-        },
+        &spec,
         layer,
         &routes.hidden,
         &routes.global_expert_ids,

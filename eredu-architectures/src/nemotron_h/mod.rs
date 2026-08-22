@@ -22,7 +22,7 @@ pub use config::{
     GgufTensorCatalog, LayerGeometry, LayerPolicy, ModelArgs, WeightDtype,
 };
 pub use mamba::Mamba2;
-pub use mlp::{DenseMlp, SparseMoe};
+pub use mlp::{expert_bank_spec, localized_expert_bank_spec, DenseMlp, SparseMoe};
 pub use model::{
     ForwardContext, LayeredModel, TargetBoundary, TargetBoundarySchema, TargetPartitionInput, Unit,
 };

@@ -13,10 +13,7 @@ use std::{
 };
 
 use eredu_architectures::qwen::ModelArgs;
-use eredu_nn::{
-    ExpertProjectionSpec, GatedProductExpertBankSpec, GatedProductExpertLayout, ParameterSpec,
-    RoutedNeuralBackend,
-};
+use eredu_nn::RoutedNeuralBackend;
 use safemlx::{
     error::Exception,
     ops::indexing::TryIndexOp,
@@ -1555,31 +1552,14 @@ impl QwenPipelineBindings {
             let count = i32::try_from(assignment.local_global_expert_ids().len())
                 .map_err(|_| Error::Parallel("local Qwen expert count exceeds i32".into()))?;
             if count > 0 {
-                let prefix = format!("model.layers.{index}.mlp.experts");
-                let gate_up = format!("{prefix}.gate_up_proj");
-                let down = format!("{prefix}.down_proj");
                 moe.experts = <MlxBackend as RoutedNeuralBackend>::gated_product_expert_bank(
-                    GatedProductExpertBankSpec {
-                        expert_count: count,
-                        input_dimensions: args.hidden_size,
-                        intermediate_dimensions: local_intermediate_size,
-                        output_dimensions: args.hidden_size,
-                        policy: eredu_nn::GatedProductPolicy::ordinary_silu(),
-                        layout: GatedProductExpertLayout::Packed {
-                            gate_up: ExpertProjectionSpec {
-                                weight: ParameterSpec::trainable(&gate_up)
-                                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                                bias: None,
-                                format: args.weight_quantization_for(&gate_up).into(),
-                            },
-                            down: ExpertProjectionSpec {
-                                weight: ParameterSpec::trainable(&down)
-                                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                                bias: None,
-                                format: args.weight_quantization_for(&down).into(),
-                            },
-                        },
-                    },
+                    eredu_architectures::qwen::localized_expert_bank_spec(
+                        args,
+                        index,
+                        count,
+                        local_intermediate_size,
+                    )
+                    .map_err(|error| Error::Parallel(error.to_string()))?,
                     stream,
                 )
                 .map_err(|error| Error::Parallel(error.to_string()))?;

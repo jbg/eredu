@@ -8,9 +8,10 @@ use std::{
 
 use eredu_architectures::gpt_oss::ModelArgs;
 use eredu_checkpoint::{store::CheckpointSource, store::TensorSelection, WeightQuantization};
+#[cfg(test)]
+use eredu_nn::ParameterSpec;
 use eredu_nn::{
-    ExpertProjectionSpec, GatedProductExpertBankSpec, GatedProductExpertLayout, ParameterMetadata,
-    ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized, RoutedNeuralBackend,
+    ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized, RoutedNeuralBackend,
 };
 use eredu_runtime::{
     CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionResidency,
@@ -822,40 +823,15 @@ impl GptOssPipelineBindings {
                     "GPT-OSS expert-parallel rank owns no experts".into(),
                 ));
             }
-            let prefix = format!("{}.layers.{index}.mlp.experts", args.parameter_root);
-            let gate_up = format!("{prefix}.gate_up_proj");
-            let gate_up_bias = format!("{prefix}.gate_up_proj_bias");
-            let down = format!("{prefix}.down_proj");
-            let down_bias = format!("{prefix}.down_proj_bias");
             layer.inner.mlp.experts =
                 <MlxBackend as RoutedNeuralBackend>::gated_product_expert_bank(
-                    GatedProductExpertBankSpec {
-                        expert_count: count,
-                        input_dimensions: args.hidden_size,
-                        intermediate_dimensions: local_intermediate_size,
-                        output_dimensions: args.hidden_size,
-                        policy: args.gated_product_policy,
-                        layout: GatedProductExpertLayout::Packed {
-                            gate_up: ExpertProjectionSpec {
-                                weight: ParameterSpec::trainable(&gate_up)
-                                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                                bias: Some(
-                                    ParameterSpec::trainable(&gate_up_bias)
-                                        .map_err(|error| Error::Parallel(error.to_string()))?,
-                                ),
-                                format: WeightQuantization::MxFp4.into(),
-                            },
-                            down: ExpertProjectionSpec {
-                                weight: ParameterSpec::trainable(&down)
-                                    .map_err(|error| Error::Parallel(error.to_string()))?,
-                                bias: Some(
-                                    ParameterSpec::trainable(&down_bias)
-                                        .map_err(|error| Error::Parallel(error.to_string()))?,
-                                ),
-                                format: WeightQuantization::MxFp4.into(),
-                            },
-                        },
-                    },
+                    eredu_architectures::gpt_oss::localized_expert_bank_spec(
+                        args,
+                        index,
+                        count,
+                        local_intermediate_size,
+                    )
+                    .map_err(|error| Error::Parallel(error.to_string()))?,
                     stream,
                 )
                 .map_err(|error| Error::Parallel(error.to_string()))?;

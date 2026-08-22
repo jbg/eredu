@@ -85,7 +85,11 @@ Routed expert banks retain and expose their architecture-owned construction
 specification. Resident, cached, distributed, and future backend execution
 paths all consume that same geometry, projection encoding, bias layout, and
 activation policy; backend residency adapters must not reconstruct a parallel
-family descriptor from model arguments. Distributed expert callbacks also
+family descriptor from model arguments. Architecture APIs derive localized
+expert-bank specifications for placement-resolved expert counts and projection
+widths while preserving canonical parameter identities and physical formats;
+backend composition only materializes those returned specifications.
+Distributed expert callbacks also
 carry whether the requested result is globally complete or a rank-local
 tensor-parallel contribution, so EP recombination preserves the reducible and
 post-reduction terms without inventing or repeating a TP collective.

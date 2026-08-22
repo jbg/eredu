@@ -150,24 +150,13 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
             },
             context,
         )?;
-        let up_name = format!("{prefix}.experts.up_proj");
-        let down_name = format!("{prefix}.experts.down_proj");
         let experts = B::relu2_expert_bank(
-            Relu2ExpertBankSpec {
-                expert_count: args.n_routed_experts,
-                hidden_dimensions: args.hidden_size,
-                intermediate_dimensions: routed_intermediate,
-                up: ExpertProjectionSpec {
-                    weight: ParameterSpec::trainable(&up_name).map_err(Error::backend)?,
-                    bias: None,
-                    format: args.weight_quantization_for(&up_name).into(),
-                },
-                down: ExpertProjectionSpec {
-                    weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
-                    bias: None,
-                    format: args.weight_quantization_for(&down_name).into(),
-                },
-            },
+            expert_bank_spec_at(
+                args,
+                &format!("{prefix}.experts"),
+                args.n_routed_experts,
+                routed_intermediate,
+            )?,
             context,
         )?;
         Ok(Self {
@@ -307,5 +296,128 @@ impl<B: RoutedNeuralBackend> SparseMoe<B> {
                 .forward_parallel(input, parallel, context)?,
             context,
         )
+    }
+}
+
+fn expert_bank_spec_at(
+    args: &ModelArgs,
+    experts_prefix: &str,
+    expert_count: i32,
+    intermediate_dimensions: i32,
+) -> Result<Relu2ExpertBankSpec, Error> {
+    let up_name = format!("{experts_prefix}.up_proj");
+    let down_name = format!("{experts_prefix}.down_proj");
+    let spec = Relu2ExpertBankSpec {
+        expert_count,
+        hidden_dimensions: args.hidden_size,
+        intermediate_dimensions,
+        up: ExpertProjectionSpec {
+            weight: ParameterSpec::trainable(&up_name).map_err(Error::backend)?,
+            bias: None,
+            format: args.weight_quantization_for(&up_name).into(),
+        },
+        down: ExpertProjectionSpec {
+            weight: ParameterSpec::trainable(&down_name).map_err(Error::backend)?,
+            bias: None,
+            format: args.weight_quantization_for(&down_name).into(),
+        },
+    };
+    spec.validate()?;
+    Ok(spec)
+}
+
+/// Returns the architecture-owned ReLU-squared expert specification for one
+/// target or appended MTP layer.
+pub fn expert_bank_spec(args: &ModelArgs, layer: usize) -> Result<Relu2ExpertBankSpec, Error> {
+    localized_expert_bank_spec(
+        args,
+        layer,
+        args.n_routed_experts,
+        args.moe_intermediate_size,
+    )
+}
+
+/// Returns the architecture-owned ReLU-squared expert specification at
+/// placement-resolved local geometry.
+pub fn localized_expert_bank_spec(
+    args: &ModelArgs,
+    layer: usize,
+    expert_count: i32,
+    intermediate_dimensions: i32,
+) -> Result<Relu2ExpertBankSpec, Error> {
+    let target_layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    let (policy, experts_prefix) = if layer < target_layers {
+        let policy = args
+            .layer_schedule
+            .get(layer)
+            .copied()
+            .ok_or_else(|| Error::backend(format!("Nemotron-H has no layer {layer}")))?;
+        (policy, format!("model.layers.{layer}.moe.experts"))
+    } else {
+        let physical = layer - target_layers;
+        let policies = args.mtp_policies().map_err(Error::backend)?;
+        let policy = policies.get(physical).copied().ok_or_else(|| {
+            Error::backend(format!("Nemotron-H has no appended MTP layer {physical}"))
+        })?;
+        (policy, format!("model.mtp.layers.{physical}.mixer.experts"))
+    };
+    if policy != super::LayerPolicy::SparseMoe {
+        return Err(Error::backend(format!(
+            "Nemotron-H layer {layer} is not a sparse expert unit"
+        )));
+    }
+    expert_bank_spec_at(args, &experts_prefix, expert_count, intermediate_dimensions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args() -> ModelArgs {
+        crate::nemotron_h::model_args_from_config_value(&serde_json::json!({
+            "model_type":"nemotron_h", "vocab_size":32, "hidden_size":16,
+            "intermediate_size":24, "num_hidden_layers":4,
+            "hybrid_override_pattern":"M*-E", "num_attention_heads":4,
+            "num_key_value_heads":2, "head_dim":4, "mamba_num_heads":4,
+            "n_groups":2, "mamba_head_dim":4, "ssm_state_size":3,
+            "conv_kernel":3, "n_routed_experts":4, "n_shared_experts":1,
+            "moe_intermediate_size":8, "moe_shared_expert_intermediate_size":8,
+            "num_experts_per_tok":2, "n_group":2, "topk_group":1,
+            "num_nextn_predict_layers":1, "mtp_hybrid_override_pattern":"*E"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn localized_specs_resolve_target_and_mtp_parameter_identity() {
+        let args = args();
+        let target = localized_expert_bank_spec(&args, 3, 2, 4).unwrap();
+        assert_eq!(target.expert_count, 2);
+        assert_eq!(target.intermediate_dimensions, 4);
+        assert_eq!(
+            target.up.weight.id.as_str(),
+            "model.layers.3.moe.experts.up_proj"
+        );
+        assert_eq!(
+            target.down.weight.id.as_str(),
+            "model.layers.3.moe.experts.down_proj"
+        );
+
+        let mtp = expert_bank_spec(&args, 5).unwrap();
+        assert_eq!(mtp.expert_count, 4);
+        assert_eq!(mtp.intermediate_dimensions, 8);
+        assert_eq!(
+            mtp.up.weight.id.as_str(),
+            "model.mtp.layers.1.mixer.experts.up_proj"
+        );
+        assert_eq!(
+            mtp.down.weight.id.as_str(),
+            "model.mtp.layers.1.mixer.experts.down_proj"
+        );
+    }
+
+    #[test]
+    fn expert_spec_rejects_non_sparse_units() {
+        assert!(expert_bank_spec(&args(), 0).is_err());
     }
 }

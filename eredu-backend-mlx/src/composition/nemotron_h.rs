@@ -51,9 +51,7 @@ use crate::{
             media::input,
             residency::expert_cache::ExpertCatalogEntry,
             residency::expert_cache::{ExpertCache, ExpertCacheReport},
-            residency::expert_provider::{
-                CachedRelu2BankSpec, CachedRelu2ExpertProvider, ExpertExecutorProvider,
-            },
+            residency::expert_provider::{CachedRelu2ExpertProvider, ExpertExecutorProvider},
         },
     },
     core::cache::{
@@ -579,22 +577,12 @@ pub fn expert_catalog_selected(
 fn cached_provider<'a>(
     cache: &'a ExpertCache,
     args: &'a ModelArgs,
-) -> CachedRelu2ExpertProvider<'a, impl FnMut(usize) -> CachedRelu2BankSpec + 'a> {
+) -> CachedRelu2ExpertProvider<
+    'a,
+    impl FnMut(usize) -> Result<eredu_nn::Relu2ExpertBankSpec, Error> + 'a,
+> {
     CachedRelu2ExpertProvider::new(cache, move |layer| {
-        let prefix = if layer < args.num_hidden_layers as usize {
-            format!("model.layers.{layer}.moe.experts")
-        } else {
-            format!(
-                "model.mtp.layers.{}.mixer.experts",
-                layer - args.num_hidden_layers as usize
-            )
-        };
-        CachedRelu2BankSpec {
-            hidden_dimensions: args.hidden_size,
-            intermediate_dimensions: args.moe_intermediate_size,
-            up_quantization: args.weight_quantization_for(&format!("{prefix}.up_proj")),
-            down_quantization: args.weight_quantization_for(&format!("{prefix}.down_proj")),
-        }
+        eredu_architectures::nemotron_h::expert_bank_spec(args, layer).map_err(Error::from)
     })
 }
 

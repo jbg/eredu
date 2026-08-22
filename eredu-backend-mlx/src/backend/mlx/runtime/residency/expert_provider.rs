@@ -2,10 +2,9 @@
 
 use std::time::Instant;
 
-use eredu_checkpoint::WeightQuantization;
 use eredu_nn::{
     GatedProductExpertBankOperator, GatedProductExpertBankSpec, GatedProductExpertLayout,
-    TensorParallelExpertOutput,
+    Relu2ExpertBankSpec, TensorParallelExpertOutput,
 };
 use eredu_runtime::{
     ExpertPass, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
@@ -27,15 +26,6 @@ fn wrap_parallel_output(
     }
 }
 
-/// Backend geometry and physical encoding for one cached ReLU2 bank.
-#[derive(Debug, Clone, Copy)]
-pub struct CachedRelu2BankSpec {
-    pub hidden_dimensions: i32,
-    pub intermediate_dimensions: i32,
-    pub up_quantization: Option<WeightQuantization>,
-    pub down_quantization: Option<WeightQuantization>,
-}
-
 /// Executes independently cached ReLU2 experts through a layer-spec factory.
 pub struct CachedRelu2ExpertProvider<'a, F> {
     cache: &'a ExpertCache,
@@ -53,7 +43,7 @@ impl<'a, F> CachedRelu2ExpertProvider<'a, F> {
 
 impl<F> RoutedExpertProvider<MlxBackend> for CachedRelu2ExpertProvider<'_, F>
 where
-    F: FnMut(usize) -> CachedRelu2BankSpec,
+    F: FnMut(usize) -> Result<Relu2ExpertBankSpec, Error>,
 {
     type Error = Error;
 
@@ -76,7 +66,7 @@ where
     ) -> Result<MlxTensor, Self::Error> {
         execute_cached_relu2(
             self.cache,
-            (self.spec_for_layer)(request.layer),
+            &(self.spec_for_layer)(request.layer)?,
             request.layer,
             request.input.as_array(),
             request.routes.expert_ids.as_array(),
@@ -664,7 +654,7 @@ fn execute_cached_gated_product_inner(
 #[allow(clippy::too_many_arguments)]
 pub fn execute_cached_relu2(
     cache: &ExpertCache,
-    spec: CachedRelu2BankSpec,
+    spec: &Relu2ExpertBankSpec,
     layer: usize,
     hidden: &Array,
     expert_ids: &Array,
@@ -672,6 +662,7 @@ pub fn execute_cached_relu2(
     pass: ExpertPass,
     stream: &Stream,
 ) -> Result<Array, Error> {
+    spec.validate()?;
     let original_shape = hidden.shape().to_vec();
     let flattened = hidden.reshape(&[-1, hidden.dim(-1)], stream)?;
     let output = cache.execute_routes_bounded(
@@ -685,8 +676,8 @@ pub fn execute_cached_relu2(
                 spec.hidden_dimensions,
                 spec.intermediate_dimensions,
                 [
-                    spec.up_quantization.or(load_time),
-                    spec.down_quantization.or(load_time),
+                    spec.up.format.weight_quantization().or(load_time),
+                    spec.down.format.weight_quantization().or(load_time),
                 ],
                 stream,
             )?;
@@ -714,7 +705,7 @@ pub fn execute_cached_relu2(
 /// Executes ReLU2 route rows already compacted by distributed ownership dispatch.
 pub fn execute_cached_relu2_dispatched(
     cache: &ExpertCache,
-    spec: CachedRelu2BankSpec,
+    spec: &Relu2ExpertBankSpec,
     layer: usize,
     hidden: &Array,
     global_expert_ids: &Array,
