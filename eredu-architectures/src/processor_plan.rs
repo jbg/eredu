@@ -1171,8 +1171,24 @@ pub struct InklingAudioPlan {
     pub fft_length: usize,
     /// Analysis hop length.
     pub hop_length: usize,
+    /// Analysis-window function.
+    pub window: AudioWindow,
+    /// Waveform padding and output-frame-count convention.
+    pub framing: AudioFramingPlan,
     /// Number of continuous mel bands.
     pub mel_bins: usize,
+    /// Lower mel filter frequency.
+    pub min_frequency: f32,
+    /// Upper mel filter frequency.
+    pub max_frequency: f32,
+    /// Frequency-to-mel conversion convention.
+    pub mel_scale: MelScale,
+    /// Mel filter-bank normalization convention.
+    pub mel_normalization: MelNormalization,
+    /// Spectrum value accumulated through the mel filters.
+    pub spectrum: SpectrumValue,
+    /// Logarithm applied after flooring the filtered spectrum.
+    pub logarithm: Logarithm,
     /// Number of discrete mel vocabulary bins.
     pub dmel_bins: usize,
     /// Minimum quantized log-mel value.
@@ -1181,6 +1197,59 @@ pub struct InklingAudioPlan {
     pub dmel_max: f32,
     /// Energy floor before base-ten logarithm.
     pub energy_floor: f32,
+}
+
+/// Backend-neutral analysis-window function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioWindow {
+    /// Periodic Hann: `0.5 - 0.5*cos(2*pi*n/N)` for `0 <= n < N`.
+    PeriodicHann,
+}
+
+/// Backend-neutral waveform framing and padding convention.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioFramingPlan {
+    /// Zero-valued samples prepended before the first analysis frame.
+    pub leading_zeros: usize,
+    /// Rule used to derive the number of emitted frames.
+    pub frame_count: AudioFrameCount,
+    /// Samples beyond the waveform are filled with this value.
+    pub trailing_padding_value: f32,
+}
+
+/// Backend-neutral output-frame-count convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioFrameCount {
+    /// Emit `ceil(input_samples / hop_length)` frames.
+    InputDivHopCeil,
+}
+
+/// Backend-neutral frequency-to-mel conversion convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MelScale {
+    /// Slaney's piecewise linear/logarithmic mel scale.
+    Slaney,
+}
+
+/// Backend-neutral mel filter-bank normalization convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MelNormalization {
+    /// Slaney area normalization, scaling each triangle by `2 / (right - left)`.
+    SlaneyArea,
+}
+
+/// Backend-neutral spectrum value accumulated through a filter bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpectrumValue {
+    /// Complex magnitude, equivalent to a spectrum power of one.
+    Magnitude,
+}
+
+/// Backend-neutral logarithm convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Logarithm {
+    /// Base-ten logarithm.
+    Base10,
 }
 
 /// Normalized Inkling multimodal processor policy.
@@ -1280,7 +1349,19 @@ impl InklingProcessorPlan {
             sample_rate: 16_000,
             fft_length: 1_600,
             hop_length: 800,
+            window: AudioWindow::PeriodicHann,
+            framing: AudioFramingPlan {
+                leading_zeros: 800,
+                frame_count: AudioFrameCount::InputDivHopCeil,
+                trailing_padding_value: 0.0,
+            },
             mel_bins: 80,
+            min_frequency: 0.0,
+            max_frequency: 8_000.0,
+            mel_scale: MelScale::Slaney,
+            mel_normalization: MelNormalization::SlaneyArea,
+            spectrum: SpectrumValue::Magnitude,
+            logarithm: Logarithm::Base10,
             dmel_bins: self.dmel_bins,
             dmel_min: self.dmel_min,
             dmel_max: self.dmel_max,
@@ -1734,7 +1815,10 @@ fn metadata_rgb(
 
 #[cfg(test)]
 mod tests {
-    use super::{Gemma4ProcessorPlan, InklingProcessorPlan, MuseProcessorPlan, QwenProcessorPlan};
+    use super::{
+        AudioFrameCount, AudioWindow, Gemma4ProcessorPlan, InklingProcessorPlan, Logarithm,
+        MelNormalization, MelScale, MuseProcessorPlan, QwenProcessorPlan, SpectrumValue,
+    };
     use eredu_core::VideoSampling;
 
     fn qwen_visual() -> Vec<u8> {
@@ -1800,6 +1884,15 @@ mod tests {
         let audio = plan.audio();
         assert_eq!(audio.start_token_id, 8);
         assert_eq!((audio.mel_bins, audio.dmel_bins), (80, 32));
+        assert_eq!(audio.window, AudioWindow::PeriodicHann);
+        assert_eq!(audio.framing.leading_zeros, 800);
+        assert_eq!(audio.framing.frame_count, AudioFrameCount::InputDivHopCeil);
+        assert_eq!(audio.framing.trailing_padding_value, 0.0);
+        assert_eq!((audio.min_frequency, audio.max_frequency), (0.0, 8_000.0));
+        assert_eq!(audio.mel_scale, MelScale::Slaney);
+        assert_eq!(audio.mel_normalization, MelNormalization::SlaneyArea);
+        assert_eq!(audio.spectrum, SpectrumValue::Magnitude);
+        assert_eq!(audio.logarithm, Logarithm::Base10);
     }
 
     #[test]

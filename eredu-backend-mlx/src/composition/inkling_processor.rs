@@ -5,10 +5,13 @@ use std::path::Path;
 #[cfg(feature = "media")]
 use std::collections::HashMap;
 
-#[cfg(feature = "audio")]
-use eredu_architectures::processor_plan::InklingAudioPlan;
 #[cfg(feature = "image")]
 use eredu_architectures::processor_plan::InklingImagePlan;
+#[cfg(feature = "audio")]
+use eredu_architectures::processor_plan::{
+    AudioFrameCount, AudioWindow, InklingAudioPlan, Logarithm, MelNormalization, MelScale,
+    SpectrumValue,
+};
 use eredu_architectures::processor_plan::{InklingProcessorPlan, ProcessorPlanError};
 #[cfg(any(feature = "image", feature = "audio"))]
 use safemlx::Array;
@@ -197,10 +200,27 @@ fn inkling_log_mel(
         )));
     }
     let samples = waveform.samples();
-    let frames = samples.len().div_ceil(plan.hop_length);
-    let mut padded = vec![0.0f32; plan.hop_length + frames * plan.hop_length];
-    padded[plan.hop_length..plan.hop_length + samples.len()].copy_from_slice(samples);
-    let filters = slaney_mel_filters(plan.fft_length, plan.sample_rate as usize, plan.mel_bins);
+    let frames = match plan.framing.frame_count {
+        AudioFrameCount::InputDivHopCeil => samples.len().div_ceil(plan.hop_length),
+    };
+    let padded_len = frames
+        .checked_sub(1)
+        .map_or(plan.framing.leading_zeros, |last_frame| {
+            plan.framing.leading_zeros.max(
+                last_frame
+                    .saturating_mul(plan.hop_length)
+                    .saturating_add(plan.fft_length),
+            )
+        });
+    let mut padded = vec![plan.framing.trailing_padding_value; padded_len];
+    let waveform_end = plan.framing.leading_zeros + samples.len();
+    if waveform_end > padded.len() {
+        return Err(Error::Processor(
+            "Inkling audio framing does not contain the waveform".into(),
+        ));
+    }
+    padded[plan.framing.leading_zeros..waveform_end].copy_from_slice(samples);
+    let filters = mel_filters(plan);
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(plan.fft_length);
     let mut spectrum = vec![Complex32::default(); plan.fft_length];
@@ -209,49 +229,56 @@ fn inkling_log_mel(
         spectrum.fill(Complex32::default());
         let start = frame * plan.hop_length;
         for index in 0..plan.fft_length {
-            let window = 0.5
-                - 0.5 * (2.0 * std::f32::consts::PI * index as f32 / plan.fft_length as f32).cos();
+            let window = match plan.window {
+                AudioWindow::PeriodicHann => {
+                    0.5 - 0.5
+                        * (2.0 * std::f32::consts::PI * index as f32 / plan.fft_length as f32).cos()
+                }
+            };
             spectrum[index].re = padded[start + index] * window;
         }
         fft.process(&mut spectrum);
         for mel in 0..plan.mel_bins {
             let mut energy = 0.0f32;
             for frequency in 0..=plan.fft_length / 2 {
-                energy += spectrum[frequency].norm()
-                    * filters[mel * (plan.fft_length / 2 + 1) + frequency];
+                let spectrum_value = match plan.spectrum {
+                    SpectrumValue::Magnitude => spectrum[frequency].norm(),
+                };
+                energy += spectrum_value * filters[mel * (plan.fft_length / 2 + 1) + frequency];
             }
-            output[frame * plan.mel_bins + mel] = energy.max(plan.energy_floor).log10();
+            output[frame * plan.mel_bins + mel] = match plan.logarithm {
+                Logarithm::Base10 => energy.max(plan.energy_floor).log10(),
+            };
         }
     }
     Ok(output)
 }
 
 #[cfg(feature = "audio")]
-fn slaney_mel_filters(fft: usize, sample_rate: usize, mel_bins: usize) -> Vec<f32> {
-    let hz_to_mel = |hz: f64| {
-        if hz < 1_000.0 {
-            hz / (200.0 / 3.0)
-        } else {
-            15.0 + (hz / 1_000.0).ln() / (6.4f64.ln() / 27.0)
-        }
+fn mel_filters(plan: InklingAudioPlan) -> Vec<f32> {
+    let hz_to_mel = |hz: f64| match plan.mel_scale {
+        MelScale::Slaney if hz < 1_000.0 => hz / (200.0 / 3.0),
+        MelScale::Slaney => 15.0 + (hz / 1_000.0).ln() / (6.4f64.ln() / 27.0),
     };
-    let mel_to_hz = |mel: f64| {
-        if mel < 15.0 {
-            mel * (200.0 / 3.0)
-        } else {
-            1_000.0 * ((mel - 15.0) * (6.4f64.ln() / 27.0)).exp()
-        }
+    let mel_to_hz = |mel: f64| match plan.mel_scale {
+        MelScale::Slaney if mel < 15.0 => mel * (200.0 / 3.0),
+        MelScale::Slaney => 1_000.0 * ((mel - 15.0) * (6.4f64.ln() / 27.0)).exp(),
     };
-    let mel_max = hz_to_mel(sample_rate as f64 / 2.0);
-    let edges = (0..mel_bins + 2)
-        .map(|index| mel_to_hz(mel_max * index as f64 / (mel_bins + 1) as f64))
+    let mel_min = hz_to_mel(plan.min_frequency as f64);
+    let mel_max = hz_to_mel(plan.max_frequency as f64);
+    let edges = (0..plan.mel_bins + 2)
+        .map(|index| {
+            mel_to_hz(mel_min + (mel_max - mel_min) * index as f64 / (plan.mel_bins + 1) as f64)
+        })
         .collect::<Vec<_>>();
-    let frequency_bins = fft / 2 + 1;
-    let mut filters = vec![0.0f32; mel_bins * frequency_bins];
-    for mel in 0..mel_bins {
-        let normalization = 2.0 / (edges[mel + 2] - edges[mel]);
+    let frequency_bins = plan.fft_length / 2 + 1;
+    let mut filters = vec![0.0f32; plan.mel_bins * frequency_bins];
+    for mel in 0..plan.mel_bins {
+        let normalization = match plan.mel_normalization {
+            MelNormalization::SlaneyArea => 2.0 / (edges[mel + 2] - edges[mel]),
+        };
         for frequency in 0..frequency_bins {
-            let hz = sample_rate as f64 * frequency as f64 / fft as f64;
+            let hz = plan.sample_rate as f64 * frequency as f64 / plan.fft_length as f64;
             let lower = (hz - edges[mel]) / (edges[mel + 1] - edges[mel]);
             let upper = (edges[mel + 2] - hz) / (edges[mel + 2] - edges[mel + 1]);
             filters[mel * frequency_bins + frequency] =

@@ -127,6 +127,9 @@ Multimodal preprocessing starts with an architecture-owned processor plan.
 That neutral plan parses family model and processor metadata, selects released
 defaults, declares framing token IDs and text, chooses frame sampling and
 grouping, and derives resize, normalization, patch, and signal-feature policy.
+Audio feature plans specify the analysis window, exact padding and frame-count
+convention, frequency bounds, mel scale and normalization, spectrum value, and
+logarithm as well as their dimensions and floors.
 Concrete backends execute those declarations: they resize pixels, extract
 features, pack patches, and construct native tensors. A new backend therefore
 consumes the same family protocol instead of reimplementing it.
