@@ -273,6 +273,8 @@ pub fn materialize_model_plan(
     weights_stream: &Stream,
 ) -> Result<MlxModel, Error> {
     validate_plan_options(&plan, options)?;
+    let runtime_state_dtype_bytes =
+        inspected_runtime_state_dtype_bytes(plan.inspection().tensors());
     let (artifact, _policy, _route) = plan.into_parts();
     if let Some(topology) = options
         .parallel
@@ -306,7 +308,7 @@ pub fn materialize_model_plan(
                     stream,
                     weights_stream,
                 )
-                .map(MlxModel::pipeline)?;
+                .map(|model| MlxModel::pipeline(model, runtime_state_dtype_bytes))?;
             return attach_artifact_processor(model, &artifact);
         }
         if topology.expert_parallel_size > 1 {
@@ -317,7 +319,7 @@ pub fn materialize_model_plan(
                     stream,
                     weights_stream,
                 )
-                .map(MlxModel::expert)?;
+                .map(|model| MlxModel::expert(model, runtime_state_dtype_bytes))?;
             return attach_artifact_processor(model, &artifact);
         }
         if let ModelArtifact::SafeTensors {
@@ -333,14 +335,14 @@ pub fn materialize_model_plan(
                 stream,
                 weights_stream,
             )
-            .map(MlxModel::complete)?;
+            .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
             return attach_artifact_processor(model, &artifact);
         }
     }
     match artifact {
         artifact @ ModelArtifact::Gguf { .. } => {
             materialize_gguf_artifact(artifact, options, stream, weights_stream)
-                .map(complete_gguf_model)
+                .map(|model| complete_gguf_model(model, runtime_state_dtype_bytes))
         }
         ModelArtifact::SafeTensors {
             path,
@@ -349,9 +351,81 @@ pub fn materialize_model_plan(
         } => {
             let model =
                 materialize_safetensors(configuration.kind, &path, options, stream, weights_stream)
-                    .map(MlxModel::complete)?;
+                    .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
             attach_safetensors_processor(model, &path)
         }
+    }
+}
+
+fn inspected_runtime_state_dtype_bytes(
+    tensors: &eredu_core::checkpoint::TensorCatalog,
+) -> std::num::NonZeroU8 {
+    // Token embeddings establish the ordinary decoder activation dtype, and
+    // MLX caches retain those activations without casting. Encoded embeddings
+    // have no portable runtime width, so keep the conservative FP32 fallback.
+    let embedding = tensors.descriptors().find(|tensor| {
+        tensor.name == "model.embed_tokens.weight"
+            || tensor.name.ends_with(".embed_tokens.weight")
+            || matches!(
+                tensor.name.as_str(),
+                "model.llm.embed.weight"
+                    | "backbone.embeddings.weight"
+                    | "model.embeddings.weight"
+                    | "embed.weight"
+            )
+    });
+    let bytes = match embedding.map(|tensor| &tensor.dtype) {
+        Some(
+            eredu_core::checkpoint::TensorDtype::F16 | eredu_core::checkpoint::TensorDtype::Bf16,
+        ) => 2,
+        Some(
+            eredu_core::checkpoint::TensorDtype::F64
+            | eredu_core::checkpoint::TensorDtype::Complex64,
+        ) => 8,
+        _ => 4,
+    };
+    std::num::NonZeroU8::new(bytes).expect("supported MLX activation widths are nonzero")
+}
+
+#[cfg(test)]
+mod runtime_state_dtype_tests {
+    use super::inspected_runtime_state_dtype_bytes;
+    use eredu_core::checkpoint::{TensorCatalog, TensorDescriptor, TensorDtype};
+
+    fn catalog(name: &str, dtype: TensorDtype) -> TensorCatalog {
+        TensorCatalog::new([TensorDescriptor {
+            name: name.into(),
+            shape: vec![32, 16],
+            dtype,
+            storage: None,
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn floating_text_embedding_width_selects_runtime_state_width() {
+        for dtype in [TensorDtype::F16, TensorDtype::Bf16] {
+            assert_eq!(
+                inspected_runtime_state_dtype_bytes(&catalog(
+                    "model.language_model.embed_tokens.weight",
+                    dtype,
+                ))
+                .get(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_embedding_keeps_conservative_fp32_width() {
+        assert_eq!(
+            inspected_runtime_state_dtype_bytes(&catalog(
+                "model.embed_tokens.weight",
+                TensorDtype::Encoded("Q4_K".into()),
+            ))
+            .get(),
+            4
+        );
     }
 }
 
@@ -374,8 +448,11 @@ fn attach_safetensors_processor(model: MlxModel, path: &Path) -> Result<MlxModel
     }
 }
 
-fn complete_gguf_model(materialized: MaterializedGgufModel) -> MlxModel {
-    let model = MlxModel::complete(materialized.model);
+fn complete_gguf_model(
+    materialized: MaterializedGgufModel,
+    runtime_state_dtype_bytes: std::num::NonZeroU8,
+) -> MlxModel {
+    let model = MlxModel::complete(materialized.model, runtime_state_dtype_bytes);
     #[cfg(feature = "media")]
     let model = model.with_processor(materialized.processor);
     model

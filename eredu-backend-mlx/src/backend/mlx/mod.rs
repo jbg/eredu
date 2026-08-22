@@ -29,6 +29,8 @@ use eredu_core::backend::{
     BackendCapabilities, BackendDescriptor, BackendProvider, Completion, DeviceDescriptor,
     ModelLoadingBackend, PreparedModel, Submission,
 };
+use std::num::NonZeroU8;
+
 use safemlx::{transforms::async_eval_with_event, Array, DeviceType, Event, Stream};
 
 #[cfg(feature = "media")]
@@ -48,6 +50,7 @@ use crate::{
 /// not exposed through the public loading API.
 pub struct MlxModel {
     pub inner: MlxModelKind,
+    runtime_state_dtype_bytes: NonZeroU8,
     #[cfg(feature = "media")]
     pub processor: Option<ModelProcessor>,
 }
@@ -59,28 +62,41 @@ pub enum MlxModelKind {
 }
 
 impl MlxModel {
-    pub const fn complete(model: Model) -> Self {
+    pub(crate) const fn complete(model: Model, runtime_state_dtype_bytes: NonZeroU8) -> Self {
         Self {
             inner: MlxModelKind::Complete(model),
+            runtime_state_dtype_bytes,
             #[cfg(feature = "media")]
             processor: None,
         }
     }
 
-    pub const fn pipeline(model: PipelineModel) -> Self {
+    pub(crate) const fn pipeline(
+        model: PipelineModel,
+        runtime_state_dtype_bytes: NonZeroU8,
+    ) -> Self {
         Self {
             inner: MlxModelKind::Pipeline(model),
+            runtime_state_dtype_bytes,
             #[cfg(feature = "media")]
             processor: None,
         }
     }
 
-    pub const fn expert(model: ExpertParallelModel) -> Self {
+    pub(crate) const fn expert(
+        model: ExpertParallelModel,
+        runtime_state_dtype_bytes: NonZeroU8,
+    ) -> Self {
         Self {
             inner: MlxModelKind::Expert(model),
+            runtime_state_dtype_bytes,
             #[cfg(feature = "media")]
             processor: None,
         }
+    }
+
+    pub(crate) const fn runtime_state_dtype_bytes(&self) -> NonZeroU8 {
+        self.runtime_state_dtype_bytes
     }
 
     #[cfg(feature = "media")]

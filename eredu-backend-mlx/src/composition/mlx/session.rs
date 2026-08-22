@@ -273,6 +273,7 @@ impl MlxModelInput {
 /// unrelated communicator.
 pub struct MlxModelSession<'a> {
     inner: MlxSessionKind,
+    runtime_state_dtype_bytes: std::num::NonZeroU8,
     distributed: Option<MlxDistributedSession<'a>>,
     #[cfg(feature = "media")]
     processor: Option<ModelProcessor>,
@@ -295,6 +296,7 @@ impl<'a> MlxModelSession<'a> {
         model: MlxModel,
         distributed: Option<MlxDistributedSession<'a>>,
     ) -> Result<Self, Error> {
+        let runtime_state_dtype_bytes = model.runtime_state_dtype_bytes();
         let topology = model.topology();
         match (topology, distributed.as_ref()) {
             (None, None) => {}
@@ -334,10 +336,15 @@ impl<'a> MlxModelSession<'a> {
         };
         Ok(Self {
             inner,
+            runtime_state_dtype_bytes,
             distributed,
             #[cfg(feature = "media")]
             processor,
         })
+    }
+
+    pub(super) const fn runtime_state_dtype_bytes(&self) -> std::num::NonZeroU8 {
+        self.runtime_state_dtype_bytes
     }
 
     #[cfg(feature = "media")]

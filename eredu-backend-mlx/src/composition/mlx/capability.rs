@@ -33,18 +33,35 @@ fn checked_mul(left: u64, right: u64, operation: &'static str) -> Result<u64, Ca
         .ok_or(CapabilityError::ArithmeticOverflow { operation })
 }
 
-fn estimate_mlx_runtime_state(
+fn estimate_mlx_runtime_state_with_dtype(
     layout: &StateLayout,
     input: InputTokenCount,
     max_output_tokens: u64,
     batch_size: u64,
+    state_dtype_bytes: NonZeroU8,
 ) -> Result<RuntimeStateEstimate, CapabilityError> {
     estimate_runtime_state(
         layout,
         input,
         max_output_tokens,
         batch_size,
-        NonZeroU8::new(4).expect("MLX cache scalar width is nonzero"),
+        state_dtype_bytes,
+    )
+}
+
+#[cfg(test)]
+fn estimate_mlx_runtime_state(
+    layout: &StateLayout,
+    input: InputTokenCount,
+    max_output_tokens: u64,
+    batch_size: u64,
+) -> Result<RuntimeStateEstimate, CapabilityError> {
+    estimate_mlx_runtime_state_with_dtype(
+        layout,
+        input,
+        max_output_tokens,
+        batch_size,
+        NonZeroU8::new(4).expect("test dtype width is nonzero"),
     )
 }
 
@@ -331,13 +348,15 @@ pub fn model_runtime_state(
     input: InputTokenCount,
     max_output_tokens: u64,
     batch_size: u64,
+    state_dtype_bytes: NonZeroU8,
 ) -> Result<RuntimeStateEstimate, CapabilityError> {
     let estimate = model.architecture_capability_estimate()?;
-    estimate_mlx_runtime_state(
+    estimate_mlx_runtime_state_with_dtype(
         estimate.state_layout(),
         input,
         max_output_tokens,
         batch_size,
+        state_dtype_bytes,
     )
 }
 
@@ -463,6 +482,7 @@ impl<'a> ModelCapabilityBackend for MlxBackend<'a> {
             input,
             max_output_tokens,
             batch_size,
+            runtime.session().runtime_state_dtype_bytes(),
         )
     }
 
@@ -1478,9 +1498,28 @@ mod tests {
     }
 
     #[test]
-    fn dtype_assumption_is_explicit() {
-        let estimate = estimate(0, Vec::new(), 1, 1).unwrap();
-        assert_eq!(estimate.assumptions.state_dtype_bytes.get(), 4);
+    fn dtype_assumption_follows_the_session_activation_width() {
+        let layout = StateLayout {
+            fixed_scalars_per_batch: 0,
+            growing: vec![GrowingState {
+                layers: 1,
+                scalars_per_position: 16,
+                window: None,
+            }],
+            hidden_size: 1,
+            allocation_granularity: 1,
+            completeness: EstimationCompleteness::Complete,
+        };
+        let estimate = estimate_mlx_runtime_state_with_dtype(
+            &layout,
+            InputTokenCount::text(2),
+            0,
+            1,
+            NonZeroU8::new(2).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(estimate.assumptions.state_dtype_bytes.get(), 2);
+        assert_eq!(estimate.requested_state_bytes, 2 * 16 * 2);
     }
 
     #[test]

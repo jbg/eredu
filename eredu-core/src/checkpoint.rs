@@ -92,6 +92,10 @@ impl TensorCatalog {
     pub fn get(&self, name: &str) -> Option<&TensorDescriptor> {
         self.tensors.get(name)
     }
+    /// Iterates over descriptors in deterministic name order.
+    pub fn descriptors(&self) -> impl Iterator<Item = &TensorDescriptor> {
+        self.tensors.values()
+    }
     /// Number of cataloged tensors.
     pub fn len(&self) -> usize {
         self.tensors.len()
