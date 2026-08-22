@@ -462,60 +462,6 @@ impl PlacedExecutionDag {
             .filter_map(move |group| group.local_units(pp_rank).map(|range| (group, range)))
     }
 
-    /// Test-only low-level fixture constructor. Production code realizes
-    /// partitions from a concrete neutral architecture below.
-    #[cfg(test)]
-    fn realize_partition<G, A>(
-        &self,
-        pp_rank: usize,
-        state: Option<(StateLayout, usize)>,
-        local_geometry: G,
-        auxiliary_boundary: A,
-        parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
-    ) -> Result<ArchitecturePartition<G, A>, Error> {
-        if pp_rank >= self.pp_rank_count {
-            return Err(Error::Parallel(format!(
-                "cannot realize PP rank {pp_rank} from {} planned ranks",
-                self.pp_rank_count
-            )));
-        }
-        let group_ranges = self
-            .local_groups(pp_rank)
-            .map(|(group, units)| (group.id.clone(), units))
-            .collect::<Vec<_>>();
-        let static_roles = self
-            .groups
-            .iter()
-            .flat_map(|group| &group.static_tensors)
-            .filter(|owner| owner.pp_rank == pp_rank)
-            .map(|owner| owner.role.clone())
-            .collect::<Vec<_>>();
-        let owns_input = self.groups.iter().enumerate().any(|(index, group)| {
-            self.semantic
-                .dependencies(index)
-                .is_some_and(|dependencies| dependencies.is_empty())
-                && group.first_owner().unwrap_or(group.merge_destination) == pp_rank
-        });
-        let owns_output = self.groups[self.semantic.output()].merge_destination == pp_rank;
-        let ownership = PartitionOwnership::new(owns_input, owns_output, static_roles)
-            .map_err(placement_partition_error)?;
-        let state = state
-            .map(|(layout, offset)| PartitionState::new(layout, offset))
-            .transpose()
-            .map_err(placement_partition_error)?;
-        ArchitecturePartition::new(
-            self.semantic.clone(),
-            self.unit_layout.clone(),
-            group_ranges,
-            ownership,
-            state,
-            local_geometry,
-            auxiliary_boundary,
-            parameter_bindings,
-        )
-        .map_err(placement_partition_error)
-    }
-
     /// Realizes rank ownership directly from the concrete neutral
     /// architecture's canonical graph and unit layout.
     #[allow(clippy::too_many_arguments)]
@@ -765,10 +711,176 @@ fn add_edge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_runtime::{
-        ExecutionGroupId, MemberSharding, OwnedParameterGroupSpec, ParameterGroupOwner,
-        ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+    use crate::backend::mlx::{
+        nn::shared::MlxBackend as MlxNeuralBackend, runtime::cache::state::MlxHybridState,
     };
+    use eredu_nn::{ParameterVisitor, ParameterVisitorMut, Parameterized};
+    use eredu_runtime::{
+        ExecutionGroupId, LayeredArchitecture, LayeredForwardState, MemberSharding,
+        OwnedParameterGroupSpec, ParameterGroupOwner, ParameterGroupSpec, ParameterMemberSpec,
+        ParameterRole,
+    };
+    use safemlx::{Array, Stream};
+
+    #[derive(Debug)]
+    struct EmptyModule;
+
+    impl Parameterized<Array> for EmptyModule {
+        fn visit_parameters<'a, V>(&'a self, _visitor: &mut V)
+        where
+            V: ParameterVisitor<'a, Array>,
+        {
+        }
+
+        fn visit_parameters_mut<'a, V>(&'a mut self, _visitor: &mut V)
+        where
+            V: ParameterVisitorMut<'a, Array>,
+        {
+        }
+
+        fn set_trainable(&mut self, _trainable: bool) {}
+    }
+
+    struct FixtureArchitecture {
+        graph: ExecutionGraph,
+        unit_counts: Vec<usize>,
+        static_modules: EmptyModule,
+    }
+
+    impl FixtureArchitecture {
+        fn new(placed: &PlacedExecutionDag) -> Self {
+            let unit_counts = (0..placed.semantic.groups().len())
+                .map(|group| {
+                    placed
+                        .unit_layout
+                        .group_range(group)
+                        .expect("fixture layout covers every semantic group")
+                        .len()
+                })
+                .collect();
+            Self {
+                graph: placed.semantic.clone(),
+                unit_counts,
+                static_modules: EmptyModule,
+            }
+        }
+    }
+
+    impl LayeredArchitecture<MlxNeuralBackend, MlxHybridState> for FixtureArchitecture {
+        type Input<'a> = &'a Array;
+        type StaticModules = EmptyModule;
+        type Unit = EmptyModule;
+        type ForwardContext = ();
+        type RetainedContextValues<'a> = std::iter::Empty<&'a Array>;
+        type Error = String;
+
+        fn model_identity(&self) -> &str {
+            "placement-fixture"
+        }
+
+        fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
+            Ok(self.graph.clone())
+        }
+
+        fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
+            self.unit_counts
+                .get(group)
+                .copied()
+                .ok_or_else(|| format!("unknown fixture group {group}"))
+        }
+
+        fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
+            Ok(format!("fixture.{group}.{index}"))
+        }
+
+        fn static_modules(&self) -> &Self::StaticModules {
+            &self.static_modules
+        }
+
+        fn static_modules_mut(&mut self) -> &mut Self::StaticModules {
+            &mut self.static_modules
+        }
+
+        fn build_unit(
+            &self,
+            _group: usize,
+            _index: usize,
+            _context: &Stream,
+        ) -> Result<Self::Unit, Self::Error> {
+            Ok(EmptyModule)
+        }
+
+        fn begin_forward<'a>(
+            &mut self,
+            _input: Self::Input<'a>,
+            _state: &mut MlxHybridState,
+            _context: &Stream,
+        ) -> Result<LayeredForwardState<Array, Self::ForwardContext>, Self::Error> {
+            Err("placement fixture does not execute".into())
+        }
+
+        fn begin_execution_group(
+            &mut self,
+            _group: usize,
+            initial: &Array,
+            _dependencies: &[&Array],
+            _state: &mut MlxHybridState,
+            _forward: &mut Self::ForwardContext,
+            _context: &Stream,
+        ) -> Result<Array, Self::Error> {
+            Ok(initial.clone())
+        }
+
+        fn forward_unit(
+            &mut self,
+            _group: usize,
+            _index: usize,
+            _unit: &mut Self::Unit,
+            hidden: &Array,
+            _state: &mut MlxHybridState,
+            _forward: &mut Self::ForwardContext,
+            _context: &Stream,
+        ) -> Result<Array, Self::Error> {
+            Ok(hidden.clone())
+        }
+
+        fn finish_forward(
+            &mut self,
+            hidden: &Array,
+            _state: &mut MlxHybridState,
+            _forward: &Self::ForwardContext,
+            _context: &Stream,
+        ) -> Result<Array, Self::Error> {
+            Ok(hidden.clone())
+        }
+
+        fn retained_context_values<'a>(
+            &'a self,
+            _forward: &'a Self::ForwardContext,
+            _group: usize,
+            _index: usize,
+        ) -> Self::RetainedContextValues<'a> {
+            std::iter::empty()
+        }
+    }
+
+    fn realize_partition<G, A>(
+        placed: &PlacedExecutionDag,
+        pp_rank: usize,
+        state: Option<(StateLayout, usize)>,
+        local_geometry: G,
+        auxiliary_boundary: A,
+        parameter_bindings: impl IntoIterator<Item = OwnedParameterGroupSpec>,
+    ) -> Result<ArchitecturePartition<G, A>, Error> {
+        placed.realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
+            &FixtureArchitecture::new(placed),
+            pp_rank,
+            state,
+            local_geometry,
+            auxiliary_boundary,
+            parameter_bindings,
+        )
+    }
 
     fn schema(id: &str) -> PayloadSchema {
         PayloadSchema::new(
@@ -876,18 +988,18 @@ mod tests {
         }
 
         let placed = partition_fixture();
-        let partition = placed
-            .realize_partition(
-                1,
-                Some((state_layout(2), 7)),
-                Geometry("family-local"),
-                Boundary { merge_token: 11 },
-                [OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::execution_unit(ExecutionGroupId::new("text").unwrap(), 0),
-                    parameter("text.layer", "model.layers.0.weight"),
-                )],
-            )
-            .unwrap();
+        let partition = realize_partition(
+            &placed,
+            1,
+            Some((state_layout(2), 7)),
+            Geometry("family-local"),
+            Boundary { merge_token: 11 },
+            [OwnedParameterGroupSpec::new(
+                ParameterGroupOwner::execution_unit(ExecutionGroupId::new("text").unwrap(), 0),
+                parameter("text.layer", "model.layers.0.weight"),
+            )],
+        )
+        .unwrap();
 
         assert_eq!(
             partition
@@ -920,9 +1032,7 @@ mod tests {
             "model.layers.0.weight"
         );
 
-        let ingress = placed
-            .realize_partition(0, None, (), (), std::iter::empty())
-            .unwrap();
+        let ingress = realize_partition(&placed, 0, None, (), (), std::iter::empty()).unwrap();
         assert!(ingress.ownership().owns_input());
         assert!(!ingress.ownership().owns_output());
         assert_eq!(ingress.ownership().static_roles(), ["vision.input"]);
@@ -969,9 +1079,7 @@ mod tests {
             ParameterGroupOwner::static_any_of(["embedding", "mtp"]),
             parameter("embedding", "model.embed_tokens.weight"),
         );
-        let output = placed
-            .realize_partition(1, None, (), (), [embedding.clone()])
-            .unwrap();
+        let output = realize_partition(&placed, 1, None, (), (), [embedding.clone()]).unwrap();
         assert!(output.ownership().owns_static_role("mtp"));
         assert!(output.ownership().owns_static_role("output"));
         assert!(!output.ownership().owns_static_role("embedding"));
@@ -1001,7 +1109,7 @@ mod tests {
         prediction.last_owner_static_roles.clear();
         let missing_role = PlacedExecutionDag::plan(2, vec![target, prediction], "mtp_0").unwrap();
         assert!(matches!(
-            missing_role.realize_partition(1, None, (), (), [embedding]),
+            realize_partition(&missing_role, 1, None, (), (), [embedding]),
             Err(Error::Parallel(message)) if message.contains("non-local parameter owner")
         ));
     }
@@ -1009,15 +1117,15 @@ mod tests {
     #[test]
     fn translates_neutral_partition_validation_at_the_placement_boundary() {
         let placed = partition_fixture();
-        let error = placed
-            .realize_partition(
-                1,
-                Some((state_layout(2), usize::MAX)),
-                (),
-                (),
-                std::iter::empty(),
-            )
-            .unwrap_err();
+        let error = realize_partition(
+            &placed,
+            1,
+            Some((state_layout(2), usize::MAX)),
+            (),
+            (),
+            std::iter::empty(),
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             Error::Parallel(message)
@@ -1025,24 +1133,24 @@ mod tests {
                     && message.contains("overflowed usize")
         ));
 
-        let error = placed
-            .realize_partition(
-                1,
-                None,
-                (),
-                (),
-                [
-                    OwnedParameterGroupSpec::new(
-                        ParameterGroupOwner::static_role("text.input"),
-                        parameter("first", "shared.weight"),
-                    ),
-                    OwnedParameterGroupSpec::new(
-                        ParameterGroupOwner::static_role("text.output"),
-                        parameter("second", "shared.weight"),
-                    ),
-                ],
-            )
-            .unwrap_err();
+        let error = realize_partition(
+            &placed,
+            1,
+            None,
+            (),
+            (),
+            [
+                OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::static_role("text.input"),
+                    parameter("first", "shared.weight"),
+                ),
+                OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::static_role("text.output"),
+                    parameter("second", "shared.weight"),
+                ),
+            ],
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             Error::Parallel(message)

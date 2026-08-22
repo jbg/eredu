@@ -180,6 +180,12 @@ Portable topology uses data, tensor, pipeline, and expert axes. Core validates
 rank coordinates, subgroup membership, balanced ownership, placement, and
 operation scopes.
 
+`ArchitecturePartition` is publicly constructed only through
+`from_architecture`, which derives its execution graph and unit layout from the
+concrete neutral architecture. Backend placement code supplies rank-local
+ranges and ownership, but cannot substitute a caller-built topology that only
+resembles the architecture it will execute.
+
 `DistributedSession` is an optional capability of the selected model session.
 It exposes high-level sum, gather, variable-count exchange, point-to-point, and
 consensus submissions with exact completion. Unsupported operations report an

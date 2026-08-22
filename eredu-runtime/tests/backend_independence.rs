@@ -18,17 +18,16 @@ use eredu_nn::{
     RotarySpec, Tensor,
 };
 use eredu_runtime::{
-    bind_materialized_unit, materialize_bindings, ArchitecturePartition,
-    ArchitecturePartitionError, CollectiveBackend, CompositeLayeredTraversalHook, DeviceState,
-    ExecutionGraph, ExecutionGroupSpec, ExecutionUnitAddress, ExecutionUnitLayout,
-    LayeredArchitecture, LayeredForwardState, LayeredTraversalHook, LayeredTraversalPoint,
-    LayeredUnitAction, LayerwisePolicy, LayerwiseRuntime, ParameterBackend, PartitionOwnership,
-    PenaltyConfig, PredictionDirective, ResettableRuntimeLayerState, ResettableRuntimeState,
-    ResidentRuntime, RuntimeLayerState, Sampler, SamplingBackend, SequentialDecisionBoundary,
-    SequentialDecisionDriver, SequentialDecisionError, SequentialDecisionPlan,
-    SequentialDecisionSource, SequentialDecisionTraversal, StateError, StateLayout, StateSegmentId,
-    StateSegmentLifetime, StateSegmentSpec, SubmissionBackend, TokenDomain, TransferBackend,
-    WeightBinding,
+    bind_materialized_unit, materialize_bindings, ArchitecturePartition, CollectiveBackend,
+    CompositeLayeredTraversalHook, DeviceState, ExecutionGraph, ExecutionGroupSpec,
+    ExecutionUnitAddress, LayeredArchitecture, LayeredForwardState, LayeredTraversalHook,
+    LayeredTraversalPoint, LayeredUnitAction, LayerwisePolicy, LayerwiseRuntime, ParameterBackend,
+    PartitionOwnership, PenaltyConfig, PredictionDirective, ResettableRuntimeLayerState,
+    ResettableRuntimeState, ResidentRuntime, RuntimeLayerState, Sampler, SamplingBackend,
+    SequentialDecisionBoundary, SequentialDecisionDriver, SequentialDecisionError,
+    SequentialDecisionPlan, SequentialDecisionSource, SequentialDecisionTraversal, StateError,
+    StateLayout, StateSegmentId, StateSegmentLifetime, StateSegmentSpec, SubmissionBackend,
+    TokenDomain, TransferBackend, WeightBinding,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1027,7 +1026,7 @@ fn architecture_partition_is_derived_from_and_revalidates_neutral_topology() {
         ArchitecturePartition::<(), ()>::from_architecture::<FakeBackend, FixtureState, _, _>(
             &architecture,
             [("vision", 0..1), ("text", 0..2)],
-            ownership.clone(),
+            ownership,
             None,
             (),
             (),
@@ -1037,28 +1036,6 @@ fn architecture_partition_is_derived_from_and_revalidates_neutral_topology() {
     partition
         .validate_architecture::<FakeBackend, FixtureState, _>(&architecture)
         .expect("derived partition revalidates");
-
-    // The group names and counts still match, but the dependencies do not.
-    // Name-only validation would incorrectly accept this shadow graph.
-    let shadow_graph = ExecutionGraph::chain(["vision", "audio", "text"]).unwrap();
-    let shadow_layout = ExecutionUnitLayout::new(&shadow_graph, [1, 1, 2]).unwrap();
-    let shadow = ArchitecturePartition::new(
-        shadow_graph,
-        shadow_layout,
-        [("vision", 0..1), ("text", 0..2)],
-        ownership,
-        None,
-        (),
-        (),
-        std::iter::empty(),
-    )
-    .unwrap();
-    assert_eq!(
-        shadow
-            .validate_architecture::<FakeBackend, FixtureState, _>(&architecture)
-            .unwrap_err(),
-        ArchitecturePartitionError::ArchitectureGraphMismatch
-    );
 }
 
 #[test]

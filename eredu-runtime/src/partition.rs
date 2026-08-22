@@ -591,8 +591,8 @@ impl<G, A> ArchitecturePartition<G, A> {
     /// Creates a partition from the topology declared by one concrete neutral
     /// architecture.
     ///
-    /// Unlike [`Self::new`], this constructor does not accept a caller-built
-    /// graph or unit layout. This prevents a backend realization from
+    /// This is the only public constructor: it derives the graph and unit
+    /// layout from `architecture`, preventing a backend realization from
     /// publishing a parallel topology that merely resembles, but is not the
     /// canonical topology of, the architecture it will execute.
     #[allow(clippy::too_many_arguments)]
@@ -625,9 +625,10 @@ impl<G, A> ArchitecturePartition<G, A> {
         )
     }
 
-    /// Creates one validated rank-local architecture partition.
+    /// Creates one validated rank-local architecture partition after the
+    /// authoritative architecture topology has already been derived.
     #[allow(clippy::too_many_arguments)]
-    pub fn new<S>(
+    fn new<S>(
         graph: ExecutionGraph,
         unit_layout: ExecutionUnitLayout,
         group_ranges: impl IntoIterator<Item = (S, Range<usize>)>,
