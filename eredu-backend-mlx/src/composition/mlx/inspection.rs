@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::composition::mlx::structural::{self, GgufArchitectureValidation};
+use crate::composition::mlx::structural;
 use eredu_checkpoint::store::WeightStore;
 use eredu_core::{
     ArtifactFormat, ArtifactModality, ArtifactTensorEncoding, GgufArchitecture, InputModalities,
@@ -302,37 +302,22 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
 
 fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionReport {
     let mut report = ModelInspectionReport::unverified(path, ArtifactFormat::Gguf);
-    let checkpoint = match GgufCheckpoint::open(path) {
-        Ok(checkpoint) => checkpoint,
+    let portable = match eredu_core::inspect_artifact(path) {
+        Ok(inspection) => inspection,
         Err(error) => {
-            let detail = error.to_string();
-            let type_code = parse_unsupported_type_code(&detail);
-            report.container = InspectionReadiness::Invalid;
-            report.model_loadability = InspectionReadiness::Invalid;
-            report.requested_load = InspectionReadiness::Invalid;
-            report.text_generation = InspectionReadiness::Invalid;
-            report.tokenizer = InspectionReadiness::Unverified;
-            report.chat_template = InspectionReadiness::Unverified;
-            report.semantic_streaming = InspectionReadiness::Unverified;
-            report.native_tools = InspectionReadiness::Unverified;
-            report.multimodal = InspectionReadiness::Unverified;
-            report.issues.push(InspectionIssue {
-                code: if type_code.is_some() {
-                    InspectionIssueCode::UnsupportedTensorEncoding
-                } else {
-                    InspectionIssueCode::InvalidContainer
-                },
-                severity: InspectionSeverity::Error,
-                detail,
-                path: Some(path.to_path_buf()),
-                metadata_key: None,
-                tensor_name: None,
-                tensor_type_code: type_code,
-            });
+            reject_portable_gguf(&mut report, path, &error);
             return report;
         }
     };
+    let validated = portable
+        .validated_gguf()
+        .expect("GGUF inspection must expose its validated GGUF result");
+    let gguf_architecture = validated.architecture();
+    let checkpoint = GgufCheckpoint::from_portable(validated.checkpoint().clone());
     report.container = InspectionReadiness::Ready;
+    report.model_kind = Some(gguf_architecture.model_kind());
+    report.architecture = Some(gguf_architecture.metadata_name().into());
+    report.architecture_support = InspectionReadiness::Ready;
     report.checkpoint_shards = Some(checkpoint.catalog().shards().len());
     report.tensor_count = Some(checkpoint.catalog().logical_outputs().count());
     report.gguf_versions = Some(
@@ -382,117 +367,38 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
     }
 
     let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-    let architecture = match metadata.get("general.architecture") {
-        Some(GgufMetadataValue::String(value)) => {
-            report.architecture = Some(value.clone());
-            value.clone()
-        }
-        Some(_) => {
-            report.model_loadability = InspectionReadiness::Invalid;
-            report.requested_load = InspectionReadiness::Invalid;
-            report.issues.push(InspectionIssue {
-                code: InspectionIssueCode::InvalidConfiguration,
-                severity: InspectionSeverity::Error,
-                detail: "GGUF metadata key general.architecture has the wrong type".into(),
-                path: Some(path.to_path_buf()),
-                metadata_key: Some("general.architecture".into()),
-                tensor_name: None,
-                tensor_type_code: None,
-            });
-            return report;
-        }
-        None => {
-            report.model_loadability = InspectionReadiness::Invalid;
-            report.requested_load = InspectionReadiness::Invalid;
-            report.issues.push(InspectionIssue {
-                code: InspectionIssueCode::InvalidConfiguration,
-                severity: InspectionSeverity::Error,
-                detail: "GGUF metadata is missing required key general.architecture".into(),
-                path: Some(path.to_path_buf()),
-                metadata_key: Some("general.architecture".into()),
-                tensor_name: None,
-                tensor_type_code: None,
-            });
-            return report;
-        }
-    };
-
-    match GgufArchitecture::resolve(&architecture) {
-        Ok(gguf_architecture) => {
-            let kind = gguf_architecture.model_kind();
-            report.model_kind = Some(kind);
-            report.architecture_support = InspectionReadiness::Ready;
-            if let Err(error) = gguf_architecture.validate_catalog(&checkpoint, &metadata) {
-                report.structural_binding = InspectionReadiness::Invalid;
-                report.model_loadability = InspectionReadiness::Invalid;
-                report.issue(
-                    InspectionIssueCode::InvalidConfiguration,
-                    InspectionSeverity::Error,
-                    error.to_string(),
-                    Some(path.to_path_buf()),
-                );
-            } else {
-                match eredu_architectures::preparation::gguf_capabilities(
-                    gguf_architecture,
-                    &checkpoint,
-                ) {
-                    Ok(capabilities) => {
-                        report.expected_modalities =
-                            artifact_modalities(capabilities.input_modalities());
-                        apply_structural_validation(
-                            &mut report,
-                            structural::validate_gguf(
-                                gguf_architecture,
-                                &checkpoint,
-                                &metadata,
-                                options.load,
-                            ),
-                            path,
-                        );
-                    }
-                    Err(error) => {
-                        report.structural_binding = InspectionReadiness::Invalid;
-                        report.model_loadability = InspectionReadiness::Invalid;
-                        report.issue(
-                            InspectionIssueCode::InvalidConfiguration,
-                            InspectionSeverity::Error,
-                            error.to_string(),
-                            Some(path.to_path_buf()),
-                        );
-                    }
-                }
-            }
-            match structural::validate_gguf_preparation(
-                gguf_architecture,
-                &checkpoint,
-                options.load,
-            ) {
-                Ok(()) => match validate_gguf_quantization_source(
-                    &checkpoint,
-                    &metadata,
-                    options.load.quantization,
-                ) {
-                    Ok(()) => report.requested_load = InspectionReadiness::Ready,
-                    Err(error) => reject_load_policy(&mut report, &error),
-                },
-                Err(error) => reject_load_policy(&mut report, &error),
-            }
-            inspect_gguf_projector(&mut report, path, gguf_architecture, &checkpoint, &metadata);
+    match eredu_architectures::preparation::gguf_capabilities(gguf_architecture, &checkpoint) {
+        Ok(capabilities) => {
+            report.expected_modalities = artifact_modalities(capabilities.input_modalities());
+            apply_structural_validation(
+                &mut report,
+                structural::validate_gguf(gguf_architecture, &checkpoint, &metadata, options.load),
+                path,
+            );
         }
         Err(error) => {
-            report.architecture_support = InspectionReadiness::Unsupported;
-            report.structural_binding = InspectionReadiness::Unsupported;
-            report.model_loadability = InspectionReadiness::Unsupported;
-            report.requested_load = InspectionReadiness::Unsupported;
+            report.structural_binding = InspectionReadiness::Invalid;
+            report.model_loadability = InspectionReadiness::Invalid;
             report.issue(
-                InspectionIssueCode::UnsupportedArchitecture,
+                InspectionIssueCode::InvalidConfiguration,
                 InspectionSeverity::Error,
                 error.to_string(),
                 Some(path.to_path_buf()),
             );
-            report.multimodal = InspectionReadiness::NotApplicable;
         }
     }
+    match structural::validate_gguf_preparation(gguf_architecture, &checkpoint, options.load) {
+        Ok(()) => match validate_gguf_quantization_source(
+            &checkpoint,
+            &metadata,
+            options.load.quantization,
+        ) {
+            Ok(()) => report.requested_load = InspectionReadiness::Ready,
+            Err(error) => reject_load_policy(&mut report, &error),
+        },
+        Err(error) => reject_load_policy(&mut report, &error),
+    }
+    inspect_gguf_projector(&mut report, path, gguf_architecture, &checkpoint, &metadata);
 
     if let Err(error) = gguf_eos_token_ids(&metadata) {
         report.issue(
@@ -505,6 +411,74 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
         report.requested_load = InspectionReadiness::Invalid;
     }
     report
+}
+
+fn reject_portable_gguf(
+    report: &mut ModelInspectionReport,
+    path: &Path,
+    error: &eredu_core::artifact::ArtifactError,
+) {
+    let detail = error.to_string();
+    let (code, container, architecture, structural, type_code) = match error {
+        eredu_core::artifact::ArtifactError::UnsupportedGgufArchitecture(name) => {
+            report.architecture = Some(name.clone());
+            (
+                InspectionIssueCode::UnsupportedArchitecture,
+                InspectionReadiness::Ready,
+                InspectionReadiness::Unsupported,
+                InspectionReadiness::Unsupported,
+                None,
+            )
+        }
+        eredu_core::artifact::ArtifactError::MissingGgufArchitecture => (
+            InspectionIssueCode::InvalidConfiguration,
+            InspectionReadiness::Ready,
+            InspectionReadiness::Invalid,
+            InspectionReadiness::Invalid,
+            None,
+        ),
+        eredu_core::artifact::ArtifactError::InvalidArtifact(_)
+        | eredu_core::artifact::ArtifactError::DuplicateTensor(_)
+        | eredu_core::artifact::ArtifactError::Catalog(_) => (
+            InspectionIssueCode::InvalidConfiguration,
+            InspectionReadiness::Ready,
+            InspectionReadiness::Unverified,
+            InspectionReadiness::Invalid,
+            None,
+        ),
+        _ => {
+            let type_code = parse_unsupported_type_code(&detail);
+            (
+                if type_code.is_some() {
+                    InspectionIssueCode::UnsupportedTensorEncoding
+                } else {
+                    InspectionIssueCode::InvalidContainer
+                },
+                InspectionReadiness::Invalid,
+                InspectionReadiness::Unverified,
+                InspectionReadiness::Unverified,
+                type_code,
+            )
+        }
+    };
+    report.container = container;
+    report.architecture_support = architecture;
+    report.structural_binding = structural;
+    report.model_loadability = if architecture == InspectionReadiness::Unsupported {
+        InspectionReadiness::Unsupported
+    } else {
+        InspectionReadiness::Invalid
+    };
+    report.requested_load = report.model_loadability;
+    report.issues.push(InspectionIssue {
+        code,
+        severity: InspectionSeverity::Error,
+        detail,
+        path: Some(path.to_path_buf()),
+        metadata_key: None,
+        tensor_name: None,
+        tensor_type_code: type_code,
+    });
 }
 
 fn apply_structural_validation(
@@ -971,6 +945,38 @@ fn parse_unsupported_type_code(detail: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    fn write_minimal_llama_gguf(path: &Path, include_embedding_length: bool) {
+        let mut metadata = BTreeMap::from([
+            (
+                "general.architecture".into(),
+                eredu_gguf::MetadataValue::String("llama".into()),
+            ),
+            (
+                "llama.block_count".into(),
+                eredu_gguf::MetadataValue::Uint32(1),
+            ),
+        ]);
+        if include_embedding_length {
+            metadata.insert(
+                "llama.embedding_length".into(),
+                eredu_gguf::MetadataValue::Uint32(1),
+            );
+        }
+        let data = 1.0_f32.to_le_bytes();
+        eredu_gguf::Writer::default()
+            .write(
+                std::fs::File::create(path).unwrap(),
+                &metadata,
+                &[eredu_gguf::TensorInput {
+                    name: "token_embd.weight",
+                    dimensions: &[1],
+                    ggml_type: eredu_gguf::GgmlType::F32,
+                    data: &data,
+                }],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn text_only_architecture_skips_processor_and_media_feature_requirements() {
         let mut report =
@@ -983,5 +989,35 @@ mod tests {
         assert_eq!(report.multimodal, InspectionReadiness::NotApplicable);
         assert!(report.requirements.is_empty());
         assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn gguf_inspection_enriches_the_portable_validated_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        write_minimal_llama_gguf(&path, true);
+
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
+
+        assert_eq!(report.container, InspectionReadiness::Ready);
+        assert_eq!(report.architecture_support, InspectionReadiness::Ready);
+        assert_eq!(report.architecture.as_deref(), Some("llama"));
+        assert_eq!(report.tensor_count, Some(1));
+    }
+
+    #[test]
+    fn gguf_inspection_surfaces_the_portable_admission_floor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        write_minimal_llama_gguf(&path, false);
+
+        let report = inspect_model(&path, MlxInspectionOptions::default()).unwrap();
+
+        assert_eq!(report.container, InspectionReadiness::Ready);
+        assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.detail.contains("llama.embedding_length")));
     }
 }

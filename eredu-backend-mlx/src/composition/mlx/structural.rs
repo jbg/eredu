@@ -72,7 +72,7 @@ pub(crate) fn validate_gguf_preparation(
     checkpoint: &GgufCheckpoint,
     options: ModelLoadOptions,
 ) -> Result<(), Error> {
-    architecture.validate_load_policy(options)?;
+    validate_gguf_load_policy(architecture, options)?;
     if options.preparation_policy()?.residency != eredu_core::ResidencyRequest::ExpertCache {
         return Ok(());
     }
@@ -118,69 +118,12 @@ pub(crate) fn validate_inspected_preparation(
     validate_expert_cache_capability(configuration.kind, capabilities)
 }
 
-pub trait GgufArchitectureValidation {
-    fn validate_load_policy(self, options: ModelLoadOptions) -> Result<(), Error>;
-    fn validate_catalog(
-        self,
-        checkpoint: &GgufCheckpoint,
-        metadata: &HashMap<String, GgufMetadataValue>,
-    ) -> Result<(), Error>;
-}
-
-impl GgufArchitectureValidation for GgufArchitecture {
-    fn validate_load_policy(self, options: ModelLoadOptions) -> Result<(), Error> {
-        options.validate_preparation(self.model_kind(), eredu_core::ArtifactFormat::Gguf)?;
-        Ok(())
-    }
-
-    fn validate_catalog(
-        self,
-        checkpoint: &GgufCheckpoint,
-        metadata: &HashMap<String, GgufMetadataValue>,
-    ) -> Result<(), Error> {
-        if checkpoint.catalog().physical_tensor_count() == 0 {
-            return Err(Error::UnsupportedArchitecture(
-                "GGUF model checkpoint contains no tensors".into(),
-            ));
-        }
-        let prefix = self.metadata_name();
-        for suffix in ["block_count", "embedding_length"] {
-            let key = format!("{prefix}.{suffix}");
-            let value = metadata
-                .get(&key)
-                .and_then(GgufMetadataValue::as_i64)
-                .ok_or_else(|| {
-                    Error::UnsupportedArchitecture(format!(
-                        "GGUF metadata key {key:?} must be a present integer"
-                    ))
-                })?;
-            if value <= 0 {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "GGUF metadata key {key:?} must be positive, got {value}"
-                )));
-            }
-        }
-        if !checkpoint
-            .catalog()
-            .tensors()
-            .any(|tensor| tensor.descriptor().name == "token_embd.weight")
-        {
-            return Err(Error::UnsupportedArchitecture(
-                "GGUF model checkpoint is missing required tensor \"token_embd.weight\"".into(),
-            ));
-        }
-        if matches!(self, Self::Qwen35 | Self::Qwen35Moe | Self::Qwen3Next)
-            && checkpoint.catalog().tensors().any(|tensor| {
-                let name = tensor.descriptor().name.as_str();
-                name.starts_with("v.") || name.starts_with("mm.")
-            })
-        {
-            return Err(Error::UnsupportedArchitecture(
-                "multimodal Qwen3-Next/Qwen3.5 GGUF checkpoints are not supported".into(),
-            ));
-        }
-        Ok(())
-    }
+fn validate_gguf_load_policy(
+    architecture: GgufArchitecture,
+    options: ModelLoadOptions,
+) -> Result<(), Error> {
+    options.validate_preparation(architecture.model_kind(), eredu_core::ArtifactFormat::Gguf)?;
+    Ok(())
 }
 
 pub fn validate_safetensors(
@@ -259,14 +202,14 @@ pub fn validate_gguf(
         GgufArchitecture::DeepSeek4 => validate_neutral_deepseek_v4_gguf(checkpoint, metadata),
         GgufArchitecture::GptOss => validate_neutral_gpt_oss_gguf(checkpoint, metadata),
         GgufArchitecture::Gemma4 => {
-            if let Err(error) = architecture.validate_load_policy(options) {
+            if let Err(error) = validate_gguf_load_policy(architecture, options) {
                 invalid_geometry(error.to_string())
             } else {
                 validate_neutral_gemma4_gguf(checkpoint, metadata)
             }
         }
         GgufArchitecture::Inkling => {
-            if let Err(error) = architecture.validate_load_policy(options) {
+            if let Err(error) = validate_gguf_load_policy(architecture, options) {
                 invalid_geometry(error.to_string())
             } else {
                 validate_neutral_inkling_gguf(checkpoint, metadata)
@@ -280,7 +223,7 @@ pub fn validate_gguf(
         }
         GgufArchitecture::MuseGlimmer => validate_neutral_muse_glimmer_gguf(checkpoint, metadata),
         GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
-            if let Err(error) = architecture.validate_load_policy(options) {
+            if let Err(error) = validate_gguf_load_policy(architecture, options) {
                 invalid_geometry(error.to_string())
             } else {
                 validate_neutral_nemotron_gguf(checkpoint, metadata)
@@ -290,7 +233,7 @@ pub fn validate_gguf(
             validate_neutral_qwen_gguf(checkpoint, metadata)
         }
         architecture @ (GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe) => {
-            if let Err(error) = architecture.validate_load_policy(options) {
+            if let Err(error) = validate_gguf_load_policy(architecture, options) {
                 invalid_geometry(error.to_string())
             } else {
                 validate_neutral_qwen_vl_gguf(architecture, checkpoint, metadata)

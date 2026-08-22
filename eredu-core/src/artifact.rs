@@ -322,7 +322,29 @@ pub struct ArtifactInspection {
     format: ArtifactFormat,
     configuration: ModelConfiguration,
     tensors: TensorCatalog,
-    gguf_checkpoint: Option<GgufCheckpoint>,
+    validated_gguf: Option<ValidatedGguf>,
+}
+
+/// Portable GGUF facts admitted by core inspection.
+///
+/// Backends may enrich this result with runtime-specific compatibility checks,
+/// but do not need to repeat the portable metadata and catalog validation.
+#[derive(Debug, Clone)]
+pub struct ValidatedGguf {
+    architecture: GgufArchitecture,
+    checkpoint: GgufCheckpoint,
+}
+
+impl ValidatedGguf {
+    /// Exact GGUF architecture admitted by portable inspection.
+    pub const fn architecture(&self) -> GgufArchitecture {
+        self.architecture
+    }
+
+    /// Header-only checkpoint admitted by portable inspection.
+    pub fn checkpoint(&self) -> &GgufCheckpoint {
+        &self.checkpoint
+    }
 }
 
 impl ArtifactInspection {
@@ -342,9 +364,13 @@ impl ArtifactInspection {
     pub fn tensors(&self) -> &TensorCatalog {
         &self.tensors
     }
+    /// Validated portable GGUF result, when applicable.
+    pub fn validated_gguf(&self) -> Option<&ValidatedGguf> {
+        self.validated_gguf.as_ref()
+    }
     /// Portable GGUF checkpoint handle, when applicable.
     pub fn gguf_checkpoint(&self) -> Option<&GgufCheckpoint> {
-        self.gguf_checkpoint.as_ref()
+        self.validated_gguf().map(ValidatedGguf::checkpoint)
     }
 }
 
@@ -424,12 +450,12 @@ impl ModelPreparationPlan {
     }
     /// Consume the plan into its portable artifact and policy.
     pub fn into_parts(self) -> (ModelArtifact, PreparationPolicy, MaterializationRoute) {
-        let artifact = match self.inspection.gguf_checkpoint {
-            Some(checkpoint) => ModelArtifact::Gguf {
+        let artifact = match self.inspection.validated_gguf {
+            Some(validated) => ModelArtifact::Gguf {
                 path: self.inspection.path,
                 configuration: self.inspection.configuration,
                 tensors: self.inspection.tensors,
-                checkpoint,
+                checkpoint: validated.checkpoint,
             },
             None => ModelArtifact::SafeTensors {
                 path: self.inspection.path,
@@ -572,7 +598,10 @@ fn inspect_gguf(path: &Path) -> Result<ArtifactInspection, ArtifactError> {
             gguf_architecture: Some(architecture),
         },
         tensors,
-        gguf_checkpoint: Some(checkpoint),
+        validated_gguf: Some(ValidatedGguf {
+            architecture,
+            checkpoint,
+        }),
     })
 }
 
@@ -688,7 +717,7 @@ fn inspect_safetensors(path: &Path) -> Result<ArtifactInspection, ArtifactError>
         format: ArtifactFormat::SafeTensors,
         configuration,
         tensors,
-        gguf_checkpoint: None,
+        validated_gguf: None,
     })
 }
 
@@ -1043,11 +1072,12 @@ mod tests {
             )
             .unwrap();
 
-        let plan = plan_model_preparation(
-            inspect_artifact(&path).unwrap(),
-            PreparationPolicy::default(),
-        )
-        .unwrap();
+        let inspection = inspect_artifact(&path).unwrap();
+        let validated = inspection.validated_gguf().unwrap();
+        assert_eq!(validated.architecture(), GgufArchitecture::Llama);
+        assert_eq!(validated.checkpoint().physical_tensor_count(), 1);
+
+        let plan = plan_model_preparation(inspection, PreparationPolicy::default()).unwrap();
         let ModelArtifact::Gguf {
             configuration,
             checkpoint,

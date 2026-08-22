@@ -50,7 +50,7 @@ pub use artifact::{
     gguf_u32_metadata_values, inspect_artifact, plan_model_preparation,
     resolve_model_configuration, validate_preparation_policy, ArtifactFormat, ArtifactInspection,
     GgufArchitecture, MaterializationRoute, ModelArtifact, ModelConfiguration, ModelKind,
-    ModelPreparationPlan, PreparationPolicy, QuantizationRequest, ResidencyRequest,
+    ModelPreparationPlan, PreparationPolicy, QuantizationRequest, ResidencyRequest, ValidatedGguf,
 };
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use automatic::{

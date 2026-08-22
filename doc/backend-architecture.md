@@ -163,6 +163,11 @@ Artifact loading has four stages:
 4. The selected backend materializes the plan into its executable model and
    creates a stateful session.
 
+For GGUF artifacts, `ArtifactInspection::validated_gguf` is the authoritative
+handoff from stage 1. Backends may wrap its portable checkpoint handle and add
+architecture or device compatibility checks, but do not repeat the portable
+tensor-count, required-metadata, embedding, or multimodal admission floor.
+
 `ModelLoadingBackend` implements backend policy, architecture/backend
 capability intersection, and materialization.
 `Backend::create_session` consumes a `PreparedModel`, so an executable cannot
