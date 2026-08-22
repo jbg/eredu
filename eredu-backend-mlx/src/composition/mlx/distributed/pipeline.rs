@@ -5318,6 +5318,77 @@ fn pipeline_prompt_cache_identity(
     }
 }
 
+fn gemma4_pipeline_prompt_cache_identity(
+    args: &eredu_architectures::gemma4::FamilyConfig,
+    topology: MlxParallelContext,
+    range: Range<usize>,
+    layout: &eredu_runtime::StateLayout,
+) -> Result<PromptCacheModelIdentity, Error> {
+    if layout.len() != range.len() {
+        return Err(Error::Parallel(format!(
+            "Gemma 4 pipeline cache layout has {} entries for stage range {range:?}",
+            layout.len()
+        )));
+    }
+    eredu_runtime::ModelStateIdentity {
+        model_family: "gemma4".into(),
+        effective_model_type: args.model_type.clone(),
+        architecture_fingerprint: args.text.architecture_fingerprint(),
+        layer_count: args.text.num_hidden_layers(),
+        global_layer_start: range.start,
+        sink_tokens: 0,
+        layer_prefix_offsets: vec![0; layout.len()],
+        topology: crate::backend::mlx::cache::prompt_cache_topology(topology),
+    }
+    .prompt_cache_identity(layout)
+    .map_err(|error| Error::Parallel(error.to_string()))
+}
+
+#[cfg(test)]
+#[test]
+fn gemma4_pipeline_cache_identity_does_not_reslice_rank_local_layout() {
+    let args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
+        br#"{
+          "model_type":"gemma4", "tie_word_embeddings":true,
+          "text_config":{
+            "model_type":"gemma4_text", "hidden_size":16,
+            "num_hidden_layers":4, "intermediate_size":32,
+            "num_attention_heads":4, "num_key_value_heads":2, "head_dim":4,
+            "rms_norm_eps":0.000001, "vocab_size":64,
+            "max_position_embeddings":128,
+            "layer_types":[
+              "full_attention", "sliding_attention",
+              "full_attention", "sliding_attention"
+            ],
+            "sliding_window":16
+          }
+        }"#,
+    )
+    .unwrap();
+    let range = args.text.pipeline_layer_ranges(2).unwrap()[1].clone();
+    assert!(range.start > 0);
+    let complete = eredu_architectures::gemma4::state_layout(&args.text).unwrap();
+    let local = decoder_partition_state_layout(&complete, range.clone()).unwrap();
+    let topology = MlxParallelContext::for_rank(
+        1,
+        1,
+        2,
+        1,
+        crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+    )
+    .unwrap();
+
+    let identity =
+        gemma4_pipeline_prompt_cache_identity(&args, topology, range.clone(), &local).unwrap();
+
+    assert_eq!(
+        identity.global_layer_start..identity.global_layer_end,
+        range
+    );
+    assert_eq!(identity.layer_layout, *local.layers());
+    assert_eq!(identity.layer_count, args.text.num_hidden_layers());
+}
+
 fn attention_window_i32(
     attention: eredu_core::AttentionPolicy,
     global_layer: usize,
@@ -6845,41 +6916,7 @@ impl PipelinePartitionMetadata for Gemma4PipelinePartition {
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layout = self.state_layout()?;
-        let mut complete = eredu_runtime::ModelStateIdentity {
-            model_family: "gemma4".into(),
-            effective_model_type: self.args().model_type.clone(),
-            architecture_fingerprint: self.args().text.architecture_fingerprint(),
-            layer_count: layout.len(),
-            global_layer_start: 0,
-            sink_tokens: 0,
-            layer_prefix_offsets: vec![0; layout.len()],
-            topology: Default::default(),
-        }
-        .prompt_cache_identity(&layout)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        if topology.tensor_parallel_size > 1 {
-            complete.topology = crate::backend::mlx::cache::prompt_cache_topology(topology);
-        }
-        let layout = eredu_core::LayerSchedule::new(
-            self.range().len(),
-            complete
-                .layer_layout
-                .iter()
-                .skip(self.range().start)
-                .take(self.range().len())
-                .cloned()
-                .collect(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "gemma4",
-            &complete.effective_model_type,
-            complete.architecture_fingerprint,
-            self.args().text.num_hidden_layers(),
-            self.range().clone(),
-            layout,
-        ))
+        gemma4_pipeline_prompt_cache_identity(self.args(), topology, self.range().clone(), &layout)
     }
 }
 
