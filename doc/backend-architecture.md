@@ -209,7 +209,10 @@ internally between reusable backend mechanics and family/backend composition:
   optional distributed context.
 - neural-network modules implement reusable MLX tensor operations;
 - runtime modules implement checkpoint materialization, sampling, caches,
-  residency workers, media processing, and collectives; and
+  residency workers, media processing, and collectives;
+- generic layerwise policy construction validates any composition-supplied
+  execution layout against the layout derived from the concrete neutral
+  architecture before binding checkpoint units; and
 - MLX events provide exact completion while retaining arrays and source
   resources required by submitted work.
 

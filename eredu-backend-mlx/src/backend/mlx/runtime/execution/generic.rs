@@ -584,6 +584,42 @@ fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error>
     Ok(largest)
 }
 
+fn validate_policy_layout(
+    canonical: ExecutionUnitLayout,
+    supplied: ExecutionUnitLayout,
+) -> Result<ExecutionUnitLayout, Error> {
+    if supplied != canonical {
+        return Err(Error::UnsupportedArchitecture(
+            "layerwise execution layout differs from the architecture-declared layout".into(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn architecture_policy_layout<A, S>(
+    architecture: &A,
+    supplied: ExecutionUnitLayout,
+) -> Result<ExecutionUnitLayout, Error>
+where
+    A: LayeredArchitecture<MlxBackend, S>,
+    S: RuntimeState<MlxBackend>,
+    A::Error: std::fmt::Display,
+{
+    let graph = architecture
+        .execution_graph()
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let counts = (0..graph.groups().len())
+        .map(|group| {
+            architecture
+                .group_unit_count(group)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let canonical = ExecutionUnitLayout::new(&graph, counts)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    validate_policy_layout(canonical, supplied)
+}
+
 /// Builds a generic MLX layerwise policy from neutral parameter topologies.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_layerwise_policy<A, S, P, I>(
@@ -660,6 +696,7 @@ where
         &Stream,
     ) -> Result<Vec<WeightBinding>, Error>,
 {
+    let layout = architecture_policy_layout::<A, S>(architecture, layout)?;
     let unit_count = layout.len();
     if unit_count == 0 {
         return Err(Error::Parallel(
@@ -1076,5 +1113,38 @@ impl<U, P> Drop for MlxLayerwisePolicy<U, P> {
         for (event, _) in &self.pending {
             let _ = event.synchronize();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eredu_runtime::{ExecutionGraph, ExecutionGroupSpec};
+
+    #[test]
+    fn policy_layout_rejects_equal_length_reordered_groups() {
+        let canonical_graph = ExecutionGraph::new(
+            vec![
+                ExecutionGroupSpec::root("vision"),
+                ExecutionGroupSpec::with_dependencies("text", ["vision"]),
+            ],
+            "text",
+        )
+        .unwrap();
+        let supplied_graph = ExecutionGraph::new(
+            vec![
+                ExecutionGroupSpec::root("text"),
+                ExecutionGroupSpec::with_dependencies("vision", ["text"]),
+            ],
+            "vision",
+        )
+        .unwrap();
+        let canonical = ExecutionUnitLayout::new(&canonical_graph, [1, 1]).unwrap();
+        let supplied = ExecutionUnitLayout::new(&supplied_graph, [1, 1]).unwrap();
+
+        let error = validate_policy_layout(canonical, supplied).unwrap_err();
+
+        assert!(matches!(error, Error::UnsupportedArchitecture(message)
+            if message.contains("architecture-declared layout")));
     }
 }
