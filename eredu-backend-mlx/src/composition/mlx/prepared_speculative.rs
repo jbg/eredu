@@ -79,53 +79,17 @@ pub fn validate_external_drafter(
         (Model::Gemma4(target), MlxDrafterKind::Gemma4Assistant) => {
             let assistant = drafter.gemma4();
             let target = &target.args().text;
-            let draft = &assistant.config.text_config;
-            if assistant.config.backbone_hidden_size != target.hidden_size
-                || draft.vocab_size != target.vocab_size
-                || assistant.max_proposals() == 0
-            {
-                return Err(Error::UnsupportedArchitecture(
-                    "Gemma 4 assistant hidden width, vocabulary, or block size does not match the target"
-                        .into(),
-                ));
-            }
-            for (layer, draft_policy) in draft.layer_schedule.iter().enumerate() {
-                let Some(target_policy) = target.layer_schedule.iter().find(|policy| {
-                    policy.attention == draft_policy.attention && policy.key_value.publishes_state()
-                }) else {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "Gemma 4 assistant layer {layer} requires {:?} shared state with no target publisher",
-                        draft_policy.attention
-                    )));
-                };
-                if draft_policy.num_key_value_heads != target_policy.num_key_value_heads
-                    || draft_policy.head_dim != target_policy.head_dim
-                    || draft.rope_theta_for(draft_policy.attention).to_bits()
-                        != target.rope_theta_for(target_policy.attention).to_bits()
-                {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "Gemma 4 assistant layer {layer} shared-KV or rotary geometry does not match its target publisher"
-                    )));
-                }
-            }
+            let _compatibility = assistant
+                .config
+                .prove_compatibility(target)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         }
         (Model::MuseGlimmer(target), MlxDrafterKind::MuseGlimmerDFlash) => {
             let assistant = drafter.muse_glimmer();
-            let target_args = target.args();
-            if assistant.config.hidden_size != target_args.hidden_size
-                || assistant
-                    .config
-                    .target_layer_ids
-                    .iter()
-                    .any(|layer| *layer >= target_args.num_hidden_layers as usize)
-                || assistant.config.mask_token_id >= target_args.vocab_size as u32
-                || assistant.config.block_size != 16
-            {
-                return Err(Error::UnsupportedArchitecture(
-                    "Muse-Glimmer DFlash hidden geometry, layer mapping, mask token, or block size does not match the target"
-                        .into(),
-                ));
-            }
+            let _compatibility = assistant
+                .config
+                .prove_compatibility(target.args())
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         }
         (model, kind) => {
             return Err(Error::UnsupportedArchitecture(format!(

@@ -14,8 +14,9 @@ pub mod text;
 pub mod vision;
 
 pub use assistant::{
-    assistant_gguf_plan, translate_assistant_gguf_weight_name, Assistant, AssistantConfig,
-    AssistantConfigError, AssistantOutput, AssistantState,
+    assistant_gguf_plan, translate_assistant_gguf_weight_name, Assistant, AssistantCompatibility,
+    AssistantCompatibilityError, AssistantConfig, AssistantConfigError, AssistantOutput,
+    AssistantState,
 };
 pub use audio::{AudioConfig, AudioConfigError, AudioInput, AudioLayer, AudioStatic, AudioTower};
 pub use checkpoint::{

@@ -212,6 +212,12 @@ probability arithmetic, random state, cache checkpoints, and concrete
 completion values. Embedded prediction heads and external assistant models use
 the same portable lifecycle.
 
+Architecture families also own external-assistant compatibility proofs. Those
+proofs match target-state publishers, hidden and rotary geometry, target-layer
+captures, and vocabulary requirements before a concrete backend composes the
+two executables. Backend composition may enforce the proof, but must not
+restate family-specific compatibility rules.
+
 ## Scheduling and cancellation
 
 The core scheduler owns queued, prepared, submitted, committed, failed,

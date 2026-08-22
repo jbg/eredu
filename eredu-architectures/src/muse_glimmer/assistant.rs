@@ -29,6 +29,60 @@ pub enum DFlashConfigError {
     Invalid(String),
 }
 
+/// Why a Muse-Glimmer DFlash assistant cannot be paired with a target decoder.
+#[derive(Debug, thiserror::Error)]
+pub enum DFlashCompatibilityError {
+    /// The target-state encoder and decoder hidden widths differ.
+    #[error("Muse-Glimmer DFlash hidden width {assistant} does not match target width {target}")]
+    HiddenWidth {
+        /// Assistant encoder width.
+        assistant: i32,
+        /// Target decoder width.
+        target: i32,
+    },
+    /// A requested target state does not exist.
+    #[error("Muse-Glimmer DFlash target layer {layer} is outside decoder depth {target_layers}")]
+    TargetLayer {
+        /// Zero-based target state requested by the assistant.
+        layer: usize,
+        /// Number of target decoder layers.
+        target_layers: usize,
+    },
+    /// The assistant mask token is not representable by the target token table.
+    #[error(
+        "Muse-Glimmer DFlash mask token {mask_token_id} is outside target vocabulary {vocabulary}"
+    )]
+    Vocabulary {
+        /// Assistant mask token.
+        mask_token_id: u32,
+        /// Target vocabulary row count.
+        vocabulary: i32,
+    },
+    /// The public DFlash transaction requires anchor plus fifteen mask positions.
+    #[error("Muse-Glimmer DFlash block size must be 16, found {0}")]
+    BlockSize(usize),
+}
+
+/// Architecture-owned proof of DFlash target-state and vocabulary compatibility.
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[must_use = "the compatibility proof should gate assistant/target composition"]
+pub struct DFlashCompatibility {
+    target_layer_ids: Box<[usize]>,
+    target_vocabulary: u32,
+}
+
+impl DFlashCompatibility {
+    /// Returns the validated zero-based target states consumed by DFlash.
+    pub fn target_layer_ids(&self) -> &[usize] {
+        &self.target_layer_ids
+    }
+
+    /// Returns the validated target token-table row count.
+    pub const fn target_vocabulary(&self) -> u32 {
+        self.target_vocabulary
+    }
+}
+
 /// Canonical DFlash checkpoint geometry.
 #[derive(Debug, Clone)]
 pub struct DFlashConfig {
@@ -228,6 +282,47 @@ impl DFlashConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Proves that the target exposes every state and token required by DFlash.
+    ///
+    /// This relationship is independent of tensor storage and execution backend.
+    pub fn prove_compatibility(
+        &self,
+        target: &super::DecoderConfig,
+    ) -> Result<DFlashCompatibility, DFlashCompatibilityError> {
+        if self.hidden_size != target.hidden_size {
+            return Err(DFlashCompatibilityError::HiddenWidth {
+                assistant: self.hidden_size,
+                target: target.hidden_size,
+            });
+        }
+        let target_layers = usize::try_from(target.num_hidden_layers).unwrap_or(0);
+        if let Some(layer) = self
+            .target_layer_ids
+            .iter()
+            .copied()
+            .find(|layer| *layer >= target_layers)
+        {
+            return Err(DFlashCompatibilityError::TargetLayer {
+                layer,
+                target_layers,
+            });
+        }
+        let target_vocabulary = u32::try_from(target.vocab_size).unwrap_or(0);
+        if self.mask_token_id >= target_vocabulary {
+            return Err(DFlashCompatibilityError::Vocabulary {
+                mask_token_id: self.mask_token_id,
+                vocabulary: target.vocab_size,
+            });
+        }
+        if self.block_size != 16 {
+            return Err(DFlashCompatibilityError::BlockSize(self.block_size));
+        }
+        Ok(DFlashCompatibility {
+            target_layer_ids: self.target_layer_ids.clone().into_boxed_slice(),
+            target_vocabulary,
+        })
     }
 
     fn linear_format_for(&self, name: &str) -> eredu_checkpoint::LinearFormat {
@@ -902,6 +997,30 @@ fn bidirectional_block_mask<T: Tensor>(
 mod tests {
     use super::*;
 
+    fn target() -> super::super::DecoderConfig {
+        let value = serde_json::json!({
+            "architectures":["MuseGlimmerForConditionalGeneration"],"model_type":"muse_glimmer",
+            "image_token_id":22,"video_token_id":23,"out_hidden_size":32,"projector_hidden_size":16,
+            "text_config":{"model_type":"muse_glimmer_text","hidden_size":16,"num_hidden_layers":2,
+              "intermediate_size":24,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+              "rms_norm_eps":0.00001,"post_norm_eps":0.00001,"vocab_size":24,"max_position_embeddings":64,
+              "rope_theta":10000.0,"layer_types":["sliding_attention","full_attention"],
+              "layer_rope_theta":[10000.0,0.0],"sliding_window":8,"tie_word_embeddings":false,
+              "hidden_act":"silu","attention_dropout":0.0,"qk_scale_factor":1.0,
+              "output_multiplier":1.0,"final_logit_softcapping":30.0},
+            "vision_config":{"model_type":"muse_glimmer_vision","hidden_size":8,"intermediate_size":12,
+              "num_attention_heads":2,"num_hidden_layers":1,"patch_size":2,"patch_temporal":1,
+              "merge_size":2,"pos_emb_height":2,"pos_emb_width":2,"max_position_embeddings":4,
+              "layer_norm_eps":0.00001,"hidden_act":"gelu","layer_types":["full_attention"],
+              "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"}}
+        });
+        let mut target = super::super::DecoderConfig::from_hf_value(&value).unwrap();
+        target.hidden_size = 6656;
+        target.num_hidden_layers = 50;
+        target.vocab_size = 201819;
+        target
+    }
+
     fn released() -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
           "model_type":"muse_glimmer_assistant","hidden_size":6656,"intermediate_size":19968,
@@ -922,5 +1041,27 @@ mod tests {
         assert_eq!(config.block_size, 16);
         assert_eq!(context_append_start(Some(7), 3, 10).unwrap(), 7);
         assert!(context_append_start(Some(6), 3, 10).is_err());
+    }
+
+    #[test]
+    fn proves_target_layer_and_vocabulary_compatibility_without_a_backend() {
+        let config = DFlashConfig::from_hf_json(&released()).unwrap();
+        let mut target = target();
+
+        let proof = config.prove_compatibility(&target).unwrap();
+        assert_eq!(proof.target_layer_ids(), [1, 13, 25, 37, 49]);
+        assert_eq!(proof.target_vocabulary(), 201819);
+
+        target.num_hidden_layers = 49;
+        assert!(matches!(
+            config.prove_compatibility(&target),
+            Err(DFlashCompatibilityError::TargetLayer { layer: 49, .. })
+        ));
+        target.num_hidden_layers = 50;
+        target.vocab_size = 201818;
+        assert!(matches!(
+            config.prove_compatibility(&target),
+            Err(DFlashCompatibilityError::Vocabulary { .. })
+        ));
     }
 }

@@ -6,7 +6,7 @@ use eredu_checkpoint::{
     schema::{GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint, TensorOperation},
     LinearFormat, WeightQuantization,
 };
-use eredu_core::LayerSchedule;
+use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_gguf::MetadataValue;
 use eredu_nn::{
     multimodal::{masked_output_projection, MaskedOutputProjectionInput},
@@ -30,6 +30,66 @@ pub enum AssistantConfigError {
     /// Assistant geometry is unsupported.
     #[error("{0}")]
     Invalid(String),
+}
+
+/// Why a Gemma 4 assistant cannot share state with a target decoder.
+#[derive(Debug, thiserror::Error)]
+pub enum AssistantCompatibilityError {
+    /// The assistant captures a different target hidden width.
+    #[error(
+        "Gemma 4 assistant target hidden width {assistant} does not match decoder width {target}"
+    )]
+    HiddenWidth {
+        /// Width captured by the assistant.
+        assistant: i32,
+        /// Target decoder width.
+        target: i32,
+    },
+    /// Assistant and target token tables have different row counts.
+    #[error("Gemma 4 assistant vocabulary {assistant} does not match target vocabulary {target}")]
+    Vocabulary {
+        /// Assistant token-table rows.
+        assistant: i32,
+        /// Target token-table rows.
+        target: i32,
+    },
+    /// A mutable or otherwise invalid assistant config has no proposal slot.
+    #[error("Gemma 4 assistant block size must include at least one proposal")]
+    EmptyProposalBlock,
+    /// No target layer publishes the attention-state class an assistant layer consumes.
+    #[error(
+        "Gemma 4 assistant layer {assistant_layer} requires {attention:?} shared state with no target publisher"
+    )]
+    MissingPublisher {
+        /// Zero-based assistant layer.
+        assistant_layer: usize,
+        /// Required full/sliding attention-state class.
+        attention: AttentionPolicy,
+    },
+    /// The selected publisher uses different KV heads, head width, or rotary policy.
+    #[error(
+        "Gemma 4 assistant layer {assistant_layer} shared-KV or rotary geometry does not match target publisher {target_layer}"
+    )]
+    PublisherGeometry {
+        /// Zero-based assistant layer.
+        assistant_layer: usize,
+        /// Zero-based target publisher layer.
+        target_layer: usize,
+    },
+}
+
+/// Architecture-owned proof that every assistant shared-KV input has a compatible target publisher.
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[must_use = "the compatibility proof should gate assistant/target composition"]
+pub struct AssistantCompatibility {
+    target_publisher_layers: Box<[usize]>,
+}
+
+impl AssistantCompatibility {
+    /// Returns the selected target publisher for each assistant layer in order.
+    pub fn target_publisher_layers(&self) -> &[usize] {
+        &self.target_publisher_layers
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,6 +300,64 @@ impl AssistantConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Proves that this assistant can consume shared state from `target`.
+    ///
+    /// This relationship is independent of tensor storage and execution backend.
+    pub fn prove_compatibility(
+        &self,
+        target: &ModelArgs,
+    ) -> Result<AssistantCompatibility, AssistantCompatibilityError> {
+        if self.backbone_hidden_size != target.hidden_size {
+            return Err(AssistantCompatibilityError::HiddenWidth {
+                assistant: self.backbone_hidden_size,
+                target: target.hidden_size,
+            });
+        }
+        if self.text_config.vocab_size != target.vocab_size {
+            return Err(AssistantCompatibilityError::Vocabulary {
+                assistant: self.text_config.vocab_size,
+                target: target.vocab_size,
+            });
+        }
+        if self.block_size < 2 {
+            return Err(AssistantCompatibilityError::EmptyProposalBlock);
+        }
+
+        let mut target_publisher_layers = Vec::with_capacity(self.text_config.num_hidden_layers());
+        for (assistant_layer, draft_policy) in self.text_config.layer_schedule.iter().enumerate() {
+            let Some((target_layer, target_policy)) = target
+                .layer_schedule
+                .iter()
+                .enumerate()
+                .find(|(_, policy)| {
+                    policy.attention == draft_policy.attention && policy.key_value.publishes_state()
+                })
+            else {
+                return Err(AssistantCompatibilityError::MissingPublisher {
+                    assistant_layer,
+                    attention: draft_policy.attention,
+                });
+            };
+            if draft_policy.num_key_value_heads != target_policy.num_key_value_heads
+                || draft_policy.head_dim != target_policy.head_dim
+                || self
+                    .text_config
+                    .rope_theta_for(draft_policy.attention)
+                    .to_bits()
+                    != target.rope_theta_for(target_policy.attention).to_bits()
+            {
+                return Err(AssistantCompatibilityError::PublisherGeometry {
+                    assistant_layer,
+                    target_layer,
+                });
+            }
+            target_publisher_layers.push(target_layer);
+        }
+        Ok(AssistantCompatibility {
+            target_publisher_layers: target_publisher_layers.into_boxed_slice(),
+        })
     }
 }
 
@@ -664,5 +782,28 @@ mod tests {
         value["num_centroids"] = 4.into();
         value["quantization"] = serde_json::json!({"bits":4,"group_size":32});
         assert!(AssistantConfig::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn proves_target_shared_kv_publishers_without_a_backend() {
+        let config = AssistantConfig::from_json(CONFIG.as_bytes()).unwrap();
+        let mut target = config.text_config.clone();
+        let mut publisher = *target.layer_schedule.get(0).unwrap();
+        publisher.key_value = AttentionStateSource::Publish {
+            value: eredu_nn::AttentionValueSource::Projected,
+        };
+        target.layer_schedule = LayerSchedule::new(1, vec![publisher]).unwrap();
+
+        let proof = config.prove_compatibility(&target).unwrap();
+        assert_eq!(proof.target_publisher_layers(), [0]);
+
+        publisher.key_value = AttentionStateSource::Local {
+            value: eredu_nn::AttentionValueSource::Projected,
+        };
+        target.layer_schedule = LayerSchedule::new(1, vec![publisher]).unwrap();
+        assert!(matches!(
+            config.prove_compatibility(&target),
+            Err(AssistantCompatibilityError::MissingPublisher { .. })
+        ));
     }
 }
