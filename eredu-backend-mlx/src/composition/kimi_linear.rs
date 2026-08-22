@@ -1,7 +1,7 @@
 //! Neutral Kimi Linear/Kimi Linear-MoE composition over MLX execution policies.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     path::Path,
     sync::Arc,
 };
@@ -33,9 +33,8 @@ use crate::{
             checkpoint::{
                 binding::{
                     binding_bytes, build_module_bindings,
-                    build_module_bindings_with_recipes_excluding, canonical_checkpoint_name,
-                    parameter_name_in_targets, parameter_role_targets,
-                    populate_module_from_lease_excluding,
+                    build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
+                    parameter_role_targets, populate_module_from_lease_excluding,
                 },
                 binding_plan::{BindingPlan, PlannedBinding},
                 load::{gguf_quantization_configs, GgufTensorNames},
@@ -271,13 +270,7 @@ impl KimiLinearBindings {
             )?,
             ParameterRole::ExpertIntermediate,
         );
-        let recipes = unit_recipes(
-            store,
-            architecture.args(),
-            index,
-            !self.external_experts,
-            &expert_targets,
-        )?;
+        let recipes = unit_recipes(store, architecture.args(), index, !self.external_experts)?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
             self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
@@ -402,190 +395,14 @@ fn resolve_store(
     ))
 }
 
-fn expert_source_from_normalized(
-    normalized: &BTreeMap<String, String>,
-    prefix: &str,
-    expert: i32,
-    projections: &[&str],
-) -> Result<DerivedWeightRecipe, Error> {
-    let runtime = projections
-        .iter()
-        .map(|projection| format!("{prefix}.{expert}.{projection}.weight"))
-        .find(|candidate| normalized.contains_key(candidate))
-        .ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
-                "Kimi Linear checkpoint is missing expert {expert} projection under {prefix}"
-            ))
-        })?;
-    let key = normalized
-        .get(&runtime)
-        .expect("normalized Kimi expert key exists");
-    Ok(DerivedWeightRecipe::source(
-        key,
-        eredu_checkpoint::store::TensorSelection::Full,
-    ))
-}
-
-fn expert_source(
-    store: &dyn CheckpointSource,
-    prefix: &str,
-    expert: i32,
-    projections: &[&str],
-) -> Result<DerivedWeightRecipe, Error> {
-    expert_source_from_normalized(
-        &normalized_checkpoint_keys(store),
-        prefix,
-        expert,
-        projections,
-    )
-}
-
-fn normalized_checkpoint_keys(store: &dyn CheckpointSource) -> BTreeMap<String, String> {
-    store
-        .source_keys()
-        .into_iter()
-        .map(|raw| {
-            let runtime = canonical_checkpoint_name(&raw).replace(".block_sparse_moe.", ".mlp.");
-            (runtime, raw)
-        })
-        .collect()
-}
-
 fn unit_recipes(
     store: &dyn CheckpointSource,
     args: &ModelArgs,
     layer: usize,
     include_experts: bool,
-    expert_targets: &BTreeSet<String>,
-) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
-    use eredu_checkpoint::store::TensorSelection;
-
-    let mut recipes = BTreeMap::new();
-    let root = format!("model.layers.{layer}");
-    let normalized = normalized_checkpoint_keys(store);
-    for (runtime, raw) in &normalized {
-        if runtime.starts_with(&format!("{root}.mlp."))
-            && !parameter_name_in_targets(runtime, expert_targets)
-            && runtime != raw
-        {
-            recipes.insert(
-                runtime.clone(),
-                DerivedWeightRecipe::source(raw, TensorSelection::Full),
-            );
-        }
-    }
-    let attention = format!("{root}.self_attn");
-    let projection = (args.kda_config.num_heads * args.kda_config.head_dim) as usize;
-    for local in ["q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"] {
-        let name = format!("{attention}.{local}");
-        if store.source_metadata(&name).is_ok() {
-            recipes.insert(
-                name.clone(),
-                DerivedWeightRecipe::Reshape {
-                    input: Box::new(DerivedWeightRecipe::source(&name, TensorSelection::Full)),
-                    shape: vec![
-                        projection,
-                        1,
-                        args.kda_config.short_conv_kernel_size as usize,
-                    ],
-                },
-            );
-        }
-    }
-    let a_log = format!("{attention}.A_log");
-    if store.source_metadata(&a_log).is_ok() {
-        let mut recipe = DerivedWeightRecipe::Reshape {
-            input: Box::new(DerivedWeightRecipe::source(&a_log, TensorSelection::Full)),
-            shape: vec![1, 1, args.kda_config.num_heads as usize, 1],
-        };
-        if store.source_diagnostics()?.backend == eredu_checkpoint::store::WeightStoreBackend::Gguf
-        {
-            recipe = DerivedWeightRecipe::NegLog {
-                input: Box::new(recipe),
-            };
-        }
-        recipes.insert(a_log, recipe);
-    }
-    let policy = args.layer_policy(layer).ok_or_else(|| {
-        Error::UnsupportedArchitecture(format!("Kimi Linear has no layer policy {layer}"))
-    })?;
-    if !include_experts
-        || policy.feed_forward != eredu_architectures::kimi_linear::FeedForwardPolicy::SparseMoe
-    {
-        return Ok(recipes);
-    }
-    let prefix = format!("{root}.mlp.experts");
-    let gate_up = format!("{prefix}.gate_up_proj");
-    let down = format!("{prefix}.down_proj");
-    if let (Some(gate_up_source), Some(down_source)) =
-        (normalized.get(&gate_up), normalized.get(&down))
-    {
-        if gate_up_source != &gate_up {
-            recipes.insert(
-                gate_up.clone(),
-                DerivedWeightRecipe::source(gate_up_source, TensorSelection::Full),
-            );
-        }
-        if down_source != &down {
-            recipes.insert(
-                down.clone(),
-                DerivedWeightRecipe::source(down_source, TensorSelection::Full),
-            );
-        }
-        return Ok(recipes);
-    }
-    let gate = format!("{prefix}.gate_proj");
-    let up = format!("{prefix}.up_proj");
-    if normalized.contains_key(&gate) && normalized.contains_key(&up) {
-        recipes.insert(
-            gate_up,
-            DerivedWeightRecipe::Concatenate {
-                axis: 1,
-                inputs: [gate, up]
-                    .into_iter()
-                    .map(|runtime| {
-                        DerivedWeightRecipe::source(
-                            normalized.get(&runtime).expect("normalized projection key"),
-                            TensorSelection::Full,
-                        )
-                    })
-                    .collect(),
-            },
-        );
-        return Ok(recipes);
-    }
-    let mut gate_up_inputs = Vec::new();
-    let mut down_inputs = Vec::new();
-    for expert in 0..args.num_experts {
-        gate_up_inputs.push(DerivedWeightRecipe::Concatenate {
-            axis: 0,
-            inputs: vec![
-                expert_source_from_normalized(&normalized, &prefix, expert, &["w1", "gate_proj"])?,
-                expert_source_from_normalized(&normalized, &prefix, expert, &["w3", "up_proj"])?,
-            ],
-        });
-        down_inputs.push(expert_source_from_normalized(
-            &normalized,
-            &prefix,
-            expert,
-            &["w2", "down_proj"],
-        )?);
-    }
-    recipes.insert(
-        gate_up,
-        DerivedWeightRecipe::Stack {
-            axis: 0,
-            inputs: gate_up_inputs,
-        },
-    );
-    recipes.insert(
-        down,
-        DerivedWeightRecipe::Stack {
-            axis: 0,
-            inputs: down_inputs,
-        },
-    );
-    Ok(recipes)
+) -> Result<std::collections::BTreeMap<String, DerivedWeightRecipe>, Error> {
+    eredu_architectures::kimi_linear::unit_recipes(store, args, layer, include_experts)
+        .map_err(Error::UnsupportedArchitecture)
 }
 
 fn planned_expert_binding(
@@ -606,139 +423,24 @@ pub fn expert_catalog(
     args: &ModelArgs,
     store: &dyn CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    use eredu_checkpoint::store::TensorSelection;
-
     if !args.has_sparse_moe_layers() {
         return Err(Error::UnsupportedArchitecture(
             "independent expert caching requires Kimi Linear-MoE".into(),
         ));
     }
-    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut entries = Vec::new();
     for (layer, policy) in args.layer_schedule.iter().enumerate() {
         if policy.feed_forward != eredu_architectures::kimi_linear::FeedForwardPolicy::SparseMoe {
             continue;
         }
-        let prefix = format!("model.layers.{layer}.mlp.experts");
-        let packed_gate_up = format!("{prefix}.gate_up_proj");
-        let packed_down = format!("{prefix}.down_proj");
         for expert in 0..args.num_experts as usize {
             let identity = ExpertIdentity::new(layer, expert);
-            let selection = TensorSelection::Range {
-                axis: 0,
-                start: expert,
-                end: expert + 1,
-            };
-            let mut planned = Vec::new();
-            if keys.contains(&packed_gate_up) && keys.contains(&packed_down) {
-                for (name, key) in [
-                    ("gate_up_proj", packed_gate_up.clone()),
-                    ("down_proj", packed_down.clone()),
-                ] {
-                    planned.push(planned_expert_binding(
-                        name,
-                        DerivedWeightRecipe::source(key, selection.clone()),
-                        store,
-                    )?);
-                }
-                for (name, key) in [
-                    ("gate_up_proj_scales", format!("{packed_gate_up}_scales")),
-                    ("gate_up_proj_biases", format!("{packed_gate_up}_biases")),
-                    ("down_proj_scales", format!("{packed_down}_scales")),
-                    ("down_proj_biases", format!("{packed_down}_biases")),
-                ] {
-                    if keys.contains(&key) {
-                        planned.push(planned_expert_binding(
-                            name,
-                            DerivedWeightRecipe::source(key, selection.clone()),
-                            store,
-                        )?);
-                    }
-                }
-            } else if keys.contains(&format!("{prefix}.gate_proj"))
-                && keys.contains(&format!("{prefix}.up_proj"))
-                && keys.contains(&packed_down)
-            {
-                planned.push(planned_expert_binding(
-                    "gate_up_proj",
-                    DerivedWeightRecipe::Concatenate {
-                        axis: 1,
-                        inputs: vec![
-                            DerivedWeightRecipe::source(
-                                format!("{prefix}.gate_proj"),
-                                selection.clone(),
-                            ),
-                            DerivedWeightRecipe::source(
-                                format!("{prefix}.up_proj"),
-                                selection.clone(),
-                            ),
-                        ],
-                    },
-                    store,
-                )?);
-                planned.push(planned_expert_binding(
-                    "down_proj",
-                    DerivedWeightRecipe::source(packed_down.clone(), selection.clone()),
-                    store,
-                )?);
-                for suffix in ["_scales", "_biases"] {
-                    let gate = format!("{prefix}.gate_proj{suffix}");
-                    let up = format!("{prefix}.up_proj{suffix}");
-                    if keys.contains(&gate) && keys.contains(&up) {
-                        planned.push(planned_expert_binding(
-                            format!("gate_up_proj{suffix}"),
-                            DerivedWeightRecipe::Concatenate {
-                                axis: 1,
-                                inputs: vec![
-                                    DerivedWeightRecipe::source(gate, selection.clone()),
-                                    DerivedWeightRecipe::source(up, selection.clone()),
-                                ],
-                            },
-                            store,
-                        )?);
-                    }
-                    let down = format!("{packed_down}{suffix}");
-                    if keys.contains(&down) {
-                        planned.push(planned_expert_binding(
-                            format!("down_proj{suffix}"),
-                            DerivedWeightRecipe::source(down, selection.clone()),
-                            store,
-                        )?);
-                    }
-                }
-            } else {
-                if args.weight_quantization_for(&packed_gate_up).is_some()
-                    || args.weight_quantization_for(&packed_down).is_some()
-                {
-                    return Err(Error::Quantization(
-                        "split Kimi Linear experts cannot be lazily load-time quantized".into(),
-                    ));
-                }
-                let gate = expert_source(store, &prefix, expert as i32, &["w1", "gate_proj"])?;
-                let up = expert_source(store, &prefix, expert as i32, &["w3", "up_proj"])?;
-                let down = expert_source(store, &prefix, expert as i32, &["w2", "down_proj"])?;
-                planned.extend([
-                    planned_expert_binding(
-                        "gate_up_proj",
-                        DerivedWeightRecipe::Stack {
-                            axis: 0,
-                            inputs: vec![DerivedWeightRecipe::Concatenate {
-                                axis: 0,
-                                inputs: vec![gate, up],
-                            }],
-                        },
-                        store,
-                    )?,
-                    planned_expert_binding(
-                        "down_proj",
-                        DerivedWeightRecipe::Stack {
-                            axis: 0,
-                            inputs: vec![down],
-                        },
-                        store,
-                    )?,
-                ]);
-            }
+            let planned =
+                eredu_architectures::kimi_linear::expert_recipes(store, args, layer, expert)
+                    .map_err(Error::UnsupportedArchitecture)?
+                    .into_iter()
+                    .map(|(name, recipe)| planned_expert_binding(name, recipe, store))
+                    .collect::<Result<Vec<_>, _>>()?;
             let bindings = BindingPlan::new(planned)
                 .and_then(|plan| plan.build_bindings(store))
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -818,13 +520,7 @@ fn load_neutral(
                 &MlxModule::new(unit),
                 "",
                 store,
-                unit_recipes(
-                    store,
-                    &binding_args,
-                    index,
-                    !external_experts,
-                    &binding_expert_targets,
-                )?,
+                unit_recipes(store, &binding_args, index, !external_experts)?,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )
             .map_err(Into::into)
@@ -921,13 +617,7 @@ fn load_neutral_parallel(
             &MlxModule::new(block),
             "",
             store.as_ref(),
-            unit_recipes(
-                store.as_ref(),
-                &args,
-                layer,
-                !external_experts,
-                &expert_targets,
-            )?,
+            unit_recipes(store.as_ref(), &args, layer, !external_experts)?,
             |name| external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
         global_parameter_bytes = global_parameter_bytes
@@ -968,13 +658,7 @@ fn load_neutral_parallel(
                 &MlxModule::new(global),
                 "",
                 store,
-                unit_recipes(
-                    store,
-                    &binding_args,
-                    layer,
-                    !external_experts,
-                    &binding_expert_targets,
-                )?,
+                unit_recipes(store, &binding_args, layer, !external_experts)?,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
             shard_layer_bindings(

@@ -15,7 +15,9 @@ pub mod moe;
 pub mod parallel;
 
 pub use block::{Block, BlockGeometry, TokenMixer};
-pub use checkpoint::{gguf_plan, safetensors_plan, translate_gguf_weight_name};
+pub use checkpoint::{
+    expert_recipes, gguf_plan, safetensors_plan, translate_gguf_weight_name, unit_recipes,
+};
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,
     prompt_cache_architecture_fingerprint, state_layout, state_layout_with_geometry, AttentionKind,

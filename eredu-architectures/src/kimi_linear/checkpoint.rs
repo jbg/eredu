@@ -1,13 +1,335 @@
-//! Pure Kimi Linear SafeTensors/GGUF checkpoint plans.
+//! Pure Kimi Linear checkpoint plans, naming, and derived-weight recipes.
+
+use std::collections::BTreeMap;
 
 use eredu_checkpoint::schema::{
     AlternativeLayoutGroup, CatalogPolicy, DepthwiseConvolutionSchema, GgufCheckpointPlan,
     GgufTensorConstraint, GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
     SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
 };
-use eredu_checkpoint::{StoredDtype, WeightQuantization};
+use eredu_checkpoint::{
+    recipe::DerivedWeightRecipe,
+    store::{CheckpointSource, TensorSelection, WeightStoreBackend},
+    StoredDtype, WeightQuantization,
+};
 
 use super::{AttentionKind, FeedForwardPolicy, ModelArgs};
+
+fn canonical_recipe_name(name: &str) -> String {
+    let canonical = name
+        .replace(".inner.weight", ".weight")
+        .replace(".inner.bias", ".bias")
+        .replace(".block_sparse_moe.", ".mlp.");
+    match canonical.as_str() {
+        "inner.weight" => "weight".into(),
+        "inner.bias" => "bias".into(),
+        _ => canonical,
+    }
+}
+
+fn normalized_checkpoint_keys(store: &dyn CheckpointSource) -> BTreeMap<String, String> {
+    store
+        .source_keys()
+        .into_iter()
+        .map(|raw| (canonical_recipe_name(&raw), raw))
+        .collect()
+}
+
+fn expert_source(
+    normalized: &BTreeMap<String, String>,
+    prefix: &str,
+    expert: usize,
+    projections: &[&str],
+) -> Result<DerivedWeightRecipe, String> {
+    let runtime = projections
+        .iter()
+        .map(|projection| format!("{prefix}.{expert}.{projection}.weight"))
+        .find(|candidate| normalized.contains_key(candidate))
+        .ok_or_else(|| {
+            format!("Kimi Linear checkpoint is missing expert {expert} projection under {prefix}")
+        })?;
+    Ok(DerivedWeightRecipe::source(
+        normalized
+            .get(&runtime)
+            .expect("normalized Kimi expert key exists"),
+        TensorSelection::Full,
+    ))
+}
+
+/// Returns the complete neutral recipe catalog for one Kimi execution unit.
+pub fn unit_recipes(
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+    layer: usize,
+    include_experts: bool,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let policy = args
+        .layer_policy(layer)
+        .ok_or_else(|| format!("Kimi Linear has no layer policy {layer}"))?;
+    let mut recipes = BTreeMap::new();
+    let root = format!("model.layers.{layer}");
+    let expert_prefix = format!("{root}.mlp.experts");
+    let normalized = normalized_checkpoint_keys(store);
+    for (runtime, raw) in &normalized {
+        if runtime.starts_with(&format!("{root}.mlp."))
+            && (include_experts || !runtime.starts_with(&expert_prefix))
+            && runtime != raw
+        {
+            recipes.insert(
+                runtime.clone(),
+                DerivedWeightRecipe::source(raw, TensorSelection::Full),
+            );
+        }
+    }
+
+    let attention = format!("{root}.self_attn");
+    let projection = checked_mul(
+        dimension(args.kda_config.num_heads, "KDA head count")?,
+        dimension(args.kda_config.head_dim, "KDA head width")?,
+        "KDA projection width",
+    )?;
+    let kernel = dimension(
+        args.kda_config.short_conv_kernel_size,
+        "KDA convolution width",
+    )?;
+    for local in ["q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"] {
+        let name = format!("{attention}.{local}");
+        if store.source_metadata(&name).is_ok() {
+            recipes.insert(
+                name.clone(),
+                DerivedWeightRecipe::Reshape {
+                    input: Box::new(DerivedWeightRecipe::source(&name, TensorSelection::Full)),
+                    shape: vec![projection, 1, kernel],
+                },
+            );
+        }
+    }
+    let a_log = format!("{attention}.A_log");
+    if store.source_metadata(&a_log).is_ok() {
+        let mut recipe = DerivedWeightRecipe::Reshape {
+            input: Box::new(DerivedWeightRecipe::source(&a_log, TensorSelection::Full)),
+            shape: vec![
+                1,
+                1,
+                dimension(args.kda_config.num_heads, "KDA head count")?,
+                1,
+            ],
+        };
+        if store
+            .source_diagnostics()
+            .map_err(|error| error.to_string())?
+            .backend
+            == WeightStoreBackend::Gguf
+        {
+            recipe = DerivedWeightRecipe::NegLog {
+                input: Box::new(recipe),
+            };
+        }
+        recipes.insert(a_log, recipe);
+    }
+
+    if !include_experts || policy.feed_forward != FeedForwardPolicy::SparseMoe {
+        return Ok(recipes);
+    }
+    let gate_up = format!("{expert_prefix}.gate_up_proj");
+    let down = format!("{expert_prefix}.down_proj");
+    if let (Some(gate_up_source), Some(down_source)) =
+        (normalized.get(&gate_up), normalized.get(&down))
+    {
+        for (target, source) in [(&gate_up, gate_up_source), (&down, down_source)] {
+            if source != target {
+                recipes.insert(
+                    target.clone(),
+                    DerivedWeightRecipe::source(source, TensorSelection::Full),
+                );
+            }
+        }
+        return Ok(recipes);
+    }
+    let gate = format!("{expert_prefix}.gate_proj");
+    let up = format!("{expert_prefix}.up_proj");
+    if normalized.contains_key(&gate) && normalized.contains_key(&up) {
+        recipes.insert(
+            gate_up,
+            DerivedWeightRecipe::Concatenate {
+                axis: 1,
+                inputs: [gate, up]
+                    .into_iter()
+                    .map(|runtime| {
+                        DerivedWeightRecipe::source(
+                            normalized.get(&runtime).expect("normalized projection key"),
+                            TensorSelection::Full,
+                        )
+                    })
+                    .collect(),
+            },
+        );
+        return Ok(recipes);
+    }
+    let experts = dimension(args.num_experts, "expert count")?;
+    let mut gate_up_inputs = Vec::with_capacity(experts);
+    let mut down_inputs = Vec::with_capacity(experts);
+    for expert in 0..experts {
+        gate_up_inputs.push(DerivedWeightRecipe::Concatenate {
+            axis: 0,
+            inputs: vec![
+                expert_source(&normalized, &expert_prefix, expert, &["w1", "gate_proj"])?,
+                expert_source(&normalized, &expert_prefix, expert, &["w3", "up_proj"])?,
+            ],
+        });
+        down_inputs.push(expert_source(
+            &normalized,
+            &expert_prefix,
+            expert,
+            &["w2", "down_proj"],
+        )?);
+    }
+    recipes.insert(
+        gate_up,
+        DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: gate_up_inputs,
+        },
+    );
+    recipes.insert(
+        down,
+        DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: down_inputs,
+        },
+    );
+    Ok(recipes)
+}
+
+/// Returns neutral lazy-loading recipes for one Kimi routed expert.
+pub fn expert_recipes(
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+    layer: usize,
+    expert: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let policy = args
+        .layer_policy(layer)
+        .ok_or_else(|| format!("Kimi Linear has no layer {layer}"))?;
+    if policy.feed_forward != FeedForwardPolicy::SparseMoe {
+        return Err(format!("Kimi Linear layer {layer} is not sparse MoE"));
+    }
+    let experts = dimension(args.num_experts, "expert count")?;
+    if expert >= experts {
+        return Err(format!(
+            "Kimi Linear has no expert {expert} in layer {layer}"
+        ));
+    }
+    let normalized = normalized_checkpoint_keys(store);
+    let prefix = format!("model.layers.{layer}.mlp.experts");
+    let packed_gate_up = format!("{prefix}.gate_up_proj");
+    let packed_down = format!("{prefix}.down_proj");
+    let selection = TensorSelection::Range {
+        axis: 0,
+        start: expert,
+        end: expert + 1,
+    };
+    let mut recipes = BTreeMap::new();
+    if let (Some(gate_up), Some(down)) = (
+        normalized.get(&packed_gate_up),
+        normalized.get(&packed_down),
+    ) {
+        recipes.insert(
+            "gate_up_proj".into(),
+            DerivedWeightRecipe::source(gate_up, selection.clone()),
+        );
+        recipes.insert(
+            "down_proj".into(),
+            DerivedWeightRecipe::source(down, selection.clone()),
+        );
+        for (target, source) in [
+            ("gate_up_proj_scales", format!("{packed_gate_up}_scales")),
+            ("gate_up_proj_biases", format!("{packed_gate_up}_biases")),
+            ("down_proj_scales", format!("{packed_down}_scales")),
+            ("down_proj_biases", format!("{packed_down}_biases")),
+        ] {
+            if let Some(source) = normalized.get(&source) {
+                recipes.insert(
+                    target.into(),
+                    DerivedWeightRecipe::source(source, selection.clone()),
+                );
+            }
+        }
+        return Ok(recipes);
+    }
+    let gate = format!("{prefix}.gate_proj");
+    let up = format!("{prefix}.up_proj");
+    if let (Some(gate), Some(up), Some(down)) = (
+        normalized.get(&gate),
+        normalized.get(&up),
+        normalized.get(&packed_down),
+    ) {
+        recipes.insert(
+            "gate_up_proj".into(),
+            DerivedWeightRecipe::Concatenate {
+                axis: 1,
+                inputs: vec![
+                    DerivedWeightRecipe::source(gate, selection.clone()),
+                    DerivedWeightRecipe::source(up, selection.clone()),
+                ],
+            },
+        );
+        recipes.insert(
+            "down_proj".into(),
+            DerivedWeightRecipe::source(down, selection.clone()),
+        );
+        for suffix in ["_scales", "_biases"] {
+            let gate = format!("{prefix}.gate_proj{suffix}");
+            let up = format!("{prefix}.up_proj{suffix}");
+            if let (Some(gate), Some(up)) = (normalized.get(&gate), normalized.get(&up)) {
+                recipes.insert(
+                    format!("gate_up_proj{suffix}"),
+                    DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![
+                            DerivedWeightRecipe::source(gate, selection.clone()),
+                            DerivedWeightRecipe::source(up, selection.clone()),
+                        ],
+                    },
+                );
+            }
+            let down = format!("{packed_down}{suffix}");
+            if let Some(down) = normalized.get(&down) {
+                recipes.insert(
+                    format!("down_proj{suffix}"),
+                    DerivedWeightRecipe::source(down, selection.clone()),
+                );
+            }
+        }
+        return Ok(recipes);
+    }
+    if args.weight_quantization_for(&packed_gate_up).is_some()
+        || args.weight_quantization_for(&packed_down).is_some()
+    {
+        return Err("split Kimi Linear experts cannot be lazily load-time quantized".into());
+    }
+    let gate = expert_source(&normalized, &prefix, expert, &["w1", "gate_proj"])?;
+    let up = expert_source(&normalized, &prefix, expert, &["w3", "up_proj"])?;
+    let down = expert_source(&normalized, &prefix, expert, &["w2", "down_proj"])?;
+    recipes.insert(
+        "gate_up_proj".into(),
+        DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: vec![DerivedWeightRecipe::Concatenate {
+                axis: 0,
+                inputs: vec![gate, up],
+            }],
+        },
+    );
+    recipes.insert(
+        "down_proj".into(),
+        DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: vec![down],
+        },
+    );
+    Ok(recipes)
+}
 
 /// Builds the strict SafeTensors catalog plan.
 pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
@@ -796,7 +1118,60 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use eredu_checkpoint::store::{
+        CheckpointLease, StoreError, TensorMetadata, TensorReadRequest, WeightStoreDiagnostics,
+    };
+
     use super::*;
+
+    struct Catalog {
+        tensors: BTreeMap<String, TensorMetadata>,
+        backend: WeightStoreBackend,
+    }
+
+    impl CheckpointSource for Catalog {
+        fn source_keys(&self) -> Vec<String> {
+            self.tensors.keys().cloned().collect()
+        }
+
+        fn source_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+            self.tensors
+                .get(key)
+                .cloned()
+                .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
+        }
+
+        fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+            Err(StoreError::UnknownTensor { key: request.key })
+        }
+
+        fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+            Ok(WeightStoreDiagnostics {
+                backend: self.backend,
+                mapping_hits: 0,
+                mapping_misses: 0,
+                evictions: 0,
+                currently_mapped_shards: 0,
+                touched_shard_paths: Vec::new(),
+                physical_reads: 0,
+                physical_read_bytes: 0,
+                coalesced_group_hits: 0,
+            })
+        }
+    }
+
+    fn metadata(name: &str, shape: Vec<usize>) -> TensorMetadata {
+        TensorMetadata {
+            name: name.into(),
+            encoded_byte_len: shape.iter().product::<usize>() as u64 * 4,
+            logical_shape: shape.clone(),
+            physical_shape: shape,
+            stored_dtype: StoredDtype::F32,
+            backing_shard: None,
+        }
+    }
 
     fn fixture(split_kv_b: bool, q_lora_rank: Option<i32>) -> ModelArgs {
         let mut value = serde_json::json!({
@@ -877,5 +1252,54 @@ mod tests {
             translate_gguf_weight_name("blk.1.ffn_gate_exps.scales"),
             "model.layers.1.mlp.experts.gate_proj_scales"
         );
+    }
+
+    #[test]
+    fn neutral_catalog_owns_kda_and_split_expert_transformations() {
+        let args = fixture(false, None);
+        let mut tensors = BTreeMap::from([
+            (
+                "model.layers.0.self_attn.q_conv1d.weight".into(),
+                metadata("model.layers.0.self_attn.q_conv1d.weight", vec![12, 3]),
+            ),
+            (
+                "model.layers.0.self_attn.A_log".into(),
+                metadata("model.layers.0.self_attn.A_log", vec![3]),
+            ),
+        ]);
+        for expert in 0..2 {
+            for (projection, shape) in [
+                ("w1", vec![9, 12]),
+                ("w2", vec![12, 9]),
+                ("w3", vec![9, 12]),
+            ] {
+                let name = format!("model.layers.1.mlp.experts.{expert}.{projection}.weight");
+                tensors.insert(name.clone(), metadata(&name, shape));
+            }
+        }
+        let catalog = Catalog {
+            tensors,
+            backend: WeightStoreBackend::Gguf,
+        };
+        let kda = unit_recipes(&catalog, &args, 0, true).unwrap();
+        assert!(matches!(
+            kda.get("model.layers.0.self_attn.q_conv1d.weight"),
+            Some(DerivedWeightRecipe::Reshape { shape, .. }) if shape == &[12, 1, 3]
+        ));
+        assert!(matches!(
+            kda.get("model.layers.0.self_attn.A_log"),
+            Some(DerivedWeightRecipe::NegLog { .. })
+        ));
+        let sparse = unit_recipes(&catalog, &args, 1, true).unwrap();
+        assert!(matches!(
+            sparse.get("model.layers.1.mlp.experts.gate_up_proj"),
+            Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 2
+        ));
+        assert!(matches!(
+            expert_recipes(&catalog, &args, 1, 0)
+                .unwrap()
+                .get("gate_up_proj"),
+            Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 1
+        ));
     }
 }

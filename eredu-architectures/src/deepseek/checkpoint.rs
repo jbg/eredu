@@ -1,4 +1,6 @@
-//! Pure checkpoint naming and schemas for the DeepSeek family.
+//! Pure checkpoint naming, schemas, and derived-weight recipes for DeepSeek.
+
+use std::collections::BTreeMap;
 
 use eredu_checkpoint::schema::{
     matrix_for_linear_format, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
@@ -420,6 +422,74 @@ pub fn v3_gguf_kv_b_recipe(
         }),
         shape: vec![width, rank],
     })
+}
+
+/// Returns the complete neutral recipe catalog for one DeepSeek V3 unit.
+pub fn v3_unit_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &V3Args,
+    layer: usize,
+    include_experts: bool,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let mut recipes = BTreeMap::new();
+    let physical = format!("blk.{layer}");
+    let logical = format!("model.layers.{layer}.self_attn");
+    if catalog
+        .tensor_metadata(&format!("{logical}.k_b_proj.weight"))
+        .is_ok()
+    {
+        let heads = dimension(args.num_attention_heads, "attention heads")?;
+        let rank = dimension(args.kv_lora_rank, "KV rank")?;
+        let width = checked_mul(
+            heads,
+            checked_add(
+                dimension(args.qk_nope_head_dim, "non-rotary width")?,
+                dimension(args.v_head_dim, "value width")?,
+                "KV-B head width",
+            )?,
+            "KV-B width",
+        )?;
+        recipes.insert(
+            format!("{logical}.kv_b_proj.weight"),
+            DerivedWeightRecipe::Reshape {
+                input: Box::new(DerivedWeightRecipe::Concatenate {
+                    axis: 1,
+                    inputs: vec![
+                        DerivedWeightRecipe::Transpose {
+                            input: Box::new(DerivedWeightRecipe::source(
+                                format!("{logical}.k_b_proj.weight"),
+                                TensorSelection::Full,
+                            )),
+                            axes: vec![0, 2, 1],
+                        },
+                        DerivedWeightRecipe::source(
+                            format!("{logical}.v_b_proj.weight"),
+                            TensorSelection::Full,
+                        ),
+                    ],
+                }),
+                shape: vec![width, rank],
+            },
+        );
+    } else if catalog
+        .tensor_metadata(&format!("{physical}.attn_k_b.weight"))
+        .is_ok()
+    {
+        recipes.insert(
+            format!("{logical}.kv_b_proj.weight"),
+            v3_gguf_kv_b_recipe(args, layer, true)?,
+        );
+    }
+
+    let target = count(args.num_hidden_layers, "target layer count")?;
+    if include_experts
+        && (layer >= target || args.layer_schedule.get(layer) == Some(&LayerPolicy::SparseMoe))
+    {
+        let expert = v3_expert_recipes(catalog, args, layer)?;
+        recipes.insert(expert.target_gate_up, expert.gate_up);
+        recipes.insert(expert.target_down, expert.down);
+    }
+    Ok(recipes)
 }
 
 /// Resolves independent, split-bank, or fused V3 experts into the one packed
@@ -1744,6 +1814,14 @@ mod tests {
                     "blk.0.attn_kv_b.weight".into(),
                     metadata("blk.0.attn_kv_b.weight", vec![192, 32]),
                 ),
+                (
+                    "model.layers.0.self_attn.k_b_proj.weight".into(),
+                    metadata("model.layers.0.self_attn.k_b_proj.weight", vec![4, 32, 24]),
+                ),
+                (
+                    "model.layers.0.self_attn.v_b_proj.weight".into(),
+                    metadata("model.layers.0.self_attn.v_b_proj.weight", vec![4, 24, 32]),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -1755,6 +1833,17 @@ mod tests {
                 .unwrap();
             assert_eq!(inferred.shape(), [192, 32]);
         }
+        let unit = v3_unit_recipes(&catalog, &args, 0, false).unwrap();
+        let recipe = unit
+            .get("model.layers.0.self_attn.kv_b_proj.weight")
+            .unwrap();
+        assert!(matches!(
+            recipe,
+            DerivedWeightRecipe::Reshape { input, shape }
+                if shape == &[192, 32]
+                    && matches!(input.as_ref(), DerivedWeightRecipe::Concatenate { axis: 1, .. })
+        ));
+        assert_eq!(recipe.infer(&catalog).unwrap().shape(), [192, 32]);
     }
 
     #[test]

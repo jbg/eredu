@@ -67,7 +67,9 @@ complete derived-weight recipe catalogs for static modules, execution units,
 and independently resident experts. Concrete backends consume those neutral
 recipes for binding, materialization, sharding, and transfer; they do not
 redeclare family-specific stacking, concatenation, reshaping, normalization,
-or recurrent-weight transformations.
+or recurrent-weight transformations. This includes format-dependent recipes
+such as fused projection assembly and recurrent transition conversion; backend
+composition may inspect recipe outputs but does not construct their equations.
 
 Architecture capability estimates likewise own native and effective context,
 accepted modalities, cache ownership and sharing, attention windows,

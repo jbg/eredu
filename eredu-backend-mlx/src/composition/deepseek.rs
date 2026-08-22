@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use eredu_architectures::deepseek::{self, LayerPolicy, V3Args, V4Args, V4AttentionPolicy};
+use eredu_architectures::deepseek::{self, V3Args, V4Args, V4AttentionPolicy};
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
     CacheResidencyPolicy, CausalModel, DeviceState, ExecutionUnitLayout, LayerWeightResidency,
@@ -2974,68 +2974,7 @@ fn v3_unit_recipes(
     layer: usize,
     external_experts: bool,
 ) -> Result<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>, Error> {
-    let mut recipes = BTreeMap::new();
-    let physical = format!("blk.{layer}");
-    let logical = format!("model.layers.{layer}.self_attn");
-    if store
-        .source_metadata(&format!("{logical}.k_b_proj.weight"))
-        .is_ok()
-    {
-        let heads = usize::try_from(args.num_attention_heads)
-            .map_err(|_| unsupported("invalid V3 attention-head count"))?;
-        let nope = usize::try_from(args.qk_nope_head_dim)
-            .map_err(|_| unsupported("invalid V3 non-rotary head width"))?;
-        let value = usize::try_from(args.v_head_dim)
-            .map_err(|_| unsupported("invalid V3 value-head width"))?;
-        let rank =
-            usize::try_from(args.kv_lora_rank).map_err(|_| unsupported("invalid V3 KV rank"))?;
-        let width = heads
-            .checked_mul(
-                nope.checked_add(value)
-                    .ok_or_else(|| unsupported("V3 KV-B head width overflowed"))?,
-            )
-            .ok_or_else(|| unsupported("V3 KV-B width overflowed"))?;
-        recipes.insert(
-            format!("{logical}.kv_b_proj.weight"),
-            eredu_checkpoint::recipe::DerivedWeightRecipe::Reshape {
-                input: Box::new(eredu_checkpoint::recipe::DerivedWeightRecipe::Concatenate {
-                    axis: 1,
-                    inputs: vec![
-                        eredu_checkpoint::recipe::DerivedWeightRecipe::Transpose {
-                            input: Box::new(eredu_checkpoint::recipe::DerivedWeightRecipe::source(
-                                format!("{logical}.k_b_proj.weight"),
-                                eredu_checkpoint::store::TensorSelection::Full,
-                            )),
-                            axes: vec![0, 2, 1],
-                        },
-                        eredu_checkpoint::recipe::DerivedWeightRecipe::source(
-                            format!("{logical}.v_b_proj.weight"),
-                            eredu_checkpoint::store::TensorSelection::Full,
-                        ),
-                    ],
-                }),
-                shape: vec![width, rank],
-            },
-        );
-    } else if store
-        .source_metadata(&format!("{physical}.attn_k_b.weight"))
-        .is_ok()
-    {
-        recipes.insert(
-            format!("model.layers.{layer}.self_attn.kv_b_proj.weight"),
-            deepseek::v3_gguf_kv_b_recipe(args, layer, true).map_err(unsupported)?,
-        );
-    }
-    let target = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| unsupported("invalid V3 layer count"))?;
-    if !external_experts
-        && (layer >= target || args.layer_schedule.get(layer) == Some(&LayerPolicy::SparseMoe))
-    {
-        let expert = deepseek::v3_expert_recipes(store, args, layer).map_err(unsupported)?;
-        recipes.insert(expert.target_gate_up, expert.gate_up);
-        recipes.insert(expert.target_down, expert.down);
-    }
-    Ok(recipes)
+    deepseek::v3_unit_recipes(store, args, layer, !external_experts).map_err(unsupported)
 }
 
 fn v4_unit_recipes(

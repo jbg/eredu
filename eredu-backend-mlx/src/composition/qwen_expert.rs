@@ -1,9 +1,7 @@
 // MLX residency adapter for neutral Qwen routed-expert checkpoint contracts.
 
-use std::collections::BTreeSet;
-
 use eredu_architectures::qwen::ModelArgs;
-use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
+use eredu_checkpoint::recipe::DerivedWeightRecipe;
 use eredu_runtime::ExpertPass;
 use eredu_runtime::{ExpertIdentity, OffloadUnit, WeightBinding};
 use safemlx::{Array, Stream};
@@ -79,7 +77,6 @@ pub fn expert_catalog_cartesian(
             "Qwen expert catalog requires Qwen3-MoE arguments".into(),
         ));
     }
-    let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut entries = Vec::new();
     let layers = usize::try_from(args.num_hidden_layers)
         .map_err(|_| Error::UnsupportedArchitecture("Qwen layer count is negative".into()))?;
@@ -87,130 +84,15 @@ pub fn expert_catalog_cartesian(
         .map_err(|_| Error::UnsupportedArchitecture("Qwen expert count is negative".into()))?;
     for layer in 0..layers {
         let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
-        let packed_gate_up = format!("{prefix}.gate_up_proj");
-        let packed_down = format!("{prefix}.down_proj");
-        let source_key = |base: &str| {
-            keys.contains(base).then(|| base.to_string()).or_else(|| {
-                let weight = format!("{base}.weight");
-                keys.contains(&weight).then_some(weight)
-            })
-        };
-        let packed_gate_up_source = source_key(&packed_gate_up);
-        let packed_down_source = source_key(&packed_down);
-        let split_gate_source = source_key(&format!("{prefix}.gate_proj"));
-        let split_up_source = source_key(&format!("{prefix}.up_proj"));
         for expert in 0..experts {
             let identity = ExpertIdentity::new(layer, expert);
-            let selection = TensorSelection::Range {
-                axis: 0,
-                start: expert,
-                end: expert + 1,
-            };
-            let mut bindings = Vec::new();
-            if let (Some(gate_up), Some(down)) = (&packed_gate_up_source, &packed_down_source) {
-                for (name, key) in [
-                    ("gate_up_proj", gate_up.clone()),
-                    ("down_proj", down.clone()),
-                ] {
-                    bindings.push(recipe_binding(
-                        name,
-                        DerivedWeightRecipe::source(key, selection.clone()),
-                        store,
-                    )?);
-                }
-                for (name, key) in [
-                    ("gate_up_proj_scales", format!("{packed_gate_up}_scales")),
-                    ("gate_up_proj_biases", format!("{packed_gate_up}_biases")),
-                    ("down_proj_scales", format!("{packed_down}_scales")),
-                    ("down_proj_biases", format!("{packed_down}_biases")),
-                ] {
-                    if keys.contains(&key) {
-                        bindings.push(recipe_binding(
-                            name,
-                            DerivedWeightRecipe::source(key, selection.clone()),
-                            store,
-                        )?);
-                    }
-                }
-            } else if let (Some(gate), Some(up), Some(down)) =
-                (&split_gate_source, &split_up_source, &packed_down_source)
-            {
-                bindings.push(recipe_binding(
-                    "gate_up_proj",
-                    DerivedWeightRecipe::Concatenate {
-                        axis: 1,
-                        inputs: vec![
-                            DerivedWeightRecipe::source(gate.clone(), selection.clone()),
-                            DerivedWeightRecipe::source(up.clone(), selection.clone()),
-                        ],
-                    },
-                    store,
-                )?);
-                bindings.push(recipe_binding(
-                    "down_proj",
-                    DerivedWeightRecipe::source(down.clone(), selection.clone()),
-                    store,
-                )?);
-                for suffix in ["_scales", "_biases"] {
-                    let gate = format!("{prefix}.gate_proj{suffix}");
-                    let up = format!("{prefix}.up_proj{suffix}");
-                    if keys.contains(&gate) && keys.contains(&up) {
-                        bindings.push(recipe_binding(
-                            &format!("gate_up_proj{suffix}"),
-                            DerivedWeightRecipe::Concatenate {
-                                axis: 1,
-                                inputs: vec![
-                                    DerivedWeightRecipe::source(gate, selection.clone()),
-                                    DerivedWeightRecipe::source(up, selection.clone()),
-                                ],
-                            },
-                            store,
-                        )?);
-                    }
-                    let down = format!("{packed_down}{suffix}");
-                    if keys.contains(&down) {
-                        bindings.push(recipe_binding(
-                            &format!("down_proj{suffix}"),
-                            DerivedWeightRecipe::source(down, selection.clone()),
-                            store,
-                        )?);
-                    }
-                }
-            } else {
-                if args.weight_quantization_for(&packed_gate_up).is_some()
-                    || args.weight_quantization_for(&packed_down).is_some()
-                {
-                    return Err(Error::Quantization(
-                        "split Qwen experts cannot be lazily load-time quantized; use checkpoint-native packed expert weights"
-                            .into(),
-                    ));
-                }
-                let gate = split_expert_key(&keys, &prefix, expert, &["gate_proj", "w1"])?;
-                let up = split_expert_key(&keys, &prefix, expert, &["up_proj", "w3"])?;
-                let down = split_expert_key(&keys, &prefix, expert, &["down_proj", "w2"])?;
-                bindings.push(recipe_binding(
-                    "gate_up_proj",
-                    DerivedWeightRecipe::Stack {
-                        axis: 0,
-                        inputs: vec![DerivedWeightRecipe::Concatenate {
-                            axis: 0,
-                            inputs: vec![
-                                DerivedWeightRecipe::source(gate, TensorSelection::Full),
-                                DerivedWeightRecipe::source(up, TensorSelection::Full),
-                            ],
-                        }],
-                    },
-                    store,
-                )?);
-                bindings.push(recipe_binding(
-                    "down_proj",
-                    DerivedWeightRecipe::Stack {
-                        axis: 0,
-                        inputs: vec![DerivedWeightRecipe::source(down, TensorSelection::Full)],
-                    },
-                    store,
-                )?);
-            }
+            let mut bindings = eredu_architectures::qwen::expert_unit_recipes(
+                store, args, layer, expert,
+            )
+            .map_err(Error::UnsupportedArchitecture)?
+            .into_iter()
+            .map(|(name, recipe)| recipe_binding(&name, recipe, store))
+            .collect::<Result<Vec<_>, _>>()?;
             if let Some(layout) = layout {
                 bindings = shard_layer_bindings(bindings, &prefix, store, layout)?;
             }
@@ -241,21 +123,4 @@ fn recipe_binding(
     .and_then(|plan| plan.build_bindings(store))
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     Ok(bindings.pop().expect("single planned expert binding"))
-}
-
-fn split_expert_key(
-    keys: &BTreeSet<String>,
-    prefix: &str,
-    expert: usize,
-    projections: &[&str],
-) -> Result<String, Error> {
-    projections
-        .iter()
-        .map(|projection| format!("{prefix}.{expert}.{projection}.weight"))
-        .find(|key| keys.contains(key))
-        .ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
-                "Qwen checkpoint is missing split expert {expert} projection {projections:?}"
-            ))
-        })
 }

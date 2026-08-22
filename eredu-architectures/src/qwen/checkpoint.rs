@@ -1,4 +1,6 @@
-//! Pure checkpoint schemas and name translation for Qwen text models.
+//! Pure checkpoint schemas, name translation, and recipes for Qwen text models.
+
+use std::collections::BTreeMap;
 
 use eredu_checkpoint::schema::{
     matrix_for_linear_format, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
@@ -12,7 +14,9 @@ use eredu_checkpoint::{
     },
     recipe::RecipeCatalog,
 };
-use eredu_checkpoint::{LinearFormat, WeightQuantization};
+use eredu_checkpoint::{
+    recipe::DerivedWeightRecipe, store::TensorSelection, LinearFormat, WeightQuantization,
+};
 
 use super::{ModelArgs, QwenVariant};
 
@@ -244,6 +248,164 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
             .collect(),
     };
     resolve_gated_product_expert_recipes(catalog, &names).map_err(|error| error.to_string())
+}
+
+fn recipe_source_key<C: RecipeCatalog + ?Sized>(catalog: &C, base: &str) -> Option<String> {
+    if catalog.tensor_metadata(base).is_ok() {
+        return Some(base.to_owned());
+    }
+    let weight = format!("{base}.weight");
+    catalog.tensor_metadata(&weight).is_ok().then_some(weight)
+}
+
+fn split_expert_source<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    prefix: &str,
+    expert: usize,
+    projections: &[&str],
+) -> Result<String, String> {
+    projections
+        .iter()
+        .map(|projection| format!("{prefix}.{expert}.{projection}.weight"))
+        .find(|key| catalog.tensor_metadata(key).is_ok())
+        .ok_or_else(|| {
+            format!("Qwen checkpoint is missing split expert {expert} projection {projections:?}")
+        })
+}
+
+/// Returns neutral lazy-loading recipes for one Qwen routed expert.
+pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &ModelArgs,
+    layer: usize,
+    expert: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    if !args.is_moe() {
+        return Err("Qwen expert recipes require Qwen3-MoE arguments".into());
+    }
+    let layers = dimension(args.num_hidden_layers, "num_hidden_layers")?;
+    if layer >= layers {
+        return Err(format!(
+            "Qwen expert recipe layer {layer} is outside {layers} layers"
+        ));
+    }
+    let experts = dimension(args.num_experts, "num_experts")?;
+    if expert >= experts {
+        return Err(format!(
+            "Qwen expert {expert} is outside {experts} experts in layer {layer}"
+        ));
+    }
+    let prefix = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
+    let packed_gate_up = format!("{prefix}.gate_up_proj");
+    let packed_down = format!("{prefix}.down_proj");
+    let packed_gate_up_source = recipe_source_key(catalog, &packed_gate_up);
+    let packed_down_source = recipe_source_key(catalog, &packed_down);
+    let split_gate_source = recipe_source_key(catalog, &format!("{prefix}.gate_proj"));
+    let split_up_source = recipe_source_key(catalog, &format!("{prefix}.up_proj"));
+    let selection = TensorSelection::Range {
+        axis: 0,
+        start: expert,
+        end: expert + 1,
+    };
+    let mut recipes = BTreeMap::new();
+    if let (Some(gate_up), Some(down)) = (packed_gate_up_source, packed_down_source.as_ref()) {
+        recipes.insert(
+            "gate_up_proj".into(),
+            DerivedWeightRecipe::source(gate_up, selection.clone()),
+        );
+        recipes.insert(
+            "down_proj".into(),
+            DerivedWeightRecipe::source(down, selection.clone()),
+        );
+        for (target, source) in [
+            ("gate_up_proj_scales", format!("{packed_gate_up}_scales")),
+            ("gate_up_proj_biases", format!("{packed_gate_up}_biases")),
+            ("down_proj_scales", format!("{packed_down}_scales")),
+            ("down_proj_biases", format!("{packed_down}_biases")),
+        ] {
+            if catalog.tensor_metadata(&source).is_ok() {
+                recipes.insert(
+                    target.into(),
+                    DerivedWeightRecipe::source(source, selection.clone()),
+                );
+            }
+        }
+        return Ok(recipes);
+    }
+    if let (Some(gate), Some(up), Some(down)) =
+        (split_gate_source, split_up_source, packed_down_source)
+    {
+        recipes.insert(
+            "gate_up_proj".into(),
+            DerivedWeightRecipe::Concatenate {
+                axis: 1,
+                inputs: vec![
+                    DerivedWeightRecipe::source(gate, selection.clone()),
+                    DerivedWeightRecipe::source(up, selection.clone()),
+                ],
+            },
+        );
+        recipes.insert(
+            "down_proj".into(),
+            DerivedWeightRecipe::source(down, selection.clone()),
+        );
+        for suffix in ["_scales", "_biases"] {
+            let gate = format!("{prefix}.gate_proj{suffix}");
+            let up = format!("{prefix}.up_proj{suffix}");
+            if catalog.tensor_metadata(&gate).is_ok() && catalog.tensor_metadata(&up).is_ok() {
+                recipes.insert(
+                    format!("gate_up_proj{suffix}"),
+                    DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![
+                            DerivedWeightRecipe::source(gate, selection.clone()),
+                            DerivedWeightRecipe::source(up, selection.clone()),
+                        ],
+                    },
+                );
+            }
+            let down = format!("{packed_down}{suffix}");
+            if catalog.tensor_metadata(&down).is_ok() {
+                recipes.insert(
+                    format!("down_proj{suffix}"),
+                    DerivedWeightRecipe::source(down, selection.clone()),
+                );
+            }
+        }
+        return Ok(recipes);
+    }
+    if args.weight_quantization_for(&packed_gate_up).is_some()
+        || args.weight_quantization_for(&packed_down).is_some()
+    {
+        return Err(
+            "split Qwen experts cannot be lazily load-time quantized; use checkpoint-native packed expert weights"
+                .into(),
+        );
+    }
+    let gate = split_expert_source(catalog, &prefix, expert, &["gate_proj", "w1"])?;
+    let up = split_expert_source(catalog, &prefix, expert, &["up_proj", "w3"])?;
+    let down = split_expert_source(catalog, &prefix, expert, &["down_proj", "w2"])?;
+    recipes.insert(
+        "gate_up_proj".into(),
+        DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: vec![DerivedWeightRecipe::Concatenate {
+                axis: 0,
+                inputs: vec![
+                    DerivedWeightRecipe::source(gate, TensorSelection::Full),
+                    DerivedWeightRecipe::source(up, TensorSelection::Full),
+                ],
+            }],
+        },
+    );
+    recipes.insert(
+        "down_proj".into(),
+        DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: vec![DerivedWeightRecipe::source(down, TensorSelection::Full)],
+        },
+    );
+    Ok(recipes)
 }
 
 fn expert_layout_group(
@@ -863,5 +1025,48 @@ mod tests {
             DerivedWeightRecipe::Source { key, .. }
                 if key == "model.layers.0.mlp.experts.0.up_proj.weight"
         ));
+        let unit = expert_unit_recipes(&catalog, &args, 0, 2).unwrap();
+        assert!(matches!(
+            unit.get("gate_up_proj"),
+            Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 1
+        ));
+        assert_eq!(
+            unit["gate_up_proj"].infer(&catalog).unwrap().shape(),
+            &[1, 16, 16]
+        );
+        assert_eq!(
+            unit["down_proj"].infer(&catalog).unwrap().shape(),
+            &[1, 16, 8]
+        );
+    }
+
+    #[test]
+    fn expert_unit_catalog_owns_separate_bank_packing() {
+        let args = args("qwen3_moe", false);
+        let prefix = "model.layers.0.mlp.experts";
+        let catalog = Catalog(BTreeMap::from([
+            (
+                format!("{prefix}.gate_proj"),
+                metadata(&format!("{prefix}.gate_proj"), vec![4, 8, 16]),
+            ),
+            (
+                format!("{prefix}.up_proj"),
+                metadata(&format!("{prefix}.up_proj"), vec![4, 8, 16]),
+            ),
+            (
+                format!("{prefix}.down_proj"),
+                metadata(&format!("{prefix}.down_proj"), vec![4, 16, 8]),
+            ),
+        ]));
+        let recipes = expert_unit_recipes(&catalog, &args, 0, 2).unwrap();
+        assert!(matches!(
+            recipes.get("gate_up_proj"),
+            Some(DerivedWeightRecipe::Concatenate { axis: 1, inputs })
+                if inputs.len() == 2
+        ));
+        assert_eq!(
+            recipes["gate_up_proj"].infer(&catalog).unwrap().shape(),
+            &[1, 16, 16]
+        );
     }
 }

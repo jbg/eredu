@@ -9,7 +9,7 @@ pub mod vision;
 pub mod vl;
 
 pub use checkpoint::{
-    expert_recipes, gguf_plan, safetensors_plan, safetensors_plan_with_root,
+    expert_recipes, expert_unit_recipes, gguf_plan, safetensors_plan, safetensors_plan_with_root,
     translate_gguf_weight_name,
 };
 pub use config::{
