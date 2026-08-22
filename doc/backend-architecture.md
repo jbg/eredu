@@ -101,6 +101,12 @@ materializers. Core selects the neutral expert-cache route but does not infer
 support from `ModelKind`, because one kind may contain both dense and MoE
 variants.
 
+Artifact inspection also consumes architecture-derived input modalities from
+that exact normalized configuration. Backends translate those neutral flags
+into report and build-feature readiness, but do not infer image, audio, or
+video support from a family name. Text-only and partially multimodal variants
+therefore do not acquire processor or feature requirements they cannot use.
+
 Multimodal preprocessing starts with an architecture-owned processor plan.
 That neutral plan parses family model and processor metadata, selects released
 defaults, declares framing token IDs and text, chooses frame sampling and

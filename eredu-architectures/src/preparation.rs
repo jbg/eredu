@@ -2,14 +2,15 @@
 
 use std::{collections::HashMap, fmt::Display};
 
-use eredu_core::{GgufArchitecture, ModelKind};
+use eredu_core::{GgufArchitecture, InputModalities, ModelKind};
 use eredu_gguf::{Checkpoint as GgufCheckpoint, MetadataValue};
 use serde_json::Value;
 
 /// Preparation-relevant facts derived from one exact normalized architecture.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ArchitectureCapabilities {
     independently_addressable_experts: bool,
+    input_modalities: InputModalities,
 }
 
 impl ArchitectureCapabilities {
@@ -18,10 +19,25 @@ impl ArchitectureCapabilities {
         self.independently_addressable_experts
     }
 
-    const fn with_independently_addressable_experts(value: bool) -> Self {
+    /// Input modalities admitted by the exact normalized architecture.
+    pub const fn input_modalities(self) -> InputModalities {
+        self.input_modalities
+    }
+
+    const fn new(
+        independently_addressable_experts: bool,
+        input_modalities: InputModalities,
+    ) -> Self {
         Self {
-            independently_addressable_experts: value,
+            independently_addressable_experts,
+            input_modalities,
         }
+    }
+}
+
+impl Default for ArchitectureCapabilities {
+    fn default() -> Self {
+        Self::new(false, InputModalities::TEXT)
     }
 }
 
@@ -40,23 +56,23 @@ pub fn safetensors_capabilities(
     kind: ModelKind,
     config: &Value,
 ) -> Result<ArchitectureCapabilities, PreparationCapabilityError> {
-    let routed = match kind {
+    let (routed, input_modalities) = match kind {
         ModelKind::DeepSeekV3 => {
             crate::deepseek::parse_v3_config(config).map_err(invalid)?;
-            true
+            (true, InputModalities::TEXT)
         }
         ModelKind::DeepSeekV4 => {
             crate::deepseek::parse_v4_config(config).map_err(invalid)?;
-            true
+            (true, InputModalities::TEXT)
         }
         ModelKind::Gemma4 => {
             let bytes = serde_json::to_vec(config).map_err(invalid)?;
             let family = crate::gemma4::FamilyConfig::from_hf_json(&bytes).map_err(invalid)?;
-            family.text.num_experts.is_some()
+            (family.text.num_experts.is_some(), family.input_modalities())
         }
         ModelKind::GptOss => {
             crate::gpt_oss::model_args_from_config_value(config).map_err(invalid)?;
-            true
+            (true, InputModalities::TEXT)
         }
         ModelKind::Inkling => {
             let bytes = serde_json::to_vec(config).map_err(invalid)?;
@@ -65,38 +81,84 @@ pub fn safetensors_capabilities(
                 args.text_config.layer_schedule.iter().any(|policy| {
                     policy.feed_forward == crate::inkling::FeedForwardPolicy::SparseMoe
                 });
-            routed
+            (routed, args.input_modalities())
         }
-        ModelKind::KimiLinear => crate::kimi_linear::model_args_from_config_value(config)
-            .map_err(invalid)?
-            .has_sparse_moe_layers(),
-        ModelKind::Lfm2 => crate::lfm2::model_args_from_config_value(config)
-            .map_err(invalid)?
-            .has_sparse_moe_layers(),
-        ModelKind::MuseGlimmer => crate::muse_glimmer::DecoderConfig::from_hf_value(config)
-            .map_err(invalid)?
-            .is_moe(),
-        ModelKind::NemotronH => crate::nemotron_h::model_args_from_config_value(config)
-            .map_err(invalid)?
-            .has_sparse_moe_layers(),
-        ModelKind::Qwen2 | ModelKind::Qwen3 => crate::qwen::model_args_from_config_value(config)
-            .map_err(invalid)?
-            .is_moe(),
-        ModelKind::Qwen3Next | ModelKind::Qwen35 => {
-            crate::qwen::hybrid::model_args_from_config_value(config)
+        ModelKind::KimiLinear => (
+            crate::kimi_linear::model_args_from_config_value(config)
                 .map_err(invalid)?
-                .text
-                .is_moe()
+                .has_sparse_moe_layers(),
+            InputModalities::TEXT,
+        ),
+        ModelKind::Lfm2 => (
+            crate::lfm2::model_args_from_config_value(config)
+                .map_err(invalid)?
+                .has_sparse_moe_layers(),
+            InputModalities::TEXT,
+        ),
+        ModelKind::MuseGlimmer => {
+            let args =
+                crate::muse_glimmer::DecoderConfig::from_hf_value(config).map_err(invalid)?;
+            (
+                args.is_moe(),
+                InputModalities {
+                    text: true,
+                    image: true,
+                    audio: false,
+                    video: args.weight_convention
+                        == crate::muse_glimmer::WeightConvention::HuggingFace,
+                },
+            )
+        }
+        ModelKind::NemotronH => (
+            crate::nemotron_h::model_args_from_config_value(config)
+                .map_err(invalid)?
+                .has_sparse_moe_layers(),
+            InputModalities::TEXT,
+        ),
+        ModelKind::Qwen2 | ModelKind::Qwen3 => (
+            crate::qwen::model_args_from_config_value(config)
+                .map_err(invalid)?
+                .is_moe(),
+            InputModalities::TEXT,
+        ),
+        ModelKind::Qwen3Next | ModelKind::Qwen35 => {
+            let args =
+                crate::qwen::hybrid::model_args_from_config_value(config).map_err(invalid)?;
+            let multimodal = args.vision.is_some();
+            (
+                args.text.is_moe(),
+                InputModalities {
+                    text: true,
+                    image: multimodal,
+                    audio: false,
+                    video: multimodal,
+                },
+            )
         }
         ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
-            crate::qwen::vl::model_args_from_config_value(config)
-                .map_err(invalid)?
-                .text
-                .is_moe()
+            let args = crate::qwen::vl::model_args_from_config_value(config).map_err(invalid)?;
+            (
+                args.text.is_moe(),
+                InputModalities {
+                    text: true,
+                    image: true,
+                    audio: false,
+                    video: true,
+                },
+            )
         }
-        ModelKind::Llama | ModelKind::Moshi => false,
+        ModelKind::Moshi => (
+            false,
+            InputModalities {
+                text: true,
+                image: false,
+                audio: true,
+                video: false,
+            },
+        ),
+        ModelKind::Llama => (false, InputModalities::TEXT),
     };
-    Ok(ArchitectureCapabilities::with_independently_addressable_experts(routed))
+    Ok(ArchitectureCapabilities::new(routed, input_modalities))
 }
 
 struct GemmaCatalog<'a>(&'a GgufCheckpoint);
@@ -154,5 +216,20 @@ pub fn gguf_capabilities(
         | GgufArchitecture::Qwen3Vl
         | GgufArchitecture::Qwen35 => false,
     };
-    Ok(ArchitectureCapabilities::with_independently_addressable_experts(routed))
+    let input_modalities = match architecture {
+        GgufArchitecture::Inkling => InputModalities {
+            text: true,
+            image: true,
+            audio: true,
+            video: false,
+        },
+        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => InputModalities {
+            text: true,
+            image: true,
+            audio: false,
+            video: true,
+        },
+        _ => InputModalities::TEXT,
+    };
+    Ok(ArchitectureCapabilities::new(routed, input_modalities))
 }

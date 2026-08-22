@@ -8,9 +8,9 @@ use std::{
 use crate::composition::mlx::structural::{self, GgufArchitectureValidation};
 use eredu_checkpoint::store::WeightStore;
 use eredu_core::{
-    ArtifactFormat, ArtifactModality, ArtifactTensorEncoding, GgufArchitecture, InspectionIssue,
-    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
-    ModelInspectionReport, ModelKind, Observed,
+    ArtifactFormat, ArtifactModality, ArtifactTensorEncoding, GgufArchitecture, InputModalities,
+    InspectionIssue, InspectionIssueCode, InspectionReadiness, InspectionRequirement,
+    InspectionSeverity, ModelInspectionReport, Observed,
 };
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use safemlx::ops::GgufCheckpoint;
@@ -125,18 +125,38 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
     if let Some(config) = &config {
         match crate::composition::mlx::resolve_model_config(config) {
             Ok(supported) => {
-                resolved_kind = Some(supported.kind);
                 report.model_kind = Some(supported.kind);
                 report.architecture = Some(supported.effective_model_type);
-                report.expected_modalities = modalities_for_safetensors(supported.kind, config);
-                report.architecture_support = InspectionReadiness::Ready;
-                match structural::validate_safetensors_preparation(
+                match eredu_architectures::preparation::safetensors_capabilities(
                     supported.kind,
                     config,
-                    options.load,
                 ) {
-                    Ok(_) => report.requested_load = InspectionReadiness::Ready,
-                    Err(error) => reject_load_policy(&mut report, &error),
+                    Ok(capabilities) => {
+                        resolved_kind = Some(supported.kind);
+                        report.expected_modalities =
+                            artifact_modalities(capabilities.input_modalities());
+                        report.architecture_support = InspectionReadiness::Ready;
+                        match structural::validate_safetensors_preparation(
+                            supported.kind,
+                            config,
+                            options.load,
+                        ) {
+                            Ok(_) => report.requested_load = InspectionReadiness::Ready,
+                            Err(error) => reject_load_policy(&mut report, &error),
+                        }
+                    }
+                    Err(error) => {
+                        report.architecture_support = InspectionReadiness::Invalid;
+                        report.model_loadability = InspectionReadiness::Invalid;
+                        report.structural_binding = InspectionReadiness::Invalid;
+                        report.requested_load = InspectionReadiness::Invalid;
+                        report.issue(
+                            InspectionIssueCode::InvalidConfiguration,
+                            InspectionSeverity::Error,
+                            error.to_string(),
+                            Some(config_path.clone()),
+                        );
+                    }
                 }
             }
             Err(error) => {
@@ -402,7 +422,6 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
             let kind = gguf_architecture.model_kind();
             report.model_kind = Some(kind);
             report.architecture_support = InspectionReadiness::Ready;
-            report.expected_modalities = modalities_for_gguf(gguf_architecture);
             if let Err(error) = gguf_architecture.validate_catalog(&checkpoint, &metadata) {
                 report.structural_binding = InspectionReadiness::Invalid;
                 report.model_loadability = InspectionReadiness::Invalid;
@@ -413,16 +432,35 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
                     Some(path.to_path_buf()),
                 );
             } else {
-                apply_structural_validation(
-                    &mut report,
-                    structural::validate_gguf(
-                        gguf_architecture,
-                        &checkpoint,
-                        &metadata,
-                        options.load,
-                    ),
-                    path,
-                );
+                match eredu_architectures::preparation::gguf_capabilities(
+                    gguf_architecture,
+                    &checkpoint,
+                ) {
+                    Ok(capabilities) => {
+                        report.expected_modalities =
+                            artifact_modalities(capabilities.input_modalities());
+                        apply_structural_validation(
+                            &mut report,
+                            structural::validate_gguf(
+                                gguf_architecture,
+                                &checkpoint,
+                                &metadata,
+                                options.load,
+                            ),
+                            path,
+                        );
+                    }
+                    Err(error) => {
+                        report.structural_binding = InspectionReadiness::Invalid;
+                        report.model_loadability = InspectionReadiness::Invalid;
+                        report.issue(
+                            InspectionIssueCode::InvalidConfiguration,
+                            InspectionSeverity::Error,
+                            error.to_string(),
+                            Some(path.to_path_buf()),
+                        );
+                    }
+                }
             }
             match structural::validate_gguf_preparation(
                 gguf_architecture,
@@ -861,64 +899,16 @@ fn inspect_safetensors_media(report: &mut ModelInspectionReport, path: &Path) {
     }
 }
 
-fn modalities_for_safetensors(kind: ModelKind, config: &Value) -> Vec<ArtifactModality> {
-    let mut modalities = BTreeSet::from([ArtifactModality::Text]);
-    match kind {
-        ModelKind::Gemma4 | ModelKind::Inkling => {
-            modalities.insert(ArtifactModality::Image);
-            modalities.insert(ArtifactModality::Audio);
-        }
-        ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
-            modalities.insert(ArtifactModality::Image);
-            modalities.insert(ArtifactModality::Video);
-        }
-        ModelKind::MuseGlimmer => {
-            modalities.insert(ArtifactModality::Image);
-            modalities.insert(ArtifactModality::Video);
-        }
-        ModelKind::Qwen35
-            if config.get("vision_config").is_some()
-                || config
-                    .get("text_config")
-                    .and_then(|text| text.get("vision_config"))
-                    .is_some() =>
-        {
-            modalities.insert(ArtifactModality::Image);
-            modalities.insert(ArtifactModality::Video);
-        }
-        ModelKind::Moshi => {
-            modalities.insert(ArtifactModality::Audio);
-        }
-        ModelKind::DeepSeekV3
-        | ModelKind::DeepSeekV4
-        | ModelKind::GptOss
-        | ModelKind::KimiLinear
-        | ModelKind::Llama
-        | ModelKind::Lfm2
-        | ModelKind::NemotronH
-        | ModelKind::Qwen2
-        | ModelKind::Qwen3
-        | ModelKind::Qwen3Next
-        | ModelKind::Qwen35 => {}
-    }
-    modalities.into_iter().collect()
-}
-
-fn modalities_for_gguf(architecture: GgufArchitecture) -> Vec<ArtifactModality> {
-    match architecture {
-        GgufArchitecture::Inkling => vec![
-            ArtifactModality::Text,
-            ArtifactModality::Image,
-            ArtifactModality::Audio,
-        ],
-        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => vec![
-            ArtifactModality::Text,
-            ArtifactModality::Image,
-            ArtifactModality::Video,
-        ],
-        GgufArchitecture::MuseGlimmer => vec![ArtifactModality::Text],
-        _ => vec![ArtifactModality::Text],
-    }
+fn artifact_modalities(modalities: InputModalities) -> Vec<ArtifactModality> {
+    [
+        (modalities.text, ArtifactModality::Text),
+        (modalities.image, ArtifactModality::Image),
+        (modalities.video, ArtifactModality::Video),
+        (modalities.audio, ArtifactModality::Audio),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, modality)| enabled.then_some(modality))
+    .collect()
 }
 
 fn reject_load_policy(report: &mut ModelInspectionReport, error: &Error) {
@@ -975,4 +965,23 @@ fn parse_unsupported_type_code(detail: &str) -> Option<u32> {
         .next()?
         .parse()
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_only_architecture_skips_processor_and_media_feature_requirements() {
+        let mut report =
+            ModelInspectionReport::unverified(Path::new("unused"), ArtifactFormat::SafeTensors);
+        report.expected_modalities = artifact_modalities(InputModalities::TEXT);
+
+        inspect_safetensors_media(&mut report, Path::new("unused"));
+
+        assert_eq!(report.expected_modalities, [ArtifactModality::Text]);
+        assert_eq!(report.multimodal, InspectionReadiness::NotApplicable);
+        assert!(report.requirements.is_empty());
+        assert!(report.issues.is_empty());
+    }
 }

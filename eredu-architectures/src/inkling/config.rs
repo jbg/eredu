@@ -4,7 +4,8 @@ use std::collections::HashMap;
 
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::{
-    cache::derive_prompt_cache_architecture_fingerprint, AttentionPolicy, LayerSchedule,
+    cache::derive_prompt_cache_architecture_fingerprint, AttentionPolicy, InputModalities,
+    LayerSchedule,
 };
 use eredu_gguf::{MetadataArray, MetadataValue};
 use serde::Deserialize;
@@ -501,6 +502,16 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
+    /// Returns the input modalities admitted by this exact family variant.
+    pub const fn input_modalities(&self) -> InputModalities {
+        InputModalities {
+            text: true,
+            image: self.vision_config.is_some(),
+            audio: self.audio_config.is_some(),
+            video: false,
+        }
+    }
+
     /// Parses and validates one Hugging Face configuration document.
     pub fn from_hf_json(bytes: &[u8]) -> Result<Self, ConfigError> {
         let source: ModelSource = serde_json::from_slice(bytes)?;
@@ -1253,7 +1264,26 @@ mod tests {
             args.text_config.layer_policy(1).unwrap().attention,
             AttentionPolicy::Full
         );
+        assert_eq!(
+            args.input_modalities(),
+            InputModalities {
+                text: true,
+                image: true,
+                audio: true,
+                video: false,
+            }
+        );
         assert!(!args.architecture_fingerprint().is_empty());
+    }
+
+    #[test]
+    fn text_only_variant_does_not_advertise_media_modalities() {
+        let mut value = config();
+        let object = value.as_object_mut().unwrap();
+        object.remove("vision_config");
+        object.remove("audio_config");
+        let args = ModelArgs::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(args.input_modalities(), InputModalities::TEXT);
     }
 
     #[test]

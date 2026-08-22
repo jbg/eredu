@@ -693,12 +693,7 @@ fn inkling_spec(args: &crate::inkling::ModelArgs) -> Result<Spec, CapabilityErro
         conv_width,
         "Inkling fixed convolution state",
     )?;
-    let modalities = InputModalities {
-        text: true,
-        image: args.vision_config.is_some(),
-        audio: args.audio_config.is_some(),
-        video: false,
-    };
+    let modalities = args.input_modalities();
     let decoder = match (global, sliding.as_slice()) {
         (_, []) => CacheStateStrategy::FullKv,
         (0, [only]) => CacheStateStrategy::SlidingKv {
@@ -1103,15 +1098,9 @@ pub fn gpt_oss(args: &crate::gpt_oss::ModelArgs) -> Result<CapabilityEstimate, C
 
 /// Derives Gemma 4 capabilities from its complete normalized family policy.
 pub fn gemma4(args: &crate::gemma4::FamilyConfig) -> Result<CapabilityEstimate, CapabilityError> {
-    let modalities = InputModalities {
-        text: true,
-        image: args.image_token_id.is_some(),
-        audio: args.audio_token_id.is_some(),
-        video: args.video_token_id.is_some(),
-    };
     Ok(finish(
         args.model_type.clone(),
-        gemma4_spec(&args.text, modalities)?,
+        gemma4_spec(&args.text, args.input_modalities())?,
     ))
 }
 

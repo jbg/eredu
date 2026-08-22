@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use eredu_checkpoint::WeightQuantization;
+use eredu_core::InputModalities;
 use serde::Deserialize;
 
 use super::{
@@ -78,6 +79,16 @@ pub struct FamilyConfig {
 }
 
 impl FamilyConfig {
+    /// Returns the input modalities admitted by this exact family variant.
+    pub const fn input_modalities(&self) -> InputModalities {
+        InputModalities {
+            text: true,
+            image: self.image_token_id.is_some(),
+            audio: self.audio_token_id.is_some(),
+            video: self.video_token_id.is_some(),
+        }
+    }
+
     /// Parses and validates one top-level Hugging Face configuration.
     pub fn from_hf_json(bytes: &[u8]) -> Result<Self, FamilyConfigError> {
         let source: FamilySource = serde_json::from_slice(bytes)?;
@@ -260,13 +271,36 @@ mod tests {
 
     #[test]
     fn normalizes_nested_family_and_freezes_all_component_identity() {
-        let parsed = FamilyConfig::from_hf_json(&serde_json::to_vec(&config()).unwrap()).unwrap();
+        let mut value = config();
+        value["video_token_id"] = 62.into();
+        let parsed = FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(parsed.model_type, "gemma4_unified");
         assert_eq!(parsed.text.model_type, "gemma4_unified");
         assert!(!parsed.text.tie_word_embeddings);
         assert!(parsed.vision.is_some());
         assert!(parsed.audio.is_some());
+        assert_eq!(
+            parsed.input_modalities(),
+            InputModalities {
+                text: true,
+                image: true,
+                audio: true,
+                video: true,
+            }
+        );
         assert!(!parsed.architecture_fingerprint().is_empty());
+    }
+
+    #[test]
+    fn text_only_variant_does_not_advertise_media_modalities() {
+        let mut value = config();
+        let object = value.as_object_mut().unwrap();
+        object.remove("image_token_id");
+        object.remove("vision_config");
+        object.remove("audio_token_id");
+        object.remove("audio_config");
+        let parsed = FamilyConfig::from_hf_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(parsed.input_modalities(), InputModalities::TEXT);
     }
 
     #[test]
