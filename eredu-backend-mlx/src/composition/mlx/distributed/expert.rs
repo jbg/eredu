@@ -2962,37 +2962,6 @@ fn load_qwen3_ep(
         weights_stream,
     )
 }
-#[cfg(test)]
-#[allow(dead_code)]
-fn is_routed_expert_key(kind: ModelKind, key: &str) -> bool {
-    match kind {
-        ModelKind::KimiLinear => {
-            key.contains(".mlp.experts.") || key.contains(".block_sparse_moe.experts.")
-        }
-        ModelKind::Lfm2 => key.contains(".feed_forward.experts."),
-        ModelKind::NemotronH => key.contains(".experts.") && !key.contains(".shared_experts."),
-        ModelKind::Inkling => key.contains(".mlp.experts.") || key.contains(".moe.experts."),
-        ModelKind::Qwen3Next | ModelKind::Qwen35 => is_qwen_hybrid_decoder_expert_key(key),
-        _ => key.contains(".mlp.experts."),
-    }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn is_qwen_hybrid_decoder_expert_key(key: &str) -> bool {
-    key.starts_with("model.layers.") && key.contains(".mlp.experts.")
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn is_auxiliary_checkpoint_key(kind: ModelKind, key: &str) -> bool {
-    match kind {
-        ModelKind::Inkling => key.starts_with("model.mtp."),
-        ModelKind::Qwen3Next => key.starts_with("model.mtp."),
-        _ => false,
-    }
-}
-
 fn rank_owned_expert_cache(
     store: std::sync::Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     entries: Vec<ExpertCatalogEntry>,
