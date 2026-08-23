@@ -43,6 +43,10 @@ process runtime configuration, synchronization, allocator telemetry, and
 diagnostic benchmarks without exposing native tensors, streams, devices, or
 random state. Direct native access remains an explicit backend-author escape
 hatch under `eredu-backend-mlx::native`; it is not an application dependency.
+Facade examples follow the same rule and construct selected local sessions
+through `eredu::api`. Backend-author probes that intentionally manipulate MLX
+tensors, streams, distributed groups, caches, or checkpoint packing live as
+`eredu-backend-mlx` examples and depend downward on neutral contracts.
 
 ## Ownership boundary
 

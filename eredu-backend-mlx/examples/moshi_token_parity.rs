@@ -1,10 +1,10 @@
-//! Compare the neutral realtime facade with a native `moshi_mlx` fixture.
+//! Compare the MLX realtime backend with a native `moshi_mlx` fixture.
 //!
 //! ```text
-//! python eredu/scripts/moshi_mlx_token_fixture.py \
+//! python scripts/moshi_mlx_token_fixture.py \
 //!   /models/moshi /fixtures/moshi-native.safetensors \
 //!   --require-mlx-version VERSION
-//! cargo run -p eredu --features mlx --example moshi_token_parity -- \
+//! cargo run -p eredu-backend-mlx --example moshi_token_parity -- \
 //!   /models/moshi /fixtures/moshi-native.safetensors
 //! ```
 //!
@@ -13,9 +13,9 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use eredu::load_realtime_model;
 use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
 use eredu_backend_mlx::{generate_encoded_greedy, MlxRealtimeBackend};
+use eredu_core::load_realtime_model;
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();

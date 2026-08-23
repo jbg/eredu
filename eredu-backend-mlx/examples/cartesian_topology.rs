@@ -1,5 +1,7 @@
 //! Inspect a pairwise Cartesian distributed topology before loading weights.
 
+//! Inspect MLX Cartesian rank topology construction.
+
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     DeviceType,

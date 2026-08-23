@@ -1,16 +1,20 @@
-//! Save, drop, lazily reopen, and continue a deterministic text prompt cache.
+//! Save, drop, lazily reopen, and continue an MLX text prompt cache.
 
 use std::path::PathBuf;
 
 use clap::Parser;
-use eredu::{
-    api::LoadedModel, AttentionPolicy, CacheResidencyPolicy, PagedCacheOptions,
-    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
-};
 use eredu_backend_mlx::native::{
     transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext,
 };
-use eredu_backend_mlx::{InputPart, MlxModelInput, ModelInput};
+use eredu_backend_mlx::{
+    InputPart, MlxBackend, MlxModelInput, MlxModelSession, ModelInput, ModelLoadOptions,
+};
+use eredu_core::{
+    cache::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
+    load_model, AttentionPolicy, BackendProvider as _, BackendSession as _,
+};
+use eredu_runtime::{CacheResidencyPolicy, PagedCacheOptions};
+use eredu_text::tokenizer::Tokenizer;
 
 #[derive(Debug, Parser)]
 #[command(about = "Verify reusable paged prompt-cache parity")]
@@ -56,13 +60,13 @@ struct Args {
 
 fn prefill_tokens(
     tokens: &Array,
-    model: &mut LoadedModel<eredu_backend_mlx::MlxBackend<'static>>,
+    backend: &MlxBackend<'static>,
+    session: &mut MlxModelSession<'static>,
 ) -> anyhow::Result<Array> {
     let parts = [InputPart::text_token_ids(tokens)];
     let input = MlxModelInput::from(ModelInput::new(&parts));
-    model
-        .runtime_mut()
-        .prefill(input)?
+    session
+        .prefill(backend, input)?
         .wait()?
         .into_logits()
         .ok_or_else(|| anyhow::anyhow!("selected MLX rank does not own prefill logits"))
@@ -70,11 +74,11 @@ fn prefill_tokens(
 
 fn decode_tokens(
     tokens: &Array,
-    model: &mut LoadedModel<eredu_backend_mlx::MlxBackend<'static>>,
+    backend: &MlxBackend<'static>,
+    session: &mut MlxModelSession<'static>,
 ) -> anyhow::Result<Array> {
-    model
-        .runtime_mut()
-        .decode(tokens.clone())?
+    session
+        .decode(backend, tokens.clone())?
         .wait()?
         .into_logits()
         .ok_or_else(|| anyhow::anyhow!("selected MLX rank does not own decode logits"))
@@ -85,12 +89,18 @@ fn main() -> anyhow::Result<()> {
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let mut model = LoadedModel::load(
-        eredu_backend_mlx::native::backend(stream, weights.stream()),
-        &args.model_dir,
-        Default::default(),
-    )?;
-    let prefix_ids = model.encode(&args.prompt, false)?;
+    let backend = eredu_backend_mlx::native::backend(stream, weights.stream());
+    let model = load_model(&backend, &args.model_dir, ModelLoadOptions::default())?;
+    let model_type = model.effective_model_type().to_owned();
+    let model_family = model.model_family().canonical_name().to_owned();
+    let mut session = backend.create_session(model)?;
+    let tokenizer = Tokenizer::from_file(args.model_dir.join("tokenizer.json"))
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let prefix_ids = tokenizer
+        .encode(args.prompt.as_str(), false)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .get_ids()
+        .to_vec();
     anyhow::ensure!(
         !prefix_ids.is_empty(),
         "prompt must encode to at least one token"
@@ -99,8 +109,8 @@ fn main() -> anyhow::Result<()> {
     let suffix = Array::from_slice(&[args.suffix_token], &[1, 1]);
 
     if args.device_cache {
-        let _ = prefill_tokens(&prefix, &mut model)?;
-        let logits = decode_tokens(&suffix, &mut model)?;
+        let _ = prefill_tokens(&prefix, &backend, &mut session)?;
+        let logits = decode_tokens(&suffix, &backend, &mut session)?;
         async_eval_with_event([&logits])?.synchronize()?;
         println!(
             "ordinary device cache suffix logits shape: {:?}",
@@ -109,7 +119,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let layer_layout = model.runtime().session().prompt_cache_layer_layout()?;
+    let layer_layout = session.prompt_cache_layer_layout()?;
     let has_full_attention = layer_layout
         .iter()
         .any(|policy| matches!(policy.attention(), Some(AttentionPolicy::Full)));
@@ -126,93 +136,57 @@ fn main() -> anyhow::Result<()> {
         paged = paged.with_live_disk(directory, args.live_disk_bytes, 2)?;
     }
 
-    model
-        .runtime_mut()
-        .session_mut()
-        .configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
-    let _ = prefill_tokens(&prefix, &mut model)?;
-    let uninterrupted_logits = decode_tokens(&suffix, &mut model)?;
+    session.configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
+    let _ = prefill_tokens(&prefix, &backend, &mut session)?;
+    let uninterrupted_logits = decode_tokens(&suffix, &backend, &mut session)?;
     async_eval_with_event([&uninterrupted_logits])?.synchronize()?;
     println!(
         "uninterrupted report: {:#?}",
-        model.runtime().session().cache_residency_report()?
+        session.cache_residency_report()?
     );
 
-    model
-        .runtime_mut()
-        .session_mut()
-        .configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
-    let _ = prefill_tokens(&prefix, &mut model)?;
-    let model_type = model.model_type().to_owned();
-    let model_family = if model_type.contains("deepseek") {
-        "deepseek_v3"
-    } else if model_type.contains("qwen") {
-        "qwen"
-    } else if model_type.contains("gpt_oss") {
-        "gpt_oss"
-    } else {
-        "llama"
-    };
+    session.configure_cache(CacheResidencyPolicy::Paged(paged.clone()))?;
+    let _ = prefill_tokens(&prefix, &backend, &mut session)?;
     let layer_count = layer_layout.len();
     let descriptor = PromptCacheDescriptor {
-        model_family: model_family.into(),
+        model_family,
         effective_model_type: model_type,
         checkpoint_fingerprint: args.checkpoint_fingerprint,
         prefix_content_fingerprint: format!("tokens:{prefix_ids:?}"),
-        architecture_fingerprint: model
-            .runtime()
-            .session()
-            .prompt_cache_architecture_fingerprint()?,
+        architecture_fingerprint: session.prompt_cache_architecture_fingerprint()?,
         layer_count,
         global_layer_start: 0,
         global_layer_end: layer_count,
         batch_size: 1,
-        layer_prefix_offsets: model
-            .runtime()
-            .session()
-            .prompt_cache_layer_prefix_offsets()?,
+        layer_prefix_offsets: session.prompt_cache_layer_prefix_offsets()?,
         layer_layout,
         sink_tokens: 0,
         topology: PromptCacheTopology::default(),
     };
-    let manifest = {
-        let (backend, session) = model.runtime_mut().parts_mut();
-        session.save_prompt_cache(
-            backend,
-            &args.cache_dir,
-            descriptor.clone(),
-            &prefix_ids,
-            &PromptCacheOptions {
-                application_namespace: Some("paged-prompt-cache-example".into()),
-                replace_existing: args.replace,
-            },
-        )?
-    };
+    let manifest = session.save_prompt_cache(
+        &backend,
+        &args.cache_dir,
+        descriptor.clone(),
+        &prefix_ids,
+        &PromptCacheOptions {
+            application_namespace: Some("paged-prompt-cache-example".into()),
+            replace_existing: args.replace,
+        },
+    )?;
     println!("saved blocks: {}", manifest.blocks.len());
-    println!(
-        "save report: {:#?}",
-        model.runtime().session().cache_residency_report()?
-    );
+    println!("save report: {:#?}", session.cache_residency_report()?);
 
-    let inspected = {
-        let (backend, session) = model.runtime_mut().parts_mut();
-        session.load_prompt_cache(backend, &args.cache_dir, &descriptor, &prefix_ids, paged)?
-    };
+    let inspected =
+        session.load_prompt_cache(&backend, &args.cache_dir, &descriptor, &prefix_ids, paged)?;
     println!("cataloged blocks: {}", inspected.blocks.len());
-    println!(
-        "load report: {:#?}",
-        model.runtime().session().cache_residency_report()?
-    );
-    let restored_logits = decode_tokens(&suffix, &mut model)?;
+    println!("load report: {:#?}", session.cache_residency_report()?);
+    let restored_logits = decode_tokens(&suffix, &backend, &mut session)?;
     async_eval_with_event([&restored_logits])?.synchronize()?;
     let equal = restored_logits
         .all_close(&uninterrupted_logits, 1e-4, 1e-4, None, stream)?
         .item::<bool>(stream);
     println!("restored suffix logits match uninterrupted execution: {equal}");
-    println!(
-        "continued report: {:#?}",
-        model.runtime().session().cache_residency_report()?
-    );
+    println!("continued report: {:#?}", session.cache_residency_report()?);
     anyhow::ensure!(
         equal,
         "restored suffix logits differ from uninterrupted execution"

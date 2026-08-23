@@ -64,4 +64,8 @@ smallvec = "1"
 ref-cast = "1"
 
 [dev-dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+eredu-text = { workspace = true, default-features = false }
+libc = "0.2"
 tempfile.workspace = true

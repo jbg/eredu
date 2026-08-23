@@ -19,7 +19,7 @@ mod composition;
 
 pub use adapter::*;
 
-/// Deliberate access to the native MLX handles needed by applications that
+/// Deliberate access to native MLX handles for backend-author tools that
 /// configure devices, streams, memory, or low-level tensor inputs.
 pub mod native {
     pub use safemlx::*;

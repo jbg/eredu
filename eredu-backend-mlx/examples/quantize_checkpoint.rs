@@ -1,3 +1,5 @@
+//! Quantize a checkpoint with MLX packing operators.
+
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};

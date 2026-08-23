@@ -889,6 +889,8 @@ dependencies = [
 name = "eredu-backend-mlx"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
  "eredu-architectures",
  "eredu-checkpoint",
  "eredu-codec",
@@ -896,6 +898,7 @@ dependencies = [
  "eredu-gguf",
  "eredu-nn",
  "eredu-runtime",
+ "eredu-text",
  "half",
  "image",
  "libc",

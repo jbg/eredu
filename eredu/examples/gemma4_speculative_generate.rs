@@ -2,14 +2,13 @@ use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
 
 use eredu::{
     api::{
-        ChatTemplateRequest, LoadedModel, PreparedChat, PreparedChatGenerationSettings,
-        PreparedChatInput, PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest,
-        SpeculativeDraft,
+        local_device_plan, ChatTemplateRequest, LoadedModel, LocalBackendFactory, LocalDevice,
+        PreparedChat, PreparedChatGenerationSettings, PreparedChatInput,
+        PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest,
     },
-    GenerationCancellationToken, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
+    DraftPlacementPlan, DraftingPlan, ExecutionPlan, GenerationCancellationToken,
+    GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
-use eredu_backend_mlx::native::{ExecutionContext, Stream};
-use eredu_backend_mlx::MlxDrafter;
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -36,29 +35,13 @@ fn main() -> anyhow::Result<()> {
     println!("assistant: {}", assistant_dir.display());
     println!("prompt: {prompt:?}");
 
-    let ctx = ExecutionContext::new(eredu_backend_mlx::native::Device::new(
-        eredu_backend_mlx::native::DeviceType::Gpu,
-        0,
-    ));
-    let stream = ctx.stream();
-    let weights_ctx = ExecutionContext::new(eredu_backend_mlx::native::Device::new(
-        eredu_backend_mlx::native::DeviceType::Cpu,
-        0,
-    ));
-    let weights_stream = weights_ctx.stream();
-    let prepared = prepare_prompt(&target_dir, &prompt, stream, weights_stream)?;
+    let prepared = prepare_prompt(&target_dir, &prompt)?;
     println!(
         "\n=== rendered prompt ===\n{}\n",
         prepared.rendered_prompt()
     );
 
-    let greedy = run_greedy(
-        &target_dir,
-        prepared.rendered_prompt(),
-        max_tokens,
-        stream,
-        weights_stream,
-    )?;
+    let greedy = run_greedy(&target_dir, prepared.rendered_prompt(), max_tokens)?;
     println!("\n=== greedy ===");
     println!(
         "tokens: {} elapsed: {:.2?}",
@@ -67,14 +50,7 @@ fn main() -> anyhow::Result<()> {
     );
     println!("{}", greedy.text);
 
-    let mtp = run_mtp(
-        &target_dir,
-        &assistant_dir,
-        &prepared,
-        max_tokens,
-        stream,
-        weights_stream,
-    )?;
+    let mtp = run_mtp(&target_dir, &assistant_dir, &prepared, max_tokens)?;
     println!("\n=== mtp ===");
     println!(
         "tokens: {} elapsed: {:.2?}",
@@ -87,24 +63,18 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-struct ProbeResult {
+struct GenerationResult {
     token_ids: Vec<u32>,
     text: String,
     elapsed: std::time::Duration,
     accept_lens: Vec<usize>,
 }
 
-fn prepare_prompt(
-    target_dir: &PathBuf,
-    prompt: &str,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> anyhow::Result<PreparedChat> {
-    let mut loaded = LoadedModel::load(
-        eredu_backend_mlx::native::backend(stream, weights_stream),
-        target_dir,
-        Default::default(),
-    )?;
+fn prepare_prompt(target_dir: &PathBuf, prompt: &str) -> anyhow::Result<PreparedChat> {
+    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    let planned =
+        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
+    let (mut loaded, _) = planned.into_parts();
     loaded
         .prepare_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({
@@ -121,14 +91,11 @@ fn run_greedy(
     target_dir: &PathBuf,
     prompt: &str,
     max_tokens: usize,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> anyhow::Result<ProbeResult> {
-    let mut loaded = LoadedModel::load(
-        eredu_backend_mlx::native::backend(stream, weights_stream),
-        target_dir,
-        Default::default(),
-    )?;
+) -> anyhow::Result<GenerationResult> {
+    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    let planned =
+        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
+    let (mut loaded, _) = planned.into_parts();
     let prompt_tokens = loaded.encode(prompt, false)?;
     let eos = loaded.eos_token_ids().to_vec();
     let mut ids = Vec::new();
@@ -152,7 +119,7 @@ fn run_greedy(
     }
     let elapsed = start.elapsed();
     let text = loaded.decode(&ids, true)?;
-    Ok(ProbeResult {
+    Ok(GenerationResult {
         token_ids: ids,
         text,
         elapsed,
@@ -165,25 +132,24 @@ fn run_mtp(
     assistant_dir: &PathBuf,
     prepared: &PreparedChat,
     max_tokens: usize,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> anyhow::Result<ProbeResult> {
-    let mut target = LoadedModel::load(
-        eredu_backend_mlx::native::backend(stream, weights_stream),
-        target_dir,
-        Default::default(),
-    )?;
-    let assistant_tokenizer = eredu::api::load_tokenizer(assistant_dir)?;
-    let mut assistant = MlxDrafter::load_with_fingerprint(
-        assistant_dir,
-        eredu_text::tokenizer::vocabulary_fingerprint(&assistant_tokenizer),
-        Default::default(),
-        stream,
-        weights_stream,
-    )?;
+) -> anyhow::Result<GenerationResult> {
+    let mut plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    plan.drafting = DraftingPlan::External {
+        model: assistant_dir.display().to_string(),
+        placement: DraftPlacementPlan::Target,
+        max_draft_tokens: 3,
+        lookahead: false,
+        adaptive_lookahead: false,
+    };
+    let planned =
+        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), target_dir, &plan)?;
+    let (mut target, mut drafting) = planned.into_parts();
+    let drafting = drafting
+        .as_speculative_draft()
+        .ok_or_else(|| anyhow::anyhow!("external drafting plan was not realized"))?;
     let output = target.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
         input: PreparedChatInput::rendered_prompt(prepared),
-        drafting: SpeculativeDraft::External(&mut assistant),
+        drafting,
         settings: PreparedChatGenerationSettings {
             overrides: GenerationConfigOverrides {
                 temperature: Some(0.0),
@@ -209,7 +175,7 @@ fn run_mtp(
         generated.pop();
     }
     let text = target.decode(&generated, true)?;
-    Ok(ProbeResult {
+    Ok(GenerationResult {
         token_ids: generated,
         text,
         elapsed: stats.elapsed,

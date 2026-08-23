@@ -1,9 +1,13 @@
 use std::{path::PathBuf, time::Instant};
 
-use eredu::{api::LoadedModel, GenerationConfigOverrides, TextGenerationConfig, TokenOutput};
-use eredu_backend_mlx::native::ExecutionContext;
-use eredu_backend_mlx::ModelLoadOptions;
-use eredu_checkpoint::AffineQuantization;
+use eredu::{
+    api::{
+        local_allocator_telemetry, local_device_plan, reset_local_allocator_peak,
+        synchronize_local_backend, LoadedModel, LocalBackend, LocalBackendFactory, LocalDevice,
+    },
+    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
+    WeightTransformationPlan,
+};
 
 const DEFAULT_DECODE_TOKENS: usize = 128;
 const CASES: &[(&str, usize)] = &[
@@ -38,43 +42,25 @@ fn main() -> anyhow::Result<()> {
     println!("decode_tokens={decode_tokens}");
     println!("quantize_on_load={quantize_on_load}");
 
-    let ctx = ExecutionContext::new(eredu_backend_mlx::native::Device::new(
-        eredu_backend_mlx::native::DeviceType::Gpu,
-        0,
-    ));
-    let stream = ctx.stream();
-    let weights_ctx = ExecutionContext::new(eredu_backend_mlx::native::Device::new(
-        eredu_backend_mlx::native::DeviceType::Cpu,
-        0,
-    ));
-    let weights_stream = weights_ctx.stream();
-    eredu_backend_mlx::native::memory::reset_peak_memory()?;
+    let mut plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    if quantize_on_load {
+        plan.weight_transformation = WeightTransformationPlan::Affine {
+            bits: 4,
+            group_size: 64,
+        };
+    }
+    reset_local_allocator_peak()?;
     let load_start = Instant::now();
-    let options = if quantize_on_load {
-        ModelLoadOptions::with_quantization(AffineQuantization::default())
-    } else {
-        ModelLoadOptions::default()
-    };
-    let mut model = LoadedModel::load(
-        eredu_backend_mlx::native::backend(stream, weights_stream),
-        &model_dir,
-        options,
-    )?;
-    stream.synchronize()?;
+    let planned =
+        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &model_dir, &plan)?;
+    let (mut model, _) = planned.into_parts();
+    synchronize_local_backend(model.runtime().backend())?;
     let load_elapsed = load_start.elapsed();
+    let allocator = local_allocator_telemetry(model.runtime().backend())?;
     println!("load_s={:.3}", load_elapsed.as_secs_f64());
-    println!(
-        "mlx_active_memory_bytes={}",
-        eredu_backend_mlx::native::memory::active_memory()?
-    );
-    println!(
-        "mlx_peak_memory_bytes={}",
-        eredu_backend_mlx::native::memory::peak_memory()?
-    );
-    println!(
-        "mlx_cache_memory_bytes={}",
-        eredu_backend_mlx::native::memory::cache_memory()?
-    );
+    println!("mlx_active_memory_bytes={}", allocator.active_bytes);
+    println!("mlx_peak_memory_bytes={}", allocator.peak_bytes);
+    println!("mlx_cache_memory_bytes={}", allocator.cache_bytes);
 
     let warmup_start = Instant::now();
     let warmup_prompt = prompt_near_token_count(&mut model, 16)?;
@@ -129,7 +115,7 @@ struct BenchResult {
 }
 
 fn run_case(
-    model: &mut LoadedModel<eredu_backend_mlx::MlxBackend<'static>>,
+    model: &mut LoadedModel<LocalBackend<'static>>,
     prompt: &str,
     decode_tokens: usize,
 ) -> anyhow::Result<BenchResult> {
@@ -181,7 +167,7 @@ fn run_case(
 }
 
 fn prompt_near_token_count(
-    model: &mut LoadedModel<eredu_backend_mlx::MlxBackend<'static>>,
+    model: &mut LoadedModel<LocalBackend<'static>>,
     target_tokens: usize,
 ) -> anyhow::Result<String> {
     let base = "Discuss hybrid linear attention, sparse mixture-of-experts routing, recurrent cache updates, grouped convolution, and vocabulary projection in a text generation runtime. ";

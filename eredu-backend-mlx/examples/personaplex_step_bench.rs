@@ -1,9 +1,7 @@
+//! Benchmark MLX PersonaPlex step execution.
+
 use std::{path::PathBuf, time::Instant};
 
-use eredu::{
-    load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
-    RealtimeScheduler, RequestId, SchedulerLimits,
-};
 use eredu_backend_mlx::native::{
     transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
 };
@@ -11,6 +9,11 @@ use eredu_backend_mlx::{
     personaplex_sine_frame, MlxRealtimeBackend, MlxRealtimeInput, ModelLoadOptions,
 };
 use eredu_checkpoint::AffineQuantization;
+use eredu_core::scheduler::{RequestId, SchedulerLimits};
+use eredu_core::{
+    load_realtime_model, load_realtime_model_with_options, RealtimeModel, RealtimeSampling,
+    RealtimeScheduler,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();

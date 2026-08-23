@@ -1,9 +1,5 @@
-//! Minimal generalized two-or-more-process Llama/Mistral TP generation probe.
+//! Minimal MLX two-or-more-process microbatched pipeline generation probe.
 
-use eredu::{
-    core::{BackendProvider as _, BackendSession},
-    load_model,
-};
 use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     DeviceType, Stream,
@@ -11,12 +7,13 @@ use eredu_backend_mlx::native::{
 use eredu_backend_mlx::{
     DeviceAssignment, InputPart, MlxParallelContext, ModelInput, ModelLoadOptions,
 };
+use eredu_core::{load_model, BackendProvider as _, BackendSession as _};
 use eredu_runtime::DefaultSampler;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_dir = std::env::args()
         .nth(1)
-        .ok_or("usage: tensor_parallel_generate MODEL_DIR")?;
+        .ok_or("usage: pipeline_generate MODEL_DIR")?;
     let group = distributed::init(true, Backend::Ring)?;
     let local_index = std::env::var("LOCAL_RANK")
         .ok()
@@ -24,8 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(0);
     let topology = MlxParallelContext::for_group(
         &group,
-        group.size(),
         1,
+        group.size(),
         1,
         DeviceAssignment::new(DeviceType::Gpu, local_index),
     )?;
@@ -43,21 +40,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut logits = session
         .prefill(&backend, ModelInput::new(&parts).into())?
         .wait()?
-        .into_logits()
-        .ok_or("tensor-parallel session returned no logits")?;
+        .into_logits();
     let mut sampler = DefaultSampler;
-    for _ in 0..8 {
-        let synchronized = session.sample_and_synchronize(
-            Some(&logits),
-            logits.dim(0),
-            &mut sampler,
-            0.0,
-            None,
-            false,
-        )?;
-        if group.rank() == 0 {
+    for generation_step in 0..8 {
+        let synchronized =
+            session.sample_and_synchronize(logits.as_ref(), 1, &mut sampler, 0.0, None, false)?;
+        if group.rank() + 1 == group.size() {
             eprintln!(
-                "sampled token {:?}",
+                "step {generation_step}: {:?}",
                 synchronized.token.evaluated()?.as_slice::<u32>()
             );
         }
@@ -67,8 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         logits = session
             .decode(&backend, synchronized.token)?
             .wait()?
-            .into_logits()
-            .ok_or("tensor-parallel session returned no logits")?;
+            .into_logits();
     }
     Ok(())
 }

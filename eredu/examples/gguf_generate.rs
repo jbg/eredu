@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 use eredu::{
-    api::LoadedModel, GenerationConfigOverrides, TextGenerationBackend, TextGenerationConfig,
+    api::{local_device_plan, LoadedModel, LocalBackendFactory, LocalDevice},
+    ExecutionPlan, GenerationConfigOverrides, TextGenerationBackend, TextGenerationConfig,
     TokenOutput,
 };
-use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
 
 fn generate<B: TextGenerationBackend>(
     model: &mut LoadedModel<B>,
@@ -54,14 +54,10 @@ fn main() -> anyhow::Result<()> {
         .transpose()?
         .unwrap_or(0.0);
 
-    let ctx = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-    let weights_ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-    let stream = ctx.stream();
-    let mut model = LoadedModel::load(
-        eredu_backend_mlx::native::backend(stream, weights_ctx.stream()),
-        &gguf_file,
-        Default::default(),
-    )?;
+    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    let planned =
+        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &gguf_file, &plan)?;
+    let (mut model, _) = planned.into_parts();
 
     println!("model type: {}", model.model_type());
     println!("chat template: {}", model.has_chat_template());

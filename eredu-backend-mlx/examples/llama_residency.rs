@@ -1,15 +1,16 @@
-//! Compare Llama residency policies with an opt-in local checkpoint benchmark.
+//! Compare MLX Llama residency policies with a local checkpoint benchmark.
 
 use std::{path::PathBuf, time::Instant};
 
 use clap::Parser;
-use eredu::{
-    core::residency::{MemoryTier, OffloadConfig, TransferDirection},
-    core::{BackendProvider as _, BackendSession as _},
-    load_model, DenseDiskStreamLoadOptions, LayerwiseLoadOptions, WeightResidency,
-};
 use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
 use eredu_backend_mlx::{sample, InputPart, ModelInput, ModelLoadOptions};
+use eredu_core::{
+    load_model,
+    residency::{MemoryTier, OffloadConfig, TransferDirection},
+    BackendProvider as _, BackendSession as _,
+};
+use eredu_runtime::{DenseDiskStreamLoadOptions, LayerwiseLoadOptions, WeightResidency};
 
 #[derive(Debug, Parser)]
 #[command(about = "Measure synchronous Llama decoder-layer host transfers")]
@@ -106,7 +107,7 @@ fn main() -> anyhow::Result<()> {
         ModelLoadOptions::default().with_weight_residency(weight_residency),
     )?;
     anyhow::ensure!(
-        model.model_family() == eredu::ModelKind::Llama,
+        model.model_family() == eredu_architectures::ModelKind::Llama,
         "the Llama residency benchmark requires a Llama-compatible checkpoint, got {} ({})",
         model.model_family().canonical_name(),
         model.effective_model_type()

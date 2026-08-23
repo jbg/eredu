@@ -7,15 +7,14 @@ use std::{env, num::NonZeroUsize};
 
 use eredu::{
     api::{
-        LoadedModel, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-        PreparedChatInput, PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest,
-        SpeculativeDraft,
+        local_device_plan, ChatTemplateRequest, LoadedModel, LocalBackendFactory, LocalDevice,
+        NativeToolSupport, ParallelToolCallPolicy, PreparedChatGenerationRequest,
+        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
+        PreparedChatMtpGenerationRequest, SpeculativeDraft, ToolChoice,
     },
-    runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
-    MtpCapability, MtpCheckpointKind, MtpSchedulerOptions, SemanticEvent,
+    DraftPlacementPlan, DraftingPlan, ExecutionPlan, MtpCapability, MtpCheckpointKind,
+    MtpSchedulerOptions, SemanticEvent,
 };
-use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
-use eredu_backend_mlx::MlxDrafter;
 use serde_json::json;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,12 +24,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: native_tool_calling TARGET [DRAFTER]")?;
     let drafter_path = arguments.next();
 
-    let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-    let mut model = LoadedModel::load(
-        eredu_backend_mlx::native::backend(target.stream(), target.stream()),
-        &target_path,
-        Default::default(),
-    )?;
+    let mut plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    if let Some(path) = &drafter_path {
+        plan.drafting = DraftingPlan::External {
+            model: path.clone(),
+            placement: DraftPlacementPlan::Device {
+                device: local_device_plan(LocalDevice::Cpu),
+            },
+            max_draft_tokens: 3,
+            lookahead: true,
+            adaptive_lookahead: false,
+        };
+    }
+    let planned =
+        LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &target_path, &plan)?;
+    let (mut model, mut drafting) = planned.into_parts();
     let prepared = model.prepare_chat(ChatTemplateRequest {
         messages: vec![json!({
             "role": "user",
@@ -82,22 +90,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut events = Vec::<SemanticEvent>::new();
 
-    let finish_reason = if let Some(drafter_path) = drafter_path {
-        // Draft on CPU while the target verifies on GPU. The loaded target and
-        // drafter retain their respective execution placements.
-        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let drafter_tokenizer = eredu::api::load_tokenizer(&drafter_path)?;
-        let mut drafter = MlxDrafter::load_with_fingerprint(
-            &drafter_path,
-            eredu_text::tokenizer::vocabulary_fingerprint(&drafter_tokenizer),
-            Default::default(),
-            draft.stream(),
-            draft.stream(),
-        )?;
+    let finish_reason = if drafter_path.is_some() {
+        let drafting = drafting
+            .as_speculative_draft()
+            .ok_or("external drafting plan was not realized")?;
         model
             .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(&prepared),
-                drafting: SpeculativeDraft::External(&mut drafter),
+                drafting,
                 settings,
                 options: PreparedChatMtpGenerationOptions {
                     max_draft_tokens: NonZeroUsize::new(3).unwrap(),

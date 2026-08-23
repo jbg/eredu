@@ -4,11 +4,13 @@ use std::{
 };
 
 use eredu::{
-    api::{LoadedModel, LoadedModelLoadError},
-    GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
+    api::{
+        local_device_plan, LoadedModel, LoadedModelLoadError, LocalBackend, LocalBackendError,
+        LocalBackendFactory, LocalDevice,
+    },
+    ExecutionPlan, GenerationConfigOverrides, PlannedModelLoadError, TextGenerationConfig,
+    TokenOutput,
 };
-use eredu_backend_mlx::native::ExecutionContext;
-use eredu_backend_mlx::MlxError;
 use serde_json::Value;
 
 fn main() -> anyhow::Result<()> {
@@ -17,7 +19,7 @@ fn main() -> anyhow::Result<()> {
         .first()
         .map(PathBuf::from)
         .or_else(default_e4b_snapshot)
-        .expect("usage: cargo run -p eredu --example gemma4_e4b_probe -- <model-dir> [prompt]");
+        .expect("usage: cargo run -p eredu --example gemma4_generate -- <model-dir> [prompt]");
     let prompt = args
         .get(1)
         .cloned()
@@ -29,23 +31,16 @@ fn main() -> anyhow::Result<()> {
 
     print_config_summary(&model_dir)?;
 
-    let ctx = ExecutionContext::new(eredu_backend_mlx::native::Device::new(
-        eredu_backend_mlx::native::DeviceType::Gpu,
-        0,
-    ));
-    let stream = ctx.stream();
-    let weights_ctx = ExecutionContext::new(eredu_backend_mlx::native::Device::new(
-        eredu_backend_mlx::native::DeviceType::Cpu,
-        0,
-    ));
-    let weights_stream = weights_ctx.stream();
-    let mut model = match LoadedModel::load(
-        eredu_backend_mlx::native::backend(stream, weights_stream),
+    let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+    let planned = match LoadedModel::load_execution_plan(
+        &LocalBackendFactory::default(),
         &model_dir,
-        Default::default(),
+        &plan,
     ) {
         Ok(model) => model,
-        Err(LoadedModelLoadError::Backend(MlxError::StrictLoadValidation { missing, unused })) => {
+        Err(PlannedModelLoadError::Loading(LoadedModelLoadError::Backend(
+            LocalBackendError::StrictLoadValidation { missing, unused },
+        ))) => {
             print_strict_report(&missing, &unused);
             anyhow::bail!(
                 "strict load failed; implement the missing architecture or key mapping above"
@@ -53,6 +48,7 @@ fn main() -> anyhow::Result<()> {
         }
         Err(error) => return Err(error.into()),
     };
+    let (mut model, _) = planned.into_parts();
 
     let rendered = model
         .apply_chat_template_json(
@@ -111,7 +107,7 @@ fn gemma4_message(prompt: &str, model_type: &str) -> serde_json::Value {
 }
 
 fn print_first_token_distribution(
-    model: &mut LoadedModel<eredu_backend_mlx::MlxBackend<'static>>,
+    model: &mut LoadedModel<LocalBackend<'static>>,
     tokens: Vec<u32>,
 ) -> anyhow::Result<()> {
     let resolved = model.resolve_generation_config(GenerationConfigOverrides {
@@ -149,7 +145,7 @@ fn print_config_summary(model_dir: &Path) -> anyhow::Result<()> {
     let config_path = model_dir.join("config.json");
     let config: Value = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
     let text = config.get("text_config").unwrap_or(&config);
-    println!("=== Gemma 4 E4B probe ===");
+    println!("=== Gemma 4 E4B generation ===");
     println!("model_dir: {}", model_dir.display());
     for key in [
         "model_type",

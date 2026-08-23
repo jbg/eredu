@@ -58,7 +58,7 @@ do not repeat it.
 Run Eredu:
 
 ```bash
-cargo run -p eredu --features cuda --example checkpoint_probe -- \
+cargo run -p eredu-backend-mlx --features cuda --example checkpoint_probe -- \
   --model /models/tinyllama \
   --input-ids 1,2,3,4 \
   --teacher-forced-ids 5,6,7,8 \

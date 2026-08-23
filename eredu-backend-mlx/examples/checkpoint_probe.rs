@@ -1,4 +1,4 @@
-//! Emit reproducible checkpoint correctness and performance evidence.
+//! Emit reproducible MLX checkpoint correctness and performance evidence.
 //!
 //! The JSON sidecar contains provenance, token IDs, timings, and memory. The
 //! SafeTensors sidecar contains the prefill logits and one row of logits for
@@ -13,23 +13,26 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
-use eredu::api::LoadedModel;
 use eredu_backend_mlx::native::{
     memory,
     ops::indexing::{NewAxis, TryIndexOp},
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
-use eredu_backend_mlx::{InputPart, MlxBackend, MlxModelInput, ModelInput};
+use eredu_backend_mlx::{
+    InputPart, MlxBackend, MlxModelInput, MlxModelSession, ModelInput, ModelLoadOptions,
+};
+use eredu_core::{load_model, BackendProvider as _, BackendSession as _};
+use eredu_text::tokenizer::Tokenizer;
 use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 use serde::Serialize;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const DEFAULT_PROMPT: &str = "The capital of France is";
 
 #[derive(Debug, Parser)]
 #[command(
     about = "Probe a local model checkpoint and emit JSON plus SafeTensors evidence",
-    after_help = "Example:\n  cargo run -p eredu --features cuda --example checkpoint_probe -- --model snapshots/model --device gpu --output validation/results/model"
+    after_help = "Example:\n  cargo run -p eredu-backend-mlx --features cuda --example checkpoint_probe -- --model snapshots/model --device gpu --output validation/results/model"
 )]
 struct Args {
     /// Local Hugging Face-compatible checkpoint directory.
@@ -113,8 +116,8 @@ struct ProbeReport {
 #[derive(Debug, Serialize)]
 struct ModelReport {
     checkpoint_path: String,
+    model_family: String,
     model_type: String,
-    model_id_for_template: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,9 +226,12 @@ fn main() -> Result<()> {
 
     memory::reset_peak_memory()?;
     let load_started = Instant::now();
-    let mut model = LoadedModel::load(backend, &args.model, Default::default())
+    let model = load_model(&backend, &args.model, ModelLoadOptions::default())
         .with_context(|| format!("failed to load checkpoint {}", args.model.display()))?;
-    model.runtime().backend().synchronize()?;
+    let model_family = model.model_family().canonical_name().to_owned();
+    let effective_model_type = model.effective_model_type().to_owned();
+    let mut session = backend.create_session(model)?;
+    backend.synchronize()?;
     weights_stream.synchronize()?;
     let load_wall = load_started.elapsed();
     let after_load = memory_snapshot()?;
@@ -233,10 +239,16 @@ fn main() -> Result<()> {
     let prompt = args.prompt.as_deref().unwrap_or(DEFAULT_PROMPT);
     let (prompt_text, input_ids) = match args.input_ids {
         Some(ids) => (None, ids),
-        None => (
-            Some(prompt.to_owned()),
-            model.encode(prompt, args.add_special_tokens)?,
-        ),
+        None => {
+            let tokenizer = Tokenizer::from_file(args.model.join("tokenizer.json"))
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let ids = tokenizer
+                .encode(prompt, args.add_special_tokens)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                .get_ids()
+                .to_vec();
+            (Some(prompt.to_owned()), ids)
+        }
     };
     ensure!(!input_ids.is_empty(), "the prompt encoded to zero tokens");
 
@@ -244,13 +256,27 @@ fn main() -> Result<()> {
     let decode_steps = forced_ids.map_or(args.decode_steps, <[u32]>::len);
     let warmup_started = Instant::now();
     for _ in 0..args.warmup_runs {
-        run_probe(&mut model, &input_ids, forced_ids, decode_steps, stream)?;
+        run_probe(
+            &backend,
+            &mut session,
+            &input_ids,
+            forced_ids,
+            decode_steps,
+            stream,
+        )?;
     }
     let warmup_wall = warmup_started.elapsed();
 
     memory::reset_peak_memory()?;
     let before_measured_run = memory_snapshot()?;
-    let run = run_probe(&mut model, &input_ids, forced_ids, decode_steps, stream)?;
+    let run = run_probe(
+        &backend,
+        &mut session,
+        &input_ids,
+        forced_ids,
+        decode_steps,
+        stream,
+    )?;
     let after_measured_run = memory_snapshot()?;
     let measured_run_peak_active_bytes = memory::peak_memory()?;
 
@@ -266,16 +292,19 @@ fn main() -> Result<()> {
     let tensors = tensor_report(&input_ids, &run);
     // Under teacher forcing these are independent predictions conditioned on
     // the supplied path, not one contiguous generated sequence.
-    let decoded_greedy_tokens = forced_ids
-        .is_none()
-        .then(|| model.decode(&run.greedy_token_ids, false).ok())
-        .flatten();
+    let decoded_greedy_tokens = if forced_ids.is_none() {
+        Tokenizer::from_file(args.model.join("tokenizer.json"))
+            .ok()
+            .and_then(|tokenizer| tokenizer.decode(&run.greedy_token_ids, false).ok())
+    } else {
+        None
+    };
     let report = ProbeReport {
         schema_version: SCHEMA_VERSION,
         model: ModelReport {
             checkpoint_path: args.model.display().to_string(),
-            model_type: model.model_type().to_owned(),
-            model_id_for_template: model.model_id().to_owned(),
+            model_family,
+            model_type: effective_model_type,
         },
         runtime: RuntimeReport {
             crate_name: env!("CARGO_PKG_NAME"),
@@ -331,20 +360,20 @@ fn main() -> Result<()> {
 }
 
 fn run_probe(
-    model: &mut LoadedModel<MlxBackend<'static>>,
+    backend: &MlxBackend<'static>,
+    session: &mut MlxModelSession<'static>,
     input_ids: &[u32],
     teacher_forced_ids: Option<&[u32]>,
     decode_steps: usize,
     stream: &Stream,
 ) -> Result<RunOutput> {
-    model.runtime_mut().session_mut().reset()?;
+    session.reset()?;
     let prompt_tokens = Array::from(input_ids).try_index_device(NewAxis, stream)?;
     let prompt_parts = [InputPart::text_token_ids(&prompt_tokens)];
 
     let prefill_started = Instant::now();
-    let prefill = model
-        .runtime_mut()
-        .prefill(MlxModelInput::from(ModelInput::new(&prompt_parts)))?
+    let prefill = session
+        .prefill(backend, MlxModelInput::from(ModelInput::new(&prompt_parts)))?
         .wait()?
         .into_logits()
         .context("selected MLX rank does not own prefill logits")?;
@@ -363,9 +392,8 @@ fn run_probe(
         let token = Array::from(&[token_id][..]).try_index_device(NewAxis, stream)?;
 
         let wall_started = Instant::now();
-        let logits = model
-            .runtime_mut()
-            .decode(token)?
+        let logits = session
+            .decode(backend, token)?
             .wait()?
             .into_logits()
             .context("selected MLX rank does not own decode logits")?;
