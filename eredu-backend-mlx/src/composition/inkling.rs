@@ -2101,24 +2101,8 @@ fn open_gguf_store(
     let mut text_formats = gguf_quantization_configs(checkpoint, |name| {
         eredu_architectures::inkling::translate_gguf_weight_name_for_model(name, &translation_args)
     })?;
-    for layer in 0..args.text_config.num_hidden_layers as usize {
-        for bank in ["experts", "shared_experts"] {
-            let prefix = format!("model.layers.{layer}.moe.{bank}");
-            let gate = text_formats.get(&format!("{prefix}.gate_proj")).copied();
-            let up = text_formats.get(&format!("{prefix}.up_proj")).copied();
-            match (gate, up) {
-                (Some(gate), Some(up)) if gate == up => {
-                    text_formats.insert(format!("{prefix}.gate_up_proj"), gate);
-                }
-                (None, None) => {}
-                (gate, up) => {
-                    return Err(Error::Quantization(format!(
-                        "Inkling GGUF fused expert bank {prefix:?} requires matching gate/up formats, got {gate:?} and {up:?}"
-                    )))
-                }
-            }
-        }
-    }
+    eredu_architectures::inkling::normalize_gguf_weight_formats(&args, &mut text_formats)
+        .map_err(Error::Quantization)?;
     args.text_config.quantized_weight_configs = (!text_formats.is_empty()).then_some(text_formats);
     let projector = find_sibling_mmproj(gguf_file, "inkling")?
         .map(GgufCheckpoint::open)

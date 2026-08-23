@@ -15,7 +15,9 @@ use eredu_checkpoint::{
     recipe::RecipeCatalog,
 };
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
-use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat, StoredDtype};
+use eredu_checkpoint::{
+    BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat, StoredDtype, WeightQuantization,
+};
 
 use super::config::{ExpertFormat, LayerPolicy, V3Args, V4Args, V4AttentionPolicy};
 
@@ -219,6 +221,45 @@ pub fn normalize_v4_weight_formats<V: Clone>(args: &V4Args, formats: &mut BTreeM
             formats.insert(format!("{root}.switch_mlp.down_proj"), format);
         }
     }
+}
+
+/// Derives a V3 configuration whose physical matrix formats reflect load-time quantization.
+pub fn v3_load_time_quantization(
+    args: &V3Args,
+    quantization: WeightQuantization,
+) -> Result<V3Args, String> {
+    quantization.validate().map_err(|error| error.to_string())?;
+    let mut target = args.clone();
+    target.linear_format = quantization.into();
+    target.linear_formats.clear();
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
+/// Derives a V4 configuration whose target and MTP expert formats reflect load-time quantization.
+pub fn v4_load_time_quantization(
+    args: &V4Args,
+    quantization: WeightQuantization,
+) -> Result<V4Args, String> {
+    quantization.validate().map_err(|error| error.to_string())?;
+    let mut target = args.clone();
+    target.linear_format = quantization.into();
+    target.linear_formats.clear();
+    let target_layers = count(target.num_hidden_layers, "V4 target layer count")?;
+    let prediction_layers = count(target.num_nextn_predict_layers, "V4 prediction layer count")?;
+    let total = target_layers
+        .checked_add(prediction_layers)
+        .ok_or_else(|| "V4 load-time quantization layer count overflowed".to_string())?;
+    for layer in 0..total {
+        let (_, expert_root) = v4_expert_roots(&target, layer)?;
+        for projection in ["gate_up_proj", "down_proj"] {
+            target
+                .linear_formats
+                .insert(format!("{expert_root}.{projection}"), quantization.into());
+        }
+    }
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
 }
 
 /// Builds the canonical llama.cpp DeepSeek2 GGUF plan. Fused and split MLA
@@ -577,22 +618,8 @@ pub fn v4_expert_recipes<C: RecipeCatalog + ?Sized>(
     args: &V4Args,
     layer: usize,
 ) -> Result<GatedProductExpertRecipes, String> {
-    let target = count(args.num_hidden_layers, "V4 target layer count")?;
-    let total = count(
-        args.num_hidden_layers + args.num_nextn_predict_layers,
-        "V4 layer count",
-    )?;
-    if layer >= total {
-        return Err(format!("V4 expert layer {layer} is outside {total} layers"));
-    }
     let count = dimension(args.n_routed_experts, "expert count")?;
-    let block = if layer < target {
-        format!("layers.{layer}")
-    } else {
-        format!("mtp.{}", layer - target)
-    };
-    let physical = format!("{block}.ffn");
-    let target = format!("{physical}.switch_mlp");
+    let (physical, target) = v4_expert_roots(args, layer)?;
     resolve_gated_product_expert_recipes(
         catalog,
         &GatedProductExpertLayoutNames {
@@ -613,6 +640,25 @@ pub fn v4_expert_recipes<C: RecipeCatalog + ?Sized>(
         },
     )
     .map_err(|error| error.to_string())
+}
+
+fn v4_expert_roots(args: &V4Args, layer: usize) -> Result<(String, String), String> {
+    let target_layers = count(args.num_hidden_layers, "V4 target layer count")?;
+    let prediction_layers = count(args.num_nextn_predict_layers, "V4 prediction layer count")?;
+    let total = target_layers
+        .checked_add(prediction_layers)
+        .ok_or_else(|| "V4 expert layer count overflowed".to_string())?;
+    if layer >= total {
+        return Err(format!("V4 expert layer {layer} is outside {total} layers"));
+    }
+    let block = if layer < target_layers {
+        format!("layers.{layer}")
+    } else {
+        format!("mtp.{}", layer - target_layers)
+    };
+    let physical = format!("{block}.ffn");
+    let target = format!("{physical}.switch_mlp");
+    Ok((physical, target))
 }
 
 /// Derives one independently resident expert from a canonical DeepSeek bank.
@@ -2128,6 +2174,45 @@ mod tests {
         assert_eq!(
             tensor("mtp.0.markov_head.markov_w1.weight").dtype,
             StoredDtypeConstraint::Floating
+        );
+
+        let quantization =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+        let target = v4_load_time_quantization(&args, quantization).unwrap();
+        assert_eq!(target.linear_format, quantization.into());
+        assert_eq!(
+            target.linear_formats,
+            BTreeMap::from([
+                (
+                    "layers.0.ffn.switch_mlp.down_proj".into(),
+                    quantization.into(),
+                ),
+                (
+                    "layers.0.ffn.switch_mlp.gate_up_proj".into(),
+                    quantization.into(),
+                ),
+                (
+                    "layers.1.ffn.switch_mlp.down_proj".into(),
+                    quantization.into(),
+                ),
+                (
+                    "layers.1.ffn.switch_mlp.gate_up_proj".into(),
+                    quantization.into(),
+                ),
+                (
+                    "layers.2.ffn.switch_mlp.down_proj".into(),
+                    quantization.into(),
+                ),
+                (
+                    "layers.2.ffn.switch_mlp.gate_up_proj".into(),
+                    quantization.into(),
+                ),
+                ("mtp.0.ffn.switch_mlp.down_proj".into(), quantization.into(),),
+                (
+                    "mtp.0.ffn.switch_mlp.gate_up_proj".into(),
+                    quantization.into(),
+                ),
+            ])
         );
     }
 

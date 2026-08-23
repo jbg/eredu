@@ -10,6 +10,7 @@ use eredu_checkpoint::{
         StoredDtypeConstraint, TensorOperation,
     },
     store::TensorSelection,
+    WeightQuantization,
 };
 
 use super::{FeedForwardPolicy, ModelArgs};
@@ -30,6 +31,40 @@ pub struct DenseW13Recipes {
     pub gate: DerivedWeightRecipe,
     /// Odd rows forming the up projection.
     pub up: DerivedWeightRecipe,
+}
+
+/// Rehomes split GGUF expert formats onto canonical fused routed and shared banks.
+pub fn normalize_gguf_weight_formats(
+    args: &ModelArgs,
+    formats: &mut HashMap<String, WeightQuantization>,
+) -> Result<(), String> {
+    let layers = dimension(args.text_config.num_hidden_layers, "layer count")?;
+    for layer in 0..layers {
+        if args
+            .text_config
+            .layer_policy(layer)
+            .is_none_or(|policy| policy.feed_forward != FeedForwardPolicy::SparseMoe)
+        {
+            continue;
+        }
+        for bank in ["experts", "shared_experts"] {
+            let root = format!("model.layers.{layer}.moe.{bank}");
+            let gate = formats.get(&format!("{root}.gate_proj")).copied();
+            let up = formats.get(&format!("{root}.up_proj")).copied();
+            match (gate, up) {
+                (Some(gate), Some(up)) if gate == up => {
+                    formats.insert(format!("{root}.gate_up_proj"), gate);
+                }
+                (None, None) => {}
+                (gate, up) => {
+                    return Err(format!(
+                        "Inkling GGUF fused expert bank {root:?} requires matching gate/up formats, got {gate:?} and {up:?}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Builds the complete released SafeTensors catalog, including native media
@@ -1463,14 +1498,14 @@ mod tests {
     use eredu_checkpoint::{
         recipe::{DerivedWeightRecipe, RecipeCatalog},
         store::{StoreError, TensorMetadata, TensorSelection},
-        StoredDtype,
+        AffineQuantization, StoredDtype, WeightQuantization,
     };
 
     use super::{
         dense_w13_recipes, expert_residency_catalog, expert_w13_recipe, gguf_plan,
-        mmproj_gguf_plan, partition_mmproj_weight_formats, safetensors_plan, safetensors_recipes,
-        translate_gguf_weight_name, translate_gguf_weight_name_for_model,
-        translate_mmproj_weight_name,
+        mmproj_gguf_plan, normalize_gguf_weight_formats, partition_mmproj_weight_formats,
+        safetensors_plan, safetensors_recipes, translate_gguf_weight_name,
+        translate_gguf_weight_name_for_model, translate_mmproj_weight_name,
     };
     use crate::inkling::ModelArgs;
 
@@ -1513,6 +1548,46 @@ mod tests {
         let expert = expert_w13_recipe(&catalog, "experts").unwrap();
         let inferred = expert.infer(&catalog).unwrap();
         assert_eq!(inferred.shape(), &[2, 8, 3]);
+    }
+
+    #[test]
+    fn gguf_format_normalization_owns_fused_expert_names_and_compatibility() {
+        let args = ModelArgs::from_hf_json(
+            br#"{
+              "model_type":"inkling_mm_model",
+              "text_config":{"hidden_size":16,"num_hidden_layers":2,"vocab_size":64,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+                "sliding_window_size":8,"layer_types":["sliding_attention","full_attention"],
+                "mlp_layer_types":["dense","moe"],"sconv_kernel_size":4,
+                "d_rel":2,"rel_extent":16,"intermediate_size":32,
+                "n_routed_experts":4,"num_experts_per_tok":2,"n_shared_experts":1}
+            }"#,
+        )
+        .unwrap();
+        let routed = "model.layers.1.moe.experts";
+        let shared = "model.layers.1.moe.shared_experts";
+        let affine = WeightQuantization::Affine(AffineQuantization::new(16, 4).unwrap());
+        let mut formats = HashMap::from([
+            (format!("{routed}.gate_proj"), WeightQuantization::MxFp4),
+            (format!("{routed}.up_proj"), WeightQuantization::MxFp4),
+            (format!("{shared}.gate_proj"), affine),
+            (format!("{shared}.up_proj"), affine),
+        ]);
+
+        normalize_gguf_weight_formats(&args, &mut formats).unwrap();
+        assert_eq!(
+            formats.get(&format!("{routed}.gate_up_proj")),
+            Some(&WeightQuantization::MxFp4)
+        );
+        assert_eq!(
+            formats.get(&format!("{shared}.gate_up_proj")),
+            Some(&affine)
+        );
+
+        formats.insert(format!("{shared}.up_proj"), WeightQuantization::MxFp4);
+        assert!(normalize_gguf_weight_formats(&args, &mut formats)
+            .unwrap_err()
+            .contains("requires matching gate/up formats"));
     }
 
     #[test]

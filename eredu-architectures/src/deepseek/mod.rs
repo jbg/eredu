@@ -29,9 +29,9 @@ pub mod v4;
 pub use checkpoint::{
     expert_unit_recipes, normalize_v3_weight_formats, normalize_v4_weight_formats,
     translate_v3_gguf_weight_name, translate_v4_gguf_weight_name, v3_expert_recipes,
-    v3_expert_residency_catalog, v3_gguf_kv_b_recipe, v3_gguf_plan, v3_safetensors_plan,
-    v3_unit_recipes, v4_expert_recipes, v4_expert_residency_catalog, v4_gguf_plan,
-    v4_safetensors_plan, ExpertUnitRecipes,
+    v3_expert_residency_catalog, v3_gguf_kv_b_recipe, v3_gguf_plan, v3_load_time_quantization,
+    v3_safetensors_plan, v3_unit_recipes, v4_expert_recipes, v4_expert_residency_catalog,
+    v4_gguf_plan, v4_load_time_quantization, v4_safetensors_plan, ExpertUnitRecipes,
 };
 pub use config::{
     parse_v3_config, parse_v3_gguf, parse_v4_config, parse_v4_gguf, v3_architecture_fingerprint,

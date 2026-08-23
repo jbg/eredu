@@ -13556,18 +13556,32 @@ fn checkpoint_backing_shards<'a>(
     Ok(shards.into_iter().collect())
 }
 
-fn checkpoint_layer_backing_shards(
+fn checkpoint_unit_backing_shards<A, S>(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
-    layer_prefix: &str,
+    architecture: &A,
+    group: usize,
     range: Range<usize>,
-) -> Result<Vec<PathBuf>, Error> {
+) -> Result<Vec<PathBuf>, Error>
+where
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
+    A::Error: std::fmt::Display,
+{
+    let paths = range
+        .map(|index| {
+            architecture
+                .unit_path(group, index)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let keys = store.source_keys();
     checkpoint_backing_shards(
         store,
         keys.iter().map(String::as_str).filter(|key| {
-            range
-                .clone()
-                .any(|layer| key.starts_with(&format!("{layer_prefix}{layer}.")))
+            paths.iter().any(|path| {
+                key.strip_prefix(path)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+            })
         }),
     )
 }
@@ -16079,9 +16093,10 @@ fn load_neutral_qwen_vl_pipeline(
         info.owned_tensors.iter().map(String::as_str),
     )?);
     if dense_stream.is_some() {
-        materialized_shards.extend(checkpoint_layer_backing_shards(
+        materialized_shards.extend(checkpoint_unit_backing_shards::<_, MlxHybridState>(
             store.as_ref(),
-            "model.language_model.layers.",
+            &stage.architecture,
+            decoder_group,
             stage.range().clone(),
         )?);
     }
@@ -20311,9 +20326,10 @@ fn load_neutral_qwen_hybrid_pipeline(
         info.owned_tensors.iter().map(String::as_str),
     )?);
     if dense_stream.is_some() {
-        materialized_shards.extend(checkpoint_layer_backing_shards(
+        materialized_shards.extend(checkpoint_unit_backing_shards::<_, MlxHybridState>(
             store.as_ref(),
-            "model.layers.",
+            &stage.architecture,
+            decoder_group,
             stage.range().clone(),
         )?);
     }
@@ -20890,9 +20906,10 @@ fn load_neutral_qwen_conditional_pipeline(
         info.owned_tensors.iter().map(String::as_str),
     )?);
     if dense_stream.is_some() {
-        materialized_shards.extend(checkpoint_layer_backing_shards(
+        materialized_shards.extend(checkpoint_unit_backing_shards::<_, MlxHybridState>(
             store.as_ref(),
-            "model.layers.",
+            &stage.architecture,
+            decoder_group,
             stage.range().clone(),
         )?);
     }

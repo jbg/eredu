@@ -2430,21 +2430,11 @@ pub fn quantize_v3_store(
     Error,
 > {
     quantization.validate()?;
-    let mut target_args = source_args.clone();
-    target_args.linear_format = quantization.into();
-    target_args.linear_formats.clear();
-    target_args
-        .validate()
-        .map_err(|error| unsupported(error.to_string()))?;
+    let target_args =
+        deepseek::v3_load_time_quantization(source_args, quantization).map_err(unsupported)?;
     let source = V3Architecture::new(source_args.clone(), stream).map_err(neutral_error)?;
     let target = V3Architecture::new(target_args.clone(), stream).map_err(neutral_error)?;
-    let count = usize::try_from(
-        source_args
-            .num_hidden_layers
-            .checked_add(source_args.num_nextn_predict_layers)
-            .ok_or_else(|| unsupported("V3 quantization unit count overflowed"))?,
-    )
-    .map_err(|_| unsupported("invalid V3 quantization unit count"))?;
+    let count = execution_layout::<V3Architecture, V3State>(&source)?.len();
     let binding_args = source_args.clone();
     let source_static = MlxModule::new(source.static_modules().clone());
     let target_static = MlxModule::new(target.static_modules().clone());
@@ -2486,37 +2476,11 @@ pub fn quantize_v4_store(
     Error,
 > {
     quantization.validate()?;
-    let mut target_args = source_args.clone();
-    target_args.linear_format = quantization.into();
-    target_args.linear_formats.clear();
-    let total = usize::try_from(
-        target_args
-            .num_hidden_layers
-            .checked_add(target_args.num_nextn_predict_layers)
-            .ok_or_else(|| unsupported("V4 quantization unit count overflowed"))?,
-    )
-    .map_err(|_| unsupported("invalid V4 quantization unit count"))?;
-    for layer in 0..total {
-        let root = if layer < target_args.num_hidden_layers as usize {
-            format!("layers.{layer}.ffn.switch_mlp")
-        } else {
-            format!(
-                "mtp.{}.ffn.switch_mlp",
-                layer - target_args.num_hidden_layers as usize
-            )
-        };
-        target_args
-            .linear_formats
-            .insert(format!("{root}.gate_up_proj"), quantization.into());
-        target_args
-            .linear_formats
-            .insert(format!("{root}.down_proj"), quantization.into());
-    }
-    target_args
-        .validate()
-        .map_err(|error| unsupported(error.to_string()))?;
+    let target_args =
+        deepseek::v4_load_time_quantization(source_args, quantization).map_err(unsupported)?;
     let source = V4Architecture::new(source_args.clone(), stream).map_err(neutral_error)?;
     let target = V4Architecture::new(target_args.clone(), stream).map_err(neutral_error)?;
+    let total = execution_layout::<V4Architecture, V4State>(&source)?.len();
     let binding_args = source_args.clone();
     let source_static = MlxModule::new(source.static_modules().clone());
     let target_static = MlxModule::new(target.static_modules().clone());
