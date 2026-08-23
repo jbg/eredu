@@ -78,12 +78,14 @@ unchanged.
 
 The architecture configuration registry is the sole owner of Hugging Face
 family aliases, GGUF `general.architecture` spellings, nested-wrapper
-normalization, assistant-family identity, and the exhaustive dispatch to
-family parsers. `eredu-core` accepts that registry through
-`ModelConfigurationResolver` while inspecting both SafeTensors and GGUF
-artifacts. The resolver returns an open canonical family string and the neutral
-`LoadingProtocol` required to prepare the artifact. Core routes that protocol;
-it neither recognizes family strings nor exposes an exhaustive family type.
+normalization, and the exhaustive dispatch to family parsers. Its external
+assistant resolvers likewise own both SafeTensors `model_type` and GGUF
+`general.architecture` identities and aliases. `eredu-core` accepts that
+registry through `ModelConfigurationResolver` while inspecting both
+SafeTensors and GGUF artifacts. The resolver returns an open canonical family
+string and the neutral `LoadingProtocol` required to prepare the artifact. Core
+routes that protocol; it neither recognizes family strings nor exposes an
+exhaustive family type.
 The typed `ModelKind` and `GgufArchitecture` identities, their aliases, the
 family-to-protocol mapping, and family-specific GGUF structural admission live
 in `eredu-architectures`. Facades and concrete backend adapters select that

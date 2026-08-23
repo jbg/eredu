@@ -88,34 +88,31 @@ impl MlxDrafter {
             let checkpoint = safemlx::ops::GgufCheckpoint::open(source)?;
             let metadata =
                 crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-            let architecture = metadata
-                .get("general.architecture")
-                .and_then(safemlx::ops::GgufMetadataValue::as_str)
-                .ok_or_else(|| {
-                    Error::UnsupportedArchitecture(
-                        "drafter GGUF requires string general.architecture".into(),
-                    )
-                })?;
-            match architecture {
-                "dflash" => MlxDrafterModel::MuseGlimmerDFlash(Box::new(load_dflash_gguf(
-                    source,
-                    options,
-                    stream,
-                    weights_stream,
-                )?)),
-                "gemma4_assistant" | "gemma4-assistant" => MlxDrafterModel::Gemma4(Box::new(
-                    load_assistant_gguf(source, options, stream, weights_stream)?,
-                )),
-                other => {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "unsupported drafter GGUF architecture {other:?}"
-                    )))
+            match eredu_architectures::configuration::resolve_gguf_assistant_model_kind(&metadata)?
+            {
+                eredu_architectures::configuration::AssistantModelKind::MuseGlimmer => {
+                    MlxDrafterModel::MuseGlimmerDFlash(Box::new(load_dflash_gguf(
+                        source,
+                        options,
+                        stream,
+                        weights_stream,
+                    )?))
+                }
+                eredu_architectures::configuration::AssistantModelKind::Gemma4 => {
+                    MlxDrafterModel::Gemma4(Box::new(load_assistant_gguf(
+                        source,
+                        options,
+                        stream,
+                        weights_stream,
+                    )?))
                 }
             }
         } else {
             let config: serde_json::Value =
                 serde_json::from_reader(std::fs::File::open(source.join("config.json"))?)?;
-            match eredu_architectures::configuration::resolve_assistant_model_kind(&config)? {
+            match eredu_architectures::configuration::resolve_safetensors_assistant_model_kind(
+                &config,
+            )? {
                 eredu_architectures::configuration::AssistantModelKind::MuseGlimmer => {
                     MlxDrafterModel::MuseGlimmerDFlash(Box::new(load_dflash_safetensors(
                         source,

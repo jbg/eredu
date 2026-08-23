@@ -3,10 +3,10 @@
 use eredu_core::{
     artifact::ArtifactError, LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
 };
-use eredu_gguf::Checkpoint as GgufCheckpoint;
+use eredu_gguf::{Checkpoint as GgufCheckpoint, MetadataValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 /// Stateless registry for every architecture family implemented by this crate.
 #[derive(Debug, Clone, Copy, Default)]
@@ -490,8 +490,10 @@ pub enum AssistantModelKind {
     MuseGlimmer,
 }
 
-/// Resolves the model kind of an external drafter config.
-pub fn resolve_assistant_model_kind(json: &Value) -> Result<AssistantModelKind, ArtifactError> {
+/// Resolves the model kind of an external SafeTensors drafter config.
+pub fn resolve_safetensors_assistant_model_kind(
+    json: &Value,
+) -> Result<AssistantModelKind, ArtifactError> {
     match json.get("model_type").and_then(Value::as_str) {
         Some("gemma4_assistant") => Ok(AssistantModelKind::Gemma4),
         Some("muse_glimmer_assistant") => Ok(AssistantModelKind::MuseGlimmer),
@@ -502,10 +504,25 @@ pub fn resolve_assistant_model_kind(json: &Value) -> Result<AssistantModelKind, 
     }
 }
 
+/// Resolves the model kind of an external GGUF drafter from neutral metadata.
+pub fn resolve_gguf_assistant_model_kind(
+    metadata: &HashMap<String, MetadataValue>,
+) -> Result<AssistantModelKind, ArtifactError> {
+    match metadata
+        .get("general.architecture")
+        .and_then(MetadataValue::as_str)
+    {
+        Some("dflash") => Ok(AssistantModelKind::MuseGlimmer),
+        Some("gemma4_assistant" | "gemma4-assistant") => Ok(AssistantModelKind::Gemma4),
+        Some(other) => Err(ArtifactError::UnsupportedGgufArchitecture(other.into())),
+        None => Err(ArtifactError::MissingGgufArchitecture),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eredu_gguf::{GgmlType, MetadataValue, TensorInput, Writer};
+    use eredu_gguf::{GgmlType, TensorInput, Writer};
     use std::{collections::BTreeMap, fs::File};
 
     #[test]
@@ -570,6 +587,40 @@ mod tests {
                 Err(ArtifactError::UnsupportedGgufArchitecture(name)) if name == nearby
             ));
         }
+    }
+
+    #[test]
+    fn external_assistant_gguf_aliases_resolve_in_the_architecture_registry() {
+        for (architecture, kind) in [
+            ("dflash", AssistantModelKind::MuseGlimmer),
+            ("gemma4_assistant", AssistantModelKind::Gemma4),
+            ("gemma4-assistant", AssistantModelKind::Gemma4),
+        ] {
+            let metadata = HashMap::from([(
+                "general.architecture".into(),
+                MetadataValue::String(architecture.into()),
+            )]);
+            assert_eq!(resolve_gguf_assistant_model_kind(&metadata).unwrap(), kind);
+        }
+
+        let unsupported = HashMap::from([(
+            "general.architecture".into(),
+            MetadataValue::String("unknown-assistant".into()),
+        )]);
+        assert!(matches!(
+            resolve_gguf_assistant_model_kind(&unsupported),
+            Err(ArtifactError::UnsupportedGgufArchitecture(name))
+                if name == "unknown-assistant"
+        ));
+        assert!(matches!(
+            resolve_gguf_assistant_model_kind(&HashMap::new()),
+            Err(ArtifactError::MissingGgufArchitecture)
+        ));
+        let wrong_type = HashMap::from([("general.architecture".into(), MetadataValue::Uint32(1))]);
+        assert!(matches!(
+            resolve_gguf_assistant_model_kind(&wrong_type),
+            Err(ArtifactError::MissingGgufArchitecture)
+        ));
     }
 
     #[test]
