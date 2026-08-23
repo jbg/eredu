@@ -119,6 +119,9 @@ unit index and parameter path, expert-parallel versus replicated placement,
 exact acquired-bank binding names, exact logical parameter targets, and
 checkpoint-derived recipes. Family code owns sparse-layer selection, routed
 versus shared-bank scheduling, expert counts, and cache-layer numbering.
+Hybrid target/MTP families additionally declare the execution group, physical
+MTP unit, checkpoint root, and cache identity of every sparse unit in this
+catalog; backend adapters only filter catalog units selected for a stage.
 Concrete backends lower catalog entries into native storage and may apply the
 declared unit path to a rank-local placement; they do not rebuild the schedule,
 instantiate a family block to discover expert parameters, or match parameter

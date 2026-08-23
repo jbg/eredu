@@ -465,7 +465,7 @@ impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
         ];
         let mut output = "target".to_owned();
         for depth in 0..self.prediction_steps {
-            let id = format!("mtp_{depth}");
+            let id = format!("mtp.{depth}");
             graph_groups.push(ExecutionGroupSpec::with_dependencies(
                 id.clone(),
                 [output.clone()],
@@ -1351,7 +1351,7 @@ where
         ];
         let mut output = "target".to_owned();
         for depth in 0..self.prediction_steps {
-            let id = format!("mtp_{depth}");
+            let id = format!("mtp.{depth}");
             groups.push(ExecutionGroupSpec::with_dependencies(
                 id.clone(),
                 [output.clone()],

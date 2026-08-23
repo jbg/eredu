@@ -15,16 +15,14 @@ use eredu_architectures::qwen::{
     vl::InputPart,
 };
 use eredu_checkpoint::{
-    recipe::DerivedWeightRecipe,
     store::{CheckpointSource, CompositeCheckpointSource},
     WeightQuantization,
 };
 use eredu_nn::Tensor;
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, ExecutionResidency, ExecutionUnitLayout, ExpertIdentity,
+    CacheResidencyPolicy, CausalModel, ExecutionResidency, ExecutionUnitLayout,
     LayerWeightResidency, LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
-    OffloadUnit, PagedCacheOptions, ParameterRole, ResidencyReport, StaticUnitBindings,
-    WeightBinding,
+    PagedCacheOptions, ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding,
 };
 use safemlx::{
     error::Exception,
@@ -69,7 +67,6 @@ use crate::backend::{
             build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
             parameter_name_in_targets, parameter_role_targets, populate_module_from_lease_excluding,
         },
-        checkpoint::binding_plan::{BindingPlan, PlannedBinding},
         checkpoint::{
             load::{gguf_quantization_configs, GgufTensorNames},
             quantization::should_quantize_on_load,
@@ -702,64 +699,13 @@ pub fn expert_catalog_selected(
     layout: Option<&eredu_runtime::LocalModelLayout>,
     mut include_layer: impl FnMut(usize) -> bool,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    if !config.is_moe() {
-        return Err(Error::UnsupportedArchitecture(
-            "independent expert caching requires a routed Qwen hybrid model".into(),
-        ));
-    }
-    let target = config.num_hidden_layers as usize;
-    let total = target + config.mtp_num_hidden_layers as usize;
-    let mut entries = Vec::new();
-    for layer in 0..total {
-        if !include_layer(layer) {
-            continue;
-        }
-        let root = if layer < target {
-            format!("model.layers.{layer}.mlp.experts")
-        } else {
-            format!("mtp.layers.{}.mlp.experts", layer - target)
-        };
-        for expert in 0..config.num_experts as usize {
-            let identity = ExpertIdentity::new(layer, expert);
-            let planned = hybrid::expert_recipes(store, config, layer, expert)
-                .map_err(Error::UnsupportedArchitecture)?
-                .into_iter()
-                .map(|(name, recipe)| planned_expert_binding(name, recipe, store))
-                .collect::<Result<Vec<_>, _>>()?;
-            let bindings = BindingPlan::new(planned)
-                .and_then(|plan| plan.build_bindings(store))
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-            let bindings = match layout {
-                Some(layout) => shard_layer_bindings(bindings, &root, store, layout)?,
-                None => bindings,
-            };
-            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
-                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
-                    Error::UnsupportedArchitecture("Qwen hybrid expert bytes overflowed".into())
-                })
-            })?;
-            entries.push(ExpertCatalogEntry::new(
-                identity,
-                OffloadUnit::new(identity.unit_id(), bindings)?,
-                bytes,
-            )?);
-        }
-    }
-    Ok(entries)
-}
-
-fn planned_expert_binding(
-    name: impl Into<String>,
-    recipe: DerivedWeightRecipe,
-    store: &dyn CheckpointSource,
-) -> Result<PlannedBinding, Error> {
-    let metadata = recipe.infer(store)?;
-    Ok(PlannedBinding {
-        target_name: name.into(),
-        expected_shape: metadata.shape().to_vec(),
-        expected_dtype: metadata.dtype().clone(),
-        recipe,
-    })
+    let catalog = hybrid::expert_residency_catalog(store, config)
+        .map_err(Error::UnsupportedArchitecture)?;
+    let units = catalog
+        .into_units()
+        .into_iter()
+        .filter(|unit| include_layer(unit.identity().layer));
+    crate::composition::architecture_expert_units(units, store, layout)
 }
 
 const fn cached_provider<'a>(

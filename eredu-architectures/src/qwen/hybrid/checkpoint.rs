@@ -306,6 +306,63 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     Ok(recipes)
 }
 
+/// Builds the complete architecture-owned schedule for independently resident experts.
+pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    config: &HybridConfig,
+) -> Result<crate::ExpertResidencyCatalog, String> {
+    config.validate().map_err(|error| error.to_string())?;
+    if !config.is_moe() {
+        return Err("Qwen hybrid expert residency requires a routed model".into());
+    }
+    let target = usize::try_from(config.num_hidden_layers)
+        .map_err(|_| "invalid Qwen hybrid target layer count".to_string())?;
+    let prediction = usize::try_from(config.mtp_num_hidden_layers)
+        .map_err(|_| "invalid Qwen hybrid MTP layer count".to_string())?;
+    let experts = usize::try_from(config.num_experts)
+        .map_err(|_| "invalid Qwen hybrid expert count".to_string())?;
+    let total = target
+        .checked_add(prediction)
+        .ok_or_else(|| "Qwen hybrid layer count overflowed".to_string())?;
+    let capacity = total
+        .checked_mul(experts)
+        .ok_or_else(|| "Qwen hybrid expert residency catalog size overflowed".to_string())?;
+    let mut units = Vec::with_capacity(capacity);
+    for layer in 0..total {
+        let (owner_group, owner_unit, unit_path) = if layer < target {
+            ("target".to_owned(), layer, format!("model.layers.{layer}"))
+        } else {
+            let depth = layer - target;
+            (format!("mtp.{depth}"), 0, format!("mtp.layers.{depth}"))
+        };
+        let owner_group =
+            eredu_runtime::ExecutionGroupId::new(owner_group).map_err(|error| error.to_string())?;
+        let expert_root = format!("{unit_path}.mlp.experts");
+        for expert in 0..experts {
+            let parameters = expert_recipes(catalog, config, layer, expert)?
+                .into_iter()
+                .map(|(binding, recipe)| {
+                    let target = format!("{expert_root}.{binding}");
+                    crate::ExpertParameterRecipe::new(binding, target, recipe)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            units.push(
+                crate::ExpertResidencyUnit::new(
+                    eredu_runtime::ExpertIdentity::new(layer, expert),
+                    owner_group.clone(),
+                    owner_unit,
+                    &unit_path,
+                    crate::ExpertResidencyDistribution::ExpertParallel,
+                    parameters,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+}
+
 fn add_gguf_unit_transforms(
     recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
     store: &dyn CheckpointSource,
@@ -1418,6 +1475,33 @@ mod tests {
         .text
     }
 
+    fn moe_config() -> HybridConfig {
+        model_args_from_config_value(&json!({
+            "model_type": "qwen3_next",
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "mtp_num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "max_position_embeddings": 128,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 8,
+            "linear_value_head_dim": 8,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "intermediate_size": 48,
+            "moe_intermediate_size": 16,
+            "shared_expert_intermediate_size": 24,
+            "num_experts_per_tok": 2,
+            "num_experts": 4,
+            "layer_types": ["linear_attention", "full_attention"]
+        }))
+        .unwrap()
+        .text
+    }
+
     fn memory_store(tensors: impl IntoIterator<Item = (String, Vec<usize>)>) -> MemoryWeightStore {
         MemoryWeightStore::from_safetensors(tensors.into_iter().map(|(name, shape)| {
             let bytes = vec![0; shape.iter().product::<usize>() * 2];
@@ -1523,5 +1607,54 @@ mod tests {
             tensors.insert(name.clone(), metadata(&name, shape));
         }
         assert!(qwen3_next_fused_recipes(&Catalog(tensors), &config, 0).is_err());
+    }
+
+    #[test]
+    fn residency_catalog_owns_target_and_mtp_expert_topology() {
+        let config = moe_config();
+        let mut tensors = BTreeMap::new();
+        for root in [
+            "model.layers.0.mlp.experts".to_owned(),
+            "model.layers.1.mlp.experts".to_owned(),
+            "mtp.layers.0.mlp.experts".to_owned(),
+        ] {
+            for (name, shape) in [
+                ("gate_up_proj", vec![4, 32, 32]),
+                ("down_proj", vec![4, 32, 16]),
+            ] {
+                let target = format!("{root}.{name}");
+                tensors.insert(target.clone(), metadata(&target, shape));
+            }
+        }
+        let catalog = expert_residency_catalog(&Catalog(tensors), &config).unwrap();
+        assert_eq!(catalog.units().len(), 12);
+        let target = &catalog.units()[0];
+        assert_eq!(target.identity(), eredu_runtime::ExpertIdentity::new(0, 0));
+        assert_eq!(target.owner_group().as_str(), "target");
+        assert_eq!(target.owner_unit(), 0);
+        assert_eq!(target.unit_path(), "model.layers.0");
+        assert_eq!(
+            target
+                .parameters()
+                .iter()
+                .map(|parameter| (parameter.binding_name(), parameter.logical_target()))
+                .collect::<Vec<_>>(),
+            [
+                ("down_proj", "model.layers.0.mlp.experts.down_proj"),
+                ("gate_up_proj", "model.layers.0.mlp.experts.gate_up_proj"),
+            ]
+        );
+        let prediction = &catalog.units()[8];
+        assert_eq!(
+            prediction.identity(),
+            eredu_runtime::ExpertIdentity::new(2, 0)
+        );
+        assert_eq!(prediction.owner_group().as_str(), "mtp.0");
+        assert_eq!(prediction.owner_unit(), 0);
+        assert_eq!(prediction.unit_path(), "mtp.layers.0");
+        assert_eq!(
+            prediction.distribution(),
+            crate::ExpertResidencyDistribution::ExpertParallel
+        );
     }
 }

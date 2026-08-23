@@ -358,6 +358,133 @@ pub fn expert_recipes(
     Ok(recipes)
 }
 
+/// Builds the complete architecture-owned schedule for independently resident experts.
+pub fn expert_residency_catalog(
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+) -> Result<crate::ExpertResidencyCatalog, String> {
+    args.validate().map_err(|error| error.to_string())?;
+    if !args.has_sparse_moe_layers() {
+        return Err("Nemotron-H expert residency requires sparse MoE units".into());
+    }
+    let target = usize::try_from(args.num_hidden_layers)
+        .map_err(|_| "invalid Nemotron-H target layer count".to_string())?;
+    let experts = usize::try_from(args.n_routed_experts)
+        .map_err(|_| "invalid Nemotron-H expert count".to_string())?;
+    let prediction_steps = usize::try_from(args.num_nextn_predict_layers)
+        .map_err(|_| "invalid Nemotron-H MTP prediction count".to_string())?;
+    let prediction_policies = args.mtp_policies().map_err(|error| error.to_string())?;
+    let prediction_pattern = if prediction_steps == 0 {
+        0
+    } else {
+        prediction_policies
+            .len()
+            .checked_div(prediction_steps)
+            .filter(|pattern| *pattern > 0)
+            .ok_or_else(|| "Nemotron-H MTP operator pattern cannot be empty".to_string())?
+    };
+    let sparse_units = args
+        .layer_schedule
+        .iter()
+        .filter(|policy| **policy == LayerPolicy::SparseMoe)
+        .count()
+        .checked_add(
+            prediction_policies
+                .iter()
+                .filter(|policy| **policy == LayerPolicy::SparseMoe)
+                .count(),
+        )
+        .ok_or_else(|| "Nemotron-H sparse unit count overflowed".to_string())?;
+    let capacity = sparse_units
+        .checked_mul(experts)
+        .ok_or_else(|| "Nemotron-H expert residency catalog size overflowed".to_string())?;
+    let mut units = Vec::with_capacity(capacity);
+
+    for (identity_layer, policy) in args.layer_schedule.iter().copied().enumerate() {
+        if policy != LayerPolicy::SparseMoe {
+            continue;
+        }
+        add_expert_residency_units(
+            &mut units,
+            store,
+            args,
+            SparseUnitResidency {
+                identity_layer,
+                owner_group: "target".to_owned(),
+                owner_unit: identity_layer,
+                unit_path: format!("model.layers.{identity_layer}"),
+                expert_root: format!("model.layers.{identity_layer}.moe.experts"),
+            },
+            experts,
+        )?;
+    }
+    for (physical, policy) in prediction_policies.into_iter().enumerate() {
+        if policy != LayerPolicy::SparseMoe {
+            continue;
+        }
+        let depth = physical / prediction_pattern;
+        let owner_unit = physical % prediction_pattern;
+        let identity_layer = target
+            .checked_add(physical)
+            .ok_or_else(|| "Nemotron-H MTP identity layer overflowed".to_string())?;
+        add_expert_residency_units(
+            &mut units,
+            store,
+            args,
+            SparseUnitResidency {
+                identity_layer,
+                owner_group: format!("mtp.{depth}"),
+                owner_unit,
+                unit_path: format!("model.mtp.layers.{physical}"),
+                expert_root: format!("model.mtp.layers.{physical}.mixer.experts"),
+            },
+            experts,
+        )?;
+    }
+    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+}
+
+struct SparseUnitResidency {
+    identity_layer: usize,
+    owner_group: String,
+    owner_unit: usize,
+    unit_path: String,
+    expert_root: String,
+}
+
+fn add_expert_residency_units(
+    units: &mut Vec<crate::ExpertResidencyUnit>,
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+    topology: SparseUnitResidency,
+    experts: usize,
+) -> Result<(), String> {
+    let owner_group = eredu_runtime::ExecutionGroupId::new(topology.owner_group)
+        .map_err(|error| error.to_string())?;
+    for expert in 0..experts {
+        let parameters = expert_recipes(store, args, topology.identity_layer, expert)?
+            .into_iter()
+            .map(|(binding, recipe)| {
+                let target = format!("{}.{binding}", topology.expert_root);
+                crate::ExpertParameterRecipe::new(binding, target, recipe)
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        units.push(
+            crate::ExpertResidencyUnit::new(
+                eredu_runtime::ExpertIdentity::new(topology.identity_layer, expert),
+                owner_group.clone(),
+                topology.owner_unit,
+                &topology.unit_path,
+                crate::ExpertResidencyDistribution::ExpertParallel,
+                parameters,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(())
+}
+
 /// Builds the strict SafeTensors catalog plan for target and MTP units.
 pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
     let hidden = dimension(args.hidden_size, "hidden size")?;
@@ -1399,5 +1526,55 @@ mod tests {
             Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 4
         ));
         assert_eq!(expert_recipes(&store, &args, 3, 1).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn residency_catalog_owns_sparse_target_and_mtp_scheduling() {
+        let args = fixture();
+        let store = memory_store([
+            ("model.layers.3.moe.experts.up_proj".into(), vec![4, 16, 16]),
+            (
+                "model.layers.3.moe.experts.down_proj".into(),
+                vec![4, 16, 8],
+            ),
+            (
+                "model.mtp.layers.1.mixer.experts.up_proj".into(),
+                vec![4, 16, 16],
+            ),
+            (
+                "model.mtp.layers.1.mixer.experts.down_proj".into(),
+                vec![4, 16, 8],
+            ),
+        ]);
+        let catalog = expert_residency_catalog(&store, &args).unwrap();
+        assert_eq!(catalog.units().len(), 8);
+        let target = &catalog.units()[0];
+        assert_eq!(target.identity(), eredu_runtime::ExpertIdentity::new(3, 0));
+        assert_eq!(target.owner_group().as_str(), "target");
+        assert_eq!(target.owner_unit(), 3);
+        assert_eq!(target.unit_path(), "model.layers.3");
+        assert_eq!(
+            target
+                .parameters()
+                .iter()
+                .map(|parameter| (parameter.binding_name(), parameter.logical_target()))
+                .collect::<Vec<_>>(),
+            [
+                ("down_proj", "model.layers.3.moe.experts.down_proj"),
+                ("up_proj", "model.layers.3.moe.experts.up_proj"),
+            ]
+        );
+        let prediction = &catalog.units()[4];
+        assert_eq!(
+            prediction.identity(),
+            eredu_runtime::ExpertIdentity::new(5, 0)
+        );
+        assert_eq!(prediction.owner_group().as_str(), "mtp.0");
+        assert_eq!(prediction.owner_unit(), 1);
+        assert_eq!(prediction.unit_path(), "model.mtp.layers.1");
+        assert_eq!(
+            prediction.distribution(),
+            crate::ExpertResidencyDistribution::ExpertParallel
+        );
     }
 }

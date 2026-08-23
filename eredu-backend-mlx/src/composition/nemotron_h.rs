@@ -5,12 +5,12 @@ use std::{path::Path, sync::Arc};
 use eredu_architectures::nemotron_h::{
     Block, LayeredModel, ModelArgs, PredictionUnit, Unit, PREDICTION_STATE_SEGMENT,
 };
-use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, WeightQuantization};
+use eredu_checkpoint::{store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
     ActivationObserver, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionGraph,
-    ExecutionUnitAddress, ExecutionUnitLayout, ExpertIdentity, LayerWeightResidency,
-    LayerwiseModelMetadata, LayerwiseRuntime, OffloadUnit, PagedCacheOptions, ParallelModelInfo,
-    ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding, WeightResidency,
+    ExecutionUnitAddress, ExecutionUnitLayout, LayerWeightResidency, LayerwiseModelMetadata,
+    LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport,
+    StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -34,7 +34,6 @@ use crate::backend::{
                 build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
                 parameter_role_targets, populate_module_from_lease_excluding,
             },
-            binding_plan::{BindingPlan, PlannedBinding},
             load::{gguf_quantization_configs, GgufTensorNames},
             quantization::should_quantize_on_load,
             store::open_gguf_checkpoint_source,
@@ -438,20 +437,6 @@ fn resolve_store(
     ))
 }
 
-fn planned_expert_binding(
-    name: impl Into<String>,
-    recipe: DerivedWeightRecipe,
-    store: &dyn CheckpointSource,
-) -> Result<PlannedBinding, Error> {
-    let metadata = recipe.infer(store)?;
-    Ok(PlannedBinding {
-        target_name: name.into(),
-        expected_shape: metadata.shape().to_vec(),
-        expected_dtype: metadata.dtype().clone(),
-        recipe,
-    })
-}
-
 pub fn expert_catalog(
     args: &ModelArgs,
     store: &dyn CheckpointSource,
@@ -464,61 +449,13 @@ pub fn expert_catalog_selected(
     store: &dyn CheckpointSource,
     mut include_layer: impl FnMut(usize) -> bool,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    if !args.has_sparse_moe_layers() {
-        return Err(Error::UnsupportedArchitecture(
-            "independent expert caching requires sparse Nemotron-H units".into(),
-        ));
-    }
-    let mut sparse = Vec::new();
-    for (layer, policy) in args.layer_schedule.iter().copied().enumerate() {
-        if policy == eredu_architectures::nemotron_h::LayerPolicy::SparseMoe && include_layer(layer)
-        {
-            sparse.push(layer);
-        }
-    }
-    for (physical, policy) in args
-        .mtp_policies()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+    let catalog = eredu_architectures::nemotron_h::expert_residency_catalog(store, args)
+        .map_err(Error::UnsupportedArchitecture)?;
+    let units = catalog
+        .into_units()
         .into_iter()
-        .enumerate()
-    {
-        let identity_layer = args.num_hidden_layers as usize + physical;
-        if policy == eredu_architectures::nemotron_h::LayerPolicy::SparseMoe
-            && include_layer(identity_layer)
-        {
-            sparse.push(identity_layer);
-        }
-    }
-    let mut entries = Vec::new();
-    for identity_layer in sparse {
-        for expert in 0..args.n_routed_experts as usize {
-            let identity = ExpertIdentity::new(identity_layer, expert);
-            let planned = eredu_architectures::nemotron_h::expert_recipes(
-                store,
-                args,
-                identity_layer,
-                expert,
-            )
-            .map_err(Error::UnsupportedArchitecture)?
-            .into_iter()
-            .map(|(name, recipe)| planned_expert_binding(name, recipe, store))
-            .collect::<Result<Vec<_>, _>>()?;
-            let bindings = BindingPlan::new(planned)
-                .and_then(|plan| plan.build_bindings(store))
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
-                total
-                    .checked_add(binding.expected_bytes())
-                    .ok_or_else(|| Error::UnsupportedArchitecture("expert bytes overflowed".into()))
-            })?;
-            entries.push(ExpertCatalogEntry::new(
-                identity,
-                OffloadUnit::new(identity.unit_id(), bindings)?,
-                bytes,
-            )?);
-        }
-    }
-    Ok(entries)
+        .filter(|unit| include_layer(unit.identity().layer));
+    crate::composition::architecture_expert_units(units, store, None)
 }
 
 fn cached_provider<'a>(
