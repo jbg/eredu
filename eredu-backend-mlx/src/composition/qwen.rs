@@ -1131,7 +1131,7 @@ fn attach_qwen_expert_cache(
         ));
     }
     let store = model.checkpoint_store_arc();
-    let entries = expert::expert_catalog(&model.args, store.as_ref(), stream)?;
+    let entries = expert::expert_catalog(&model.args, store.as_ref())?;
     model.expert_cache = Some(ExpertCache::new_shared(
         store,
         entries,

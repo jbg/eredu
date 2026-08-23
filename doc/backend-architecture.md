@@ -104,6 +104,16 @@ name discovery or recipe construction into backend composition.
 Architecture checkpoint APIs also derive rank-local independently resident
 expert recipes, including segmented fused-projection selection; backend
 composition binds those recipes without reconstructing the segment equation.
+Independent expert residency is exposed as a validated neutral catalog. Each
+catalog entry carries the router/cache identity, the owning architecture group,
+unit index and parameter path, expert-parallel versus replicated placement,
+exact acquired-bank binding names, exact logical parameter targets, and
+checkpoint-derived recipes. Family code owns sparse-layer selection, routed
+versus shared-bank scheduling, expert counts, and cache-layer numbering.
+Concrete backends lower catalog entries into native storage and may apply the
+declared unit path to a rank-local placement; they do not rebuild the schedule,
+instantiate a family block to discover expert parameters, or match parameter
+targets by substring or suffix.
 They also normalize physical checkpoint format metadata onto canonical runtime
 parameters, including fused expert projections, so each backend consumes the
 same family-specific quantization identities. Catalog policies declare any

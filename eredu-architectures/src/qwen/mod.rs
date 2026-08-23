@@ -9,8 +9,9 @@ pub mod vision;
 pub mod vl;
 
 pub use checkpoint::{
-    expert_recipes, expert_unit_recipes, gguf_plan, normalize_weight_formats, safetensors_plan,
-    safetensors_plan_with_root, translate_gguf_weight_name,
+    expert_recipes, expert_residency_catalog, expert_unit_recipes, gguf_plan,
+    normalize_weight_formats, safetensors_plan, safetensors_plan_with_root,
+    translate_gguf_weight_name,
 };
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,

@@ -12,8 +12,8 @@ pub mod vision;
 
 pub use audio::{AudioInput, AudioTower};
 pub use checkpoint::{
-    dense_w13_recipes, expert_w13_recipe, gguf_plan, mmproj_gguf_plan, safetensors_aliases,
-    safetensors_plan, safetensors_recipes, translate_gguf_weight_name,
+    dense_w13_recipes, expert_residency_catalog, expert_w13_recipe, gguf_plan, mmproj_gguf_plan,
+    safetensors_aliases, safetensors_plan, safetensors_recipes, translate_gguf_weight_name,
     translate_gguf_weight_name_for_model, translate_mmproj_weight_name, DenseW13Recipes,
     ParameterAlias,
 };

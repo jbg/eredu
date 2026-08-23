@@ -411,6 +411,50 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
     Ok(recipes)
 }
 
+/// Builds the complete architecture-owned schedule for independent expert residency.
+pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &ModelArgs,
+) -> Result<crate::ExpertResidencyCatalog, String> {
+    if !args.is_moe() {
+        return Err("Qwen expert residency requires Qwen3-MoE arguments".into());
+    }
+    let layers = dimension(args.num_hidden_layers, "num_hidden_layers")?;
+    let experts = dimension(args.num_experts, "num_experts")?;
+    let capacity = layers
+        .checked_mul(experts)
+        .ok_or_else(|| "Qwen expert residency catalog size overflowed".to_owned())?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(|error| error.to_string())?;
+    let mut units = Vec::with_capacity(capacity);
+    for layer in 0..layers {
+        let unit_path = format!("{}.layers.{layer}", args.parameter_root);
+        let expert_root = format!("{unit_path}.mlp.experts");
+        for expert in 0..experts {
+            let parameters = expert_unit_recipes(catalog, args, layer, expert)?
+                .into_iter()
+                .map(|(binding, recipe)| {
+                    let target = format!("{expert_root}.{binding}");
+                    crate::ExpertParameterRecipe::new(binding, target, recipe)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            units.push(
+                crate::ExpertResidencyUnit::new(
+                    eredu_runtime::ExpertIdentity::new(layer, expert),
+                    owner_group.clone(),
+                    layer,
+                    &unit_path,
+                    crate::ExpertResidencyDistribution::ExpertParallel,
+                    parameters,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+}
+
 fn expert_layout_group(
     args: &ModelArgs,
     prefix: &str,
@@ -1097,6 +1141,48 @@ mod tests {
         assert_eq!(
             recipes["gate_up_proj"].infer(&catalog).unwrap().shape(),
             &[1, 16, 16]
+        );
+    }
+
+    #[test]
+    fn residency_catalog_owns_expert_schedule_paths_and_exact_targets() {
+        let args = args("qwen3_moe", false);
+        let mut tensors = BTreeMap::new();
+        for layer in 0..2 {
+            let root = format!("model.layers.{layer}.mlp.experts");
+            for (name, shape) in [
+                ("gate_up_proj", vec![4, 16, 16]),
+                ("down_proj", vec![4, 16, 8]),
+            ] {
+                let target = format!("{root}.{name}");
+                tensors.insert(target.clone(), metadata(&target, shape));
+            }
+        }
+        let catalog = expert_residency_catalog(&Catalog(tensors), &args).unwrap();
+        assert_eq!(catalog.units().len(), 8);
+        let first = &catalog.units()[0];
+        assert_eq!(first.identity(), eredu_runtime::ExpertIdentity::new(0, 0));
+        assert_eq!(first.owner_group().as_str(), "text_decoder");
+        assert_eq!(first.owner_unit(), 0);
+        assert_eq!(
+            first.distribution(),
+            crate::ExpertResidencyDistribution::ExpertParallel
+        );
+        assert_eq!(first.unit_path(), "model.layers.0");
+        assert_eq!(
+            first
+                .parameters()
+                .iter()
+                .map(|parameter| (parameter.binding_name(), parameter.logical_target()))
+                .collect::<Vec<_>>(),
+            [
+                ("down_proj", "model.layers.0.mlp.experts.down_proj"),
+                ("gate_up_proj", "model.layers.0.mlp.experts.gate_up_proj"),
+            ]
+        );
+        assert_eq!(
+            catalog.units()[7].identity(),
+            eredu_runtime::ExpertIdentity::new(1, 3)
         );
     }
 }

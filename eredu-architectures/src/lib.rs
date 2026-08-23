@@ -31,6 +31,12 @@ pub mod static_parameters;
 pub use static_parameters::{
     BindableStaticParameters, StaticParameterVisitor, StaticParameterVisitorMut,
 };
+/// Backend-neutral schedules and recipes for independent expert residency.
+pub mod expert_residency;
+pub use expert_residency::{
+    ExpertParameterRecipe, ExpertResidencyCatalog, ExpertResidencyCatalogError,
+    ExpertResidencyDistribution, ExpertResidencyUnit,
+};
 
 /// Shared decoder mechanics used by backend-neutral text architectures.
 pub mod decoder;

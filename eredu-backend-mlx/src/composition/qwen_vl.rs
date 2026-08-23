@@ -1351,7 +1351,6 @@ fn attach_expert_cache(
     let entries = crate::composition::qwen::expert::expert_catalog(
         &model.args.text,
         store.as_ref(),
-        stream,
     )?;
     model.expert_cache = Some(ExpertCache::new_shared(
         store,

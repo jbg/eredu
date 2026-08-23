@@ -59,6 +59,53 @@ where
     Ok(visitor.units)
 }
 
+pub(crate) fn architecture_expert_units(
+    units: impl IntoIterator<Item = eredu_architectures::ExpertResidencyUnit>,
+    store: &dyn CheckpointSource,
+    layout: Option<&eredu_runtime::LocalModelLayout>,
+) -> Result<Vec<crate::backend::mlx::runtime::residency::expert_cache::ExpertCatalogEntry>, Error> {
+    use crate::backend::mlx::runtime::residency::expert_cache::ExpertCatalogEntry;
+    use eredu_runtime::{OffloadUnit, WeightBinding};
+
+    units
+        .into_iter()
+        .map(|unit| {
+            let identity = unit.identity();
+            let unit_path = unit.unit_path().to_owned();
+            let mut bindings = unit
+                .into_parameters()
+                .into_iter()
+                .map(|parameter| {
+                    let (binding_name, logical_target, recipe) = parameter.into_parts();
+                    let metadata = recipe.infer(store)?;
+                    Ok(
+                        WeightBinding::from_recipe(binding_name, recipe, metadata.byte_len())?
+                            .with_logical_target(logical_target)?,
+                    )
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            if let Some(layout) = layout {
+                bindings =
+                    crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
+                        bindings, &unit_path, store, layout,
+                    )?;
+            }
+            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
+                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "expert {identity:?} byte total overflowed"
+                    ))
+                })
+            })?;
+            Ok(ExpertCatalogEntry::new(
+                identity,
+                OffloadUnit::new(identity.unit_id(), bindings)?,
+                bytes,
+            )?)
+        })
+        .collect()
+}
+
 pub(crate) fn tensor_ref(array: &Array) -> &crate::MlxTensor {
     crate::MlxTensor::ref_cast(array)
 }

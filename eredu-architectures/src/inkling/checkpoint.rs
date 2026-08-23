@@ -955,6 +955,102 @@ pub fn safetensors_recipes<C: RecipeCatalog + ?Sized>(
     Ok(recipes)
 }
 
+/// Builds the complete architecture-owned schedule for independent expert residency.
+pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
+    args: &ModelArgs,
+    catalog: &C,
+) -> Result<crate::ExpertResidencyCatalog, String> {
+    let layers = nonnegative_count(args.text_config.num_hidden_layers, "layer count")?;
+    let recipes = safetensors_recipes(args, catalog)?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(|error| error.to_string())?;
+    let mut units = Vec::new();
+    for layer in 0..layers {
+        if args
+            .text_config
+            .layer_policy(layer)
+            .is_none_or(|policy| policy.feed_forward != FeedForwardPolicy::SparseMoe)
+        {
+            continue;
+        }
+        let unit_path = format!("model.layers.{layer}");
+        let groups =
+            super::layer_parameter_groups(args, layer).map_err(|error| error.to_string())?;
+        for (bank, cache_layer, count, distribution) in [
+            (
+                "experts",
+                layer,
+                args.text_config.n_routed_experts,
+                crate::ExpertResidencyDistribution::ExpertParallel,
+            ),
+            (
+                "shared_experts",
+                layers + layer,
+                args.text_config.n_shared_experts,
+                crate::ExpertResidencyDistribution::Replicated,
+            ),
+        ] {
+            let count = nonnegative_count(count, "expert count")?;
+            let bank_root = format!("{unit_path}.moe.{bank}");
+            let logical_group = format!("{bank_root}.intermediate");
+            let group = groups
+                .iter()
+                .find(|group| {
+                    group.role() == eredu_runtime::ParameterRole::ExpertIntermediate
+                        && group.logical_name() == logical_group
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "Inkling sparse layer {layer} is missing expert group {logical_group:?}"
+                    )
+                })?;
+            for expert in 0..count {
+                let selection = TensorSelection::Range {
+                    axis: 0,
+                    start: expert,
+                    end: expert + 1,
+                };
+                let parameters = group
+                    .members()
+                    .iter()
+                    .map(|member| {
+                        let target = member.target();
+                        let binding = target
+                            .strip_prefix(&bank_root)
+                            .and_then(|suffix| suffix.strip_prefix('.'))
+                            .ok_or_else(|| {
+                                format!(
+                                    "Inkling expert target {target:?} is outside bank {bank_root:?}"
+                                )
+                            })?;
+                        let bank_recipe = recipes.get(target).cloned().unwrap_or_else(|| {
+                            DerivedWeightRecipe::source(target, TensorSelection::Full)
+                        });
+                        let recipe = DerivedWeightRecipe::Select {
+                            input: Box::new(bank_recipe),
+                            selection: selection.clone(),
+                        };
+                        crate::ExpertParameterRecipe::new(binding, target, recipe)
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                units.push(
+                    crate::ExpertResidencyUnit::new(
+                        eredu_runtime::ExpertIdentity::new(cache_layer, expert),
+                        owner_group.clone(),
+                        layer,
+                        &unit_path,
+                        distribution,
+                        parameters,
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+    }
+    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+}
+
 fn add_convolution_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     released: &str,
@@ -1371,8 +1467,8 @@ mod tests {
     };
 
     use super::{
-        dense_w13_recipes, expert_w13_recipe, gguf_plan, mmproj_gguf_plan,
-        partition_mmproj_weight_formats, safetensors_plan, safetensors_recipes,
+        dense_w13_recipes, expert_residency_catalog, expert_w13_recipe, gguf_plan,
+        mmproj_gguf_plan, partition_mmproj_weight_formats, safetensors_plan, safetensors_recipes,
         translate_gguf_weight_name, translate_gguf_weight_name_for_model,
         translate_mmproj_weight_name,
     };
@@ -1527,5 +1623,62 @@ mod tests {
             recipes.get("model.layers.1.moe.shared_experts.gate_up_proj"),
             Some(DerivedWeightRecipe::Concatenate { axis: 1, .. })
         ));
+    }
+
+    #[test]
+    fn residency_catalog_owns_sparse_and_shared_expert_schedule() {
+        let args = ModelArgs::from_hf_json(
+            br#"{
+              "model_type":"inkling_mm_model",
+              "text_config":{"hidden_size":16,"num_hidden_layers":2,"vocab_size":64,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,
+                "sliding_window_size":8,"layer_types":["sliding_attention","full_attention"],
+                "mlp_layer_types":["dense","moe"],"sconv_kernel_size":4,
+                "d_rel":2,"rel_extent":16,"intermediate_size":32,
+                "n_routed_experts":4,"num_experts_per_tok":2,"n_shared_experts":1}
+            }"#,
+        )
+        .unwrap();
+        let routed_gate = "model.llm.layers.1.mlp.experts.w13_weight";
+        let routed_down = "model.llm.layers.1.mlp.experts.w2_weight";
+        let shared_gate = "model.llm.layers.1.mlp.shared_experts.shared_w13_weight";
+        let shared_down = "model.llm.layers.1.mlp.shared_experts.shared_w2_weight";
+        let catalog = Catalog(BTreeMap::from([
+            (routed_gate.into(), metadata(routed_gate, vec![4, 64, 16])),
+            (routed_down.into(), metadata(routed_down, vec![4, 16, 32])),
+            (shared_gate.into(), metadata(shared_gate, vec![1, 64, 16])),
+            (shared_down.into(), metadata(shared_down, vec![1, 16, 32])),
+        ]));
+        let catalog = expert_residency_catalog(&args, &catalog).unwrap();
+        assert_eq!(catalog.units().len(), 5);
+        assert_eq!(catalog.units()[0].unit_path(), "model.layers.1");
+        assert_eq!(
+            catalog.units()[0].identity(),
+            eredu_runtime::ExpertIdentity::new(1, 0)
+        );
+        assert_eq!(
+            catalog.units()[4].identity(),
+            eredu_runtime::ExpertIdentity::new(3, 0)
+        );
+        assert_eq!(catalog.units()[4].owner_group().as_str(), "text_decoder");
+        assert_eq!(catalog.units()[4].owner_unit(), 1);
+        assert_eq!(
+            catalog.units()[4].distribution(),
+            crate::ExpertResidencyDistribution::Replicated
+        );
+        assert_eq!(
+            catalog.units()[4]
+                .parameters()
+                .iter()
+                .map(|parameter| (parameter.binding_name(), parameter.logical_target()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "gate_up_proj",
+                    "model.layers.1.moe.shared_experts.gate_up_proj"
+                ),
+                ("down_proj", "model.layers.1.moe.shared_experts.down_proj"),
+            ]
+        );
     }
 }
