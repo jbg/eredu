@@ -287,16 +287,6 @@ impl StrictLoadConfig {
             } else if let Some(inner_key) = candidate.strip_suffix(".bias") {
                 expanded.push(format!("{inner_key}.inner.bias"));
             }
-            if let Some(rest) = candidate.strip_prefix("model.language_model.embed_tokens.") {
-                expanded.push(format!("model.language_model.embed_tokens.inner.{rest}"));
-            }
-            if let Some(rest) =
-                candidate.strip_prefix("model.language_model.embed_tokens_per_layer.")
-            {
-                expanded.push(format!(
-                    "model.language_model.embed_tokens_per_layer.inner.{rest}"
-                ));
-            }
         }
 
         let mut seen = HashSet::new();
@@ -1379,6 +1369,19 @@ mod tests {
             "model.layers.3.feed_forward.experts.17.bias"
         )
         .is_none());
+    }
+
+    #[test]
+    fn strict_load_candidates_do_not_invent_family_aliases() {
+        let config = StrictLoadConfig::default();
+        assert_eq!(
+            config.candidates("model.language_model.embed_tokens.scales"),
+            ["model.language_model.embed_tokens.scales"]
+        );
+        assert_eq!(
+            config.candidates("model.language_model.embed_tokens_per_layer.biases"),
+            ["model.language_model.embed_tokens_per_layer.biases"]
+        );
     }
 
     #[derive(Debug, Clone, ModuleParameters)]
