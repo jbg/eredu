@@ -274,7 +274,12 @@ impl KimiLinearBindings {
         let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
         match layout {
             Some(layout) => {
-                shard_layer_bindings(bindings, &format!("model.layers.{index}"), store, layout)
+                let root = <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxHybridState,
+                >>::unit_path(architecture, group, index)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                shard_layer_bindings(bindings, &root, store, layout)
             }
             None => Ok(bindings),
         }

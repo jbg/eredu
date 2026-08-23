@@ -473,20 +473,12 @@ impl MuseGlimmerPipelineBindings {
         )?;
         match layout {
             Some(layout) => {
-                let prefix = match group_kind(architecture, group) {
-                    eredu_runtime::ArchitectureGroupKind::VisionEncoder => {
-                        format!("model.vision_tower.layers.{index}")
-                    }
-                    eredu_runtime::ArchitectureGroupKind::Decoder => {
-                        format!("model.layers.{index}")
-                    }
-                    kind => {
-                        return Err(Error::Parallel(format!(
-                            "Muse-Glimmer cannot shard {kind:?} unit {index}"
-                        )))
-                    }
-                };
-                shard_layer_bindings(bindings, &prefix, store, layout)
+                let root = <NeutralArchitecture as LayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxKeyValueState,
+                >>::unit_path(architecture, group, index)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                shard_layer_bindings(bindings, &root, store, layout)
             }
             None => Ok(bindings),
         }

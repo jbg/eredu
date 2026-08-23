@@ -5,8 +5,8 @@ pub mod checkpoint;
 
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
-    CausalModel, ExecutionResidency, LayerWeightResidency, LayerwiseRuntime, RuntimeState,
-    WeightResidency,
+    CausalModel, ExecutionResidency, LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime,
+    RuntimeState, WeightResidency,
 };
 
 use std::{path::Path, sync::Arc};
@@ -930,7 +930,12 @@ impl LlamaPipelineBindings {
         let bindings = build_module_bindings(&global, "", store)?;
         match layout {
             Some(layout) => {
-                shard_layer_bindings(bindings, &format!("model.layers.{index}"), store, layout)
+                let root = <NeutralArchitecture as LayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxKeyValueState,
+                >>::unit_path(architecture, 0, index)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                shard_layer_bindings(bindings, &root, store, layout)
             }
             None => Ok(bindings),
         }

@@ -174,12 +174,14 @@ impl Gemma4Bindings {
             |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
         match (is_decoder, layout) {
-            (true, Some(layout)) => shard_layer_bindings(
-                bindings,
-                &format!("model.language_model.layers.{index}"),
-                store,
-                layout,
-            ),
+            (true, Some(layout)) => {
+                let root = <NeutralArchitecture as LayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxHybridState,
+                >>::unit_path(architecture, group, index)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                shard_layer_bindings(bindings, &root, store, layout)
+            }
             _ => Ok(bindings),
         }
     }
