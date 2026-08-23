@@ -101,7 +101,7 @@ fn prepare_prompt(
     weights_stream: &Stream,
 ) -> anyhow::Result<PreparedChat> {
     let mut loaded = LoadedModel::load(
-        eredu_backend_mlx::MlxBackend::new(stream, weights_stream),
+        eredu_backend_mlx::native::backend(stream, weights_stream),
         target_dir,
         Default::default(),
     )?;
@@ -125,7 +125,7 @@ fn run_greedy(
     weights_stream: &Stream,
 ) -> anyhow::Result<ProbeResult> {
     let mut loaded = LoadedModel::load(
-        eredu_backend_mlx::MlxBackend::new(stream, weights_stream),
+        eredu_backend_mlx::native::backend(stream, weights_stream),
         target_dir,
         Default::default(),
     )?;
@@ -169,7 +169,7 @@ fn run_mtp(
     weights_stream: &Stream,
 ) -> anyhow::Result<ProbeResult> {
     let mut target = LoadedModel::load(
-        eredu_backend_mlx::MlxBackend::new(stream, weights_stream),
+        eredu_backend_mlx::native::backend(stream, weights_stream),
         target_dir,
         Default::default(),
     )?;

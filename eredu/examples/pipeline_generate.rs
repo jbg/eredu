@@ -9,9 +9,9 @@ use eredu_backend_mlx::native::{
     DeviceType, Stream,
 };
 use eredu_backend_mlx::{
-    DefaultSampler, DeviceAssignment, InputPart, MlxBackend, MlxParallelContext, ModelInput,
-    ModelLoadOptions,
+    DeviceAssignment, InputPart, MlxParallelContext, ModelInput, ModelLoadOptions,
 };
+use eredu_runtime::DefaultSampler;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_dir = std::env::args()
@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
-    let backend = MlxBackend::with_distributed_world(&stream, &weights_stream, &group);
+    let backend = eredu_backend_mlx::native::distributed_backend(&stream, &weights_stream, &group);
     let model = load_model(
         &backend,
         &model_dir,

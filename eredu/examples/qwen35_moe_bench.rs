@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
         ModelLoadOptions::default()
     };
     let mut model = LoadedModel::load(
-        eredu_backend_mlx::MlxBackend::new(stream, weights_stream),
+        eredu_backend_mlx::native::backend(stream, weights_stream),
         &model_dir,
         options,
     )?;

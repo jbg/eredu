@@ -6,11 +6,6 @@
 
 use std::{path::PathBuf, time::Duration};
 
-use eredu_backend_mlx::native::{
-    ops::indexing::{NewAxis, TryIndexOp},
-    Array,
-};
-
 /// Discovers hardware available to the selected local backend.
 pub use eredu_backend_mlx::discover_hardware as discover_local_hardware;
 /// Converts a selected-backend expert-cache report into portable telemetry.
@@ -22,6 +17,14 @@ pub use eredu_backend_mlx::mtp_telemetry as local_mtp_telemetry;
 /// Converts a selected-backend residency report into portable telemetry.
 pub use eredu_backend_mlx::residency_telemetry as local_residency_telemetry;
 /// Backend selected for local model execution.
+///
+/// Native streams remain private to the selected backend:
+///
+/// ```compile_fail
+/// fn native_stream(backend: &eredu::api::LocalBackend<'_>) {
+///     let _ = backend.stream();
+/// }
+/// ```
 pub use eredu_backend_mlx::MlxBackend as LocalBackend;
 /// Automatic planner and execution-plan factory for the selected local backend.
 pub use eredu_backend_mlx::MlxBackendFactory as LocalBackendFactory;
@@ -106,8 +109,7 @@ pub fn local_device_plan(device: LocalDevice) -> crate::DevicePlan {
 
 /// Waits for work submitted to the selected local backend.
 pub fn synchronize_local_backend(backend: &LocalBackend<'_>) -> Result<(), LocalBackendError> {
-    backend.stream().synchronize()?;
-    Ok(())
+    backend.synchronize()
 }
 
 /// Resets the selected runtime's allocator high-water mark.
@@ -251,10 +253,10 @@ pub fn benchmark_local_expert_cache(
             "expert-cache benchmark requires at least one prompt token".into(),
         ));
     }
-    let stream = runtime.backend().stream().clone();
-    let tokens = Array::from(token_ids).try_index_device(NewAxis, &stream)?;
-    let parts = [eredu_backend_mlx::InputPart::text_token_ids(&tokens)];
-    let prompt = eredu_backend_mlx::MlxModelInput::from(eredu_backend_mlx::ModelInput::new(&parts));
+    let prompt = <LocalBackend<'static> as crate::TextGenerationBackend>::prepare_text_prompt(
+        runtime.backend(),
+        token_ids.to_vec(),
+    )?;
 
     let before_cold = expert_snapshot(runtime)?;
     runtime.session_mut().reset()?;
@@ -268,8 +270,7 @@ pub fn benchmark_local_expert_cache(
                 "expert-cache benchmark requires logits on the local rank".into(),
             )
         })?;
-    eredu_backend_mlx::native::transforms::eval([&logits])?;
-    stream.synchronize()?;
+    drop(logits);
     let after_cold = expert_snapshot(runtime)?;
     let cold_prefill = benchmark_sample(
         started.elapsed(),
@@ -289,8 +290,7 @@ pub fn benchmark_local_expert_cache(
                 "expert-cache benchmark requires logits on the local rank".into(),
             )
         })?;
-    eredu_backend_mlx::native::transforms::eval([&logits])?;
-    stream.synchronize()?;
+    drop(logits);
     let after_repeated = expert_snapshot(runtime)?;
     let repeated_prefill = benchmark_sample(
         started.elapsed(),
@@ -299,15 +299,18 @@ pub fn benchmark_local_expert_cache(
         after_repeated,
     );
 
-    let last = tokens.try_index_device((.., tokens.dim(1) - 1..), &stream)?;
     let started = std::time::Instant::now();
-    let logits = runtime.decode(last)?.wait()?.into_logits().ok_or_else(|| {
+    let output = {
+        let (backend, session) = runtime.parts_mut();
+        session.submit_token_decode(backend, token_ids[token_ids.len() - 1])?
+    }
+    .wait()?;
+    let logits = output.into_logits().ok_or_else(|| {
         LocalBackendError::Parallel(
             "expert-cache benchmark requires logits on the local rank".into(),
         )
     })?;
-    eredu_backend_mlx::native::transforms::eval([&logits])?;
-    stream.synchronize()?;
+    drop(logits);
     let after_decode = expert_snapshot(runtime)?;
     let cached_decode = benchmark_sample(
         started.elapsed(),

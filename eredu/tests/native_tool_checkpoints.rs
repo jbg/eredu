@@ -37,10 +37,7 @@ fn smoke_with_options(environment: &str, expected_profile_prefix: &str, options:
         .unwrap_or_else(|_| panic!("{environment} must name a local checkpoint"));
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let mut model = LoadedModel::load(
-        eredu_backend_mlx::testing::backend::mlx::MlxBackend::new(
-            execution.stream(),
-            execution.stream(),
-        ),
+        eredu_backend_mlx::native::backend(execution.stream(), execution.stream()),
         &path,
         options,
     )

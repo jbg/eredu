@@ -189,8 +189,7 @@ pub struct MlxBackend<'a> {
 }
 
 impl MlxBackend<'static> {
-    /// Uses the selected execution and weight-materialization streams.
-    pub fn new(stream: &Stream, weights_stream: &Stream) -> Self {
+    pub(crate) fn new(stream: &Stream, weights_stream: &Stream) -> Self {
         Self {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
@@ -199,7 +198,11 @@ impl MlxBackend<'static> {
         }
     }
 
-    pub fn for_execution_plan(stream: &Stream, weights_stream: &Stream, device_id: String) -> Self {
+    pub(crate) fn for_execution_plan(
+        stream: &Stream,
+        weights_stream: &Stream,
+        device_id: String,
+    ) -> Self {
         Self {
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
@@ -210,8 +213,7 @@ impl MlxBackend<'static> {
 }
 
 impl<'a> MlxBackend<'a> {
-    /// Selects MLX distributed communication for sessions created by this backend.
-    pub fn with_distributed_world(
+    pub(crate) fn with_distributed_world(
         stream: &Stream,
         weights_stream: &Stream,
         world: &'a safemlx::distributed::Group,
@@ -223,14 +225,17 @@ impl<'a> MlxBackend<'a> {
             world: Some(world),
         }
     }
-    /// Execution stream used by this backend instance.
-    pub const fn stream(&self) -> &Stream {
+    pub(crate) const fn stream(&self) -> &Stream {
         &self.stream
     }
 
-    /// Checkpoint materialization and transfer stream owned by this backend.
-    pub const fn weights_stream(&self) -> &Stream {
+    pub(crate) const fn weights_stream(&self) -> &Stream {
         &self.weights_stream
+    }
+
+    /// Waits for all work submitted to this backend's execution queue.
+    pub fn synchronize(&self) -> Result<(), Error> {
+        self.stream.synchronize().map_err(Into::into)
     }
 
     #[cfg(any(test, feature = "test-support"))]

@@ -9,7 +9,7 @@ use eredu::{
     load_model, DenseDiskStreamLoadOptions, LayerwiseLoadOptions, WeightResidency,
 };
 use eredu_backend_mlx::native::{Array, Device, DeviceType, ExecutionContext};
-use eredu_backend_mlx::{sample, InputPart, MlxBackend, ModelInput, ModelLoadOptions};
+use eredu_backend_mlx::{sample, InputPart, ModelInput, ModelLoadOptions};
 
 #[derive(Debug, Parser)]
 #[command(about = "Measure synchronous Llama decoder-layer host transfers")]
@@ -99,7 +99,7 @@ fn main() -> anyhow::Result<()> {
         };
         WeightResidency::layerwise_host(layerwise)
     };
-    let backend = MlxBackend::new(stream, weights.stream());
+    let backend = eredu_backend_mlx::native::backend(stream, weights.stream());
     let model = load_model(
         &backend,
         &args.model_dir,

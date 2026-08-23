@@ -86,7 +86,7 @@ fn main() -> anyhow::Result<()> {
     let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let mut model = LoadedModel::load(
-        eredu_backend_mlx::MlxBackend::new(stream, weights.stream()),
+        eredu_backend_mlx::native::backend(stream, weights.stream()),
         &args.model_dir,
         Default::default(),
     )?;

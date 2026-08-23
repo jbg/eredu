@@ -56,7 +56,7 @@ fn load_test_model(
     crate::PreparedModel<eredu_backend_mlx::testing::backend::mlx::MlxModel>,
     crate::ModelLoadError<Error>,
 > {
-    let backend = eredu_backend_mlx::testing::backend::mlx::MlxBackend::new(stream, weights_stream);
+    let backend = eredu_backend_mlx::native::backend(stream, weights_stream);
     crate::load_model(&backend, path, options)
 }
 
@@ -66,6 +66,15 @@ fn load_qwen_hybrid_config(
     let config =
         serde_json::from_reader(std::fs::File::open(path.join("config.json")).unwrap()).unwrap();
     eredu_architectures::qwen::hybrid::model_args_from_config_value(&config).unwrap()
+}
+
+#[test]
+fn selected_backend_synchronizes_without_exposing_its_stream() {
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let backend: crate::api::LocalBackend<'static> =
+        eredu_backend_mlx::native::backend(context.stream(), context.stream());
+
+    crate::api::synchronize_local_backend(&backend).unwrap();
 }
 
 #[test]
@@ -80,10 +89,7 @@ fn observer_forward_reports_attention_and_residual_hooks() {
         eredu_backend_mlx::native::Device::new(eredu_backend_mlx::native::DeviceType::Cpu, 0),
     );
     let mut model = LoadedModel::load(
-        eredu_backend_mlx::testing::backend::mlx::MlxBackend::new(
-            ctx.stream(),
-            weights_ctx.stream(),
-        ),
+        eredu_backend_mlx::native::backend(ctx.stream(), weights_ctx.stream()),
         model_dir,
         ModelLoadOptions::default(),
     )
@@ -269,7 +275,7 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         panic!("expected canonical Qwen3.5 model");
     };
     let runtime = eredu_core::ModelRuntime::from_prepared(
-        eredu_backend_mlx::testing::backend::mlx::MlxBackend::new(stream, stream),
+        eredu_backend_mlx::native::backend(stream, stream),
         eredu_core::PreparedModel::new(
             eredu_backend_mlx::testing::backend::mlx::MlxModel::complete_for_test(
                 Model::Qwen35(qwen),
@@ -1980,7 +1986,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 }
 
                 let mut runtime = eredu_core::ModelRuntime::from_prepared(
-                    eredu_backend_mlx::testing::backend::mlx::MlxBackend::new(stream, stream),
+                    eredu_backend_mlx::native::backend(stream, stream),
                     eredu_core::PreparedModel::new(
                         eredu_backend_mlx::testing::backend::mlx::MlxModel::complete_for_test(
                             dense,

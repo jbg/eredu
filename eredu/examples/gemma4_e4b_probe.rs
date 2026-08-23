@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     ));
     let weights_stream = weights_ctx.stream();
     let mut model = match LoadedModel::load(
-        eredu_backend_mlx::MlxBackend::new(stream, weights_stream),
+        eredu_backend_mlx::native::backend(stream, weights_stream),
         &model_dir,
         Default::default(),
     ) {

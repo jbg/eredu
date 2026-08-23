@@ -455,7 +455,7 @@ fn pipeline_ring_worker() {
     let pipeline_rank = topology.pipeline_parallel_rank;
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
     if std::env::var_os(OPAQUE_SESSION).is_some() {
-        let backend = MlxBackend::with_distributed_world(&stream, &stream, &group);
+        let backend = eredu_backend_mlx::native::distributed_backend(&stream, &stream, &group);
         let load_options = if std::env::var_os(EXPERT_CACHE).is_some() {
             ModelLoadOptions::with_parallel(topology).with_weight_residency(
                 WeightResidency::with_expert_cache(
@@ -738,7 +738,7 @@ fn pipeline_ring_worker() {
         );
         return;
     }
-    let execution = MlxBackend::new(&stream, &stream)
+    let execution = eredu_backend_mlx::native::backend(&stream, &stream)
         .communication_for_topology(topology, &group)
         .unwrap();
     let reference = (pipeline_rank + 1 == pipeline_parallel_size
@@ -1265,7 +1265,7 @@ fn resident_reference_quantized(
     let options = quantization
         .map(ModelLoadOptions::with_quantization)
         .unwrap_or_default();
-    let backend = MlxBackend::new(stream, stream);
+    let backend = eredu_backend_mlx::native::backend(stream, stream);
     let mut model = eredu::load_model(&backend, checkpoint, options)
         .unwrap()
         .into_inner()
@@ -1311,7 +1311,7 @@ fn resident_reference_for_prepared(
     prepared: &PreparedModelInput,
     stream: &Stream,
 ) -> (Vec<f32>, Vec<f32>) {
-    let backend = MlxBackend::new(stream, stream);
+    let backend = eredu_backend_mlx::native::backend(stream, stream);
     let mut model = eredu::load_model(&backend, checkpoint, ModelLoadOptions::default())
         .unwrap()
         .into_inner()
@@ -1414,7 +1414,7 @@ fn multimodal_resident_reference(
     checkpoint: &Path,
     stream: &Stream,
 ) -> (Vec<f32>, Vec<f32>) {
-    let backend = MlxBackend::new(stream, stream);
+    let backend = eredu_backend_mlx::native::backend(stream, stream);
     let mut model = eredu::load_model(&backend, checkpoint, ModelLoadOptions::default())
         .unwrap()
         .into_inner()
@@ -5877,7 +5877,7 @@ fn inkling_mtp_prompt_round_trip() {
     write_inkling_mtp_fixture(checkpoint.path());
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let backend = MlxBackend::new(stream, stream);
+    let backend = eredu_backend_mlx::native::backend(stream, stream);
     let model = load_model(&backend, checkpoint.path(), ModelLoadOptions::default()).unwrap();
     let mut session = backend.create_session(model).unwrap();
     let paged = PagedCacheOptions::new(1, 32768, 32768, 1)

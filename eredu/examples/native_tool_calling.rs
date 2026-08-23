@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let mut model = LoadedModel::load(
-        eredu_backend_mlx::MlxBackend::new(target.stream(), target.stream()),
+        eredu_backend_mlx::native::backend(target.stream(), target.stream()),
         &target_path,
         Default::default(),
     )?;

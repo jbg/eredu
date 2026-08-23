@@ -26,6 +26,20 @@ pub use eredu_core as core;
 /// configure devices, streams, memory, or low-level tensor inputs.
 pub mod native {
     pub use safemlx::*;
+
+    /// Constructs an MLX backend from explicitly selected native streams.
+    pub fn backend(stream: &Stream, weights_stream: &Stream) -> crate::MlxBackend<'static> {
+        crate::MlxBackend::new(stream, weights_stream)
+    }
+
+    /// Constructs a distributed MLX backend from native streams and a world group.
+    pub fn distributed_backend<'a>(
+        stream: &Stream,
+        weights_stream: &Stream,
+        world: &'a distributed::Group,
+    ) -> crate::MlxBackend<'a> {
+        crate::MlxBackend::with_distributed_world(stream, weights_stream, world)
+    }
 }
 
 mod tensor;

@@ -564,6 +564,18 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
+    /// Submits one cached decode position from a portable token id.
+    pub fn submit_token_decode(
+        &mut self,
+        backend: &MlxBackend<'a>,
+        token_id: u32,
+    ) -> Result<Submission<MlxModelOutput, MlxSessionCompletion>, Error> {
+        let token_ids = [token_id];
+        let input =
+            Array::from(token_ids.as_slice()).try_index_device(NewAxis, backend.stream())?;
+        self.decode(backend, input)
+    }
+
     /// Returns aggregate cache-residency telemetry for this session.
     pub fn cache_residency_report(
         &self,
