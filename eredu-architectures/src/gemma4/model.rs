@@ -372,6 +372,76 @@ pub struct LayeredModel<B: RoutedNeuralBackend> {
     parallel_geometry: Option<LocalGeometry>,
 }
 
+impl<B: RoutedNeuralBackend> crate::BindableStaticParameters<B> for LayeredModel<B> {
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitor<B>,
+    {
+        let modules = &self.static_modules;
+        visitor.visit("embedding", &modules.text.embeddings)?;
+        if let Some(module) = &modules.text.per_layer_embeddings {
+            visitor.visit("per_layer_embedding", module)?;
+        }
+        if let Some(module) = &modules.text.per_layer_projection {
+            visitor.visit("per_layer_projection", module)?;
+        }
+        if let Some(module) = &modules.text.per_layer_norm {
+            visitor.visit("per_layer_norm", module)?;
+        }
+        visitor.visit("norm", &modules.text.norm)?;
+        if let Some(module) = &modules.text.head {
+            visitor.visit("output", module)?;
+        }
+        if let Some(module) = &modules.vision {
+            visitor.visit("vision", module)?;
+        }
+        if let Some(module) = &modules.vision_projection {
+            visitor.visit("vision_projection", module)?;
+        }
+        if let Some(module) = &modules.audio {
+            visitor.visit("audio", module)?;
+        }
+        if let Some(module) = &modules.audio_projection {
+            visitor.visit("audio_projection", module)?;
+        }
+        Ok(())
+    }
+
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitorMut<B>,
+    {
+        let modules = &mut self.static_modules;
+        visitor.visit_mut("embedding", &mut modules.text.embeddings)?;
+        if let Some(module) = &mut modules.text.per_layer_embeddings {
+            visitor.visit_mut("per_layer_embedding", module)?;
+        }
+        if let Some(module) = &mut modules.text.per_layer_projection {
+            visitor.visit_mut("per_layer_projection", module)?;
+        }
+        if let Some(module) = &mut modules.text.per_layer_norm {
+            visitor.visit_mut("per_layer_norm", module)?;
+        }
+        visitor.visit_mut("norm", &mut modules.text.norm)?;
+        if let Some(module) = &mut modules.text.head {
+            visitor.visit_mut("output", module)?;
+        }
+        if let Some(module) = &mut modules.vision {
+            visitor.visit_mut("vision", module)?;
+        }
+        if let Some(module) = &mut modules.vision_projection {
+            visitor.visit_mut("vision_projection", module)?;
+        }
+        if let Some(module) = &mut modules.audio {
+            visitor.visit_mut("audio", module)?;
+        }
+        if let Some(module) = &mut modules.audio_projection {
+            visitor.visit_mut("audio_projection", module)?;
+        }
+        Ok(())
+    }
+}
+
 impl<B: RoutedNeuralBackend> LayeredModel<B> {
     /// Executes one media unit for a continuation request whose primary
     /// layered forward context lives on another pipeline owner.

@@ -14633,7 +14633,7 @@ fn load_llama_pipeline(
         stage.partition.parameter_bindings(),
         stage
             .bindings
-            .selected_static_units(&stage.architecture, store.as_ref(), &static_roles)?,
+            .static_units(&stage.architecture, store.as_ref())?,
         &static_roles,
     )?;
     let quantize_on_load = None;

@@ -60,7 +60,7 @@ use crate::backend::mlx::{
         },
         checkpoint::binding::{
             build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
-            localize_module_bindings, parameter_name_in_targets, parameter_role_targets,
+            parameter_name_in_targets, parameter_role_targets,
             populate_module_from_lease_excluding,
         },
         checkpoint::{
@@ -351,7 +351,7 @@ impl QwenVlPipelineBindings {
         architecture: &Architecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(architecture, store, &|_| true)
+        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
@@ -382,69 +382,6 @@ impl QwenVlPipelineBindings {
             recipes,
             |name| self.external_experts && parameter_name_in_targets(name, &expert_targets),
         )?)
-    }
-
-    pub fn selected_static_units(
-        &self,
-        architecture: &Architecture,
-        store: &dyn CheckpointSource,
-        select: &dyn Fn(&str) -> bool,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let modules =
-            <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-                architecture,
-            );
-        let recipes = vl::static_recipes(store);
-        let mut units = Vec::new();
-        if select("qwen_vl.static.vision") {
-            units.push(StaticUnitBindings::new(
-                "qwen_vl.static.vision",
-                build_module_bindings_with_recipes(
-                    &MlxModule::new(modules.vision.clone()),
-                    "",
-                    store,
-                    recipes,
-                )?,
-            )?);
-        }
-        if select("qwen_vl.static.embedding") {
-            let bindings = build_module_bindings_with_recipes(
-                &MlxModule::new(modules.text.embeddings.clone()),
-                "",
-                store,
-                BTreeMap::new(),
-            )?;
-            units.push(StaticUnitBindings::new(
-                "qwen_vl.static.embedding",
-                localize_module_bindings(&modules.text.embeddings, bindings)?,
-            )?);
-        }
-        if select("qwen_vl.static.norm") {
-            units.push(StaticUnitBindings::new(
-                "qwen_vl.static.norm",
-                build_module_bindings_with_recipes(
-                    &MlxModule::new(modules.text.norm.clone()),
-                    "",
-                    store,
-                    BTreeMap::new(),
-                )?,
-            )?);
-        }
-        if select("qwen_vl.static.output") {
-            if let Some(head) = &modules.text.lm_head {
-                let bindings = build_module_bindings_with_recipes(
-                    &MlxModule::new(head.clone()),
-                    "",
-                    store,
-                    BTreeMap::new(),
-                )?;
-                units.push(StaticUnitBindings::new(
-                    "qwen_vl.static.output",
-                    localize_module_bindings(head, bindings)?,
-                )?);
-            }
-        }
-        Ok(units)
     }
 
     pub fn expert_parallel_assignment(

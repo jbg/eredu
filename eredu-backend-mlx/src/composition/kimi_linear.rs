@@ -199,42 +199,7 @@ impl KimiLinearBindings {
         architecture: &NeutralArchitecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(architecture, store, &|_| true)
-    }
-
-    pub fn selected_static_units(
-        &self,
-        architecture: &NeutralArchitecture,
-        store: &dyn CheckpointSource,
-        select: &dyn Fn(&str) -> bool,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let static_modules = architecture.static_modules();
-        let mut units = Vec::new();
-        if select("kimi_linear.static.embedding") {
-            units.push(StaticUnitBindings::new(
-                "kimi_linear.static.embedding",
-                build_module_bindings(
-                    &MlxModule::new(static_modules.embeddings.clone()),
-                    "",
-                    store,
-                )?,
-            )?);
-        }
-        if select("kimi_linear.static.norm") {
-            units.push(StaticUnitBindings::new(
-                "kimi_linear.static.norm",
-                build_module_bindings(&MlxModule::new(static_modules.norm.clone()), "", store)?,
-            )?);
-        }
-        if select("kimi_linear.static.output") {
-            if let Some(head) = &static_modules.lm_head {
-                units.push(StaticUnitBindings::new(
-                    "kimi_linear.static.output",
-                    build_module_bindings(&MlxModule::new(head.clone()), "", store)?,
-                )?);
-            }
-        }
-        Ok(units)
+        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn layer_count(

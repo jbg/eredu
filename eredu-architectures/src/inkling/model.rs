@@ -297,6 +297,61 @@ pub struct LayeredModel<B: RoutedNeuralBackend> {
     parallel_geometry: Option<Arc<LocalGeometry>>,
 }
 
+impl<B: RoutedNeuralBackend> crate::BindableStaticParameters<B> for LayeredModel<B> {
+    fn static_parameter_recipes(
+        &self,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<
+        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        String,
+    > {
+        crate::static_parameters::module_recipes(
+            &self.static_modules,
+            super::safetensors_recipes(&self.args, source)?,
+        )
+    }
+
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitor<B>,
+    {
+        visitor.visit("embedding", &self.static_modules.embeddings)?;
+        visitor.visit("embedding_norm", &self.static_modules.embedding_norm)?;
+        visitor.visit("norm", &self.static_modules.final_norm)?;
+        visitor.visit("output", &self.static_modules.output)?;
+        if let Some(module) = &self.static_modules.audio {
+            visitor.visit("audio", module)?;
+        }
+        if let Some(module) = &self.static_modules.vision {
+            visitor.visit("vision", module)?;
+        }
+        if let Some(module) = &self.static_modules.mtp {
+            visitor.visit("mtp", module)?;
+        }
+        Ok(())
+    }
+
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitorMut<B>,
+    {
+        visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
+        visitor.visit_mut("embedding_norm", &mut self.static_modules.embedding_norm)?;
+        visitor.visit_mut("norm", &mut self.static_modules.final_norm)?;
+        visitor.visit_mut("output", &mut self.static_modules.output)?;
+        if let Some(module) = &mut self.static_modules.audio {
+            visitor.visit_mut("audio", module)?;
+        }
+        if let Some(module) = &mut self.static_modules.vision {
+            visitor.visit_mut("vision", module)?;
+        }
+        if let Some(module) = &mut self.static_modules.mtp {
+            visitor.visit_mut("mtp", module)?;
+        }
+        Ok(())
+    }
+}
+
 impl<B: RoutedNeuralBackend> LayeredModel<B> {
     /// Enters or resumes a routed text partition through the family embedding
     /// boundary.

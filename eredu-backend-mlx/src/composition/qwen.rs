@@ -12,8 +12,8 @@ use std::{
     sync::Arc,
 };
 
-use eredu_architectures::{qwen::ModelArgs, BindableStaticParameters, StaticParameterVisitor};
-use eredu_nn::{Parameterized, RoutedNeuralBackend};
+use eredu_architectures::qwen::ModelArgs;
+use eredu_nn::RoutedNeuralBackend;
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, ops::GgufCheckpoint, Array, Stream};
 
 use eredu_core::cache::{
@@ -28,10 +28,9 @@ use crate::{
     backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
     backend::mlx::runtime::cache::state::MlxKeyValueState,
     backend::mlx::runtime::checkpoint::binding::{
-        binding_bytes, build_module_binding_plan_with_recipes,
-        build_module_binding_plan_with_recipes_excluding, build_module_bindings,
-        build_module_bindings_with_recipes_excluding, build_neutral_module_bindings,
-        parameter_name_in_targets, parameter_role_targets, populate_module_from_lease_excluding,
+        binding_bytes, build_module_binding_plan_with_recipes_excluding, build_module_bindings,
+        build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
+        parameter_role_targets, populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, store::open_gguf_checkpoint_source,
@@ -1520,26 +1519,6 @@ pub struct QwenPipelineBindings {
     external_experts: bool,
 }
 
-struct StaticBindingVisitor<'a> {
-    store: &'a dyn eredu_checkpoint::store::CheckpointSource,
-    units: Vec<StaticUnitBindings>,
-}
-
-impl StaticParameterVisitor<MlxBackend> for StaticBindingVisitor<'_> {
-    type Error = Error;
-
-    fn visit<M>(&mut self, role: &str, module: &M) -> Result<(), Self::Error>
-    where
-        M: Parameterized<crate::MlxTensor>,
-    {
-        self.units.push(StaticUnitBindings::new(
-            role,
-            build_neutral_module_bindings(module, self.store)?,
-        )?);
-        Ok(())
-    }
-}
-
 impl QwenPipelineBindings {
     /// Creates a stateless checkpoint-binding adapter.
     pub const fn new() -> Self {
@@ -1563,12 +1542,7 @@ impl QwenPipelineBindings {
         architecture: &NeutralArchitecture,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let mut visitor = StaticBindingVisitor {
-            store,
-            units: Vec::new(),
-        };
-        architecture.visit_static_parameters(&mut visitor)?;
-        Ok(visitor.units)
+        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {

@@ -66,8 +66,7 @@ use crate::backend::mlx::{
             state::MlxHybridState,
         },
         checkpoint::binding::{
-            build_module_bindings, build_module_bindings_with_recipes,
-            build_module_bindings_with_recipes_excluding, localize_module_bindings,
+            build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
             parameter_name_in_targets, parameter_role_targets, populate_module_from_lease_excluding,
         },
         checkpoint::binding_plan::{BindingPlan, PlannedBinding},
@@ -264,7 +263,7 @@ impl QwenConditionalPipelineBindings {
         architecture: &ConditionalArchitecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(architecture, store, &|_| true)
+        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn begin_pipeline_ingress(
@@ -419,64 +418,6 @@ impl QwenConditionalPipelineBindings {
             None => architecture.begin_pipeline_target(&parts, pixels, None, offset, stream),
         }
         .map_err(|error| Error::Parallel(error.to_string()))
-    }
-
-    pub fn selected_static_units(
-        &self,
-        architecture: &ConditionalArchitecture,
-        store: &dyn CheckpointSource,
-        select: &dyn Fn(&str) -> bool,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let modules = <ConditionalArchitecture as LayeredArchitecture<
-            MlxBackend,
-            MlxHybridState,
-        >>::static_modules(architecture);
-        let recipes = hybrid::static_recipes(store).map_err(Error::UnsupportedArchitecture)?;
-        let mut units = Vec::new();
-        {
-            let (role, module) = ("vision", MlxModule::new(modules.vision.clone()));
-            let id = format!("qwen_conditional.static.{role}");
-            if select(&id) {
-                units.push(StaticUnitBindings::new(
-                    id,
-                    build_module_bindings_with_recipes(&module, "", store, recipes.clone())?,
-                )?);
-            }
-        }
-        if select("qwen_conditional.static.embedding") {
-            let bindings = build_module_bindings_with_recipes(
-                &MlxModule::new(modules.text.embeddings.clone()),
-                "",
-                store,
-                recipes.clone(),
-            )?;
-            units.push(StaticUnitBindings::new(
-                "qwen_conditional.static.embedding",
-                localize_module_bindings(&modules.text.embeddings, bindings)?,
-            )?);
-        }
-        if select("qwen_conditional.static.norm") {
-            let bindings = build_module_bindings_with_recipes(
-                &MlxModule::new(modules.text.norm.clone()),
-                "",
-                store,
-                recipes,
-            )?;
-            units.push(StaticUnitBindings::new(
-                "qwen_conditional.static.norm",
-                localize_module_bindings(&modules.text.norm, bindings)?,
-            )?);
-        }
-        if select("qwen_conditional.static.output") {
-            if let Some(head) = &modules.text.lm_head {
-                let bindings = build_module_bindings(&MlxModule::new(head.clone()), "", store)?;
-                units.push(StaticUnitBindings::new(
-                    "qwen_conditional.static.output",
-                    localize_module_bindings(head, bindings)?,
-                )?);
-            }
-        }
-        Ok(units)
     }
 
     pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
@@ -645,53 +586,7 @@ impl QwenHybridPipelineBindings {
         architecture: &Architecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(architecture, store, &|_| true)
-    }
-
-    pub fn selected_static_units(
-        &self,
-        architecture: &Architecture,
-        store: &dyn CheckpointSource,
-        select: &dyn Fn(&str) -> bool,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let modules = architecture.static_modules();
-        let recipes = hybrid::static_recipes(store).map_err(Error::UnsupportedArchitecture)?;
-        let mut units = Vec::new();
-        if select("qwen_hybrid.static.embedding") {
-            let bindings = build_module_bindings_with_recipes(
-                &MlxModule::new(modules.embeddings.clone()),
-                "",
-                store,
-                recipes.clone(),
-            )?;
-            units.push(StaticUnitBindings::new(
-                "qwen_hybrid.static.embedding",
-                localize_module_bindings(&modules.embeddings, bindings)?,
-            )?);
-        }
-        if select("qwen_hybrid.static.norm") {
-            let bindings = build_module_bindings_with_recipes(
-                &MlxModule::new(modules.norm.clone()),
-                "",
-                store,
-                recipes,
-            )?;
-            units.push(StaticUnitBindings::new(
-                "qwen_hybrid.static.norm",
-                localize_module_bindings(&modules.norm, bindings)?,
-            )?);
-        }
-        if select("qwen_hybrid.static.output") {
-            if let Some(head) = &modules.lm_head {
-                let bindings =
-                    build_module_bindings(&MlxModule::new(head.clone()), "", store)?;
-                units.push(StaticUnitBindings::new(
-                    "qwen_hybrid.static.output",
-                    localize_module_bindings(head, bindings)?,
-                )?);
-            }
-        }
-        Ok(units)
+        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn layer_count(&self, architecture: &Architecture, group: usize) -> Result<usize, Error> {

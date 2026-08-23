@@ -32,10 +32,10 @@ use crate::{
             },
             checkpoint::{
                 binding::{
-                    binding_bytes, build_module_binding_plan_with_recipes,
-                    build_module_binding_plan_with_recipes_excluding, build_module_bindings,
-                    build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
-                    parameter_role_targets, populate_module_from_lease_excluding,
+                    binding_bytes, build_module_binding_plan_with_recipes_excluding,
+                    build_module_bindings, build_module_bindings_with_recipes_excluding,
+                    parameter_name_in_targets, parameter_role_targets,
+                    populate_module_from_lease_excluding,
                 },
                 load::gguf_quantization_configs,
                 quantization::should_quantize_on_load,
@@ -818,24 +818,7 @@ impl GptOssPipelineBindings {
         architecture: &NeutralArchitecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(architecture, store, &|_| true)
-    }
-
-    pub fn selected_static_units(
-        &self,
-        architecture: &NeutralArchitecture,
-        store: &dyn CheckpointSource,
-        select: &dyn Fn(&str) -> bool,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let roles = [
-            ("embedding", "gpt_oss.static.embedding"),
-            ("norm", "gpt_oss.static.norm"),
-            ("output", "gpt_oss.static.output"),
-        ]
-        .into_iter()
-        .filter_map(|(role, unit)| select(unit).then_some(role))
-        .collect::<Vec<_>>();
-        self.selected_static_units_for_roles(architecture, store, &roles)
+        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
@@ -991,62 +974,6 @@ impl GptOssPipelineBindings {
             })?
             .build_bindings(store)?,
         )
-    }
-
-    fn selected_static_units_for_roles(
-        &self,
-        architecture: &NeutralArchitecture,
-        store: &dyn CheckpointSource,
-        roles: &[&str],
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let selected = |role: &str| roles.contains(&role);
-        let args = architecture.args();
-        let static_modules = architecture.static_modules();
-        let mut units = Vec::new();
-        if selected("embedding") {
-            units.push(StaticUnitBindings::new(
-                "gpt_oss.static.embedding",
-                build_module_binding_plan_with_recipes(
-                    &static_modules.embeddings,
-                    &format!("{}.embed_tokens", args.parameter_root),
-                    store,
-                    Default::default(),
-                )?
-                .build_bindings(store)?,
-            )?);
-        }
-        if selected("norm") {
-            let norm_root = format!("{}.norm.", args.parameter_root);
-            let bindings = build_module_binding_plan_with_recipes(
-                &static_modules.norm,
-                "",
-                store,
-                Default::default(),
-            )?
-            .build_bindings(store)?
-            .into_iter()
-            .map(|binding| {
-                let local = binding
-                    .name()
-                    .strip_prefix(&norm_root)
-                    .unwrap_or(binding.name())
-                    .to_owned();
-                binding.with_name(local).map_err(Error::from)
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-            units.push(StaticUnitBindings::new("gpt_oss.static.norm", bindings)?);
-        }
-        if selected("output") {
-            let head = static_modules.lm_head.as_ref().ok_or_else(|| {
-                Error::UnsupportedArchitecture("GPT-OSS requires a separate LM head".into())
-            })?;
-            units.push(StaticUnitBindings::new(
-                "gpt_oss.static.output",
-                build_module_binding_plan_with_recipes(head, "lm_head", store, Default::default())?
-                    .build_bindings(store)?,
-            )?);
-        }
-        Ok(units)
     }
 }
 

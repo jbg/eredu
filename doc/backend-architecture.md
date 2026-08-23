@@ -111,7 +111,12 @@ partition, and the architecture resolves each role to its parameterized module
 for binding construction or mutable population. A backend may materialize and
 shard those visited modules, but must not map roles to family-specific fields,
 residency identifiers, or checkpoint roots. Stable parameter identities on the
-visited module are the checkpoint-binding namespace.
+visited module are the checkpoint-binding namespace. Every pipeline-composed
+family, including multimodal and hybrid graphs, implements this interface;
+concrete backend adapters use one shared visitor rather than family binding tables.
+Architecture implementations also provide any released-checkpoint rewrite
+recipes for their static modules, so alias and fused-layout handling does not
+reintroduce checkpoint roots into a backend.
 
 Routed expert banks retain and expose their architecture-owned construction
 specification. Resident, cached, distributed, and future backend execution

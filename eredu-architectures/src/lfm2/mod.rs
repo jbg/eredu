@@ -58,6 +58,34 @@ pub struct LayeredModel<B: RoutedNeuralBackend> {
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
+impl<B: RoutedNeuralBackend> crate::BindableStaticParameters<B> for LayeredModel<B> {
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitor<B>,
+    {
+        let modules = self.decoder.static_modules();
+        visitor.visit("embedding", &modules.embeddings)?;
+        visitor.visit("norm", &modules.norm)?;
+        if let Some(head) = &modules.lm_head {
+            visitor.visit("output", head)?;
+        }
+        Ok(())
+    }
+
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitorMut<B>,
+    {
+        let modules = self.decoder.static_modules_mut();
+        visitor.visit_mut("embedding", &mut modules.embeddings)?;
+        visitor.visit_mut("norm", &mut modules.norm)?;
+        if let Some(head) = &mut modules.lm_head {
+            visitor.visit_mut("output", head)?;
+        }
+        Ok(())
+    }
+}
+
 impl<B: RoutedNeuralBackend> LayeredModel<B> {
     /// Builds unloaded pinned modules and validates the complete schedule.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {

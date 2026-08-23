@@ -14,6 +14,24 @@ use crate::backend::mlx::{
 };
 use crate::MlxTensor;
 
+#[test]
+fn every_pipeline_composed_family_exposes_architecture_owned_static_bindings() {
+    fn assert_bindable<A: eredu_architectures::BindableStaticParameters<MlxBackend>>() {}
+
+    assert_bindable::<eredu_architectures::llama::LayeredModel<MlxBackend>>();
+    assert_bindable::<eredu_architectures::gpt_oss::LayeredModel<MlxBackend>>();
+    assert_bindable::<eredu_architectures::qwen::LayeredModel<MlxBackend>>();
+    assert_bindable::<eredu_architectures::lfm2::LayeredModel<MlxBackend>>();
+    assert_bindable::<eredu_architectures::kimi_linear::LayeredModel<MlxBackend>>();
+    assert_bindable::<eredu_architectures::nemotron_h::LayeredModel<MlxBackend>>();
+    assert_bindable::<eredu_architectures::gemma4::LayeredModel<MlxBackend>>();
+    assert_bindable::<eredu_architectures::inkling::LayeredModel<MlxBackend>>();
+    assert_bindable::<eredu_architectures::muse_glimmer::LayeredModel<MlxBackend>>();
+    assert_bindable::<eredu_architectures::qwen::hybrid::LayeredModel<MlxBackend>>();
+    assert_bindable::<eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend>>();
+    assert_bindable::<eredu_architectures::qwen::vl::LayeredModel<MlxBackend>>();
+}
+
 fn mlx_execution() -> Option<ExecutionContext> {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     let available = AVAILABLE.get_or_init(|| {

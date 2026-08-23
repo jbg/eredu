@@ -24,9 +24,7 @@ use crate::{
     backend::mlx::nn::shared::{MlxBackend, MlxModule},
     backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
     backend::mlx::runtime::cache::state::MlxKeyValueState,
-    backend::mlx::runtime::checkpoint::binding::{
-        binding_bytes, build_module_binding_plan_with_recipes, build_module_bindings,
-    },
+    backend::mlx::runtime::checkpoint::binding::{binding_bytes, build_module_bindings},
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, store::open_gguf_checkpoint_source,
     },
@@ -940,48 +938,11 @@ impl LlamaPipelineBindings {
         }
     }
 
-    pub fn selected_static_units(
+    pub fn static_units(
         &self,
         architecture: &NeutralArchitecture,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
-        roles: &[&str],
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let selected = |role: &str| roles.contains(&role);
-        let static_modules = architecture.static_modules();
-        let mut units = Vec::new();
-        if selected("embedding") {
-            units.push(StaticUnitBindings::new(
-                "llama.static.embedding",
-                build_module_binding_plan_with_recipes(
-                    &static_modules.embeddings,
-                    "",
-                    store,
-                    Default::default(),
-                )?
-                .build_bindings(store)?,
-            )?);
-        }
-        if selected("norm") {
-            units.push(StaticUnitBindings::new(
-                "llama.static.norm",
-                build_module_binding_plan_with_recipes(
-                    &static_modules.norm,
-                    "",
-                    store,
-                    Default::default(),
-                )?
-                .build_bindings(store)?,
-            )?);
-        }
-        if selected("output") {
-            if let Some(head) = &static_modules.lm_head {
-                units.push(StaticUnitBindings::new(
-                    "llama.static.output",
-                    build_module_binding_plan_with_recipes(head, "", store, Default::default())?
-                        .build_bindings(store)?,
-                )?);
-            }
-        }
-        Ok(units)
+        crate::composition::architecture_static_units(architecture, store)
     }
 }

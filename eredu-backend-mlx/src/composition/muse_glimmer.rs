@@ -421,108 +421,12 @@ impl MuseGlimmerPipelineBindings {
         &architecture.args().model_type
     }
 
-    pub fn selected_static_units(
-        &self,
-        architecture: &NeutralArchitecture,
-        store: &dyn CheckpointSource,
-        select: &dyn Fn(&str) -> bool,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let args = architecture.args();
-        let modules = <NeutralArchitecture as LayeredArchitecture<
-            MlxBackend,
-            MlxKeyValueState,
-        >>::static_modules(architecture);
-        let mut units = Vec::new();
-        macro_rules! push_leaf {
-            ($role:literal, $module:expr, $prefix:literal, $packed:expr) => {
-                if select(concat!("muse_glimmer.static.", $role)) {
-                    let module = MlxModule::new($module.clone());
-                    let recipes = crate::composition::muse_glimmer_expert::module_recipes(
-                        &module,
-                        args,
-                        store,
-                    )?;
-                    let prefix = concat!($prefix, ".");
-                    let bindings = build_module_bindings_with_recipes_excluding(
-                        &module,
-                        "",
-                        store,
-                        recipes,
-                        |_| false,
-                    )?
-                    .into_iter()
-                    .map(|binding| {
-                        let local = binding
-                            .name()
-                            .strip_prefix(prefix)
-                            .ok_or_else(|| {
-                                Error::Parallel(format!(
-                                    "Muse-Glimmer static binding {:?} does not start with {prefix:?}",
-                                    binding.name()
-                                ))
-                            })?
-                            .to_string();
-                        let local = if $packed && local == "weight" {
-                            "inner.weight"
-                        } else {
-                            local.as_str()
-                        };
-                        binding.with_name(local).map_err(Error::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                    units.push(StaticUnitBindings::new(
-                        concat!("muse_glimmer.static.", $role),
-                        bindings,
-                    )?);
-                }
-            };
-        }
-        macro_rules! push {
-            ($role:literal, $module:expr) => {
-                if select(concat!("muse_glimmer.static.", $role)) {
-                    let module = MlxModule::new($module.clone());
-                    let recipes = crate::composition::muse_glimmer_expert::module_recipes(
-                        &module, args, store,
-                    )?;
-                    units.push(StaticUnitBindings::new(
-                        concat!("muse_glimmer.static.", $role),
-                        build_module_bindings_with_recipes_excluding(
-                            &module,
-                            "",
-                            store,
-                            recipes,
-                            |_| false,
-                        )?,
-                    )?);
-                }
-            };
-        }
-        push!("vision", modules.vision);
-        push_leaf!(
-            "embedding",
-            modules.text.embeddings,
-            "model.embed_tokens",
-            args.weight_quantization_for("model.embed_tokens.weight")
-                .is_some()
-        );
-        push_leaf!("norm", modules.text.final_norm, "model.norm", false);
-        if let Some(head) = &modules.text.head {
-            push_leaf!(
-                "output",
-                head,
-                "lm_head",
-                args.weight_quantization_for("lm_head.weight").is_some()
-            );
-        }
-        Ok(units)
-    }
-
     pub fn static_units(
         &self,
         architecture: &NeutralArchitecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(architecture, store, &|_| true)
+        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {

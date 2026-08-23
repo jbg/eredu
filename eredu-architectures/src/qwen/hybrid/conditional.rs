@@ -337,6 +337,45 @@ pub struct ConditionalLayeredModel<B: RoutedNeuralBackend> {
     parallel_geometry: Option<std::sync::Arc<ConditionalLocalGeometry>>,
 }
 
+impl<B: RoutedNeuralBackend> crate::BindableStaticParameters<B> for ConditionalLayeredModel<B> {
+    fn static_parameter_recipes(
+        &self,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<
+        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        String,
+    > {
+        let recipes = super::static_recipes(source)?;
+        crate::static_parameters::module_recipes(&self.static_modules, recipes)
+    }
+
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitor<B>,
+    {
+        visitor.visit("vision", &self.static_modules.vision)?;
+        visitor.visit("embedding", &self.static_modules.text.embeddings)?;
+        visitor.visit("norm", &self.static_modules.text.norm)?;
+        if let Some(head) = &self.static_modules.text.lm_head {
+            visitor.visit("output", head)?;
+        }
+        Ok(())
+    }
+
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitorMut<B>,
+    {
+        visitor.visit_mut("vision", &mut self.static_modules.vision)?;
+        visitor.visit_mut("embedding", &mut self.static_modules.text.embeddings)?;
+        visitor.visit_mut("norm", &mut self.static_modules.text.norm)?;
+        if let Some(head) = &mut self.static_modules.text.lm_head {
+            visitor.visit_mut("output", head)?;
+        }
+        Ok(())
+    }
+}
+
 impl<B: RoutedNeuralBackend> ConditionalLayeredModel<B> {
     /// Prepares one routed target decoder partition with architecture-owned
     /// shape validation and causal-mask construction.

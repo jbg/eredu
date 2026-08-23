@@ -258,6 +258,45 @@ where
     .build_bindings(store)
 }
 
+/// Builds exact bindings for one architecture-owned static module, consuming
+/// any architecture recipes whose destinations belong to that module.
+pub fn build_neutral_module_bindings_with_recipes<M>(
+    module: &M,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+    recipes: &mut BTreeMap<String, DerivedWeightRecipe>,
+) -> Result<Vec<WeightBinding>, ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+{
+    let parameters = neutral_parameter_refs(module, false).flatten();
+    let names = parameters
+        .iter()
+        .map(|(name, _)| name.to_owned())
+        .collect::<BTreeSet<_>>();
+    let selected = recipes
+        .keys()
+        .filter(|name| names.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected = selected
+        .into_iter()
+        .map(|name| {
+            let recipe = recipes
+                .remove(&name)
+                .expect("recipe key came from the same map");
+            (name, recipe)
+        })
+        .collect();
+    build_flattened_module_binding_plan_with_recipes_excluding(
+        parameters,
+        "",
+        store,
+        selected,
+        |_| false,
+    )?
+    .build_bindings(store)
+}
+
 /// Materializes a set of direct or derived bindings without constructing a
 /// residency manager.
 ///

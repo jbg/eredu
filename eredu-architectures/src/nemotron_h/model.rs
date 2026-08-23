@@ -224,6 +224,42 @@ pub struct LayeredModel<B: RoutedNeuralBackend> {
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
+impl<B: RoutedNeuralBackend> crate::BindableStaticParameters<B> for LayeredModel<B> {
+    fn static_parameter_recipes(
+        &self,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+    ) -> Result<
+        std::collections::BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>,
+        String,
+    > {
+        super::static_recipes(source, &self.args, None)
+    }
+
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitor<B>,
+    {
+        visitor.visit("embedding", &self.static_modules.embeddings)?;
+        visitor.visit("norm", &self.static_modules.norm)?;
+        if let Some(head) = &self.static_modules.lm_head {
+            visitor.visit("output", head)?;
+        }
+        Ok(())
+    }
+
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitorMut<B>,
+    {
+        visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
+        visitor.visit_mut("norm", &mut self.static_modules.norm)?;
+        if let Some(head) = &mut self.static_modules.lm_head {
+            visitor.visit_mut("output", head)?;
+        }
+        Ok(())
+    }
+}
+
 impl<B: RoutedNeuralBackend> LayeredModel<B> {
     /// Builds unloaded static modules and validates target plus MTP schedules.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {

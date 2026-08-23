@@ -29,7 +29,7 @@ use crate::{
             },
             checkpoint::{
                 binding::{
-                    binding_bytes, build_module_bindings, build_module_bindings_with_recipes,
+                    binding_bytes, build_module_bindings_with_recipes,
                     build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
                     parameter_role_targets, populate_module_from_lease_excluding,
                 },
@@ -222,59 +222,7 @@ impl NemotronHBindings {
         architecture: &NeutralArchitecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(architecture, store, &|_| true)
-    }
-
-    pub fn selected_static_units(
-        &self,
-        architecture: &NeutralArchitecture,
-        store: &dyn CheckpointSource,
-        select: &dyn Fn(&str) -> bool,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let args = architecture.args();
-        let static_modules = architecture.static_modules();
-        let mut units = Vec::new();
-        if select("nemotron_h.static.embedding") {
-            units.push(StaticUnitBindings::new(
-                "nemotron_h.static.embedding",
-                build_module_bindings_with_recipes(
-                    &MlxModule::new(static_modules.embeddings.clone()),
-                    "",
-                    store,
-                    eredu_architectures::nemotron_h::static_recipes(
-                        store,
-                        args,
-                        Some("model.embeddings."),
-                    )
-                    .map_err(Error::UnsupportedArchitecture)?,
-                )?,
-            )?);
-        }
-        if select("nemotron_h.static.norm") {
-            units.push(StaticUnitBindings::new(
-                "nemotron_h.static.norm",
-                build_module_bindings_with_recipes(
-                    &MlxModule::new(static_modules.norm.clone()),
-                    "",
-                    store,
-                    eredu_architectures::nemotron_h::static_recipes(
-                        store,
-                        args,
-                        Some("model.norm_f."),
-                    )
-                    .map_err(Error::UnsupportedArchitecture)?,
-                )?,
-            )?);
-        }
-        if select("nemotron_h.static.output") {
-            if let Some(head) = &static_modules.lm_head {
-                units.push(StaticUnitBindings::new(
-                    "nemotron_h.static.output",
-                    build_module_bindings(&MlxModule::new(head.clone()), "", store)?,
-                )?);
-            }
-        }
-        Ok(units)
+        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn layer_bindings(

@@ -91,142 +91,8 @@ impl Gemma4Bindings {
         Self { external_experts }
     }
 
-    fn static_modules(
-        architecture: &NeutralArchitecture,
-    ) -> &eredu_architectures::gemma4::StaticModules<MlxBackend> {
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-            architecture,
-        )
-    }
-
     pub fn model_type<'a>(&self, architecture: &'a NeutralArchitecture) -> &'a str {
         &architecture.args().model_type
-    }
-
-    pub fn selected_static_units(
-        &self,
-        architecture: &NeutralArchitecture,
-        store: &dyn CheckpointSource,
-        select: &dyn Fn(&str) -> bool,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let args = architecture.args();
-        let modules = Self::static_modules(architecture);
-        let mut units = Vec::new();
-        macro_rules! push_leaf {
-            ($role:literal, $module:expr, $prefix:literal, $packed:expr) => {
-                if select(concat!("gemma4.static.", $role)) {
-                    let prefix = concat!($prefix, ".");
-                    let bindings = build_module_bindings(
-                        &MlxModule::new($module.clone()),
-                        "",
-                        store,
-                    )?
-                    .into_iter()
-                    .map(|binding| {
-                        let local = binding
-                            .name()
-                            .strip_prefix(prefix)
-                            .ok_or_else(|| {
-                                Error::Parallel(format!(
-                                    "Gemma 4 static binding {:?} does not start with {prefix:?}",
-                                    binding.name()
-                                ))
-                            })?
-                            .to_string();
-                        let local = if $packed && local == "weight" {
-                            "inner.weight"
-                        } else {
-                            local.as_str()
-                        };
-                        binding.with_name(local).map_err(Error::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                    units.push(StaticUnitBindings::new(
-                        concat!("gemma4.static.", $role),
-                        bindings,
-                    )?);
-                }
-            };
-        }
-        macro_rules! push {
-            ($role:literal, $module:expr) => {
-                if select(concat!("gemma4.static.", $role)) {
-                    units.push(StaticUnitBindings::new(
-                        concat!("gemma4.static.", $role),
-                        build_module_bindings(&MlxModule::new($module.clone()), "", store)?,
-                    )?);
-                }
-            };
-        }
-        push_leaf!(
-            "embedding",
-            modules.text.embeddings,
-            "model.language_model.embed_tokens",
-            args.text
-                .linear_format_for("model.language_model.embed_tokens.weight")
-                .weight_quantization()
-                .is_some()
-        );
-        if let Some(module) = &modules.text.per_layer_embeddings {
-            push_leaf!(
-                "per_layer_embedding",
-                module,
-                "model.language_model.embed_tokens_per_layer",
-                args.text
-                    .linear_format_for("model.language_model.embed_tokens_per_layer.weight")
-                    .weight_quantization()
-                    .is_some()
-            );
-        }
-        if let Some(module) = &modules.text.per_layer_projection {
-            push_leaf!(
-                "per_layer_projection",
-                module,
-                "model.language_model.per_layer_model_projection",
-                args.text
-                    .linear_format_for("model.language_model.per_layer_model_projection.weight")
-                    .weight_quantization()
-                    .is_some()
-            );
-        }
-        if let Some(module) = &modules.text.per_layer_norm {
-            push_leaf!(
-                "per_layer_norm",
-                module,
-                "model.language_model.per_layer_projection_norm",
-                false
-            );
-        }
-        push_leaf!(
-            "norm",
-            modules.text.norm,
-            "model.language_model.norm",
-            false
-        );
-        if let Some(module) = &modules.text.head {
-            push_leaf!(
-                "output",
-                module,
-                "lm_head",
-                args.text
-                    .linear_format_for("lm_head.weight")
-                    .weight_quantization()
-                    .is_some()
-            );
-        }
-        if let Some(module) = &modules.vision {
-            push!("vision", module);
-        }
-        if let Some(module) = &modules.vision_projection {
-            push!("vision_projection", module);
-        }
-        if let Some(module) = &modules.audio {
-            push!("audio", module);
-        }
-        if let Some(module) = &modules.audio_projection {
-            push!("audio_projection", module);
-        }
-        Ok(units)
     }
 
     pub fn static_units(
@@ -234,7 +100,7 @@ impl Gemma4Bindings {
         architecture: &NeutralArchitecture,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(architecture, store, &|_| true)
+        crate::composition::architecture_static_units(architecture, store)
     }
 
     pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {

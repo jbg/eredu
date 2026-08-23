@@ -70,6 +70,35 @@ where
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
 }
 
+impl<B> crate::BindableStaticParameters<B> for LayeredModel<B>
+where
+    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+{
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitor<B>,
+    {
+        visitor.visit("embedding", &self.static_modules.embeddings)?;
+        visitor.visit("norm", &self.static_modules.norm)?;
+        if let Some(head) = &self.static_modules.lm_head {
+            visitor.visit("output", head)?;
+        }
+        Ok(())
+    }
+
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitorMut<B>,
+    {
+        visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
+        visitor.visit_mut("norm", &mut self.static_modules.norm)?;
+        if let Some(head) = &mut self.static_modules.lm_head {
+            visitor.visit_mut("output", head)?;
+        }
+        Ok(())
+    }
+}
+
 impl<B> LayeredModel<B>
 where
     B: RoutedNeuralBackend + BlockwiseAttentionBackend,
