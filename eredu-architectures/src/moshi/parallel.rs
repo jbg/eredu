@@ -741,12 +741,14 @@ fn local_state_layout(
                 TEMPORAL_STATE_SEGMENT,
                 0..temporal_count,
                 StateSegmentLifetime::Persistent,
+                0,
             )
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
             StateSegmentSpec::new(
                 DEPTH_STATE_SEGMENT,
                 temporal_count..temporal_count + depth_count,
                 StateSegmentLifetime::FrameLocal,
+                0,
             )
             .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?,
         ],

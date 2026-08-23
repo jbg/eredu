@@ -2290,8 +2290,9 @@ mod semantic_transaction_tests {
         StateLayout::segmented(
             LayerSchedule::new(2, vec![policy.clone(), policy]).unwrap(),
             [
-                StateSegmentSpec::new("temporal", 0..1, StateSegmentLifetime::Persistent).unwrap(),
-                StateSegmentSpec::new("depth", 1..2, StateSegmentLifetime::FrameLocal).unwrap(),
+                StateSegmentSpec::new("temporal", 0..1, StateSegmentLifetime::Persistent, 0)
+                    .unwrap(),
+                StateSegmentSpec::new("depth", 1..2, StateSegmentLifetime::FrameLocal, 0).unwrap(),
             ],
         )
         .unwrap()
@@ -2312,8 +2313,8 @@ mod semantic_transaction_tests {
         let layout = StateLayout::segmented(
             LayerSchedule::new(3, vec![LayerCachePolicy::NoState; 3]).unwrap(),
             [
-                StateSegmentSpec::new("target", 0..2, StateSegmentLifetime::Persistent).unwrap(),
-                StateSegmentSpec::new("prediction", 2..3, StateSegmentLifetime::Persistent)
+                StateSegmentSpec::new("target", 0..2, StateSegmentLifetime::Persistent, 0).unwrap(),
+                StateSegmentSpec::new("prediction", 2..3, StateSegmentLifetime::Persistent, -1)
                     .unwrap(),
             ],
         )

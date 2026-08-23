@@ -590,7 +590,7 @@ impl DecoderConfig {
         self.num_experts > 0
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         if self.model_type != "muse_glimmer_text" {
             return Err(invalid("text model_type must be muse_glimmer_text"));
         }
@@ -1115,6 +1115,28 @@ mod tests {
         );
         assert_eq!(config.layer_uses_rope, [true, false]);
         assert_eq!(config.vision_config.schedule, [VisionAttentionPolicy::Full]);
+    }
+
+    #[test]
+    fn family_owns_prompt_cache_identity() {
+        let args = DecoderConfig::from_hf_value(&config()).unwrap();
+        let layout = crate::muse_glimmer::state_layout(&args).unwrap();
+        let identity = crate::muse_glimmer::state_identity(
+            &args,
+            &layout,
+            0,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap()
+        .prompt_cache_identity(&layout)
+        .unwrap();
+
+        assert_eq!(identity.model_family, "muse_glimmer");
+        assert_eq!(
+            identity.architecture_fingerprint,
+            args.architecture_fingerprint()
+        );
+        assert_eq!(identity.layer_prefix_offsets, vec![0; layout.len()]);
     }
 
     #[test]

@@ -1140,6 +1140,7 @@ pub fn state_layout_with_geometry(
         TARGET_STATE_SEGMENT,
         0..target_layers,
         StateSegmentLifetime::Persistent,
+        0,
     )
     .map_err(|error| invalid(error.to_string()))?];
     if mtp_layers > 0 {
@@ -1148,6 +1149,7 @@ pub fn state_layout_with_geometry(
                 PREDICTION_STATE_SEGMENT,
                 target_layers..target_layers + mtp_layers,
                 StateSegmentLifetime::Persistent,
+                -1,
             )
             .map_err(|error| invalid(error.to_string()))?,
         );

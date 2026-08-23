@@ -5303,16 +5303,13 @@ fn gemma4_pipeline_prompt_cache_identity(
             layout.len()
         )));
     }
-    eredu_runtime::ModelStateIdentity {
-        model_family: "gemma4".into(),
-        effective_model_type: args.model_type.clone(),
-        architecture_fingerprint: args.architecture_fingerprint(),
-        layer_count: args.text.num_hidden_layers(),
-        global_layer_start: range.start,
-        sink_tokens: 0,
-        layer_prefix_offsets: vec![0; layout.len()],
-        topology: crate::backend::cache::prompt_cache_topology(topology),
-    }
+    eredu_architectures::gemma4::state_identity(
+        args,
+        layout,
+        range.start,
+        crate::backend::cache::prompt_cache_topology(topology),
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
     .prompt_cache_identity(layout)
     .map_err(|error| Error::Parallel(error.to_string()))
 }
@@ -5999,24 +5996,18 @@ impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let full = eredu_architectures::deepseek::v3::state_layout(self.args())
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let policies = full
-            .layers()
-            .iter()
-            .skip(self.range().start)
-            .take(self.range().len())
-            .cloned()
-            .collect::<Vec<_>>();
-        let layout = eredu_core::LayerSchedule::new(policies.len(), policies)
+        let layout = full
+            .slice(self.range())
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "deepseek_v3",
-            &self.args().model_type,
-            eredu_architectures::deepseek::v3_architecture_fingerprint(self.args()),
-            self.args().num_hidden_layers as usize,
-            self.range().clone(),
-            layout.clone(),
-        ))
+        eredu_architectures::deepseek::v3::state_identity(
+            self.args(),
+            &layout,
+            self.range().start,
+            crate::backend::cache::prompt_cache_topology(topology),
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .prompt_cache_identity(&layout)
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 }
 
@@ -6473,24 +6464,18 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let full = eredu_architectures::deepseek::v4::state_layout(self.args())
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let policies = full
-            .layers()
-            .iter()
-            .skip(self.range().start)
-            .take(self.range().len())
-            .cloned()
-            .collect::<Vec<_>>();
-        let layout = eredu_core::LayerSchedule::new(policies.len(), policies)
+        let layout = full
+            .slice(self.range())
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "deepseek_v4",
-            &self.args().model_type,
-            eredu_architectures::deepseek::v4_architecture_fingerprint(self.args()),
-            self.args().num_hidden_layers as usize,
-            self.range().clone(),
-            layout.clone(),
-        ))
+        eredu_architectures::deepseek::v4::state_identity(
+            self.args(),
+            &layout,
+            self.range().start,
+            crate::backend::cache::prompt_cache_topology(topology),
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .prompt_cache_identity(&layout)
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     fn new_cache_layers(
@@ -7326,26 +7311,18 @@ impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
             .architecture
             .runtime_state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let layout = eredu_core::LayerSchedule::new(
-            self.range().len(),
-            complete
-                .layers()
-                .iter()
-                .skip(self.range().start)
-                .take(self.range().len())
-                .cloned()
-                .collect(),
+        let layout = complete
+            .slice(self.range())
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        eredu_architectures::muse_glimmer::state_identity(
+            self.architecture.args(),
+            &layout,
+            self.range().start,
+            crate::backend::cache::prompt_cache_topology(topology),
         )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "muse_glimmer",
-            &self.architecture.args().model_type,
-            self.architecture.args().architecture_fingerprint(),
-            self.architecture.args().num_hidden_layers as usize,
-            self.range().clone(),
-            layout,
-        ))
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .prompt_cache_identity(&layout)
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 }
 
@@ -12956,22 +12933,9 @@ fn decoder_partition_state_layout(
     complete: &eredu_runtime::StateLayout,
     layers: Range<usize>,
 ) -> Result<eredu_runtime::StateLayout, Error> {
-    let policies = complete
-        .layers()
-        .iter()
-        .skip(layers.start)
-        .take(layers.len())
-        .cloned()
-        .collect::<Vec<_>>();
-    if policies.len() != layers.len() {
-        return Err(Error::Parallel(format!(
-            "decoder state layout has {} layers, cannot select {layers:?}",
-            complete.len()
-        )));
-    }
-    let schedule = eredu_core::LayerSchedule::new(policies.len(), policies)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    eredu_runtime::StateLayout::new(schedule).map_err(|error| Error::Parallel(error.to_string()))
+    complete
+        .slice(layers)
+        .map_err(|error| Error::Parallel(error.to_string()))
 }
 
 fn local_architecture_parameter_bindings<G, A>(

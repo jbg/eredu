@@ -725,8 +725,8 @@ fn named_frame_local_segment_resets_without_touching_persistent_state() {
     let layout = StateLayout::segmented(
         LayerSchedule::new(4, policies).unwrap(),
         [
-            StateSegmentSpec::new("temporal", 0..2, StateSegmentLifetime::Persistent).unwrap(),
-            StateSegmentSpec::new("depth", 2..4, StateSegmentLifetime::FrameLocal).unwrap(),
+            StateSegmentSpec::new("temporal", 0..2, StateSegmentLifetime::Persistent, 0).unwrap(),
+            StateSegmentSpec::new("depth", 2..4, StateSegmentLifetime::FrameLocal, 0).unwrap(),
         ],
     )
     .unwrap();

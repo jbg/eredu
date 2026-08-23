@@ -6735,7 +6735,7 @@ fn qwen_prompt_snapshot_reopens_with_global_identity_and_continues_exactly() {
     // state. This is the portable failure-atomicity boundary used before any
     // persistent tensors are materialized.
     let mut malformed_identity = model_identity;
-    malformed_identity.layer_prefix_offsets.clear();
+    malformed_identity.global_layer_start = 2;
     assert!(malformed_identity
         .prompt_cache_identity(&local_layout)
         .is_err());

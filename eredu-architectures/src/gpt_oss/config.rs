@@ -400,7 +400,6 @@ pub fn state_identity(
         layer_count,
         global_layer_start,
         sink_tokens: 0,
-        layer_prefix_offsets: vec![0; layout.len()],
         topology,
     })
 }
@@ -1296,7 +1295,10 @@ mod tests {
             tensor_parallel: Some((2, 1)),
             ..PromptCacheTopology::default()
         };
-        let identity = state_identity(&args, &layout, 0, topology.clone()).unwrap();
+        let identity = state_identity(&args, &layout, 0, topology.clone())
+            .unwrap()
+            .prompt_cache_identity(&layout)
+            .unwrap();
         assert_eq!(identity.model_family, "gpt_oss");
         assert_eq!(identity.architecture_fingerprint, fingerprint);
         assert_eq!(identity.layer_prefix_offsets, vec![0; 4]);

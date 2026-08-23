@@ -2096,44 +2096,21 @@ impl DeepSeekModel {
             .map_err(Into::into)
     }
 
-    pub fn architecture_fingerprint(&self) -> String {
-        match &self.inner {
-            DeepSeekModelInner::V3 { args, .. } => deepseek::v3_architecture_fingerprint(args),
-            DeepSeekModelInner::V4 { args, .. } => deepseek::v4_architecture_fingerprint(args),
-        }
-    }
-
     pub fn prompt_cache_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
         let layout = self.state_layout()?;
-        let target = match &self.inner {
-            DeepSeekModelInner::V3 { args, .. } => args.num_hidden_layers as usize,
-            DeepSeekModelInner::V4 { args, .. } => args.num_hidden_layers as usize,
-        };
-        let dspark =
-            matches!(&self.inner, DeepSeekModelInner::V4 { args, .. } if args.dspark.is_some());
-        let offsets = (0..layout.len())
-            .map(|layer| if layer >= target && !dspark { -1 } else { 0 })
-            .collect();
-        let identity = PromptCacheModelIdentity {
-            model_family: self.model_type().into(),
-            effective_model_type: self.model_type().into(),
-            architecture_fingerprint: self.architecture_fingerprint(),
-            layer_count: layout.len(),
-            global_layer_start: 0,
-            global_layer_end: layout.len(),
-            sink_tokens: 0,
-            layer_prefix_offsets: offsets,
-            topology: PromptCacheTopology::default(),
-            layer_layout: layout.layers().clone(),
+        let topology = PromptCacheTopology::default();
+        let identity = match &self.inner {
+            DeepSeekModelInner::V3 { args, .. } => {
+                deepseek::v3::state_identity(args, &layout, 0, topology)
+            }
+            DeepSeekModelInner::V4 { args, .. } => {
+                deepseek::v4::state_identity(args, &layout, 0, topology)
+            }
         };
         identity
-            .validate()
-            .map_err(|error| unsupported(error.to_string()))?;
-        Ok(identity)
-    }
-
-    pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
-        Ok(self.prompt_cache_identity()?.layer_prefix_offsets)
+            .map_err(neutral_error)?
+            .prompt_cache_identity(&layout)
+            .map_err(|error| unsupported(error.to_string()))
     }
 
     pub fn save_prompt_cache(

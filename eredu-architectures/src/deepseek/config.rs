@@ -1502,6 +1502,18 @@ mod tests {
             super::super::PREDICTION_STATE_SEGMENT
         );
         assert_eq!(v3_layout.segments()[1].layers(), 4..6);
+        assert_eq!(v3_layout.layer_prefix_offsets(), [0, 0, 0, 0, -1, -1]);
+        let v3_identity = crate::deepseek::v3::state_identity(
+            &v3,
+            &v3_layout,
+            0,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap()
+        .prompt_cache_identity(&v3_layout)
+        .unwrap();
+        assert_eq!(v3_identity.model_family, "deepseek_v3");
+        assert_eq!(v3_identity.layer_prefix_offsets, [0, 0, 0, 0, -1, -1]);
         assert_eq!(
             v3_layout.components(0).unwrap()[0].role.stable_name(),
             "attention.compressed_latent"
@@ -1524,6 +1536,7 @@ mod tests {
             super::super::PREDICTION_STATE_SEGMENT
         );
         assert_eq!(v4_layout.segments()[1].layers(), 3..4);
+        assert_eq!(v4_layout.layer_prefix_offsets(), [0, 0, 0, -1]);
         assert_eq!(v4_layout.components(0).unwrap().len(), 1);
         let compressed = v4_layout.components(1).unwrap();
         assert_eq!(compressed.len(), 11);
@@ -1539,6 +1552,30 @@ mod tests {
             .unwrap()
             .correction_bias
             .is_some());
+    }
+
+    #[test]
+    fn dspark_prediction_frontier_is_declared_by_the_state_segment() {
+        let mut value = v4_fixture();
+        value["dspark_block_size"] = Value::from(4);
+        value["dspark_noise_token_id"] = Value::from(0);
+        value["dspark_target_layer_ids"] = serde_json::json!([0, 2]);
+        value["dspark_markov_rank"] = Value::from(4);
+        let args = parse_v4_config(&value).unwrap();
+        let layout = crate::deepseek::v4::state_layout(&args).unwrap();
+        let identity = crate::deepseek::v4::state_identity(
+            &args,
+            &layout,
+            0,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap()
+        .prompt_cache_identity(&layout)
+        .unwrap();
+
+        assert_eq!(layout.segments()[1].processed_token_offset(), 0);
+        assert_eq!(identity.layer_prefix_offsets, [0, 0, 0, 0]);
+        assert_eq!(identity.model_family, "deepseek_v4");
     }
 
     #[test]

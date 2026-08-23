@@ -599,8 +599,14 @@ impl Model {
     /// Returns the canonical cache-relevant architecture identity derived from the loaded model.
     pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Exception> {
         match self {
-            Self::DeepSeek(model) => Ok(model.architecture_fingerprint()),
-            Self::Gemma4(model) => Ok(model.args().architecture_fingerprint()),
+            Self::DeepSeek(model) => model
+                .prompt_cache_identity()
+                .map(|identity| identity.architecture_fingerprint)
+                .map_err(|error| Exception::custom(error.to_string())),
+            Self::Gemma4(model) => model
+                .prompt_cache_model_identity()
+                .map(|identity| identity.architecture_fingerprint)
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::Llama(model) => {
                 Ok(eredu_architectures::llama::prompt_cache_architecture_fingerprint(model.args()))
             }
@@ -613,7 +619,10 @@ impl Model {
                 .prompt_cache_architecture_fingerprint()
                 .map_err(|error| Exception::custom(error.to_string())),
             Self::Qwen(model) => Ok(model.prompt_cache_architecture_fingerprint()),
-            Self::MuseGlimmer(model) => Ok(model.args().architecture_fingerprint()),
+            Self::MuseGlimmer(model) => model
+                .prompt_cache_model_identity()
+                .map(|identity| identity.architecture_fingerprint)
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::NemotronH(model) => model
                 .prompt_cache_architecture_fingerprint()
                 .map_err(|error| Exception::custom(error.to_string())),
@@ -629,17 +638,23 @@ impl Model {
     /// Returns the exact ordered prompt-cache state and attention layout.
     pub fn prompt_cache_layer_layout(&self) -> Result<LayerSchedule<LayerCachePolicy>, Exception> {
         match self {
-            Self::DeepSeek(model) => model.state_layout().map(|layout| layout.layers().clone()),
+            Self::DeepSeek(model) => model
+                .prompt_cache_identity()
+                .map(|identity| identity.layer_layout),
             Self::Llama(model) => model.prompt_cache_layer_layout(),
             Self::GptOss(model) => model.prompt_cache_layer_layout(),
             Self::Qwen(model) => model.prompt_cache_layer_layout(),
-            Self::MuseGlimmer(model) => model.prompt_cache_layer_layout(),
+            Self::MuseGlimmer(model) => model
+                .prompt_cache_model_identity()
+                .map(|identity| identity.layer_layout),
             Self::KimiLinear(model) => model.prompt_cache_layer_layout(),
             Self::Lfm2(model) => model.prompt_cache_layer_layout(),
             Self::NemotronH(model) => model.prompt_cache_layer_layout(),
             Self::Qwen3Next(model) | Self::Qwen35(model) => model.prompt_cache_layer_layout(),
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => model.prompt_cache_layer_layout(),
-            Self::Gemma4(model) => model.prompt_cache_layer_layout(),
+            Self::Gemma4(model) => model
+                .prompt_cache_model_identity()
+                .map(|identity| identity.layer_layout),
             Self::Inkling(model) => model.prompt_cache_layer_layout(),
         }
         .map_err(|error| Exception::custom(error.to_string()))
@@ -651,7 +666,16 @@ impl Model {
     pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Exception> {
         match self {
             Self::DeepSeek(model) => model
-                .prompt_cache_layer_prefix_offsets()
+                .prompt_cache_identity()
+                .map(|identity| identity.layer_prefix_offsets)
+                .map_err(|error| Exception::custom(error.to_string())),
+            Self::Gemma4(model) => model
+                .prompt_cache_model_identity()
+                .map(|identity| identity.layer_prefix_offsets)
+                .map_err(|error| Exception::custom(error.to_string())),
+            Self::MuseGlimmer(model) => model
+                .prompt_cache_model_identity()
+                .map(|identity| identity.layer_prefix_offsets)
                 .map_err(|error| Exception::custom(error.to_string())),
             Self::Inkling(model) => model
                 .prompt_cache_layer_prefix_offsets()

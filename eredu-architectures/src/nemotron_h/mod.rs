@@ -52,13 +52,6 @@ pub fn state_identity(
             "Nemotron-H owns state layers {global_layer_start}..{global_layer_end}, outside {total} layers"
         )));
     }
-    let mut layer_prefix_offsets = Vec::with_capacity(layout.len());
-    for global_layer in global_layer_start..global_layer_end {
-        // An embedded prediction group consumes the prompt's shifted
-        // token/hidden pairs, so its recurrent and attention frontier is one
-        // token behind the ordinary target group.
-        layer_prefix_offsets.push(if global_layer < target { 0 } else { -1 });
-    }
     Ok(eredu_runtime::ModelStateIdentity {
         model_family: "nemotron_h".into(),
         effective_model_type: args.model_type.clone(),
@@ -66,7 +59,6 @@ pub fn state_identity(
         layer_count: total,
         global_layer_start,
         sink_tokens: 0,
-        layer_prefix_offsets,
         topology,
     })
 }

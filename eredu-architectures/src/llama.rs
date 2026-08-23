@@ -44,7 +44,6 @@ pub fn state_identity(
         layer_count,
         global_layer_start,
         sink_tokens: 0,
-        layer_prefix_offsets: vec![0; layout.len()],
         topology,
     })
 }

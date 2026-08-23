@@ -1053,17 +1053,6 @@ pub fn state_identity(
             "Qwen hybrid owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    let layer_prefix_offsets = (global_layer_start..global_layer_end)
-        .map(|global_layer| {
-            // Embedded prediction groups consume shifted token/hidden pairs,
-            // so their cache frontier trails the persisted prompt by one.
-            if global_layer < target_layers {
-                0
-            } else {
-                -1
-            }
-        })
-        .collect();
     Ok(ModelStateIdentity {
         model_family: "qwen_hybrid".into(),
         effective_model_type: config.model_type.clone(),
@@ -1071,7 +1060,6 @@ pub fn state_identity(
         layer_count,
         global_layer_start,
         sink_tokens: 0,
-        layer_prefix_offsets,
         topology,
     })
 }
@@ -1105,21 +1093,21 @@ mod state_identity_tests {
             0,
             eredu_core::cache::PromptCacheTopology::default(),
         )
+        .unwrap()
+        .prompt_cache_identity(&layout)
         .unwrap();
 
         assert_eq!(identity.layer_prefix_offsets, [0, 0, -1, -1]);
 
-        let prediction_layout = eredu_runtime::StateLayout::new(
-            eredu_core::LayerSchedule::new(2, layout.layers().iter().skip(2).cloned().collect())
-                .unwrap(),
-        )
-        .unwrap();
+        let prediction_layout = layout.slice(2..4).unwrap();
         let prediction_identity = state_identity(
             &parsed.text,
             &prediction_layout,
             2,
             eredu_core::cache::PromptCacheTopology::default(),
         )
+        .unwrap()
+        .prompt_cache_identity(&prediction_layout)
         .unwrap();
         assert_eq!(prediction_identity.layer_prefix_offsets, [-1, -1]);
     }

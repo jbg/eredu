@@ -59,6 +59,7 @@ pub struct StateSegmentSpec {
     id: StateSegmentId,
     layers: Range<usize>,
     lifetime: StateSegmentLifetime,
+    processed_token_offset: i32,
 }
 
 impl StateSegmentSpec {
@@ -67,6 +68,7 @@ impl StateSegmentSpec {
         id: impl Into<String>,
         layers: Range<usize>,
         lifetime: StateSegmentLifetime,
+        processed_token_offset: i32,
     ) -> Result<Self, StateError> {
         let id = StateSegmentId::new(id)?;
         if layers.is_empty() {
@@ -76,10 +78,17 @@ impl StateSegmentSpec {
                 end: layers.end,
             });
         }
+        if processed_token_offset > 0 {
+            return Err(StateError::PositiveSegmentOffset {
+                segment: id,
+                offset: processed_token_offset,
+            });
+        }
         Ok(Self {
             id,
             layers,
             lifetime,
+            processed_token_offset,
         })
     }
 
@@ -96,6 +105,11 @@ impl StateSegmentSpec {
     /// Returns whether the segment persists or resets at a frame boundary.
     pub const fn lifetime(&self) -> StateSegmentLifetime {
         self.lifetime
+    }
+
+    /// Returns the segment's processed-token delta from the persisted prefix.
+    pub const fn processed_token_offset(&self) -> i32 {
+        self.processed_token_offset
     }
 }
 
@@ -121,6 +135,7 @@ impl StateLayout {
                 DEFAULT_STATE_SEGMENT_ID,
                 0..count,
                 StateSegmentLifetime::Persistent,
+                0,
             )?],
         )
     }
@@ -236,6 +251,54 @@ impl StateLayout {
         self.segments
             .iter()
             .find(|segment| segment.layers.contains(&layer))
+    }
+
+    /// Expands architecture-declared segment frontiers into layer order.
+    pub fn layer_prefix_offsets(&self) -> Vec<i32> {
+        let mut offsets = Vec::with_capacity(self.len());
+        for segment in &self.segments {
+            offsets.extend(
+                std::iter::repeat(segment.processed_token_offset()).take(segment.layers.len()),
+            );
+        }
+        offsets
+    }
+
+    /// Selects a contiguous architecture-global range while preserving the
+    /// intersecting segment identities, lifetimes, and token frontiers.
+    pub fn slice(&self, layers: Range<usize>) -> Result<Self, StateError> {
+        if layers.is_empty() || layers.end > self.len() {
+            return Err(StateError::InvalidLayoutSlice {
+                start: layers.start,
+                end: layers.end,
+                layers: self.len(),
+            });
+        }
+        let policies = self
+            .layers
+            .iter()
+            .skip(layers.start)
+            .take(layers.len())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut segments = Vec::new();
+        for segment in &self.segments {
+            let start = segment.layers.start.max(layers.start);
+            let end = segment.layers.end.min(layers.end);
+            if start < end {
+                segments.push(StateSegmentSpec::new(
+                    segment.id.as_str(),
+                    start - layers.start..end - layers.start,
+                    segment.lifetime,
+                    segment.processed_token_offset,
+                )?);
+            }
+        }
+        Self::segmented(
+            LayerSchedule::new(policies.len(), policies)
+                .map_err(|error| StateError::InvalidResidency(error.to_string()))?,
+            segments,
+        )
     }
 }
 
@@ -509,8 +572,6 @@ pub struct ModelStateIdentity {
     pub global_layer_start: usize,
     /// Attention sink or pinned-prefix token count.
     pub sink_tokens: usize,
-    /// Per-owned-layer processed-token deltas.
-    pub layer_prefix_offsets: Vec<i32>,
     /// Rank-local distributed placement.
     pub topology: PromptCacheTopology,
 }
@@ -535,7 +596,7 @@ impl ModelStateIdentity {
             sink_tokens: self.sink_tokens,
             topology: self.topology.clone(),
             layer_layout: layout.layers().clone(),
-            layer_prefix_offsets: self.layer_prefix_offsets.clone(),
+            layer_prefix_offsets: layout.layer_prefix_offsets(),
         };
         identity.validate()?;
         Ok(identity)
@@ -563,6 +624,24 @@ pub enum StateError {
         start: usize,
         /// Exclusive range end.
         end: usize,
+    },
+    /// A state segment claimed to be ahead of the persisted token prefix.
+    #[error("runtime state segment {segment:?} has positive processed-token offset {offset}")]
+    PositiveSegmentOffset {
+        /// Invalid segment identity.
+        segment: StateSegmentId,
+        /// Invalid positive processed-token offset.
+        offset: i32,
+    },
+    /// A requested sub-layout range was empty or outside the source layout.
+    #[error("runtime state layout cannot select range {start}..{end} from {layers} layers")]
+    InvalidLayoutSlice {
+        /// Inclusive requested layer start.
+        start: usize,
+        /// Exclusive requested layer end.
+        end: usize,
+        /// Available source layer count.
+        layers: usize,
     },
     /// Two state segments used the same stable identity.
     #[error("runtime state segment {segment:?} is declared more than once")]
@@ -675,7 +754,6 @@ mod tests {
             layer_count: 4,
             global_layer_start: 1,
             sink_tokens: 0,
-            layer_prefix_offsets: vec![0, 0],
             topology: PromptCacheTopology::default(),
         }
         .prompt_cache_identity(&layout)
@@ -686,20 +764,29 @@ mod tests {
     }
 
     #[test]
-    fn prompt_identity_rejects_offsets_that_do_not_match_layout() {
-        let error = ModelStateIdentity {
+    fn prompt_identity_derives_offsets_from_segments() {
+        let policy = LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 8).unwrap();
+        let layout = StateLayout::segmented(
+            LayerSchedule::new(2, vec![policy.clone(), policy]).unwrap(),
+            [
+                StateSegmentSpec::new("target", 0..1, StateSegmentLifetime::Persistent, 0).unwrap(),
+                StateSegmentSpec::new("prediction", 1..2, StateSegmentLifetime::Persistent, -1)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let identity = ModelStateIdentity {
             model_family: "fixture".into(),
             effective_model_type: "fixture-v1".into(),
             architecture_fingerprint: "geometry-1".into(),
             layer_count: 2,
             global_layer_start: 0,
             sink_tokens: 0,
-            layer_prefix_offsets: vec![0],
             topology: PromptCacheTopology::default(),
         }
-        .prompt_cache_identity(&layout())
-        .unwrap_err();
-        assert!(matches!(error, PromptCacheError::Incompatible(_)));
+        .prompt_cache_identity(&layout)
+        .unwrap();
+        assert_eq!(identity.layer_prefix_offsets, [0, -1]);
     }
 
     #[test]
@@ -742,8 +829,9 @@ mod tests {
         let layout = StateLayout::segmented(
             four_layer_schedule(),
             [
-                StateSegmentSpec::new("depth", 2..4, StateSegmentLifetime::FrameLocal).unwrap(),
-                StateSegmentSpec::new("temporal", 0..2, StateSegmentLifetime::Persistent).unwrap(),
+                StateSegmentSpec::new("depth", 2..4, StateSegmentLifetime::FrameLocal, 0).unwrap(),
+                StateSegmentSpec::new("temporal", 0..2, StateSegmentLifetime::Persistent, 0)
+                    .unwrap(),
             ],
         )
         .unwrap();
@@ -768,24 +856,49 @@ mod tests {
     }
 
     #[test]
-    fn segment_identity_and_lifetime_participate_in_layout_equality() {
-        let layout = |depth_name, lifetime| {
+    fn state_layout_slice_preserves_and_rebases_segment_frontiers() {
+        let layout = StateLayout::segmented(
+            four_layer_schedule(),
+            [
+                StateSegmentSpec::new("target", 0..2, StateSegmentLifetime::Persistent, 0).unwrap(),
+                StateSegmentSpec::new("prediction", 2..4, StateSegmentLifetime::Persistent, -1)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let sliced = layout.slice(1..4).unwrap();
+        assert_eq!(sliced.segments()[0].layers(), 0..1);
+        assert_eq!(sliced.segments()[1].layers(), 1..3);
+        assert_eq!(sliced.layer_prefix_offsets(), [0, -1, -1]);
+    }
+
+    #[test]
+    fn segment_identity_lifetime_and_offset_participate_in_layout_equality() {
+        let layout = |depth_name, lifetime, offset| {
             StateLayout::segmented(
                 four_layer_schedule(),
                 [
-                    StateSegmentSpec::new("temporal", 0..2, StateSegmentLifetime::Persistent)
+                    StateSegmentSpec::new("temporal", 0..2, StateSegmentLifetime::Persistent, 0)
                         .unwrap(),
-                    StateSegmentSpec::new(depth_name, 2..4, lifetime).unwrap(),
+                    StateSegmentSpec::new(depth_name, 2..4, lifetime, offset).unwrap(),
                 ],
             )
             .unwrap()
         };
-        let canonical = layout("depth", StateSegmentLifetime::FrameLocal);
+        let canonical = layout("depth", StateSegmentLifetime::FrameLocal, 0);
         assert_ne!(
             canonical,
-            layout("predictor", StateSegmentLifetime::FrameLocal)
+            layout("predictor", StateSegmentLifetime::FrameLocal, 0)
         );
-        assert_ne!(canonical, layout("depth", StateSegmentLifetime::Persistent));
+        assert_ne!(
+            canonical,
+            layout("depth", StateSegmentLifetime::Persistent, 0)
+        );
+        assert_ne!(
+            canonical,
+            layout("depth", StateSegmentLifetime::FrameLocal, -1)
+        );
     }
 
     #[test]
@@ -793,8 +906,8 @@ mod tests {
         let duplicate = StateLayout::segmented(
             four_layer_schedule(),
             [
-                StateSegmentSpec::new("cache", 0..2, StateSegmentLifetime::Persistent).unwrap(),
-                StateSegmentSpec::new("cache", 2..4, StateSegmentLifetime::FrameLocal).unwrap(),
+                StateSegmentSpec::new("cache", 0..2, StateSegmentLifetime::Persistent, 0).unwrap(),
+                StateSegmentSpec::new("cache", 2..4, StateSegmentLifetime::FrameLocal, 0).unwrap(),
             ],
         )
         .unwrap_err();
@@ -803,8 +916,8 @@ mod tests {
         let overlap = StateLayout::segmented(
             four_layer_schedule(),
             [
-                StateSegmentSpec::new("left", 0..3, StateSegmentLifetime::Persistent).unwrap(),
-                StateSegmentSpec::new("right", 2..4, StateSegmentLifetime::FrameLocal).unwrap(),
+                StateSegmentSpec::new("left", 0..3, StateSegmentLifetime::Persistent, 0).unwrap(),
+                StateSegmentSpec::new("right", 2..4, StateSegmentLifetime::FrameLocal, 0).unwrap(),
             ],
         )
         .unwrap_err();
@@ -813,8 +926,8 @@ mod tests {
         let gap = StateLayout::segmented(
             four_layer_schedule(),
             [
-                StateSegmentSpec::new("left", 0..1, StateSegmentLifetime::Persistent).unwrap(),
-                StateSegmentSpec::new("right", 2..4, StateSegmentLifetime::FrameLocal).unwrap(),
+                StateSegmentSpec::new("left", 0..1, StateSegmentLifetime::Persistent, 0).unwrap(),
+                StateSegmentSpec::new("right", 2..4, StateSegmentLifetime::FrameLocal, 0).unwrap(),
             ],
         )
         .unwrap_err();
@@ -822,7 +935,7 @@ mod tests {
 
         let outside = StateLayout::segmented(
             four_layer_schedule(),
-            [StateSegmentSpec::new("all", 0..5, StateSegmentLifetime::Persistent).unwrap()],
+            [StateSegmentSpec::new("all", 0..5, StateSegmentLifetime::Persistent, 0).unwrap()],
         )
         .unwrap_err();
         assert!(matches!(outside, StateError::SegmentOutOfBounds { .. }));

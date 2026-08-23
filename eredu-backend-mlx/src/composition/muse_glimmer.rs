@@ -637,29 +637,22 @@ impl MuseGlimmerModel {
         }
     }
 
-    pub fn prompt_cache_layer_layout(
+    pub(crate) fn prompt_cache_model_identity(
         &self,
-    ) -> Result<eredu_core::LayerSchedule<eredu_core::cache::LayerCachePolicy>, Error> {
-        Ok(self.state_layout.layers().clone())
-    }
-
-    fn prompt_identity(&self) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
+    ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
         let topology = self
             .parallel_info
             .as_ref()
             .map_or_else(eredu_core::cache::PromptCacheTopology::default, |info| {
                 crate::backend::cache::prompt_cache_topology(info.topology())
             });
-        eredu_runtime::ModelStateIdentity {
-            model_family: "muse_glimmer".into(),
-            effective_model_type: self.args.model_type.clone(),
-            architecture_fingerprint: self.args.architecture_fingerprint(),
-            layer_count: self.state_layout.len(),
-            global_layer_start: 0,
-            sink_tokens: 0,
-            layer_prefix_offsets: vec![0; self.state_layout.len()],
+        eredu_architectures::muse_glimmer::state_identity(
+            &self.args,
+            &self.state_layout,
+            0,
             topology,
-        }
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
         .prompt_cache_identity(&self.state_layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -672,7 +665,7 @@ impl MuseGlimmerModel {
         options: PagedCacheOptions,
         _stream: &Stream,
     ) -> Result<(MlxKeyValueState, eredu_core::cache::PromptCacheManifest), Error> {
-        let identity = self.prompt_identity()?;
+        let identity = self.prompt_cache_model_identity()?;
         let rank = identity.topology.cache_rank_identity();
         let (manager, manifest) = open_prompt_cache(
             directory.as_ref(),
@@ -697,7 +690,7 @@ impl MuseGlimmerModel {
     ) -> Result<eredu_core::cache::PromptCacheManifest, Error> {
         eredu_core::cache::validate_prompt_cache_model_identity(
             &descriptor,
-            &self.prompt_identity()?,
+            &self.prompt_cache_model_identity()?,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
         state

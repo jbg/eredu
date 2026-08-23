@@ -309,6 +309,28 @@ mod tests {
     }
 
     #[test]
+    fn family_owns_prompt_cache_identity() {
+        let parsed = FamilyConfig::from_hf_json(&serde_json::to_vec(&config()).unwrap()).unwrap();
+        let layout = crate::gemma4::state_layout(&parsed.text).unwrap();
+        let identity = crate::gemma4::state_identity(
+            &parsed,
+            &layout,
+            0,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap()
+        .prompt_cache_identity(&layout)
+        .unwrap();
+
+        assert_eq!(identity.model_family, "gemma4");
+        assert_eq!(
+            identity.architecture_fingerprint,
+            parsed.architecture_fingerprint()
+        );
+        assert_eq!(identity.layer_prefix_offsets, vec![0; layout.len()]);
+    }
+
+    #[test]
     fn rejects_placeholder_collisions_and_orphan_modalities() {
         let mut value = config();
         value["audio_token_id"] = value["image_token_id"].clone();

@@ -428,9 +428,7 @@ impl InklingModel {
     }
 
     pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
-        Ok(self
-            .prompt_state_identity(eredu_core::cache::PromptCacheTopology::default())?
-            .layer_prefix_offsets)
+        Ok(self.prompt_state_layout.layer_prefix_offsets())
     }
 
     pub fn new_cache(&self) -> InklingState {

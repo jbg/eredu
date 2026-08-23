@@ -1550,15 +1550,6 @@ pub fn state_identity(
             "Inkling owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    let layer_prefix_offsets = (global_layer_start..global_layer_end)
-        .map(|global_layer| {
-            if global_layer < target_layer_count {
-                0
-            } else {
-                -1
-            }
-        })
-        .collect();
     Ok(ModelStateIdentity {
         model_family: "inkling".into(),
         effective_model_type: args.model_type.clone(),
@@ -1566,7 +1557,6 @@ pub fn state_identity(
         layer_count,
         global_layer_start,
         sink_tokens: 0,
-        layer_prefix_offsets,
         topology,
     })
 }

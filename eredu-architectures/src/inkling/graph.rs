@@ -214,12 +214,14 @@ pub fn composite_state_layout(
         TARGET_STATE_SEGMENT,
         0..target.len(),
         StateSegmentLifetime::Persistent,
+        0,
     )?];
     if prediction_len > 0 {
         segments.push(StateSegmentSpec::new(
             PREDICTION_STATE_SEGMENT,
             target.len()..total_len,
             StateSegmentLifetime::Persistent,
+            -1,
         )?);
     }
     StateLayout::segmented(
@@ -375,16 +377,21 @@ mod tests {
             0,
             eredu_core::cache::PromptCacheTopology::default(),
         )
+        .unwrap()
+        .prompt_cache_identity(&composite)
         .unwrap();
         assert_eq!(identity.layer_count, 4);
         assert_eq!(identity.layer_prefix_offsets, [0, 0, -1, -1]);
 
+        let prediction_layout = composite.slice(target.len()..composite.len()).unwrap();
         let prediction_identity = super::super::state_identity(
             &args,
-            &layout,
+            &prediction_layout,
             target.len(),
             eredu_core::cache::PromptCacheTopology::default(),
         )
+        .unwrap()
+        .prompt_cache_identity(&prediction_layout)
         .unwrap();
         assert_eq!(prediction_identity.layer_count, 4);
         assert_eq!(prediction_identity.layer_prefix_offsets, [-1, -1]);

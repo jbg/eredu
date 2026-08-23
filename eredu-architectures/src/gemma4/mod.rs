@@ -50,3 +50,34 @@ pub use vision::{
     ClippedLinear, PatchEmbedder, VisionConfig, VisionConfigError, VisionInput, VisionLayer,
     VisionState, VisionStatic, VisionTower,
 };
+
+/// Declares Gemma 4 cache identity independently of concrete state storage.
+pub fn state_identity(
+    args: &FamilyConfig,
+    layout: &eredu_runtime::StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+) -> Result<eredu_runtime::ModelStateIdentity, FamilyConfigError> {
+    args.validate()?;
+    topology
+        .validate()
+        .map_err(|error| FamilyConfigError::Invalid(error.to_string()))?;
+    let layer_count = args.text.num_hidden_layers();
+    let global_layer_end = global_layer_start
+        .checked_add(layout.len())
+        .ok_or_else(|| FamilyConfigError::Invalid("Gemma 4 owned state range overflowed".into()))?;
+    if global_layer_end > layer_count {
+        return Err(FamilyConfigError::Invalid(format!(
+            "Gemma 4 owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
+        )));
+    }
+    Ok(eredu_runtime::ModelStateIdentity {
+        model_family: "gemma4".into(),
+        effective_model_type: args.model_type.clone(),
+        architecture_fingerprint: args.architecture_fingerprint(),
+        layer_count,
+        global_layer_start,
+        sink_tokens: 0,
+        topology,
+    })
+}

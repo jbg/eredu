@@ -831,6 +831,8 @@ mod tests {
             0,
             eredu_core::cache::PromptCacheTopology::default(),
         )
+        .unwrap()
+        .prompt_cache_identity(&state_layout)
         .unwrap();
         assert_eq!(identity.layer_count, state_layout.len());
         assert_eq!(identity.global_layer_start, 0);

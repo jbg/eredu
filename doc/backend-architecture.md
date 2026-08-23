@@ -200,12 +200,15 @@ Concrete backends derive native cache objects directly from those policies;
 model-family arguments are not a second source of state geometry. Composite
 model layouts, such as a target decoder plus embedded prediction state, are
 assembled by the architecture before a backend consumes them. Architecture
-state identity also declares the composite global layer count and each
-segment's processed-token frontier offset; backends must not reconstruct
-target/prediction boundaries or shifted-prediction offsets. Draft commit and
-pipeline prompt-cache persistence likewise select the architecture's named
-prediction segment; family configuration layer counts are not commit-range
-metadata.
+state segments also declare their processed-token frontier offsets. Runtime
+expands those segment offsets into prompt-cache identity, and contiguous
+partition slices preserve and rebase the intersecting segment metadata.
+Architecture identity functions declare family, fingerprint, composite global
+layer count, and placement; backends must not reconstruct family identity,
+target/prediction boundaries, DSpark behavior, or shifted-prediction offsets.
+Draft commit and pipeline prompt-cache persistence likewise select the
+architecture's named prediction segment; family configuration layer counts are
+not commit-range metadata.
 
 Pre-materialization capabilities follow the same rule. The normalized
 architecture reports whether independently addressable routed experts exist;

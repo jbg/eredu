@@ -8,9 +8,10 @@ use eredu_nn::{
     Error, LinearOperator, NormalizationOperator, Parameterized, RoutedNeuralBackend, Tensor,
 };
 use eredu_runtime::{
-    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, RoutedExpertProvider, RoutedLayeredArchitecture,
-    RuntimeStateComponents, StateLayout, StateSegmentLifetime, StateSegmentSpec,
+    LayerRuntimeState, LayeredArchitecture, LayeredForwardState, ModelStateIdentity,
+    ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture, RoutedExpertProvider,
+    RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout, StateSegmentLifetime,
+    StateSegmentSpec,
 };
 
 use crate::decoder::{SequentialPredictionGroups, StaticModuleSpec, StaticModules};
@@ -21,6 +22,40 @@ use super::{
     mtp::{EmbeddedInput, ForwardMode, RetainedValues, V3PredictionLayer},
     LayerPolicy, V3Args,
 };
+
+/// Declares V3 cache identity independently of concrete state storage.
+pub fn state_identity(
+    args: &V3Args,
+    layout: &StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+) -> Result<ModelStateIdentity, Error> {
+    args.validate().map_err(Error::backend)?;
+    topology.validate().map_err(Error::backend)?;
+    let layer_count = usize::try_from(
+        args.num_hidden_layers
+            .checked_add(args.num_nextn_predict_layers)
+            .ok_or_else(|| Error::backend("V3 state layer count overflowed"))?,
+    )
+    .map_err(Error::backend)?;
+    let global_layer_end = global_layer_start
+        .checked_add(layout.len())
+        .ok_or_else(|| Error::backend("V3 owned state range overflowed"))?;
+    if global_layer_end > layer_count {
+        return Err(Error::backend(format!(
+            "V3 owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
+        )));
+    }
+    Ok(ModelStateIdentity {
+        model_family: "deepseek_v3".into(),
+        effective_model_type: args.model_type.clone(),
+        architecture_fingerprint: super::v3_architecture_fingerprint(args),
+        layer_count,
+        global_layer_start,
+        sink_tokens: 0,
+        topology,
+    })
+}
 
 /// One target or appended prediction execution unit.
 #[derive(Debug, Clone, Parameterized)]
@@ -1403,6 +1438,7 @@ pub fn state_layout(args: &V3Args) -> Result<StateLayout, Error> {
         super::TARGET_STATE_SEGMENT,
         0..target_layers,
         StateSegmentLifetime::Persistent,
+        0,
     )
     .map_err(Error::backend)?];
     if layers > target_layers {
@@ -1411,6 +1447,7 @@ pub fn state_layout(args: &V3Args) -> Result<StateLayout, Error> {
                 super::PREDICTION_STATE_SEGMENT,
                 target_layers..layers,
                 StateSegmentLifetime::Persistent,
+                -1,
             )
             .map_err(Error::backend)?,
         );
