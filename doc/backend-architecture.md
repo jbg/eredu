@@ -110,6 +110,11 @@ same family-specific quantization identities. Catalog policies declare any
 admitted checkpoint-only names by exact key, prefix, or suffix, and composite
 checkpoint schemas partition canonical projector formats by architecture-owned
 component identity; backend composition does not repeat those naming rules.
+Packed recipes expose format semantics rather than a concrete accelerator's
+storage units. In particular, canonical MXFP4 expert recipes describe logical
+F4 values regardless of whether a source stores byte blocks or integer words;
+the MLX adapter lowers those terminal recipes to the U32 geometry required by
+its affine kernels before constructing runtime bindings.
 
 Parameter-class selection follows the architecture's validated parameter
 description. Backends select exact targets by semantic role, retain the

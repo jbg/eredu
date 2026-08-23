@@ -347,7 +347,7 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
 }
 
 /// Resolves SafeTensors alternating rows or translated GGUF separate matrices
-/// into one atomic component-major native-MXFP4 expert family.
+/// into one atomic component-major logical-MXFP4 expert family.
 pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     args: &ModelArgs,
@@ -771,7 +771,7 @@ mod tests {
                 .infer(&catalog)
                 .unwrap()
                 .shape,
-            [2, 64, 4]
+            [2, 64, 32]
         );
     }
 
@@ -847,7 +847,7 @@ mod tests {
                 .infer(&catalog)
                 .unwrap()
                 .shape,
-            [2, 64, 4]
+            [2, 64, 32]
         );
         assert_eq!(
             recipes
@@ -856,7 +856,7 @@ mod tests {
                 .infer(&catalog)
                 .unwrap()
                 .shape,
-            [2, 32, 4]
+            [2, 32, 32]
         );
     }
 

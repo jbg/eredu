@@ -68,6 +68,44 @@ fn mlx_dtype(value: &RecipeDtype) -> Result<Dtype, WeightRecipeError> {
     }
 }
 
+/// Lowers a terminal logical MXFP4 value recipe to MLX's packed U32 storage.
+///
+/// Neutral checkpoint recipes describe the represented F4 values. MLX affine
+/// kernels instead address eight packed F4 values through each U32 unit, so
+/// composition must apply this lowering before it constructs runtime bindings.
+pub fn lower_mxfp4_recipe(
+    recipe: DerivedWeightRecipe,
+    store: &dyn CheckpointSource,
+) -> Result<DerivedWeightRecipe, WeightRecipeError> {
+    let metadata = recipe.infer(store)?;
+    let DerivedWeightRecipe::View {
+        input,
+        dtype: RecipeDtype::F4,
+        shape,
+    } = recipe
+    else {
+        return Err(WeightRecipeError::ExpectedLogicalMxFp4 {
+            dtype: metadata.dtype().clone(),
+        });
+    };
+    debug_assert_eq!(shape, metadata.shape());
+    let mut packed_shape = shape;
+    let logical_width = packed_shape
+        .last_mut()
+        .ok_or(WeightRecipeError::InvalidMxFp4LogicalShape)?;
+    if *logical_width == 0 || !logical_width.is_multiple_of(8) {
+        return Err(WeightRecipeError::InvalidMxFp4LogicalShape);
+    }
+    *logical_width /= 8;
+    let lowered = DerivedWeightRecipe::View {
+        input,
+        dtype: RecipeDtype::U32,
+        shape: packed_shape,
+    };
+    lowered.infer(store)?;
+    Ok(lowered)
+}
+
 /// MLX lowering operations for a backend-neutral recipe.
 pub trait MlxWeightRecipeExt {
     #[cfg(test)]
@@ -500,6 +538,15 @@ pub enum WeightRecipeError {
         /// Debug name of the unsupported encoding.
         dtype: String,
     },
+    /// MLX MXFP4 lowering received a recipe other than a logical F4 view.
+    #[error("MLX MXFP4 lowering requires a terminal logical F4 view, got {dtype:?}")]
+    ExpectedLogicalMxFp4 {
+        /// Actual recipe dtype.
+        dtype: RecipeDtype,
+    },
+    /// A logical MXFP4 value shape cannot be represented by packed U32 units.
+    #[error("logical MXFP4 shape must have a nonzero final dimension divisible by 8")]
+    InvalidMxFp4LogicalShape,
     /// Checked shape or byte arithmetic overflowed.
     #[error("derived-weight arithmetic overflow: {0}")]
     ArithmeticOverflow(&'static str),
@@ -589,6 +636,51 @@ mod tests {
             output.evaluated().unwrap().as_slice::<u8>(),
             &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn lowers_logical_mxfp4_values_to_mlx_u32_storage() {
+        let (_dir, store) = fixture();
+        let logical = DerivedWeightRecipe::View {
+            input: Box::new(DerivedWeightRecipe::source("left", TensorSelection::Full)),
+            dtype: RecipeDtype::F4,
+            shape: vec![1, 32],
+        };
+
+        let lowered = lower_mxfp4_recipe(logical, store.as_ref()).unwrap();
+        let metadata = lowered.infer(store.as_ref()).unwrap();
+        assert_eq!(metadata.shape(), &[1, 4]);
+        assert_eq!(metadata.dtype(), &RecipeDtype::U32);
+        assert!(matches!(
+            lowered,
+            DerivedWeightRecipe::View {
+                dtype: RecipeDtype::U32,
+                ref shape,
+                ..
+            } if shape == &[1, 4]
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires local MLX Metal execution"]
+    fn mlx_lowered_mxfp4_recipe_materializes_u32_storage() {
+        let (_dir, store) = fixture();
+        let context =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let logical = DerivedWeightRecipe::View {
+            input: Box::new(DerivedWeightRecipe::source("left", TensorSelection::Full)),
+            dtype: RecipeDtype::F4,
+            shape: vec![1, 32],
+        };
+        let lowered = lower_mxfp4_recipe(logical, store.as_ref()).unwrap();
+
+        let output = lowered
+            .materialize(store.as_ref(), context.stream())
+            .unwrap();
+        assert_eq!(output.shape(), &[1, 4]);
+        assert_eq!(output.dtype(), Dtype::Uint32);
+        assert_eq!(output.evaluated().unwrap().as_slice::<u32>(), &[1, 2, 3, 4]);
     }
 
     fn one_mapping_cross_shard_fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {

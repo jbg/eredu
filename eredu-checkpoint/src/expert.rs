@@ -313,8 +313,8 @@ pub fn canonical_gated_expert_projection_family_recipes<C: RecipeCatalog + ?Size
             });
         }
     };
-    let gate_up_weight = canonical_mxfp4_storage(catalog, gate_up_weight, &gate_up_scales)?;
-    let down_weight = canonical_mxfp4_storage(catalog, weights.down, &scales.down)?;
+    let gate_up_weight = canonical_mxfp4_values(catalog, gate_up_weight, &gate_up_scales)?;
+    let down_weight = canonical_mxfp4_values(catalog, weights.down, &scales.down)?;
 
     validate_canonical_projection_family(
         catalog,
@@ -406,45 +406,43 @@ fn component_major_permutation(rows: usize) -> Vec<usize> {
     (0..rows).step_by(2).chain((1..rows).step_by(2)).collect()
 }
 
-fn canonical_mxfp4_storage<C: RecipeCatalog + ?Sized>(
+fn canonical_mxfp4_values<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     weight: DerivedWeightRecipe,
     scales: &DerivedWeightRecipe,
 ) -> Result<DerivedWeightRecipe, ExpertLayoutError> {
     let weight_metadata = weight.infer(catalog)?;
     let scale_metadata = scales.infer(catalog)?;
-    let mut packed_shape = scale_metadata.shape;
-    let packed_width =
-        packed_shape
+    let mut logical_shape = scale_metadata.shape;
+    let logical_width =
+        logical_shape
             .last_mut()
             .ok_or_else(|| ExpertLayoutError::InvalidProjectionFamily {
                 detail: "MXFP4 scales have no packed input axis".into(),
             })?;
-    // One MXFP4 group contains 32 four-bit values: 16 bytes, represented by
-    // the MLX affine kernels as four U32 storage units. SafeTensors exposes
-    // those bytes as [..., groups, 16] U8 blocks, while converted GGUF
-    // exposes [..., groups * 4] U32 directly. Canonical parameters use the
-    // latter shape so translated GGUF remains a source/concatenate recipe and
-    // bounded expert selection can reach its physical sources unchanged.
-    *packed_width =
-        packed_width
-            .checked_mul(4)
-            .ok_or_else(|| ExpertLayoutError::InvalidProjectionFamily {
-                detail: "MXFP4 packed input width overflowed".into(),
-            })?;
-    if weight_metadata.dtype == RecipeDtype::U32 && weight_metadata.shape == packed_shape {
+    // One MXFP4 group represents 32 four-bit values. SafeTensors exposes its
+    // 16 encoded bytes as [..., groups, 16] U8 blocks, while converted GGUF
+    // exposes the same bytes as [..., groups * 4] U32 words. The neutral
+    // recipe describes the represented F4 values and leaves each backend to
+    // select its native packed storage units.
+    *logical_width = logical_width.checked_mul(32).ok_or_else(|| {
+        ExpertLayoutError::InvalidProjectionFamily {
+            detail: "MXFP4 logical input width overflowed".into(),
+        }
+    })?;
+    if weight_metadata.dtype == RecipeDtype::F4 && weight_metadata.shape == logical_shape {
         return Ok(weight);
     }
     let viewed = DerivedWeightRecipe::View {
         input: Box::new(weight),
-        dtype: RecipeDtype::U32,
-        shape: packed_shape,
+        dtype: RecipeDtype::F4,
+        shape: logical_shape,
     };
     viewed
         .infer(catalog)
         .map_err(|error| ExpertLayoutError::InvalidProjectionFamily {
             detail: format!(
-                "packed weight cannot be viewed as U32 MXFP4 storage matching its scales: {error}"
+                "packed weight cannot be viewed as logical MXFP4 values matching its scales: {error}"
             ),
         })?;
     Ok(viewed)
@@ -779,8 +777,8 @@ mod tests {
         let expected = vec![0, 2, 4, 1, 3, 5];
         assert!(matches!(
             recipes.get(&names.target_gate_up.weight).unwrap(),
-            DerivedWeightRecipe::View { input, dtype: RecipeDtype::U32, shape }
-                if shape == &[2, 6, 4]
+            DerivedWeightRecipe::View { input, dtype: RecipeDtype::F4, shape }
+                if shape == &[2, 6, 32]
                     && input.as_ref() == &DerivedWeightRecipe::source(
                         &names.alternating_gate_up.weight,
                         TensorSelection::Indices {
@@ -814,7 +812,7 @@ mod tests {
                 .infer(&catalog)
                 .unwrap()
                 .shape(),
-            &[2, 6, 4]
+            &[2, 6, 32]
         );
         assert_eq!(
             recipes.get(&names.target_down.bias).unwrap(),
@@ -832,10 +830,10 @@ mod tests {
             GatedProductExpertStorageLayout::SeparatePacked
         );
         for (target, expected_shape) in [
-            (&names.target_gate_up.weight, vec![2, 6, 4]),
+            (&names.target_gate_up.weight, vec![2, 6, 32]),
             (&names.target_gate_up.scales, vec![2, 6, 1]),
             (&names.target_gate_up.bias, vec![2, 6]),
-            (&names.target_down.weight, vec![2, 4, 4]),
+            (&names.target_down.weight, vec![2, 4, 32]),
             (&names.target_down.scales, vec![2, 4, 1]),
             (&names.target_down.bias, vec![2, 4]),
         ] {
@@ -851,8 +849,8 @@ mod tests {
         }
         assert!(matches!(
             recipes.get(&names.target_gate_up.weight).unwrap(),
-            DerivedWeightRecipe::Concatenate { axis: 1, inputs }
-                if inputs.len() == 2
+            DerivedWeightRecipe::View { input, dtype: RecipeDtype::F4, .. }
+                if matches!(input.as_ref(), DerivedWeightRecipe::Concatenate { axis: 1, inputs } if inputs.len() == 2)
         ));
     }
 

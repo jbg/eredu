@@ -14,7 +14,10 @@ use crate::backend::mlx::{
     error::Error,
     nn::shared::MlxNeuralBackend,
     runtime::{
-        checkpoint::binding_plan::{BindingPlan, PlannedBinding},
+        checkpoint::{
+            binding_plan::{BindingPlan, PlannedBinding},
+            recipe::lower_mxfp4_recipe,
+        },
         distributed::expert::{
             dispatch_local_tensor_parallel, dispatch_local_with,
             dispatch_replicated_tensor_parallel, dispatch_replicated_with, DispatchedRoutes,
@@ -122,6 +125,13 @@ pub fn expert_catalog_cartesian(
                     ))
                 })?;
                 let selected = recipe.select_bounded(store, expert_selection.clone())?;
+                let selected = if selected.infer(store)?.dtype()
+                    == &eredu_checkpoint::recipe::RecipeDtype::F4
+                {
+                    lower_mxfp4_recipe(selected, store)?
+                } else {
+                    selected
+                };
                 bindings.push(recipe_binding(local_name, target, selected, store)?);
             }
 
