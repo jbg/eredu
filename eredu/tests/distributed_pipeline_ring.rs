@@ -633,16 +633,18 @@ fn pipeline_ring_worker() {
             family.comparison_tolerance()
         };
         if inkling_mtp_mode {
-            assert!(session
-                .prompt_cache_layer_prefix_offsets()
-                .unwrap()
-                .contains(&-1));
+            let layer_prefix_offsets = session.prompt_cache_layer_prefix_offsets().unwrap();
+            assert_eq!(
+                layer_prefix_offsets.contains(&-1),
+                pipeline_rank + 1 == pipeline_parallel_size
+            );
+            let max_tokens = if pipeline_parallel_size > 1 { 1 } else { 3 };
             let (generated, stats) = session
                 .generate_embedded_mtp(
                     &backend,
                     ModelInput::new(&parts).into(),
                     &MtpConfig {
-                        max_tokens: 3,
+                        max_tokens,
                         max_draft_tokens: 2,
                         temperature: 0.0,
                         eos_token_ids: Vec::new(),
@@ -651,9 +653,86 @@ fn pipeline_ring_worker() {
                     &mut DefaultSampler,
                 )
                 .unwrap();
-            assert_eq!(generated.len(), 3);
-            assert_eq!(stats.emitted_tokens, 3);
-            assert!(stats.draft_tokens > 0);
+            assert_eq!(generated.len(), max_tokens);
+            assert_eq!(stats.emitted_tokens, max_tokens);
+            if pipeline_parallel_size == 1 {
+                assert!(stats.draft_tokens > 0);
+            }
+            if pipeline_parallel_size > 1 {
+                let layer_layout = session.prompt_cache_layer_layout().unwrap();
+                let layer_count = session.prompt_cache_layer_count().unwrap();
+                let global_layer_range = session.prompt_cache_global_layer_range().unwrap();
+                let descriptor = PromptCacheDescriptor {
+                    model_family: "inkling".into(),
+                    effective_model_type: "inkling_mm_model".into(),
+                    checkpoint_fingerprint: "opaque-pipeline-mtp-fixture".into(),
+                    prefix_content_fingerprint: format!("tokens:{prefix_tokens:?}"),
+                    architecture_fingerprint: session
+                        .prompt_cache_architecture_fingerprint()
+                        .unwrap(),
+                    layer_count,
+                    global_layer_start: global_layer_range.start,
+                    global_layer_end: global_layer_range.end,
+                    batch_size: 1,
+                    layer_prefix_offsets: layer_prefix_offsets.clone(),
+                    layer_layout,
+                    sink_tokens: 0,
+                    topology: PromptCacheTopology {
+                        pipeline: Some((pipeline_parallel_size, pipeline_rank)),
+                        tensor_parallel: None,
+                        expert_parallel: None,
+                        expert_parallel_cache_replicated: true,
+                    },
+                };
+                let rank_prompt_cache = prompt_cache_root.join(format!("rank-{expected_rank}"));
+                let manifest = session
+                    .save_prompt_cache(
+                        &backend,
+                        &rank_prompt_cache,
+                        descriptor.clone(),
+                        &prefix_tokens,
+                        &PromptCacheOptions::default(),
+                    )
+                    .unwrap();
+                if let Some(local_prediction_start) =
+                    layer_prefix_offsets.iter().position(|offset| *offset == -1)
+                {
+                    let prediction_layers = layer_prefix_offsets.len() - local_prediction_start;
+                    let prediction_start = global_layer_range.start + local_prediction_start;
+                    assert!(manifest
+                        .blocks
+                        .iter()
+                        .any(|block| block.global_layer >= prediction_start));
+                    assert_eq!(
+                        manifest
+                            .state_tensors
+                            .iter()
+                            .filter(|tensor| {
+                                matches!(
+                                    tensor.owner,
+                                    eredu::StateTensorOwner::Layer(layer)
+                                        if layer >= prediction_start
+                                ) && matches!(
+                                    tensor.role,
+                                    eredu::StateTensorRole::Convolution { .. }
+                                )
+                            })
+                            .count(),
+                        prediction_layers * 4
+                    );
+                }
+                session
+                    .load_prompt_cache(
+                        &backend,
+                        &rank_prompt_cache,
+                        &descriptor,
+                        &prefix_tokens,
+                        PagedCacheOptions::new(1, 32768, 32768, 1)
+                            .unwrap()
+                            .with_full_attention(true),
+                    )
+                    .unwrap();
+            }
             return;
         }
         let mut output = session
@@ -3551,10 +3630,26 @@ fn write_inkling_fixture(directory: &Path) {
 }
 
 fn write_inkling_mtp_fixture(directory: &Path) {
+    write_inkling_mtp_fixture_for_pipeline(directory, false);
+}
+
+fn write_inkling_pipeline_mtp_fixture(directory: &Path) {
+    write_inkling_mtp_fixture_for_pipeline(directory, true);
+}
+
+fn write_inkling_mtp_fixture_for_pipeline(directory: &Path, pipeline: bool) {
     let mut config = inkling_config();
-    config["text_config"]["num_hidden_layers"] = 1.into();
-    config["text_config"]["layer_types"] = serde_json::json!(["sliding_attention"]);
-    config["text_config"]["dense_mlp_idx"] = 0.into();
+    if pipeline {
+        config["text_config"]["num_hidden_layers"] = 2.into();
+        config["text_config"]["layer_types"] =
+            serde_json::json!(["sliding_attention", "full_attention"]);
+        config["text_config"]["dense_mlp_idx"] = 1.into();
+        config["text_config"]["model_max_length"] = 32.into();
+    } else {
+        config["text_config"]["num_hidden_layers"] = 1.into();
+        config["text_config"]["layer_types"] = serde_json::json!(["sliding_attention"]);
+        config["text_config"]["dense_mlp_idx"] = 0.into();
+    }
     config["mtp_config"] = serde_json::json!({
         "num_nextn_predict_layers": 2,
         "local_layer_ids": [1],
@@ -5909,6 +6004,14 @@ fn ring_two_process_inkling_mtp_tensor_parallel_opaque_session() {
     );
 }
 
+/// Persists and restores the output-stage predictor KV and convolution state
+/// through the public pipeline session prompt-cache lifecycle.
+#[test]
+#[ignore = "spawns local processes, opens loopback sockets, and initializes MLX; run explicitly"]
+fn ring_two_process_inkling_mtp_pipeline_prompt_round_trip() {
+    run_ring_pipeline_mode(false, FixtureFamily::Inkling, WorkerMode::OpaqueInklingMtp);
+}
+
 /// Persists embedded Inkling predictor KV and all four convolution histories
 /// as globally addressed neutral state, then reopens the complete manifest.
 #[test]
@@ -6562,6 +6665,9 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
             }
             FixtureFamily::Qwen3Vl => write_qwen3_vl_fixture(checkpoint.path(), false),
             FixtureFamily::Qwen3VlMoe => write_qwen3_vl_fixture(checkpoint.path(), true),
+            FixtureFamily::Inkling if mode == WorkerMode::OpaqueInklingMtp => {
+                write_inkling_pipeline_mtp_fixture(checkpoint.path())
+            }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
             FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
             FixtureFamily::DeepSeekGguf

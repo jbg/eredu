@@ -7562,6 +7562,38 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
         self.expert_storage.cache()
     }
 
+    fn new_cache_layers(
+        &self,
+        identity: &PromptCacheModelIdentity,
+        paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+    ) -> Result<Vec<PipelineLayerCache>, Error> {
+        // Predictor state is appended to the final stage's persistence
+        // identity, but it is materialized in the transactional MTP cache.
+        let target_owned = self.range().len();
+        let mut target_identity = identity.clone();
+        target_identity.global_layer_end = target_identity
+            .global_layer_start
+            .checked_add(target_owned)
+            .ok_or_else(|| Error::Parallel("pipeline target cache range overflowed".into()))?;
+        target_identity.layer_layout = eredu_core::LayerSchedule::new(
+            target_owned,
+            identity
+                .layer_layout
+                .iter()
+                .take(target_owned)
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        target_identity.layer_prefix_offsets = identity
+            .layer_prefix_offsets
+            .iter()
+            .take(target_owned)
+            .copied()
+            .collect();
+        materialize_pipeline_cache_layers(&target_identity, paged)
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: MlxParallelContext,
@@ -7570,35 +7602,26 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
             .partition
             .state()
             .ok_or_else(|| Error::Parallel("Inkling partition has no runtime state".into()))?;
-        let state_layout = partition_state.layout();
-        let topology_identity = if topology.tensor_parallel_size > 1 {
-            crate::backend::cache::prompt_cache_topology(topology)
+        let prediction = if self.range().end == self.args().text_config.num_hidden_layers as usize {
+            eredu_architectures::inkling::mtp_state_layout(self.args())
+                .map_err(|error| Error::Parallel(error.to_string()))?
         } else {
-            Default::default()
+            None
         };
-        let complete = eredu_architectures::inkling::state_identity(
+        let state_layout = eredu_architectures::inkling::composite_state_layout(
+            partition_state.layout(),
+            prediction.as_ref(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        eredu_architectures::inkling::state_identity(
             self.args(),
-            state_layout,
+            &state_layout,
             partition_state.global_layer_offset(),
-            topology_identity,
+            crate::backend::cache::prompt_cache_topology(topology),
         )
         .map_err(|error| Error::Parallel(error.to_string()))?
-        .prompt_cache_identity(state_layout)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        let layout = eredu_core::LayerSchedule::new(
-            self.range().len(),
-            complete.layer_layout.iter().cloned().collect(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "inkling",
-            &complete.effective_model_type,
-            complete.architecture_fingerprint,
-            self.args().text_config.num_hidden_layers as usize,
-            self.range().clone(),
-            layout,
-        ))
+        .prompt_cache_identity(&state_layout)
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 }
 
@@ -7757,9 +7780,15 @@ impl PipelineEmbeddedMtp for InklingPipelinePartition {
                     "Inkling checkpoint has no embedded MTP predictor".into(),
                 )
             })?;
+        let global_layer_start = self.args().text_config.num_hidden_layers as usize;
         let state = match paged {
-            Some((manager, rank)) => MlxHybridState::paged(layout, manager, rank)?,
-            None => MlxHybridState::device(layout)?,
+            Some((manager, rank)) => MlxHybridState::paged_with_global_layer_start(
+                layout,
+                manager,
+                rank,
+                global_layer_start,
+            )?,
+            None => MlxHybridState::device_with_global_layer_start(layout, global_layer_start)?,
         };
         Ok(PipelineMtpCache::Hybrid(state))
     }
@@ -7783,7 +7812,7 @@ impl PipelineEmbeddedMtp for InklingPipelinePartition {
     }
 
     fn embedded_mtp_state_segment(&self) -> Option<&'static str> {
-        None
+        Some(eredu_architectures::inkling::PREDICTION_STATE_SEGMENT)
     }
 
     fn prefill_embedded_mtp_cache(

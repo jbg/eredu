@@ -180,9 +180,16 @@ pub fn mtp_state_layout(args: &ModelArgs) -> Result<Option<StateLayout>, StateEr
                 .expect("one-layer MTP geometry has one policy"),
         )?);
     }
-    StateLayout::new(
-        LayerSchedule::new(policies.len(), policies)
-            .map_err(|error| StateError::InvalidResidency(error.to_string()))?,
+    let layers = LayerSchedule::new(policies.len(), policies)
+        .map_err(|error| StateError::InvalidResidency(error.to_string()))?;
+    StateLayout::segmented(
+        layers,
+        [StateSegmentSpec::new(
+            PREDICTION_STATE_SEGMENT,
+            0..count,
+            StateSegmentLifetime::Persistent,
+            -1,
+        )?],
     )
     .map(Some)
 }
@@ -324,6 +331,14 @@ mod tests {
         .unwrap();
         let layout = mtp_state_layout(&args).unwrap().expect("MTP layout");
         assert_eq!(layout.len(), 2);
+        assert_eq!(layout.segments().len(), 1);
+        assert_eq!(layout.segments()[0].id().as_str(), PREDICTION_STATE_SEGMENT);
+        assert_eq!(layout.segments()[0].layers(), 0..2);
+        assert_eq!(
+            layout.segments()[0].lifetime(),
+            StateSegmentLifetime::Persistent
+        );
+        assert_eq!(layout.segments()[0].processed_token_offset(), -1);
         assert!(layout
             .layers()
             .get(0)
