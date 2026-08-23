@@ -172,7 +172,7 @@ impl Model {
             }
             (model, _, kind) => Err(Exception::custom(format!(
                 "drafter {kind:?} has no runtime adapter for model type {} ({:?})",
-                model.model_type(),
+                model.effective_model_type(),
                 model.mtp_capability()
             ))),
         }
@@ -284,7 +284,7 @@ impl Model {
             }
             (model, _) => Err(Exception::custom(format!(
                 "distributed embedded MTP runtime adapter is unavailable for model type {} ({:?})",
-                model.model_type(),
+                model.effective_model_type(),
                 model.mtp_capability()
             ))),
         };
@@ -401,7 +401,7 @@ impl Model {
             }
             (model, _) => Err(Exception::custom(format!(
                 "embedded MTP runtime adapter is unavailable for model type {} ({:?})",
-                model.model_type(),
+                model.effective_model_type(),
                 model.mtp_capability()
             ))),
         }
@@ -505,7 +505,7 @@ impl Model {
             }
             (model, _) => Err(Exception::custom(format!(
                 "embedded MTP runtime adapter is unavailable for model type {} ({:?})",
-                model.model_type(),
+                model.effective_model_type(),
                 model.mtp_capability()
             ))),
         }
@@ -572,8 +572,14 @@ impl Model {
         }
     }
 
-    /// Returns the effective model type used for dispatch.
-    pub fn model_type(&self) -> &str {
+    /// Returns the canonical architecture family for this loaded model.
+    pub fn model_family(&self) -> eredu_architectures::ModelKind {
+        eredu_architectures::ModelKind::resolve_model_type(self.effective_model_type())
+            .expect("loaded MLX model has a validated effective model type")
+    }
+
+    /// Returns the effective model type preserved from the parsed configuration.
+    pub fn effective_model_type(&self) -> &str {
         match self {
             Self::DeepSeek(model) => model.model_type(),
             Self::Gemma4(model) => &model.args().model_type,
@@ -783,7 +789,7 @@ impl Model {
                     .map_err(|error| Exception::custom(error.to_string())),
                 _ => Err(Exception::custom(format!(
                     "paged cache residency is unsupported for model type {}",
-                    self.model_type()
+                    self.effective_model_type()
                 ))),
             },
         }
@@ -997,7 +1003,7 @@ impl Model {
         let layer_count = layer_layout.len();
         let identity = PromptCacheModelIdentity {
             model_family: model_family.into(),
-            effective_model_type: self.model_type().into(),
+            effective_model_type: self.effective_model_type().into(),
             architecture_fingerprint: self.prompt_cache_architecture_fingerprint()?,
             layer_count,
             global_layer_start: 0,

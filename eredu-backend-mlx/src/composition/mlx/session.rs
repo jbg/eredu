@@ -365,11 +365,19 @@ impl<'a> MlxModelSession<'a> {
         self.processor.as_ref()
     }
 
-    /// Returns the normalized architecture name of the session-owned model.
-    pub fn model_type(&self) -> &str {
+    /// Returns the canonical architecture family of the session-owned model.
+    pub fn model_family(&self) -> eredu_architectures::ModelKind {
         match &self.inner {
-            MlxSessionKind::Complete(model, _) => model.model_type(),
-            MlxSessionKind::Pipeline(model, _) => model.stage_info().model_kind.canonical_name(),
+            MlxSessionKind::Complete(model, _) => model.model_family(),
+            MlxSessionKind::Pipeline(model, _) => model.model_family(),
+        }
+    }
+
+    /// Returns the effective model type preserved from the parsed configuration.
+    pub fn effective_model_type(&self) -> &str {
+        match &self.inner {
+            MlxSessionKind::Complete(model, _) => model.effective_model_type(),
+            MlxSessionKind::Pipeline(model, _) => model.effective_model_type(),
         }
     }
 
@@ -808,7 +816,7 @@ impl<'a> MlxModelSession<'a> {
             (model, _) => {
                 return Err(Error::UnsupportedArchitecture(format!(
                     "activation observation is unavailable for model type {} or the supplied cache does not match",
-                    model.model_type()
+                    model.effective_model_type()
                 )))
             }
         };
@@ -1183,7 +1191,7 @@ fn prefill_model(
         }
         (model, _) => Err(Error::UnsupportedArchitecture(format!(
             "MLX cache does not match model type {}",
-            model.model_type()
+            model.effective_model_type()
         ))),
     }
 }
@@ -1231,7 +1239,7 @@ fn decode_model(
         }
         (model, _) => Err(Error::UnsupportedArchitecture(format!(
             "MLX cache does not match model type {}",
-            model.model_type()
+            model.effective_model_type()
         ))),
     }
 }
@@ -1362,7 +1370,7 @@ fn forward_model_tensor_parallel(
         }
         (model, _) => Err(Error::UnsupportedArchitecture(format!(
             "tensor-parallel MLX cache does not match model type {}",
-            model.model_type()
+            model.effective_model_type()
         ))),
     }
 }

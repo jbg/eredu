@@ -201,11 +201,13 @@ impl Model {
     ) -> Result<MediaShapePlan, CapabilityError> {
         match self {
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
-                media_plan::qwen_vision(&model.args().vision, input, self.model_type())
+                media_plan::qwen_vision(&model.args().vision, input, self.effective_model_type())
             }
-            Self::Qwen3Next(model) | Self::Qwen35(model) => {
-                media_plan::qwen_hybrid_vision(model.vision_config(), input, self.model_type())
-            }
+            Self::Qwen3Next(model) | Self::Qwen35(model) => media_plan::qwen_hybrid_vision(
+                model.vision_config(),
+                input,
+                self.effective_model_type(),
+            ),
             Self::Gemma4(model) => media_plan::gemma4(model.args(), input),
             Self::Inkling(model) => media_plan::inkling(model.args(), input),
             Self::MuseGlimmer(model) => media_plan::muse_glimmer(model.args(), input),
@@ -215,7 +217,7 @@ impl Model {
             | Self::Llama(_)
             | Self::Lfm2(_)
             | Self::NemotronH(_)
-            | Self::Qwen(_) => media_plan::text_only(self.model_type(), input),
+            | Self::Qwen(_) => media_plan::text_only(self.effective_model_type(), input),
         }
     }
 }
@@ -277,7 +279,7 @@ pub fn count_prepared_input(
             (Modality::Text, InputPayload::TokenIds(tokens)) => {
                 if tokens.ndim() != 2 || tokens.dim(0) != 1 {
                     return Err(CapabilityError::UnsupportedInput {
-                        architecture: session.model_type().into(),
+                        architecture: session.effective_model_type().into(),
                         reason: format!(
                             "prepared text token IDs must be [1, sequence], got {:?}",
                             tokens.shape()
@@ -292,14 +294,14 @@ pub fn count_prepared_input(
             }
             (Modality::Text, _) => {
                 return Err(CapabilityError::UnsupportedInput {
-                    architecture: session.model_type().into(),
+                    architecture: session.effective_model_type().into(),
                     reason: "prepared text is not represented by tokenizer IDs".into(),
                 });
             }
             (_modality, InputPayload::Embeddings(embeddings)) => {
                 if embeddings.ndim() != 3 || embeddings.dim(0) != 1 {
                     return Err(CapabilityError::UnsupportedInput {
-                        architecture: session.model_type().into(),
+                        architecture: session.effective_model_type().into(),
                         reason: format!(
                             "prepared media embeddings must be [1, sequence, hidden], got {:?}",
                             embeddings.shape()
@@ -326,7 +328,7 @@ pub fn count_prepared_input(
             }
             (_, InputPayload::TokenIds(_)) => {
                 return Err(CapabilityError::UnsupportedInput {
-                    architecture: session.model_type().into(),
+                    architecture: session.effective_model_type().into(),
                     reason: "non-text prepared input cannot contain tokenizer IDs".into(),
                 });
             }

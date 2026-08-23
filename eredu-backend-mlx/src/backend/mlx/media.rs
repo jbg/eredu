@@ -21,7 +21,7 @@ impl MultimodalPreparationBackend for MlxBackend<'_> {
         let processor = runtime.session().processor().ok_or_else(|| {
             MultimodalPreparationFailure::Backend(Error::Processor(format!(
                 "MLX model session {} has no multimodal processor",
-                runtime.session().model_type()
+                runtime.session().effective_model_type()
             )))
         })?;
         let prepared = processor

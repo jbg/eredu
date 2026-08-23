@@ -106,9 +106,10 @@ fn main() -> anyhow::Result<()> {
         ModelLoadOptions::default().with_weight_residency(weight_residency),
     )?;
     anyhow::ensure!(
-        model.model_type() == "llama",
-        "the Llama residency benchmark requires a Llama-compatible checkpoint, got {}",
-        model.model_type()
+        model.model_family() == eredu::ModelKind::Llama,
+        "the Llama residency benchmark requires a Llama-compatible checkpoint, got {} ({})",
+        model.model_family().canonical_name(),
+        model.effective_model_type()
     );
     let mut session = backend.create_session(model)?;
 
@@ -175,7 +176,11 @@ fn main() -> anyhow::Result<()> {
         .filter(|unit| unit.id().as_str().starts_with("model.unit.") && unit.device_resident())
         .count();
 
-    println!("model type: {}", session.model_type());
+    println!(
+        "model family/type: {}/{}",
+        session.model_family().canonical_name(),
+        session.effective_model_type()
+    );
     println!(
         "residency policy: {}",
         if args.fully_resident {

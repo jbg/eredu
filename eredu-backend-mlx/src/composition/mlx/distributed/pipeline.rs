@@ -10294,6 +10294,16 @@ impl PipelineModel {
         &self.info
     }
 
+    /// Returns the canonical architecture family selected for this stage.
+    pub const fn model_family(&self) -> ModelKind {
+        self.info.model_kind
+    }
+
+    /// Returns the effective model type preserved from the parsed configuration.
+    pub fn effective_model_type(&self) -> &str {
+        &self.cache_identity.effective_model_type
+    }
+
     pub(in crate::composition::mlx) fn capability_estimate(
         &self,
     ) -> Result<eredu_architectures::capability::CapabilityEstimate, eredu_core::CapabilityError>

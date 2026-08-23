@@ -92,7 +92,7 @@ pub fn validate_external_drafter(
         (model, kind) => {
             return Err(Error::UnsupportedArchitecture(format!(
                 "drafter {kind:?} is incompatible with target {} ({:?})",
-                model.model_type(),
+                model.effective_model_type(),
                 model.mtp_capability()
             )))
         }
@@ -392,7 +392,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             }
             (model, kind) => Err(Error::Speculative(format!(
                 "MTP runtime adapter is unavailable for model type {} ({:?})",
-                model.model_type(),
+                model.effective_model_type(),
                 kind
             ))),
         }
@@ -488,7 +488,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
             }
             model => Err(Error::Speculative(format!(
             "scheduled prepared-chat embedded MTP batch is unavailable for model type {} ({:?})",
-            model.model_type(),
+            model.effective_model_type(),
             model.mtp_capability()
         ))),
         }

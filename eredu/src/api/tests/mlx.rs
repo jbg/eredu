@@ -265,13 +265,10 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         .unwrap();
     let directory = temp_model_dir(&config.to_string());
     save_zero_neutral_checkpoint(&qwen, &directory, stream);
-    let Model::Qwen35(qwen) =
-        load_test_model(&directory, ModelLoadOptions::default(), stream, stream)
-            .unwrap()
-            .into_inner()
-            .into_complete()
-            .unwrap()
-    else {
+    let loaded = load_test_model(&directory, ModelLoadOptions::default(), stream, stream).unwrap();
+    assert_eq!(loaded.model_family(), ModelKind::Qwen35);
+    assert_eq!(loaded.effective_model_type(), "qwen3_5_text");
+    let Model::Qwen35(qwen) = loaded.into_inner().into_complete().unwrap() else {
         panic!("expected canonical Qwen3.5 model");
     };
     let runtime = eredu_core::ModelRuntime::from_prepared(

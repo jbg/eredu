@@ -40,7 +40,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = eredu_backend_mlx::native::distributed_backend(&stream, &weights_stream, &group);
     let model = load_model(&backend, &model_dir, options)?;
     if group.rank() == 0 {
-        eprintln!("loaded {} with EP={}", model.model_type(), group.size());
+        eprintln!(
+            "loaded {}/{} with EP={}",
+            model.model_family().canonical_name(),
+            model.effective_model_type(),
+            group.size()
+        );
     }
 
     let mut session = backend.create_session(model)?;

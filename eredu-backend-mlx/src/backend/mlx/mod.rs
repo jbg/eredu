@@ -122,11 +122,19 @@ impl MlxModel {
         }
     }
 
-    /// Returns the selected model's normalized architecture name.
-    pub fn model_type(&self) -> &str {
+    /// Returns the selected model's canonical architecture family.
+    pub fn model_family(&self) -> eredu_architectures::ModelKind {
         match &self.inner {
-            MlxModelKind::Complete(model) => model.model_type(),
-            MlxModelKind::Pipeline(model) => model.stage_info().model_kind.canonical_name(),
+            MlxModelKind::Complete(model) => model.model_family(),
+            MlxModelKind::Pipeline(model) => model.model_family(),
+        }
+    }
+
+    /// Returns the effective model type preserved from the parsed configuration.
+    pub fn effective_model_type(&self) -> &str {
+        match &self.inner {
+            MlxModelKind::Complete(model) => model.effective_model_type(),
+            MlxModelKind::Pipeline(model) => model.effective_model_type(),
         }
     }
 

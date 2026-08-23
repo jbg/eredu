@@ -12,8 +12,8 @@ use std::{
 use eredu::{
     core::{residency::OffloadConfig, BackendProvider as _, BackendSession as _},
     load_model, DenseDiskStreamLoadOptions, ExpertCacheLoadOptions, LayerwiseLoadOptions,
-    MtpCapability, MtpCheckpointKind, MtpConfig, NonExpertWeightResidency, PromptCacheDescriptor,
-    PromptCacheOptions, PromptCacheTopology, WeightResidency,
+    ModelKind, MtpCapability, MtpCheckpointKind, MtpConfig, NonExpertWeightResidency,
+    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 use eredu::{CacheResidencyPolicy, PagedCacheOptions};
 use eredu_architectures::gpt_oss;
@@ -108,6 +108,39 @@ fn distributed_materialization_uses_the_planned_configuration() {
         matches!(error, MlxError::StrictLoadValidation { .. }),
         "expected checkpoint binding validation after planned configuration parsing, got {error}"
     );
+}
+
+#[test]
+fn pipeline_identity_preserves_family_and_effective_wrapper_type() {
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_qwen_fixture(checkpoint.path(), "qwen3_moe");
+    let topology =
+        MlxParallelContext::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            .unwrap();
+    let stream = Stream::new_with_device(&topology.device.device().unwrap());
+    let model = load_prepared_pipeline_model(
+        checkpoint.path(),
+        ModelLoadOptions::with_parallel(topology),
+        &stream,
+    );
+
+    assert_eq!(model.model_family(), ModelKind::Qwen3);
+    assert_eq!(model.effective_model_type(), "qwen3_moe");
+
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_qwen35_multimodal_fixture(checkpoint.path(), true);
+    let topology =
+        MlxParallelContext::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            .unwrap();
+    let stream = Stream::new_with_device(&topology.device.device().unwrap());
+    let model = load_prepared_pipeline_model(
+        checkpoint.path(),
+        ModelLoadOptions::with_parallel(topology),
+        &stream,
+    );
+
+    assert_eq!(model.model_family(), ModelKind::Qwen35);
+    assert_eq!(model.effective_model_type(), "qwen3_5_moe_text");
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -467,8 +500,18 @@ fn pipeline_ring_worker() {
             ModelLoadOptions::with_parallel(topology)
         };
         let model = load_model(&backend, &checkpoint, load_options).unwrap();
+        let expected_effective_model_type = family.descriptor_names().1;
+        let expected_model_family =
+            ModelKind::resolve_model_type(expected_effective_model_type).unwrap();
+        assert_eq!(model.model_family(), expected_model_family);
+        assert_eq!(model.effective_model_type(), expected_effective_model_type);
         let expected_mtp_capability = model.mtp_capability_for_test();
         let mut runtime = eredu::ModelRuntime::from_prepared(backend, model).unwrap();
+        assert_eq!(runtime.session().model_family(), expected_model_family);
+        assert_eq!(
+            runtime.session().effective_model_type(),
+            expected_effective_model_type
+        );
         assert_eq!(
             <MlxBackend<'_> as eredu::SpeculativeGenerationBackend>::mtp_capability(&runtime),
             expected_mtp_capability
@@ -808,6 +851,12 @@ fn pipeline_ring_worker() {
     } else {
         load_prepared_pipeline_model(&checkpoint, base_options(), &stream)
     };
+    let expected_effective_model_type = family.descriptor_names().1;
+    assert_eq!(
+        model.model_family(),
+        ModelKind::resolve_model_type(expected_effective_model_type).unwrap()
+    );
+    assert_eq!(model.effective_model_type(), expected_effective_model_type);
     let info = model.stage_info();
     let expected_range = family.stage_range(pipeline_rank);
     assert_eq!(info.global_layer_range, expected_range);

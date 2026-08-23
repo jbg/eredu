@@ -133,6 +133,33 @@ impl ModelKind {
                 ))
             })
     }
+
+    /// Resolves a declared or effective model type to its canonical family.
+    ///
+    /// Wrapper and implementation variants such as `qwen3_moe` and
+    /// `qwen3_5_moe_text` intentionally resolve to the same family identity.
+    pub fn resolve_model_type(model_type: &str) -> Result<Self, ArtifactError> {
+        match model_type {
+            "deepseek_v3" => Ok(Self::DeepSeekV3),
+            "deepseek_v4" => Ok(Self::DeepSeekV4),
+            "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
+            "gpt_oss" => Ok(Self::GptOss),
+            "inkling_mm_model" => Ok(Self::Inkling),
+            "kimi_linear" => Ok(Self::KimiLinear),
+            "llama" | "mistral" => Ok(Self::Llama),
+            "muse_glimmer" | "muse_glimmer_text" => Ok(Self::MuseGlimmer),
+            "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
+            "nemotron_h" => Ok(Self::NemotronH),
+            "moshi" | "personaplex" => Ok(Self::Moshi),
+            "qwen2" => Ok(Self::Qwen2),
+            "qwen3" | "qwen3_moe" => Ok(Self::Qwen3),
+            "qwen3_next" => Ok(Self::Qwen3Next),
+            "qwen3_vl" | "qwen3_vl_text" => Ok(Self::Qwen3Vl),
+            "qwen3_vl_moe" | "qwen3_vl_moe_text" => Ok(Self::Qwen3VlMoe),
+            "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35),
+            other => Err(ArtifactError::UnsupportedModelType(other.into())),
+        }
+    }
 }
 
 /// Architecture-owned GGUF family identity.
@@ -311,31 +338,6 @@ struct TextConfigMetadata {
     model_type: Option<String>,
 }
 
-fn model_kind(model_type: &str) -> Result<ModelKind, ArtifactError> {
-    match model_type {
-        "deepseek_v3" => Ok(ModelKind::DeepSeekV3),
-        "deepseek_v4" => Ok(ModelKind::DeepSeekV4),
-        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
-            Ok(ModelKind::Gemma4)
-        }
-        "gpt_oss" => Ok(ModelKind::GptOss),
-        "inkling_mm_model" => Ok(ModelKind::Inkling),
-        "kimi_linear" => Ok(ModelKind::KimiLinear),
-        "llama" | "mistral" => Ok(ModelKind::Llama),
-        "muse_glimmer" | "muse_glimmer_text" => Ok(ModelKind::MuseGlimmer),
-        "lfm2" | "lfm2_moe" => Ok(ModelKind::Lfm2),
-        "nemotron_h" => Ok(ModelKind::NemotronH),
-        "moshi" | "personaplex" => Ok(ModelKind::Moshi),
-        "qwen2" => Ok(ModelKind::Qwen2),
-        "qwen3" | "qwen3_moe" => Ok(ModelKind::Qwen3),
-        "qwen3_next" => Ok(ModelKind::Qwen3Next),
-        "qwen3_vl" | "qwen3_vl_text" => Ok(ModelKind::Qwen3Vl),
-        "qwen3_vl_moe" | "qwen3_vl_moe_text" => Ok(ModelKind::Qwen3VlMoe),
-        "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(ModelKind::Qwen35),
-        other => Err(ArtifactError::UnsupportedModelType(other.into())),
-    }
-}
-
 fn effective_model_type(metadata: &ConfigMetadata) -> String {
     if metadata.model_type == "inkling_mm_model" {
         return metadata.model_type.clone();
@@ -349,7 +351,7 @@ fn effective_model_type(metadata: &ConfigMetadata) -> String {
             .as_ref()
             .and_then(|text| text.model_type.clone())
             .unwrap_or_else(|| metadata.model_type.clone())
-    } else if model_kind(&metadata.model_type).is_ok() {
+    } else if ModelKind::resolve_model_type(&metadata.model_type).is_ok() {
         metadata.model_type.clone()
     } else {
         metadata
@@ -364,7 +366,7 @@ fn effective_model_type(metadata: &ConfigMetadata) -> String {
 pub fn resolve_model_identity(json: &Value) -> Result<ResolvedModelConfig, ArtifactError> {
     let metadata: ConfigMetadata = serde_json::from_value(json.clone())?;
     let effective_model_type = effective_model_type(&metadata);
-    let kind = model_kind(&effective_model_type)?;
+    let kind = ModelKind::resolve_model_type(&effective_model_type)?;
     Ok(ResolvedModelConfig {
         model_type: metadata.model_type,
         effective_model_type,
@@ -524,6 +526,24 @@ mod tests {
             let portable = MODEL_CONFIGURATIONS.resolve_safetensors(&json).unwrap();
             assert_eq!(portable.family, "moshi");
             assert_eq!(portable.loading_protocol, LoadingProtocol::Realtime);
+        }
+    }
+
+    #[test]
+    fn effective_model_types_resolve_to_explicit_canonical_families() {
+        for (model_type, family) in [
+            ("qwen3_moe", ModelKind::Qwen3),
+            ("qwen3_vl_moe_text", ModelKind::Qwen3VlMoe),
+            ("qwen3_5_text", ModelKind::Qwen35),
+            ("qwen3_5_moe_text", ModelKind::Qwen35),
+        ] {
+            assert_eq!(ModelKind::resolve_model_type(model_type).unwrap(), family);
+            assert_eq!(
+                ModelKind::resolve_model_type(model_type)
+                    .unwrap()
+                    .canonical_name(),
+                family.canonical_name()
+            );
         }
     }
 
