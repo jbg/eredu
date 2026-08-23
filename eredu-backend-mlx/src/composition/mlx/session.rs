@@ -4,8 +4,10 @@ use eredu_core::{
     BackendSession, Completion, ModelRuntime, Submission, TextGenerationBackend,
     TextGenerationConfig, TextSamplingStrategy, TokenFilter, TokenOutput,
 };
-use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
-use eredu_runtime::CausalModel;
+use eredu_runtime::{
+    ActivationObserver as RuntimeActivationObserver, CausalModel, GenerationSampler,
+    MirostatV2Sampler,
+};
 use ref_cast::RefCast;
 use safemlx::{
     error::Exception,
@@ -146,8 +148,8 @@ pub struct MlxTextGenerationState {
 }
 
 enum MlxTextSampler {
-    Standard(crate::backend::mlx::runtime::generation::sampler::GenerationSampler),
-    MirostatV2(crate::backend::mlx::runtime::generation::sampler::MirostatV2Sampler),
+    Standard(GenerationSampler),
+    MirostatV2(MirostatV2Sampler),
 }
 
 impl MlxTextSampler {
@@ -982,16 +984,11 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
             Some(RandomState::from_key(safemlx::random::key(config.seed())?))
         };
         let sampler = match config.strategy() {
-            TextSamplingStrategy::Standard => MlxTextSampler::Standard(
-                crate::backend::mlx::runtime::generation::sampler::GenerationSampler::from_resolved(
-                    sampling,
-                ),
-            ),
+            TextSamplingStrategy::Standard => {
+                MlxTextSampler::Standard(GenerationSampler::from_resolved(sampling))
+            }
             TextSamplingStrategy::MirostatV2 { tau, eta } => {
-                let sampler =
-                    crate::backend::mlx::runtime::generation::sampler::MirostatV2Sampler::new(
-                        tau, eta,
-                    )
+                let sampler = MirostatV2Sampler::new(tau, eta)
                     .map_err(|error| eredu_core::BackendError::Execution {
                         session: "text-generation".into(),
                         operation: "configure Mirostat V2".into(),

@@ -12,9 +12,10 @@ use eredu_checkpoint::{
     store::{CheckpointSource, ResolvedCheckpointSource, SharedCheckpointSource},
 };
 use eredu_runtime::{
-    DenseDiskStreamReport, ExecutionUnitLayout, LayeredArchitecture, LayeredTraversalHook,
-    LayerwiseModelMetadata, LayerwiseRuntime, ResidencyReport, ResidentLayerGroupReport,
-    SequentialDecisionDriver, SequentialDecisionTraversal, ShardingPolicy,
+    DefaultSampler, DenseDiskStreamReport, ExecutionUnitLayout, LayeredArchitecture,
+    LayeredTraversalHook, LayerwiseModelMetadata, LayerwiseRuntime, ResidencyReport,
+    ResidentLayerGroupReport, SequentialDecisionDriver, SequentialDecisionTraversal,
+    ShardingPolicy,
 };
 use safemlx::{module::ModuleParameters, Array, Stream};
 
@@ -41,7 +42,7 @@ use crate::backend::mlx::{
                 shard_layer_bindings,
             },
         },
-        generation::sampler::{DefaultSampler, MlxSamplingBackend},
+        generation::sampler::MlxSamplingBackend,
     },
     ModelLoadOptions,
 };

@@ -3,7 +3,13 @@
 //! Reusable MLX materialization, residency-transfer, sharding, and pipeline
 //! quantization capabilities used by the backend-neutral layered runtime.
 
-use eredu_checkpoint::{store::SharedCheckpointSource, WeightQuantization};
+#[cfg(test)]
+use eredu_checkpoint::recipe::DerivedWeightRecipe;
+use eredu_checkpoint::{
+    recipe::RecipeDtype,
+    store::{SafetensorsWeightStore, SharedCheckpointSource, TensorSelection},
+    WeightQuantization,
+};
 #[cfg(test)]
 use eredu_runtime::OffloadUnit;
 use eredu_runtime::{
@@ -30,8 +36,6 @@ use crate::{
     backend::mlx::runtime::checkpoint::bounded_quantization::{
         BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
     },
-    backend::mlx::runtime::checkpoint::recipe::RecipeDtype,
-    backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore,
     backend::mlx::runtime::residency::dense_stream::BackgroundLayerPrefetch,
     backend::mlx::runtime::residency::manager::{
         ResidencyError, ResidencyManager, ResidentTransfer, ResidentUnitLease,
@@ -911,8 +915,7 @@ fn bounded_quantization_working_set(
 fn stored_tensor_selection(
     tensor: &eredu_runtime::LocalTensorLayout,
     stored_shape: &[usize],
-) -> Result<crate::backend::mlx::runtime::checkpoint::store::TensorSelection, Error> {
-    use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
+) -> Result<TensorSelection, Error> {
     use eredu_runtime::TensorPlacement;
 
     let scale_boundary = |axis: usize, boundary: usize| -> Result<usize, Error> {
@@ -980,8 +983,6 @@ pub fn shard_layer_bindings(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<Vec<WeightBinding>, Error> {
-    use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
-
     let store_keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let mut output = Vec::with_capacity(bindings.len());
     for binding in bindings {
@@ -1063,7 +1064,7 @@ pub fn shard_layer_bindings(
         let recipe = binding.source_recipe();
         let metadata = recipe.infer(store)?;
         let selection = stored_tensor_selection(tensor, metadata.shape())?;
-        if selection == crate::backend::mlx::runtime::checkpoint::store::TensorSelection::Full {
+        if selection == TensorSelection::Full {
             output.push(binding);
             continue;
         }
@@ -1086,7 +1087,6 @@ fn build_parallel_module_bindings(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     layout: &eredu_runtime::LocalModelLayout,
 ) -> Result<Vec<WeightBinding>, Error> {
-    use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
     let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
     let params = module.parameters().flatten();
     let mut names = params
@@ -1150,11 +1150,7 @@ fn build_parallel_module_bindings(
                     selected_shape, local_shape
                 )));
             }
-            let recipe =
-                crate::backend::mlx::runtime::checkpoint::recipe::DerivedWeightRecipe::source(
-                    checkpoint_key.clone(),
-                    selection.clone(),
-                );
+            let recipe = DerivedWeightRecipe::source(checkpoint_key.clone(), selection.clone());
             let bytes = recipe.infer(store)?.byte_len();
             (selection, bytes)
         } else {

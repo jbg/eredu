@@ -5,7 +5,7 @@
 //! inspected once per routed block, validated before acquisition, coalesced in
 //! deterministic global-id order, and rewritten to a temporary compact bank.
 
-use eredu_checkpoint::WeightQuantization;
+use eredu_checkpoint::{recipe::RecipeDtype, store::TensorSelection, WeightQuantization};
 use eredu_runtime::{
     ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, OffloadUnit, ResidencyReport,
     WeightBinding, WeightMaterializationReport,
@@ -27,12 +27,8 @@ use safemlx::{
 use crate::backend::mlx::runtime::residency::manager::ResidentUnitLease;
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::runtime::checkpoint::{
-        bounded_quantization::{
-            BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
-        },
-        recipe::RecipeDtype,
-        store::TensorSelection,
+    backend::mlx::runtime::checkpoint::bounded_quantization::{
+        BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
     },
     backend::mlx::runtime::residency::manager::{
         ResidencyError, ResidencyManager, ResidentTransfer,
@@ -1357,7 +1353,10 @@ pub enum ExpertCacheError {
 mod tests {
     use std::sync::Arc;
 
-    use eredu_checkpoint::store::CheckpointSource;
+    use eredu_checkpoint::{
+        recipe::DerivedWeightRecipe,
+        store::{CheckpointSource, SafetensorsWeightStore},
+    };
     use safemlx::{
         host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy,
         HostTransferStorageKind,
@@ -1365,9 +1364,6 @@ mod tests {
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
 
     use super::*;
-    use crate::backend::mlx::runtime::checkpoint::{
-        recipe::DerivedWeightRecipe, store::SafetensorsWeightStore,
-    };
     use eredu_core::residency::CacheEvictionPolicy;
     use eredu_runtime::WeightBinding;
 

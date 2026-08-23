@@ -5,8 +5,8 @@
 //! to a single checkpoint key. They are validated from checkpoint metadata and
 //! materialized on the residency source stream before device promotion.
 
-pub use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype};
-use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, TensorReadRequest};
+use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype};
+use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, TensorReadRequest, TensorSelection};
 
 use safemlx::{
     ops::{concatenate_axis, contiguous, stack_axis},
@@ -15,8 +15,7 @@ use safemlx::{
 };
 
 use crate::backend::mlx::runtime::checkpoint::store::{
-    MlxParameterMaterializationContext, PendingWeightMaterialization, TensorSelection,
-    WeightStoreError,
+    MlxParameterMaterializationContext, PendingWeightMaterialization, WeightStoreError,
 };
 
 /// Converts an MLX scalar type into the backend-neutral recipe representation.
@@ -577,7 +576,7 @@ mod tests {
     use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 
     use super::*;
-    use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
+    use eredu_checkpoint::store::SafetensorsWeightStore;
 
     fn fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
         let dir = tempfile::tempdir().unwrap();

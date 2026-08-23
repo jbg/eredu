@@ -18,7 +18,7 @@ use safemlx::ops::GgufCheckpoint;
 use serde_json::Value;
 
 use super::*;
-use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
+use eredu_checkpoint::store::SafetensorsWeightStore;
 
 /// Options applied while inspecting a model artifact.
 #[derive(Debug, Clone, Default)]

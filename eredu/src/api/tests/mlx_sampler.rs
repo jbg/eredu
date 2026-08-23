@@ -21,10 +21,10 @@ use crate::{
     runtime::chat::{GenerationRuntimePlan, ParallelToolCallPolicy, ToolChoice},
 };
 use eredu_backend_mlx::testing::backend::mlx::runtime::generation::sampler::{
-    ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler, MlxSamplingBackend,
-    Sampler, SpeculativeSampler,
+    MlxSamplingBackend, Sampler, SpeculativeSampler,
 };
 use eredu_core::generation::{FinishReason, SemanticEvent};
+use eredu_runtime::{ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler};
 
 const SYNTHETIC_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
     envelope: ExactEnvelope {

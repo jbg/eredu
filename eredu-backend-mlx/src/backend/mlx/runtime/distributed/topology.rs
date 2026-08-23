@@ -6,7 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, TensorReadRequest};
+use eredu_checkpoint::store::{
+    CheckpointSource, ReadPolicy, SafetensorsWeightStore, TensorReadRequest, TensorSelection,
+};
 use eredu_core::{
     balanced_contiguous_range, ParallelAxis, ParallelRankTopology, SubgroupMembership,
 };
@@ -14,11 +16,8 @@ use eredu_runtime::TensorPlacement;
 use safemlx::{distributed::Group, Array, Stream};
 
 use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
-    backend::mlx::runtime::checkpoint::store::{
-        MlxParameterMaterializationContext, SafetensorsWeightStore, TensorSelection,
-    },
+    backend::mlx::error::Error, backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
+    backend::mlx::runtime::checkpoint::store::MlxParameterMaterializationContext,
 };
 
 #[cfg(test)]

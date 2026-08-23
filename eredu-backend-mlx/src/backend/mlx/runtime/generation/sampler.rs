@@ -9,8 +9,6 @@ pub use super::backend::MlxSamplingBackend;
 use crate::MlxTensor;
 use eredu_core::TokenFilter;
 
-pub use eredu_runtime::{ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler};
-
 /// SafeMLX-specialized token selection policy.
 pub trait Sampler {
     /// Whether loaded checkpoint defaults should wrap this policy.

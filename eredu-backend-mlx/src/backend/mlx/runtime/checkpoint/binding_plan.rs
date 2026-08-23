@@ -2,14 +2,15 @@
 
 #[cfg(test)]
 use eredu_checkpoint::StoredDtype;
+use eredu_checkpoint::{
+    recipe::{DerivedWeightRecipe, RecipeDtype},
+    store::TensorSelection,
+};
 
 use eredu_runtime::WeightBinding;
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{
-    recipe::{DerivedWeightRecipe, RecipeDtype, WeightRecipeError},
-    store::TensorSelection,
-};
+use super::recipe::WeightRecipeError;
 use crate::backend::mlx::runtime::residency::manager::ResidencyError;
 
 /// One runtime target and the physical recipe that produces it.

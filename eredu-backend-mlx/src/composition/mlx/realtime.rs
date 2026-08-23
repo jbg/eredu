@@ -15,8 +15,8 @@ use eredu_core::{
     scheduler::{RequestId, SchedulerLimits, SemanticStateTransaction, WorkDescriptor},
 };
 use eredu_runtime::{
-    PredictionDirective, RealtimeGenerationBranch, RealtimeGenerationState, RuntimeState,
-    SequentialDecisionPlan,
+    DefaultSampler, PredictionDirective, RealtimeGenerationBranch, RealtimeGenerationState,
+    RuntimeState, SequentialDecisionPlan,
 };
 use safemlx::{
     distributed::Group,
@@ -30,7 +30,7 @@ use crate::{
     backend::mlx::runtime::{
         cache::state::{MlxKeyValueState, MlxKeyValueTransactionBranch},
         checkpoint::artifact::LoadedArtifactIdentity,
-        generation::sampler::{DefaultSampler, MlxSamplingBackend},
+        generation::sampler::MlxSamplingBackend,
     },
     backend::mlx::ModelLoadOptions,
     backend::mlx::{

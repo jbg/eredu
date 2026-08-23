@@ -1673,7 +1673,7 @@ mod tests {
         time::Duration,
     };
 
-    use eredu_checkpoint::store::{CheckpointSource, TensorSelection};
+    use eredu_checkpoint::store::{CheckpointSource, SafetensorsWeightStore, TensorSelection};
     use eredu_runtime::{DeviceLayerWindow, ResidentLayerGroup};
     use safemlx::{
         host_transfer_capacity_upper_bound, Device, DeviceType, HostTransferPolicy,
@@ -1682,7 +1682,6 @@ mod tests {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     use super::*;
-    use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
     use eredu_core::residency::{
         OffloadConfig, OffloadUnitSpec, ResidencyLedgerError, ResidencyPolicy,
     };

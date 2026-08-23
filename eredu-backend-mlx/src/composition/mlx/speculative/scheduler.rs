@@ -580,12 +580,8 @@ mod tests {
     use safemlx::{Device, DeviceType, ExecutionContext};
 
     use super::*;
-    use crate::{
-        backend::mlx::runtime::generation::sampler::{
-            DefaultSampler, GenerationSampler, MirostatV2Sampler,
-        },
-        backend::mlx::runtime::media::input::InputPart,
-    };
+    use crate::backend::mlx::runtime::media::input::InputPart;
+    use eredu_runtime::{DefaultSampler, GenerationSampler, MirostatV2Sampler};
 
     #[derive(Clone, Default)]
     struct CountingSampler {

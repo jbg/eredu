@@ -9,9 +9,10 @@ use serde_json::Value;
 use eredu_architectures::{GgufArchitecture, ModelKind};
 
 use super::ModelLoadOptions;
+use crate::backend::mlx::error::Error;
 use crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames;
-use crate::backend::mlx::{error::Error, runtime::checkpoint::store::SafetensorsWeightStore};
 use crate::composition::llama::checkpoint as llama_checkpoint;
+use eredu_checkpoint::store::SafetensorsWeightStore;
 
 pub use eredu_checkpoint::validation::{
     CheckpointIssue as StructuralIssue, CheckpointIssueKind as StructuralIssueKind,

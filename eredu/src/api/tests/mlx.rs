@@ -26,13 +26,13 @@ use eredu_backend_mlx::{
     testing::backend::mlx::error::Error,
     testing::backend::mlx::runtime::checkpoint::quantization::CheckpointQuantizationOptions,
     testing::backend::mlx::runtime::execution::inspection::ActivationRecorder,
-    testing::backend::mlx::runtime::generation::sampler::{ConstrainedSampler, DefaultSampler},
     testing::backend::mlx::runtime::media::input,
     testing::backend::mlx::ModelLoadOptions,
     testing::composition::mlx::{validate_gguf_quantization_source, Model},
 };
 use eredu_gguf::{GgmlType, MetadataValue as GgufWriterMetadata, TensorInput, Writer};
 use eredu_nn::{ParameterMetadata, ParameterVisitor, Parameterized};
+use eredu_runtime::{ConstrainedSampler, DefaultSampler};
 
 const GEMMA4_LARGE_FIXTURE: &str =
     include_str!("../../../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");

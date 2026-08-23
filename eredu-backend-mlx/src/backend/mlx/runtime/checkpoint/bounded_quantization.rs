@@ -16,9 +16,12 @@
 
 use eredu_checkpoint::store::{
     CheckpointLease, CheckpointSource, MemoryWeightStore, StoreError, TensorReadRequest,
-    WeightStoreDiagnostics,
+    TensorSelection, WeightStoreDiagnostics,
 };
-use eredu_checkpoint::WeightQuantization;
+use eredu_checkpoint::{
+    recipe::{DerivedWeightRecipe, RecipeDtype},
+    WeightQuantization,
+};
 use eredu_runtime::WeightMaterializationReport;
 
 use std::{
@@ -34,10 +37,8 @@ use crate::{
     backend::mlx::error::Error,
     backend::mlx::runtime::checkpoint::{
         quantization::quantize_tensor,
-        recipe::{DerivedWeightRecipe, MlxWeightRecipeExt, RecipeDtype},
-        store::{
-            MlxParameterMaterializationContext, PendingWeightMaterialization, TensorSelection,
-        },
+        recipe::MlxWeightRecipeExt,
+        store::{MlxParameterMaterializationContext, PendingWeightMaterialization},
     },
 };
 
@@ -1292,17 +1293,17 @@ fn quantization_error(message: impl Into<String>) -> Error {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use eredu_checkpoint::AffineQuantization;
+    use eredu_checkpoint::{
+        store::{ReadPolicy as WeightReadPolicy, SafetensorsWeightStore, WeightStoreBackend},
+        AffineQuantization,
+    };
     use safemlx::{ops::GgufCheckpoint, Device, DeviceType, ExecutionContext};
     use safetensors::tensor::{serialize_to_file, TensorView};
     use tempfile::TempDir;
 
     use super::*;
     use crate::backend::mlx::runtime::{
-        checkpoint::store::{
-            open_gguf_checkpoint_source_for_test, SafetensorsWeightStore, WeightReadPolicy,
-            WeightStoreBackend,
-        },
+        checkpoint::store::open_gguf_checkpoint_source_for_test,
         residency::manager::{host_capacity_upper_bound_for_bindings, ResidencyManager},
     };
     use crate::test_utils::SyntheticGguf;

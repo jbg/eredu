@@ -6,10 +6,7 @@
 //! consumer stream without blocking the host, or synchronize the exact
 //! materialization before taking its independently owned output.
 
-pub use eredu_checkpoint::store::{
-    ReadPolicy as WeightReadPolicy, SafetensorsWeightStore, TensorSelection, WeightStoreBackend,
-    WeightStoreDiagnostics,
-};
+use eredu_checkpoint::store::TensorSelection;
 use eredu_checkpoint::{
     gguf_store::{
         GgufLease as NeutralGgufLease, GgufWeightStore as NeutralGgufWeightStore,
@@ -38,7 +35,10 @@ use safetensors::tensor::{Dtype, TensorView};
 #[cfg(test)]
 use eredu_checkpoint::gguf_store::GgufPhysicalSelection;
 #[cfg(test)]
-use eredu_checkpoint::store::{CheckpointSource, TensorReadRequest};
+use eredu_checkpoint::store::{
+    CheckpointSource, ReadPolicy as WeightReadPolicy, SafetensorsWeightStore, TensorReadRequest,
+    WeightStoreBackend, WeightStoreDiagnostics,
+};
 #[cfg(test)]
 use safemlx::ops::GgufTensorSelection;
 

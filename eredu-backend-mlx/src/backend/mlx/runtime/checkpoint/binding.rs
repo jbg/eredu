@@ -28,14 +28,16 @@ use crate::{
         load_array_quantized_strict, StrictLoadConfig, StrictLoadReport,
     },
     backend::mlx::runtime::checkpoint::recipe::{
-        recipe_dtype_from_mlx, DerivedWeightRecipe, MlxWeightRecipeExt, RecipeDtype,
-        WeightRecipeError,
+        recipe_dtype_from_mlx, MlxWeightRecipeExt, WeightRecipeError,
     },
     backend::mlx::runtime::checkpoint::store::{
-        MlxParameterMaterializationContext, TensorSelection, WeightMaterialization,
-        WeightStoreError,
+        MlxParameterMaterializationContext, WeightMaterialization, WeightStoreError,
     },
     backend::mlx::runtime::residency::manager::ResidentUnitLease,
+};
+use eredu_checkpoint::{
+    recipe::{DerivedWeightRecipe, RecipeDtype},
+    store::TensorSelection,
 };
 
 const MODEL_LOAD_MATERIALIZATION_BUFFERS: usize = 2;

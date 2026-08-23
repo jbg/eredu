@@ -104,9 +104,7 @@ pub enum DenseStreamError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::mlx::runtime::checkpoint::store::{
-        SafetensorsWeightStore, TensorSelection,
-    };
+    use eredu_checkpoint::store::{SafetensorsWeightStore, TensorSelection};
     use eredu_core::residency::{OffloadConfig, OffloadPlan, OffloadUnitSpec, ResidencyPolicy};
     use eredu_runtime::{OffloadUnit, WeightBinding};
     use safemlx::{

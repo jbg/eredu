@@ -259,6 +259,12 @@ A backend owns runtime-specific resources and computation:
 - communicators and collective tensor operations; and
 - exact native completion objects and runtime-specific errors.
 
+Backend modules expose only the backend-specific implementations of these
+facilities. Checkpoint recipes, checkpoint store metadata and selections,
+sampling policies, and observation contracts remain public through their
+neutral owning crates rather than compatibility re-exports under a concrete
+backend namespace.
+
 Neutral contracts use associated concrete types for these values. They do not
 use `Any`, untyped pointers, string-dispatched operations, or erased calls in
 per-layer and per-token paths.

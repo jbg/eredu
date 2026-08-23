@@ -20,7 +20,6 @@ use eredu_backend_mlx::{
     testing::backend::mlx::error::Error,
     testing::backend::mlx::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
     testing::backend::mlx::runtime::{
-        checkpoint::store::{SafetensorsWeightStore, TensorSelection},
         distributed::expert::{
             dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings,
             AllToAllVPlan, DispatchedRoutes, ExpertAssignment, LocalExpertBank, RoutedTransport,
@@ -29,6 +28,7 @@ use eredu_backend_mlx::{
         residency::expert_cache::{ExpertCache, ExpertCatalogEntry, ExpertRouteBatch},
     },
 };
+use eredu_checkpoint::store::{SafetensorsWeightStore, TensorSelection};
 use eredu_runtime::{
     ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, OffloadUnit, WeightBinding,
 };

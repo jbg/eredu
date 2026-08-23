@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::backend::mlx::error::Error;
 use crate::backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames};
-use crate::backend::mlx::runtime::checkpoint::store::SafetensorsWeightStore;
+use eredu_checkpoint::store::SafetensorsWeightStore;
 use eredu_checkpoint::store::WeightStore;
 use eredu_checkpoint::validation;
 use eredu_checkpoint::validation::{CheckpointIssue, CheckpointIssueKind, CheckpointValidation};

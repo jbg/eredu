@@ -5,9 +5,7 @@ pub use crate::backend::mlx::nn::generation::sample;
 pub use crate::backend::mlx::runtime::checkpoint::quantization::{
     quantize_checkpoint, CheckpointQuantizationOptions, CheckpointQuantizationReport,
 };
-pub use crate::backend::mlx::runtime::generation::sampler::{
-    DefaultSampler, MirostatV2Sampler, Sampler,
-};
+pub use crate::backend::mlx::runtime::generation::sampler::Sampler;
 pub use crate::backend::mlx::runtime::media::input::{InputPart, ModelInput};
 pub use crate::backend::mlx::runtime::residency::expert_cache::{
     ExpertCacheReport, ExpertPassStatistics, ExpertTierStatistics,

@@ -7,6 +7,7 @@ use eredu_core::{
     SpeculativeGenerationOutput, SpeculativeGenerationRequest, SpeculativeSemanticState,
     SpeculativeTokenFilterController,
 };
+use eredu_runtime::{ConstrainedSampler, GenerationSampler};
 use safemlx::{error::Exception, Array};
 
 use super::{
@@ -15,10 +16,7 @@ use super::{
     },
     MlxBackend, MlxModelInput, Model, ModelCache,
 };
-use crate::backend::mlx::{
-    error::Error,
-    runtime::generation::sampler::{ConstrainedSampler, GenerationSampler},
-};
+use crate::backend::mlx::error::Error;
 
 impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
     type Drafter = MlxDrafter;

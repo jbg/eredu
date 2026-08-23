@@ -26,7 +26,6 @@ use eredu_backend_mlx::native::{
 };
 use eredu_backend_mlx::MlxTensor;
 use eredu_backend_mlx::{
-    testing::backend::mlx::runtime::generation::sampler::DefaultSampler,
     testing::backend::mlx::runtime::{
         checkpoint::binding::canonical_checkpoint_name,
         execution::layerwise::open_safetensors_weight_store,
@@ -46,6 +45,7 @@ use eredu_backend_mlx::{
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_gguf::{GgmlType, TensorInput, Writer};
 use eredu_nn::{ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized};
+use eredu_runtime::DefaultSampler;
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 const WORKER_RANK: &str = "EREDU_PIPELINE_RING_WORKER";

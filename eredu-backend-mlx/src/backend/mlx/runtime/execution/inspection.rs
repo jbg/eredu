@@ -3,8 +3,6 @@
 use crate::MlxTensor;
 use safemlx::error::Exception;
 
-pub use eredu_runtime::{NoopObserver, RoutingObservation as MoeRoutingObservation};
-
 /// A cloned activation captured by [`ActivationRecorder`].
 #[derive(Debug, Clone)]
 pub struct RecordedActivation {
@@ -54,9 +52,9 @@ impl eredu_runtime::ActivationObserver<MlxTensor, Exception> for ActivationRecor
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivationRecorder, NoopObserver};
+    use super::ActivationRecorder;
     use crate::MlxTensor;
-    use eredu_runtime::ActivationObserver;
+    use eredu_runtime::{ActivationObserver, NoopObserver};
     use safemlx::{error::Exception, Array};
 
     struct ReplacingObserver {

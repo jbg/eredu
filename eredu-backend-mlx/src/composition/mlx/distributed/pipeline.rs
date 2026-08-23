@@ -14,7 +14,7 @@ use eredu_architectures::{
     llama::ModelArgs as LlamaModelArgs, muse_glimmer, BindableStaticParameters, GgufArchitecture,
     StaticParameterVisitorMut,
 };
-use eredu_checkpoint::WeightQuantization;
+use eredu_checkpoint::{store::WeightStoreDiagnostics, WeightQuantization};
 use eredu_core::{
     MaterializationRoute, ModelArtifact, ModelPreparationPlan, PreparedInputIdentity,
 };
@@ -79,9 +79,7 @@ use crate::{
         populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
     },
     backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load,
-    backend::mlx::runtime::checkpoint::store::{
-        open_gguf_checkpoint_source, WeightStoreDiagnostics,
-    },
+    backend::mlx::runtime::checkpoint::store::open_gguf_checkpoint_source,
     backend::mlx::runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
     backend::mlx::runtime::distributed::expert::{
         dispatch_local_with, dispatch_replicated, dispatch_replicated_tensor_parallel,
@@ -13154,7 +13152,7 @@ fn validate_partition_owner_bindings_excluding_roles(
 #[allow(clippy::items_after_test_module)]
 mod binding_authority_tests {
     use super::*;
-    use crate::backend::mlx::runtime::checkpoint::store::TensorSelection;
+    use eredu_checkpoint::store::TensorSelection;
     use eredu_runtime::{
         ExecutionGroupId, MemberSharding, OwnedParameterGroupSpec, ParameterGroupOwner,
         ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
