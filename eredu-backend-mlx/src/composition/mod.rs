@@ -76,7 +76,12 @@ pub(crate) fn architecture_expert_units(
                 .into_parameters()
                 .into_iter()
                 .map(|parameter| {
-                    let (binding_name, logical_target, recipe) = parameter.into_parts();
+                    let (binding_name, logical_target, mut recipe) = parameter.into_parts();
+                    if recipe.infer(store)?.dtype() == &eredu_checkpoint::recipe::RecipeDtype::F4 {
+                        recipe = crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(
+                            recipe, store,
+                        )?;
+                    }
                     let metadata = recipe.infer(store)?;
                     Ok(
                         WeightBinding::from_recipe(binding_name, recipe, metadata.byte_len())?

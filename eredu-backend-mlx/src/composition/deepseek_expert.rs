@@ -2,19 +2,14 @@
 
 use std::{collections::BTreeSet, ops::Range};
 
-use eredu_architectures::deepseek::{self, LayerPolicy, V3Args, V4Args};
-use eredu_checkpoint::{expert::GatedProductExpertRecipes, recipe::DerivedWeightRecipe};
+use eredu_architectures::deepseek::{self, V3Args, V4Args};
 use eredu_nn::GatedProductExpertBankSpec;
-use eredu_runtime::{ExpertIdentity, OffloadUnit, WeightBinding};
 
 use crate::backend::{
     error::Error,
-    runtime::{
-        checkpoint::binding_plan::{BindingPlan, PlannedBinding},
-        residency::{
-            expert_cache::{ExpertCache, ExpertCatalogEntry},
-            expert_provider::CachedGatedProductExpertProvider,
-        },
+    runtime::residency::{
+        expert_cache::{ExpertCache, ExpertCatalogEntry},
+        expert_provider::CachedGatedProductExpertProvider,
     },
 };
 
@@ -22,23 +17,9 @@ pub fn v3_catalog(
     args: &V3Args,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    let mut entries = Vec::new();
-    let target = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid V3 layer count".into()))?;
-    let total = target
-        + usize::try_from(args.num_nextn_predict_layers)
-            .map_err(|_| Error::UnsupportedArchitecture("invalid V3 prediction count".into()))?;
-    let experts = usize::try_from(args.n_routed_experts)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid V3 expert count".into()))?;
-    for layer in 0..total {
-        if layer < target && args.layer_schedule.get(layer) != Some(&LayerPolicy::SparseMoe) {
-            continue;
-        }
-        let recipes = deepseek::v3_expert_recipes(store, args, layer)
-            .map_err(Error::UnsupportedArchitecture)?;
-        append_entries(&mut entries, layer, experts, recipes, None, store)?;
-    }
-    Ok(entries)
+    let catalog = deepseek::v3_expert_residency_catalog(store, args, None)
+        .map_err(Error::UnsupportedArchitecture)?;
+    crate::composition::architecture_expert_units(catalog, store, None)
 }
 
 /// Physical checkpoint keys owned by the independent V3 expert cache.
@@ -50,28 +31,9 @@ pub fn v3_checkpoint_keys(
     args: &V3Args,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<BTreeSet<String>, Error> {
-    let target = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid V3 layer count".into()))?;
-    let total = target
-        + usize::try_from(args.num_nextn_predict_layers)
-            .map_err(|_| Error::UnsupportedArchitecture("invalid V3 prediction count".into()))?;
-    let mut keys = BTreeSet::new();
-    for layer in 0..total {
-        if layer < target && args.layer_schedule.get(layer) != Some(&LayerPolicy::SparseMoe) {
-            continue;
-        }
-        let recipes = deepseek::v3_expert_recipes(store, args, layer)
-            .map_err(Error::UnsupportedArchitecture)?;
-        keys.extend(
-            recipes
-                .gate_up
-                .source_keys()
-                .into_iter()
-                .chain(recipes.down.source_keys())
-                .map(str::to_owned),
-        );
-    }
-    Ok(keys)
+    let catalog = deepseek::v3_expert_residency_catalog(store, args, None)
+        .map_err(Error::UnsupportedArchitecture)?;
+    Ok(checkpoint_keys(&catalog))
 }
 
 pub fn v3_parallel_catalog(
@@ -79,55 +41,18 @@ pub fn v3_parallel_catalog(
     intermediate: Range<usize>,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    v3_catalog_with_intermediate(args, Some(intermediate), store)
-}
-
-fn v3_catalog_with_intermediate(
-    args: &V3Args,
-    intermediate: Option<Range<usize>>,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    let mut entries = Vec::new();
-    let target = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid V3 layer count".into()))?;
-    let total = target
-        + usize::try_from(args.num_nextn_predict_layers)
-            .map_err(|_| Error::UnsupportedArchitecture("invalid V3 prediction count".into()))?;
-    let experts = usize::try_from(args.n_routed_experts)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid V3 expert count".into()))?;
-    for layer in 0..total {
-        if layer < target && args.layer_schedule.get(layer) != Some(&LayerPolicy::SparseMoe) {
-            continue;
-        }
-        let recipes = deepseek::v3_expert_recipes(store, args, layer)
-            .map_err(Error::UnsupportedArchitecture)?;
-        append_entries(
-            &mut entries,
-            layer,
-            experts,
-            recipes,
-            intermediate.clone(),
-            store,
-        )?;
-    }
-    Ok(entries)
+    let catalog = deepseek::v3_expert_residency_catalog(store, args, Some(intermediate))
+        .map_err(Error::UnsupportedArchitecture)?;
+    crate::composition::architecture_expert_units(catalog, store, None)
 }
 
 pub fn v4_catalog(
     args: &V4Args,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid V4 layer count".into()))?;
-    let experts = usize::try_from(args.n_routed_experts)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid V4 expert count".into()))?;
-    let mut entries = Vec::new();
-    for layer in 0..total {
-        let recipes = deepseek::v4_expert_recipes(store, args, layer)
-            .map_err(Error::UnsupportedArchitecture)?;
-        append_entries(&mut entries, layer, experts, recipes, None, store)?;
-    }
-    Ok(entries)
+    let catalog = deepseek::v4_expert_residency_catalog(store, args, None)
+        .map_err(Error::UnsupportedArchitecture)?;
+    crate::composition::architecture_expert_units(catalog, store, None)
 }
 
 /// Physical checkpoint keys owned by the independent V4 expert cache.
@@ -135,22 +60,9 @@ pub fn v4_checkpoint_keys(
     args: &V4Args,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<BTreeSet<String>, Error> {
-    let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid V4 layer count".into()))?;
-    let mut keys = BTreeSet::new();
-    for layer in 0..total {
-        let recipes = deepseek::v4_expert_recipes(store, args, layer)
-            .map_err(Error::UnsupportedArchitecture)?;
-        keys.extend(
-            recipes
-                .gate_up
-                .source_keys()
-                .into_iter()
-                .chain(recipes.down.source_keys())
-                .map(str::to_owned),
-        );
-    }
-    Ok(keys)
+    let catalog = deepseek::v4_expert_residency_catalog(store, args, None)
+        .map_err(Error::UnsupportedArchitecture)?;
+    Ok(checkpoint_keys(&catalog))
 }
 
 pub fn v4_parallel_catalog(
@@ -158,71 +70,19 @@ pub fn v4_parallel_catalog(
     intermediate: Range<usize>,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid V4 layer count".into()))?;
-    let experts = usize::try_from(args.n_routed_experts)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid V4 expert count".into()))?;
-    let mut entries = Vec::new();
-    for layer in 0..total {
-        let recipes = deepseek::v4_expert_recipes(store, args, layer)
-            .map_err(Error::UnsupportedArchitecture)?;
-        append_entries(
-            &mut entries,
-            layer,
-            experts,
-            recipes,
-            Some(intermediate.clone()),
-            store,
-        )?;
-    }
-    Ok(entries)
+    let catalog = deepseek::v4_expert_residency_catalog(store, args, Some(intermediate))
+        .map_err(Error::UnsupportedArchitecture)?;
+    crate::composition::architecture_expert_units(catalog, store, None)
 }
 
-fn append_entries(
-    entries: &mut Vec<ExpertCatalogEntry>,
-    layer: usize,
-    experts: usize,
-    bank: GatedProductExpertRecipes,
-    intermediate: Option<Range<usize>>,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<(), Error> {
-    for expert in 0..experts {
-        let recipes = deepseek::expert_unit_recipes(store, &bank, expert, intermediate.clone())
-            .map_err(Error::UnsupportedArchitecture)?;
-        let bindings = vec![
-            recipe_binding("gate_up_proj", recipes.gate_up, store)?,
-            recipe_binding("down_proj", recipes.down, store)?,
-        ];
-        let bytes = bindings.iter().try_fold(0u64, |total, binding| {
-            total.checked_add(binding.expected_bytes()).ok_or_else(|| {
-                Error::UnsupportedArchitecture("DeepSeek expert byte total overflowed".into())
-            })
-        })?;
-        let identity = ExpertIdentity::new(layer, expert);
-        entries.push(ExpertCatalogEntry::new(
-            identity,
-            OffloadUnit::new(identity.unit_id(), bindings)?,
-            bytes,
-        )?);
-    }
-    Ok(())
-}
-
-fn recipe_binding(
-    name: &str,
-    recipe: DerivedWeightRecipe,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<WeightBinding, Error> {
-    let metadata = recipe.infer(store)?;
-    let mut bindings = BindingPlan::new(vec![PlannedBinding {
-        target_name: name.into(),
-        expected_shape: metadata.shape().to_vec(),
-        expected_dtype: metadata.dtype().clone(),
-        recipe,
-    }])
-    .and_then(|plan| plan.build_bindings(store))
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    Ok(bindings.pop().expect("one expert binding"))
+fn checkpoint_keys(catalog: &eredu_architectures::ExpertResidencyCatalog) -> BTreeSet<String> {
+    catalog
+        .units()
+        .iter()
+        .flat_map(|unit| unit.parameters())
+        .flat_map(|parameter| parameter.recipe().source_keys())
+        .map(str::to_owned)
+        .collect()
 }
 
 pub const fn v3_provider<'a>(

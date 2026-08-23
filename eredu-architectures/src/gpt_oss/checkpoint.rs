@@ -1,5 +1,6 @@
 //! Pure checkpoint schemas, name translation, and expert normalization for GPT-OSS.
 
+use eredu_checkpoint::store::TensorSelection;
 use eredu_checkpoint::{
     expert::{
         canonical_gated_expert_projection_family_recipes, ExpertProjectionFamilyNames,
@@ -362,6 +363,68 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     let root = format!("{}.layers.{layer}.mlp.experts", args.parameter_root);
     canonical_gated_expert_projection_family_recipes(catalog, &expert_names(&root))
         .map_err(|error| error.to_string())
+}
+
+/// Builds the complete architecture-owned schedule for independently resident experts.
+pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &ModelArgs,
+) -> Result<crate::ExpertResidencyCatalog, String> {
+    let layers = dimension(args.num_hidden_layers, "layer count")?;
+    let experts = dimension(args.num_local_experts, "expert count")?;
+    let capacity = layers
+        .checked_mul(experts)
+        .ok_or_else(|| "GPT-OSS expert residency catalog size overflowed".to_string())?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(|error| error.to_string())?;
+    let mut units = Vec::with_capacity(capacity);
+    for layer in 0..layers {
+        let unit_path = format!("{}.layers.{layer}", args.parameter_root);
+        let expert_root = format!("{unit_path}.mlp.experts");
+        let canonical = expert_recipes(catalog, args, layer)?
+            .into_outputs()
+            .into_outputs();
+        for expert in 0..experts {
+            let selection = TensorSelection::Range {
+                axis: 0,
+                start: expert,
+                end: expert
+                    .checked_add(1)
+                    .ok_or_else(|| "GPT-OSS expert index overflowed".to_string())?,
+            };
+            let parameters = canonical
+                .iter()
+                .map(|(target, recipe)| {
+                    let binding = target
+                        .strip_prefix(&expert_root)
+                        .and_then(|suffix| suffix.strip_prefix('.'))
+                        .ok_or_else(|| {
+                            format!(
+                                "GPT-OSS expert target {target:?} is outside bank {expert_root:?}"
+                            )
+                        })?;
+                    let recipe = recipe
+                        .clone()
+                        .select_bounded(catalog, selection.clone())
+                        .map_err(|error| error.to_string())?;
+                    crate::ExpertParameterRecipe::new(binding, target, recipe)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            units.push(
+                crate::ExpertResidencyUnit::new(
+                    eredu_runtime::ExpertIdentity::new(layer, expert),
+                    owner_group.clone(),
+                    layer,
+                    &unit_path,
+                    crate::ExpertResidencyDistribution::ExpertParallel,
+                    parameters,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
 }
 
 fn expert_names(root: &str) -> GatedExpertProjectionFamilyNames {
@@ -772,6 +835,35 @@ mod tests {
                 .unwrap()
                 .shape,
             [2, 64, 32]
+        );
+        let residency = expert_residency_catalog(&catalog, &args()).unwrap();
+        assert_eq!(residency.units().len(), 2);
+        let first = &residency.units()[0];
+        assert_eq!(first.identity(), eredu_runtime::ExpertIdentity::new(0, 0));
+        assert_eq!(first.owner_group().as_str(), "text_decoder");
+        assert_eq!(first.owner_unit(), 0);
+        assert_eq!(first.unit_path(), "model.layers.0");
+        assert_eq!(
+            first
+                .parameters()
+                .iter()
+                .map(|parameter| parameter.binding_name())
+                .collect::<Vec<_>>(),
+            [
+                "down_proj",
+                "down_proj_bias",
+                "down_proj_scales",
+                "gate_up_proj",
+                "gate_up_proj_bias",
+                "gate_up_proj_scales",
+            ]
+        );
+        assert!(first.parameters().iter().all(|parameter| parameter
+            .logical_target()
+            .starts_with("model.layers.0.mlp.experts.")));
+        assert_eq!(
+            residency.units()[1].identity(),
+            eredu_runtime::ExpertIdentity::new(0, 1)
         );
     }
 

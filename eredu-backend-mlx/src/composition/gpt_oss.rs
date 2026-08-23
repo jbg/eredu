@@ -710,9 +710,7 @@ fn load_neutral_parallel_with_store(
         )))
     };
     let planned_external_experts = external_experts
-        .then(|| {
-            expert::expert_catalog_cartesian(&args, store.as_ref(), Some(&local_layout), stream)
-        })
+        .then(|| expert::expert_catalog(&args, store.as_ref(), Some(&local_layout)))
         .transpose()?;
     Ok(GptOssModel {
         args,
@@ -1012,12 +1010,9 @@ impl GptOssModel {
     }
 
     /// Builds expert-cache units with this rank's exact TP selections.
-    pub fn external_expert_catalog(
-        &self,
-        stream: &Stream,
-    ) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    pub fn external_expert_catalog(&self) -> Result<Vec<ExpertCatalogEntry>, Error> {
         self.planned_external_experts.clone().map_or_else(
-            || expert::expert_catalog_cartesian(&self.args, self.checkpoint_store(), None, stream),
+            || expert::expert_catalog(&self.args, self.checkpoint_store(), None),
             Ok,
         )
     }
@@ -1624,7 +1619,7 @@ fn attach_expert_cache(
     weights_stream: &Stream,
 ) -> Result<(), Error> {
     let store = model.checkpoint_store_arc();
-    let entries = model.external_expert_catalog(stream)?;
+    let entries = model.external_expert_catalog()?;
     model.expert_cache = Some(ExpertCache::new_shared(
         store,
         entries,

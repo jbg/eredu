@@ -698,6 +698,125 @@ pub fn expert_unit_recipes<C: RecipeCatalog + ?Sized>(
     Ok(ExpertUnitRecipes { gate_up, down })
 }
 
+/// Builds the complete V3/R1 schedule for independently resident routed experts.
+pub fn v3_expert_residency_catalog<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &V3Args,
+    intermediate: Option<Range<usize>>,
+) -> Result<crate::ExpertResidencyCatalog, String> {
+    let target = count(args.num_hidden_layers, "V3 target layer count")?;
+    let prediction = count(args.num_nextn_predict_layers, "V3 prediction layer count")?;
+    let total = target
+        .checked_add(prediction)
+        .ok_or_else(|| "V3 expert residency layer count overflowed".to_string())?;
+    let experts = dimension(args.n_routed_experts, "V3 expert count")?;
+    let mut units = Vec::new();
+    for layer in 0..total {
+        if layer < target && args.layer_schedule.get(layer) != Some(&LayerPolicy::SparseMoe) {
+            continue;
+        }
+        let (owner, owner_unit) = if layer < target {
+            ("target".to_string(), layer)
+        } else {
+            (format!("mtp.{}", layer - target), 0)
+        };
+        let unit_path = format!("model.layers.{layer}");
+        let bank = v3_expert_recipes(catalog, args, layer)?;
+        append_expert_residency_units(
+            &mut units,
+            catalog,
+            layer,
+            &owner,
+            owner_unit,
+            &unit_path,
+            experts,
+            &bank,
+            intermediate.clone(),
+        )?;
+    }
+    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+}
+
+/// Builds the complete V4 schedule for independently resident routed experts.
+pub fn v4_expert_residency_catalog<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &V4Args,
+    intermediate: Option<Range<usize>>,
+) -> Result<crate::ExpertResidencyCatalog, String> {
+    let target = count(args.num_hidden_layers, "V4 target layer count")?;
+    let prediction = count(args.num_nextn_predict_layers, "V4 prediction layer count")?;
+    let total = target
+        .checked_add(prediction)
+        .ok_or_else(|| "V4 expert residency layer count overflowed".to_string())?;
+    let experts = dimension(args.n_routed_experts, "V4 expert count")?;
+    let capacity = total
+        .checked_mul(experts)
+        .ok_or_else(|| "V4 expert residency catalog size overflowed".to_string())?;
+    let mut units = Vec::with_capacity(capacity);
+    for layer in 0..total {
+        let (owner, owner_unit, unit_path) = if layer < target {
+            ("target".to_string(), layer, format!("layers.{layer}"))
+        } else {
+            let depth = layer - target;
+            (format!("mtp.{depth}"), 0, format!("mtp.{depth}"))
+        };
+        let bank = v4_expert_recipes(catalog, args, layer)?;
+        append_expert_residency_units(
+            &mut units,
+            catalog,
+            layer,
+            &owner,
+            owner_unit,
+            &unit_path,
+            experts,
+            &bank,
+            intermediate.clone(),
+        )?;
+    }
+    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_expert_residency_units<C: RecipeCatalog + ?Sized>(
+    units: &mut Vec<crate::ExpertResidencyUnit>,
+    catalog: &C,
+    identity_layer: usize,
+    owner_group: &str,
+    owner_unit: usize,
+    unit_path: &str,
+    experts: usize,
+    bank: &GatedProductExpertRecipes,
+    intermediate: Option<Range<usize>>,
+) -> Result<(), String> {
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new(owner_group).map_err(|error| error.to_string())?;
+    for expert in 0..experts {
+        let recipes = expert_unit_recipes(catalog, bank, expert, intermediate.clone())?;
+        let parameters = [
+            ("gate_up_proj", bank.target_gate_up.clone(), recipes.gate_up),
+            ("down_proj", bank.target_down.clone(), recipes.down),
+        ]
+        .into_iter()
+        .map(|(binding, target, recipe)| {
+            crate::ExpertParameterRecipe::new(binding, target, recipe)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+        units.push(
+            crate::ExpertResidencyUnit::new(
+                eredu_runtime::ExpertIdentity::new(identity_layer, expert),
+                owner_group.clone(),
+                owner_unit,
+                unit_path,
+                crate::ExpertResidencyDistribution::ExpertParallel,
+                parameters,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(())
+}
+
 /// Builds the canonical DeepSeek-V3/R1 SafeTensors catalog plan.
 pub fn v3_safetensors_plan(
     args: &V3Args,
@@ -1759,6 +1878,101 @@ mod tests {
                 if inputs.len() == 2
         ));
         assert!(expert_unit_recipes(&catalog, &bank, 2, Some(48..65)).is_err());
+    }
+
+    #[test]
+    fn v3_residency_catalog_owns_sparse_mtp_topology_and_local_selection() {
+        struct Catalog(BTreeMap<String, eredu_checkpoint::store::TensorMetadata>);
+        impl RecipeCatalog for Catalog {
+            fn tensor_metadata(
+                &self,
+                key: &str,
+            ) -> Result<eredu_checkpoint::store::TensorMetadata, eredu_checkpoint::store::StoreError>
+            {
+                self.0.get(key).cloned().ok_or_else(|| {
+                    eredu_checkpoint::store::StoreError::UnknownTensor { key: key.into() }
+                })
+            }
+        }
+        let args = parse_v3_config(&serde_json::json!({
+            "model_type": "deepseek_v3",
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "moe_intermediate_size": 64,
+            "num_hidden_layers": 2,
+            "num_nextn_predict_layers": 1,
+            "num_attention_heads": 2,
+            "vocab_size": 128,
+            "max_position_embeddings": 4096,
+            "q_lora_rank": 128,
+            "kv_lora_rank": 128,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 64,
+            "first_k_dense_replace": 1,
+            "n_routed_experts": 4,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "n_group": 1,
+            "topk_group": 1,
+            "tie_word_embeddings": false
+        }))
+        .unwrap();
+        let metadata = |name: &str, shape: Vec<usize>| eredu_checkpoint::store::TensorMetadata {
+            name: name.into(),
+            encoded_byte_len: shape.iter().product::<usize>() as u64 * 4,
+            physical_shape: shape.clone(),
+            logical_shape: shape,
+            stored_dtype: StoredDtype::F32,
+            backing_shard: None,
+        };
+        let mut tensors = BTreeMap::new();
+        for layer in [1, 2] {
+            let root = format!("model.layers.{layer}.mlp.experts");
+            for (binding, shape) in [
+                ("gate_up_proj", vec![4, 128, 128]),
+                ("down_proj", vec![4, 128, 64]),
+            ] {
+                let name = format!("{root}.{binding}");
+                tensors.insert(name.clone(), metadata(&name, shape));
+            }
+        }
+        let catalog = Catalog(tensors);
+        let residency = v3_expert_residency_catalog(&catalog, &args, Some(16..48)).unwrap();
+        assert_eq!(residency.units().len(), 8);
+        let target = &residency.units()[0];
+        assert_eq!(target.identity(), eredu_runtime::ExpertIdentity::new(1, 0));
+        assert_eq!(target.owner_group().as_str(), "target");
+        assert_eq!(target.owner_unit(), 1);
+        assert_eq!(target.unit_path(), "model.layers.1");
+        assert_eq!(
+            target.parameters()[0]
+                .recipe()
+                .infer(&catalog)
+                .unwrap()
+                .shape(),
+            [1, 64, 128]
+        );
+        assert_eq!(
+            target.parameters()[1]
+                .recipe()
+                .infer(&catalog)
+                .unwrap()
+                .shape(),
+            [1, 128, 32]
+        );
+        let prediction = &residency.units()[4];
+        assert_eq!(
+            prediction.identity(),
+            eredu_runtime::ExpertIdentity::new(2, 0)
+        );
+        assert_eq!(prediction.owner_group().as_str(), "mtp.0");
+        assert_eq!(prediction.owner_unit(), 0);
+        assert_eq!(prediction.unit_path(), "model.layers.2");
+        assert_eq!(
+            residency.units()[7].identity(),
+            eredu_runtime::ExpertIdentity::new(2, 3)
+        );
     }
 
     #[test]

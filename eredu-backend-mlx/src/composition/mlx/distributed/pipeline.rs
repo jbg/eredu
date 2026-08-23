@@ -15575,15 +15575,14 @@ fn load_muse_glimmer_pipeline(
         let assignment = stage.expert_assignment.as_ref().ok_or_else(|| {
             Error::Parallel("Muse-Glimmer external experts have no assignment".into())
         })?;
-        let entries = crate::composition::muse_glimmer_expert::expert_catalog(
-            &source_args,
-            store.as_ref(),
-            stream,
-        )?
-        .into_iter()
-        .filter(|entry| stage.range().contains(&entry.identity().layer))
-        .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
-        .collect::<Vec<_>>();
+        let entries =
+            crate::composition::muse_glimmer_expert::expert_catalog(&source_args, store.as_ref())?
+                .into_iter()
+                .filter(|entry| stage.range().contains(&entry.identity().layer))
+                .filter(|entry| {
+                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                })
+                .collect::<Vec<_>>();
         let cache = build_pipeline_expert_cache(
             Arc::clone(&store),
             entries,
@@ -17874,11 +17873,10 @@ fn load_gpt_oss_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if let Some(options) = expert_cache_options {
-        let entries = neutral_gpt_oss::expert::expert_catalog_cartesian(
+        let entries = neutral_gpt_oss::expert::expert_catalog(
             &source_args,
             store.as_ref(),
             parallel_layout.as_ref(),
-            stream,
         )?
         .into_iter()
         .filter(|entry| range.contains(&entry.identity().layer))
@@ -22262,15 +22260,14 @@ fn load_neutral_gemma4_pipeline(
             .expert_assignment
             .as_ref()
             .expect("Gemma 4 expert assignment");
-        let entries = crate::composition::gemma4_expert::expert_catalog(
-            &source_args.text,
-            store.as_ref(),
-            stream,
-        )?
-        .into_iter()
-        .filter(|entry| stage.range().contains(&entry.identity().layer))
-        .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
-        .collect::<Vec<_>>();
+        let entries =
+            crate::composition::gemma4_expert::expert_catalog(&source_args.text, store.as_ref())?
+                .into_iter()
+                .filter(|entry| stage.range().contains(&entry.identity().layer))
+                .filter(|entry| {
+                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                })
+                .collect::<Vec<_>>();
         let cache = build_pipeline_expert_cache(
             Arc::clone(&store),
             entries,

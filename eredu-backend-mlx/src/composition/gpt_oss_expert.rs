@@ -1,12 +1,9 @@
 // MLX residency adapter for the neutral GPT-OSS routed-expert graph.
 
-use eredu_architectures::gpt_oss::{expert_recipes, ModelArgs};
-use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
+use eredu_architectures::gpt_oss::ModelArgs;
 use eredu_nn::{GatedProductExpertBankOperator, GatedProductExpertBankSpec};
 use eredu_runtime::{
-    ExpertIdentity, ExpertPass, LayeredArchitecture, OffloadUnit, ParameterGroupOwner,
-    ParameterRole, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
-    WeightBinding,
+    ExpertPass, RoutedExpertProvider, RoutedExpertRequest, RoutedExpertTensorParallelOutput,
 };
 use safemlx::{distributed::Group, Array, Stream};
 
@@ -14,16 +11,11 @@ use crate::backend::{
     error::Error,
     nn::shared::MlxNeuralBackend,
     runtime::{
-        checkpoint::{
-            binding_plan::{BindingPlan, PlannedBinding},
-            recipe::lower_mxfp4_recipe,
-        },
         distributed::expert::{
             dispatch_local_tensor_parallel, dispatch_local_with,
             dispatch_replicated_tensor_parallel, dispatch_replicated_with, DispatchedRoutes,
             ExpertAssignment, LocalExpertBank, RoutingStatistics,
         },
-        execution::layerwise::shard_layer_bindings,
         residency::{
             expert_cache::{ExpertCache, ExpertCatalogEntry},
             expert_provider::{
@@ -34,125 +26,15 @@ use crate::backend::{
     },
 };
 
-/// Builds expert-granular canonical bindings with optional semantic TP selection.
-///
-/// The architecture recipe first normalizes alternating SafeTensors rows or
-/// translated separate GGUF projections to one component-major family. Expert
-/// selection is then pushed through that recipe before TP placement is applied,
-/// keeping native blocks, E8M0 scales, and ordinary biases in one atomic unit.
-pub fn expert_catalog_cartesian(
+/// Lowers the architecture-owned expert schedule into MLX cache entries.
+pub fn expert_catalog(
     args: &ModelArgs,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
     layout: Option<&eredu_runtime::LocalModelLayout>,
-    stream: &Stream,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    let architecture = eredu_architectures::gpt_oss::LayeredModel::<MlxNeuralBackend>::new(
-        args.clone(),
-        stream,
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let description = eredu_architectures::gpt_oss::parameter_description(&architecture, stream)
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let graph = <eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-        MlxNeuralBackend,
-        super::Cache,
-    >>::execution_graph(&architecture)
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let layers = positive_dimension(args.num_hidden_layers, "layer count")?;
-    let experts = positive_dimension(args.num_local_experts, "expert count")?;
-    let capacity = layers.checked_mul(experts).ok_or_else(|| {
-        Error::UnsupportedArchitecture("GPT-OSS expert catalog size overflowed".into())
-    })?;
-    let mut entries = Vec::with_capacity(capacity);
-
-    for layer in 0..layers {
-        let mut owner_group = None;
-        let expert_targets = description
-            .groups()
-            .iter()
-            .filter(|owned| owned.role() == ParameterRole::ExpertIntermediate)
-            .filter_map(|owned| match owned.owner() {
-                ParameterGroupOwner::ExecutionUnit { group, global_unit }
-                    if *global_unit == layer =>
-                {
-                    owner_group.get_or_insert(group.clone());
-                    Some(owned.members())
-                }
-                _ => None,
-            })
-            .flatten()
-            .map(|member| member.target().to_owned())
-            .collect::<std::collections::BTreeSet<_>>();
-        let owner_group = owner_group.ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
-                "GPT-OSS layer {layer} declares no expert-intermediate owner"
-            ))
-        })?;
-        let group = graph
-            .groups()
-            .iter()
-            .position(|candidate| candidate.id() == owner_group.as_str())
-            .ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "GPT-OSS expert owner group {owner_group:?} is absent from the execution graph"
-                ))
-            })?;
-        let unit_path = <eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-            MlxNeuralBackend,
-            super::Cache,
-        >>::unit_path(&architecture, group, layer)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let resolved =
-            expert_recipes(store, args, layer).map_err(Error::UnsupportedArchitecture)?;
-        let canonical = resolved.into_outputs().into_outputs();
-
-        for expert in 0..experts {
-            let expert_selection = TensorSelection::Range {
-                axis: 0,
-                start: expert,
-                end: expert + 1,
-            };
-            let mut bindings = Vec::with_capacity(canonical.len());
-            for (target, recipe) in &canonical {
-                if !expert_targets.contains(target) {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "GPT-OSS expert recipe target {target:?} is not owned by the architecture expert-intermediate role"
-                    )));
-                }
-                let local_name = target.rsplit('.').next().ok_or_else(|| {
-                    Error::UnsupportedArchitecture(format!(
-                        "GPT-OSS expert recipe target {target:?} has no compact binding name"
-                    ))
-                })?;
-                let selected = recipe.select_bounded(store, expert_selection.clone())?;
-                let selected = if selected.infer(store)?.dtype()
-                    == &eredu_checkpoint::recipe::RecipeDtype::F4
-                {
-                    lower_mxfp4_recipe(selected, store)?
-                } else {
-                    selected
-                };
-                bindings.push(recipe_binding(local_name, target, selected, store)?);
-            }
-
-            if let Some(layout) = layout {
-                bindings = shard_layer_bindings(bindings, &unit_path, store, layout)?;
-            }
-
-            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
-                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
-                    Error::UnsupportedArchitecture("GPT-OSS expert byte total overflowed".into())
-                })
-            })?;
-            let identity = ExpertIdentity::new(layer, expert);
-            entries.push(ExpertCatalogEntry::new(
-                identity,
-                OffloadUnit::new(identity.unit_id(), bindings)?,
-                bytes,
-            )?);
-        }
-    }
-    Ok(entries)
+    let catalog = eredu_architectures::gpt_oss::expert_residency_catalog(store, args)
+        .map_err(Error::UnsupportedArchitecture)?;
+    crate::composition::architecture_expert_units(catalog, store, layout)
 }
 
 /// Adapts an expert cache to the neutral routed-provider contract.
@@ -424,37 +306,6 @@ impl RoutedExpertProvider<MlxNeuralBackend> for DistributedCachedProvider<'_> {
     }
 }
 
-fn recipe_binding(
-    local_name: &str,
-    logical_target: &str,
-    recipe: DerivedWeightRecipe,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<WeightBinding, Error> {
-    let metadata = recipe.infer(store)?;
-    let mut bindings = BindingPlan::new(vec![PlannedBinding {
-        target_name: logical_target.into(),
-        expected_shape: metadata.shape().to_vec(),
-        expected_dtype: metadata.dtype().clone(),
-        recipe,
-    }])
-    .and_then(|plan| plan.build_bindings(store))
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    bindings
-        .pop()
-        .expect("single planned GPT-OSS expert binding")
-        .with_name(local_name)
-        .map_err(Error::from)
-}
-
-fn positive_dimension(value: i32, name: &str) -> Result<usize, Error> {
-    usize::try_from(value)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!("GPT-OSS {name} must be positive, got {value}"))
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,9 +356,4 @@ mod tests {
         assert_eq!(spec.policy.up_absolute_bound(), Some(7.0));
     }
 
-    #[test]
-    fn invalid_catalog_geometry_is_rejected_before_store_access() {
-        assert!(positive_dimension(0, "expert count").is_err());
-        assert!(positive_dimension(-1, "layer count").is_err());
-    }
 }

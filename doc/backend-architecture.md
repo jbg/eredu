@@ -123,6 +123,11 @@ unit index and parameter path, expert-parallel versus replicated placement,
 exact acquired-bank binding names, exact logical parameter targets, and
 checkpoint-derived recipes. Family code owns sparse-layer selection, routed
 versus shared-bank scheduling, expert counts, and cache-layer numbering.
+This applies uniformly to Gemma 4, Muse-Glimmer, DeepSeek, GPT-OSS, and later
+families: each architecture checkpoint module emits its complete
+`ExpertResidencyCatalog`, including compact acquired-bank names and every
+per-expert or rank-local selection recipe. Backend family adapters may request
+and filter that catalog, but do not calculate a parallel expert topology.
 Hybrid target/MTP families additionally declare the execution group, physical
 MTP unit, checkpoint root, and cache identity of every sparse unit in this
 catalog; backend adapters only filter catalog units selected for a stage.

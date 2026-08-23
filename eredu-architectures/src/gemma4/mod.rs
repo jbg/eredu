@@ -21,8 +21,8 @@ pub use assistant::{
 };
 pub use audio::{AudioConfig, AudioConfigError, AudioInput, AudioLayer, AudioStatic, AudioTower};
 pub use checkpoint::{
-    expert_recipes, gguf_plan, mmproj_gguf_plan, safetensors_plan, translate_gguf_weight_name,
-    Gemma4ArtifactConfig,
+    expert_recipes, expert_residency_catalog, gguf_plan, mmproj_gguf_plan, safetensors_plan,
+    translate_gguf_weight_name, Gemma4ArtifactConfig,
 };
 pub use config::{ConfigError, FeedForwardPolicy, GgufTensorCatalog, LayerPolicy, ModelArgs};
 pub use family::{FamilyConfig, FamilyConfigError};

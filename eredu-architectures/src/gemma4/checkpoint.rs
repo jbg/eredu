@@ -6,6 +6,7 @@ use eredu_checkpoint::composite::{
     ArtifactComponentSchema, ArtifactRole, ComponentId, ComponentParameterCatalog,
     CompositeArtifactError, CompositeArtifactSchema, ProjectorCompatibility,
 };
+use eredu_checkpoint::store::TensorSelection;
 use eredu_checkpoint::{
     expert::{
         resolve_gated_product_expert_recipes, GatedProductExpertLayoutNames,
@@ -1116,6 +1117,71 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     resolve_gated_product_expert_recipes(catalog, &names).map_err(|error| error.to_string())
 }
 
+/// Builds the complete architecture-owned schedule for independently resident experts.
+pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    args: &ModelArgs,
+) -> Result<crate::ExpertResidencyCatalog, String> {
+    let experts = usize::try_from(
+        args.num_experts
+            .ok_or_else(|| "Gemma 4 expert residency requires an expert count".to_string())?,
+    )
+    .ok()
+    .filter(|count| *count > 0)
+    .ok_or_else(|| "Gemma 4 expert count must be positive".to_string())?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(|error| error.to_string())?;
+    let mut units = Vec::new();
+    for layer in 0..args.num_hidden_layers() {
+        if args
+            .layer_policy(layer)
+            .is_none_or(|policy| policy.feed_forward != FeedForwardPolicy::DenseWithSparseMoe)
+        {
+            continue;
+        }
+        let unit_path = format!("model.language_model.layers.{layer}");
+        let bank = expert_recipes(catalog, args, "model.language_model.layers", layer)?;
+        for expert in 0..experts {
+            let selection = TensorSelection::Range {
+                axis: 0,
+                start: expert,
+                end: expert
+                    .checked_add(1)
+                    .ok_or_else(|| "Gemma 4 expert index overflowed".to_string())?,
+            };
+            let parameters = [
+                (
+                    "gate_up_proj",
+                    bank.target_gate_up.clone(),
+                    bank.gate_up.clone(),
+                ),
+                ("down_proj", bank.target_down.clone(), bank.down.clone()),
+            ]
+            .into_iter()
+            .map(|(binding, target, recipe)| {
+                let recipe = recipe
+                    .select_bounded(catalog, selection.clone())
+                    .map_err(|error| error.to_string())?;
+                crate::ExpertParameterRecipe::new(binding, target, recipe)
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+            units.push(
+                crate::ExpertResidencyUnit::new(
+                    eredu_runtime::ExpertIdentity::new(layer, expert),
+                    owner_group.clone(),
+                    layer,
+                    &unit_path,
+                    crate::ExpertResidencyDistribution::ExpertParallel,
+                    parameters,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1275,6 +1341,50 @@ mod tests {
             recipes.gate_up,
             DerivedWeightRecipe::Concatenate { axis: 1, .. }
         ));
+    }
+
+    #[test]
+    fn residency_catalog_owns_sparse_schedule_identity_and_bindings() {
+        let args = sparse_args();
+        let root = "model.language_model.layers.0.experts.switch_glu";
+        let catalog = Catalog(BTreeMap::from([
+            (
+                format!("{root}.gate_up_proj"),
+                metadata(&format!("{root}.gate_up_proj"), vec![4, 16, 16]),
+            ),
+            (
+                format!("{root}.down_proj"),
+                metadata(&format!("{root}.down_proj"), vec![4, 16, 8]),
+            ),
+        ]));
+        let residency = expert_residency_catalog(&catalog, &args).unwrap();
+        assert_eq!(residency.units().len(), 4);
+        let first = &residency.units()[0];
+        assert_eq!(first.identity(), eredu_runtime::ExpertIdentity::new(0, 0));
+        assert_eq!(first.owner_group().as_str(), "text_decoder");
+        assert_eq!(first.owner_unit(), 0);
+        assert_eq!(first.unit_path(), "model.language_model.layers.0");
+        assert_eq!(
+            first
+                .parameters()
+                .iter()
+                .map(|parameter| (parameter.binding_name(), parameter.logical_target()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "gate_up_proj",
+                    "model.language_model.layers.0.experts.switch_glu.gate_up_proj"
+                ),
+                (
+                    "down_proj",
+                    "model.language_model.layers.0.experts.switch_glu.down_proj"
+                ),
+            ]
+        );
+        assert_eq!(
+            residency.units()[3].identity(),
+            eredu_runtime::ExpertIdentity::new(0, 3)
+        );
     }
 
     #[test]

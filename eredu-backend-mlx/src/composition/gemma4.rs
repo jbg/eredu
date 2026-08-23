@@ -1927,11 +1927,8 @@ fn attach_expert_cache(
     weights_stream: &Stream,
 ) -> Result<(), Error> {
     let store = model.checkpoint_store_arc();
-    let entries = crate::composition::gemma4_expert::expert_catalog(
-        &model.args.text,
-        store.as_ref(),
-        stream,
-    )?;
+    let entries =
+        crate::composition::gemma4_expert::expert_catalog(&model.args.text, store.as_ref())?;
     model.expert_cache = Some(ExpertCache::new_shared(
         store,
         entries,
