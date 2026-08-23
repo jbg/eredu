@@ -504,6 +504,12 @@ where
                     .iter()
                     .any(|prefix| key.starts_with(prefix))
             })
+            .filter(|key| {
+                !policy
+                    .allowed_suffixes
+                    .iter()
+                    .any(|suffix| key.ends_with(suffix))
+            })
             .cloned()
             .collect()
     };
@@ -715,6 +721,10 @@ where
                     .allowed_prefixes
                     .iter()
                     .any(|prefix| key.starts_with(prefix))
+                || policy
+                    .allowed_suffixes
+                    .iter()
+                    .any(|suffix| key.ends_with(suffix))
             {
                 continue;
             }
@@ -949,12 +959,14 @@ mod tests {
                 strict: true,
                 explicitly_allowed_keys: BTreeSet::from(["allowed".into()]),
                 allowed_prefixes: vec!["cache.".into()],
+                allowed_suffixes: vec![".rotary".into()],
             },
         );
         let catalog = BTreeMap::from([
             safe("required", &[2], StoredDtype::F16),
             safe("allowed", &[1], StoredDtype::I32),
             safe("cache.value", &[1], StoredDtype::I32),
+            safe("layer.rotary", &[1], StoredDtype::F32),
             safe("unexpected", &[1], StoredDtype::F32),
         ]);
         let issues = validate_catalog(
@@ -977,6 +989,19 @@ mod tests {
             &non_strict.catalog_policy,
         )
         .is_empty());
+        let resolved = resolve_catalog(
+            &catalog,
+            &non_strict.identity,
+            &non_strict.common_tensors,
+            &non_strict.layout_groups,
+            &non_strict.catalog_policy,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.unclaimed_keys(),
+            &BTreeSet::from(["unexpected".into()])
+        );
     }
 
     #[test]

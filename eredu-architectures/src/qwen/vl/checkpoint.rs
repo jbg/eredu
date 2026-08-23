@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeCatalog},
-    schema::{CatalogPolicy, SafetensorsCheckpointPlan},
+    schema::SafetensorsCheckpointPlan,
     store::TensorSelection,
 };
 
@@ -18,11 +18,12 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
         vision::safetensors_plan(&args.vision, vision::VisionMode::DeepStack, "model.visual")?;
     text.common_tensors.extend(vision.common_tensors);
     text.layout_groups.extend(vision.layout_groups);
+    let policy = text.catalog_policy;
     SafetensorsCheckpointPlan::new(
         format!("{} composite SafeTensors", args.model_type),
         text.common_tensors,
         text.layout_groups,
-        CatalogPolicy::strict(),
+        policy,
     )
     .map_err(|error| error.to_string())
 }

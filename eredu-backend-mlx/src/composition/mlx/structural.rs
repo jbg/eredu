@@ -920,16 +920,7 @@ pub fn validate_inkling_mmproj_gguf(
         Ok(formats) => formats,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    let audio = formats
-        .iter()
-        .filter(|(name, _)| name.starts_with("audio."))
-        .map(|(name, value)| (name.clone(), *value))
-        .collect();
-    let vision = formats
-        .into_iter()
-        .filter(|(name, _)| name.starts_with("visual."))
-        .collect();
-    args = match args.with_gguf_projector_metadata(model_metadata, metadata, audio, vision) {
+    args = match args.with_gguf_projector_metadata(model_metadata, metadata, formats) {
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };

@@ -196,11 +196,14 @@ pub fn safetensors_plan_with_root(
             }
         }
     }
+    let mut policy = CatalogPolicy::strict();
+    policy.allowed_prefixes.push("rope_freqs.".into());
+    policy.allowed_suffixes.push(".rotary_emb.inv_freq".into());
     SafetensorsCheckpointPlan::new(
         format!("{} SafeTensors", args.model_type),
         common,
         groups,
-        CatalogPolicy::strict(),
+        policy,
     )
     .map_err(|error| error.to_string())
 }
@@ -660,11 +663,13 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
             }
         }
     }
+    let mut policy = CatalogPolicy::non_strict();
+    policy.allowed_prefixes.push("rope_freqs.".into());
     GgufCheckpointPlan::new(
         format!("{:?} GGUF", args.variant),
         tensors,
         Vec::new(),
-        CatalogPolicy::non_strict(),
+        policy,
     )
     .map_err(|error| error.to_string())
 }

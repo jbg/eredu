@@ -781,13 +781,11 @@ pub fn v3_safetensors_plan(
             )?;
         }
     }
-    SafetensorsCheckpointPlan::new(
-        "DeepSeek-V3 SafeTensors",
-        tensors,
-        groups,
-        CatalogPolicy::strict(),
-    )
-    .map_err(|error| error.to_string())
+    let mut policy = CatalogPolicy::strict();
+    policy.allowed_prefixes.push("rope_freqs.".into());
+    policy.allowed_suffixes.push("rotary_emb.inv_freq".into());
+    SafetensorsCheckpointPlan::new("DeepSeek-V3 SafeTensors", tensors, groups, policy)
+        .map_err(|error| error.to_string())
 }
 
 fn add_v3_layer(
@@ -1079,13 +1077,10 @@ pub fn v4_safetensors_plan(args: &V4Args) -> Result<SafetensorsCheckpointPlan, S
             }
         }
     }
-    SafetensorsCheckpointPlan::new(
-        "DeepSeek-V4 SafeTensors",
-        tensors,
-        Vec::new(),
-        CatalogPolicy::non_strict(),
-    )
-    .map_err(|error| error.to_string())
+    let mut policy = CatalogPolicy::non_strict();
+    policy.allowed_suffixes.push("rotary_emb.inv_freq".into());
+    SafetensorsCheckpointPlan::new("DeepSeek-V4 SafeTensors", tensors, Vec::new(), policy)
+        .map_err(|error| error.to_string())
 }
 
 /// Builds the strict llama.cpp DeepSeek-V4 base-model GGUF plan. Routed

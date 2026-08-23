@@ -694,9 +694,10 @@ impl ModelArgs {
         mut self,
         model_metadata: &HashMap<String, MetadataValue>,
         projector_metadata: &HashMap<String, MetadataValue>,
-        audio_formats: HashMap<String, WeightQuantization>,
-        vision_formats: HashMap<String, WeightQuantization>,
+        formats: HashMap<String, WeightQuantization>,
     ) -> Result<Self, ConfigError> {
+        let (audio_formats, vision_formats) =
+            super::checkpoint::partition_mmproj_weight_formats(formats).map_err(invalid)?;
         let architecture = gguf_string(projector_metadata, "general.architecture")?;
         let vision_projector = gguf_string(projector_metadata, "clip.vision.projector_type")?;
         let audio_projector = gguf_string(projector_metadata, "clip.audio.projector_type")?;
@@ -1394,7 +1395,7 @@ mod tests {
             ("clip.audio.num_mel_bins".into(), MetadataValue::Uint32(4)),
         ]);
         let args = args
-            .with_gguf_projector_metadata(&metadata, &projector, HashMap::new(), HashMap::new())
+            .with_gguf_projector_metadata(&metadata, &projector, HashMap::new())
             .unwrap();
         assert_eq!(args.audio_config.unwrap().num_codebooks, 4);
         assert_eq!(args.vision_config.unwrap().patch_size, 40);

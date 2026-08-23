@@ -113,13 +113,11 @@ pub fn safetensors_plan(
             }
         }
     }
-    SafetensorsCheckpointPlan::new(
-        "Llama SafeTensors",
-        tensors,
-        Vec::new(),
-        CatalogPolicy::non_strict(),
-    )
-    .map_err(|error| SafetensorsPlanError::Geometry(error.to_string()))
+    let mut policy = CatalogPolicy::strict();
+    policy.allowed_prefixes.push("rope_freqs.".into());
+    policy.allowed_suffixes.push(".rotary_emb.inv_freq".into());
+    SafetensorsCheckpointPlan::new("Llama SafeTensors", tensors, Vec::new(), policy)
+        .map_err(|error| SafetensorsPlanError::Geometry(error.to_string()))
 }
 
 fn add_safe(
@@ -333,13 +331,10 @@ pub fn gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
             }
         }
     }
-    GgufCheckpointPlan::new(
-        "Llama GGUF",
-        tensors,
-        Vec::new(),
-        CatalogPolicy::non_strict(),
-    )
-    .map_err(|error| error.to_string())
+    let mut policy = CatalogPolicy::strict();
+    policy.allowed_prefixes.push("rope_freqs.".into());
+    GgufCheckpointPlan::new("Llama GGUF", tensors, Vec::new(), policy)
+        .map_err(|error| error.to_string())
 }
 
 fn gguf(

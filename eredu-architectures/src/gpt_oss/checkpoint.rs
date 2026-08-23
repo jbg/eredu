@@ -105,13 +105,11 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
         )?);
     }
 
-    SafetensorsCheckpointPlan::new(
-        "GPT-OSS SafeTensors",
-        tensors,
-        Vec::new(),
-        CatalogPolicy::strict(),
-    )
-    .map_err(|error| error.to_string())
+    let mut policy = CatalogPolicy::strict();
+    policy.allowed_prefixes.push("rope_freqs.".into());
+    policy.allowed_suffixes.push(".rotary_emb.inv_freq".into());
+    SafetensorsCheckpointPlan::new("GPT-OSS SafeTensors", tensors, Vec::new(), policy)
+        .map_err(|error| error.to_string())
 }
 
 /// Returns the exact published SafeTensors storage owned by routed experts.
@@ -629,7 +627,11 @@ mod tests {
         let plan = safetensors_plan(&args()).unwrap();
         assert!(plan.catalog_policy.strict);
         assert!(plan.catalog_policy.explicitly_allowed_keys.is_empty());
-        assert!(plan.catalog_policy.allowed_prefixes.is_empty());
+        assert_eq!(plan.catalog_policy.allowed_prefixes, ["rope_freqs."]);
+        assert_eq!(
+            plan.catalog_policy.allowed_suffixes,
+            [".rotary_emb.inv_freq"]
+        );
         let root = "model.layers.0.mlp.experts";
         let expected = [
             (format!("{root}.gate_up_proj_blocks"), vec![2, 64, 1, 16]),

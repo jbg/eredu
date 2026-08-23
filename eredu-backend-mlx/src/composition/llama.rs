@@ -128,7 +128,7 @@ fn load_neutral_llama(
         options,
         stream,
         weights_stream,
-        |key| key.starts_with("rope_freqs.") || key.ends_with(".rotary_emb.inv_freq"),
+        |_| false,
     )?;
     metadata.set_model_type(args.model_type.clone());
     metadata.set_quantization(args.weight_quantization());
@@ -740,7 +740,7 @@ fn load_neutral_llama_parallel(
         options,
         stream,
         weights_stream,
-        |key| key.starts_with("rope_freqs.") || key.ends_with(".rotary_emb.inv_freq"),
+        |_| false,
         move |_modules, store| {
             let global = MlxModule::new(global_static_modules.clone());
             let bindings = build_module_bindings(&global, "", store)?;

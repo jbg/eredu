@@ -379,6 +379,7 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
     }
     let mut policy = CatalogPolicy::strict();
     policy.allowed_prefixes.push("model.mtp.".into());
+    policy.allowed_suffixes.push(".rotary_emb.inv_freq".into());
     SafetensorsCheckpointPlan::new("Kimi Linear SafeTensors", common, groups, policy)
         .map_err(|error| error.to_string())
 }

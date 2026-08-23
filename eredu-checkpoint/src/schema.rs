@@ -627,6 +627,7 @@ pub struct CatalogPolicy {
     pub strict: bool,
     pub explicitly_allowed_keys: BTreeSet<String>,
     pub allowed_prefixes: Vec<String>,
+    pub allowed_suffixes: Vec<String>,
 }
 
 impl CatalogPolicy {
@@ -635,6 +636,7 @@ impl CatalogPolicy {
             strict: true,
             explicitly_allowed_keys: BTreeSet::new(),
             allowed_prefixes: Vec::new(),
+            allowed_suffixes: Vec::new(),
         }
     }
 
@@ -648,6 +650,8 @@ impl CatalogPolicy {
     fn normalize(&mut self) {
         self.allowed_prefixes.sort();
         self.allowed_prefixes.dedup();
+        self.allowed_suffixes.sort();
+        self.allowed_suffixes.dedup();
     }
 }
 
@@ -688,6 +692,8 @@ pub enum CheckpointPlanError {
     EmptyAllowedKey,
     #[error("checkpoint catalog policy contains an empty allowed prefix")]
     EmptyAllowedPrefix,
+    #[error("checkpoint catalog policy contains an empty allowed suffix")]
+    EmptyAllowedSuffix,
     #[error("checkpoint tensor {key:?} has an empty encoding alternative set")]
     EmptyEncodingSet { key: String },
 }
@@ -940,6 +946,13 @@ fn normalize_plan<T: PhysicalConstraint>(
     {
         return Err(CheckpointPlanError::EmptyAllowedPrefix);
     }
+    if policy
+        .allowed_suffixes
+        .iter()
+        .any(|suffix| suffix.trim().is_empty())
+    {
+        return Err(CheckpointPlanError::EmptyAllowedSuffix);
+    }
     policy.normalize();
     Ok(())
 }
@@ -1145,6 +1158,17 @@ mod tests {
                 CatalogPolicy::strict(),
             ),
             Err(CheckpointPlanError::EmptyEncodingSet { .. })
+        ));
+        let mut empty_suffix = CatalogPolicy::strict();
+        empty_suffix.allowed_suffixes.push(" ".into());
+        assert!(matches!(
+            SafetensorsCheckpointPlan::new(
+                "empty allowed suffix",
+                vec![tensor("a", vec![1])],
+                Vec::new(),
+                empty_suffix,
+            ),
+            Err(CheckpointPlanError::EmptyAllowedSuffix)
         ));
 
         let shared = tensor("shared", vec![1]);

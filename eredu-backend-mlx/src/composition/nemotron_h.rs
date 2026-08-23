@@ -566,10 +566,7 @@ fn load_neutral(
         options,
         stream,
         weights_stream,
-        move |key| {
-            key.ends_with(".rotary_emb.inv_freq")
-                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
-        },
+        move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
         move |modules, store| {
             build_module_bindings_with_recipes(
                 &MlxModule::new(modules.clone()),
@@ -732,10 +729,7 @@ fn load_neutral_parallel(
         options,
         stream,
         weights_stream,
-        move |key| {
-            key.ends_with(".rotary_emb.inv_freq")
-                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
-        },
+        move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
         move |_modules, store| {
             let global = MlxModule::new(global_static_modules.clone());
             let bindings = build_module_bindings_with_recipes(

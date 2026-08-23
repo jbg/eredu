@@ -279,11 +279,7 @@ fn load_neutral_qwen(
         options,
         stream,
         weights_stream,
-        move |key| {
-            key.starts_with("rope_freqs.")
-                || key.ends_with(".rotary_emb.inv_freq")
-                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
-        },
+        move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
@@ -1239,11 +1235,7 @@ fn load_neutral_qwen_parallel(
         options,
         stream,
         weights_stream,
-        move |key| {
-            key.starts_with("rope_freqs.")
-                || key.ends_with(".rotary_emb.inv_freq")
-                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
-        },
+        move |key| external_experts && parameter_name_in_targets(key, &excluded_expert_targets),
         move |_modules, store| {
             let global = MlxModule::new(global_static_modules.clone());
             let bindings = build_module_bindings(&global, "", store)?;

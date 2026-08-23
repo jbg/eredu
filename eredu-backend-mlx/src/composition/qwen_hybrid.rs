@@ -2337,8 +2337,7 @@ fn load_conditional_store(
         stream,
         weights_stream,
         move |key| {
-            key.ends_with("rotary_emb.inv_freq")
-                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
+            external_experts && parameter_name_in_targets(key, &excluded_expert_targets)
         },
         |modules, store| {
             build_module_bindings_with_recipes(
@@ -2430,8 +2429,7 @@ fn load_store(
         stream,
         weights_stream,
         move |key| {
-            key.ends_with("rotary_emb.inv_freq")
-                || (external_experts && parameter_name_in_targets(key, &excluded_expert_targets))
+            external_experts && parameter_name_in_targets(key, &excluded_expert_targets)
         },
         |modules, store| {
             let recipes =

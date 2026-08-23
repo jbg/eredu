@@ -559,11 +559,13 @@ pub fn safetensors_plan(config: &HybridConfig) -> Result<SafetensorsCheckpointPl
             )?;
         }
     }
+    let mut policy = CatalogPolicy::strict();
+    policy.allowed_suffixes.push("rotary_emb.inv_freq".into());
     SafetensorsCheckpointPlan::new(
         format!("{} SafeTensors", config.model_type),
         common,
         groups,
-        CatalogPolicy::strict(),
+        policy,
     )
     .map_err(|error| error.to_string())
 }

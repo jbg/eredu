@@ -106,7 +106,10 @@ expert recipes, including segmented fused-projection selection; backend
 composition binds those recipes without reconstructing the segment equation.
 They also normalize physical checkpoint format metadata onto canonical runtime
 parameters, including fused expert projections, so each backend consumes the
-same family-specific quantization identities.
+same family-specific quantization identities. Catalog policies declare any
+admitted checkpoint-only names by exact key, prefix, or suffix, and composite
+checkpoint schemas partition canonical projector formats by architecture-owned
+component identity; backend composition does not repeat those naming rules.
 
 Parameter-class selection follows the architecture's validated parameter
 description. Backends select exact targets by semantic role, retain the

@@ -2172,17 +2172,8 @@ fn open_gguf_store(
             projector,
             eredu_architectures::inkling::translate_mmproj_weight_name,
         )?;
-        let audio = formats
-            .iter()
-            .filter(|(name, _)| name.starts_with("audio."))
-            .map(|(name, value)| (name.clone(), *value))
-            .collect();
-        let vision = formats
-            .into_iter()
-            .filter(|(name, _)| name.starts_with("visual."))
-            .collect();
         args = args
-            .with_gguf_projector_metadata(metadata, projector_metadata, audio, vision)
+            .with_gguf_projector_metadata(metadata, projector_metadata, formats)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     }
     let text_plan =

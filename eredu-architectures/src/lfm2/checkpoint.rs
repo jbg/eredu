@@ -407,13 +407,10 @@ pub fn safetensors_plan(
         }
     }
 
-    SafetensorsCheckpointPlan::new(
-        "LFM2 SafeTensors",
-        common,
-        groups,
-        CatalogPolicy::non_strict(),
-    )
-    .map_err(|error| error.to_string())
+    let mut policy = CatalogPolicy::non_strict();
+    policy.allowed_suffixes.push(".rotary_emb.inv_freq".into());
+    SafetensorsCheckpointPlan::new("LFM2 SafeTensors", common, groups, policy)
+        .map_err(|error| error.to_string())
 }
 
 fn add_safe_moe(

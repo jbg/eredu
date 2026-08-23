@@ -4,10 +4,9 @@
 //! translation. This module applies those contracts to concrete MLX
 //! SafeTensors and GGUF sources during cold-path validation and loading.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use eredu_architectures::llama::ModelArgs;
-use eredu_checkpoint::schema::SafetensorsTensorConstraint;
 use eredu_checkpoint::WeightQuantization;
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
 use safemlx::Stream;
@@ -50,25 +49,7 @@ pub fn validate_safetensors(
             }]);
         }
     };
-    let mut issues = validation_issues(validation::validate_safetensors_plan(store, &plan));
-    let allowed = physical_keys(&plan.common_tensors);
-    for key in store.keys() {
-        if !allowed.contains(&key)
-            && !key.starts_with("rope_freqs.")
-            && !key.ends_with(".rotary_emb.inv_freq")
-        {
-            issues.push(unexpected(&key, "Llama SafeTensors"));
-        }
-    }
-    CheckpointValidation::from_issues(issues)
-}
-
-fn physical_keys(tensors: &[SafetensorsTensorConstraint]) -> BTreeSet<String> {
-    tensors
-        .iter()
-        .flat_map(|tensor| std::iter::once(&tensor.key).chain(&tensor.aliases))
-        .cloned()
-        .collect()
+    validation::validate_safetensors_plan(store, &plan)
 }
 
 pub fn validate_gguf(
@@ -102,37 +83,7 @@ pub fn validate_gguf(
         Ok(plan) => plan,
         Err(error) => return invalid_geometry(error),
     };
-    let mut issues = validation_issues(validation::validate_gguf_plan(checkpoint, &plan));
-    let allowed = plan
-        .common_tensors
-        .iter()
-        .flat_map(|tensor| std::iter::once(&tensor.key).chain(&tensor.aliases))
-        .collect::<BTreeSet<_>>();
-    for tensor in checkpoint.catalog().tensors() {
-        let name = &tensor.descriptor().name;
-        if !allowed.contains(name) && !name.starts_with("rope_freqs.") {
-            issues.push(unexpected(name, "Llama GGUF"));
-        }
-    }
-    CheckpointValidation::from_issues(issues)
-}
-
-fn validation_issues(validation: CheckpointValidation) -> Vec<CheckpointIssue> {
-    match validation {
-        CheckpointValidation::Exact => Vec::new(),
-        CheckpointValidation::Invalid(issues) => issues,
-        CheckpointValidation::Unverified(issue) => vec![issue],
-    }
-}
-
-fn unexpected(name: &str, loader: &str) -> CheckpointIssue {
-    CheckpointIssue {
-        kind: CheckpointIssueKind::UnexpectedTensor,
-        detail: format!("{loader} catalog contains unexpected tensor {name:?}"),
-        tensor_name: Some(name.into()),
-        tensor_type_code: None,
-        metadata_key: None,
-    }
+    validation::validate_gguf_plan(checkpoint, &plan)
 }
 
 fn invalid_geometry(detail: String) -> CheckpointValidation {

@@ -429,9 +429,7 @@ impl DeepSeekModel {
             stream,
             weights_stream,
             move |key| {
-                key.starts_with("rope_freqs.")
-                    || key.ends_with("rotary_emb.inv_freq")
-                    || excluded_expert_sources.contains(key)
+                excluded_expert_sources.contains(key)
                     || (external_experts
                         && parameter_name_in_targets(key, &excluded_expert_targets))
             },
@@ -508,8 +506,7 @@ impl DeepSeekModel {
             stream,
             weights_stream,
             move |key| {
-                key.ends_with("rotary_emb.inv_freq")
-                    || excluded_expert_sources.contains(key)
+                excluded_expert_sources.contains(key)
                     || (external_experts
                         && parameter_name_in_targets(key, &excluded_expert_targets))
             },
@@ -603,11 +600,7 @@ impl DeepSeekModel {
             weights_stream,
             {
                 let expert_targets = Arc::clone(&expert_targets);
-                move |key| {
-                    key.starts_with("rope_freqs.")
-                        || key.ends_with("rotary_emb.inv_freq")
-                        || parameter_name_in_targets(key, &expert_targets)
-                }
+                move |key| parameter_name_in_targets(key, &expert_targets)
             },
             move |_modules, store| {
                 let bindings =
@@ -688,10 +681,7 @@ impl DeepSeekModel {
             weights_stream,
             {
                 let expert_targets = Arc::clone(&expert_targets);
-                move |key| {
-                    key.ends_with("rotary_emb.inv_freq")
-                        || parameter_name_in_targets(key, &expert_targets)
-                }
+                move |key| parameter_name_in_targets(key, &expert_targets)
             },
             move |_modules, store| {
                 let bindings =

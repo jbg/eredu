@@ -1,6 +1,6 @@
 //! Backend-neutral Inkling checkpoint name normalization and derived recipes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeCatalog},
@@ -1278,6 +1278,40 @@ pub fn translate_mmproj_weight_name(name: &str) -> String {
     name.to_owned()
 }
 
+/// Partitions translated sibling-projector weight formats by the component
+/// that owns each canonical parameter.
+pub(super) fn partition_mmproj_weight_formats<T>(
+    formats: HashMap<String, T>,
+) -> Result<(HashMap<String, T>, HashMap<String, T>), String> {
+    let mut audio = HashMap::new();
+    let mut vision = HashMap::new();
+    for (name, format) in formats {
+        if matches!(
+            name.as_str(),
+            "audio.encoder.weight" | "audio.final_norm.weight"
+        ) {
+            audio.insert(name, format);
+        } else if name == "visual.final_norm.weight" || is_visual_layer_parameter(&name) {
+            vision.insert(name, format);
+        } else {
+            return Err(format!(
+                "Inkling mmproj format map contains unknown canonical parameter {name:?}"
+            ));
+        }
+    }
+    Ok((audio, vision))
+}
+
+fn is_visual_layer_parameter(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("visual.layers.") else {
+        return false;
+    };
+    let Some((layer, parameter)) = rest.split_once('.') else {
+        return false;
+    };
+    layer.parse::<usize>().is_ok() && matches!(parameter, "projection.weight" | "layer_norm.weight")
+}
+
 fn gguf(
     key: impl Into<String>,
     shape: Vec<usize>,
@@ -1328,7 +1362,7 @@ fn checked_add(left: usize, right: usize, name: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use eredu_checkpoint::{
         recipe::{DerivedWeightRecipe, RecipeCatalog},
@@ -1337,8 +1371,9 @@ mod tests {
     };
 
     use super::{
-        dense_w13_recipes, expert_w13_recipe, gguf_plan, mmproj_gguf_plan, safetensors_plan,
-        safetensors_recipes, translate_gguf_weight_name, translate_gguf_weight_name_for_model,
+        dense_w13_recipes, expert_w13_recipe, gguf_plan, mmproj_gguf_plan,
+        partition_mmproj_weight_formats, safetensors_plan, safetensors_recipes,
+        translate_gguf_weight_name, translate_gguf_weight_name_for_model,
         translate_mmproj_weight_name,
     };
     use crate::inkling::ModelArgs;
@@ -1432,6 +1467,19 @@ mod tests {
         assert_eq!(
             translate_mmproj_weight_name("v.hmlp.0.linear.weight"),
             "visual.layers.0.projection.weight"
+        );
+        let (audio, vision) = partition_mmproj_weight_formats(HashMap::from([
+            ("audio.encoder.weight".into(), 1),
+            ("audio.final_norm.weight".into(), 2),
+            ("visual.layers.0.projection.weight".into(), 3),
+            ("visual.final_norm.weight".into(), 4),
+        ]))
+        .unwrap();
+        assert_eq!(audio.len(), 2);
+        assert_eq!(vision.len(), 2);
+        assert!(
+            partition_mmproj_weight_formats(HashMap::from([("decoder.weight".into(), 1,)]))
+                .is_err()
         );
     }
 

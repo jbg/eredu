@@ -465,13 +465,10 @@ pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, S
         }
     }
 
-    SafetensorsCheckpointPlan::new(
-        "Nemotron-H SafeTensors",
-        common,
-        groups,
-        CatalogPolicy::strict(),
-    )
-    .map_err(|error| error.to_string())
+    let mut policy = CatalogPolicy::strict();
+    policy.allowed_suffixes.push(".rotary_emb.inv_freq".into());
+    SafetensorsCheckpointPlan::new("Nemotron-H SafeTensors", common, groups, policy)
+        .map_err(|error| error.to_string())
 }
 
 fn add_safe_layer(
