@@ -14,8 +14,10 @@ use eredu_backend_mlx::native::{
 };
 use eredu_backend_mlx::{
     testing::backend::mlx::runtime::checkpoint::load::StrictLoadConfig,
-    testing::backend::mlx::runtime::distributed::topology::load_safetensors_partition,
-    testing::backend::mlx::{DeviceAssignment, MlxParallelContext, PlacementPlan},
+    testing::backend::mlx::runtime::distributed::topology::{
+        load_safetensors_partition, PlacementPlan,
+    },
+    testing::backend::mlx::{DeviceAssignment, MlxParallelContext},
 };
 use eredu_runtime::TensorPlacement;
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
@@ -109,7 +111,7 @@ fn render_failure(rank: usize, output: &Output) -> String {
 }
 
 /// Run with:
-/// `cargo test -p eredu --test distributed_partition_ring ring_two_process_partition_load -- --ignored --exact --nocapture`
+/// `cargo test -p eredu --features mlx-test-support --lib distributed_partition_ring::ring_two_process_partition_load -- --ignored --exact --nocapture`
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_partition_load() {

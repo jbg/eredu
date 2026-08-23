@@ -3037,9 +3037,11 @@ fn load_policy_admits_fully_resident_inkling_and_nemotron_materialization() {
     ] {
         let options = ModelLoadOptions::with_quantization(quantization);
         for kind in [crate::ModelKind::Inkling, crate::ModelKind::NemotronH] {
-            options
-                .validate_preparation(kind, eredu_core::ArtifactFormat::SafeTensors)
-                .unwrap();
+            eredu_core::validate_preparation_policy(
+                kind.loading_protocol(),
+                options.preparation_policy().unwrap(),
+            )
+            .unwrap();
         }
     }
 }
@@ -3193,11 +3195,17 @@ fn resolve_model_config_normalizes_moshi_family_before_text_loader_admission() {
         normalized.checkpoint_layout(),
         eredu_architectures::moshi::CheckpointLayout::NativeMlx
     );
-    assert!(ModelLoadOptions::default()
-        .validate_preparation(resolved.kind, eredu_core::ArtifactFormat::SafeTensors)
-        .unwrap_err()
-        .to_string()
-        .contains("realtime"));
+    assert!(matches!(
+        eredu_core::validate_preparation_policy(
+            resolved.kind.loading_protocol(),
+            ModelLoadOptions::default().preparation_policy().unwrap(),
+        ),
+        Err(
+            eredu_core::artifact::ArtifactError::UnsupportedLoadingProtocol(
+                eredu_core::LoadingProtocol::Realtime
+            )
+        )
+    ));
 
     let persona = json!({"model_type": "personaplex", "version": "7b-v1"});
     let resolved = resolve_model_config(&persona).unwrap();
