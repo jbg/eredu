@@ -1,4 +1,4 @@
-//! Pure parallel topology coordinates, membership, and placement validation.
+//! Pure parallel topology coordinates and membership validation.
 
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
@@ -517,26 +517,6 @@ pub fn balanced_contiguous_range(
         .checked_add(base + usize::from(index < extra))
         .ok_or(TopologyError::PartitionOverflow)?;
     Ok(start..end)
-}
-
-/// Portable tensor placement description.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TensorPlacement {
-    /// Identical copy on every member.
-    Replicated,
-    /// One dimension partitioned over an axis.
-    Sharded {
-        /// Tensor dimension.
-        dimension: usize,
-        /// Parallel axis.
-        axis: ParallelAxis,
-    },
-    /// Tensor is owned by exactly one rank.
-    RankLocal {
-        /// Owning world rank.
-        rank: usize,
-    },
 }
 
 /// Topology validation error.

@@ -411,8 +411,9 @@ results.
 ## Distributed execution
 
 Portable topology uses data, tensor, pipeline, and expert axes. Core validates
-rank coordinates, subgroup membership, balanced ownership, placement, and
-operation scopes.
+rank coordinates, subgroup membership, balanced ownership, and operation
+scopes. Runtime owns the backend-neutral tensor-placement decisions consumed by
+architecture planning and concrete backend realization.
 
 `ArchitecturePartition` is publicly constructed only through
 `from_architecture`, which derives its execution graph and unit layout from the

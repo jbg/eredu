@@ -137,6 +137,5 @@ pub use speculative::{
 };
 pub use topology::{
     balanced_contiguous_range, ParallelAxis, ParallelCoordinates, ParallelRankTopology,
-    ParallelTopology, SubgroupMembership, TensorPlacement as PortableTensorPlacement,
-    TopologyError, TopologyPreflightReport,
+    ParallelTopology, SubgroupMembership, TopologyError, TopologyPreflightReport,
 };
