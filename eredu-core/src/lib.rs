@@ -48,9 +48,9 @@ pub mod topology;
 
 pub use artifact::{
     gguf_u32_metadata_values, inspect_artifact, plan_model_preparation,
-    validate_preparation_policy, ArtifactFormat, ArtifactInspection, GgufArchitecture,
-    MaterializationRoute, ModelArtifact, ModelConfiguration, ModelConfigurationResolver, ModelKind,
-    ModelPreparationPlan, PreparationPolicy, QuantizationRequest, ResidencyRequest, ValidatedGguf,
+    validate_preparation_policy, ArtifactFormat, ArtifactInspection, MaterializationRoute,
+    ModelArtifact, ModelConfiguration, ModelConfigurationResolver, ModelKind, ModelPreparationPlan,
+    PreparationPolicy, QuantizationRequest, ResidencyRequest, ValidatedGguf,
 };
 pub use attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use automatic::{

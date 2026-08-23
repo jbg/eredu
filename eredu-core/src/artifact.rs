@@ -105,136 +105,6 @@ impl ModelKind {
     }
 }
 
-/// GGUF architecture value resolved independently of an execution backend.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GgufArchitecture {
-    /// `kimi-linear`.
-    KimiLinear,
-    /// `deepseek2`.
-    DeepSeek2,
-    /// `deepseek4`.
-    DeepSeek4,
-    /// `gpt-oss`.
-    GptOss,
-    /// `inkling`.
-    Inkling,
-    /// `gemma4`.
-    Gemma4,
-    /// `llama`.
-    Llama,
-    /// `mistral`.
-    Mistral,
-    /// `muse-glimmer`.
-    MuseGlimmer,
-    /// `lfm2`.
-    Lfm2,
-    /// `lfm2moe`.
-    Lfm2Moe,
-    /// `nemotron_h`.
-    NemotronH,
-    /// `nemotron_h_moe`.
-    NemotronHMoe,
-    /// `qwen2`.
-    Qwen2,
-    /// `qwen3`.
-    Qwen3,
-    /// `qwen3moe`.
-    Qwen3Moe,
-    /// `qwen3vl`.
-    Qwen3Vl,
-    /// `qwen3vlmoe`.
-    Qwen3VlMoe,
-    /// `qwen35`.
-    Qwen35,
-    /// `qwen35moe`.
-    Qwen35Moe,
-    /// `qwen3next`.
-    Qwen3Next,
-}
-
-impl GgufArchitecture {
-    /// Accepted `general.architecture` values.
-    pub const SUPPORTED_NAMES: &'static str = "kimi-linear, deepseek2, deepseek4, gpt-oss, inkling, gemma4, llama, mistral, muse-glimmer, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen2, qwen3, qwen3moe, qwen3vl, qwen3vlmoe, qwen35, qwen35moe, and qwen3next";
-
-    /// Resolves `general.architecture`.
-    pub fn resolve(name: &str) -> Result<Self, ArtifactError> {
-        match name {
-            "kimi-linear" => Ok(Self::KimiLinear),
-            "deepseek2" => Ok(Self::DeepSeek2),
-            "deepseek4" => Ok(Self::DeepSeek4),
-            "gpt-oss" => Ok(Self::GptOss),
-            "inkling" => Ok(Self::Inkling),
-            "gemma4" => Ok(Self::Gemma4),
-            "llama" => Ok(Self::Llama),
-            "mistral" => Ok(Self::Mistral),
-            "muse-glimmer" => Ok(Self::MuseGlimmer),
-            "lfm2" => Ok(Self::Lfm2),
-            "lfm2moe" => Ok(Self::Lfm2Moe),
-            "nemotron_h" => Ok(Self::NemotronH),
-            "nemotron_h_moe" => Ok(Self::NemotronHMoe),
-            "qwen2" => Ok(Self::Qwen2),
-            "qwen3" => Ok(Self::Qwen3),
-            "qwen3moe" => Ok(Self::Qwen3Moe),
-            "qwen3vl" => Ok(Self::Qwen3Vl),
-            "qwen3vlmoe" => Ok(Self::Qwen3VlMoe),
-            "qwen35" => Ok(Self::Qwen35),
-            "qwen35moe" => Ok(Self::Qwen35Moe),
-            "qwen3next" => Ok(Self::Qwen3Next),
-            other => Err(ArtifactError::UnsupportedGgufArchitecture(other.into())),
-        }
-    }
-
-    /// General model family implemented by this GGUF architecture.
-    pub const fn model_kind(self) -> ModelKind {
-        match self {
-            Self::KimiLinear => ModelKind::KimiLinear,
-            Self::DeepSeek2 => ModelKind::DeepSeekV3,
-            Self::DeepSeek4 => ModelKind::DeepSeekV4,
-            Self::GptOss => ModelKind::GptOss,
-            Self::Inkling => ModelKind::Inkling,
-            Self::Gemma4 => ModelKind::Gemma4,
-            Self::Llama | Self::Mistral => ModelKind::Llama,
-            Self::MuseGlimmer => ModelKind::MuseGlimmer,
-            Self::Lfm2 | Self::Lfm2Moe => ModelKind::Lfm2,
-            Self::NemotronH | Self::NemotronHMoe => ModelKind::NemotronH,
-            Self::Qwen2 => ModelKind::Qwen2,
-            Self::Qwen3 | Self::Qwen3Moe => ModelKind::Qwen3,
-            Self::Qwen3Vl => ModelKind::Qwen3Vl,
-            Self::Qwen3VlMoe => ModelKind::Qwen3VlMoe,
-            Self::Qwen35 | Self::Qwen35Moe => ModelKind::Qwen35,
-            Self::Qwen3Next => ModelKind::Qwen3Next,
-        }
-    }
-
-    /// Exact metadata spelling.
-    pub const fn metadata_name(self) -> &'static str {
-        match self {
-            Self::KimiLinear => "kimi-linear",
-            Self::DeepSeek2 => "deepseek2",
-            Self::DeepSeek4 => "deepseek4",
-            Self::GptOss => "gpt-oss",
-            Self::Inkling => "inkling",
-            Self::Gemma4 => "gemma4",
-            Self::Llama => "llama",
-            Self::Mistral => "mistral",
-            Self::MuseGlimmer => "muse-glimmer",
-            Self::Lfm2 => "lfm2",
-            Self::Lfm2Moe => "lfm2moe",
-            Self::NemotronH => "nemotron_h",
-            Self::NemotronHMoe => "nemotron_h_moe",
-            Self::Qwen2 => "qwen2",
-            Self::Qwen3 => "qwen3",
-            Self::Qwen3Moe => "qwen3moe",
-            Self::Qwen3Vl => "qwen3vl",
-            Self::Qwen3VlMoe => "qwen3vlmoe",
-            Self::Qwen35 => "qwen35",
-            Self::Qwen35Moe => "qwen35moe",
-            Self::Qwen3Next => "qwen3next",
-        }
-    }
-}
-
 /// Artifact container selected during inspection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -257,18 +127,22 @@ pub struct ModelConfiguration {
     /// Raw JSON configuration for SafeTensors artifacts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json: Option<Value>,
-    /// Exact GGUF architecture for GGUF artifacts.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gguf_architecture: Option<GgufArchitecture>,
 }
 
 /// Architecture-owned resolver used by neutral artifact inspection.
 ///
 /// Core owns the transport contract but deliberately does not recognize model
-/// family aliases or nested configuration wrappers.
+/// family aliases, GGUF architecture spellings, or nested configuration wrappers.
 pub trait ModelConfigurationResolver {
     /// Resolves one Hugging Face `config.json` value to its canonical family.
-    fn resolve(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError>;
+    fn resolve_safetensors(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError>;
+
+    /// Resolves and structurally admits one GGUF architecture and checkpoint.
+    fn resolve_gguf(
+        &self,
+        architecture: &str,
+        checkpoint: &GgufCheckpoint,
+    ) -> Result<ModelConfiguration, ArtifactError>;
 }
 
 /// Parses an optional GGUF integer metadata value as lossless `u32` values.
@@ -302,16 +176,10 @@ pub struct ArtifactInspection {
 /// but do not need to repeat the portable metadata and catalog validation.
 #[derive(Debug, Clone)]
 pub struct ValidatedGguf {
-    architecture: GgufArchitecture,
     checkpoint: GgufCheckpoint,
 }
 
 impl ValidatedGguf {
-    /// Exact GGUF architecture admitted by portable inspection.
-    pub const fn architecture(&self) -> GgufArchitecture {
-        self.architecture
-    }
-
     /// Header-only checkpoint admitted by portable inspection.
     pub fn checkpoint(&self) -> &GgufCheckpoint {
         &self.checkpoint
@@ -470,7 +338,7 @@ pub fn inspect_artifact(
 ) -> Result<ArtifactInspection, ArtifactError> {
     let path = path.as_ref();
     if is_gguf(path) {
-        inspect_gguf(path)
+        inspect_gguf(path, resolver)
     } else if path.is_dir() {
         inspect_safetensors(path, resolver)
     } else if !path.exists() {
@@ -511,15 +379,18 @@ pub fn validate_preparation_policy(
     Ok(route)
 }
 
-fn inspect_gguf(path: &Path) -> Result<ArtifactInspection, ArtifactError> {
+fn inspect_gguf(
+    path: &Path,
+    resolver: &impl ModelConfigurationResolver,
+) -> Result<ArtifactInspection, ArtifactError> {
     let checkpoint = GgufCheckpoint::open(path)?;
     let architecture_name = checkpoint
         .metadata()
         .get("general.architecture")
         .and_then(MetadataValue::as_str)
         .ok_or(ArtifactError::MissingGgufArchitecture)?;
-    let architecture = GgufArchitecture::resolve(architecture_name)?;
-    validate_gguf_floor(architecture, &checkpoint)?;
+    let configuration = resolver.resolve_gguf(architecture_name, &checkpoint)?;
+    validate_gguf_floor(architecture_name, &checkpoint)?;
     let tensors = checkpoint
         .tensors()
         .map(|tensor| {
@@ -548,23 +419,14 @@ fn inspect_gguf(path: &Path) -> Result<ArtifactInspection, ArtifactError> {
     Ok(ArtifactInspection {
         path: path.to_path_buf(),
         format: ArtifactFormat::Gguf,
-        configuration: ModelConfiguration {
-            declared_model_type: architecture_name.into(),
-            effective_model_type: architecture_name.into(),
-            kind: architecture.model_kind(),
-            json: None,
-            gguf_architecture: Some(architecture),
-        },
+        configuration,
         tensors,
-        validated_gguf: Some(ValidatedGguf {
-            architecture,
-            checkpoint,
-        }),
+        validated_gguf: Some(ValidatedGguf { checkpoint }),
     })
 }
 
 fn validate_gguf_floor(
-    architecture: GgufArchitecture,
+    architecture: &str,
     checkpoint: &GgufCheckpoint,
 ) -> Result<(), ArtifactError> {
     if checkpoint.physical_tensor_count() == 0 {
@@ -572,7 +434,7 @@ fn validate_gguf_floor(
             "GGUF model checkpoint contains no tensors".into(),
         ));
     }
-    let prefix = architecture.metadata_name();
+    let prefix = architecture;
     for suffix in ["block_count", "embedding_length"] {
         let key = format!("{prefix}.{suffix}");
         let value = checkpoint
@@ -598,17 +460,6 @@ fn validate_gguf_floor(
             "GGUF model checkpoint is missing required tensor \"token_embd.weight\"".into(),
         ));
     }
-    if matches!(
-        architecture,
-        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next
-    ) && checkpoint.tensors().any(|tensor| {
-        let name = tensor.descriptor().name.as_str();
-        name.starts_with("v.") || name.starts_with("mm.")
-    }) {
-        return Err(ArtifactError::InvalidArtifact(
-            "multimodal Qwen3-Next/Qwen3.5 GGUF checkpoints are not supported".into(),
-        ));
-    }
     Ok(())
 }
 
@@ -618,7 +469,7 @@ fn inspect_safetensors(
 ) -> Result<ArtifactInspection, ArtifactError> {
     let config_path = path.join("config.json");
     let json: Value = serde_json::from_reader(File::open(&config_path)?)?;
-    let configuration = resolver.resolve(&json)?;
+    let configuration = resolver.resolve_safetensors(&json)?;
     let shards = safetensors_shards(path)?;
     let mut descriptors = Vec::new();
     let mut names = BTreeSet::new();
@@ -836,7 +687,7 @@ mod tests {
     struct FixtureResolver;
 
     impl ModelConfigurationResolver for FixtureResolver {
-        fn resolve(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError> {
+        fn resolve_safetensors(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError> {
             let model_type = json
                 .get("model_type")
                 .and_then(Value::as_str)
@@ -851,7 +702,23 @@ mod tests {
                 effective_model_type: model_type.into(),
                 kind,
                 json: Some(json.clone()),
-                gguf_architecture: None,
+            })
+        }
+
+        fn resolve_gguf(
+            &self,
+            architecture: &str,
+            _checkpoint: &GgufCheckpoint,
+        ) -> Result<ModelConfiguration, ArtifactError> {
+            let kind = match architecture {
+                "llama" => ModelKind::Llama,
+                other => return Err(ArtifactError::UnsupportedGgufArchitecture(other.into())),
+            };
+            Ok(ModelConfiguration {
+                declared_model_type: architecture.into(),
+                effective_model_type: architecture.into(),
+                kind,
+                json: None,
             })
         }
     }
@@ -1022,8 +889,8 @@ mod tests {
 
         let inspection = inspect_artifact(&path, &FixtureResolver).unwrap();
         let validated = inspection.validated_gguf().unwrap();
-        assert_eq!(validated.architecture(), GgufArchitecture::Llama);
         assert_eq!(validated.checkpoint().physical_tensor_count(), 1);
+        assert_eq!(inspection.configuration().declared_model_type, "llama");
 
         let plan = plan_model_preparation(inspection, PreparationPolicy::default()).unwrap();
         let ModelArtifact::Gguf {

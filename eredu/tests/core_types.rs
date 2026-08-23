@@ -7,10 +7,6 @@ fn facade_exports_are_the_canonical_core_types() {
         TypeId::of::<eredu::core::artifact::ModelKind>(),
     );
     assert_eq!(
-        TypeId::of::<eredu::GgufArchitecture>(),
-        TypeId::of::<eredu::core::artifact::GgufArchitecture>(),
-    );
-    assert_eq!(
         TypeId::of::<eredu::PreparationPolicy>(),
         TypeId::of::<eredu::core::artifact::PreparationPolicy>(),
     );

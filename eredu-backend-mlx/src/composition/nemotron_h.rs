@@ -2218,7 +2218,8 @@ pub(crate) fn prepare_gguf(
 ) -> Result<PreparedGguf, Error> {
     if !matches!(
         source.architecture(),
-        eredu_core::GgufArchitecture::NemotronH | eredu_core::GgufArchitecture::NemotronHMoe
+        eredu_architectures::GgufArchitecture::NemotronH
+            | eredu_architectures::GgufArchitecture::NemotronHMoe
     ) {
         return Err(Error::UnsupportedArchitecture(format!(
             "Nemotron-H GGUF loader received architecture {:?}",

@@ -986,9 +986,9 @@ pub(crate) fn load_gguf(
 ) -> Result<(QwenHybridModel, Vec<u32>), Error> {
     if !matches!(
         source.architecture(),
-        eredu_core::GgufArchitecture::Qwen35
-            | eredu_core::GgufArchitecture::Qwen35Moe
-            | eredu_core::GgufArchitecture::Qwen3Next
+        eredu_architectures::GgufArchitecture::Qwen35
+            | eredu_architectures::GgufArchitecture::Qwen35Moe
+            | eredu_architectures::GgufArchitecture::Qwen3Next
     ) {
         return Err(Error::UnsupportedArchitecture(format!(
             "Qwen hybrid GGUF loader received architecture {:?}",

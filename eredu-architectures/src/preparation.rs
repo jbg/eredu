@@ -4,9 +4,11 @@ use std::{collections::HashMap, fmt::Display};
 
 use eredu_checkpoint::schema::SafetensorsCheckpointPlan;
 use eredu_core::checkpoint::{TensorCatalog, TensorDtype};
-use eredu_core::{GgufArchitecture, InputModalities, ModelKind};
+use eredu_core::{InputModalities, ModelKind};
 use eredu_gguf::{Checkpoint as GgufCheckpoint, MetadataValue};
 use serde_json::Value;
+
+use crate::GgufArchitecture;
 
 /// Preparation-relevant facts derived from one exact normalized architecture.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

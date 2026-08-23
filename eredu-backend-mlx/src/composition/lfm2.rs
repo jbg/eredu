@@ -1493,10 +1493,11 @@ pub(crate) struct PreparedGguf {
 pub(crate) fn prepare_gguf(
     source: &crate::composition::mlx::structural::AdmittedGguf,
 ) -> Result<PreparedGguf, Error> {
-    let is_moe = source.architecture() == eredu_core::GgufArchitecture::Lfm2Moe;
+    let is_moe = source.architecture() == eredu_architectures::GgufArchitecture::Lfm2Moe;
     if !matches!(
         source.architecture(),
-        eredu_core::GgufArchitecture::Lfm2 | eredu_core::GgufArchitecture::Lfm2Moe
+        eredu_architectures::GgufArchitecture::Lfm2
+            | eredu_architectures::GgufArchitecture::Lfm2Moe
     ) {
         return Err(Error::UnsupportedArchitecture(format!(
             "LFM2 GGUF loader received architecture {:?}",

@@ -4,7 +4,8 @@ use eredu_checkpoint::WeightQuantization;
 
 use std::path::Path;
 
-use eredu_core::{GgufArchitecture, ModelArtifact, ModelKind, ModelPreparationPlan};
+use eredu_architectures::GgufArchitecture;
+use eredu_core::{ModelArtifact, ModelKind, ModelPreparationPlan};
 #[cfg(feature = "media")]
 use safemlx::ops::GgufCheckpoint;
 use safemlx::{ops::GgufMetadataValue, Stream};
@@ -659,9 +660,7 @@ fn materialize_gguf_artifact(
     };
     let checkpoint = safemlx::ops::GgufCheckpoint::from_portable(checkpoint);
     let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-    let architecture = configuration.gguf_architecture.ok_or_else(|| {
-        Error::UnsupportedArchitecture("backend-neutral GGUF plan omitted its architecture".into())
-    })?;
+    let architecture = GgufArchitecture::resolve(&configuration.declared_model_type)?;
     let source = structural::admit_gguf(architecture, checkpoint, metadata, options)?;
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();

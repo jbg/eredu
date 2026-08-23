@@ -6,11 +6,12 @@ use std::{
 };
 
 use crate::composition::mlx::structural;
+use eredu_architectures::GgufArchitecture;
 use eredu_checkpoint::store::WeightStore;
 use eredu_core::{
-    ArtifactFormat, ArtifactModality, ArtifactTensorEncoding, GgufArchitecture, InputModalities,
-    InspectionIssue, InspectionIssueCode, InspectionReadiness, InspectionRequirement,
-    InspectionSeverity, ModelInspectionReport, Observed,
+    ArtifactFormat, ArtifactModality, ArtifactTensorEncoding, InputModalities, InspectionIssue,
+    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
+    ModelInspectionReport, Observed,
 };
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use safemlx::ops::GgufCheckpoint;
@@ -323,7 +324,9 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
     let validated = portable
         .validated_gguf()
         .expect("GGUF inspection must expose its validated GGUF result");
-    let gguf_architecture = validated.architecture();
+    let gguf_architecture =
+        GgufArchitecture::resolve(&portable.configuration().declared_model_type)
+            .expect("GGUF inspection must resolve through the architecture registry");
     let checkpoint = GgufCheckpoint::from_portable(validated.checkpoint().clone());
     report.container = InspectionReadiness::Ready;
     report.model_kind = Some(gguf_architecture.model_kind());

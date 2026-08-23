@@ -1,9 +1,10 @@
-//! Authoritative Hugging Face family identity and configuration validation.
+//! Authoritative Hugging Face and GGUF family identity and configuration validation.
 
 use eredu_core::{
     artifact::ArtifactError, ModelConfiguration, ModelConfigurationResolver, ModelKind,
 };
-use serde::Deserialize;
+use eredu_gguf::Checkpoint as GgufCheckpoint;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
@@ -15,9 +16,179 @@ pub struct ModelConfigurations;
 pub static MODEL_CONFIGURATIONS: ModelConfigurations = ModelConfigurations;
 
 impl ModelConfigurationResolver for ModelConfigurations {
-    fn resolve(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError> {
+    fn resolve_safetensors(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError> {
         resolve_model_configuration(json)
     }
+
+    fn resolve_gguf(
+        &self,
+        architecture: &str,
+        checkpoint: &GgufCheckpoint,
+    ) -> Result<ModelConfiguration, ArtifactError> {
+        resolve_gguf_configuration(architecture, checkpoint)
+    }
+}
+
+/// Architecture-owned GGUF family identity.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GgufArchitecture {
+    /// `kimi-linear`.
+    KimiLinear,
+    /// `deepseek2`.
+    DeepSeek2,
+    /// `deepseek4`.
+    DeepSeek4,
+    /// `gpt-oss`.
+    GptOss,
+    /// `inkling`.
+    Inkling,
+    /// `gemma4`.
+    Gemma4,
+    /// `llama`.
+    Llama,
+    /// `mistral`.
+    Mistral,
+    /// `muse-glimmer`.
+    MuseGlimmer,
+    /// `lfm2`.
+    Lfm2,
+    /// `lfm2moe`.
+    Lfm2Moe,
+    /// `nemotron_h`.
+    NemotronH,
+    /// `nemotron_h_moe`.
+    NemotronHMoe,
+    /// `qwen2`.
+    Qwen2,
+    /// `qwen3`.
+    Qwen3,
+    /// `qwen3moe`.
+    Qwen3Moe,
+    /// `qwen3vl`.
+    Qwen3Vl,
+    /// `qwen3vlmoe`.
+    Qwen3VlMoe,
+    /// `qwen35`.
+    Qwen35,
+    /// `qwen35moe`.
+    Qwen35Moe,
+    /// `qwen3next`.
+    Qwen3Next,
+}
+
+impl GgufArchitecture {
+    /// Accepted `general.architecture` values.
+    pub const SUPPORTED_NAMES: &'static str = "kimi-linear, deepseek2, deepseek4, gpt-oss, inkling, gemma4, llama, mistral, muse-glimmer, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen2, qwen3, qwen3moe, qwen3vl, qwen3vlmoe, qwen35, qwen35moe, and qwen3next";
+
+    /// Resolves `general.architecture` through the architecture registry.
+    pub fn resolve(name: &str) -> Result<Self, ArtifactError> {
+        match name {
+            "kimi-linear" => Ok(Self::KimiLinear),
+            "deepseek2" => Ok(Self::DeepSeek2),
+            "deepseek4" => Ok(Self::DeepSeek4),
+            "gpt-oss" => Ok(Self::GptOss),
+            "inkling" => Ok(Self::Inkling),
+            "gemma4" => Ok(Self::Gemma4),
+            "llama" => Ok(Self::Llama),
+            "mistral" => Ok(Self::Mistral),
+            "muse-glimmer" => Ok(Self::MuseGlimmer),
+            "lfm2" => Ok(Self::Lfm2),
+            "lfm2moe" => Ok(Self::Lfm2Moe),
+            "nemotron_h" => Ok(Self::NemotronH),
+            "nemotron_h_moe" => Ok(Self::NemotronHMoe),
+            "qwen2" => Ok(Self::Qwen2),
+            "qwen3" => Ok(Self::Qwen3),
+            "qwen3moe" => Ok(Self::Qwen3Moe),
+            "qwen3vl" => Ok(Self::Qwen3Vl),
+            "qwen3vlmoe" => Ok(Self::Qwen3VlMoe),
+            "qwen35" => Ok(Self::Qwen35),
+            "qwen35moe" => Ok(Self::Qwen35Moe),
+            "qwen3next" => Ok(Self::Qwen3Next),
+            other => Err(ArtifactError::UnsupportedGgufArchitecture(other.into())),
+        }
+    }
+
+    /// General model family implemented by this GGUF architecture.
+    pub const fn model_kind(self) -> ModelKind {
+        match self {
+            Self::KimiLinear => ModelKind::KimiLinear,
+            Self::DeepSeek2 => ModelKind::DeepSeekV3,
+            Self::DeepSeek4 => ModelKind::DeepSeekV4,
+            Self::GptOss => ModelKind::GptOss,
+            Self::Inkling => ModelKind::Inkling,
+            Self::Gemma4 => ModelKind::Gemma4,
+            Self::Llama | Self::Mistral => ModelKind::Llama,
+            Self::MuseGlimmer => ModelKind::MuseGlimmer,
+            Self::Lfm2 | Self::Lfm2Moe => ModelKind::Lfm2,
+            Self::NemotronH | Self::NemotronHMoe => ModelKind::NemotronH,
+            Self::Qwen2 => ModelKind::Qwen2,
+            Self::Qwen3 | Self::Qwen3Moe => ModelKind::Qwen3,
+            Self::Qwen3Vl => ModelKind::Qwen3Vl,
+            Self::Qwen3VlMoe => ModelKind::Qwen3VlMoe,
+            Self::Qwen35 | Self::Qwen35Moe => ModelKind::Qwen35,
+            Self::Qwen3Next => ModelKind::Qwen3Next,
+        }
+    }
+
+    /// Exact metadata spelling.
+    pub const fn metadata_name(self) -> &'static str {
+        match self {
+            Self::KimiLinear => "kimi-linear",
+            Self::DeepSeek2 => "deepseek2",
+            Self::DeepSeek4 => "deepseek4",
+            Self::GptOss => "gpt-oss",
+            Self::Inkling => "inkling",
+            Self::Gemma4 => "gemma4",
+            Self::Llama => "llama",
+            Self::Mistral => "mistral",
+            Self::MuseGlimmer => "muse-glimmer",
+            Self::Lfm2 => "lfm2",
+            Self::Lfm2Moe => "lfm2moe",
+            Self::NemotronH => "nemotron_h",
+            Self::NemotronHMoe => "nemotron_h_moe",
+            Self::Qwen2 => "qwen2",
+            Self::Qwen3 => "qwen3",
+            Self::Qwen3Moe => "qwen3moe",
+            Self::Qwen3Vl => "qwen3vl",
+            Self::Qwen3VlMoe => "qwen3vlmoe",
+            Self::Qwen35 => "qwen35",
+            Self::Qwen35Moe => "qwen35moe",
+            Self::Qwen3Next => "qwen3next",
+        }
+    }
+}
+
+fn resolve_gguf_configuration(
+    name: &str,
+    checkpoint: &GgufCheckpoint,
+) -> Result<ModelConfiguration, ArtifactError> {
+    let architecture = GgufArchitecture::resolve(name)?;
+    validate_gguf_structure(architecture, checkpoint)?;
+    Ok(ModelConfiguration {
+        declared_model_type: name.into(),
+        effective_model_type: name.into(),
+        kind: architecture.model_kind(),
+        json: None,
+    })
+}
+
+fn validate_gguf_structure(
+    architecture: GgufArchitecture,
+    checkpoint: &GgufCheckpoint,
+) -> Result<(), ArtifactError> {
+    if matches!(
+        architecture,
+        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next
+    ) && checkpoint.tensors().any(|tensor| {
+        let name = tensor.descriptor().name.as_str();
+        name.starts_with("v.") || name.starts_with("mm.")
+    }) {
+        return Err(ArtifactError::InvalidArtifact(
+            "multimodal Qwen3-Next/Qwen3.5 GGUF checkpoints are not supported".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -92,7 +263,6 @@ pub fn resolve_model_configuration(json: &Value) -> Result<ModelConfiguration, A
         effective_model_type,
         kind,
         json: Some(json.clone()),
-        gguf_architecture: None,
     })
 }
 
@@ -236,6 +406,8 @@ pub fn resolve_assistant_model_kind(json: &Value) -> Result<AssistantModelKind, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eredu_gguf::{GgmlType, MetadataValue, TensorInput, Writer};
+    use std::{collections::BTreeMap, fs::File};
 
     #[test]
     fn nested_wrappers_and_aliases_resolve_in_one_registry() {
@@ -265,5 +437,61 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.kind, ModelKind::Qwen3VlMoe);
         assert_eq!(resolved.effective_model_type, "qwen3_vl_moe_text");
+    }
+
+    #[test]
+    fn gguf_spellings_resolve_only_through_the_architecture_registry() {
+        assert_eq!(
+            GgufArchitecture::resolve("qwen2").unwrap(),
+            GgufArchitecture::Qwen2
+        );
+        for nearby in ["qwen", "qwen2moe", "qwen2vl", "qwen2.5"] {
+            assert!(matches!(
+                GgufArchitecture::resolve(nearby),
+                Err(ArtifactError::UnsupportedGgufArchitecture(name)) if name == nearby
+            ));
+        }
+    }
+
+    #[test]
+    fn gguf_inspection_applies_architecture_owned_qwen_structure_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("model.gguf");
+        let scalar = 1.0_f32.to_le_bytes();
+        let metadata = BTreeMap::from([
+            (
+                "general.architecture".into(),
+                MetadataValue::String("qwen35".into()),
+            ),
+            ("qwen35.block_count".into(), MetadataValue::Uint32(1)),
+            ("qwen35.embedding_length".into(), MetadataValue::Uint32(1)),
+        ]);
+        Writer::default()
+            .write(
+                File::create(&path).unwrap(),
+                &metadata,
+                &[
+                    TensorInput {
+                        name: "token_embd.weight",
+                        dimensions: &[1],
+                        ggml_type: GgmlType::F32,
+                        data: &scalar,
+                    },
+                    TensorInput {
+                        name: "v.patch_embd.weight",
+                        dimensions: &[1],
+                        ggml_type: GgmlType::F32,
+                        data: &scalar,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let error = inspect_artifact(&path).unwrap_err();
+        assert!(matches!(
+            error,
+            ArtifactError::InvalidArtifact(detail)
+                if detail.contains("multimodal Qwen3-Next/Qwen3.5")
+        ));
     }
 }

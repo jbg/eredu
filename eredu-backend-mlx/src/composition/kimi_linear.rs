@@ -1479,7 +1479,7 @@ pub(crate) struct PreparedGguf {
 pub(crate) fn prepare_gguf(
     source: &crate::composition::mlx::structural::AdmittedGguf,
 ) -> Result<PreparedGguf, Error> {
-    if source.architecture() != eredu_core::GgufArchitecture::KimiLinear {
+    if source.architecture() != eredu_architectures::GgufArchitecture::KimiLinear {
         return Err(Error::UnsupportedArchitecture(format!(
             "Kimi Linear GGUF loader received architecture {:?}",
             source.architecture()

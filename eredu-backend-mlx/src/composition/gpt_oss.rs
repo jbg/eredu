@@ -1852,7 +1852,7 @@ pub(crate) struct PreparedGptOssGguf {
 pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
     source: &crate::composition::mlx::structural::AdmittedGguf,
 ) -> Result<PreparedGptOssGguf, Error> {
-    if source.architecture() != eredu_core::GgufArchitecture::GptOss {
+    if source.architecture() != eredu_architectures::GgufArchitecture::GptOss {
         return Err(Error::UnsupportedArchitecture(format!(
             "GPT-OSS GGUF loader received architecture {:?}",
             source.architecture()

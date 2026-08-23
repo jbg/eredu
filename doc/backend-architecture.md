@@ -67,13 +67,16 @@ generic over `NeuralBackend` and passes backend-native tensor handles through
 unchanged.
 
 The architecture configuration registry is the sole owner of Hugging Face
-family aliases, nested-wrapper normalization, assistant-family identity, and
-the exhaustive dispatch to family parsers. `eredu-core` accepts that registry
-through `ModelConfigurationResolver` while inspecting SafeTensors artifacts;
-it does not recognize family strings. Facades and concrete backend adapters
-select the shared `eredu-architectures` registry. Backend composition consumes
-the resolved `ModelKind` and architecture parser outputs, never a second raw
-`model_type` dispatch table.
+family aliases, GGUF `general.architecture` spellings, nested-wrapper
+normalization, assistant-family identity, and the exhaustive dispatch to
+family parsers. `eredu-core` accepts that registry through
+`ModelConfigurationResolver` while inspecting both SafeTensors and GGUF
+artifacts; it does not recognize family strings or expose an exhaustive GGUF
+family type. The typed `GgufArchitecture` identity and family-specific GGUF
+structural admission live in `eredu-architectures`. Facades and concrete
+backend adapters select that shared registry. Backend composition consumes the
+resolved `ModelKind` and architecture parser outputs, never a second raw
+`model_type` or `general.architecture` dispatch table.
 
 Architecture checkpoint modules also own canonical name translation and the
 complete derived-weight recipe catalogs for static modules, execution units,
@@ -236,9 +239,12 @@ Artifact loading has four stages:
    creates a stateful session.
 
 For GGUF artifacts, `ArtifactInspection::validated_gguf` is the authoritative
-handoff from stage 1. Backends may wrap its portable checkpoint handle and add
-architecture or device compatibility checks, but do not repeat the portable
-tensor-count, required-metadata, embedding, or multimodal admission floor.
+handoff from stage 1. Core validates format-generic tensor-count, required
+metadata, and embedding floors using the submitted metadata prefix. The
+selected architecture registry resolves the family spelling and applies
+family-specific structural admission. Backends may wrap the resulting portable
+checkpoint handle and add architecture or device compatibility checks, but do
+not repeat either portable admission layer.
 
 `ModelLoadingBackend` implements backend policy, architecture/backend
 capability intersection, and materialization.
@@ -412,12 +418,12 @@ internally between reusable backend mechanics and family/backend composition:
   residency workers, media processing, and collectives. Their production
   checkpoint API consumes canonical parameter names and architecture-derived
   recipes; it does not expose parsers for physical family checkpoint names;
-- GGUF family selection and structural admission are composition concerns.
-  Composition consumes the architecture resolved by backend-neutral artifact
-  inspection, validates the native checkpoint once, and passes an admitted
-  source to resident, tensor-parallel, pipeline, or expert family loaders.
-  Reusable backend runtime modules neither parse `general.architecture` nor
-  invoke family composition;
+- GGUF family selection and portable family-specific structural admission are
+  architecture-registry concerns. MLX composition resolves the already
+  admitted spelling through the same registry, validates native checkpoint
+  compatibility once, and passes an admitted source to resident,
+  tensor-parallel, pipeline, or expert family loaders. Reusable backend runtime
+  modules neither parse `general.architecture` nor invoke family composition;
 - generic layerwise policy construction derives its execution graph and unit
   layout directly from the concrete neutral architecture before binding
   checkpoint units; composition cannot supply or reconstruct that layout.

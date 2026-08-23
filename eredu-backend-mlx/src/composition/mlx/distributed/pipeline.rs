@@ -10,7 +10,7 @@
 //! Multimodal encoder, projection, merge, finalization, and decoder groups use
 //! one validated placement DAG with topology-planned payload routes.
 
-use eredu_architectures::{llama::ModelArgs as LlamaModelArgs, muse_glimmer};
+use eredu_architectures::{llama::ModelArgs as LlamaModelArgs, muse_glimmer, GgufArchitecture};
 use eredu_checkpoint::WeightQuantization;
 use eredu_core::PreparedInputIdentity;
 use eredu_nn::{RoutedNeuralBackend, TensorParallelExpertOutput};
@@ -13866,7 +13866,7 @@ pub fn load_pipeline_model_with_options(
             architecture.metadata_name(),
         )?;
         return match architecture {
-            eredu_core::GgufArchitecture::DeepSeek4 => {
+            GgufArchitecture::DeepSeek4 => {
                 let args = eredu_architectures::deepseek::parse_v4_gguf(&metadata)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
                 let gguf_plan = eredu_architectures::deepseek::v4_gguf_plan(&args)
@@ -13888,7 +13888,7 @@ pub fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            eredu_core::GgufArchitecture::Llama | eredu_core::GgufArchitecture::Mistral => {
+            GgufArchitecture::Llama | GgufArchitecture::Mistral => {
                 let prepared = llama_checkpoint::prepare_llama_gguf_checkpoint(
                     &admitted,
                     None,
@@ -13912,7 +13912,7 @@ pub fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            eredu_core::GgufArchitecture::MuseGlimmer => {
+            GgufArchitecture::MuseGlimmer => {
                 let (args, store) = crate::composition::muse_glimmer::prepare_gguf_pipeline_source(
                     &checkpoint,
                     &metadata,
@@ -13929,7 +13929,7 @@ pub fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            eredu_core::GgufArchitecture::DeepSeek2 => {
+            GgufArchitecture::DeepSeek2 => {
                 let args = eredu_architectures::deepseek::parse_v3_gguf(
                     &PipelineDeepSeekGgufCatalog(&checkpoint),
                     &metadata,
@@ -13954,7 +13954,7 @@ pub fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            eredu_core::GgufArchitecture::Gemma4 => {
+            GgufArchitecture::Gemma4 => {
                 let (store, args) = crate::composition::gemma4::open_pipeline_gguf_store(
                     model_dir,
                     &checkpoint,
@@ -13972,10 +13972,10 @@ pub fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            architecture @ (eredu_core::GgufArchitecture::Qwen2
-            | eredu_core::GgufArchitecture::Qwen3
-            | eredu_core::GgufArchitecture::Qwen3Moe) => {
-                let is_moe = architecture == eredu_core::GgufArchitecture::Qwen3Moe;
+            architecture @ (GgufArchitecture::Qwen2
+            | GgufArchitecture::Qwen3
+            | GgufArchitecture::Qwen3Moe) => {
+                let is_moe = architecture == GgufArchitecture::Qwen3Moe;
                 let prepared = crate::composition::qwen::prepare_qwen_gguf_checkpoint(&admitted)?;
                 let args = prepared.args;
                 let gguf_plan = eredu_architectures::qwen::gguf_plan(&args)
@@ -13997,7 +13997,7 @@ pub fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            eredu_core::GgufArchitecture::Qwen3Vl | eredu_core::GgufArchitecture::Qwen3VlMoe => {
+            GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
                 let (args, store) = crate::composition::qwen::vl::prepare_gguf_pipeline(
                     model_dir,
                     &checkpoint,
@@ -14015,7 +14015,7 @@ pub fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            eredu_core::GgufArchitecture::GptOss => {
+            GgufArchitecture::GptOss => {
                 let prepared = neutral_gpt_oss::prepare_gpt_oss_gguf_checkpoint(&admitted)?;
                 let gguf_plan =
                     gpt_oss::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
@@ -14036,10 +14036,9 @@ pub fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            architecture @ (eredu_core::GgufArchitecture::Lfm2
-            | eredu_core::GgufArchitecture::Lfm2Moe) => {
+            architecture @ (GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe) => {
                 let prepared = crate::composition::lfm2::prepare_gguf(&admitted)?;
-                let is_moe = architecture == eredu_core::GgufArchitecture::Lfm2Moe;
+                let is_moe = architecture == GgufArchitecture::Lfm2Moe;
                 let gguf_plan = eredu_architectures::lfm2::gguf_plan(&prepared.args)
                     .map_err(Error::UnsupportedArchitecture)?;
                 let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
@@ -14059,8 +14058,7 @@ pub fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            architecture @ (eredu_core::GgufArchitecture::NemotronH
-            | eredu_core::GgufArchitecture::NemotronHMoe) => {
+            architecture @ (GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe) => {
                 let prepared = crate::composition::nemotron_h::prepare_gguf(&admitted)?;
                 let gguf_plan = eredu_architectures::nemotron_h::gguf_plan(&prepared.args)
                     .map_err(Error::UnsupportedArchitecture)?;
@@ -14082,9 +14080,9 @@ pub fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            eredu_core::GgufArchitecture::Qwen35
-            | eredu_core::GgufArchitecture::Qwen35Moe
-            | eredu_core::GgufArchitecture::Qwen3Next => {
+            GgufArchitecture::Qwen35
+            | GgufArchitecture::Qwen35Moe
+            | GgufArchitecture::Qwen3Next => {
                 let (parsed, store) = crate::composition::qwen::hybrid::prepare_gguf_pipeline(
                     model_dir,
                     &checkpoint,
@@ -14115,7 +14113,7 @@ pub fn load_pipeline_model_with_options(
                     )
                 }
             }
-            eredu_core::GgufArchitecture::KimiLinear => {
+            GgufArchitecture::KimiLinear => {
                 let prepared = crate::composition::kimi_linear::prepare_gguf(&admitted)?;
                 let gguf_plan = eredu_architectures::kimi_linear::gguf_plan(&prepared.args)
                     .map_err(Error::UnsupportedArchitecture)?;
@@ -14136,7 +14134,7 @@ pub fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
-            eredu_core::GgufArchitecture::Inkling => {
+            GgufArchitecture::Inkling => {
                 let (store, args) = crate::composition::inkling::prepare_gguf_pipeline_source(
                     model_dir,
                     &checkpoint,

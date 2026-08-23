@@ -157,7 +157,8 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
 ) -> Result<PreparedLlamaGguf, Error> {
     if !matches!(
         source.architecture(),
-        eredu_core::GgufArchitecture::Llama | eredu_core::GgufArchitecture::Mistral
+        eredu_architectures::GgufArchitecture::Llama
+            | eredu_architectures::GgufArchitecture::Mistral
     ) {
         return Err(Error::UnsupportedArchitecture(format!(
             "Llama GGUF loader received architecture {:?}",

@@ -1127,7 +1127,7 @@ mod tests {
     struct LoadingConfigurationResolver;
 
     impl ModelConfigurationResolver for LoadingConfigurationResolver {
-        fn resolve(
+        fn resolve_safetensors(
             &self,
             json: &serde_json::Value,
         ) -> Result<crate::ModelConfiguration, ArtifactError> {
@@ -1136,7 +1136,24 @@ mod tests {
                 effective_model_type: "llama".into(),
                 kind: crate::ModelKind::Llama,
                 json: Some(json.clone()),
-                gguf_architecture: None,
+            })
+        }
+
+        fn resolve_gguf(
+            &self,
+            architecture: &str,
+            _checkpoint: &eredu_gguf::Checkpoint,
+        ) -> Result<crate::ModelConfiguration, ArtifactError> {
+            if architecture != "llama" {
+                return Err(ArtifactError::UnsupportedGgufArchitecture(
+                    architecture.into(),
+                ));
+            }
+            Ok(crate::ModelConfiguration {
+                declared_model_type: architecture.into(),
+                effective_model_type: architecture.into(),
+                kind: crate::ModelKind::Llama,
+                json: None,
             })
         }
     }

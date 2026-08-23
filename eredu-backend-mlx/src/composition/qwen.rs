@@ -1394,9 +1394,9 @@ pub(crate) fn prepare_qwen_gguf_checkpoint(
 ) -> Result<PreparedQwenGguf, Error> {
     if !matches!(
         source.architecture(),
-        eredu_core::GgufArchitecture::Qwen2
-            | eredu_core::GgufArchitecture::Qwen3
-            | eredu_core::GgufArchitecture::Qwen3Moe
+        eredu_architectures::GgufArchitecture::Qwen2
+            | eredu_architectures::GgufArchitecture::Qwen3
+            | eredu_architectures::GgufArchitecture::Qwen3Moe
     ) {
         return Err(Error::UnsupportedArchitecture(format!(
             "Qwen GGUF loader received architecture {:?}",

@@ -6,7 +6,8 @@ use std::path::Path;
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
 use serde_json::Value;
 
-use eredu_core::{GgufArchitecture, ModelKind};
+use eredu_architectures::GgufArchitecture;
+use eredu_core::ModelKind;
 
 use super::ModelLoadOptions;
 use crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames;
@@ -64,7 +65,7 @@ pub(crate) fn admit_gguf_path(
     let validated = inspection.validated_gguf().ok_or_else(|| {
         Error::UnsupportedArchitecture("GGUF admission received a non-GGUF artifact".into())
     })?;
-    let architecture = validated.architecture();
+    let architecture = GgufArchitecture::resolve(&inspection.configuration().declared_model_type)?;
     let checkpoint = GgufCheckpoint::from_portable(validated.checkpoint().clone());
     let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
     admit_gguf(architecture, checkpoint, metadata, options)
@@ -223,11 +224,7 @@ pub(crate) fn validate_inspected_preparation(
             )
         }
         eredu_core::ArtifactFormat::Gguf => eredu_architectures::preparation::gguf_capabilities(
-            configuration.gguf_architecture.ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "GGUF inspection omitted normalized architecture".into(),
-                )
-            })?,
+            GgufArchitecture::resolve(&configuration.declared_model_type)?,
             inspection.gguf_checkpoint().ok_or_else(|| {
                 Error::UnsupportedArchitecture(
                     "GGUF inspection omitted portable checkpoint metadata".into(),
