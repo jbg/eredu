@@ -1107,7 +1107,7 @@ impl QwenHybridModel {
         }
     }
 
-    fn prompt_cache_model_identity(
+    pub(crate) fn prompt_cache_model_identity(
         &self,
     ) -> Result<eredu_core::cache::PromptCacheModelIdentity, Error> {
         hybrid::state_identity(

@@ -1039,9 +1039,12 @@ pub fn state_identity(
     global_layer_start: usize,
     topology: PromptCacheTopology,
 ) -> Result<ModelStateIdentity, Error> {
-    let layer_count = usize::try_from(config.num_hidden_layers)
-        .and_then(|target| usize::try_from(config.mtp_num_hidden_layers).map(|mtp| target + mtp))
-        .map_err(Error::backend)?;
+    let target_layers = usize::try_from(config.num_hidden_layers).map_err(Error::backend)?;
+    let prediction_layers =
+        usize::try_from(config.mtp_num_hidden_layers).map_err(Error::backend)?;
+    let layer_count = target_layers
+        .checked_add(prediction_layers)
+        .ok_or_else(|| Error::backend("Qwen hybrid state layer count overflowed"))?;
     let global_layer_end = global_layer_start
         .checked_add(layout.len())
         .ok_or_else(|| Error::backend("Qwen hybrid owned layer range overflowed"))?;
@@ -1050,6 +1053,17 @@ pub fn state_identity(
             "Qwen hybrid owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
+    let layer_prefix_offsets = (global_layer_start..global_layer_end)
+        .map(|global_layer| {
+            // Embedded prediction groups consume shifted token/hidden pairs,
+            // so their cache frontier trails the persisted prompt by one.
+            if global_layer < target_layers {
+                0
+            } else {
+                -1
+            }
+        })
+        .collect();
     Ok(ModelStateIdentity {
         model_family: "qwen_hybrid".into(),
         effective_model_type: config.model_type.clone(),
@@ -1057,7 +1071,56 @@ pub fn state_identity(
         layer_count,
         global_layer_start,
         sink_tokens: 0,
-        layer_prefix_offsets: vec![0; layout.len()],
+        layer_prefix_offsets,
         topology,
     })
+}
+
+#[cfg(test)]
+mod state_identity_tests {
+    use super::state_identity;
+
+    #[test]
+    fn embedded_prediction_layers_trail_the_prompt_frontier() {
+        let parsed = crate::qwen::hybrid::model_args_from_config_value(&serde_json::json!({
+            "model_type": "qwen3_5_text",
+            "vocab_size": 8,
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "mtp_num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "max_position_embeddings": 16,
+            "intermediate_size": 16,
+            "num_experts": 0,
+            "tie_word_embeddings": true,
+            "layer_types": ["full_attention", "full_attention"]
+        }))
+        .unwrap();
+        let layout = crate::qwen::hybrid::state_layout(&parsed.text).unwrap();
+        let identity = state_identity(
+            &parsed.text,
+            &layout,
+            0,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap();
+
+        assert_eq!(identity.layer_prefix_offsets, [0, 0, -1, -1]);
+
+        let prediction_layout = eredu_runtime::StateLayout::new(
+            eredu_core::LayerSchedule::new(2, layout.layers().iter().skip(2).cloned().collect())
+                .unwrap(),
+        )
+        .unwrap();
+        let prediction_identity = state_identity(
+            &parsed.text,
+            &prediction_layout,
+            2,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap();
+        assert_eq!(prediction_identity.layer_prefix_offsets, [-1, -1]);
+    }
 }

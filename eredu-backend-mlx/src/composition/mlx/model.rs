@@ -659,6 +659,14 @@ impl Model {
             Self::Inkling(model) => model
                 .prompt_cache_layer_prefix_offsets()
                 .map_err(|error| Exception::custom(error.to_string())),
+            Self::NemotronH(model) => model
+                .prompt_cache_model_identity()
+                .map(|identity| identity.layer_prefix_offsets)
+                .map_err(|error| Exception::custom(error.to_string())),
+            Self::Qwen3Next(model) | Self::Qwen35(model) => model
+                .prompt_cache_model_identity()
+                .map(|identity| identity.layer_prefix_offsets)
+                .map_err(|error| Exception::custom(error.to_string())),
             _ => Ok(vec![0; self.prompt_cache_layer_layout()?.len()]),
         }
     }
@@ -1002,7 +1010,7 @@ impl Model {
             global_layer_start: 0,
             global_layer_end: layer_count,
             sink_tokens: 0,
-            layer_prefix_offsets: vec![0; layer_count],
+            layer_prefix_offsets: self.prompt_cache_layer_prefix_offsets()?,
             topology: Default::default(),
             layer_layout,
         };

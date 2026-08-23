@@ -337,9 +337,10 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         .unwrap()
         .is_empty());
     let cache_layout = session.prompt_cache_layer_layout().unwrap();
+    assert_eq!(cache_layout.len(), 2);
     assert_eq!(
-        session.prompt_cache_layer_prefix_offsets().unwrap().len(),
-        cache_layout.len()
+        session.prompt_cache_layer_prefix_offsets().unwrap(),
+        [0, -1]
     );
     assert!(session.native_quantization_stats().is_none());
 
