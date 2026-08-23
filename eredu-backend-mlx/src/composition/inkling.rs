@@ -15,9 +15,9 @@ use eredu_checkpoint::{
 };
 use eredu_nn::Tensor;
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, ExecutionUnitLayout, LayerWeightResidency,
-    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
-    RuntimeState, StaticUnitBindings, WeightBinding, WeightResidency,
+    CacheResidencyPolicy, CausalModel, LayerWeightResidency, LayeredArchitecture, LayerwiseRuntime,
+    PagedCacheOptions, ParallelModelInfo, ParameterRole, RuntimeState, StaticUnitBindings,
+    WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -46,8 +46,9 @@ use crate::backend::{
         },
         execution::{
             generic::{
-                construct_architecture_unit, prepare_layerwise_policy_with_bindings,
-                MlxLayerwisePolicy, MlxResidentPolicy, MlxUnitPopulator,
+                architecture_execution_layout, construct_architecture_unit,
+                prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
+                MlxUnitPopulator,
             },
             layerwise::{
                 open_safetensors_weight_store, quantize_module_store_with_bindings,
@@ -1619,14 +1620,14 @@ fn quantize_store(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let target_architecture = NeutralArchitecture::new(target.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let unit_count = source
-        .vision_config
-        .as_ref()
-        .map_or(0, |vision| vision.num_hidden_layers as usize)
-        .checked_add(source.text_config.num_hidden_layers as usize)
-        .ok_or_else(|| Error::Quantization("Inkling unit count overflowed".into()))?;
-    let source_layout = inkling_execution_layout(source)?;
-    let target_layout = inkling_execution_layout(&target)?;
+    let source_layout = architecture_execution_layout::<_, MlxHybridState>(&source_architecture)?;
+    let target_layout = architecture_execution_layout::<_, MlxHybridState>(&target_architecture)?;
+    if source_layout != target_layout {
+        return Err(Error::Quantization(
+            "Inkling quantization changed the architecture execution layout".into(),
+        ));
+    }
+    let unit_count = source_layout.len();
     let source_static = MlxModule::new(
         <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &source_architecture,
@@ -1682,20 +1683,6 @@ fn quantize_store(
         },
     )?;
     Ok((store, target, report))
-}
-
-fn inkling_execution_layout(args: &ModelArgs) -> Result<ExecutionUnitLayout, Error> {
-    let vision_layers = args
-        .vision_config
-        .as_ref()
-        .map_or(0, |vision| vision.num_hidden_layers as usize);
-    let graph = eredu_runtime::ExecutionGraph::chain(["vision", "text_decoder"])
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    ExecutionUnitLayout::new(
-        &graph,
-        [vision_layers, args.text_config.num_hidden_layers as usize],
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 fn load_store(
@@ -1792,8 +1779,25 @@ fn load_parallel_store(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
-    let layer_count = usize::try_from(args.text_config.num_hidden_layers)
-        .map_err(|_| Error::Parallel("invalid Inkling layer count".into()))?;
+    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let global_execution =
+        architecture_execution_layout::<_, MlxHybridState>(&global_architecture)?;
+    let decoder_groups = (0..global_execution.group_count())
+        .filter(|&group| {
+            group_kind(&global_architecture, group) == eredu_runtime::ArchitectureGroupKind::Decoder
+        })
+        .collect::<Vec<_>>();
+    let [decoder_group] = decoder_groups.as_slice() else {
+        return Err(Error::Parallel(format!(
+            "Inkling architecture declared {} decoder execution groups; expected one",
+            decoder_groups.len()
+        )));
+    };
+    let layer_count = global_execution
+        .group_range(*decoder_group)
+        .expect("validated execution group")
+        .len();
     let mut planner = build.planner();
     for group in eredu_architectures::inkling::static_parameter_groups(&args)? {
         planner.register(group)?;
@@ -1822,8 +1826,6 @@ fn load_parallel_store(
     let state_layout = architecture
         .runtime_state_layout()
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let global_static = MlxModule::new(
         <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &global_architecture,
@@ -1839,38 +1841,15 @@ fn load_parallel_store(
         static_recipes,
         |_| false,
     )?;
-    let mut global_vision_bindings = Vec::new();
-    if let Some(vision) = &args.vision_config {
-        for (index, spec) in vision.layer_specs().into_iter().enumerate() {
-            let layer = MlxModule::new(
-                eredu_architectures::inkling::VisionLayer::<MlxNeuralBackend>::new(
-                    vision, index, spec, stream,
-                )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-            );
-            let recipes =
-                crate::composition::inkling_expert::module_recipes(&layer, &args, store.as_ref())?;
-            global_vision_bindings.extend(build_module_bindings_with_recipes_excluding(
-                &layer,
-                "",
-                store.as_ref(),
-                recipes,
-                |_| false,
-            )?);
-        }
-    }
-    let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?
-        .checked_add(binding_bytes(&global_vision_bindings)?)
-        .ok_or_else(|| Error::Parallel("Inkling global parameter bytes overflowed".into()))?;
-    for index in 0..layer_count {
-        let unit = MlxModule::new(
-            eredu_architectures::inkling::DecoderLayer::<MlxNeuralBackend>::new(
-                &args.text_config,
-                index,
-                stream,
-            )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-        );
+    let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
+    for ordinal in 0..global_execution.len() {
+        let unit = MlxModule::new(construct_architecture_unit(
+            &global_architecture,
+            &global_execution,
+            ordinal,
+            stream,
+            std::marker::PhantomData::<MlxHybridState>,
+        )?);
         let recipes =
             crate::composition::inkling_expert::module_recipes(&unit, &args, store.as_ref())?;
         global_parameter_bytes = global_parameter_bytes
@@ -1890,6 +1869,7 @@ fn load_parallel_store(
     let unit_sharding = Arc::clone(&static_layout);
     let report_layout = Arc::clone(&static_layout);
     let binding_args = args.clone();
+    let binding_architecture = global_architecture;
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
         &mut architecture,
@@ -1906,29 +1886,19 @@ fn load_parallel_store(
             shard_layer_bindings(global_static_bindings, "", store, &static_layout)
         },
         move |address, path, _local, store, stream| {
-            let global = if address.group() == 0 {
-                let vision = binding_args.vision_config.as_ref().ok_or_else(|| {
-                    Error::UnsupportedArchitecture("Inkling vision config is missing".into())
-                })?;
-                MlxModule::new(NeutralUnit::Vision(
-                    eredu_architectures::inkling::VisionLayer::<MlxNeuralBackend>::new(
-                        vision,
-                        address.index(),
-                        vision.layer_specs()[address.index()],
-                        stream,
-                    )
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-                ))
-            } else {
-                MlxModule::new(NeutralUnit::Text(
-                    eredu_architectures::inkling::DecoderLayer::<MlxNeuralBackend>::new(
-                        &binding_args.text_config,
+            let global =
+                MlxModule::new(
+                    <NeutralArchitecture as LayeredArchitecture<
+                        MlxNeuralBackend,
+                        MlxHybridState,
+                    >>::build_unit(
+                        &binding_architecture,
+                        address.group(),
                         address.index(),
                         stream,
                     )
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-                ))
-            };
+                );
             let recipes =
                 crate::composition::inkling_expert::module_recipes(&global, &binding_args, store)?;
             let bindings =

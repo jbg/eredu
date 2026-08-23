@@ -2,15 +2,13 @@
 
 use std::{path::Path, sync::Arc};
 
-use eredu_architectures::nemotron_h::{
-    Block, LayeredModel, ModelArgs, PredictionUnit, Unit, PREDICTION_STATE_SEGMENT,
-};
+use eredu_architectures::nemotron_h::{LayeredModel, ModelArgs, Unit, PREDICTION_STATE_SEGMENT};
 use eredu_checkpoint::{store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
-    ActivationObserver, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionGraph,
-    ExecutionUnitAddress, ExecutionUnitLayout, LayerWeightResidency, LayerwiseModelMetadata,
-    LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport,
-    StaticUnitBindings, WeightBinding, WeightResidency,
+    ActivationObserver, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport,
+    LayerWeightResidency, LayeredArchitecture, LayerwiseModelMetadata, LayerwiseRuntime,
+    PagedCacheOptions, ParallelModelInfo, ParameterRole, ResidencyReport, StaticUnitBindings,
+    WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -40,6 +38,7 @@ use crate::backend::{
         },
         execution::{
             generic::{
+                architecture_execution_layout, construct_architecture_unit,
                 prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
                 MlxUnitPopulator,
             },
@@ -101,13 +100,17 @@ impl NemotronHCheckpointTemplate {
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let architecture = NeutralArchitecture::new(args.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let total = args.num_hidden_layers as usize
-            + args
-                .mtp_policies()
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
-                .len();
-        let layers = (0..total)
-            .map(|index| build_unit(&args, index, stream))
+        let layout = architecture_execution_layout::<_, MlxHybridState>(&architecture)?;
+        let layers = (0..layout.len())
+            .map(|index| {
+                construct_architecture_unit(
+                    &architecture,
+                    &layout,
+                    index,
+                    stream,
+                    std::marker::PhantomData::<MlxHybridState>,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             static_modules: architecture.static_modules().clone(),
@@ -232,7 +235,7 @@ impl NemotronHBindings {
         layer: &MlxModule<NeutralBlock>,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let flat = execution_layout(architecture.args())?
+        let flat = architecture_execution_layout::<_, MlxHybridState>(architecture)?
             .ordinal(group, index)
             .ok_or_else(|| {
                 Error::Parallel(format!("Nemotron-H has no unit {index} in group {group}"))
@@ -325,45 +328,6 @@ impl MlxUnitPopulator<NeutralBlock> for NemotronHUnitPopulator {
     }
 }
 
-fn build_unit(args: &ModelArgs, index: usize, stream: &Stream) -> Result<NeutralBlock, Error> {
-    let target = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Nemotron-H layer count".into()))?;
-    if index < target {
-        return Block::new(args, index, stream)
-            .map(Unit::Target)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()));
-    }
-    let physical = index - target;
-    let policies = args
-        .mtp_policies()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let steps = usize::try_from(args.num_nextn_predict_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Nemotron-H MTP count".into()))?;
-    let pattern = policies
-        .len()
-        .checked_div(steps)
-        .filter(|n| *n > 0)
-        .ok_or_else(|| Error::UnsupportedArchitecture("invalid Nemotron-H MTP pattern".into()))?;
-    PredictionUnit::new(args, physical / pattern, physical % pattern, stream)
-        .map(Unit::Prediction)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
-fn build_addressed_unit(
-    args: &ModelArgs,
-    address: ExecutionUnitAddress,
-    stream: &Stream,
-) -> Result<NeutralBlock, Error> {
-    if address.group() == 0 {
-        return Block::new(args, address.index(), stream)
-            .map(Unit::Target)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()));
-    }
-    PredictionUnit::new(args, address.group() - 1, address.index(), stream)
-        .map(Unit::Prediction)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
 #[derive(Clone)]
 struct NemotronHParallelUnitPopulator {
     external_experts: bool,
@@ -388,24 +352,6 @@ enum NemotronHExecution {
     Layerwise(Box<BoundedRuntime>),
     TensorParallelResident(Box<ParallelResidentRuntime>),
     TensorParallelLayerwise(Box<ParallelBoundedRuntime>),
-}
-
-fn execution_layout(args: &ModelArgs) -> Result<ExecutionUnitLayout, Error> {
-    let steps = usize::try_from(args.num_nextn_predict_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Nemotron-H MTP count".into()))?;
-    let policies = args
-        .mtp_policies()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let pattern = policies.len().checked_div(steps).unwrap_or(0);
-    let graph = ExecutionGraph::chain(
-        std::iter::once("target".to_owned()).chain((0..steps).map(|depth| format!("mtp.{depth}"))),
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    ExecutionUnitLayout::new(
-        &graph,
-        std::iter::once(args.num_hidden_layers as usize).chain(std::iter::repeat_n(pattern, steps)),
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 pub fn load_model_args(model_dir: &Path) -> Result<ModelArgs, Error> {
@@ -569,16 +515,10 @@ fn load_neutral_parallel(
     weights_stream: &Stream,
     external_experts: bool,
 ) -> Result<NemotronHModel, Error> {
-    let count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::Parallel("invalid Nemotron-H layer count".into()))?
-        .checked_add(
-            args.mtp_policies()
-                .map_err(|error| Error::Parallel(error.to_string()))?
-                .len(),
-        )
-        .ok_or_else(|| Error::Parallel("Nemotron-H unit count overflowed".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let global_execution =
+        architecture_execution_layout::<_, MlxHybridState>(&global_architecture)?;
     let expert_targets = Arc::new(
         global_architecture
             .parameter_description(stream)
@@ -592,10 +532,16 @@ fn load_neutral_parallel(
     {
         planner.register(group)?;
     }
-    for layer in 0..count {
-        let unit = build_unit(&args, layer, stream)?;
+    for ordinal in 0..global_execution.len() {
+        let unit = construct_architecture_unit(
+            &global_architecture,
+            &global_execution,
+            ordinal,
+            stream,
+            std::marker::PhantomData::<MlxHybridState>,
+        )?;
         for group in
-            eredu_architectures::nemotron_h::unit_parallel_parameter_groups(&unit, &args, layer)?
+            eredu_architectures::nemotron_h::unit_parallel_parameter_groups(&unit, &args, ordinal)?
         {
             planner.register(group)?;
         }
@@ -627,16 +573,26 @@ fn load_neutral_parallel(
             .map_err(Error::UnsupportedArchitecture)?,
     )?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
-    for layer in 0..count {
-        let unit = build_unit(&args, layer, stream)?;
+    for ordinal in 0..global_execution.len() {
+        let unit = construct_architecture_unit(
+            &global_architecture,
+            &global_execution,
+            ordinal,
+            stream,
+            std::marker::PhantomData::<MlxHybridState>,
+        )?;
+        let address = global_execution
+            .address(ordinal)
+            .expect("architecture execution layout contains every ordinal");
         let bindings = build_module_bindings_with_recipes_excluding(
             &MlxModule::new(unit),
             "",
             store.as_ref(),
-            eredu_architectures::nemotron_h::unit_recipes_flat(
+            eredu_architectures::nemotron_h::unit_recipes(
                 store.as_ref(),
                 &args,
-                layer,
+                address.group(),
+                address.index(),
                 !external_experts,
             )
             .map_err(Error::UnsupportedArchitecture)?,
@@ -655,6 +611,7 @@ fn load_neutral_parallel(
     let static_binding_args = args.clone();
     let binding_args = args.clone();
     let global_static_modules = global_architecture.static_modules().clone();
+    let binding_architecture = global_architecture;
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
@@ -678,7 +635,16 @@ fn load_neutral_parallel(
             shard_layer_bindings(bindings, "", store, &static_layout)
         },
         move |address, path, _local, store, stream| {
-            let global = build_addressed_unit(&binding_args, address, stream)?;
+            let global = <NeutralArchitecture as LayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::build_unit(
+                &binding_architecture,
+                address.group(),
+                address.index(),
+                stream,
+            )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bindings = build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(global),
                 "",
@@ -770,8 +736,15 @@ fn quantize_store(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let destination = NeutralArchitecture::new(target.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let source_args = args.clone();
-    let target_args = target.clone();
+    let source_layout = architecture_execution_layout::<_, MlxHybridState>(&source)?;
+    let target_layout = architecture_execution_layout::<_, MlxHybridState>(&destination)?;
+    if source_layout != target_layout {
+        return Err(Error::Quantization(
+            "Nemotron-H quantization changed the architecture execution layout".into(),
+        ));
+    }
+    let unit_count = source_layout.len();
+    let binding_layout = source_layout.clone();
     let binding_args = args.clone();
     let static_binding_args = args.clone();
     let source_static = MlxModule::new(source.static_modules().clone());
@@ -780,18 +753,27 @@ fn quantize_store(
         store,
         &source_static,
         &target_static,
-        move |index, stream| Ok(MlxModule::new(build_unit(&source_args, index, stream)?)),
-        move |index, stream| Ok(MlxModule::new(build_unit(&target_args, index, stream)?)),
-        usize::try_from(args.num_hidden_layers)
-            .map_err(|_| Error::UnsupportedArchitecture("invalid Nemotron-H layer count".into()))?
-            .checked_add(
-                args.mtp_policies()
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
-                    .len(),
+        move |index, stream| {
+            construct_architecture_unit(
+                &source,
+                &source_layout,
+                index,
+                stream,
+                std::marker::PhantomData::<MlxHybridState>,
             )
-            .ok_or_else(|| {
-                Error::UnsupportedArchitecture("Nemotron-H unit count overflowed".into())
-            })?,
+            .map(MlxModule::new)
+        },
+        move |index, stream| {
+            construct_architecture_unit(
+                &destination,
+                &target_layout,
+                index,
+                stream,
+                std::marker::PhantomData::<MlxHybridState>,
+            )
+            .map(MlxModule::new)
+        },
+        unit_count,
         quantization,
         stream,
         move |modules, store| {
@@ -805,14 +787,20 @@ fn quantize_store(
             .map_err(Into::into)
         },
         move |index, unit, store| {
+            let address = binding_layout.address(index).ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Nemotron-H has no execution unit at ordinal {index}"
+                ))
+            })?;
             build_module_bindings_with_recipes(
                 unit,
                 "",
                 store,
-                eredu_architectures::nemotron_h::unit_recipes_flat(
+                eredu_architectures::nemotron_h::unit_recipes(
                     store,
                     &binding_args,
-                    index,
+                    address.group(),
+                    address.index(),
                     true,
                 )
                 .map_err(Error::UnsupportedArchitecture)?,

@@ -11,10 +11,9 @@ use eredu_checkpoint::{
 };
 use eredu_nn::Tensor;
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, ExecutionUnitLayout, LayerWeightResidency,
-    LayeredArchitecture, LayeredForwardState, LayerwiseRuntime, PagedCacheOptions,
-    ParallelModelInfo, ParameterRole, RuntimeState, StaticUnitBindings, WeightBinding,
-    WeightResidency,
+    CacheResidencyPolicy, CausalModel, LayerWeightResidency, LayeredArchitecture,
+    LayeredForwardState, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
+    RuntimeState, StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -39,8 +38,9 @@ use crate::backend::{
         },
         execution::{
             generic::{
-                construct_architecture_unit, prepare_layerwise_policy_with_bindings,
-                MlxLayerwisePolicy, MlxResidentPolicy, MlxUnitPopulator,
+                architecture_execution_layout, construct_architecture_unit,
+                prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
+                MlxUnitPopulator,
             },
             layerwise::{
                 open_safetensors_weight_store, quantize_parameterized_module_store,
@@ -1261,19 +1261,6 @@ impl CausalModel<MlxKeyValueState> for MuseGlimmerModel {
     }
 }
 
-fn layout(args: &DecoderConfig) -> Result<ExecutionUnitLayout, Error> {
-    let graph = eredu_runtime::ExecutionGraph::chain(["vision_encoder", "text_decoder"])
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    ExecutionUnitLayout::new(
-        &graph,
-        [
-            args.vision_config.layer_count(),
-            args.num_hidden_layers as usize,
-        ],
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
 fn resolve_store(
     store: SharedCheckpointSource,
     args: &DecoderConfig,
@@ -1315,13 +1302,14 @@ fn quantize_store(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let target_architecture = NeutralArchitecture::new(target.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let unit_count = source
-        .vision_config
-        .layer_count()
-        .checked_add(source.num_hidden_layers as usize)
-        .ok_or_else(|| Error::Quantization("Muse-Glimmer unit count overflowed".into()))?;
-    let source_layout = layout(source)?;
-    let target_layout = layout(&target)?;
+    let source_layout = architecture_execution_layout::<_, MlxKeyValueState>(&source_architecture)?;
+    let target_layout = architecture_execution_layout::<_, MlxKeyValueState>(&target_architecture)?;
+    if source_layout != target_layout {
+        return Err(Error::Quantization(
+            "Muse-Glimmer quantization changed the architecture execution layout".into(),
+        ));
+    }
+    let unit_count = source_layout.len();
     let source_static = <NeutralArchitecture as LayeredArchitecture<
         MlxNeuralBackend,
         MlxKeyValueState,
@@ -1449,7 +1437,25 @@ fn load_parallel_store(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
-    let layer_count = args.num_hidden_layers as usize;
+    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let global_execution =
+        architecture_execution_layout::<_, MlxKeyValueState>(&global_architecture)?;
+    let decoder_groups = (0..global_execution.group_count())
+        .filter(|&group| {
+            group_kind(&global_architecture, group) == eredu_runtime::ArchitectureGroupKind::Decoder
+        })
+        .collect::<Vec<_>>();
+    let [decoder_group] = decoder_groups.as_slice() else {
+        return Err(Error::Parallel(format!(
+            "Muse-Glimmer architecture declared {} decoder execution groups; expected one",
+            decoder_groups.len()
+        )));
+    };
+    let layer_count = global_execution
+        .group_range(*decoder_group)
+        .expect("validated execution group")
+        .len();
     let mut planner = build.planner();
     for group in eredu_architectures::muse_glimmer::static_parameter_groups(&args)? {
         planner.register(group)?;
@@ -1469,19 +1475,9 @@ fn load_parallel_store(
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let geometry = architecture.shared_parallel_geometry().ok_or_else(|| {
-        Error::Parallel("Muse-Glimmer architecture did not retain local geometry".into())
-    })?;
     let state_layout = architecture
         .runtime_state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let vision_layers = geometry.vision_layers();
-    let total_units = vision_layers
-        .checked_add(layer_count)
-        .ok_or_else(|| Error::Parallel("Muse-Glimmer unit count overflowed".into()))?;
-
-    let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let global_static = MlxModule::new(
         <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::static_modules(
             &global_architecture,
@@ -1501,11 +1497,10 @@ fn load_parallel_store(
         |_| false,
     )?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
-    let global_layout = self::layout(&args)?;
-    for ordinal in 0..total_units {
+    for ordinal in 0..global_execution.len() {
         let unit = MlxModule::new(construct_architecture_unit(
             &global_architecture,
-            &global_layout,
+            &global_execution,
             ordinal,
             stream,
             std::marker::PhantomData::<MlxKeyValueState>,
@@ -1531,6 +1526,7 @@ fn load_parallel_store(
     let unit_sharding = Arc::clone(&static_layout);
     let report_layout = Arc::clone(&static_layout);
     let binding_args = args.clone();
+    let binding_architecture = global_architecture;
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         Arc::clone(&store),
         &mut architecture,
@@ -1546,32 +1542,20 @@ fn load_parallel_store(
         move |_modules, store| {
             shard_layer_bindings(global_static_bindings, "", store, &static_layout)
         },
-        move |address, path, local, store, stream| {
-            if address.group() == 0 {
-                let module = MlxModule::new(local.clone());
-                let recipes = crate::composition::muse_glimmer_expert::module_recipes(
-                    &module,
-                    &binding_args,
-                    store,
-                )?;
-                return build_module_bindings_with_recipes_excluding(
-                    &module,
-                    "",
-                    store,
-                    recipes,
-                    |_| false,
-                )
-                .map_err(Into::into);
-            }
-            let index = address.index();
-            let global = MlxModule::new(NeutralUnit::Text(
-                eredu_architectures::muse_glimmer::TransformerBlock::<MlxNeuralBackend>::new(
-                    &binding_args,
-                    index,
-                    stream,
-                )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
-            ));
+        move |address, path, _local, store, stream| {
+            let global =
+                MlxModule::new(
+                    <NeutralArchitecture as LayeredArchitecture<
+                        MlxNeuralBackend,
+                        MlxKeyValueState,
+                    >>::build_unit(
+                        &binding_architecture,
+                        address.group(),
+                        address.index(),
+                        stream,
+                    )
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                );
             let recipes = crate::composition::muse_glimmer_expert::module_recipes(
                 &global,
                 &binding_args,
@@ -1581,7 +1565,13 @@ fn load_parallel_store(
                 build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |_| {
                     false
                 })?;
-            shard_layer_bindings(bindings, path, store, &unit_sharding)
+            if group_kind(&binding_architecture, address.group())
+                == eredu_runtime::ArchitectureGroupKind::Decoder
+            {
+                shard_layer_bindings(bindings, path, store, &unit_sharding)
+            } else {
+                Ok(bindings)
+            }
         },
     )?;
     metadata.set_model_type(args.model_type.clone());

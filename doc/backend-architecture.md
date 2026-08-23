@@ -396,9 +396,11 @@ part/batch plans.
 
 Layered model execution topology follows the same ownership rule. Loaders and
 materializers derive execution graphs and per-group unit counts through
-`LayeredArchitecture`; they do not reconstruct a family's group order,
-dependencies, or layer counts from configuration. This keeps quantization,
-residency, and parallel placement aligned with architecture execution.
+`LayeredArchitecture` into one canonical `ExecutionUnitLayout`; quantization,
+residency, parallel planning, parameter accounting, and unit construction all
+consume that layout. They do not reconstruct a family's group order,
+dependencies, layer counts, or flat-to-group mapping from configuration. This
+keeps every backend realization aligned with architecture execution.
 
 The facade owns tokenizer and chat-template discovery. A backend may request
 tokenization of checkpoint-defined framing text through typed callbacks, but it

@@ -584,7 +584,8 @@ fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error>
     Ok(largest)
 }
 
-fn architecture_policy_layout<A, S>(architecture: &A) -> Result<ExecutionUnitLayout, Error>
+/// Derives the canonical flat unit layout from a neutral architecture.
+pub fn architecture_execution_layout<A, S>(architecture: &A) -> Result<ExecutionUnitLayout, Error>
 where
     A: LayeredArchitecture<MlxNeuralBackend, S>,
     S: RuntimeState<MlxNeuralBackend>,
@@ -680,7 +681,7 @@ where
         &Stream,
     ) -> Result<Vec<WeightBinding>, Error>,
 {
-    let layout = architecture_policy_layout::<A, S>(architecture)?;
+    let layout = architecture_execution_layout::<A, S>(architecture)?;
     let unit_count = layout.len();
     if unit_count == 0 {
         return Err(Error::Parallel(
