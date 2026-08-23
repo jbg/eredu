@@ -23,13 +23,13 @@ eredu-backend-mlx = "0.1"
 ```rust,no_run
 use eredu_backend_mlx::{
     core::load_model,
-    native::{Device, DeviceType, ExecutionContext},
-    MlxBackend, ModelLoadOptions,
+    native::{backend, Device, DeviceType, ExecutionContext},
+    ModelLoadOptions,
 };
 
 let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
 let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-let backend = MlxBackend::new(execution.stream(), weights.stream());
+let backend = backend(execution.stream(), weights.stream());
 let model = load_model(&backend, "/path/to/model", ModelLoadOptions::default())?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
