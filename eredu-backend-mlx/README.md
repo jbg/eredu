@@ -17,21 +17,20 @@ backend development and backend-specific low-level tooling:
 
 ```toml
 [dependencies]
-eredu = "0.4"
 eredu-backend-mlx = "0.1"
 ```
 
-```rust,ignore
-use eredu::api::LoadedModel;
+```rust,no_run
 use eredu_backend_mlx::{
-    backend::mlx::{MlxBackend, ModelLoadOptions},
+    core::load_model,
     native::{Device, DeviceType, ExecutionContext},
+    MlxBackend, ModelLoadOptions,
 };
 
 let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
 let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
 let backend = MlxBackend::new(execution.stream(), weights.stream());
-let model = LoadedModel::load(backend, "/path/to/model", ModelLoadOptions::default())?;
+let model = load_model(&backend, "/path/to/model", ModelLoadOptions::default())?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

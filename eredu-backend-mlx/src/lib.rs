@@ -1,8 +1,4 @@
-//! MLX implementations of Eredu's backend-neutral contracts.
-//!
-//! This crate is the concrete MLX boundary. It may depend on neutral Eredu
-//! crates and SafeMLX, but it must not depend on the `eredu` facade crate.
-
+#![doc = include_str!("../README.md")]
 #![allow(missing_docs)]
 #![allow(
     clippy::arc_with_non_send_sync,
