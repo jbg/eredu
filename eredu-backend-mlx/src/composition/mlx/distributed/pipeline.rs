@@ -5268,27 +5268,71 @@ where
     }
 }
 
-fn pipeline_prompt_cache_identity(
+fn qwen_hybrid_pipeline_prompt_cache_identity(
+    args: &eredu_architectures::qwen::hybrid::HybridConfig,
     topology: MlxParallelContext,
-    model_family: &str,
-    effective_model_type: &str,
-    architecture_fingerprint: String,
-    layer_count: usize,
     range: Range<usize>,
-    layer_layout: eredu_core::LayerSchedule<eredu_core::cache::LayerCachePolicy>,
-) -> PromptCacheModelIdentity {
-    PromptCacheModelIdentity {
-        model_family: model_family.into(),
-        effective_model_type: effective_model_type.into(),
-        architecture_fingerprint,
-        layer_count,
-        global_layer_start: range.start,
-        global_layer_end: range.end,
-        sink_tokens: 0,
-        layer_prefix_offsets: vec![0; layer_layout.len()],
-        topology: crate::backend::cache::prompt_cache_topology(topology),
-        layer_layout,
-    }
+    complete: &eredu_runtime::StateLayout,
+) -> Result<PromptCacheModelIdentity, Error> {
+    let target_layers = usize::try_from(args.num_hidden_layers)
+        .map_err(|_| Error::Parallel("invalid Qwen hybrid target layer count".into()))?;
+    let state_end = if range.end == target_layers {
+        complete.len()
+    } else {
+        range.end
+    };
+    let layout = complete
+        .slice(range.start..state_end)
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+    eredu_architectures::qwen::hybrid::state_identity(
+        args,
+        &layout,
+        range.start,
+        crate::backend::cache::prompt_cache_topology(topology),
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+    .prompt_cache_identity(&layout)
+    .map_err(|error| Error::Parallel(error.to_string()))
+}
+
+#[cfg(test)]
+#[test]
+fn qwen_hybrid_pipeline_cache_identity_preserves_prediction_frontiers() {
+    let parsed =
+        eredu_architectures::qwen::hybrid::model_args_from_config_value(&serde_json::json!({
+            "model_type": "qwen3_5_text",
+            "vocab_size": 8,
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "mtp_num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "max_position_embeddings": 16,
+            "intermediate_size": 16,
+            "num_experts": 0,
+            "tie_word_embeddings": true,
+            "layer_types": ["full_attention", "full_attention"]
+        }))
+        .unwrap();
+    let complete = eredu_architectures::qwen::hybrid::state_layout(&parsed.text).unwrap();
+    let topology = MlxParallelContext::for_rank(
+        1,
+        1,
+        2,
+        1,
+        crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+    )
+    .unwrap();
+
+    let identity =
+        qwen_hybrid_pipeline_prompt_cache_identity(&parsed.text, topology, 1..2, &complete)
+            .unwrap();
+
+    assert_eq!(identity.layer_count, 4);
+    assert_eq!(identity.global_layer_start..identity.global_layer_end, 1..4);
+    assert_eq!(identity.layer_prefix_offsets, [0, -1, -1]);
+    assert_eq!(identity.layer_layout.len(), 3);
 }
 
 fn gemma4_pipeline_prompt_cache_identity(
@@ -5678,23 +5722,23 @@ impl PipelinePartitionMetadata for LlamaPipelinePartition {
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let args = &self.architecture.args();
-        let layout = self
-            .partition
-            .state()
-            .expect("Llama partition state")
-            .layout()
-            .layers()
-            .clone();
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "llama",
-            &args.model_type,
-            eredu_architectures::llama::prompt_cache_architecture_fingerprint(args),
-            usize::try_from(args.num_hidden_layers)
-                .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
-            self.range(),
-            layout.clone(),
-        ))
+        let complete = self
+            .architecture
+            .runtime_state_layout()
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let range = self.range();
+        let layout = complete
+            .slice(range.clone())
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        eredu_architectures::llama::state_identity(
+            args,
+            &layout,
+            range.start,
+            crate::backend::cache::prompt_cache_topology(topology),
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .prompt_cache_identity(&layout)
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 }
 
@@ -7158,23 +7202,23 @@ impl PipelinePartitionMetadata for QwenPipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let layout = self
-            .partition
-            .state()
-            .expect("Qwen partition state")
-            .layout()
-            .layers()
-            .clone();
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "qwen",
-            &self.args().model_type,
-            eredu_architectures::qwen::prompt_cache_architecture_fingerprint(self.args()),
-            usize::try_from(self.args().num_hidden_layers)
-                .map_err(|_| Error::Parallel("invalid Qwen layer count".into()))?,
-            self.range(),
-            layout,
-        ))
+        let complete = self
+            .architecture
+            .runtime_state_layout()
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let range = self.range();
+        let layout = complete
+            .slice(range.clone())
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        eredu_architectures::qwen::state_identity(
+            self.args(),
+            &layout,
+            range.start,
+            crate::backend::cache::prompt_cache_topology(topology),
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .prompt_cache_identity(&layout)
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 }
 
@@ -8336,24 +8380,19 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
             .architecture
             .runtime_state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let policies = layout
-            .layers()
-            .iter()
-            .skip(self.range().start)
-            .take(self.range().len())
-            .cloned()
-            .collect::<Vec<_>>();
-        let local = eredu_core::LayerSchedule::new(policies.len(), policies)
+        let range = self.range().clone();
+        let local = layout
+            .slice(range.clone())
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "qwen3_vl",
-            &self.args().model_type,
-            eredu_architectures::qwen::vl::prompt_cache_architecture_fingerprint(self.args()),
-            self.args().text.num_hidden_layers as usize,
-            self.range().clone(),
-            local,
-        ))
+        eredu_architectures::qwen::vl::state_identity(
+            self.args(),
+            &local,
+            range.start,
+            crate::backend::cache::prompt_cache_topology(topology),
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .prompt_cache_identity(&local)
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 }
 
@@ -9087,26 +9126,12 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
             .architecture
             .runtime_state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let policies = layout
-            .layers()
-            .iter()
-            .skip(self.range().start)
-            .take(self.range().len())
-            .cloned()
-            .collect::<Vec<_>>();
-        let local = eredu_core::LayerSchedule::new(policies.len(), policies)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
+        qwen_hybrid_pipeline_prompt_cache_identity(
+            &self.args().text,
             topology,
-            "qwen_hybrid",
-            &self.args().text.model_type,
-            eredu_architectures::qwen::hybrid::prompt_cache_architecture_fingerprint(
-                &self.args().text,
-            ),
-            self.args().text.num_hidden_layers as usize,
             self.range().clone(),
-            local,
-        ))
+            &layout,
+        )
     }
 }
 
@@ -9421,23 +9446,23 @@ impl PipelinePartitionMetadata for GptOssPipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let layout = self
-            .partition
-            .state()
-            .expect("GPT-OSS partition state")
-            .layout()
-            .layers()
-            .clone();
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "gpt_oss",
-            &self.args().model_type,
-            gpt_oss::prompt_cache_architecture_fingerprint(self.args()),
-            usize::try_from(self.args().num_hidden_layers)
-                .map_err(|_| Error::Parallel("invalid GPT-OSS layer count".into()))?,
-            self.range(),
-            layout,
-        ))
+        let complete = self
+            .architecture
+            .runtime_state_layout()
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let range = self.range();
+        let layout = complete
+            .slice(range.clone())
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        gpt_oss::state_identity(
+            self.args(),
+            &layout,
+            range.start,
+            crate::backend::cache::prompt_cache_topology(topology),
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .prompt_cache_identity(&layout)
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 }
 
@@ -9563,38 +9588,23 @@ impl PipelinePartitionMetadata for Lfm2PipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let state = self
-            .partition
-            .state()
-            .ok_or_else(|| Error::Parallel("LFM2 partition has no runtime state".into()))?;
-        let topology_identity = if topology.tensor_parallel_size > 1 {
-            crate::backend::cache::prompt_cache_topology(topology)
-        } else {
-            Default::default()
-        };
-        let complete = eredu_architectures::lfm2::state_identity(
+        let complete = self
+            .architecture
+            .runtime_state_layout()
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let range = self.range();
+        let layout = complete
+            .slice(range.clone())
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        eredu_architectures::lfm2::state_identity(
             self.args(),
-            state.layout(),
-            state.global_layer_offset(),
-            topology_identity,
+            &layout,
+            range.start,
+            crate::backend::cache::prompt_cache_topology(topology),
         )
-        .map_err(|error| Error::Parallel(error.to_string()))?
-        .prompt_cache_identity(state.layout())
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        let layout = eredu_core::LayerSchedule::new(
-            self.range().len(),
-            complete.layer_layout.iter().cloned().collect(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "lfm2",
-            &complete.effective_model_type,
-            complete.architecture_fingerprint,
-            self.args().layer_schedule.len(),
-            self.range(),
-            layout,
-        ))
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .prompt_cache_identity(&layout)
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 }
 
@@ -9967,38 +9977,23 @@ impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
         &self,
         topology: MlxParallelContext,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let state = self
-            .partition
-            .state()
-            .ok_or_else(|| Error::Parallel("Kimi Linear partition has no runtime state".into()))?;
-        let topology_identity = if topology.tensor_parallel_size > 1 {
-            crate::backend::cache::prompt_cache_topology(topology)
-        } else {
-            Default::default()
-        };
-        let complete = eredu_architectures::kimi_linear::state_identity(
+        let complete = self
+            .architecture
+            .runtime_state_layout()
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let range = self.range();
+        let layout = complete
+            .slice(range.clone())
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        eredu_architectures::kimi_linear::state_identity(
             self.args(),
-            state.layout(),
-            state.global_layer_offset(),
-            topology_identity,
+            &layout,
+            range.start,
+            crate::backend::cache::prompt_cache_topology(topology),
         )
-        .map_err(|error| Error::Parallel(error.to_string()))?
-        .prompt_cache_identity(state.layout())
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        let layout = eredu_core::LayerSchedule::new(
-            self.range().len(),
-            complete.layer_layout.iter().cloned().collect(),
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
-            topology,
-            "kimi_linear",
-            &complete.effective_model_type,
-            complete.architecture_fingerprint,
-            self.args().num_hidden_layers as usize,
-            self.range(),
-            layout,
-        ))
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .prompt_cache_identity(&layout)
+        .map_err(|error| Error::Parallel(error.to_string()))
     }
 }
 
@@ -19716,24 +19711,12 @@ impl PipelinePartitionMetadata for QwenHybridPipelinePartition {
             .architecture
             .runtime_state_layout()
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let policies = complete
-            .layers()
-            .iter()
-            .skip(self.range().start)
-            .take(self.range().len())
-            .cloned()
-            .collect::<Vec<_>>();
-        let layout = eredu_core::LayerSchedule::new(policies.len(), policies)
-            .map_err(|error| Error::Parallel(error.to_string()))?;
-        Ok(pipeline_prompt_cache_identity(
+        qwen_hybrid_pipeline_prompt_cache_identity(
+            self.args(),
             topology,
-            "qwen_hybrid",
-            &self.args().model_type,
-            eredu_architectures::qwen::hybrid::prompt_cache_architecture_fingerprint(self.args()),
-            self.args().num_hidden_layers as usize,
             self.range().clone(),
-            layout,
-        ))
+            &complete,
+        )
     }
 }
 
