@@ -15,9 +15,14 @@ use eredu_core::{
     AttentionPolicy, LayerSchedule,
 };
 use eredu_gguf::MetadataValue;
-use eredu_runtime::StateLayout;
+use eredu_runtime::{StateLayout, StateSegmentLifetime, StateSegmentSpec};
 use serde::Deserialize;
 use serde_json::Value;
+
+/// Stable segment identity for target decoder state.
+pub const TARGET_STATE_SEGMENT: &str = "target";
+/// Stable segment identity for checkpoint-embedded prediction state.
+pub const PREDICTION_STATE_SEGMENT: &str = "prediction";
 
 /// Executable physical unit at one Nemotron-H schedule position.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -892,8 +897,27 @@ pub fn state_layout_with_geometry(
             )),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    StateLayout::new(
+    let target_layers = args.layer_schedule.len();
+    let prediction_layers = policies.len() - target_layers;
+    let mut segments = vec![StateSegmentSpec::new(
+        TARGET_STATE_SEGMENT,
+        0..target_layers,
+        StateSegmentLifetime::Persistent,
+    )
+    .map_err(|error| invalid(error.to_string()))?];
+    if prediction_layers > 0 {
+        segments.push(
+            StateSegmentSpec::new(
+                PREDICTION_STATE_SEGMENT,
+                target_layers..target_layers + prediction_layers,
+                StateSegmentLifetime::Persistent,
+            )
+            .map_err(|error| invalid(error.to_string()))?,
+        );
+    }
+    StateLayout::segmented(
         LayerSchedule::new(policies.len(), policies).map_err(|e| invalid(e.to_string()))?,
+        segments,
     )
     .map_err(|e| invalid(e.to_string()))
 }
@@ -1078,6 +1102,11 @@ mod tests {
             Some(LayerCachePolicy::FixedState { .. })
         ));
         let layout = state_layout(&args).unwrap();
+        assert_eq!(layout.segments().len(), 2);
+        assert_eq!(layout.segments()[0].id().as_str(), TARGET_STATE_SEGMENT);
+        assert_eq!(layout.segments()[0].layers(), 0..4);
+        assert_eq!(layout.segments()[1].id().as_str(), PREDICTION_STATE_SEGMENT);
+        assert_eq!(layout.segments()[1].layers(), 4..6);
         let identity = crate::nemotron_h::state_identity(
             &args,
             &layout,

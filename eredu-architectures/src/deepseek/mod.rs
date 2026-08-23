@@ -1,5 +1,10 @@
 //! Shared backend-neutral DeepSeek architecture policy.
 
+/// Stable segment identity for target decoder state.
+pub const TARGET_STATE_SEGMENT: &str = "target";
+/// Stable segment identity for checkpoint-embedded prediction state.
+pub const PREDICTION_STATE_SEGMENT: &str = "prediction";
+
 /// Family-specific compressed-attention equations.
 pub mod attention;
 /// Shared normalization, residual, and feed-forward sequencing.

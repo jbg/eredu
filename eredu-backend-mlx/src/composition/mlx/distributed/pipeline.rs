@@ -2982,7 +2982,7 @@ trait PipelinePlacedIngress {
 trait PipelineEmbeddedMtp {
     fn embedded_mtp_len(&self) -> usize;
 
-    fn embedded_mtp_state_start(&self) -> Option<usize>;
+    fn embedded_mtp_state_segment(&self) -> Option<&'static str>;
 
     fn new_embedded_mtp_cache(
         &self,
@@ -6176,7 +6176,7 @@ impl PipelineEmbeddedMtp for DeepSeekV3PipelinePartition {
         })
     }
 
-    fn embedded_mtp_state_start(&self) -> Option<usize> {
+    fn embedded_mtp_state_segment(&self) -> Option<&'static str> {
         None
     }
 
@@ -6914,7 +6914,7 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
         Ok(true)
     }
 
-    fn embedded_mtp_state_start(&self) -> Option<usize> {
+    fn embedded_mtp_state_segment(&self) -> Option<&'static str> {
         None
     }
 
@@ -7809,7 +7809,7 @@ impl PipelineEmbeddedMtp for InklingPipelinePartition {
         self.forward_pipeline_mtp(hidden, tokens, depth, cache, execution, stream)
     }
 
-    fn embedded_mtp_state_start(&self) -> Option<usize> {
+    fn embedded_mtp_state_segment(&self) -> Option<&'static str> {
         None
     }
 
@@ -9281,8 +9281,8 @@ impl PipelineEmbeddedMtp for QwenConditionalPipelinePartition {
         self.args().text.mtp_num_hidden_layers.max(0) as usize
     }
 
-    fn embedded_mtp_state_start(&self) -> Option<usize> {
-        Some(self.args().text.num_hidden_layers as usize)
+    fn embedded_mtp_state_segment(&self) -> Option<&'static str> {
+        Some(eredu_architectures::qwen::hybrid::PREDICTION_STATE_SEGMENT)
     }
 
     fn new_embedded_mtp_cache(
@@ -9785,8 +9785,8 @@ impl PipelineEmbeddedMtp for NemotronHPipelinePartition {
         self.args().num_nextn_predict_layers as usize
     }
 
-    fn embedded_mtp_state_start(&self) -> Option<usize> {
-        Some(self.args().num_hidden_layers as usize)
+    fn embedded_mtp_state_segment(&self) -> Option<&'static str> {
+        Some(eredu_architectures::nemotron_h::PREDICTION_STATE_SEGMENT)
     }
 
     fn new_embedded_mtp_cache(
@@ -10518,19 +10518,27 @@ impl PipelineModel {
                 }
             }
         }
-        if let (PipelineMtpCache::Hybrid(mtp), Some(start)) = (
+        if let (PipelineMtpCache::Hybrid(mtp), Some(segment)) = (
             &mut cache.mtp,
             self.stage
                 .embedded_mtp()
-                .and_then(PipelineEmbeddedMtp::embedded_mtp_state_start),
+                .and_then(PipelineEmbeddedMtp::embedded_mtp_state_segment),
         ) {
             let target_owned = cache.layers.len();
             let offsets = identity
                 .layer_prefix_offsets
                 .get(target_owned..)
                 .ok_or_else(|| Error::Parallel("pipeline MTP prompt offsets are missing".into()))?;
+            let range = mtp
+                .segment_range(segment)
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            if range.len() != offsets.len() {
+                return Err(Error::Parallel(
+                    "pipeline MTP prompt offsets do not match the prediction state segment".into(),
+                ));
+            }
             state_arrays.extend(mtp.prompt_cache_state_arrays_range(
-                start..start + offsets.len(),
+                range,
                 expected_offset,
                 offsets,
             )?);
@@ -10636,11 +10644,11 @@ impl PipelineModel {
                 .embedded_mtp()
                 .expect("MTP capability checked")
                 .new_embedded_mtp_cache(Some((manager, rank)))?;
-            if let (PipelineMtpCache::Hybrid(mtp), Some(start)) = (
+            if let (PipelineMtpCache::Hybrid(mtp), Some(segment)) = (
                 &mut cache.mtp,
                 self.stage
                     .embedded_mtp()
-                    .and_then(PipelineEmbeddedMtp::embedded_mtp_state_start),
+                    .and_then(PipelineEmbeddedMtp::embedded_mtp_state_segment),
             ) {
                 let target_owned = cache.layers.len();
                 let offsets = identity
@@ -10649,12 +10657,16 @@ impl PipelineModel {
                     .ok_or_else(|| {
                         Error::Parallel("pipeline MTP prompt offsets are missing".into())
                     })?;
-                mtp.restore_prompt_cache_state_range(
-                    &mut restored_state,
-                    start..start + offsets.len(),
-                    offset,
-                    offsets,
-                )?;
+                let range = mtp
+                    .segment_range(segment)
+                    .map_err(|error| Error::Parallel(error.to_string()))?;
+                if range.len() != offsets.len() {
+                    return Err(Error::Parallel(
+                        "pipeline MTP prompt offsets do not match the prediction state segment"
+                            .into(),
+                    ));
+                }
+                mtp.restore_prompt_cache_state_range(&mut restored_state, range, offset, offsets)?;
             }
         }
         if !restored_state.is_empty() {
@@ -11948,15 +11960,15 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
             self.model
                 .stage
                 .embedded_mtp()
-                .and_then(PipelineEmbeddedMtp::embedded_mtp_state_start),
+                .and_then(PipelineEmbeddedMtp::embedded_mtp_state_segment),
         ) {
             (
                 PipelineMtpCache::Hybrid(canonical),
                 PipelineMtpCache::Hybrid(source),
-                Some(start),
+                Some(segment),
             ) => canonical
-                .commit_layer_range_from(source, start)
-                .expect("validated hybrid MTP draft state layout"),
+                .commit_segment_from(source, segment)
+                .expect("validated hybrid MTP prediction state segment"),
             (canonical, source, _) => canonical.clone_from(source),
         }
     }
@@ -20047,8 +20059,8 @@ impl PipelineEmbeddedMtp for QwenHybridPipelinePartition {
         self.args().mtp_num_hidden_layers.max(0) as usize
     }
 
-    fn embedded_mtp_state_start(&self) -> Option<usize> {
-        Some(self.args().num_hidden_layers as usize)
+    fn embedded_mtp_state_segment(&self) -> Option<&'static str> {
+        Some(eredu_architectures::qwen::hybrid::PREDICTION_STATE_SEGMENT)
     }
 
     fn new_embedded_mtp_cache(

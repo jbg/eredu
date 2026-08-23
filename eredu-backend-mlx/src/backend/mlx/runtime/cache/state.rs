@@ -1903,6 +1903,31 @@ impl MlxHybridState {
         Ok(())
     }
 
+    /// Commits exactly one architecture-declared state segment.
+    pub fn commit_segment_from(&mut self, source: &Self, segment: &str) -> Result<(), Exception> {
+        if self.layout != source.layout
+            || self.global_layer_start != source.global_layer_start
+            || self.layers.len() != source.layers.len()
+        {
+            return Err(Exception::custom(
+                "hybrid draft state layout does not match canonical state",
+            ));
+        }
+        let range = self.segment_range(segment)?;
+        self.layers[range.clone()].clone_from_slice(&source.layers[range]);
+        Ok(())
+    }
+
+    /// Resolves one named architecture-owned state segment.
+    pub fn segment_range(&self, segment: &str) -> Result<Range<usize>, Exception> {
+        let segment =
+            StateSegmentId::new(segment).map_err(|error| Exception::custom(error.to_string()))?;
+        self.layout
+            .segment(&segment)
+            .map(StateSegmentSpec::layers)
+            .ok_or_else(|| Exception::custom(format!("unknown hybrid state segment {segment:?}")))
+    }
+
     /// Returns aggregate telemetry when this state contains paged attention.
     pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
         self.layers
@@ -2280,6 +2305,33 @@ mod semantic_transaction_tests {
         assert!(canonical.permits_parallel_branches());
         assert!(canonical.has_same_transaction_identity(&branch));
         canonical.commit_branch(branch).unwrap();
+    }
+
+    #[test]
+    fn hybrid_commit_clones_only_the_architecture_named_segment() {
+        let layout = StateLayout::segmented(
+            LayerSchedule::new(3, vec![LayerCachePolicy::NoState; 3]).unwrap(),
+            [
+                StateSegmentSpec::new("target", 0..2, StateSegmentLifetime::Persistent).unwrap(),
+                StateSegmentSpec::new("prediction", 2..3, StateSegmentLifetime::Persistent)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut canonical = MlxHybridState::device(layout.clone()).unwrap();
+        let mut draft = MlxHybridState::device(layout).unwrap();
+        canonical.layers[0].fixed_offset = 1;
+        canonical.layers[1].fixed_offset = 2;
+        canonical.layers[2].fixed_offset = 3;
+        draft.layers[0].fixed_offset = 10;
+        draft.layers[1].fixed_offset = 20;
+        draft.layers[2].fixed_offset = 30;
+
+        canonical.commit_segment_from(&draft, "prediction").unwrap();
+
+        assert_eq!(canonical.layers[0].fixed_offset, 1);
+        assert_eq!(canonical.layers[1].fixed_offset, 2);
+        assert_eq!(canonical.layers[2].fixed_offset, 30);
     }
 
     #[test]

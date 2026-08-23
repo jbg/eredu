@@ -12,12 +12,17 @@ use eredu_core::{
 };
 use eredu_gguf::MetadataValue;
 use eredu_nn::RopeValue;
-use eredu_runtime::StateLayout;
+use eredu_runtime::{StateLayout, StateSegmentLifetime, StateSegmentSpec};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::qwen::vision::{VisionConfig, VisionConfigSource};
 use crate::qwen::GgufTensorCatalog;
+
+/// Stable segment identity for target decoder state.
+pub const TARGET_STATE_SEGMENT: &str = "target";
+/// Stable segment identity for checkpoint-embedded prediction state.
+pub const PREDICTION_STATE_SEGMENT: &str = "prediction";
 
 /// Stateful operator policy for one hybrid decoder layer.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -1131,7 +1136,23 @@ pub fn state_layout_with_geometry(
     }
     let schedule = LayerSchedule::new(config.layer_schedule.len() + mtp_layers, policies)
         .map_err(|error| invalid(error.to_string()))?;
-    StateLayout::new(schedule).map_err(|error| invalid(error.to_string()))
+    let mut segments = vec![StateSegmentSpec::new(
+        TARGET_STATE_SEGMENT,
+        0..target_layers,
+        StateSegmentLifetime::Persistent,
+    )
+    .map_err(|error| invalid(error.to_string()))?];
+    if mtp_layers > 0 {
+        segments.push(
+            StateSegmentSpec::new(
+                PREDICTION_STATE_SEGMENT,
+                target_layers..target_layers + mtp_layers,
+                StateSegmentLifetime::Persistent,
+            )
+            .map_err(|error| invalid(error.to_string()))?,
+        );
+    }
+    StateLayout::segmented(schedule, segments).map_err(|error| invalid(error.to_string()))
 }
 
 fn validate_rope_policy(config: Option<&HashMap<String, Value>>) -> Result<(), HybridConfigError> {
@@ -1395,6 +1416,11 @@ mod tests {
         assert!(layout.layer(0).unwrap().attention().is_none());
         assert!(layout.layer(3).unwrap().attention().is_some());
         assert!(layout.layer(4).unwrap().attention().is_some());
+        assert_eq!(layout.segments().len(), 2);
+        assert_eq!(layout.segments()[0].id().as_str(), TARGET_STATE_SEGMENT);
+        assert_eq!(layout.segments()[0].layers(), 0..4);
+        assert_eq!(layout.segments()[1].id().as_str(), PREDICTION_STATE_SEGMENT);
+        assert_eq!(layout.segments()[1].layers(), 4..5);
     }
 
     struct Catalog(HashSet<String>);

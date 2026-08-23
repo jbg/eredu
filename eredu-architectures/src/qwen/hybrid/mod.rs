@@ -25,7 +25,7 @@ pub use config::{
     model_args_from_gguf_catalog, prompt_cache_architecture_fingerprint, state_layout,
     state_layout_with_geometry, with_gguf_vision_projector, HybridConfig, HybridConfigError,
     HybridLayerPolicy, HybridStateGeometry, HybridVariant, ParsedHybridConfig,
-    QwenFp8QuantizationConfig,
+    QwenFp8QuantizationConfig, PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
 };
 pub use linear_attention::LinearAttention;
 pub use model::{state_identity, ForwardContext, LayeredModel, TargetPartitionInput, Unit};

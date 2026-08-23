@@ -2,7 +2,9 @@
 
 use std::{path::Path, sync::Arc};
 
-use eredu_architectures::nemotron_h::{Block, LayeredModel, ModelArgs, PredictionUnit, Unit};
+use eredu_architectures::nemotron_h::{
+    Block, LayeredModel, ModelArgs, PredictionUnit, Unit, PREDICTION_STATE_SEGMENT,
+};
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
     ActivationObserver, CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExecutionGraph,
@@ -1851,8 +1853,8 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for Nemot
 
     fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
         cache
-            .commit_layer_range_from(draft, self.args.num_hidden_layers as usize)
-            .expect("validated Nemotron-H draft state layout");
+            .commit_segment_from(draft, PREDICTION_STATE_SEGMENT)
+            .expect("validated Nemotron-H prediction state segment");
     }
 
     fn restore_target_checkpoint(
@@ -1967,8 +1969,8 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget
 
     fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
         cache
-            .commit_layer_range_from(draft, self.model.args.num_hidden_layers as usize)
-            .expect("validated Nemotron-H tensor draft state layout");
+            .commit_segment_from(draft, PREDICTION_STATE_SEGMENT)
+            .expect("validated Nemotron-H tensor prediction state segment");
     }
 
     fn restore_target_checkpoint(

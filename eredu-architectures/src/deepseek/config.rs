@@ -1486,9 +1486,22 @@ mod tests {
 
     #[test]
     fn deepseek_state_and_moe_policies_are_neutral_and_scheduled() {
-        let v3 = parse_v3_config(&fixture()).unwrap();
+        let mut v3_fixture = fixture();
+        v3_fixture["num_nextn_predict_layers"] = Value::from(2);
+        let v3 = parse_v3_config(&v3_fixture).unwrap();
         let v3_layout = crate::deepseek::v3::state_layout(&v3).unwrap();
-        assert_eq!(v3_layout.len(), 4);
+        assert_eq!(v3_layout.len(), 6);
+        assert_eq!(v3_layout.segments().len(), 2);
+        assert_eq!(
+            v3_layout.segments()[0].id().as_str(),
+            super::super::TARGET_STATE_SEGMENT
+        );
+        assert_eq!(v3_layout.segments()[0].layers(), 0..4);
+        assert_eq!(
+            v3_layout.segments()[1].id().as_str(),
+            super::super::PREDICTION_STATE_SEGMENT
+        );
+        assert_eq!(v3_layout.segments()[1].layers(), 4..6);
         assert_eq!(
             v3_layout.components(0).unwrap()[0].role.stable_name(),
             "attention.compressed_latent"
@@ -1500,6 +1513,17 @@ mod tests {
         let v4 = parse_v4_config(&v4_fixture()).unwrap();
         let v4_layout = crate::deepseek::v4::state_layout(&v4).unwrap();
         assert_eq!(v4_layout.len(), 4);
+        assert_eq!(v4_layout.segments().len(), 2);
+        assert_eq!(
+            v4_layout.segments()[0].id().as_str(),
+            super::super::TARGET_STATE_SEGMENT
+        );
+        assert_eq!(v4_layout.segments()[0].layers(), 0..3);
+        assert_eq!(
+            v4_layout.segments()[1].id().as_str(),
+            super::super::PREDICTION_STATE_SEGMENT
+        );
+        assert_eq!(v4_layout.segments()[1].layers(), 3..4);
         assert_eq!(v4_layout.components(0).unwrap().len(), 1);
         let compressed = v4_layout.components(1).unwrap();
         assert_eq!(compressed.len(), 11);

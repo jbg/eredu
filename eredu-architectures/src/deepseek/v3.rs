@@ -10,7 +10,7 @@ use eredu_nn::{
 use eredu_runtime::{
     LayerRuntimeState, LayeredArchitecture, LayeredForwardState, ParallelLayeredArchitecture,
     ParallelRoutedLayeredArchitecture, RoutedExpertProvider, RoutedLayeredArchitecture,
-    RuntimeStateComponents, StateLayout,
+    RuntimeStateComponents, StateLayout, StateSegmentLifetime, StateSegmentSpec,
 };
 
 use crate::decoder::{SequentialPredictionGroups, StaticModuleSpec, StaticModules};
@@ -1375,8 +1375,28 @@ pub fn state_layout(args: &V3Args) -> Result<StateLayout, Error> {
             .map_err(Error::backend)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    StateLayout::new(LayerSchedule::new(layers, policies).map_err(Error::backend)?)
-        .map_err(Error::backend)
+    let target_layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    let mut segments = vec![StateSegmentSpec::new(
+        super::TARGET_STATE_SEGMENT,
+        0..target_layers,
+        StateSegmentLifetime::Persistent,
+    )
+    .map_err(Error::backend)?];
+    if layers > target_layers {
+        segments.push(
+            StateSegmentSpec::new(
+                super::PREDICTION_STATE_SEGMENT,
+                target_layers..layers,
+                StateSegmentLifetime::Persistent,
+            )
+            .map_err(Error::backend)?,
+        );
+    }
+    StateLayout::segmented(
+        LayerSchedule::new(layers, policies).map_err(Error::backend)?,
+        segments,
+    )
+    .map_err(Error::backend)
 }
 
 #[cfg(test)]

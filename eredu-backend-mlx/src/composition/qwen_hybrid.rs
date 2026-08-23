@@ -1962,8 +1962,8 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for QwenH
 
     fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
         cache
-            .commit_layer_range_from(draft, self.parsed.text.num_hidden_layers as usize)
-            .expect("validated Qwen hybrid draft range")
+            .commit_segment_from(draft, hybrid::PREDICTION_STATE_SEGMENT)
+            .expect("validated Qwen hybrid prediction state segment")
     }
 
     fn restore_target_checkpoint(

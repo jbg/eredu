@@ -10,8 +10,8 @@ use eredu_architectures::deepseek::{self, V3Args, V4Args};
 use eredu_checkpoint::WeightQuantization;
 use eredu_runtime::{
     CacheResidencyPolicy, CausalModel, DeviceState, ExecutionUnitLayout, LayerWeightResidency,
-    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole, RuntimeState,
-    WeightResidency,
+    LayeredArchitecture, LayerwiseRuntime, PagedCacheOptions, ParameterRole, RuntimeLayerState,
+    RuntimeState, StateSegmentId, WeightResidency,
 };
 use safemlx::{
     distributed::Group,
@@ -277,7 +277,6 @@ enum DeepSeekModelInner {
 #[derive(Debug, Clone)]
 pub struct DeepSeekState {
     inner: DeepSeekStateInner,
-    target_layers: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -317,27 +316,13 @@ impl DeepSeekState {
         }
     }
 
-    fn commit_prediction_layers_from(
-        &mut self,
-        draft: &Self,
-        target_layers: usize,
-    ) -> Result<(), Exception> {
+    fn commit_prediction_layers_from(&mut self, draft: &Self) -> Result<(), Exception> {
         match (&mut self.inner, &draft.inner) {
             (DeepSeekStateInner::V3(current), DeepSeekStateInner::V3(draft)) => {
-                let current = current.as_mut();
-                let draft = draft.as_ref();
-                if current.len() != draft.len() || target_layers > current.len() {
-                    return Err(Exception::custom("V3 draft state layout mismatch"));
-                }
-                current[target_layers..].clone_from_slice(&draft[target_layers..]);
+                commit_state_segment(current, draft, deepseek::PREDICTION_STATE_SEGMENT, "V3")?;
             }
             (DeepSeekStateInner::V4(current), DeepSeekStateInner::V4(draft)) => {
-                let current = current.as_mut();
-                let draft = draft.as_ref();
-                if current.len() != draft.len() || target_layers > current.len() {
-                    return Err(Exception::custom("V4 draft state layout mismatch"));
-                }
-                current[target_layers..].clone_from_slice(&draft[target_layers..]);
+                commit_state_segment(current, draft, deepseek::PREDICTION_STATE_SEGMENT, "V4")?;
             }
             _ => return Err(Exception::custom("DeepSeek draft state family mismatch")),
         }
@@ -391,6 +376,31 @@ impl DeepSeekState {
                 .map_err(|error| Exception::custom(error.to_string())),
         }
     }
+}
+
+fn commit_state_segment<L>(
+    current: &mut DeviceState<MlxNeuralBackend, L>,
+    draft: &DeviceState<MlxNeuralBackend, L>,
+    segment: &str,
+    family: &str,
+) -> Result<(), Exception>
+where
+    L: Clone + RuntimeLayerState<MlxNeuralBackend>,
+{
+    if current.layout() != draft.layout() || current.as_ref().len() != draft.as_ref().len() {
+        return Err(Exception::custom(format!(
+            "{family} draft state layout mismatch"
+        )));
+    }
+    let segment =
+        StateSegmentId::new(segment).map_err(|error| Exception::custom(error.to_string()))?;
+    let range = current
+        .layout()
+        .segment(&segment)
+        .map(eredu_runtime::StateSegmentSpec::layers)
+        .ok_or_else(|| Exception::custom(format!("{family} state has no {segment:?} segment")))?;
+    current.as_mut()[range.clone()].clone_from_slice(&draft.as_ref()[range]);
+    Ok(())
 }
 
 impl DeepSeekModel {
@@ -718,17 +728,15 @@ impl DeepSeekModel {
     pub fn new_state(&self) -> Result<DeepSeekState, Error> {
         let layout = self.state_layout()?;
         match &self.inner {
-            DeepSeekModelInner::V3 { args, .. } => Ok(DeepSeekState {
+            DeepSeekModelInner::V3 { .. } => Ok(DeepSeekState {
                 inner: DeepSeekStateInner::V3(DeviceState::create(layout, |_, _| {
                     Ok::<_, Error>(CompressedLatentCache::new())
                 })?),
-                target_layers: args.num_hidden_layers as usize,
             }),
-            DeepSeekModelInner::V4 { args, .. } => Ok(DeepSeekState {
+            DeepSeekModelInner::V4 { .. } => Ok(DeepSeekState {
                 inner: DeepSeekStateInner::V4(
                     MlxPoolingAttentionStateFactory::device(layout).map_err(Error::from)?,
                 ),
-                target_layers: args.num_hidden_layers as usize,
             }),
         }
     }
@@ -755,19 +763,17 @@ impl DeepSeekModel {
     ) -> Result<DeepSeekState, Error> {
         let layout = self.state_layout()?;
         match &self.inner {
-            DeepSeekModelInner::V3 { args, .. } => Ok(DeepSeekState {
+            DeepSeekModelInner::V3 { .. } => Ok(DeepSeekState {
                 inner: DeepSeekStateInner::V3(DeviceState::create(layout, |layer, _| {
                     CompressedLatentCache::new_paged(manager.clone(), layer, rank)
                         .map_err(Error::from)
                 })?),
-                target_layers: args.num_hidden_layers as usize,
             }),
-            DeepSeekModelInner::V4 { args, .. } => Ok(DeepSeekState {
+            DeepSeekModelInner::V4 { .. } => Ok(DeepSeekState {
                 inner: DeepSeekStateInner::V4(
                     MlxPoolingAttentionStateFactory::paged(layout, manager, 0, prefix_tokens, rank)
                         .map_err(Error::from)?,
                 ),
-                target_layers: args.num_hidden_layers as usize,
             }),
         }
     }
@@ -2310,7 +2316,7 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for DeepS
 
     fn commit_draft_cache(&self, cache: &mut Self::Cache, draft: &Self::DraftCache) {
         cache
-            .commit_prediction_layers_from(draft, draft.target_layers)
+            .commit_prediction_layers_from(draft)
             .expect("validated DeepSeek draft and target layouts match");
     }
 
