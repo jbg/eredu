@@ -8,6 +8,7 @@ use eredu_checkpoint::{
     store::{ReadPolicy, TensorReadRequest},
     WeightQuantization,
 };
+use eredu_nn::Parameterized;
 use eredu_runtime::{ParameterGroupSpec, ParameterRole, WeightBinding, WeightBindingPlan};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -19,6 +20,7 @@ use safemlx::{
 
 use crate::{
     backend::mlx::error::Error,
+    backend::mlx::nn::shared::neutral_parameter_refs,
     backend::mlx::runtime::checkpoint::binding_plan::{
         BindingPlan, BindingPlanError, PlannedBinding,
     },
@@ -233,6 +235,27 @@ pub fn build_module_binding_plan_with_recipes(
     recipes: BTreeMap<String, DerivedWeightRecipe>,
 ) -> Result<ModuleBindingPlan, ModuleBindingError> {
     build_module_binding_plan_with_recipes_excluding(module, prefix, store, recipes, |_| false)
+}
+
+/// Builds exact checkpoint bindings from a backend-neutral parameter module.
+///
+/// Stable parameter identities are already fully qualified, so no
+/// family-specific checkpoint root is accepted here.
+pub fn build_neutral_module_bindings<M>(
+    module: &M,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
+) -> Result<Vec<WeightBinding>, ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+{
+    build_flattened_module_binding_plan_with_recipes_excluding(
+        neutral_parameter_refs(module, false).flatten(),
+        "",
+        store,
+        BTreeMap::new(),
+        |_| false,
+    )?
+    .build_bindings(store)
 }
 
 /// Materializes a set of direct or derived bindings without constructing a
@@ -492,6 +515,25 @@ pub fn build_module_binding_plan_with_recipes_excluding<F>(
     module: &impl ModuleParameters,
     prefix: &str,
     store: &dyn eredu_checkpoint::store::CheckpointSource,
+    recipes: BTreeMap<String, DerivedWeightRecipe>,
+    exclude: F,
+) -> Result<ModuleBindingPlan, ModuleBindingError>
+where
+    F: Fn(&str) -> bool,
+{
+    build_flattened_module_binding_plan_with_recipes_excluding(
+        module.parameters().flatten(),
+        prefix,
+        store,
+        recipes,
+        exclude,
+    )
+}
+
+fn build_flattened_module_binding_plan_with_recipes_excluding<F>(
+    params: FlattenedModuleParamRef<'_>,
+    prefix: &str,
+    store: &dyn eredu_checkpoint::store::CheckpointSource,
     mut recipes: BTreeMap<String, DerivedWeightRecipe>,
     exclude: F,
 ) -> Result<ModuleBindingPlan, ModuleBindingError>
@@ -499,7 +541,6 @@ where
     F: Fn(&str) -> bool,
 {
     let keys = store.source_keys().into_iter().collect::<BTreeSet<_>>();
-    let params = module.parameters().flatten();
     let mut local_names = params
         .iter()
         .filter(|(name, parameter)| {

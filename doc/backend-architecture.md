@@ -105,6 +105,14 @@ source-layout projections are exposed explicitly by the architecture
 checkpoint contract. Loading, residency, and quantization code must not infer
 any of those facts from substrings in checkpoint names.
 
+Pinned parameters additionally expose an architecture-owned bindable static
+module interface. The parameter description selects the roles owned by a
+partition, and the architecture resolves each role to its parameterized module
+for binding construction or mutable population. A backend may materialize and
+shard those visited modules, but must not map roles to family-specific fields,
+residency identifiers, or checkpoint roots. Stable parameter identities on the
+visited module are the checkpoint-binding namespace.
+
 Routed expert banks retain and expose their architecture-owned construction
 specification. Resident, cached, distributed, and future backend execution
 paths all consume that same geometry, projection encoding, bias layout, and

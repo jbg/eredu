@@ -26,6 +26,11 @@ pub mod operator_requirements;
 pub mod preparation;
 /// Backend-neutral family preprocessing and framing plans.
 pub mod processor_plan;
+/// Architecture-owned bindings from static semantic roles to parameter modules.
+pub mod static_parameters;
+pub use static_parameters::{
+    BindableStaticParameters, StaticParameterVisitor, StaticParameterVisitorMut,
+};
 
 /// Shared decoder mechanics used by backend-neutral text architectures.
 pub mod decoder;

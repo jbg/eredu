@@ -12,8 +12,8 @@ use std::{
     sync::Arc,
 };
 
-use eredu_architectures::qwen::ModelArgs;
-use eredu_nn::RoutedNeuralBackend;
+use eredu_architectures::{qwen::ModelArgs, BindableStaticParameters, StaticParameterVisitor};
+use eredu_nn::{Parameterized, RoutedNeuralBackend};
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, ops::GgufCheckpoint, Array, Stream};
 
 use eredu_core::cache::{
@@ -30,8 +30,8 @@ use crate::{
     backend::mlx::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes,
         build_module_binding_plan_with_recipes_excluding, build_module_bindings,
-        build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
-        parameter_role_targets, populate_module_from_lease_excluding,
+        build_module_bindings_with_recipes_excluding, build_neutral_module_bindings,
+        parameter_name_in_targets, parameter_role_targets, populate_module_from_lease_excluding,
     },
     backend::mlx::runtime::checkpoint::{
         quantization::should_quantize_on_load, store::open_gguf_checkpoint_source,
@@ -1520,6 +1520,26 @@ pub struct QwenPipelineBindings {
     external_experts: bool,
 }
 
+struct StaticBindingVisitor<'a> {
+    store: &'a dyn eredu_checkpoint::store::CheckpointSource,
+    units: Vec<StaticUnitBindings>,
+}
+
+impl StaticParameterVisitor<MlxBackend> for StaticBindingVisitor<'_> {
+    type Error = Error;
+
+    fn visit<M>(&mut self, role: &str, module: &M) -> Result<(), Self::Error>
+    where
+        M: Parameterized<crate::MlxTensor>,
+    {
+        self.units.push(StaticUnitBindings::new(
+            role,
+            build_neutral_module_bindings(module, self.store)?,
+        )?);
+        Ok(())
+    }
+}
+
 impl QwenPipelineBindings {
     /// Creates a stateless checkpoint-binding adapter.
     pub const fn new() -> Self {
@@ -1543,24 +1563,12 @@ impl QwenPipelineBindings {
         architecture: &NeutralArchitecture,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<StaticUnitBindings>, Error> {
-        self.selected_static_units(architecture, store, &|_| true)
-    }
-
-    pub fn selected_static_units(
-        &self,
-        architecture: &NeutralArchitecture,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-        select: &dyn Fn(&str) -> bool,
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let roles = [
-            ("embedding", "qwen.static.embedding"),
-            ("norm", "qwen.static.norm"),
-            ("output", "qwen.static.output"),
-        ]
-        .into_iter()
-        .filter_map(|(role, unit)| select(unit).then_some(role))
-        .collect::<Vec<_>>();
-        self.selected_static_units_for_roles(architecture, store, &roles)
+        let mut visitor = StaticBindingVisitor {
+            store,
+            units: Vec::new(),
+        };
+        architecture.visit_static_parameters(&mut visitor)?;
+        Ok(visitor.units)
     }
 
     pub fn quantizes_static_binding(&self, _binding: &WeightBinding) -> bool {
@@ -1724,66 +1732,6 @@ impl QwenPipelineBindings {
             .build_bindings(store)?,
         )
     }
-
-    fn selected_static_units_for_roles(
-        &self,
-        architecture: &NeutralArchitecture,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-        roles: &[&str],
-    ) -> Result<Vec<StaticUnitBindings>, Error> {
-        let selected = |role: &str| roles.contains(&role);
-        let args = architecture.args();
-        let static_modules = architecture.static_modules();
-        let mut units = Vec::new();
-        if selected("embedding") {
-            units.push(StaticUnitBindings::new(
-                "qwen.static.embedding",
-                build_module_binding_plan_with_recipes(
-                    &static_modules.embeddings,
-                    &format!("{}.embed_tokens", args.parameter_root),
-                    store,
-                    Default::default(),
-                )?
-                .build_bindings(store)?,
-            )?);
-        }
-        if selected("norm") {
-            let norm_root = format!("{}.norm.", args.parameter_root);
-            let bindings = build_module_binding_plan_with_recipes(
-                &static_modules.norm,
-                "",
-                store,
-                Default::default(),
-            )?
-            .build_bindings(store)?
-            .into_iter()
-            .map(|binding| {
-                let local = binding
-                    .name()
-                    .strip_prefix(&norm_root)
-                    .unwrap_or(binding.name())
-                    .to_owned();
-                binding.with_name(local).map_err(Error::from)
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-            units.push(StaticUnitBindings::new("qwen.static.norm", bindings)?);
-        }
-        if selected("output") {
-            if let Some(head) = &static_modules.lm_head {
-                units.push(StaticUnitBindings::new(
-                    "qwen.static.output",
-                    build_module_binding_plan_with_recipes(
-                        head,
-                        "lm_head",
-                        store,
-                        Default::default(),
-                    )?
-                    .build_bindings(store)?,
-                )?);
-            }
-        }
-        Ok(units)
-    }
 }
 
 /// Structured failures at the unified Qwen model boundary.
@@ -1800,5 +1748,79 @@ pub enum QwenModelError {
 impl From<QwenModelError> for crate::backend::mlx::error::Error {
     fn from(error: QwenModelError) -> Self {
         Self::ArchitectureModel(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use eredu_checkpoint::store::MemoryWeightStore;
+    use safemlx::{Device, DeviceType};
+
+    use super::*;
+
+    fn f32_tensor(
+        name: &str,
+        shape: Vec<usize>,
+    ) -> (String, safetensors::Dtype, Vec<usize>, Vec<u8>) {
+        let elements = shape.iter().product::<usize>();
+        (
+            name.into(),
+            safetensors::Dtype::F32,
+            shape,
+            vec![0; elements * size_of::<f32>()],
+        )
+    }
+
+    #[test]
+    fn qwen_static_bindings_use_architecture_parameter_identities() {
+        let args = eredu_architectures::qwen::model_args_from_config_value(&serde_json::json!({
+            "model_type": "qwen3",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 32,
+            "max_position_embeddings": 128,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": false
+        }))
+        .unwrap();
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let architecture = NeutralArchitecture::new(args, &stream).unwrap();
+        let store = MemoryWeightStore::from_safetensors([
+            f32_tensor("model.embed_tokens.weight", vec![32, 8]),
+            f32_tensor("model.norm.weight", vec![8]),
+            f32_tensor("lm_head.weight", vec![32, 8]),
+        ])
+        .unwrap();
+
+        let units = QwenPipelineBindings::new()
+            .static_units(&architecture, &store)
+            .unwrap();
+        let actual = units
+            .iter()
+            .map(|unit| {
+                (
+                    unit.id().as_str(),
+                    unit.bindings()[0].name(),
+                    unit.bindings()[0].logical_target(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                (
+                    "embedding",
+                    "model.embed_tokens.weight",
+                    Some("model.embed_tokens.weight")
+                ),
+                ("norm", "model.norm.weight", Some("model.norm.weight")),
+                ("output", "lm_head.weight", Some("lm_head.weight")),
+            ]
+        );
     }
 }

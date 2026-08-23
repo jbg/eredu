@@ -1,20 +1,20 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::BTreeMap};
 
 use eredu_architectures::{
     decoder::{self, AttentionProjectionLayout, GatedProjectionLayout, TransformerBlock},
     gpt_oss,
     llama::{self, LayeredInput, ModelArgs},
-    moshi, qwen,
+    moshi, qwen, BindableStaticParameters, StaticParameterVisitor,
 };
 use eredu_core::{AttentionPolicy, Completion, LayerSchedule, TokenFilter};
 use eredu_nn::{
-    AttentionCache, AttentionMask, AttentionRequest, EmbeddingLookupPolicy, EmbeddingOperator,
-    EmbeddingSpec, Error, GatedProductExpertBankOperator, GatedProductExpertBankSpec, Index,
-    LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator, NormalizationSpec, PadMode,
-    ParameterMetadata, ParameterVisitor, ParameterVisitorMut, Parameterized,
-    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
-    RoutedNeuralBackend, RoutingOperator, RoutingResult, Tensor, TopKRouterSpec,
-    VocabularyParallelRange,
+    validate_parameter_topology, AttentionCache, AttentionMask, AttentionRequest,
+    EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, GatedProductExpertBankOperator,
+    GatedProductExpertBankSpec, Index, LinearOperator, LinearSpec, NeuralBackend,
+    NormalizationOperator, NormalizationSpec, PadMode, ParameterMetadata, ParameterVisitor,
+    ParameterVisitorMut, Parameterized, Relu2ExpertBankOperator, Relu2ExpertBankSpec,
+    RotaryOperator, RotaryPosition, RotarySpec, RoutedNeuralBackend, RoutingOperator,
+    RoutingResult, Tensor, TopKRouterSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{
     bind_materialized_unit, materialize_bindings, DeviceState, ExpertPass, LayerRuntimeState,
@@ -1173,6 +1173,56 @@ fn shared_decoder_parallel_geometry_rejects_cross_config_reuse() {
             .to_string()
             .contains("requires unsupported backend operators: attention_sinks"),
         "unexpected capability error: {error}"
+    );
+}
+
+struct StaticTopologyCollector(BTreeMap<String, Vec<String>>);
+
+impl StaticParameterVisitor<ReferenceBackend> for StaticTopologyCollector {
+    type Error = Error;
+
+    fn visit<M>(&mut self, role: &str, module: &M) -> Result<(), Self::Error>
+    where
+        M: Parameterized<ReferenceTensor>,
+    {
+        let parameters = validate_parameter_topology(module)
+            .map_err(Error::backend)?
+            .into_iter()
+            .map(|metadata| metadata.id.as_str().to_owned())
+            .collect();
+        assert!(self.0.insert(role.to_owned(), parameters).is_none());
+        Ok(())
+    }
+}
+
+#[test]
+fn shared_decoder_exposes_architecture_owned_static_parameter_bindings() {
+    let args = qwen::model_args_from_config_value(&serde_json::json!({
+        "model_type": "qwen3",
+        "hidden_size": 8,
+        "num_hidden_layers": 1,
+        "intermediate_size": 16,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "rms_norm_eps": 0.00001,
+        "vocab_size": 32,
+        "max_position_embeddings": 128,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": false
+    }))
+    .unwrap();
+    let model = qwen::LayeredModel::<ReferenceBackend>::new(args, &()).unwrap();
+    let mut visitor = StaticTopologyCollector(BTreeMap::new());
+    model.visit_static_parameters(&mut visitor).unwrap();
+
+    assert_eq!(
+        visitor.0,
+        BTreeMap::from([
+            ("embedding".into(), vec!["model.embed_tokens.weight".into()]),
+            ("norm".into(), vec!["model.norm.weight".into()]),
+            ("output".into(), vec!["lm_head.weight".into()]),
+        ])
     );
 }
 
