@@ -57,54 +57,52 @@ use safemlx::{
 use std::collections::HashMap;
 
 #[cfg(test)]
-use crate::backend::mlx::runtime::checkpoint::quantization::quantize_tensor;
+use crate::backend::runtime::checkpoint::quantization::quantize_tensor;
 use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::nn::{
+    backend::error::Error,
+    backend::nn::{
         shared::{MlxModule, MlxModuleRef, MlxNeuralBackend},
         tensor::{TokenValidationBatch, TokenValidationScope},
     },
-    backend::mlx::runtime::cache::residency::{
+    backend::runtime::cache::residency::{
         load_prompt_cache_state_tensors, open_prompt_cache, CacheResidencyManager,
         PromptCacheStateArray,
     },
-    backend::mlx::runtime::cache::state::MlxKeyValueState,
-    backend::mlx::runtime::cache::{
+    backend::runtime::cache::state::MlxKeyValueState,
+    backend::runtime::cache::{
         state::{MlxHybridState, MlxPoolingAttentionCache},
         CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
-    backend::mlx::runtime::checkpoint::binding::{
+    backend::runtime::checkpoint::binding::{
         binding_bytes, build_module_bindings, materialize_module_bindings,
         populate_module_from_arrays_excluding,
         populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
     },
-    backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load,
-    backend::mlx::runtime::checkpoint::store::open_gguf_checkpoint_source,
-    backend::mlx::runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
-    backend::mlx::runtime::distributed::expert::{
+    backend::runtime::checkpoint::quantization::should_quantize_on_load,
+    backend::runtime::checkpoint::store::open_gguf_checkpoint_source,
+    backend::runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
+    backend::runtime::distributed::expert::{
         dispatch_local_with, dispatch_replicated, dispatch_replicated_tensor_parallel,
         dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
-    backend::mlx::runtime::distributed::parallel::{
-        ParallelBuildContext, ParallelExecutionContext,
-    },
-    backend::mlx::runtime::execution::layerwise::{
+    backend::runtime::distributed::parallel::{ParallelBuildContext, ParallelExecutionContext},
+    backend::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_pipeline_stage_store_with, shard_layer_bindings,
         DenseStreamController, DenseTransferWindow, PipelineStageQuantizationSelection,
     },
-    backend::mlx::runtime::generation::sampler::SpeculativeSampler,
-    backend::mlx::runtime::media::{prepared_identity_wire_arrays, PreparedModelInput},
-    backend::mlx::runtime::residency::expert_cache::{
+    backend::runtime::generation::sampler::SpeculativeSampler,
+    backend::runtime::media::{prepared_identity_wire_arrays, PreparedModelInput},
+    backend::runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheReport, ExpertCatalogEntry,
     },
-    backend::mlx::runtime::residency::expert_provider::{
+    backend::runtime::residency::expert_provider::{
         ExpertExecutorProvider, ResidentExpertExecutorProvider,
     },
-    backend::mlx::runtime::residency::manager::{
+    backend::runtime::residency::manager::{
         host_capacity_upper_bound_for_bindings, ResidencyManager,
     },
-    backend::mlx::MlxParallelContext,
-    backend::mlx::ModelLoadOptions,
+    backend::MlxParallelContext,
+    backend::ModelLoadOptions,
     composition::llama::checkpoint as llama_checkpoint,
     composition::mlx::speculative::embedded::{
         DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
@@ -619,7 +617,7 @@ impl InklingPipelinePartition {
 
     fn begin_ingress(
         &mut self,
-        typed: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        typed: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<InklingIngressState, Error> {
@@ -634,16 +632,16 @@ impl InklingPipelinePartition {
                     eredu_architectures::inkling::DecoderInputPart::Projected { tokens, embeddings }
                 }
                 None => match kind {
-                    crate::backend::mlx::runtime::media::input::Modality::Text => {
+                    crate::backend::runtime::media::input::Modality::Text => {
                         eredu_architectures::inkling::DecoderInputPart::Text(tokens)
                     }
-                    crate::backend::mlx::runtime::media::input::Modality::Image => {
+                    crate::backend::runtime::media::input::Modality::Image => {
                         eredu_architectures::inkling::DecoderInputPart::Image(tokens)
                     }
-                    crate::backend::mlx::runtime::media::input::Modality::Audio => {
+                    crate::backend::runtime::media::input::Modality::Audio => {
                         eredu_architectures::inkling::DecoderInputPart::Audio(tokens)
                     }
-                    crate::backend::mlx::runtime::media::input::Modality::Video => unreachable!(),
+                    crate::backend::runtime::media::input::Modality::Video => unreachable!(),
                 },
             })
             .collect::<Vec<_>>();
@@ -1211,7 +1209,7 @@ pub enum PipelineStageInput<'a> {
 #[derive(Clone, Copy)]
 enum PipelineIngress<'a> {
     Tokens(&'a Array),
-    ModelInput(crate::backend::mlx::runtime::media::input::ModelInput<'a>),
+    ModelInput(crate::backend::runtime::media::input::ModelInput<'a>),
 }
 
 /// Result of one stage-local forward operation.
@@ -1673,11 +1671,11 @@ impl Gemma4PipelinePartition {
 
     fn begin_ingress(
         &mut self,
-        typed: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        typed: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Gemma4IngressState, Error> {
-        crate::backend::mlx::runtime::media::input::validate(typed)?;
+        crate::backend::runtime::media::input::validate(typed)?;
         let prepared = Gemma4PreparedParts::new(self.args(), typed, stream)?;
         let parts = prepared.decoder_parts();
         let mut state = MlxHybridState::device(self.state_layout()?)?;
@@ -1762,10 +1760,10 @@ impl Gemma4PipelinePartition {
 
     fn begin_ingress_continuation(
         &mut self,
-        typed: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        typed: crate::backend::runtime::media::input::ModelInput<'_>,
         stream: &Stream,
     ) -> Result<Gemma4IngressState, Error> {
-        crate::backend::mlx::runtime::media::input::validate(typed)?;
+        crate::backend::runtime::media::input::validate(typed)?;
         let prepared = Gemma4PreparedParts::new(self.args(), typed, stream)?;
         let vision_hidden = prepared.vision_input().map(|input| input.patches.clone());
         let vision_state = prepared
@@ -2920,14 +2918,14 @@ trait PipelinePartitionMetadata {
 trait PipelinePlacedIngress {
     fn begin_placed_ingress(
         &mut self,
-        _input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        _input: crate::backend::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         _stream: &Stream,
     ) -> Result<(), Error>;
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error>;
@@ -2960,7 +2958,7 @@ trait PipelinePlacedIngress {
 
     fn prefill(
         &mut self,
-        _input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        _input: crate::backend::runtime::media::input::ModelInput<'_>,
         _step: PipelineStep,
         _mask: Option<&Array>,
         _cache: &mut [PipelineLayerCache],
@@ -3066,7 +3064,7 @@ trait PipelineArchitecture: PipelinePartitionMetadata + PipelineForward {
 impl dyn PipelineArchitecture {
     fn begin_placed_ingress(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
@@ -3077,7 +3075,7 @@ impl dyn PipelineArchitecture {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
@@ -3138,7 +3136,7 @@ impl dyn PipelineArchitecture {
 
     fn prefill(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -3485,14 +3483,14 @@ impl PipelineLayerStorage {
     fn prepare_layerwise(
         &self,
         local_index: usize,
-    ) -> Result<crate::backend::mlx::runtime::residency::manager::ResidentUnitLease, Error> {
+    ) -> Result<crate::backend::runtime::residency::manager::ResidentUnitLease, Error> {
         self.prepare_layerwise_absolute(self.execution_offset + local_index)
     }
 
     fn prepare_layerwise_absolute(
         &self,
         unit_index: usize,
-    ) -> Result<crate::backend::mlx::runtime::residency::manager::ResidentUnitLease, Error> {
+    ) -> Result<crate::backend::runtime::residency::manager::ResidentUnitLease, Error> {
         if unit_index >= self.units.len() {
             return Err(Error::Parallel(format!(
                 "pipeline unit index {unit_index} exceeds {} planned units",
@@ -3695,7 +3693,7 @@ where
             let excluded = &dense_layers.unwrap().excluded_parameter_targets
                 [local_index + dense_layers.unwrap().execution_offset];
             if !excluded.is_empty() {
-                crate::backend::mlx::runtime::checkpoint::binding::populate_module_from_lease_excluding(
+                crate::backend::runtime::checkpoint::binding::populate_module_from_lease_excluding(
                     &mut layer,
                     transfer.lease(),
                     |name| parameter_name_in_targets(name, excluded),
@@ -3718,7 +3716,7 @@ where
             let mut layer = new_layer(owner, global_layer, stream)?;
             let excluded = &dense.excluded_parameter_targets[local_index + dense.execution_offset];
             if !excluded.is_empty() {
-                crate::backend::mlx::runtime::checkpoint::binding::populate_module_from_lease_excluding(
+                crate::backend::runtime::checkpoint::binding::populate_module_from_lease_excluding(
                     &mut layer,
                     &lease,
                     |name| parameter_name_in_targets(name, excluded),
@@ -5288,7 +5286,7 @@ fn pipeline_prompt_cache_identity(
         global_layer_end: range.end,
         sink_tokens: 0,
         layer_prefix_offsets: vec![0; layer_layout.len()],
-        topology: crate::backend::mlx::cache::prompt_cache_topology(topology),
+        topology: crate::backend::cache::prompt_cache_topology(topology),
         layer_layout,
     }
 }
@@ -5313,7 +5311,7 @@ fn gemma4_pipeline_prompt_cache_identity(
         global_layer_start: range.start,
         sink_tokens: 0,
         layer_prefix_offsets: vec![0; layout.len()],
-        topology: crate::backend::mlx::cache::prompt_cache_topology(topology),
+        topology: crate::backend::cache::prompt_cache_topology(topology),
     }
     .prompt_cache_identity(layout)
     .map_err(|error| Error::Parallel(error.to_string()))
@@ -5349,7 +5347,7 @@ fn gemma4_pipeline_cache_identity_does_not_reslice_rank_local_layout() {
         1,
         2,
         1,
-        crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
     )
     .unwrap();
 
@@ -5415,7 +5413,7 @@ fn gemma4_pipeline_cache_identity_includes_multimodal_configuration() {
         1,
         1,
         1,
-        crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
     )
     .unwrap();
     let original_identity =
@@ -6082,84 +6080,87 @@ impl PipelineEmbeddedMtp for DeepSeekV3PipelinePartition {
             ))
         })?;
         let output = if let Some(expert_cache) = self.expert_storage.cache() {
-                let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
-                    Error::Parallel("neutral DeepSeek V3 MTP experts have no assignment".into())
-                })?;
-                let args = &unit_args;
-                let mut execute = |requested_layer,
-                                   routed_hidden: &Array,
-                                   ids: &Array,
-                                   weights: &Array,
-                                   context: &Stream| {
-                    let original_shape = routed_hidden.shape().to_vec();
-                    let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
-                    execute_pipeline_cached_neutral_deepseek_v3(
-                        args,
-                        requested_layer,
-                        &flattened,
-                        ids,
-                        weights,
-                        ExpertPass::Decode,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        &mut self.routing_statistics,
-                        context,
-                    )
-                    .and_then(|value| value.reshape(&original_shape, context).map_err(Into::into))
-                    .map_err(|error: Error| Exception::custom(error.to_string()))
-                };
-                let mut provider = crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(&mut execute);
-                match tensor_group {
-                    Some(group) => self
-                        .architecture
-                        .pipeline_forward_prediction_neutral_parallel_with_provider(
-                            &mut unit.inner,
-                            crate::composition::tensor_ref(hidden),
-                            crate::composition::tensor_ref(tokens),
-                            layer_cache,
-                            ExpertPass::Decode,
-                            &mut provider,
-                            group,
-                            stream,
-                        ),
-                    None => self.architecture.pipeline_forward_prediction_with_provider(
+            let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+                Error::Parallel("neutral DeepSeek V3 MTP experts have no assignment".into())
+            })?;
+            let args = &unit_args;
+            let mut execute = |requested_layer,
+                               routed_hidden: &Array,
+                               ids: &Array,
+                               weights: &Array,
+                               context: &Stream| {
+                let original_shape = routed_hidden.shape().to_vec();
+                let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
+                execute_pipeline_cached_neutral_deepseek_v3(
+                    args,
+                    requested_layer,
+                    &flattened,
+                    ids,
+                    weights,
+                    ExpertPass::Decode,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    context,
+                )
+                .and_then(|value| value.reshape(&original_shape, context).map_err(Into::into))
+                .map_err(|error: Error| Exception::custom(error.to_string()))
+            };
+            let mut provider =
+                crate::backend::runtime::residency::expert_provider::ExpertExecutorProvider::new(
+                    &mut execute,
+                );
+            match tensor_group {
+                Some(group) => self
+                    .architecture
+                    .pipeline_forward_prediction_neutral_parallel_with_provider(
                         &mut unit.inner,
                         crate::composition::tensor_ref(hidden),
                         crate::composition::tensor_ref(tokens),
                         layer_cache,
                         ExpertPass::Decode,
                         &mut provider,
+                        group,
                         stream,
                     ),
-                }
-            } else {
-                if expert_group.is_some() {
-                    return Err(Error::Parallel(
-                        "neutral DeepSeek V3 MTP received EP without external experts".into(),
-                    ));
-                }
-                match tensor_group {
-                    Some(group) => self
-                        .architecture
-                        .pipeline_forward_prediction_neutral_parallel(
-                            &mut unit.inner,
-                            crate::composition::tensor_ref(hidden),
-                            crate::composition::tensor_ref(tokens),
-                            layer_cache,
-                            group,
-                            stream,
-                        ),
-                    None => self.architecture.pipeline_forward_prediction(
+                None => self.architecture.pipeline_forward_prediction_with_provider(
+                    &mut unit.inner,
+                    crate::composition::tensor_ref(hidden),
+                    crate::composition::tensor_ref(tokens),
+                    layer_cache,
+                    ExpertPass::Decode,
+                    &mut provider,
+                    stream,
+                ),
+            }
+        } else {
+            if expert_group.is_some() {
+                return Err(Error::Parallel(
+                    "neutral DeepSeek V3 MTP received EP without external experts".into(),
+                ));
+            }
+            match tensor_group {
+                Some(group) => self
+                    .architecture
+                    .pipeline_forward_prediction_neutral_parallel(
                         &mut unit.inner,
                         crate::composition::tensor_ref(hidden),
                         crate::composition::tensor_ref(tokens),
                         layer_cache,
+                        group,
                         stream,
                     ),
-                }
+                None => self.architecture.pipeline_forward_prediction(
+                    &mut unit.inner,
+                    crate::composition::tensor_ref(hidden),
+                    crate::composition::tensor_ref(tokens),
+                    layer_cache,
+                    stream,
+                ),
             }
-            .map_err(|error| Error::Parallel(format!("V3 MTP layer {layer}: {error}")))?;
+        }
+        .map_err(|error| Error::Parallel(format!("V3 MTP layer {layer}: {error}")))?;
         Ok(EmbeddedMtpOutput {
             logits: output.logits,
             hidden: output.hidden,
@@ -6611,84 +6612,87 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
             .begin_partition_prediction_hidden(crate::composition::tensor_ref(hidden), stream)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let output = if let Some(expert_cache) = self.expert_storage.cache() {
-                let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
-                    Error::Parallel("neutral DeepSeek V4 MTP experts have no assignment".into())
-                })?;
-                let args = &unit_args;
-                let mut execute = |requested_layer,
-                                   routed_hidden: &Array,
-                                   ids: &Array,
-                                   weights: &Array,
-                                   context: &Stream| {
-                    let original_shape = routed_hidden.shape().to_vec();
-                    let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
-                    execute_pipeline_cached_neutral_deepseek_v4(
-                        args,
-                        requested_layer,
-                        &flattened,
-                        ids,
-                        weights,
-                        ExpertPass::Decode,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        &mut self.routing_statistics,
-                        context,
-                    )
-                    .and_then(|value| value.reshape(&original_shape, context).map_err(Into::into))
-                    .map_err(|error: Error| Exception::custom(error.to_string()))
-                };
-                let mut provider = crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(&mut execute);
-                match tensor_group {
-                    Some(group) => self
-                        .architecture
-                        .pipeline_forward_prediction_neutral_parallel_with_provider(
-                            &mut unit.inner,
-                            &hidden,
-                            crate::composition::tensor_ref(tokens),
-                            layer_cache,
-                            ExpertPass::Decode,
-                            &mut provider,
-                            group,
-                            stream,
-                        ),
-                    None => self.architecture.pipeline_forward_prediction_with_provider(
+            let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+                Error::Parallel("neutral DeepSeek V4 MTP experts have no assignment".into())
+            })?;
+            let args = &unit_args;
+            let mut execute = |requested_layer,
+                               routed_hidden: &Array,
+                               ids: &Array,
+                               weights: &Array,
+                               context: &Stream| {
+                let original_shape = routed_hidden.shape().to_vec();
+                let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
+                execute_pipeline_cached_neutral_deepseek_v4(
+                    args,
+                    requested_layer,
+                    &flattened,
+                    ids,
+                    weights,
+                    ExpertPass::Decode,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    context,
+                )
+                .and_then(|value| value.reshape(&original_shape, context).map_err(Into::into))
+                .map_err(|error: Error| Exception::custom(error.to_string()))
+            };
+            let mut provider =
+                crate::backend::runtime::residency::expert_provider::ExpertExecutorProvider::new(
+                    &mut execute,
+                );
+            match tensor_group {
+                Some(group) => self
+                    .architecture
+                    .pipeline_forward_prediction_neutral_parallel_with_provider(
                         &mut unit.inner,
                         &hidden,
                         crate::composition::tensor_ref(tokens),
                         layer_cache,
                         ExpertPass::Decode,
                         &mut provider,
+                        group,
                         stream,
                     ),
-                }
-            } else {
-                if expert_group.is_some() {
-                    return Err(Error::Parallel(
-                        "neutral DeepSeek V4 MTP received EP without external experts".into(),
-                    ));
-                }
-                match tensor_group {
-                    Some(group) => self
-                        .architecture
-                        .pipeline_forward_prediction_neutral_parallel(
-                            &mut unit.inner,
-                            &hidden,
-                            crate::composition::tensor_ref(tokens),
-                            layer_cache,
-                            group,
-                            stream,
-                        ),
-                    None => self.architecture.pipeline_forward_prediction(
+                None => self.architecture.pipeline_forward_prediction_with_provider(
+                    &mut unit.inner,
+                    &hidden,
+                    crate::composition::tensor_ref(tokens),
+                    layer_cache,
+                    ExpertPass::Decode,
+                    &mut provider,
+                    stream,
+                ),
+            }
+        } else {
+            if expert_group.is_some() {
+                return Err(Error::Parallel(
+                    "neutral DeepSeek V4 MTP received EP without external experts".into(),
+                ));
+            }
+            match tensor_group {
+                Some(group) => self
+                    .architecture
+                    .pipeline_forward_prediction_neutral_parallel(
                         &mut unit.inner,
                         &hidden,
                         crate::composition::tensor_ref(tokens),
                         layer_cache,
+                        group,
                         stream,
                     ),
-                }
+                None => self.architecture.pipeline_forward_prediction(
+                    &mut unit.inner,
+                    &hidden,
+                    crate::composition::tensor_ref(tokens),
+                    layer_cache,
+                    stream,
+                ),
             }
-            .map_err(|error| Error::Parallel(format!("V4 MTP layer {layer}: {error}")))?;
+        }
+        .map_err(|error| Error::Parallel(format!("V4 MTP layer {layer}: {error}")))?;
         let output = self
             .architecture
             .finish_partition_prediction_output(output, stream)
@@ -6784,88 +6788,89 @@ impl PipelineEmbeddedMtp for DeepSeekV4PipelinePartition {
         let mut proposal = caches.clone();
         let anchor = crate::MlxTensor::from_array(Array::from_slice(&[last_token], &[1, 1]));
         let logits = if let Some(expert_cache) = self.expert_storage.cache() {
-                let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
-                    Error::Parallel("neutral DSpark experts have no assignment".into())
-                })?;
-                let unit_args = self
+            let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+                Error::Parallel("neutral DSpark experts have no assignment".into())
+            })?;
+            let unit_args = self
+                .architecture
+                .shared_parallel_geometry()
+                .map_or_else(|| self.args().clone(), |geometry| geometry.args().clone());
+            let args = &unit_args;
+            let mut execute = |requested_layer,
+                               routed_hidden: &Array,
+                               ids: &Array,
+                               weights: &Array,
+                               context: &Stream| {
+                let original_shape = routed_hidden.shape().to_vec();
+                let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
+                execute_pipeline_cached_neutral_deepseek_v4(
+                    args,
+                    requested_layer,
+                    &flattened,
+                    ids,
+                    weights,
+                    ExpertPass::Decode,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    &mut self.routing_statistics,
+                    context,
+                )
+                .and_then(|value| value.reshape(&original_shape, context).map_err(Into::into))
+                .map_err(|error: Error| Exception::custom(error.to_string()))
+            };
+            let mut provider =
+                crate::backend::runtime::residency::expert_provider::ExpertExecutorProvider::new(
+                    &mut execute,
+                );
+            match tensor_group {
+                Some(group) => self
                     .architecture
-                    .shared_parallel_geometry()
-                    .map_or_else(|| self.args().clone(), |geometry| geometry.args().clone());
-                let args = &unit_args;
-                let mut execute = |requested_layer,
-                                   routed_hidden: &Array,
-                                   ids: &Array,
-                                   weights: &Array,
-                                   context: &Stream| {
-                    let original_shape = routed_hidden.shape().to_vec();
-                    let flattened = routed_hidden.reshape(&[-1, routed_hidden.dim(-1)], context)?;
-                    execute_pipeline_cached_neutral_deepseek_v4(
-                        args,
-                        requested_layer,
-                        &flattened,
-                        ids,
-                        weights,
-                        ExpertPass::Decode,
-                        expert_cache,
-                        assignment,
-                        expert_group,
-                        &mut self.routing_statistics,
-                        context,
-                    )
-                    .and_then(|value| value.reshape(&original_shape, context).map_err(Into::into))
-                    .map_err(|error: Error| Exception::custom(error.to_string()))
-                };
-                let mut provider = crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(&mut execute);
-                match tensor_group {
-                    Some(group) => self
-                        .architecture
-                        .pipeline_dspark_proposal_neutral_parallel_with_provider(
-                            &mut self.mtp_layers,
-                            &anchor,
-                            proposal_capacity,
-                            &mut proposal,
-                            ExpertPass::Decode,
-                            &mut provider,
-                            group,
-                            stream,
-                        ),
-                    None => self.architecture.pipeline_dspark_proposal_with_provider(
+                    .pipeline_dspark_proposal_neutral_parallel_with_provider(
                         &mut self.mtp_layers,
                         &anchor,
                         proposal_capacity,
                         &mut proposal,
                         ExpertPass::Decode,
                         &mut provider,
+                        group,
                         stream,
                     ),
-                }
-            } else {
-                if expert_group.is_some() {
-                    return Err(Error::Parallel(
-                        "neutral DSpark received EP without external experts".into(),
-                    ));
-                }
-                match tensor_group {
-                    Some(group) => self
-                        .architecture
-                        .pipeline_dspark_proposal_neutral_parallel(
-                            &mut self.mtp_layers,
-                            &anchor,
-                            proposal_capacity,
-                            &mut proposal,
-                            group,
-                            stream,
-                        ),
-                    None => self.architecture.pipeline_dspark_proposal(
-                        &mut self.mtp_layers,
-                        &anchor,
-                        proposal_capacity,
-                        &mut proposal,
-                        stream,
-                    ),
-                }
+                None => self.architecture.pipeline_dspark_proposal_with_provider(
+                    &mut self.mtp_layers,
+                    &anchor,
+                    proposal_capacity,
+                    &mut proposal,
+                    ExpertPass::Decode,
+                    &mut provider,
+                    stream,
+                ),
             }
-            .map_err(|error| Error::Parallel(error.to_string()))?;
+        } else {
+            if expert_group.is_some() {
+                return Err(Error::Parallel(
+                    "neutral DSpark received EP without external experts".into(),
+                ));
+            }
+            match tensor_group {
+                Some(group) => self.architecture.pipeline_dspark_proposal_neutral_parallel(
+                    &mut self.mtp_layers,
+                    &anchor,
+                    proposal_capacity,
+                    &mut proposal,
+                    group,
+                    stream,
+                ),
+                None => self.architecture.pipeline_dspark_proposal(
+                    &mut self.mtp_layers,
+                    &anchor,
+                    proposal_capacity,
+                    &mut proposal,
+                    stream,
+                ),
+            }
+        }
+        .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok(Some(logits.into_array()))
     }
 
@@ -6991,7 +6996,7 @@ impl PipelinePartitionMetadata for Gemma4PipelinePartition {
 impl PipelinePlacedIngress for Gemma4PipelinePartition {
     fn begin_placed_ingress(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
@@ -7001,7 +7006,7 @@ impl PipelinePlacedIngress for Gemma4PipelinePartition {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
@@ -7079,7 +7084,7 @@ impl PipelinePlacedIngress for Gemma4PipelinePartition {
 
     fn prefill(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -7347,7 +7352,7 @@ impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
 impl PipelinePlacedIngress for MuseGlimmerPipelinePartition {
     fn begin_placed_ingress(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
@@ -7357,7 +7362,7 @@ impl PipelinePlacedIngress for MuseGlimmerPipelinePartition {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         _execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
@@ -7477,7 +7482,7 @@ impl PipelinePlacedIngress for MuseGlimmerPipelinePartition {
 
     fn prefill(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -7590,7 +7595,7 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
             .ok_or_else(|| Error::Parallel("Inkling partition has no runtime state".into()))?;
         let state_layout = partition_state.layout();
         let topology_identity = if topology.tensor_parallel_size > 1 {
-            crate::backend::mlx::cache::prompt_cache_topology(topology)
+            crate::backend::cache::prompt_cache_topology(topology)
         } else {
             Default::default()
         };
@@ -7623,7 +7628,7 @@ impl PipelinePartitionMetadata for InklingPipelinePartition {
 impl PipelinePlacedIngress for InklingPipelinePartition {
     fn begin_placed_ingress(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
@@ -7709,7 +7714,7 @@ impl PipelinePlacedIngress for InklingPipelinePartition {
 
     fn prefill(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -7751,7 +7756,7 @@ impl PipelinePlacedIngress for InklingPipelinePartition {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
@@ -7977,7 +7982,7 @@ impl QwenVlPipelinePartition {
 
     fn begin_ingress(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         offset: i32,
         delta: Option<&Array>,
         execution: Option<&ParallelExecutionContext<'_>>,
@@ -8349,7 +8354,7 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
 impl PipelinePlacedIngress for QwenVlPipelinePartition {
     fn begin_placed_ingress(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
@@ -8359,7 +8364,7 @@ impl PipelinePlacedIngress for QwenVlPipelinePartition {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
@@ -8480,7 +8485,7 @@ impl PipelinePlacedIngress for QwenVlPipelinePartition {
 
     fn prefill(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -8608,7 +8613,7 @@ impl QwenConditionalPipelinePartition {
 
     fn begin_ingress(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         offset: i32,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
@@ -9102,7 +9107,7 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
 impl PipelinePlacedIngress for QwenConditionalPipelinePartition {
     fn begin_placed_ingress(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
@@ -9112,7 +9117,7 @@ impl PipelinePlacedIngress for QwenConditionalPipelinePartition {
 
     fn begin_placed_ingress_continuation(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
@@ -9220,7 +9225,7 @@ impl PipelinePlacedIngress for QwenConditionalPipelinePartition {
 
     fn prefill(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut [PipelineLayerCache],
@@ -9557,7 +9562,7 @@ impl PipelinePartitionMetadata for Lfm2PipelinePartition {
             .state()
             .ok_or_else(|| Error::Parallel("LFM2 partition has no runtime state".into()))?;
         let topology_identity = if topology.tensor_parallel_size > 1 {
-            crate::backend::mlx::cache::prompt_cache_topology(topology)
+            crate::backend::cache::prompt_cache_topology(topology)
         } else {
             Default::default()
         };
@@ -9754,7 +9759,7 @@ impl PipelinePartitionMetadata for NemotronHPipelinePartition {
             .state()
             .ok_or_else(|| Error::Parallel("Nemotron-H partition has no runtime state".into()))?;
         let topology_identity = if topology.tensor_parallel_size > 1 {
-            crate::backend::mlx::cache::prompt_cache_topology(topology)
+            crate::backend::cache::prompt_cache_topology(topology)
         } else {
             Default::default()
         };
@@ -9961,7 +9966,7 @@ impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
             .state()
             .ok_or_else(|| Error::Parallel("Kimi Linear partition has no runtime state".into()))?;
         let topology_identity = if topology.tensor_parallel_size > 1 {
-            crate::backend::mlx::cache::prompt_cache_topology(topology)
+            crate::backend::cache::prompt_cache_topology(topology)
         } else {
             Default::default()
         };
@@ -10121,23 +10126,23 @@ pub struct PipelineModel {
 
 struct PipelineEmbeddedMtpTarget<'a> {
     model: &'a mut PipelineModel,
-    execution: &'a crate::backend::mlx::MlxDistributedSession<'a>,
+    execution: &'a crate::backend::MlxDistributedSession<'a>,
 }
 
 fn pipeline_mtp_token_identity(
-    input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+    input: crate::backend::runtime::media::input::ModelInput<'_>,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    crate::backend::mlx::runtime::media::input::validate(input)?;
+    crate::backend::runtime::media::input::validate(input)?;
     let tokens = input
         .parts
         .iter()
         .filter_map(|part| match (part.modality, part.payload) {
             (
-                crate::backend::mlx::runtime::media::input::Modality::Text,
-                crate::backend::mlx::runtime::media::input::InputPayload::TokenIds(tokens),
+                crate::backend::runtime::media::input::Modality::Text,
+                crate::backend::runtime::media::input::InputPayload::TokenIds(tokens),
             ) => Some(Ok(tokens.clone())),
-            (crate::backend::mlx::runtime::media::input::Modality::Text, _) => Some(Err(
+            (crate::backend::runtime::media::input::Modality::Text, _) => Some(Err(
                 Exception::custom("pipeline embedded MTP requires token-id text ingress"),
             )),
             _ => None,
@@ -10693,7 +10698,7 @@ impl PipelineModel {
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut PipelineCache,
-        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
+        execution: &crate::backend::MlxDistributedSession<'_>,
     ) -> Result<PipelineStageCompletion, Error> {
         if execution.topology() != self.topology {
             return Err(Error::Parallel(format!(
@@ -10748,11 +10753,11 @@ impl PipelineModel {
     /// Runs typed multimodal prefill through the selected distributed session.
     pub fn prefill_distributed(
         &mut self,
-        input: Option<crate::backend::mlx::runtime::media::input::ModelInput<'_>>,
+        input: Option<crate::backend::runtime::media::input::ModelInput<'_>>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut PipelineCache,
-        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
+        execution: &crate::backend::MlxDistributedSession<'_>,
     ) -> Result<PipelineStageCompletion, Error> {
         if execution.topology() != self.topology {
             return Err(Error::Parallel(format!(
@@ -10846,7 +10851,7 @@ impl PipelineModel {
         local_logits: Option<Array>,
         local_hidden: Option<Array>,
         tokens: Array,
-        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
+        execution: &crate::backend::MlxDistributedSession<'_>,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Exception> {
         let pipeline = match execution.pipeline_group() {
@@ -10917,7 +10922,7 @@ impl PipelineModel {
     fn synchronize_embedded_mtp_control(
         &self,
         local: Option<bool>,
-        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
+        execution: &crate::backend::MlxDistributedSession<'_>,
         stream: &Stream,
     ) -> Result<bool, Exception> {
         let pipeline = match execution.pipeline_group() {
@@ -10971,7 +10976,7 @@ impl PipelineModel {
     #[allow(clippy::too_many_arguments)]
     fn execute_placed_ingress_dag(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         group: &Group,
         tensor: Option<&ParallelExecutionContext<'_>>,
@@ -11300,11 +11305,11 @@ impl PipelineModel {
     pub fn generate_embedded_mtp_distributed<S: SpeculativeSampler + Clone>(
         &mut self,
         cache: &mut PipelineCache,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
-        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
+        execution: &crate::backend::MlxDistributedSession<'_>,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         if execution.topology() != self.topology {
             return Err(Exception::custom(
@@ -11361,7 +11366,7 @@ impl PipelineModel {
     /// point-to-point activation traffic.
     #[allow(clippy::too_many_arguments)]
     pub fn sample_and_synchronize_token<
-        S: crate::backend::mlx::runtime::generation::sampler::Sampler,
+        S: crate::backend::runtime::generation::sampler::Sampler,
     >(
         &self,
         logits: Option<&Array>,
@@ -11370,8 +11375,8 @@ impl PipelineModel {
         temperature: f32,
         prng_state: Option<&mut safemlx::random::RandomState>,
         finished: bool,
-        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
-    ) -> Result<crate::backend::mlx::runtime::distributed::parallel::SynchronizedToken, Error> {
+        execution: &crate::backend::MlxDistributedSession<'_>,
+    ) -> Result<crate::backend::runtime::distributed::parallel::SynchronizedToken, Error> {
         if execution.topology() != self.topology {
             return Err(Error::Parallel(
                 "pipeline sampling topology does not match distributed session".into(),
@@ -11436,7 +11441,7 @@ impl PipelineModel {
             )?;
         }
         Ok(
-            crate::backend::mlx::runtime::distributed::parallel::SynchronizedToken {
+            crate::backend::runtime::distributed::parallel::SynchronizedToken {
                 token: arrays.into_iter().next().expect("validated token payload"),
                 finished,
             },
@@ -11484,19 +11489,19 @@ impl PipelineModel {
         let ingress = routed_parts
             .as_ref()
             .map(|parts| {
-                PipelineIngress::ModelInput(
-                    crate::backend::mlx::runtime::media::input::ModelInput::new(parts),
-                )
+                PipelineIngress::ModelInput(crate::backend::runtime::media::input::ModelInput::new(
+                    parts,
+                ))
             })
             .or(ingress);
         let mut placed_payload = None;
         if let Some(PipelineIngress::ModelInput(input)) = ingress {
             if self.info.placement.groups().len() > 1 {
                 let has_media_tensor = input.parts.iter().any(|part| {
-                    part.modality != crate::backend::mlx::runtime::media::input::Modality::Text
+                    part.modality != crate::backend::runtime::media::input::Modality::Text
                         && matches!(
                             part.payload,
-                            crate::backend::mlx::runtime::media::input::InputPayload::Tensor(_)
+                            crate::backend::runtime::media::input::InputPayload::Tensor(_)
                         )
                 });
                 if has_media_tensor {
@@ -11593,7 +11598,7 @@ impl PipelineModel {
                     )?
                 }
                 PipelineIngress::ModelInput(input) => {
-                    crate::backend::mlx::runtime::media::input::validate(input)?;
+                    crate::backend::runtime::media::input::validate(input)?;
                     if let Some(payload) = placed_payload.as_ref() {
                         self.stage.forward_with_execution(
                             PipelineStageInput::Hidden(payload),
@@ -11727,7 +11732,7 @@ impl PipelineModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn sample_and_synchronize<S: crate::backend::mlx::runtime::generation::sampler::Sampler>(
+    pub fn sample_and_synchronize<S: crate::backend::runtime::generation::sampler::Sampler>(
         &self,
         logits: Option<&Array>,
         step: PipelineStep,
@@ -11735,8 +11740,8 @@ impl PipelineModel {
         temperature: f32,
         prng_state: Option<&mut safemlx::random::RandomState>,
         finished: bool,
-        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
-    ) -> Result<crate::backend::mlx::runtime::distributed::parallel::SynchronizedToken, Error> {
+        execution: &crate::backend::MlxDistributedSession<'_>,
+    ) -> Result<crate::backend::runtime::distributed::parallel::SynchronizedToken, Error> {
         self.sample_and_synchronize_token(
             logits,
             step.batch_size,
@@ -11779,7 +11784,7 @@ impl PipelineModel {
 
     pub fn prefill_stage(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         step: PipelineStep,
         mask: Option<&Array>,
         cache: &mut PipelineCache,
@@ -11791,7 +11796,7 @@ impl PipelineModel {
                 self.info.pipeline_stage
             )));
         }
-        crate::backend::mlx::runtime::media::input::validate(input)?;
+        crate::backend::runtime::media::input::validate(input)?;
         self.topology.validate_execution_stream(stream)?;
         if cache.model_kind != self.info.model_kind {
             return Err(Error::Parallel(format!(
@@ -11810,14 +11815,15 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
 
     fn prefill_target(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Exception> {
         let tokens = pipeline_mtp_token_identity(input, stream)?;
-        let multimodal = input.parts.iter().any(|part| {
-            part.modality != crate::backend::mlx::runtime::media::input::Modality::Text
-        });
+        let multimodal = input
+            .parts
+            .iter()
+            .any(|part| part.modality != crate::backend::runtime::media::input::Modality::Text);
         cache
             .reset()
             .map_err(|error| Exception::custom(error.to_string()))?;
@@ -12194,7 +12200,7 @@ fn distributed_stage_topology_accepts_pure_tensor_parallelism() {
         2,
         1,
         1,
-        crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
     )
     .unwrap();
     validate_distributed_stage_topology(tensor_parallel).unwrap();
@@ -12204,7 +12210,7 @@ fn distributed_stage_topology_accepts_pure_tensor_parallelism() {
         1,
         1,
         1,
-        crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
     )
     .unwrap();
     assert!(validate_distributed_stage_topology(replicated).is_err());
@@ -12539,7 +12545,7 @@ fn validate_hidden_metadata(
 
 #[cfg(test)]
 fn checkpoint_name(parameter_name: &str) -> String {
-    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(parameter_name)
+    crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(parameter_name)
 }
 
 #[cfg(test)]
@@ -13029,15 +13035,13 @@ fn binding_target(binding: &WeightBinding) -> &str {
 }
 
 fn canonical_binding_target(binding: &WeightBinding) -> String {
-    crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(binding_target(
-        binding,
-    ))
+    crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(binding_target(binding))
 }
 
 fn parameter_name_in_targets(name: &str, targets: &BTreeSet<String>) -> bool {
     targets.contains(name)
         || targets.contains(
-            &crate::backend::mlx::runtime::checkpoint::binding::canonical_checkpoint_name(name),
+            &crate::backend::runtime::checkpoint::binding::canonical_checkpoint_name(name),
         )
 }
 
@@ -13292,7 +13296,7 @@ mod binding_authority_tests {
             .into_iter()
             .map(OwnedParameterGroupSpec::into_group)
             .collect::<Vec<_>>();
-        let targets = crate::backend::mlx::runtime::checkpoint::binding::parameter_role_targets(
+        let targets = crate::backend::runtime::checkpoint::binding::parameter_role_targets(
             &groups,
             ParameterRole::ExpertIntermediate,
         );
@@ -13301,7 +13305,7 @@ mod binding_authority_tests {
         assert!(targets.contains("unit.expert_bank.biases"));
         assert!(targets.contains("unit.expert_bank.alias"));
         assert!(
-            crate::backend::mlx::runtime::checkpoint::binding::parameter_name_in_targets(
+            crate::backend::runtime::checkpoint::binding::parameter_name_in_targets(
                 "unit.expert_bank.inner.weight",
                 &targets,
             )
@@ -13854,7 +13858,7 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
         2,
         2,
         2,
-        crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
     )
     .unwrap();
 
@@ -13888,7 +13892,7 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
         2,
         2,
         1,
-        crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
     )
     .unwrap();
     let error = validate_distributed_stage_capabilities(
@@ -13986,8 +13990,7 @@ pub fn load_pipeline_model_with_options(
             structural_options.weight_residency = WeightResidency::fully_resident();
             let architecture = GgufArchitecture::resolve(&configuration.declared_model_type)?;
             let checkpoint = GgufCheckpoint::from_portable(checkpoint);
-            let metadata =
-                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
             let admitted = crate::composition::mlx::structural::admit_gguf(
                 architecture,
                 checkpoint,
@@ -14559,7 +14562,7 @@ fn load_llama_pipeline(
     topology.preflight(Some(source_args.attention_schedule.len()), None)?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Llama pipeline",
                 source_args.quantization.or(source_args.quantization_config),
                 requested,
@@ -14853,7 +14856,7 @@ fn load_qwen_pipeline(
     )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Qwen pipeline",
                 source_args.quantization.or(source_args.quantization_config),
                 requested,
@@ -15648,7 +15651,7 @@ fn load_neutral_qwen_vl_pipeline(
     )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Qwen3-VL pipeline",
                 source_args.text.weight_quantization(),
                 requested,
@@ -16157,7 +16160,7 @@ impl MuseGlimmerPipelinePartition {
 
     fn begin_placed_input(
         &mut self,
-        input: crate::backend::mlx::runtime::media::input::ModelInput<'_>,
+        input: crate::backend::runtime::media::input::ModelInput<'_>,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<MuseGlimmerPlacedState, Error> {
@@ -17222,7 +17225,7 @@ fn execute_pipeline_cached_qwen3(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_neutral_qwen3(args, global_layer, routes, pass, cache, stream)
     };
@@ -17251,7 +17254,7 @@ fn execute_pipeline_cached_neutral_gemma4(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_neutral_gemma4(
             args,
@@ -17345,9 +17348,9 @@ fn execute_pipeline_cached_neutral_deepseek(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
+        crate::backend::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
             cache,
             &spec,
             global_layer,
@@ -17382,7 +17385,7 @@ fn execute_pipeline_cached_lfm2(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_lfm2(args, global_layer, routes, pass, cache, stream)
     };
@@ -17411,7 +17414,7 @@ fn execute_pipeline_cached_muse_glimmer(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_muse_glimmer(args, global_layer, routes, pass, cache, stream)
     };
@@ -17441,9 +17444,9 @@ fn execute_pipeline_cached_neutral_qwen_hybrid(
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
     let spec = eredu_architectures::qwen::hybrid::expert_bank_spec(args, global_layer)?;
-    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
-        crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
+        crate::backend::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
             cache,
             &spec,
             global_layer,
@@ -17478,7 +17481,7 @@ fn execute_pipeline_cached_kimi_linear(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_kimi_linear(args, global_layer, routes, pass, cache, stream)
     };
@@ -17507,7 +17510,7 @@ fn execute_pipeline_cached_neutral_inkling(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_neutral_inkling(
             args,
@@ -17543,7 +17546,7 @@ fn execute_pipeline_cached_nemotron_h(
     stream: &Stream,
 ) -> Result<Array, Error> {
     validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
-    let execute = |routes: &crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes,
+    let execute = |routes: &crate::backend::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_nemotron_h(args, global_layer, routes, pass, cache, stream)
     };
@@ -17583,7 +17586,7 @@ fn load_gpt_oss_pipeline(
     )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
                 "GPT-OSS pipeline dense matrices",
                 source_args.quantization,
                 requested,
@@ -18098,7 +18101,7 @@ fn load_lfm2_pipeline(
     )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
                 "LFM2 pipeline",
                 source_args.weight_quantization,
                 requested,
@@ -18598,7 +18601,7 @@ fn load_nemotron_h_pipeline(
     )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Nemotron-H pipeline",
                 source_args.weight_quantization,
                 requested,
@@ -19877,7 +19880,7 @@ fn load_neutral_qwen_hybrid_pipeline(
     }
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Qwen hybrid pipeline",
                 source_args.quantization,
                 requested,
@@ -20934,7 +20937,7 @@ fn load_kimi_linear_pipeline(
     )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::backend::mlx::runtime::checkpoint::quantization::should_quantize_on_load(
+            crate::backend::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Kimi Linear pipeline",
                 source_args.weight_quantization,
                 requested,
@@ -22299,7 +22302,7 @@ struct PipelineDeepSeekGgufCatalog<'a>(&'a GgufCheckpoint);
 
 impl eredu_architectures::deepseek::GgufTensorCatalog for PipelineDeepSeekGgufCatalog<'_> {
     fn contains(&self, name: &str) -> bool {
-        crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames::contains_gguf_tensor(
+        crate::backend::runtime::checkpoint::load::GgufTensorNames::contains_gguf_tensor(
             self.0, name,
         )
     }

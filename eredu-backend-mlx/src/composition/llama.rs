@@ -20,22 +20,22 @@ use eredu_core::cache::{
 };
 
 use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::nn::shared::{MlxModule, MlxNeuralBackend},
-    backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
-    backend::mlx::runtime::cache::state::MlxKeyValueState,
-    backend::mlx::runtime::checkpoint::binding::{binding_bytes, build_module_bindings},
-    backend::mlx::runtime::checkpoint::{
+    backend::error::Error,
+    backend::nn::shared::{MlxModule, MlxNeuralBackend},
+    backend::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
+    backend::runtime::cache::state::MlxKeyValueState,
+    backend::runtime::checkpoint::binding::{binding_bytes, build_module_bindings},
+    backend::runtime::checkpoint::{
         quantization::should_quantize_on_load, store::open_gguf_checkpoint_source,
     },
-    backend::mlx::runtime::execution::generic::{
+    backend::runtime::execution::generic::{
         prepare_layerwise_policy, prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy,
         MlxResidentPolicy,
     },
-    backend::mlx::runtime::execution::layerwise::{
+    backend::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
     },
-    backend::mlx::runtime::media::input,
+    backend::runtime::media::input,
 };
 use eredu_runtime::{
     CacheResidencyPolicy, DenseDiskStreamReport, LayerwiseModelMetadata, PagedCacheOptions,
@@ -206,7 +206,7 @@ pub struct LlamaModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
     metadata: LayerwiseModelMetadata,
-    parallel_info: Option<ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
+    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
     execution: LlamaExecution,
 }
@@ -240,9 +240,7 @@ impl LlamaModel {
     }
 
     /// Returns rank-local generalized parallel information when applicable.
-    pub fn parallel_info(
-        &self,
-    ) -> Option<&ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
         self.parallel_info.as_ref()
     }
 
@@ -575,7 +573,7 @@ impl LlamaModel {
             .parallel_info
             .as_ref()
             .map_or_else(PromptCacheTopology::default, |info| {
-                crate::backend::mlx::cache::prompt_cache_topology(info.topology())
+                crate::backend::cache::prompt_cache_topology(info.topology())
             });
         let identity =
             eredu_architectures::llama::state_identity(self.args(), &layout, 0, topology)
@@ -670,7 +668,7 @@ fn load_neutral_llama_parallel(
     store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     options: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
@@ -781,7 +779,7 @@ fn load_neutral_llama_parallel(
         maximum_device_parameter_bytes,
     );
     let parallel_rank =
-        crate::backend::mlx::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
+        crate::backend::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
     let execution = if options.is_fully_resident() {
         LlamaExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -811,7 +809,7 @@ fn load_neutral_llama_parallel(
 pub fn load_llama_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
@@ -823,7 +821,7 @@ pub fn load_llama_tensor_parallel_model(
     {
         let admitted = crate::composition::mlx::structural::admit_gguf_path(
             model_dir,
-            crate::backend::mlx::ModelLoadOptions::default()
+            crate::backend::ModelLoadOptions::default()
                 .with_weight_residency(WeightResidency::with_layers(options)),
         )?;
         return load_llama_gguf_tensor_parallel_model(
@@ -844,7 +842,7 @@ pub fn load_llama_tensor_parallel_model(
 pub(crate) fn load_llama_gguf_tensor_parallel_model(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     options: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(LlamaModel, Vec<u32>), Error> {

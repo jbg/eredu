@@ -12,7 +12,7 @@ use eredu_backend_mlx::native::{
     distributed::{self, Backend},
     Array, Device, DeviceType, Stream,
 };
-use eredu_backend_mlx::testing::backend::mlx::{
+use eredu_backend_mlx::testing::backend::{
     runtime::distributed::expert::{AllToAllVPlan, RoutedTransport},
     DeviceAssignment, MlxParallelContext,
 };

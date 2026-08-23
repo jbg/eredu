@@ -31,7 +31,7 @@ use safemlx::{
     Array, Stream,
 };
 
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
@@ -219,7 +219,7 @@ impl MlxUnitPopulator<NeutralUnit> for UnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<NeutralUnit>,
-        lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
+        lease: &crate::backend::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
             self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
@@ -295,7 +295,7 @@ pub struct Gemma4Model {
     metadata: eredu_runtime::LayerwiseModelMetadata,
     execution: Execution,
     expert_cache: Option<ExpertCache>,
-    parallel_info: Option<ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
+    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
 }
 
 /// Fully resident external assistant built from the neutral Gemma equations.
@@ -325,7 +325,7 @@ impl Gemma4AssistantModel {
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Error> {
         self.module
-            .draft_step::<crate::backend::mlx::runtime::cache::kv::ConcatKeyValueCache>(
+            .draft_step::<crate::backend::runtime::cache::kv::ConcatKeyValueCache>(
                 embedding, state, stream,
             )
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
@@ -335,7 +335,7 @@ impl Gemma4AssistantModel {
 /// Loads the released SafeTensors assistant into the backend-neutral module.
 pub fn load_assistant_safetensors(
     model_dir: &Path,
-    options: crate::backend::mlx::ModelLoadOptions,
+    options: crate::backend::ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4AssistantModel, Error> {
@@ -401,7 +401,7 @@ pub fn load_assistant_safetensors(
 
 pub fn load_assistant_gguf(
     gguf_file: &Path,
-    options: crate::backend::mlx::ModelLoadOptions,
+    options: crate::backend::ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4AssistantModel, Error> {
@@ -500,9 +500,7 @@ impl Gemma4Model {
         &self.metadata
     }
 
-    pub fn parallel_info(
-        &self,
-    ) -> Option<&ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
         self.parallel_info.as_ref()
     }
 
@@ -519,7 +517,7 @@ impl Gemma4Model {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
             CacheResidencyPolicy::Paged(options) => {
                 let rank = self.parallel_info.as_ref().and_then(|info| {
-                    crate::backend::mlx::cache::prompt_cache_topology(info.topology())
+                    crate::backend::cache::prompt_cache_topology(info.topology())
                         .cache_rank_identity()
                 });
                 MlxHybridState::paged(
@@ -544,7 +542,7 @@ impl Gemma4Model {
             .parallel_info
             .as_ref()
             .map_or_else(eredu_core::cache::PromptCacheTopology::default, |info| {
-                crate::backend::mlx::cache::prompt_cache_topology(info.topology())
+                crate::backend::cache::prompt_cache_topology(info.topology())
             });
         eredu_runtime::ModelStateIdentity {
             model_family: "gemma4".into(),
@@ -1723,7 +1721,7 @@ fn load_parallel_store(
     store: SharedCheckpointSource,
     args: FamilyConfig,
     residency: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
@@ -1898,7 +1896,7 @@ fn load_parallel_store(
 pub fn load_safetensors_tensor_parallel(
     model_dir: impl AsRef<Path>,
     residency: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
@@ -1915,7 +1913,7 @@ pub fn load_gguf_tensor_parallel(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     residency: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(Gemma4Model, Vec<u32>), Error> {
@@ -2040,7 +2038,7 @@ pub fn open_pipeline_gguf_store(
         .transpose()?;
     let projector_metadata = projector
         .as_ref()
-        .map(crate::backend::mlx::runtime::checkpoint::load::gguf_metadata);
+        .map(crate::backend::runtime::checkpoint::load::gguf_metadata);
     if let Some(metadata) = projector_metadata.as_ref() {
         eredu_architectures::gemma4::validate_projector_identity(metadata)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;

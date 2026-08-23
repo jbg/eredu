@@ -27,13 +27,13 @@ use safemlx::{
 };
 
 use crate::{
-    backend::mlx::runtime::{
+    backend::runtime::{
         cache::state::{MlxKeyValueState, MlxKeyValueTransactionBranch},
         checkpoint::artifact::LoadedArtifactIdentity,
         generation::sampler::MlxSamplingBackend,
     },
-    backend::mlx::ModelLoadOptions,
-    backend::mlx::{
+    backend::ModelLoadOptions,
+    backend::{
         error::Error,
         nn::tensor::{validate_token_domain, TokenValidationBatch, TokenValidationScope},
     },
@@ -1141,7 +1141,7 @@ mod tests {
 
     impl
         LayeredTraversalHook<
-            crate::backend::mlx::nn::shared::MlxNeuralBackend,
+            crate::backend::nn::shared::MlxNeuralBackend,
             eredu_architectures::moshi::ForwardContext<crate::MlxTensor>,
             eredu_nn::Error,
         > for TeacherObservationCapture
@@ -1601,15 +1601,15 @@ mod tests {
     fn moshi_mlx_conformance_suite() {
         verify_tiny_native_hardware_matrix();
         const TESTS: &[&str] = &[
-            "backend::mlx::nn::shared::neutral_semantic_operator_tests::mlx_dense_fused_projection_equivalence",
-            "backend::mlx::nn::shared::neutral_semantic_operator_tests::mlx_affine_fused_projection_equivalence",
-            "backend::mlx::nn::shared::neutral_semantic_operator_tests::mlx_mxfp4_fused_projection_equivalence",
-            "backend::mlx::nn::shared::neutral_semantic_operator_tests::mlx_sentinel_embedding_validation",
-            "backend::mlx::nn::shared::neutral_semantic_operator_tests::mlx_multi_table_embedding_sum_is_ordered_and_sentinel_safe",
-            "backend::mlx::runtime::cache::state::semantic_transaction_tests::paged_depth_segment_reset_preserves_temporal_pages_and_later_rollback",
-            "backend::mlx::runtime::cache::state::semantic_transaction_tests::mlx_realtime_transaction_paged_rollback_release_resume",
-            "backend::mlx::runtime::residency::manager::tests::cross_unit_alias_reacquisition_reuses_one_pinned_owner_read",
-            "backend::mlx::runtime::generation::backend::tests::mlx_token_domain_validation_is_deferred_to_completion",
+            "backend::nn::shared::neutral_semantic_operator_tests::mlx_dense_fused_projection_equivalence",
+            "backend::nn::shared::neutral_semantic_operator_tests::mlx_affine_fused_projection_equivalence",
+            "backend::nn::shared::neutral_semantic_operator_tests::mlx_mxfp4_fused_projection_equivalence",
+            "backend::nn::shared::neutral_semantic_operator_tests::mlx_sentinel_embedding_validation",
+            "backend::nn::shared::neutral_semantic_operator_tests::mlx_multi_table_embedding_sum_is_ordered_and_sentinel_safe",
+            "backend::runtime::cache::state::semantic_transaction_tests::paged_depth_segment_reset_preserves_temporal_pages_and_later_rollback",
+            "backend::runtime::cache::state::semantic_transaction_tests::mlx_realtime_transaction_paged_rollback_release_resume",
+            "backend::runtime::residency::manager::tests::cross_unit_alias_reacquisition_reuses_one_pinned_owner_read",
+            "backend::runtime::generation::backend::tests::mlx_token_domain_validation_is_deferred_to_completion",
             "composition::mlx::realtime::tests::mlx_realtime_input_domains_are_deferred_and_strict",
         ];
         let executable = std::env::current_exe().expect("current unit-test executable");

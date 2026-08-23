@@ -13,26 +13,26 @@ use eredu_architectures::processor_plan::{
 #[cfg(any(feature = "image", feature = "audio"))]
 use safemlx::Array;
 
-use crate::backend::mlx::error::Error;
+use crate::backend::error::Error;
 #[cfg(feature = "audio")]
-use crate::backend::mlx::runtime::media::audio::{extract_log_mel, LogMelConfig};
+use crate::backend::runtime::media::audio::{extract_log_mel, LogMelConfig};
 #[cfg(feature = "image")]
-use crate::backend::mlx::runtime::media::image::{
+use crate::backend::runtime::media::image::{
     rescale_and_normalize_rgb8, resize_rgb8_bicubic, resize_rgb8_lanczos3, NormalizedImage,
     RgbImage, RgbImageView,
 };
 #[cfg(any(feature = "image", feature = "audio"))]
-use crate::backend::mlx::runtime::media::input::Modality;
+use crate::backend::runtime::media::input::Modality;
 #[cfg(feature = "image")]
-use crate::backend::mlx::runtime::media::video::validate_rgb_frames;
+use crate::backend::runtime::media::video::validate_rgb_frames;
 #[cfg(feature = "image")]
-use crate::backend::mlx::runtime::media::VideoFrames;
-use crate::backend::mlx::runtime::media::{
+use crate::backend::runtime::media::VideoFrames;
+use crate::backend::runtime::media::{
     prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
     ProcessorInput, ProcessorPreparationError,
 };
 #[cfg(any(feature = "image", feature = "audio"))]
-use crate::backend::mlx::runtime::media::{MediaPayload, OwnedInputMetadata};
+use crate::backend::runtime::media::{MediaPayload, OwnedInputMetadata};
 
 #[derive(Debug, Clone)]
 pub struct Gemma4Processor {
@@ -208,7 +208,7 @@ impl Gemma4Processor {
     #[cfg(feature = "audio")]
     fn process_audio(
         &self,
-        waveform: crate::backend::mlx::runtime::media::audio::AudioWaveform<'_>,
+        waveform: crate::backend::runtime::media::audio::AudioWaveform<'_>,
         plan: &eredu_architectures::processor_plan::Gemma4AudioPlan,
     ) -> Result<PreparedInputPart, Error> {
         let features = extract_log_mel(
@@ -320,8 +320,8 @@ mod tests {
 
     use super::Gemma4Processor;
     use crate::{
-        backend::mlx::runtime::media::input::{InputPayload, Modality},
-        backend::mlx::runtime::media::{MediaInput, ProcessorInput, RgbImageView, VideoSampling},
+        backend::runtime::media::input::{InputPayload, Modality},
+        backend::runtime::media::{MediaInput, ProcessorInput, RgbImageView, VideoSampling},
     };
 
     fn tiny_processor() -> Gemma4Processor {
@@ -436,8 +436,8 @@ mod audio_tests {
 
     use super::Gemma4Processor;
     use crate::{
-        backend::mlx::runtime::media::input::{InputPayload, Modality},
-        backend::mlx::runtime::media::{MediaInput, ProcessorInput},
+        backend::runtime::media::input::{InputPayload, Modality},
+        backend::runtime::media::{MediaInput, ProcessorInput},
     };
 
     #[test]

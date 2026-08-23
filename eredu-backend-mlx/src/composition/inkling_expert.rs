@@ -6,7 +6,7 @@ use eredu_architectures::inkling::ModelArgs;
 use eredu_checkpoint::recipe::DerivedWeightRecipe;
 use safemlx::module::ModuleParameters;
 
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     runtime::residency::{
         expert_cache::{ExpertCache, ExpertCatalogEntry},

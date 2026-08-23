@@ -24,9 +24,9 @@ use safemlx::{
 };
 
 use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::runtime::generation::sampler::SpeculativeSampler,
-    backend::mlx::ModelLoadOptions,
+    backend::error::Error,
+    backend::runtime::generation::sampler::SpeculativeSampler,
+    backend::ModelLoadOptions,
     composition::gemma4::{load_assistant_gguf, load_assistant_safetensors, Gemma4AssistantModel},
     composition::mlx::ModelCache,
     composition::muse_glimmer::{
@@ -86,8 +86,7 @@ impl MlxDrafter {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
         let model = if is_gguf {
             let checkpoint = safemlx::ops::GgufCheckpoint::open(source)?;
-            let metadata =
-                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
             match eredu_architectures::configuration::resolve_gguf_assistant_model_kind(&metadata)?
             {
                 eredu_architectures::configuration::AssistantModelKind::MuseGlimmer => {

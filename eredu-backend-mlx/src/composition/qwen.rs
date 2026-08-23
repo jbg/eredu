@@ -21,30 +21,30 @@ use eredu_core::cache::{
     PromptCacheTopology,
 };
 
-use crate::backend::mlx::runtime::checkpoint::load::gguf_quantization_configs;
+use crate::backend::runtime::checkpoint::load::gguf_quantization_configs;
 use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::nn::shared::{MlxModule, MlxNeuralBackend},
-    backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
-    backend::mlx::runtime::cache::state::MlxKeyValueState,
-    backend::mlx::runtime::checkpoint::binding::{
+    backend::error::Error,
+    backend::nn::shared::{MlxModule, MlxNeuralBackend},
+    backend::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
+    backend::runtime::cache::state::MlxKeyValueState,
+    backend::runtime::checkpoint::binding::{
         binding_bytes, build_module_binding_plan_with_recipes_excluding, build_module_bindings,
         build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
         parameter_role_targets, populate_module_from_lease_excluding,
     },
-    backend::mlx::runtime::checkpoint::{
+    backend::runtime::checkpoint::{
         quantization::should_quantize_on_load, store::open_gguf_checkpoint_source,
     },
-    backend::mlx::runtime::execution::generic::{
+    backend::runtime::execution::generic::{
         prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
         MlxUnitPopulator,
     },
-    backend::mlx::runtime::execution::layerwise::{
+    backend::runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
     },
-    backend::mlx::runtime::media::input,
-    backend::mlx::runtime::residency::expert_cache::{ExpertCache, ExpertCacheReport},
-    backend::mlx::runtime::residency::manager::ResidentUnitLease,
+    backend::runtime::media::input,
+    backend::runtime::residency::expert_cache::{ExpertCache, ExpertCacheReport},
+    backend::runtime::residency::manager::ResidentUnitLease,
 };
 
 pub mod expert {
@@ -385,7 +385,7 @@ pub struct QwenModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
     metadata: LayerwiseModelMetadata,
-    parallel_info: Option<ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
+    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
     execution: QwenExecution,
     expert_cache: Option<ExpertCache>,
@@ -420,9 +420,7 @@ impl QwenModel {
     }
 
     /// Returns rank-local generalized parallel information when applicable.
-    pub fn parallel_info(
-        &self,
-    ) -> Option<&ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
         self.parallel_info.as_ref()
     }
 
@@ -813,7 +811,7 @@ impl QwenModel {
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
         let mut provider =
-            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
+            crate::backend::runtime::residency::expert_provider::ExpertExecutorProvider::new(
                 &mut execute,
             );
         self.forward_with_expert_provider(inputs, mask, cache, &mut provider, stream)
@@ -897,7 +895,7 @@ impl QwenModel {
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
         let mut provider =
-            crate::backend::mlx::runtime::residency::expert_provider::ExpertExecutorProvider::new(
+            crate::backend::runtime::residency::expert_provider::ExpertExecutorProvider::new(
                 &mut execute,
             );
         self.forward_tensor_expert_provider(inputs, mask, cache, group, &mut provider, stream)
@@ -1016,7 +1014,7 @@ impl QwenModel {
             .parallel_info
             .as_ref()
             .map_or_else(PromptCacheTopology::default, |info| {
-                crate::backend::mlx::cache::prompt_cache_topology(info.topology())
+                crate::backend::cache::prompt_cache_topology(info.topology())
             });
         let identity = eredu_architectures::qwen::state_identity(self.args(), &layout, 0, topology)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -1146,7 +1144,7 @@ fn load_neutral_qwen_parallel(
     store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
     args: ModelArgs,
     options: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
     external_experts: bool,
@@ -1291,7 +1289,7 @@ fn load_neutral_qwen_parallel(
         maximum_device_parameter_bytes,
     );
     let parallel_rank =
-        crate::backend::mlx::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
+        crate::backend::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
     let execution = if options.is_fully_resident() {
         QwenExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -1322,7 +1320,7 @@ fn load_neutral_qwen_parallel(
 pub fn load_qwen_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenModel, Error> {
@@ -1334,7 +1332,7 @@ pub fn load_qwen_tensor_parallel_model(
     {
         let admitted = crate::composition::mlx::structural::admit_gguf_path(
             model_dir,
-            crate::backend::mlx::ModelLoadOptions::default()
+            crate::backend::ModelLoadOptions::default()
                 .with_weight_residency(WeightResidency::with_layers(options)),
         )?;
         return load_qwen_gguf_tensor_parallel_model(
@@ -1356,7 +1354,7 @@ struct QwenGgufCatalog<'a>(&'a GgufCheckpoint);
 
 impl eredu_architectures::qwen::GgufTensorCatalog for QwenGgufCatalog<'_> {
     fn contains(&self, name: &str) -> bool {
-        crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames::contains_gguf_tensor(
+        crate::backend::runtime::checkpoint::load::GgufTensorNames::contains_gguf_tensor(
             self.0, name,
         )
     }
@@ -1409,7 +1407,7 @@ pub(crate) fn prepare_qwen_gguf_checkpoint(
 pub(crate) fn load_qwen_gguf_tensor_parallel_model(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     options: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(QwenModel, Vec<u32>), Error> {
@@ -1535,7 +1533,7 @@ impl QwenPipelineBindings {
         index: usize,
         layer: &mut MlxModule<NeutralBlock>,
         local_intermediate_size: i32,
-        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<(), Error> {
         let args = architecture.args();
@@ -1570,7 +1568,7 @@ impl QwenPipelineBindings {
         global_layer: &MlxModule<NeutralBlock>,
         store: &dyn eredu_checkpoint::store::CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
         require_decoder_group(architecture, group)?;
         let expert_targets = parameter_role_targets(
@@ -1634,9 +1632,8 @@ impl QwenPipelineBindings {
     pub fn expert_parallel_assignment(
         &self,
         architecture: &NeutralArchitecture,
-        topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
-    {
+        topology: crate::backend::MlxParallelContext,
+    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
         }
@@ -1647,7 +1644,7 @@ impl QwenPipelineBindings {
             ));
         }
         Ok(Some(
-            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::runtime::distributed::expert::ExpertAssignment::balanced(
                 args.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -1698,7 +1695,7 @@ pub enum QwenModelError {
     },
 }
 
-impl From<QwenModelError> for crate::backend::mlx::error::Error {
+impl From<QwenModelError> for crate::backend::error::Error {
     fn from(error: QwenModelError) -> Self {
         Self::ArchitectureModel(error.to_string())
     }

@@ -20,7 +20,7 @@ use crate::{
     },
     runtime::chat::{GenerationRuntimePlan, ParallelToolCallPolicy, ToolChoice},
 };
-use eredu_backend_mlx::testing::backend::mlx::runtime::generation::sampler::{
+use eredu_backend_mlx::testing::backend::runtime::generation::sampler::{
     MlxSamplingBackend, Sampler, SpeculativeSampler,
 };
 use eredu_core::generation::{FinishReason, SemanticEvent};

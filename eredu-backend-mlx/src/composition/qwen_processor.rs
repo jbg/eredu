@@ -8,8 +8,8 @@ use eredu_architectures::processor_plan::{
 };
 use safemlx::Array;
 
-use crate::backend::mlx::runtime::media::video::validate_rgb_frames;
-use crate::backend::mlx::runtime::media::{
+use crate::backend::runtime::media::video::validate_rgb_frames;
+use crate::backend::runtime::media::{
     image::{
         rescale_and_normalize_rgb8, resize_rgb8_bicubic, resize_rgb8_lanczos3, NormalizedImage,
         RgbImage, RgbImageView,
@@ -17,7 +17,7 @@ use crate::backend::mlx::runtime::media::{
     prepared_model_input, push_text_token_ids, MediaInput, MediaPayload, OwnedInputMetadata,
     PreparedInputPart, PreparedModelInput, ProcessorInput, ProcessorPreparationError, VideoFrames,
 };
-use crate::{backend::mlx::error::Error, backend::mlx::runtime::media::input::Modality};
+use crate::{backend::error::Error, backend::runtime::media::input::Modality};
 
 #[derive(Debug, Clone)]
 pub struct QwenProcessor {
@@ -305,8 +305,8 @@ mod tests {
 
     use super::{pack_image_patches, QwenProcessor};
     use crate::{
-        backend::mlx::runtime::media::input::{InputPayload, Modality},
-        backend::mlx::runtime::media::{
+        backend::runtime::media::input::{InputPayload, Modality},
+        backend::runtime::media::{
             image::{rescale_and_normalize_rgb8, RgbImageView},
             MediaInput, ProcessorInput, VideoSampling,
         },

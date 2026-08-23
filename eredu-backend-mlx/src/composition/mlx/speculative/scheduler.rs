@@ -20,8 +20,8 @@ use safemlx::{error::Exception, Array};
 use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event, Stream};
 
 use crate::{
-    backend::mlx::runtime::generation::sampler::SpeculativeSampler,
-    backend::mlx::runtime::media::input::{InputPayload, Modality, ModelInput},
+    backend::runtime::generation::sampler::SpeculativeSampler,
+    backend::runtime::media::input::{InputPayload, Modality, ModelInput},
     composition::mlx::{
         speculative::{MlxSpeculativeCompletion, MlxSpeculativeSampling, MtpExecutionStreams},
         MlxModelInput,
@@ -580,7 +580,7 @@ mod tests {
     use safemlx::{Device, DeviceType, ExecutionContext};
 
     use super::*;
-    use crate::backend::mlx::runtime::media::input::InputPart;
+    use crate::backend::runtime::media::input::InputPart;
     use eredu_runtime::{DefaultSampler, GenerationSampler, MirostatV2Sampler};
 
     #[derive(Clone, Default)]

@@ -8,7 +8,7 @@ use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
 use eredu_nn::Parameterized;
 use eredu_runtime::StaticUnitBindings;
 
-use crate::{backend::mlx::error::Error, backend::mlx::nn::shared::MlxNeuralBackend};
+use crate::{backend::error::Error, backend::nn::shared::MlxNeuralBackend};
 
 struct StaticBindingVisitor<'a> {
     store: &'a dyn CheckpointSource,
@@ -24,7 +24,7 @@ impl StaticParameterVisitor<MlxNeuralBackend> for StaticBindingVisitor<'_> {
         M: Parameterized<crate::MlxTensor>,
     {
         let bindings =
-            crate::backend::mlx::runtime::checkpoint::binding::build_neutral_module_bindings_with_recipes(
+            crate::backend::runtime::checkpoint::binding::build_neutral_module_bindings_with_recipes(
                 module,
                 self.store,
                 &mut self.recipes,
@@ -63,8 +63,8 @@ pub(crate) fn architecture_expert_units(
     units: impl IntoIterator<Item = eredu_architectures::ExpertResidencyUnit>,
     store: &dyn CheckpointSource,
     layout: Option<&eredu_runtime::LocalModelLayout>,
-) -> Result<Vec<crate::backend::mlx::runtime::residency::expert_cache::ExpertCatalogEntry>, Error> {
-    use crate::backend::mlx::runtime::residency::expert_cache::ExpertCatalogEntry;
+) -> Result<Vec<crate::backend::runtime::residency::expert_cache::ExpertCatalogEntry>, Error> {
+    use crate::backend::runtime::residency::expert_cache::ExpertCatalogEntry;
     use eredu_runtime::{OffloadUnit, WeightBinding};
 
     units
@@ -85,10 +85,9 @@ pub(crate) fn architecture_expert_units(
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
             if let Some(layout) = layout {
-                bindings =
-                    crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
-                        bindings, &unit_path, store, layout,
-                    )?;
+                bindings = crate::backend::runtime::execution::layerwise::shard_layer_bindings(
+                    bindings, &unit_path, store, layout,
+                )?;
             }
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
                 total.checked_add(binding.expected_bytes()).ok_or_else(|| {

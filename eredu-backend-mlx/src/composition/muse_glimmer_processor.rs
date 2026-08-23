@@ -9,8 +9,8 @@ use eredu_architectures::processor_plan::{
 use safemlx::{ops::GgufMetadataValue, Array};
 
 use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::runtime::media::{
+    backend::error::Error,
+    backend::runtime::media::{
         image::{rescale_and_normalize_rgb8, resize_rgb8_lanczos3, NormalizedImage, RgbImageView},
         input::Modality,
         prepared_model_input, push_text_token_ids,

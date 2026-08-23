@@ -496,6 +496,9 @@ The complete concrete implementation lives in `eredu-backend-mlx`, split
 between public reusable backend mechanics and private family/backend
 composition:
 
+- reusable public mechanics are rooted directly at
+  `eredu_backend_mlx::backend::{nn, runtime, ...}`. The dedicated MLX crate
+  does not repeat its backend name as another module layer;
 - `MlxBackend` is the facade backend provider and privately owns execution and
   weight-materialization streams. Its production inherent API neither accepts
   nor returns native handles; callers that deliberately construct

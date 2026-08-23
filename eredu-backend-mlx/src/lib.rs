@@ -54,7 +54,7 @@ pub use tensor::MlxTensor;
 #[doc(hidden)]
 pub mod testing {
     pub mod backend {
-        pub use crate::backend::mlx;
+        pub use crate::backend::*;
     }
 
     pub mod composition {

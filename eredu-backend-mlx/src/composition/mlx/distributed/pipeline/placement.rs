@@ -10,7 +10,7 @@ use std::{
     ops::Range,
 };
 
-use crate::backend::mlx::error::Error;
+use crate::backend::error::Error;
 use eredu_runtime::{
     ArchitecturePartition, ArchitecturePartitionError, ExecutionGraph, ExecutionGroupSpec,
     ExecutionUnitLayout, OwnedParameterGroupSpec, PartitionOwnership, PartitionState, StateLayout,
@@ -618,9 +618,7 @@ fn add_edge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::mlx::{
-        nn::shared::MlxNeuralBackend, runtime::cache::state::MlxHybridState,
-    };
+    use crate::backend::{nn::shared::MlxNeuralBackend, runtime::cache::state::MlxHybridState};
     use eredu_nn::{ParameterVisitor, ParameterVisitorMut, Parameterized};
     use eredu_runtime::{
         ArchitectureBoundary, ExecutionGroupId, LayeredArchitecture, LayeredForwardState,

@@ -91,7 +91,7 @@ fn open_optional_projector(
         return Ok(None);
     };
     let checkpoint = GgufCheckpoint::open(&path)?;
-    let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+    let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
     Ok(Some((path, checkpoint, metadata)))
 }
 
@@ -380,7 +380,7 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
         }
     }
 
-    let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+    let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
     let composite_plan =
         eredu_architectures::preparation::gguf_composite_artifact_plan(gguf_architecture);
     let mut capabilities_valid = false;
@@ -591,9 +591,7 @@ fn inspect_gguf_projector(
                 Ok(projector) => match GgufCheckpoint::open(&projector) {
                     Ok(checkpoint) => {
                         let metadata =
-                            crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
-                                &checkpoint,
-                            );
+                            crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
                         let validation = structural::validate_qwen3_vl_projector_gguf(
                             model_checkpoint,
                             model_metadata,
@@ -637,9 +635,7 @@ fn inspect_gguf_projector(
                 Ok(Some(projector_path)) => match GgufCheckpoint::open(&projector_path) {
                     Ok(checkpoint) => {
                         let metadata =
-                            crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
-                                &checkpoint,
-                            );
+                            crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
                         let validation = structural::validate_qwen35_projector_gguf(
                             model_checkpoint,
                             model_metadata,

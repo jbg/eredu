@@ -55,7 +55,7 @@ fn neutral_input_parts<'a>(
         .collect()
 }
 
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     nn::shared::{MlxNeuralBackend, MlxModule},
     runtime::{
@@ -191,7 +191,7 @@ impl MlxUnitPopulator<ConditionalUnit<MlxNeuralBackend>> for ConditionalUnitPopu
     fn populate(
         &mut self,
         unit: &mut MlxModule<ConditionalUnit<MlxNeuralBackend>>,
-        lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
+        lease: &crate::backend::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
             self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
@@ -538,8 +538,8 @@ impl QwenConditionalPipelineBindings {
     pub fn expert_parallel_assignment(
         &self,
         architecture: &ConditionalArchitecture,
-        topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+        topology: crate::backend::MlxParallelContext,
+    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error>
     {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
@@ -551,7 +551,7 @@ impl QwenConditionalPipelineBindings {
             ));
         }
         Ok(Some(
-            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::runtime::distributed::expert::ExpertAssignment::balanced(
                 parsed.text.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -646,8 +646,8 @@ impl QwenHybridPipelineBindings {
     pub fn expert_parallel_assignment(
         &self,
         architecture: &Architecture,
-        topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+        topology: crate::backend::MlxParallelContext,
+    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error>
     {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
@@ -659,7 +659,7 @@ impl QwenHybridPipelineBindings {
             ));
         }
         Ok(Some(
-            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::runtime::distributed::expert::ExpertAssignment::balanced(
                 config.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -676,7 +676,7 @@ impl QwenHybridPipelineBindings {
         global_layer: &MlxModule<Block>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        _assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
         let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
         match layout {
@@ -830,7 +830,7 @@ fn prepare_hybrid_gguf_store(
     };
     let projector = GgufCheckpoint::open(projector_path)?;
     let projector_metadata =
-        crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&projector);
+        crate::backend::runtime::checkpoint::load::gguf_metadata(&projector);
     let mut vision =
         vision::config_from_gguf_catalog(&HybridVisionGgufCatalog(&projector), &projector_metadata)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -956,7 +956,7 @@ impl MlxUnitPopulator<Block> for UnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<Block>,
-        lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
+        lease: &crate::backend::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
             self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
@@ -1042,7 +1042,7 @@ impl QwenHybridModel {
     /// This initial binder is replicated; distributed construction installs topology separately.
     pub fn parallel_info(
         &self,
-    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::MlxParallelContext>> {
         None
     }
     /// Canonical residency metadata.
@@ -1088,7 +1088,7 @@ impl QwenHybridModel {
     pub fn expert_cache_report(
         &self,
     ) -> Result<
-        Option<crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheReport>,
+        Option<crate::backend::runtime::residency::expert_cache::ExpertCacheReport>,
         Error,
     > {
         Ok(self

@@ -3,9 +3,9 @@
 use eredu_runtime::ExpertPass;
 use safemlx::{Array, Stream};
 
-use crate::backend::mlx::{error::Error, runtime::residency::expert_cache::ExpertCache};
+use crate::backend::{error::Error, runtime::residency::expert_cache::ExpertCache};
 
-use crate::backend::mlx::runtime::distributed::expert::DispatchedRoutes;
+use crate::backend::runtime::distributed::expert::DispatchedRoutes;
 
 pub(super) fn execute_cached_neutral_gemma4(
     args: &eredu_architectures::gemma4::ModelArgs,
@@ -16,8 +16,14 @@ pub(super) fn execute_cached_neutral_gemma4(
     stream: &Stream,
 ) -> Result<Array, Error> {
     let spec = eredu_architectures::gemma4::text::expert_bank_spec(args, layer)?;
-    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
-        cache, &spec, layer, &routes.hidden, &routes.global_expert_ids, pass, stream,
+    crate::backend::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
+        cache,
+        &spec,
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        pass,
+        stream,
     )
 }
 
@@ -30,8 +36,14 @@ pub(super) fn execute_cached_kimi_linear(
     stream: &Stream,
 ) -> Result<Array, Error> {
     let spec = eredu_architectures::kimi_linear::moe::expert_bank_spec(args, layer)?;
-    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
-        cache, &spec, layer, &routes.hidden, &routes.global_expert_ids, pass, stream,
+    crate::backend::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
+        cache,
+        &spec,
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        pass,
+        stream,
     )
 }
 
@@ -63,8 +75,14 @@ pub(super) fn execute_cached_neutral_inkling(
     stream: &Stream,
 ) -> Result<Array, Error> {
     let spec = eredu_architectures::inkling::text::expert_bank_spec(args, cache_layer)?;
-    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
-        cache, &spec, cache_layer, &routes.hidden, &routes.global_expert_ids, pass, stream,
+    crate::backend::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
+        cache,
+        &spec,
+        cache_layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        pass,
+        stream,
     )
 }
 
@@ -77,8 +95,14 @@ pub(super) fn execute_cached_lfm2(
     stream: &Stream,
 ) -> Result<Array, Error> {
     let spec = eredu_architectures::lfm2::moe::expert_bank_spec(args, layer)?;
-    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
-        cache, &spec, layer, &routes.hidden, &routes.global_expert_ids, pass, stream,
+    crate::backend::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
+        cache,
+        &spec,
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        pass,
+        stream,
     )
 }
 
@@ -91,8 +115,14 @@ pub(super) fn execute_cached_muse_glimmer(
     stream: &Stream,
 ) -> Result<Array, Error> {
     let spec = eredu_architectures::muse_glimmer::text::expert_bank_spec(args, layer)?;
-    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
-        cache, &spec, layer, &routes.hidden, &routes.global_expert_ids, pass, stream,
+    crate::backend::runtime::residency::expert_provider::execute_cached_gated_product_dispatched(
+        cache,
+        &spec,
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        pass,
+        stream,
     )
 }
 
@@ -105,7 +135,7 @@ pub(super) fn execute_cached_nemotron_h(
     stream: &Stream,
 ) -> Result<Array, Error> {
     let spec = eredu_architectures::nemotron_h::expert_bank_spec(args, layer)?;
-    crate::backend::mlx::runtime::residency::expert_provider::execute_cached_relu2_dispatched(
+    crate::backend::runtime::residency::expert_provider::execute_cached_relu2_dispatched(
         cache,
         &spec,
         layer,

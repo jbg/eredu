@@ -23,8 +23,8 @@ pub fn gguf_eos_token_ids(
     )?)
 }
 use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::{MlxModel, ModelLoadOptions},
+    backend::error::Error,
+    backend::{MlxModel, ModelLoadOptions},
     composition::mlx::{structural, Model},
 };
 
@@ -133,7 +133,7 @@ fn materialize_gguf_model(
                 let mmproj = GgufCheckpoint::open(mmproj_path)?;
                 processor = Some(ModelProcessor::load_gemma4_gguf(
                     metadata,
-                    &crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&mmproj),
+                    &crate::backend::runtime::checkpoint::load::gguf_metadata(&mmproj),
                 )?);
             }
             if options.quantization.is_some() {
@@ -168,7 +168,7 @@ fn materialize_gguf_model(
             {
                 let checkpoint = GgufCheckpoint::open(mmproj)?;
                 processor = Some(ModelProcessor::load_muse_glimmer_gguf(
-                    &crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint),
+                    &crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint),
                 )?);
             }
             if options.quantization.is_some() {
@@ -337,7 +337,7 @@ pub fn materialize_model_plan(
 
 fn requires_distributed_stage_loader(
     kind: ModelKind,
-    topology: crate::backend::mlx::MlxParallelContext,
+    topology: crate::backend::MlxParallelContext,
 ) -> bool {
     topology.pipeline_parallel_size > 1
         || topology.expert_parallel_size > 1
@@ -397,7 +397,7 @@ fn mlx_runtime_state_dtype_bytes(
 #[cfg(test)]
 mod runtime_state_dtype_tests {
     use super::{mlx_runtime_state_dtype_bytes, requires_distributed_stage_loader};
-    use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
+    use crate::backend::{DeviceAssignment, MlxParallelContext};
     use eredu_architectures::ModelKind;
     use eredu_core::checkpoint::TensorDtype;
     use safemlx::DeviceType;
@@ -542,7 +542,7 @@ fn materialize_tensor_parallel(
         )));
     }
     let execution = options.weight_residency.layers();
-    let build = crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext::new(
+    let build = crate::backend::runtime::distributed::parallel::ParallelBuildContext::new(
         topology,
         eredu_runtime::ShardingPolicy::Require,
     );
@@ -683,7 +683,7 @@ fn materialize_gguf_artifact(
         ));
     };
     let checkpoint = safemlx::ops::GgufCheckpoint::from_portable(checkpoint);
-    let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+    let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
     let architecture = GgufArchitecture::resolve(&configuration.declared_model_type)?;
     let source = structural::admit_gguf(architecture, checkpoint, metadata, options)?;
     let checkpoint = source.checkpoint();
@@ -712,9 +712,7 @@ fn materialize_gguf_artifact(
                     .map(|checkpoint| {
                         ModelProcessor::load_gemma4_gguf(
                             &metadata,
-                            &crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
-                                checkpoint,
-                            ),
+                            &crate::backend::runtime::checkpoint::load::gguf_metadata(checkpoint),
                         )
                     })
                     .transpose()?
@@ -727,9 +725,7 @@ fn materialize_gguf_artifact(
                     .as_ref()
                     .map(|checkpoint| {
                         ModelProcessor::load_muse_glimmer_gguf(
-                            &crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(
-                                checkpoint,
-                            ),
+                            &crate::backend::runtime::checkpoint::load::gguf_metadata(checkpoint),
                         )
                     })
                     .transpose()?
@@ -772,7 +768,7 @@ fn materialize_gguf_tensor_parallel(
         )));
     }
     let residency = options.weight_residency.layers();
-    let build = crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext::new(
+    let build = crate::backend::runtime::distributed::parallel::ParallelBuildContext::new(
         topology,
         eredu_runtime::ShardingPolicy::Require,
     );
@@ -901,7 +897,7 @@ fn materialize_gguf_tensor_parallel(
 }
 
 pub fn validate_gguf_quantization_source<
-    S: crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames,
+    S: crate::backend::runtime::checkpoint::load::GgufTensorNames,
 >(
     source: &S,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,

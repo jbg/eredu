@@ -23,11 +23,11 @@ use eredu_backend_mlx::native::{
     Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
 };
 use eredu_backend_mlx::{
-    testing::backend::mlx::error::Error,
-    testing::backend::mlx::runtime::checkpoint::quantization::CheckpointQuantizationOptions,
-    testing::backend::mlx::runtime::execution::inspection::ActivationRecorder,
-    testing::backend::mlx::runtime::media::input,
-    testing::backend::mlx::ModelLoadOptions,
+    testing::backend::error::Error,
+    testing::backend::runtime::checkpoint::quantization::CheckpointQuantizationOptions,
+    testing::backend::runtime::execution::inspection::ActivationRecorder,
+    testing::backend::runtime::media::input,
+    testing::backend::ModelLoadOptions,
     testing::composition::mlx::{validate_gguf_quantization_source, Model},
 };
 use eredu_gguf::{GgmlType, MetadataValue as GgufWriterMetadata, TensorInput, Writer};
@@ -53,7 +53,7 @@ fn load_test_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<
-    crate::PreparedModel<eredu_backend_mlx::testing::backend::mlx::MlxModel>,
+    crate::PreparedModel<eredu_backend_mlx::testing::backend::MlxModel>,
     crate::ModelLoadError<Error>,
 > {
     let backend = eredu_backend_mlx::native::backend(stream, weights_stream);
@@ -103,12 +103,12 @@ fn observer_forward_reports_attention_and_residual_hooks() {
         .unwrap();
     let mut recorder = ActivationRecorder::new();
     let parts = [
-        eredu_backend_mlx::testing::backend::mlx::runtime::media::input::InputPart::text_token_ids(
+        eredu_backend_mlx::testing::backend::runtime::media::input::InputPart::text_token_ids(
             &input,
         ),
     ];
     let input = eredu_backend_mlx::testing::composition::mlx::MlxModelInput::from(
-        eredu_backend_mlx::testing::backend::mlx::runtime::media::input::ModelInput::new(&parts),
+        eredu_backend_mlx::testing::backend::runtime::media::input::ModelInput::new(&parts),
     );
     let (backend, session) = model.runtime_mut().parts_mut();
     session
@@ -152,7 +152,7 @@ fn chat_preparation_contracts_are_public_and_default_conservatively() {
         ParallelToolCallPolicy::Disabled
     );
     let _: fn(
-        &mut LoadedModel<eredu_backend_mlx::testing::backend::mlx::MlxBackend<'static>>,
+        &mut LoadedModel<eredu_backend_mlx::testing::backend::MlxBackend<'static>>,
         ChatTemplateRequest,
     ) -> Result<PreparedChat, TextModelError> = LoadedModel::prepare_chat;
 }
@@ -198,23 +198,22 @@ fn prepared_chat_input_keeps_its_semantic_owner_with_an_opaque_backend_prompt() 
         preserved_structural_token_ids: Vec::new(),
         profile_stop_sequences: Vec::new(),
     };
-    let input: PreparedChatInput<
-        '_,
-        eredu_backend_mlx::testing::backend::mlx::MlxBackend<'static>,
-    > = PreparedChatInput::rendered_prompt(&prepared);
+    let input: PreparedChatInput<'_, eredu_backend_mlx::testing::backend::MlxBackend<'static>> =
+        PreparedChatInput::rendered_prompt(&prepared);
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
     assert!(input.backend_prompt().is_none());
-    let model_input = eredu_backend_mlx::testing::backend::mlx::runtime::media::prepared_model_input(vec![
-        eredu_backend_mlx::testing::backend::mlx::runtime::media::PreparedInputPart::text_token_ids(&[7]),
-    ])
-    .unwrap();
+    let model_input =
+        eredu_backend_mlx::testing::backend::runtime::media::prepared_model_input(vec![
+            eredu_backend_mlx::testing::backend::runtime::media::PreparedInputPart::text_token_ids(
+                &[7],
+            ),
+        ])
+        .unwrap();
     let model_input = model_input.with_model_input(|input| {
         eredu_backend_mlx::testing::composition::mlx::MlxModelInput::from(input)
     });
-    let input: PreparedChatInput<
-        '_,
-        eredu_backend_mlx::testing::backend::mlx::MlxBackend<'static>,
-    > = PreparedChatInput::prepared_backend_input(&prepared, model_input);
+    let input: PreparedChatInput<'_, eredu_backend_mlx::testing::backend::MlxBackend<'static>> =
+        PreparedChatInput::prepared_backend_input(&prepared, model_input);
     assert!(std::ptr::eq(input.prepared_chat(), &prepared));
     assert!(input.backend_prompt().is_some());
 }
@@ -274,7 +273,7 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     let runtime = eredu_core::ModelRuntime::from_prepared(
         eredu_backend_mlx::native::backend(stream, stream),
         eredu_core::PreparedModel::new(
-            eredu_backend_mlx::testing::backend::mlx::MlxModel::complete_for_test(
+            eredu_backend_mlx::testing::backend::MlxModel::complete_for_test(
                 Model::Qwen35(qwen),
                 std::num::NonZeroU8::new(4).unwrap(),
             ),
@@ -295,7 +294,7 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
 
     let capabilities = model.capabilities().unwrap();
     assert_eq!(capabilities.model_type, "qwen3_5_text");
-    let prompt = <eredu_backend_mlx::testing::backend::mlx::MlxBackend<'static> as eredu_core::TextGenerationBackend>::prepare_text_prompt(
+    let prompt = <eredu_backend_mlx::testing::backend::MlxBackend<'static> as eredu_core::TextGenerationBackend>::prepare_text_prompt(
         model.runtime().backend(),
         vec![1, 2],
     )
@@ -1341,7 +1340,7 @@ fn save_zero_qwen_checkpoint(
     }
 
     let architecture = eredu_architectures::qwen::LayeredModel::<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
+        eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
     >::new(args.clone(), stream)
     .unwrap();
     let mut collector = ZeroCollector {
@@ -1353,7 +1352,7 @@ fn save_zero_qwen_checkpoint(
         .visit_parameters(&mut collector);
     for layer in 0..args.num_hidden_layers as usize {
         eredu_architectures::qwen::new_block::<
-            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
+            eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
         >(args, layer, stream)
         .unwrap()
         .visit_parameters(&mut collector);
@@ -1399,28 +1398,28 @@ fn save_zero_gemma4_checkpoint(
     }
 
     type Architecture = eredu_architectures::gemma4::LayeredModel<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
+        eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
     >;
-    type State = eredu_backend_mlx::testing::backend::mlx::runtime::cache::state::MlxHybridState;
+    type State = eredu_backend_mlx::testing::backend::runtime::cache::state::MlxHybridState;
     let architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut collector = ZeroCollector {
         stream,
         arrays: Vec::new(),
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
+        eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     for group in 0..3 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
+            eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
+                eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -1462,28 +1461,28 @@ fn save_zero_inkling_checkpoint(
     }
 
     type Architecture = eredu_architectures::inkling::LayeredModel<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
+        eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
     >;
-    type State = eredu_backend_mlx::testing::backend::mlx::runtime::cache::state::MlxHybridState;
+    type State = eredu_backend_mlx::testing::backend::runtime::cache::state::MlxHybridState;
     let architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut collector = ZeroCollector {
         stream,
         arrays: Vec::new(),
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
+        eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     for group in 0..2 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
+            eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
+                eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -1593,7 +1592,7 @@ fn tiny_gemma4_external_assistant_uses_neutral_transaction_path() {
     )
     .unwrap();
     let assistant_module = eredu_architectures::gemma4::Assistant::<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
+        eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
     >::new(assistant_config, stream)
     .unwrap();
     save_zero_neutral_checkpoint(&assistant_module, &assistant_dir, stream);
@@ -1806,7 +1805,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 )
                 .unwrap();
                 let model = eredu_architectures::llama::Model::<
-                    eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
+                    eredu_backend_mlx::testing::backend::nn::shared::MlxNeuralBackend,
                 >::new(&args, stream)
                 .unwrap();
                 save_zero_neutral_checkpoint(&model, &dir, stream);
@@ -1875,7 +1874,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 "q4"
             };
             let saved_dir = dir.with_extension(suffix);
-            eredu_backend_mlx::testing::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
+            eredu_backend_mlx::testing::backend::runtime::checkpoint::quantization::quantize_checkpoint(
                 &dir,
                 &saved_dir,
                 &CheckpointQuantizationOptions {
@@ -1984,7 +1983,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 let mut runtime = eredu_core::ModelRuntime::from_prepared(
                     eredu_backend_mlx::native::backend(stream, stream),
                     eredu_core::PreparedModel::new(
-                        eredu_backend_mlx::testing::backend::mlx::MlxModel::complete_for_test(
+                        eredu_backend_mlx::testing::backend::MlxModel::complete_for_test(
                             dense,
                             std::num::NonZeroU8::new(4).unwrap(),
                         ),
@@ -2029,7 +2028,7 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
             }"#,
     );
     let args = eredu_backend_mlx::testing::composition::gpt_oss::load_model_args(&dir).unwrap();
-    let fixture = eredu_backend_mlx::testing::backend::mlx::nn::MlxModule::new(
+    let fixture = eredu_backend_mlx::testing::backend::nn::MlxModule::new(
         eredu_backend_mlx::testing::composition::gpt_oss::GptOssCheckpointTemplate::new(
             args, stream,
         )
@@ -2431,7 +2430,7 @@ fn tiny_lfm2_moe_neutral_runtime_executes_independent_expert_cache() {
     );
     let args = eredu_backend_mlx::testing::composition::lfm2::load_model_args(&dir).unwrap();
     save_zero_checkpoint(
-        &eredu_backend_mlx::testing::backend::mlx::nn::MlxModule::new(
+        &eredu_backend_mlx::testing::backend::nn::MlxModule::new(
             eredu_backend_mlx::testing::composition::lfm2::Lfm2CheckpointTemplate::new(
                 args, stream,
             )
@@ -3002,7 +3001,7 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     assert!(bounded.residency_report().unwrap().initialized());
 
     let saved_dir = dir.with_extension("mxfp4");
-    eredu_backend_mlx::testing::backend::mlx::runtime::checkpoint::quantization::quantize_checkpoint(
+    eredu_backend_mlx::testing::backend::runtime::checkpoint::quantization::quantize_checkpoint(
         &dir,
         &saved_dir,
         &CheckpointQuantizationOptions {

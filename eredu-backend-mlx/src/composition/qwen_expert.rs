@@ -4,11 +4,11 @@ use eredu_architectures::qwen::ModelArgs;
 use eredu_runtime::ExpertPass;
 use safemlx::{Array, Stream};
 
-use crate::backend::mlx::runtime::residency::expert_cache::ExpertCache;
-use crate::backend::mlx::runtime::residency::expert_provider::{
+use crate::backend::runtime::residency::expert_cache::ExpertCache;
+use crate::backend::runtime::residency::expert_provider::{
     execute_cached_gated_product_dispatched, CachedGatedProductExpertProvider,
 };
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error, runtime::residency::expert_cache::ExpertCatalogEntry,
 };
 

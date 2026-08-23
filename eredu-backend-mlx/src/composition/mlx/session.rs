@@ -18,16 +18,16 @@ use safemlx::{
 use std::path::Path;
 
 use crate::{
-    backend::mlx::runtime::generation::sampler::{Sampler, SpeculativeSampler},
-    backend::mlx::runtime::media::input,
-    backend::mlx::{error::Error, MlxModelKind},
+    backend::runtime::generation::sampler::{Sampler, SpeculativeSampler},
+    backend::runtime::media::input,
+    backend::{error::Error, MlxModelKind},
     composition::mlx::distributed::pipeline::{
         PipelineCache, PipelineStageCompletion, PipelineStep,
     },
     MlxTensor,
 };
 #[cfg(feature = "media")]
-use crate::{backend::mlx::runtime::media::PreparedModelInput, composition::mlx::ModelProcessor};
+use crate::{backend::runtime::media::PreparedModelInput, composition::mlx::ModelProcessor};
 use eredu_core::cache::{PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions};
 use eredu_core::generation::MtpConfig;
 use eredu_core::{MtpCapability, MtpStats};
@@ -410,10 +410,8 @@ impl<'a> MlxModelSession<'a> {
     /// Returns sparse routed-expert cache telemetry when enabled.
     pub fn expert_cache_report(
         &self,
-    ) -> Result<
-        Option<crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheReport>,
-        Error,
-    > {
+    ) -> Result<Option<crate::backend::runtime::residency::expert_cache::ExpertCacheReport>, Error>
+    {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.expert_cache_report(),
             MlxSessionKind::Pipeline(model, _) => model.expert_cache_report(),
@@ -727,7 +725,7 @@ impl<'a> MlxModelSession<'a> {
         temperature: f32,
         prng_state: Option<&mut RandomState>,
         finished: bool,
-    ) -> Result<crate::backend::mlx::runtime::distributed::parallel::SynchronizedToken, Error> {
+    ) -> Result<crate::backend::runtime::distributed::parallel::SynchronizedToken, Error> {
         let distributed = self.distributed.as_ref().ok_or_else(|| {
             Error::Parallel("sampling synchronization requires a distributed model session".into())
         })?;
@@ -1067,9 +1065,8 @@ fn sample_text_submission(
     let logits = submission.output.into_logits().ok_or_else(|| {
         Error::Parallel("text generation requires logits on the local session rank".into())
     })?;
-    let logits = crate::backend::mlx::runtime::generation::sampler::apply_token_filter(
-        &logits, filter, &stream,
-    )?;
+    let logits =
+        crate::backend::runtime::generation::sampler::apply_token_filter(&logits, filter, &stream)?;
     let token = state
         .sampler
         .sample(&logits, state.temperature, state.prng.as_mut(), &stream)?;

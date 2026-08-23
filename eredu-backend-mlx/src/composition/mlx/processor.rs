@@ -6,11 +6,11 @@ use eredu_core::{Media as PortableMedia, TokenizedMultimodalRequest, TokenizedMu
 
 #[cfg(feature = "image")]
 use crate::{
-    backend::mlx::runtime::media::{RgbImageView, VideoSampling},
+    backend::runtime::media::{RgbImageView, VideoSampling},
     composition::{muse_glimmer_processor as muse_glimmer, qwen::processor as qwen},
 };
 use crate::{
-    backend::mlx::{
+    backend::{
         error::Error,
         runtime::media::{
             MediaInput, PreparedModelInput, ProcessorInput, ProcessorPreparationError,
@@ -300,7 +300,7 @@ mod tests {
     use safemlx::ops::GgufMetadataValue;
 
     use super::ModelProcessor;
-    use crate::backend::mlx::runtime::media::input::Modality;
+    use crate::backend::runtime::media::input::Modality;
 
     #[test]
     fn mlx_processor_materializes_the_portable_ordered_request() {

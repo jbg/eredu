@@ -25,7 +25,7 @@ use safemlx::{
     Array, Stream,
 };
 
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
@@ -250,7 +250,7 @@ impl MlxUnitPopulator<NeutralUnit> for UnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<NeutralUnit>,
-        lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
+        lease: &crate::backend::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
             self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
@@ -263,7 +263,7 @@ impl MlxUnitPopulator<NeutralUnit> for ParallelUnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<NeutralUnit>,
-        lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
+        lease: &crate::backend::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
             self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
@@ -376,7 +376,7 @@ pub struct InklingModel {
     metadata: eredu_runtime::LayerwiseModelMetadata,
     execution: Execution,
     expert_cache: Option<ExpertCache>,
-    parallel_info: Option<ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
+    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
 }
 
 /// Collective context adapter for the neutral tensor-parallel MTP target.
@@ -400,9 +400,7 @@ impl InklingModel {
         &self.metadata
     }
 
-    pub fn parallel_info(
-        &self,
-    ) -> Option<&ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
         self.parallel_info.as_ref()
     }
 
@@ -455,7 +453,7 @@ impl InklingModel {
                 let manager = CacheResidencyManager::new(options)
                     .map_err(|error| Error::Parallel(error.to_string()))?;
                 let rank = self.parallel_info.as_ref().and_then(|info| {
-                    crate::backend::mlx::cache::prompt_cache_topology(info.topology())
+                    crate::backend::cache::prompt_cache_topology(info.topology())
                         .cache_rank_identity()
                 });
                 Ok(InklingState {
@@ -492,7 +490,7 @@ impl InklingModel {
             .parallel_info
             .as_ref()
             .map_or_else(eredu_core::cache::PromptCacheTopology::default, |info| {
-                crate::backend::mlx::cache::prompt_cache_topology(info.topology())
+                crate::backend::cache::prompt_cache_topology(info.topology())
             });
         self.prompt_state_identity(topology)?
             .prompt_cache_identity(&self.prompt_state_layout)
@@ -1792,7 +1790,7 @@ fn load_parallel_store(
     store: SharedCheckpointSource,
     args: ModelArgs,
     layer_policy: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
@@ -2003,7 +2001,7 @@ fn load_parallel_store(
 pub fn load_safetensors_tensor_parallel(
     model_dir: impl AsRef<Path>,
     layer_policy: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
@@ -2021,7 +2019,7 @@ pub fn load_gguf_tensor_parallel(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     layer_policy: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(InklingModel, Vec<u32>), Error> {

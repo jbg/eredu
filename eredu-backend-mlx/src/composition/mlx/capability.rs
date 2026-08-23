@@ -13,7 +13,7 @@ use eredu_core::{
 use safemlx::{Array, Stream};
 
 use super::{MlxBackend, MlxModelInput, MlxModelSession, Model};
-use crate::backend::mlx::runtime::media::input::{self, InputPayload, Modality};
+use crate::backend::runtime::media::input::{self, InputPayload, Modality};
 use eredu_core::residency::MemoryTier;
 
 fn positive(value: i32, field: &'static str) -> Result<u64, CapabilityError> {

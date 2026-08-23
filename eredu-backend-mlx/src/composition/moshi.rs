@@ -19,7 +19,7 @@ use eredu_runtime::{
 };
 use safemlx::{module::ModuleParameters, Array, Stream};
 
-use crate::backend::mlx::{
+use crate::backend::{
     ensure_replicated_load_options,
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
@@ -114,7 +114,7 @@ pub struct MoshiModel {
     artifact_identity: LoadedArtifactIdentity,
     state_layout: eredu_runtime::StateLayout,
     metadata: LayerwiseModelMetadata,
-    topology: Option<crate::backend::mlx::MlxParallelContext>,
+    topology: Option<crate::backend::MlxParallelContext>,
     execution: Execution,
 }
 
@@ -145,7 +145,7 @@ impl MoshiModel {
     }
 
     /// Rank-local topology when this instance owns tensor-parallel parameters.
-    pub fn topology(&self) -> Option<crate::backend::mlx::MlxParallelContext> {
+    pub fn topology(&self) -> Option<crate::backend::MlxParallelContext> {
         self.topology
     }
 
@@ -445,7 +445,7 @@ fn load_parallel(
     artifact_identity: LoadedArtifactIdentity,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
     residency: eredu_runtime::LayerWeightResidency,
-    topology: crate::backend::mlx::MlxParallelContext,
+    topology: crate::backend::MlxParallelContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiModel, Error> {
@@ -458,7 +458,7 @@ fn load_parallel(
         )));
     }
     topology.validate_execution_stream(stream)?;
-    let build = crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext::new(
+    let build = crate::backend::runtime::distributed::parallel::ParallelBuildContext::new(
         topology,
         ShardingPolicy::Require,
     );
@@ -601,7 +601,7 @@ fn artifact_identity(
     config: &MoshiConfig,
 ) -> Result<LoadedArtifactIdentity, Error> {
     let paths = if source.is_dir() {
-        crate::backend::mlx::runtime::checkpoint::load::safetensors_files(source)?
+        crate::backend::runtime::checkpoint::load::safetensors_files(source)?
     } else {
         vec![source.to_owned()]
     };

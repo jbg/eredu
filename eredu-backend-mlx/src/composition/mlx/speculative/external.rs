@@ -10,7 +10,7 @@ use safemlx::{
 };
 
 use crate::{
-    backend::mlx::runtime::{
+    backend::runtime::{
         cache::state::{MlxHybridState, MlxKeyValueState},
         media::input::ModelInput,
     },

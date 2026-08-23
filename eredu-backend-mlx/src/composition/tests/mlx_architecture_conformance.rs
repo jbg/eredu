@@ -5,7 +5,7 @@ use eredu_runtime::{DeviceState, LayeredArchitecture, LayeredForwardState};
 use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext};
 use std::sync::OnceLock;
 
-use crate::backend::mlx::{
+use crate::backend::{
     nn::{shared::MlxNeuralBackend, tensor::TokenValidationScope},
     runtime::cache::{
         state::{MlxHybridState, MlxKeyValueState, MlxPoolingAttentionStateFactory},
@@ -877,7 +877,7 @@ fn neutral_deepseek_v3_forward_executes_on_mlx() {
 #[test]
 fn neutral_deepseek_v4_forward_executes_on_mlx() {
     type Architecture = eredu_architectures::deepseek::v4::Model<MlxNeuralBackend>;
-    type State = crate::backend::mlx::runtime::cache::state::MlxPoolingAttentionState;
+    type State = crate::backend::runtime::cache::state::MlxPoolingAttentionState;
     let args = eredu_architectures::deepseek::parse_v4_config(&serde_json::json!({
         "hidden_size":8,"moe_intermediate_size":8,"num_hidden_layers":3,
         "num_attention_heads":2,"head_dim":4,"qk_rope_head_dim":2,

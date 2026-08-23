@@ -5,9 +5,9 @@ use eredu_runtime::DraftStateTransaction;
 use safemlx::{distributed::Group, error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::runtime::generation::sampler::SpeculativeSampler,
-    backend::mlx::runtime::media::input::ModelInput,
+    backend::error::Error,
+    backend::runtime::generation::sampler::SpeculativeSampler,
+    backend::runtime::media::input::ModelInput,
     composition::mlx::{
         speculative::{
             scheduler::MtpComponentTimings, MlxSpeculativeCompletion, MtpExecutionStreams,

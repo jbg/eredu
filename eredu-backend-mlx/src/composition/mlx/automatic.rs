@@ -24,8 +24,8 @@ use super::{
     MlxBackend, ModelLoadOptions,
 };
 use crate::{
-    backend::mlx::error::Error,
-    backend::mlx::runtime::{
+    backend::error::Error,
+    backend::runtime::{
         execution::layerwise::LayerwiseModelError, residency::expert_cache::ExpertCacheReport,
     },
 };

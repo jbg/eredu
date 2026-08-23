@@ -12,9 +12,9 @@ use eredu_core::generation::{
 use eredu_core::{MtpCapability, MtpCheckpointKind, MtpStats, SpeculativeSemanticState};
 use safemlx::{error::Exception, Array, Stream};
 
-use crate::backend::mlx::error::Error;
-use crate::backend::mlx::runtime::generation::sampler::SpeculativeSampler;
-use crate::backend::mlx::runtime::media::input;
+use crate::backend::error::Error;
+use crate::backend::runtime::generation::sampler::SpeculativeSampler;
+use crate::backend::runtime::media::input;
 use crate::composition::gpt_oss;
 use crate::composition::mlx::speculative::{MlxDrafter, MtpExecutionStreams};
 use eredu_architectures::kimi_linear;
@@ -61,7 +61,7 @@ impl Model {
     /// model was loaded through generalized parallel execution groups.
     pub fn parallel_info(
         &self,
-    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::MlxParallelContext>> {
         match self {
             Self::DeepSeek(_) => None,
             Self::Llama(model) => model.parallel_info(),
@@ -190,7 +190,7 @@ impl Model {
         config: &MtpConfig,
         prng_key: Option<Array>,
         sampler: &mut S,
-        execution: &crate::backend::mlx::MlxDistributedSession<'_>,
+        execution: &crate::backend::MlxDistributedSession<'_>,
     ) -> Result<(Vec<u32>, MtpStats), Exception> {
         let topology = execution.topology();
         if topology.pipeline_parallel_size != 1 || topology.expert_parallel_size != 1 {
@@ -552,10 +552,8 @@ impl Model {
     /// Returns sparse routed-expert cache telemetry when enabled.
     pub fn expert_cache_report(
         &self,
-    ) -> Result<
-        Option<crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheReport>,
-        Error,
-    > {
+    ) -> Result<Option<crate::backend::runtime::residency::expert_cache::ExpertCacheReport>, Error>
+    {
         match self {
             Self::DeepSeek(model) => model.expert_cache_report(),
             Self::Gemma4(model) => model.expert_cache_report(),
@@ -697,7 +695,7 @@ impl Model {
         cache: &mut ModelCache,
         stream: &Stream,
         observer: &mut impl RuntimeActivationObserver<crate::MlxTensor, Exception>,
-    ) -> Result<eredu_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
+    ) -> Result<eredu_core::Submission<Array, crate::backend::MlxCompletion>, Error> {
         crate::composition::mlx::MlxModelSession::submit_complete_prefill_with_observer(
             self,
             input.into(),
@@ -1026,7 +1024,7 @@ impl Model {
         input: input::ModelInput<'_>,
         cache: &mut ModelCache,
         stream: &Stream,
-    ) -> Result<eredu_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
+    ) -> Result<eredu_core::Submission<Array, crate::backend::MlxCompletion>, Error> {
         crate::composition::mlx::submit_prefill_with_cache(self, cache, input.into(), stream)
     }
 
@@ -1036,7 +1034,7 @@ impl Model {
         input: Array,
         cache: &mut ModelCache,
         stream: &Stream,
-    ) -> Result<eredu_core::Submission<Array, crate::backend::mlx::MlxCompletion>, Error> {
+    ) -> Result<eredu_core::Submission<Array, crate::backend::MlxCompletion>, Error> {
         crate::composition::mlx::submit_decode_with_cache(self, cache, input, stream)
     }
 }
@@ -1049,23 +1047,23 @@ pub enum ModelCache {
     /// GPT-OSS cache following its canonical per-layer attention schedule.
     GptOss(gpt_oss::Cache),
     /// Neutral Muse-Glimmer key/value state.
-    MuseGlimmer(crate::backend::mlx::runtime::cache::state::MlxKeyValueState),
+    MuseGlimmer(crate::backend::runtime::cache::state::MlxKeyValueState),
     /// Runtime-policy-selected MLX key/value state.
-    Llama(crate::backend::mlx::runtime::cache::state::MlxKeyValueState),
+    Llama(crate::backend::runtime::cache::state::MlxKeyValueState),
     /// Runtime-policy-selected Qwen key/value state.
-    Qwen(crate::backend::mlx::runtime::cache::state::MlxKeyValueState),
+    Qwen(crate::backend::runtime::cache::state::MlxKeyValueState),
     /// Qwen3-VL key/value cache and multimodal position state.
-    Qwen3Vl(crate::backend::mlx::runtime::cache::state::MlxHybridState),
+    Qwen3Vl(crate::backend::runtime::cache::state::MlxHybridState),
     /// Qwen3-VL-MoE key/value cache and multimodal position state.
-    Qwen3VlMoe(crate::backend::mlx::runtime::cache::state::MlxHybridState),
+    Qwen3VlMoe(crate::backend::runtime::cache::state::MlxHybridState),
     /// Architecture-declared heterogeneous append-only and fixed state.
-    Hybrid(crate::backend::mlx::runtime::cache::state::MlxHybridState),
+    Hybrid(crate::backend::runtime::cache::state::MlxHybridState),
     /// Neutral Inkling target and checkpoint-embedded predictor state.
     Inkling(crate::composition::inkling::InklingState),
     /// Heterogeneous Qwen3.5 MoE cache.
-    Qwen35(crate::backend::mlx::runtime::cache::state::MlxHybridState),
+    Qwen35(crate::backend::runtime::cache::state::MlxHybridState),
     /// Heterogeneous Qwen3-Next cache.
-    Qwen3Next(crate::backend::mlx::runtime::cache::state::MlxHybridState),
+    Qwen3Next(crate::backend::runtime::cache::state::MlxHybridState),
 }
 
 impl ModelCache {
@@ -1090,7 +1088,7 @@ impl ModelCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::mlx::runtime::cache::{
+    use crate::backend::runtime::cache::{
         residency::CacheResidencyManager,
         state::{MlxHybridState, MlxKeyValueState},
     };

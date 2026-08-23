@@ -7,7 +7,7 @@ use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection};
 use eredu_runtime::{ExpertIdentity, OffloadUnit, ParameterRole, WeightBinding};
 use safemlx::Stream;
 
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{

@@ -17,9 +17,9 @@ use eredu_backend_mlx::native::{
     Array, Device, DeviceType, Stream,
 };
 use eredu_backend_mlx::{
-    testing::backend::mlx::error::Error,
-    testing::backend::mlx::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
-    testing::backend::mlx::runtime::{
+    testing::backend::error::Error,
+    testing::backend::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts},
+    testing::backend::runtime::{
         distributed::expert::{
             dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings,
             AllToAllVPlan, DispatchedRoutes, ExpertAssignment, LocalExpertBank, RoutedTransport,

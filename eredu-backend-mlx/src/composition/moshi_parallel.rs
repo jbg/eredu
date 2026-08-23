@@ -4,7 +4,7 @@ use eredu_architectures::moshi::{self, LayeredModel};
 use eredu_runtime::LayeredArchitecture;
 use safemlx::Stream;
 
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     nn::shared::MlxNeuralBackend,
     runtime::{cache::state::MlxKeyValueState, distributed::parallel::ParallelPlanBuilder},

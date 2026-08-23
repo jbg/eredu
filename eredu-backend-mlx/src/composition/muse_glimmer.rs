@@ -22,7 +22,7 @@ use safemlx::{
     Array, Stream,
 };
 
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
@@ -103,7 +103,7 @@ impl MlxUnitPopulator<NeutralUnit> for UnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<NeutralUnit>,
-        lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
+        lease: &crate::backend::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
             self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
@@ -180,7 +180,7 @@ pub struct MuseGlimmerModel {
     metadata: eredu_runtime::LayerwiseModelMetadata,
     execution: Execution,
     expert_cache: Option<ExpertCache>,
-    parallel_info: Option<ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
+    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
 }
 
 /// Fully resident DFlash assistant built from neutral equations.
@@ -231,7 +231,7 @@ impl MuseGlimmerDFlashModel {
 
 pub fn load_dflash_safetensors(
     model_dir: &Path,
-    options: crate::backend::mlx::ModelLoadOptions,
+    options: crate::backend::ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerDFlashModel, Error> {
@@ -286,7 +286,7 @@ pub fn load_dflash_safetensors(
 
 pub fn load_dflash_gguf(
     gguf_file: &Path,
-    options: crate::backend::mlx::ModelLoadOptions,
+    options: crate::backend::ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerDFlashModel, Error> {
@@ -453,7 +453,7 @@ impl MuseGlimmerPipelineBindings {
         global_layer: &MuseGlimmerPipelineUnit,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        _assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
         let expert_targets = architecture
             .parameter_description()
@@ -606,9 +606,7 @@ impl MuseGlimmerModel {
         &self.metadata
     }
 
-    pub fn parallel_info(
-        &self,
-    ) -> Option<&ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
         self.parallel_info.as_ref()
     }
 
@@ -625,7 +623,7 @@ impl MuseGlimmerModel {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
             CacheResidencyPolicy::Paged(options) => {
                 let rank = self.parallel_info.as_ref().and_then(|info| {
-                    crate::backend::mlx::cache::prompt_cache_topology(info.topology())
+                    crate::backend::cache::prompt_cache_topology(info.topology())
                         .cache_rank_identity()
                 });
                 MlxKeyValueState::paged(
@@ -650,7 +648,7 @@ impl MuseGlimmerModel {
             .parallel_info
             .as_ref()
             .map_or_else(eredu_core::cache::PromptCacheTopology::default, |info| {
-                crate::backend::mlx::cache::prompt_cache_topology(info.topology())
+                crate::backend::cache::prompt_cache_topology(info.topology())
             });
         eredu_runtime::ModelStateIdentity {
             model_family: "muse_glimmer".into(),
@@ -1454,7 +1452,7 @@ fn load_parallel_store(
     store: SharedCheckpointSource,
     args: DecoderConfig,
     residency: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
@@ -1644,7 +1642,7 @@ fn load_parallel_store(
 pub fn load_safetensors_tensor_parallel(
     model_dir: impl AsRef<Path>,
     residency: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
@@ -1661,7 +1659,7 @@ pub fn load_gguf_tensor_parallel(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     residency: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(MuseGlimmerModel, Vec<u32>), Error> {

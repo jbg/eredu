@@ -10,7 +10,7 @@ use eredu_runtime::{
 };
 use safemlx::{distributed::Group, Array, Stream};
 
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     nn::shared::MlxNeuralBackend,
     runtime::{

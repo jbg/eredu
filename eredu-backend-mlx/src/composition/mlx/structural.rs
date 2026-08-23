@@ -9,8 +9,8 @@ use serde_json::Value;
 use eredu_architectures::{GgufArchitecture, ModelKind};
 
 use super::ModelLoadOptions;
-use crate::backend::mlx::error::Error;
-use crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames;
+use crate::backend::error::Error;
+use crate::backend::runtime::checkpoint::load::GgufTensorNames;
 use crate::composition::llama::checkpoint as llama_checkpoint;
 use eredu_checkpoint::store::SafetensorsWeightStore;
 
@@ -67,7 +67,7 @@ pub(crate) fn admit_gguf_path(
     })?;
     let architecture = GgufArchitecture::resolve(&inspection.configuration().declared_model_type)?;
     let checkpoint = GgufCheckpoint::from_portable(validated.checkpoint().clone());
-    let metadata = crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+    let metadata = crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
     admit_gguf(architecture, checkpoint, metadata, options)
 }
 
@@ -914,7 +914,7 @@ pub fn validate_inkling_mmproj_gguf(
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    let formats = match crate::backend::mlx::runtime::checkpoint::load::gguf_quantization_configs(
+    let formats = match crate::backend::runtime::checkpoint::load::gguf_quantization_configs(
         checkpoint,
         eredu_architectures::inkling::translate_mmproj_weight_name,
     ) {
@@ -978,7 +978,7 @@ pub fn validate_muse_glimmer_projector_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    let formats = match crate::backend::mlx::runtime::checkpoint::load::gguf_quantization_configs(
+    let formats = match crate::backend::runtime::checkpoint::load::gguf_quantization_configs(
         checkpoint,
         eredu_architectures::muse_glimmer::translate_projector_gguf_name,
     ) {

@@ -20,12 +20,12 @@ use safemlx::{
     Array, Stream,
 };
 
-use crate::backend::mlx::runtime::{
+use crate::backend::runtime::{
     distributed::parallel::ParallelBuildContext,
     execution::layerwise::{open_safetensors_weight_store, shard_layer_bindings},
     media::input,
 };
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{

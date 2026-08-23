@@ -12,7 +12,7 @@ use eredu::{
     FinishReason, SemanticEvent,
 };
 use eredu_backend_mlx::native::{Device, DeviceType, ExecutionContext};
-use eredu_backend_mlx::testing::backend::mlx::ModelLoadOptions;
+use eredu_backend_mlx::testing::backend::ModelLoadOptions;
 use serde_json::json;
 
 fn profile_requires_structural_tool_tokens(identity: &str) -> bool {

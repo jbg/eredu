@@ -1,16 +1,16 @@
 //! Curated application-facing MLX adapter API.
 
-pub use crate::backend::mlx::error::Error as MlxError;
-pub use crate::backend::mlx::nn::generation::sample;
-pub use crate::backend::mlx::runtime::checkpoint::quantization::{
+pub use crate::backend::error::Error as MlxError;
+pub use crate::backend::nn::generation::sample;
+pub use crate::backend::runtime::checkpoint::quantization::{
     quantize_checkpoint, CheckpointQuantizationOptions, CheckpointQuantizationReport,
 };
-pub use crate::backend::mlx::runtime::generation::sampler::Sampler;
-pub use crate::backend::mlx::runtime::media::input::{InputPart, ModelInput};
-pub use crate::backend::mlx::runtime::residency::expert_cache::{
+pub use crate::backend::runtime::generation::sampler::Sampler;
+pub use crate::backend::runtime::media::input::{InputPart, ModelInput};
+pub use crate::backend::runtime::residency::expert_cache::{
     ExpertCacheReport, ExpertPassStatistics, ExpertTierStatistics,
 };
-pub use crate::backend::mlx::{
+pub use crate::backend::{
     DeviceAssignment, MlxBackend, MlxCompletion, MlxModel, MlxModelConfig, MlxParallelContext,
     ModelLoadOptions,
 };

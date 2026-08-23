@@ -23,6 +23,6 @@ pub use processor::{load_processor, ModelProcessor};
 pub use session::{submit_decode_with_cache, submit_prefill_with_cache};
 pub use session::{MlxModelInput, MlxModelOutput, MlxModelSession, MlxSessionCompletion};
 
-pub use crate::backend::mlx::{
+pub use crate::backend::{
     error::Error, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, ModelLoadOptions,
 };

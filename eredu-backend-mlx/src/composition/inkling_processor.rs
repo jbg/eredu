@@ -16,16 +16,16 @@ use eredu_architectures::processor_plan::{InklingProcessorPlan, ProcessorPlanErr
 #[cfg(any(feature = "image", feature = "audio"))]
 use safemlx::Array;
 
-use crate::backend::mlx::error::Error;
+use crate::backend::error::Error;
 #[cfg(any(feature = "image", feature = "audio"))]
-use crate::backend::mlx::runtime::media::input::Modality;
+use crate::backend::runtime::media::input::Modality;
 
-use crate::backend::mlx::runtime::media::{
+use crate::backend::runtime::media::{
     prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
     ProcessorInput, ProcessorPreparationError,
 };
 #[cfg(any(feature = "image", feature = "audio"))]
-use crate::backend::mlx::runtime::media::{MediaPayload, OwnedInputMetadata};
+use crate::backend::runtime::media::{MediaPayload, OwnedInputMetadata};
 
 #[derive(Debug, Clone)]
 pub struct InklingProcessor {
@@ -96,7 +96,7 @@ impl InklingProcessor {
     #[cfg(feature = "audio")]
     fn process_audio(
         &self,
-        waveform: crate::backend::mlx::runtime::media::audio::AudioWaveform<'_>,
+        waveform: crate::backend::runtime::media::audio::AudioWaveform<'_>,
         plan: InklingAudioPlan,
     ) -> Result<PreparedInputPart, Error> {
         let features = inkling_log_mel(waveform, plan)?;
@@ -135,7 +135,7 @@ fn processor_error(error: ProcessorPlanError) -> Error {
 
 #[cfg(feature = "image")]
 fn process_image(
-    image: crate::backend::mlx::runtime::media::image::RgbImageView<'_>,
+    image: crate::backend::runtime::media::image::RgbImageView<'_>,
     plan: InklingImagePlan,
 ) -> Result<PreparedInputPart, Error> {
     let width = image.width() as usize;
@@ -187,7 +187,7 @@ fn process_image(
 
 #[cfg(feature = "audio")]
 fn inkling_log_mel(
-    waveform: crate::backend::mlx::runtime::media::audio::AudioWaveform<'_>,
+    waveform: crate::backend::runtime::media::audio::AudioWaveform<'_>,
     plan: InklingAudioPlan,
 ) -> Result<Vec<f32>, Error> {
     use rustfft::{num_complex::Complex32, FftPlanner};
@@ -330,7 +330,7 @@ mod tests {
     fn dmel_frontend_uses_fifty_millisecond_frames() {
         let samples = vec![0.0f32; 801];
         let waveform =
-            crate::backend::mlx::runtime::media::AudioWaveform::new(&samples, 16_000).unwrap();
+            crate::backend::runtime::media::AudioWaveform::new(&samples, 16_000).unwrap();
         let plan = eredu_architectures::processor_plan::InklingProcessorPlan::from_hf_json(
             br#"{"model_type":"inkling_mm_model"}"#,
         )

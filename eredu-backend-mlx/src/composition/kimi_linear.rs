@@ -15,7 +15,7 @@ use safemlx::{
     Array, Stream,
 };
 
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
@@ -239,9 +239,8 @@ impl KimiLinearBindings {
     pub fn expert_parallel_assignment(
         &self,
         architecture: &NeutralArchitecture,
-        topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
-    {
+        topology: crate::backend::MlxParallelContext,
+    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
         }
@@ -252,7 +251,7 @@ impl KimiLinearBindings {
             ));
         }
         Ok(Some(
-            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::runtime::distributed::expert::ExpertAssignment::balanced(
                 args.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -269,7 +268,7 @@ impl KimiLinearBindings {
         global_layer: &MlxModule<NeutralBlock>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        _assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        _assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
         self.layer_count(architecture, group)?;
         let bindings = self.layer_bindings(architecture, group, index, global_layer, store)?;
@@ -286,7 +285,7 @@ impl MlxUnitPopulator<NeutralBlock> for KimiLinearUnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<NeutralBlock>,
-        lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
+        lease: &crate::backend::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
             self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
@@ -305,7 +304,7 @@ impl MlxUnitPopulator<NeutralBlock> for KimiLinearParallelUnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<NeutralBlock>,
-        lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
+        lease: &crate::backend::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
             self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
@@ -501,7 +500,7 @@ fn load_neutral_parallel(
     store: Arc<dyn CheckpointSource>,
     args: ModelArgs,
     options: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
     external_experts: bool,
@@ -631,8 +630,7 @@ fn load_neutral_parallel(
         },
         maximum_device_parameter_bytes,
     );
-    let rank =
-        crate::backend::mlx::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
+    let rank = crate::backend::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
     let execution = if options.is_fully_resident() {
         KimiLinearExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -709,7 +707,7 @@ pub struct KimiLinearModel {
     metadata: LayerwiseModelMetadata,
     execution: KimiLinearExecution,
     expert_cache: Option<ExpertCache>,
-    parallel_info: Option<ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
+    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
 }
 
@@ -725,9 +723,7 @@ impl KimiLinearModel {
     }
 
     /// Returns parallel metadata when a distributed binder supplied it.
-    pub fn parallel_info(
-        &self,
-    ) -> Option<&ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
         self.parallel_info.as_ref()
     }
 
@@ -844,7 +840,7 @@ impl KimiLinearModel {
             self.parallel_info
                 .as_ref()
                 .map_or_else(PromptCacheTopology::default, |info| {
-                    crate::backend::mlx::cache::prompt_cache_topology(info.topology())
+                    crate::backend::cache::prompt_cache_topology(info.topology())
                 }),
         )
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
@@ -1377,7 +1373,7 @@ fn attach_expert_cache(
 pub fn load_kimi_linear_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<KimiLinearModel, Error> {
@@ -1485,7 +1481,7 @@ pub(crate) fn load_kimi_linear_gguf_model(
 pub(crate) fn load_kimi_linear_gguf_tensor_parallel_model(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     options: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(KimiLinearModel, Vec<u32>), Error> {

@@ -35,6 +35,11 @@ let model = load_model(&backend, "/path/to/model", ModelLoadOptions::default())?
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+Reusable low-level mechanics are rooted directly under
+`eredu_backend_mlx::backend`, including `backend::nn` and `backend::runtime`.
+Because this crate implements only MLX, there is no additional backend-name
+module below that root.
+
 The `native` module is a deliberate escape hatch for device, stream, allocator,
 random-state, low-level array, and platform setup needed by concrete MLX
 applications. Backend-neutral APIs exchange `MlxTensor` instead of raw arrays.

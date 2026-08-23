@@ -48,7 +48,7 @@ fn neutral_input_parts<'a>(
         .collect()
 }
 
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     nn::shared::{MlxNeuralBackend, MlxModule},
     runtime::{
@@ -387,8 +387,8 @@ impl QwenVlPipelineBindings {
     pub fn expert_parallel_assignment(
         &self,
         architecture: &Architecture,
-        topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
+        topology: crate::backend::MlxParallelContext,
+    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error>
     {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
@@ -400,7 +400,7 @@ impl QwenVlPipelineBindings {
             ));
         }
         Ok(Some(
-            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::runtime::distributed::expert::ExpertAssignment::balanced(
                 args.text.num_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -417,14 +417,14 @@ impl QwenVlPipelineBindings {
         global_layer: &MlxModule<Unit>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
         match (&global_layer.inner, group_kind(architecture, group)) {
             (Unit::Vision(_), eredu_runtime::ArchitectureGroupKind::VisionEncoder) => {
                 let bindings =
                     build_module_bindings_with_recipes(global_layer, "", store, BTreeMap::new())?;
                 if let Some(layout) = layout {
-                    crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
+                    crate::backend::runtime::execution::layerwise::shard_layer_bindings(
                         bindings, "", store, layout,
                     )
                 } else {
@@ -473,7 +473,7 @@ impl QwenVlPipelineBindings {
                 }
                 match layout {
                     Some(layout) => {
-                        crate::backend::mlx::runtime::execution::layerwise::shard_layer_bindings(
+                        crate::backend::runtime::execution::layerwise::shard_layer_bindings(
                             bindings,
                             &format!("model.layers.{index}"),
                             store,
@@ -492,7 +492,7 @@ impl MlxUnitPopulator<Unit> for UnitPopulator {
     fn populate(
         &mut self,
         unit: &mut MlxModule<Unit>,
-        lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
+        lease: &crate::backend::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
             self.external_experts && parameter_name_in_targets(name, &self.expert_targets)
@@ -534,7 +534,7 @@ impl QwenVlModel {
 
     pub fn parallel_info(
         &self,
-    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+    ) -> Option<&eredu_runtime::ParallelModelInfo<crate::backend::MlxParallelContext>> {
         None
     }
 
@@ -658,7 +658,7 @@ impl QwenVlModel {
     pub fn expert_cache_report(
         &self,
     ) -> Result<
-        Option<crate::backend::mlx::runtime::residency::expert_cache::ExpertCacheReport>,
+        Option<crate::backend::runtime::residency::expert_cache::ExpertCacheReport>,
         Error,
     > {
         Ok(self
@@ -1112,7 +1112,7 @@ pub fn prepare_gguf_pipeline(
     })?;
     let projector = GgufCheckpoint::open(projector_path)?;
     let projector_metadata =
-        crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&projector);
+        crate::backend::runtime::checkpoint::load::gguf_metadata(&projector);
     let mut vision =
         vision::config_from_gguf_catalog(&VisionGgufCatalog(&projector), &projector_metadata)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -1209,7 +1209,7 @@ pub fn load_gguf(
     })?;
     let projector = GgufCheckpoint::open(projector_path)?;
     let projector_metadata =
-        crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&projector);
+        crate::backend::runtime::checkpoint::load::gguf_metadata(&projector);
     let mut vision =
         vision::config_from_gguf_catalog(&VisionGgufCatalog(&projector), &projector_metadata)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;

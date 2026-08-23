@@ -19,7 +19,7 @@ use eredu_backend_mlx::native::{
     Array, Device, DeviceType, Stream,
 };
 use eredu_backend_mlx::{
-    testing::backend::mlx::{DeviceAssignment, MlxParallelContext, ModelLoadOptions},
+    testing::backend::{DeviceAssignment, MlxParallelContext, ModelLoadOptions},
     testing::composition::mlx::realtime::{MlxRealtimeBackend, MlxRealtimeInput},
 };
 

@@ -16,7 +16,7 @@ use super::{
     },
     MlxBackend, MlxModelInput, Model, ModelCache,
 };
-use crate::backend::mlx::error::Error;
+use crate::backend::error::Error;
 
 impl<'world> SpeculativeGenerationBackend for MlxBackend<'world> {
     type Drafter = MlxDrafter;
@@ -174,7 +174,7 @@ where
 
 fn neutral_gemma_mtp_cache(
     cache: &mut ModelCache,
-) -> Option<&mut crate::backend::mlx::runtime::cache::state::MlxHybridState> {
+) -> Option<&mut crate::backend::runtime::cache::state::MlxHybridState> {
     match cache {
         ModelCache::Hybrid(cache) => Some(cache),
         _ => None,
@@ -183,7 +183,7 @@ fn neutral_gemma_mtp_cache(
 
 fn neutral_muse_mtp_cache(
     cache: &mut ModelCache,
-) -> Option<&mut crate::backend::mlx::runtime::cache::state::MlxKeyValueState> {
+) -> Option<&mut crate::backend::runtime::cache::state::MlxKeyValueState> {
     match cache {
         ModelCache::MuseGlimmer(cache) => Some(cache),
         _ => None,
@@ -201,7 +201,7 @@ fn neutral_inkling_mtp_cache(
 
 fn qwen_next_mtp_cache(
     cache: &mut ModelCache,
-) -> Option<&mut crate::backend::mlx::runtime::cache::state::MlxHybridState> {
+) -> Option<&mut crate::backend::runtime::cache::state::MlxHybridState> {
     match cache {
         ModelCache::Qwen3Next(cache) => Some(cache),
         _ => None,
@@ -210,7 +210,7 @@ fn qwen_next_mtp_cache(
 
 fn qwen35_mtp_cache(
     cache: &mut ModelCache,
-) -> Option<&mut crate::backend::mlx::runtime::cache::state::MlxHybridState> {
+) -> Option<&mut crate::backend::runtime::cache::state::MlxHybridState> {
     match cache {
         ModelCache::Qwen35(cache) => Some(cache),
         _ => None,
@@ -228,7 +228,7 @@ fn neutral_deepseek_mtp_cache(
 
 fn nemotron_mtp_cache(
     cache: &mut ModelCache,
-) -> Option<&mut crate::backend::mlx::runtime::cache::state::MlxHybridState> {
+) -> Option<&mut crate::backend::runtime::cache::state::MlxHybridState> {
     match cache {
         ModelCache::Hybrid(cache) => Some(cache),
         _ => None,

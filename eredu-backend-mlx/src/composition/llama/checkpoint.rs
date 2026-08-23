@@ -12,8 +12,8 @@ use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
 use safemlx::Stream;
 use serde_json::Value;
 
-use crate::backend::mlx::error::Error;
-use crate::backend::mlx::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames};
+use crate::backend::error::Error;
+use crate::backend::runtime::checkpoint::load::{gguf_quantization_configs, GgufTensorNames};
 use eredu_checkpoint::store::SafetensorsWeightStore;
 use eredu_checkpoint::store::WeightStore;
 use eredu_checkpoint::validation;

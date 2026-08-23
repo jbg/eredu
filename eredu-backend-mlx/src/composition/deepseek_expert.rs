@@ -7,7 +7,7 @@ use eredu_checkpoint::{expert::GatedProductExpertRecipes, recipe::DerivedWeightR
 use eredu_nn::GatedProductExpertBankSpec;
 use eredu_runtime::{ExpertIdentity, OffloadUnit, WeightBinding};
 
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     runtime::{
         checkpoint::binding_plan::{BindingPlan, PlannedBinding},

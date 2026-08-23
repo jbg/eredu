@@ -21,7 +21,7 @@ use eredu_runtime::{
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
-use crate::backend::mlx::{
+use crate::backend::{
     error::Error,
     nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
@@ -552,7 +552,7 @@ fn load_neutral_parallel_with_store(
     store: Arc<dyn CheckpointSource>,
     args: ModelArgs,
     options: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
     external_experts: bool,
@@ -693,7 +693,7 @@ fn load_neutral_parallel_with_store(
         maximum_device_parameter_bytes,
     );
     let parallel_rank =
-        crate::backend::mlx::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
+        crate::backend::cache::prompt_cache_topology(build.topology()).cache_rank_identity();
     let execution = if options.is_fully_resident() {
         GptOssExecution::TensorParallelResident(Box::new(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -721,7 +721,7 @@ fn load_neutral_parallel_with_store(
         parallel_info: Some(parallel_info),
         parallel_rank,
         planned_external_experts,
-        prompt_cache_topology: crate::backend::mlx::cache::prompt_cache_topology(build.topology()),
+        prompt_cache_topology: crate::backend::cache::prompt_cache_topology(build.topology()),
         execution,
         expert_cache: None,
     })
@@ -835,14 +835,13 @@ impl GptOssPipelineBindings {
     pub fn expert_parallel_assignment(
         &self,
         architecture: &NeutralArchitecture,
-        topology: crate::backend::mlx::MlxParallelContext,
-    ) -> Result<Option<crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>, Error>
-    {
+        topology: crate::backend::MlxParallelContext,
+    ) -> Result<Option<crate::backend::runtime::distributed::expert::ExpertAssignment>, Error> {
         if topology.expert_parallel_size == 1 && !self.external_experts {
             return Ok(None);
         }
         Ok(Some(
-            crate::backend::mlx::runtime::distributed::expert::ExpertAssignment::balanced(
+            crate::backend::runtime::distributed::expert::ExpertAssignment::balanced(
                 architecture.args().num_local_experts as usize,
                 topology.expert_parallel_size,
                 topology.expert_parallel_rank,
@@ -857,7 +856,7 @@ impl GptOssPipelineBindings {
         index: usize,
         layer: &mut MlxModule<NeutralBlock>,
         local_intermediate_size: i32,
-        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<(), Error> {
         let args = architecture.args();
@@ -894,7 +893,7 @@ impl GptOssPipelineBindings {
         global_layer: &MlxModule<NeutralBlock>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
-        assignment: Option<&crate::backend::mlx::runtime::distributed::expert::ExpertAssignment>,
+        assignment: Option<&crate::backend::runtime::distributed::expert::ExpertAssignment>,
     ) -> Result<Vec<WeightBinding>, Error> {
         require_decoder_group(architecture, group)?;
         let expert_targets = parameter_role_targets(
@@ -989,7 +988,7 @@ pub struct GptOssModel {
     args: ModelArgs,
     state_layout: eredu_runtime::StateLayout,
     metadata: LayerwiseModelMetadata,
-    parallel_info: Option<ParallelModelInfo<crate::backend::mlx::MlxParallelContext>>,
+    parallel_info: Option<ParallelModelInfo<crate::backend::MlxParallelContext>>,
     parallel_rank: Option<eredu_core::cache::CacheRankIdentity>,
     planned_external_experts: Option<Vec<ExpertCatalogEntry>>,
     prompt_cache_topology: PromptCacheTopology,
@@ -1008,9 +1007,7 @@ impl GptOssModel {
         &self.metadata
     }
 
-    pub fn parallel_info(
-        &self,
-    ) -> Option<&ParallelModelInfo<crate::backend::mlx::MlxParallelContext>> {
+    pub fn parallel_info(&self) -> Option<&ParallelModelInfo<crate::backend::MlxParallelContext>> {
         self.parallel_info.as_ref()
     }
 
@@ -1026,10 +1023,10 @@ impl GptOssModel {
     }
 
     /// Records the complete distributed coordinates used by EP/TP+EP wrappers.
-    pub fn bind_parallel_topology(&mut self, topology: crate::backend::mlx::MlxParallelContext) {
+    pub fn bind_parallel_topology(&mut self, topology: crate::backend::MlxParallelContext) {
         self.parallel_rank =
-            crate::backend::mlx::cache::prompt_cache_topology(topology).cache_rank_identity();
-        self.prompt_cache_topology = crate::backend::mlx::cache::prompt_cache_topology(topology);
+            crate::backend::cache::prompt_cache_topology(topology).cache_rank_identity();
+        self.prompt_cache_topology = crate::backend::cache::prompt_cache_topology(topology);
     }
 
     /// Returns whether all decoder blocks remain resident on the execution device.
@@ -1720,7 +1717,7 @@ pub fn load_gpt_oss_expert_cache_model(
 pub fn load_gpt_oss_tensor_parallel_model(
     model_path: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssModel, Error> {
@@ -1732,7 +1729,7 @@ pub fn load_gpt_oss_tensor_parallel_model(
     {
         let admitted = crate::composition::mlx::structural::admit_gguf_path(
             model_path,
-            crate::backend::mlx::ModelLoadOptions::default()
+            crate::backend::ModelLoadOptions::default()
                 .with_weight_residency(WeightResidency::with_layers(options)),
         )?;
         return load_gpt_oss_gguf_tensor_parallel_model(
@@ -1846,7 +1843,7 @@ pub(crate) fn load_gpt_oss_gguf_model(
 pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
     source: &crate::composition::mlx::structural::AdmittedGguf,
     options: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
+    build: crate::backend::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(GptOssModel, Vec<u32>), Error> {
