@@ -15,7 +15,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::qwen::vision::{VisionConfig, VisionConfigSource};
-use crate::qwen::{self, TextConfigContext};
+use crate::{
+    qwen::{self, TextConfigContext},
+    GgufArchitecture,
+};
 
 /// Normalized Qwen3-VL policy over shared vision and ordinary Qwen text.
 #[derive(Debug, Clone)]
@@ -149,19 +152,17 @@ pub fn model_args_from_gguf_parts(
     if !text.tie_word_embeddings {
         return Err(invalid("Qwen3-VL GGUF requires tied word embeddings"));
     }
-    let architecture = match metadata.get("general.architecture") {
-        Some(MetadataValue::String(value))
-            if matches!(value.as_str(), "qwen3vl" | "qwen3vlmoe") =>
-        {
-            value
-        }
-        other => {
-            return Err(invalid(format!(
-                "Qwen3-VL GGUF requires qwen3vl/qwen3vlmoe metadata, got {other:?}"
-            )))
-        }
-    };
-    let section_key = format!("{architecture}.rope.dimension_sections");
+    let architecture = metadata
+        .get("general.architecture")
+        .and_then(MetadataValue::as_str)
+        .ok_or_else(|| invalid("Qwen3-VL GGUF is missing general.architecture"))
+        .and_then(|name| {
+            GgufArchitecture::resolve(name).map_err(|error| invalid(error.to_string()))
+        })?;
+    TextConfigContext::from_qwen3_vl_gguf_architecture(architecture)
+        .map_err(|error| invalid(error.to_string()))?;
+    let architecture_name = architecture.metadata_name();
+    let section_key = format!("{architecture_name}.rope.dimension_sections");
     let section = metadata
         .get(&section_key)
         .and_then(MetadataValue::as_array)
@@ -200,7 +201,7 @@ pub fn model_args_from_gguf_parts(
         )));
     }
     if let Some(expected) = metadata
-        .get(&format!("{architecture}.n_deepstack_layers"))
+        .get(&format!("{architecture_name}.n_deepstack_layers"))
         .and_then(MetadataValue::as_i64)
     {
         if expected != vision.deepstack_layer_count() as i64 {
@@ -216,7 +217,7 @@ pub fn model_args_from_gguf_parts(
         image_token_id: token_id("<|image_pad|>")?,
         video_token_id: token_id("<|video_pad|>")?,
         mrope_section,
-        model_type: if architecture == "qwen3vlmoe" {
+        model_type: if architecture == GgufArchitecture::Qwen3VlMoe {
             "qwen3_vl_moe".into()
         } else {
             "qwen3_vl".into()

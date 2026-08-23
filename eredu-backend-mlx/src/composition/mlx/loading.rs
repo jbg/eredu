@@ -220,6 +220,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             let (loaded, eos_token_ids) = crate::composition::qwen::vl::load_gguf(
+                source.architecture(),
                 gguf_file,
                 checkpoint,
                 metadata,

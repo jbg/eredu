@@ -1006,24 +1006,19 @@ pub fn validate_muse_glimmer_projector_gguf(
 }
 
 pub fn validate_qwen3_vl_projector_gguf(
+    architecture: GgufArchitecture,
     model_checkpoint: &GgufCheckpoint,
     model_metadata: &HashMap<String, GgufMetadataValue>,
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    let context = match model_metadata.get("general.architecture") {
-        Some(GgufMetadataValue::String(value)) if value == "qwen3vl" => {
-            eredu_architectures::qwen::TextConfigContext::Qwen3Vl
-        }
-        Some(GgufMetadataValue::String(value)) if value == "qwen3vlmoe" => {
-            eredu_architectures::qwen::TextConfigContext::Qwen3VlMoe
-        }
-        other => {
-            return invalid_geometry(format!(
-                "Qwen3-VL projector requires qwen3vl text metadata, got {other:?}"
-            ))
-        }
-    };
+    let context =
+        match eredu_architectures::qwen::TextConfigContext::from_qwen3_vl_gguf_architecture(
+            architecture,
+        ) {
+            Ok(context) => context,
+            Err(error) => return invalid_geometry(error.to_string()),
+        };
     let text = match eredu_architectures::qwen::model_args_from_gguf_catalog_with_context(
         &NeutralQwenGgufCatalog(model_checkpoint),
         model_metadata,

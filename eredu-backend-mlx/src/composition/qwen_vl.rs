@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use eredu_architectures::qwen::{self, vision, vl};
+use eredu_architectures::{qwen::{self, vision, vl}, GgufArchitecture};
 use eredu_checkpoint::{
     store::{CheckpointSource, CompositeCheckpointSource, TensorSelection},
     WeightQuantization,
@@ -1065,28 +1065,14 @@ fn quantize_store(
 }
 
 pub fn prepare_gguf_pipeline(
+    architecture: GgufArchitecture,
     model_path: &Path,
     checkpoint: &GgufCheckpoint,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     max_mapped_shards: usize,
 ) -> Result<(vl::ModelArgs, Arc<dyn CheckpointSource>), Error> {
-    let architecture = match metadata.get("general.architecture") {
-        Some(GgufMetadataValue::String(value)) => value.as_str(),
-        _ => {
-            return Err(Error::UnsupportedArchitecture(
-                "Qwen3-VL GGUF general.architecture must be a string".into(),
-            ))
-        }
-    };
-    let context = match architecture {
-        "qwen3vl" => qwen::TextConfigContext::Qwen3Vl,
-        "qwen3vlmoe" => qwen::TextConfigContext::Qwen3VlMoe,
-        other => {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "unsupported Qwen3-VL GGUF architecture {other:?}"
-            )))
-        }
-    };
+    let context = qwen::TextConfigContext::from_qwen3_vl_gguf_architecture(architecture)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut text = qwen::model_args_from_gguf_catalog_with_context(
         &TextGgufCatalog(checkpoint),
         metadata,
@@ -1158,6 +1144,7 @@ pub fn prepare_gguf_pipeline(
 /// Loads split Qwen3-VL text plus projector GGUF artifacts through one
 /// composite neutral checkpoint source.
 pub fn load_gguf(
+    architecture: GgufArchitecture,
     model_path: &Path,
     checkpoint: &GgufCheckpoint,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
@@ -1166,23 +1153,8 @@ pub fn load_gguf(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(QwenVlModel, Vec<u32>), Error> {
-    let architecture = match metadata.get("general.architecture") {
-        Some(GgufMetadataValue::String(value)) => value.as_str(),
-        _ => {
-            return Err(Error::UnsupportedArchitecture(
-                "Qwen3-VL GGUF general.architecture must be a string".into(),
-            ))
-        }
-    };
-    let context = match architecture {
-        "qwen3vl" => qwen::TextConfigContext::Qwen3Vl,
-        "qwen3vlmoe" => qwen::TextConfigContext::Qwen3VlMoe,
-        other => {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "unsupported Qwen3-VL GGUF architecture {other:?}"
-            )))
-        }
-    };
+    let context = qwen::TextConfigContext::from_qwen3_vl_gguf_architecture(architecture)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut text = qwen::model_args_from_gguf_catalog_with_context(
         &TextGgufCatalog(checkpoint),
         metadata,

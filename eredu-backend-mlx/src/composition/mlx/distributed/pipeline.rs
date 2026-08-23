@@ -14153,8 +14153,9 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-                GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
+                architecture @ (GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe) => {
                     let (args, store) = crate::composition::qwen::vl::prepare_gguf_pipeline(
+                        architecture,
                         &model_dir,
                         &checkpoint,
                         &metadata,

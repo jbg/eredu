@@ -9,7 +9,10 @@ use eredu_nn::{RopeValue, RotarySpec};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::decoder::{AttentionProjection, Config};
+use crate::{
+    decoder::{AttentionProjection, Config},
+    GgufArchitecture,
+};
 
 /// Invalid or unsupported Qwen text configuration.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +45,21 @@ pub enum TextConfigContext {
     Qwen3Vl,
     /// A Qwen3-VL-MoE artifact embeds a Qwen3-MoE text configuration.
     Qwen3VlMoe,
+}
+
+impl TextConfigContext {
+    /// Selects the embedded Qwen text policy for a registry-resolved Qwen3-VL GGUF.
+    pub fn from_qwen3_vl_gguf_architecture(
+        architecture: GgufArchitecture,
+    ) -> Result<Self, ConfigError> {
+        match architecture {
+            GgufArchitecture::Qwen3Vl => Ok(Self::Qwen3Vl),
+            GgufArchitecture::Qwen3VlMoe => Ok(Self::Qwen3VlMoe),
+            other => Err(invalid(format!(
+                "unsupported Qwen3-VL GGUF architecture {other:?}"
+            ))),
+        }
+    }
 }
 
 /// Normalized Qwen arguments shared by inspection, checkpoint planning, and execution.
@@ -396,19 +414,22 @@ pub fn model_args_from_gguf_catalog_with_context(
     metadata: &HashMap<String, MetadataValue>,
     context: TextConfigContext,
 ) -> Result<ModelArgs, ConfigError> {
-    let architecture = gguf_string(metadata, "general.architecture")?;
-    let variant = match (context, architecture.as_str()) {
-        (TextConfigContext::Standalone, "qwen2") => QwenVariant::Qwen2,
-        (TextConfigContext::Standalone, "qwen3") => QwenVariant::Qwen3,
-        (TextConfigContext::Standalone, "qwen3moe" | "qwen3_moe") => QwenVariant::Qwen3Moe,
-        (TextConfigContext::Qwen3Vl, "qwen3vl") => QwenVariant::Qwen3,
-        (TextConfigContext::Qwen3VlMoe, "qwen3vlmoe") => QwenVariant::Qwen3Moe,
+    let declared_architecture = gguf_string(metadata, "general.architecture")?;
+    let architecture = GgufArchitecture::resolve(&declared_architecture)
+        .map_err(|error| invalid(error.to_string()))?;
+    let variant = match (context, architecture) {
+        (TextConfigContext::Standalone, GgufArchitecture::Qwen2) => QwenVariant::Qwen2,
+        (TextConfigContext::Standalone, GgufArchitecture::Qwen3) => QwenVariant::Qwen3,
+        (TextConfigContext::Standalone, GgufArchitecture::Qwen3Moe) => QwenVariant::Qwen3Moe,
+        (TextConfigContext::Qwen3Vl, GgufArchitecture::Qwen3Vl) => QwenVariant::Qwen3,
+        (TextConfigContext::Qwen3VlMoe, GgufArchitecture::Qwen3VlMoe) => QwenVariant::Qwen3Moe,
         (_, other) => {
             return Err(invalid(format!(
                 "unsupported Qwen GGUF architecture {other:?} for {context:?}"
             )))
         }
     };
+    let architecture = architecture.metadata_name();
     let key = |suffix: &str| format!("{architecture}.{suffix}");
     let hidden_size = gguf_i32(metadata, &key("embedding_length"))?;
     let num_hidden_layers = gguf_i32(metadata, &key("block_count"))?;
@@ -1035,6 +1056,22 @@ mod tests {
             .unwrap();
         assert_eq!(args.variant, QwenVariant::Qwen3);
         assert_eq!(args.model_type, "qwen3");
+    }
+
+    #[test]
+    fn qwen3_vl_gguf_context_uses_registry_identity() {
+        assert_eq!(
+            TextConfigContext::from_qwen3_vl_gguf_architecture(GgufArchitecture::Qwen3Vl).unwrap(),
+            TextConfigContext::Qwen3Vl
+        );
+        assert_eq!(
+            TextConfigContext::from_qwen3_vl_gguf_architecture(GgufArchitecture::Qwen3VlMoe)
+                .unwrap(),
+            TextConfigContext::Qwen3VlMoe
+        );
+        assert!(
+            TextConfigContext::from_qwen3_vl_gguf_architecture(GgufArchitecture::Qwen3).is_err()
+        );
     }
 
     #[test]

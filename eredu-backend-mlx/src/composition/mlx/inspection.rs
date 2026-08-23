@@ -593,6 +593,7 @@ fn inspect_gguf_projector(
                         let metadata =
                             crate::backend::runtime::checkpoint::load::gguf_metadata(&checkpoint);
                         let validation = structural::validate_qwen3_vl_projector_gguf(
+                            architecture,
                             model_checkpoint,
                             model_metadata,
                             &checkpoint,
