@@ -41,8 +41,10 @@ Because this crate implements only MLX, there is no additional backend-name
 module below that root.
 
 The `native` module is a deliberate escape hatch for device, stream, allocator,
-random-state, low-level array, and platform setup needed by concrete MLX
-applications. Backend-neutral APIs exchange `MlxTensor` instead of raw arrays.
+random-state, low-level array, sampling, and platform setup needed by concrete
+MLX applications. Native sampling APIs that exchange raw arrays, streams, or
+random state are available only through this namespace. Backend-neutral APIs
+exchange `MlxTensor` instead of raw arrays.
 
 ## Features
 

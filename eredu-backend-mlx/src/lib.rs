@@ -22,6 +22,8 @@ pub use adapter::*;
 /// Deliberate access to native MLX handles for backend-author tools that
 /// configure devices, streams, memory, or low-level tensor inputs.
 pub mod native {
+    pub use crate::backend::nn::generation::sample;
+    pub use crate::backend::runtime::generation::sampler::Sampler;
     pub use safemlx::*;
 
     /// Constructs an MLX backend from explicitly selected native streams.
