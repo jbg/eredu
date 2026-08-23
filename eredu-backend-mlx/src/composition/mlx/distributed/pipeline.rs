@@ -5319,7 +5319,7 @@ fn gemma4_pipeline_prompt_cache_identity(
     eredu_runtime::ModelStateIdentity {
         model_family: "gemma4".into(),
         effective_model_type: args.model_type.clone(),
-        architecture_fingerprint: args.text.architecture_fingerprint(),
+        architecture_fingerprint: args.architecture_fingerprint(),
         layer_count: args.text.num_hidden_layers(),
         global_layer_start: range.start,
         sink_tokens: 0,
@@ -5373,6 +5373,71 @@ fn gemma4_pipeline_cache_identity_does_not_reslice_rank_local_layout() {
     );
     assert_eq!(identity.layer_layout, *local.layers());
     assert_eq!(identity.layer_count, args.text.num_hidden_layers());
+}
+
+#[cfg(test)]
+#[test]
+fn gemma4_pipeline_cache_identity_includes_multimodal_configuration() {
+    let config = serde_json::json!({
+        "model_type":"gemma4", "tie_word_embeddings":true,
+        "image_token_id":60, "audio_token_id":61,
+        "text_config":{
+            "model_type":"gemma4_text", "hidden_size":16,
+            "num_hidden_layers":2, "intermediate_size":32,
+            "num_attention_heads":2, "num_key_value_heads":1, "head_dim":8,
+            "rms_norm_eps":0.000001, "vocab_size":64,
+            "max_position_embeddings":128,
+            "layer_types":["full_attention", "full_attention"]
+        },
+        "vision_config":{
+            "hidden_size":16, "intermediate_size":32, "num_hidden_layers":1,
+            "num_attention_heads":2, "num_key_value_heads":1, "head_dim":8,
+            "patch_size":4, "pooling_kernel_size":2, "position_embedding_size":16,
+            "rms_norm_eps":0.000001
+        },
+        "audio_config":{
+            "hidden_size":16, "num_hidden_layers":1, "num_attention_heads":2,
+            "output_proj_dims":8, "conv_kernel_size":3, "attention_chunk_size":4,
+            "attention_context_left":5, "attention_context_right":0,
+            "attention_invalid_logits_value":-1000000000.0,
+            "attention_logit_cap":50.0, "residual_weight":0.5,
+            "rms_norm_eps":0.000001, "subsampling_conv_channels":[4, 8]
+        }
+    });
+    let args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
+        &serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let mut changed_config = config;
+    changed_config["image_token_id"] = 59.into();
+    let changed = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
+        &serde_json::to_vec(&changed_config).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        args.text.architecture_fingerprint(),
+        changed.text.architecture_fingerprint()
+    );
+
+    let layout = eredu_architectures::gemma4::state_layout(&args.text).unwrap();
+    let range = 0..args.text.num_hidden_layers();
+    let topology = MlxParallelContext::for_rank(
+        0,
+        1,
+        1,
+        1,
+        crate::backend::mlx::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+    )
+    .unwrap();
+    let original_identity =
+        gemma4_pipeline_prompt_cache_identity(&args, topology, range.clone(), &layout).unwrap();
+    let changed_identity =
+        gemma4_pipeline_prompt_cache_identity(&changed, topology, range, &layout).unwrap();
+
+    assert_ne!(
+        original_identity.architecture_fingerprint,
+        changed_identity.architecture_fingerprint
+    );
 }
 
 fn attention_window_i32(
