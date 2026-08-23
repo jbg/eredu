@@ -27,7 +27,7 @@ use crate::backend::mlx::runtime::{
 };
 use crate::backend::mlx::{
     error::Error,
-    nn::shared::{MlxBackend, MlxModule},
+    nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
         cache::{
             residency::{
@@ -60,24 +60,26 @@ use eredu_core::cache::{
     PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
 };
 
-type V3Architecture = deepseek::v3::Model<MlxBackend>;
-type V3Unit = deepseek::v3::Unit<MlxBackend>;
-type V3State = DeviceState<MlxBackend, CompressedLatentCache>;
-type V3Resident = LayerwiseRuntime<V3Architecture, MlxBackend, V3State, MlxResidentPolicy<V3Unit>>;
+type V3Architecture = deepseek::v3::Model<MlxNeuralBackend>;
+type V3Unit = deepseek::v3::Unit<MlxNeuralBackend>;
+type V3State = DeviceState<MlxNeuralBackend, CompressedLatentCache>;
+type V3Resident =
+    LayerwiseRuntime<V3Architecture, MlxNeuralBackend, V3State, MlxResidentPolicy<V3Unit>>;
 type V3Layerwise = LayerwiseRuntime<
     V3Architecture,
-    MlxBackend,
+    MlxNeuralBackend,
     V3State,
     MlxLayerwisePolicy<V3Unit, V3UnitPopulator>,
 >;
 
-type V4Architecture = deepseek::v4::Model<MlxBackend>;
-type V4Unit = deepseek::v4::Unit<MlxBackend>;
+type V4Architecture = deepseek::v4::Model<MlxNeuralBackend>;
+type V4Unit = deepseek::v4::Unit<MlxNeuralBackend>;
 type V4State = MlxPoolingAttentionState;
-type V4Resident = LayerwiseRuntime<V4Architecture, MlxBackend, V4State, MlxResidentPolicy<V4Unit>>;
+type V4Resident =
+    LayerwiseRuntime<V4Architecture, MlxNeuralBackend, V4State, MlxResidentPolicy<V4Unit>>;
 type V4Layerwise = LayerwiseRuntime<
     V4Architecture,
-    MlxBackend,
+    MlxNeuralBackend,
     V4State,
     MlxLayerwisePolicy<V4Unit, V4UnitPopulator>,
 >;
@@ -91,7 +93,7 @@ fn construct_v3_unit(
     let address = layout
         .address(ordinal)
         .ok_or_else(|| unsupported(format!("V3 unit ordinal {ordinal} is out of range")))?;
-    <V3Architecture as LayeredArchitecture<MlxBackend, V3State>>::build_unit(
+    <V3Architecture as LayeredArchitecture<MlxNeuralBackend, V3State>>::build_unit(
         architecture,
         address.group(),
         address.index(),
@@ -109,7 +111,7 @@ fn construct_v4_unit(
     let address = layout
         .address(ordinal)
         .ok_or_else(|| unsupported(format!("V4 unit ordinal {ordinal} is out of range")))?;
-    <V4Architecture as LayeredArchitecture<MlxBackend, V4State>>::build_unit(
+    <V4Architecture as LayeredArchitecture<MlxNeuralBackend, V4State>>::build_unit(
         architecture,
         address.group(),
         address.index(),
@@ -969,7 +971,7 @@ impl DeepSeekModel {
         Error,
     >
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         match execution {
@@ -1031,7 +1033,7 @@ impl DeepSeekModel {
         Error,
     >
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         match execution {
@@ -1094,7 +1096,7 @@ impl DeepSeekModel {
         Error,
     >
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         let hook = |architecture: &mut V3Architecture,
@@ -1159,7 +1161,7 @@ impl DeepSeekModel {
         Error,
     >
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         let hook = |architecture: &mut V4Architecture,
@@ -2781,8 +2783,8 @@ fn resolve_safetensors_store(
 
 fn execution_layout<A, S>(architecture: &A) -> Result<ExecutionUnitLayout, Error>
 where
-    A: LayeredArchitecture<MlxBackend, S, Error = eredu_nn::Error>,
-    S: RuntimeState<MlxBackend>,
+    A: LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
+    S: RuntimeState<MlxNeuralBackend>,
 {
     let graph = architecture.execution_graph().map_err(neutral_error)?;
     let counts = (0..graph.groups().len())

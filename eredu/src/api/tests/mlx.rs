@@ -1331,7 +1331,7 @@ fn save_zero_qwen_checkpoint(
     }
 
     let architecture = eredu_architectures::qwen::LayeredModel::<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
     >::new(args.clone(), stream)
     .unwrap();
     let mut collector = ZeroCollector {
@@ -1343,7 +1343,7 @@ fn save_zero_qwen_checkpoint(
         .visit_parameters(&mut collector);
     for layer in 0..args.num_hidden_layers as usize {
         eredu_architectures::qwen::new_block::<
-            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
         >(args, layer, stream)
         .unwrap()
         .visit_parameters(&mut collector);
@@ -1389,7 +1389,7 @@ fn save_zero_gemma4_checkpoint(
     }
 
     type Architecture = eredu_architectures::gemma4::LayeredModel<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
     >;
     type State = eredu_backend_mlx::testing::backend::mlx::runtime::cache::state::MlxHybridState;
     let architecture = Architecture::new(args.clone(), stream).unwrap();
@@ -1398,19 +1398,19 @@ fn save_zero_gemma4_checkpoint(
         arrays: Vec::new(),
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     for group in 0..3 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -1452,7 +1452,7 @@ fn save_zero_inkling_checkpoint(
     }
 
     type Architecture = eredu_architectures::inkling::LayeredModel<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
     >;
     type State = eredu_backend_mlx::testing::backend::mlx::runtime::cache::state::MlxHybridState;
     let architecture = Architecture::new(args.clone(), stream).unwrap();
@@ -1461,19 +1461,19 @@ fn save_zero_inkling_checkpoint(
         arrays: Vec::new(),
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     for group in 0..2 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -1583,7 +1583,7 @@ fn tiny_gemma4_external_assistant_uses_neutral_transaction_path() {
     )
     .unwrap();
     let assistant_module = eredu_architectures::gemma4::Assistant::<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
     >::new(assistant_config, stream)
     .unwrap();
     save_zero_neutral_checkpoint(&assistant_module, &assistant_dir, stream);
@@ -1796,7 +1796,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 )
                 .unwrap();
                 let model = eredu_architectures::llama::Model::<
-                    eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+                    eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
                 >::new(&args, stream)
                 .unwrap();
                 save_zero_neutral_checkpoint(&model, &dir, stream);

@@ -619,7 +619,7 @@ fn add_edge(
 mod tests {
     use super::*;
     use crate::backend::mlx::{
-        nn::shared::MlxBackend as MlxNeuralBackend, runtime::cache::state::MlxHybridState,
+        nn::shared::MlxNeuralBackend, runtime::cache::state::MlxHybridState,
     };
     use eredu_nn::{ParameterVisitor, ParameterVisitorMut, Parameterized};
     use eredu_runtime::{

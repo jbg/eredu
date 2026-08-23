@@ -32,7 +32,7 @@ use safemlx::{
 };
 
 use crate::backend::mlx::{
-    nn::shared::MlxBackend,
+    nn::shared::MlxNeuralBackend,
     runtime::cache::{
         kv::{
             CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
@@ -89,7 +89,7 @@ pub enum MlxPoolingAttentionCache {
 
 /// Complete MLX pooling-attention state realized directly from a neutral
 /// architecture layout.
-pub type MlxPoolingAttentionState = DeviceState<MlxBackend, MlxPoolingAttentionCache>;
+pub type MlxPoolingAttentionState = DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>;
 
 /// Architecture-independent MLX materializer for pooling-attention layouts.
 pub struct MlxPoolingAttentionStateFactory;
@@ -682,7 +682,7 @@ fn restore_pooling_state(
     )
 }
 
-impl RuntimeLayerState<MlxBackend> for MlxPoolingAttentionCache {
+impl RuntimeLayerState<MlxNeuralBackend> for MlxPoolingAttentionCache {
     type RetainedValues<'a> = RetainedArrayVecIter<'a>;
 
     fn retained_values(&self) -> Self::RetainedValues<'_> {
@@ -994,18 +994,18 @@ impl KeyValueCache for MlxKeyValueLayerState {
     }
 }
 
-impl RuntimeLayerState<MlxBackend> for MlxKeyValueLayerState {
+impl RuntimeLayerState<MlxNeuralBackend> for MlxKeyValueLayerState {
     type RetainedValues<'a> = RetainedArrayIter<'a>;
 
     fn retained_values(&self) -> Self::RetainedValues<'_> {
         match self {
-            Self::Device(cache) => RuntimeLayerState::<MlxBackend>::retained_values(cache),
-            Self::Paged(cache) => RuntimeLayerState::<MlxBackend>::retained_values(cache),
+            Self::Device(cache) => RuntimeLayerState::<MlxNeuralBackend>::retained_values(cache),
+            Self::Paged(cache) => RuntimeLayerState::<MlxNeuralBackend>::retained_values(cache),
         }
     }
 }
 
-impl ResettableRuntimeLayerState<MlxBackend> for MlxKeyValueLayerState {
+impl ResettableRuntimeLayerState<MlxNeuralBackend> for MlxKeyValueLayerState {
     fn reset(&mut self) -> Result<(), StateError> {
         self.clear()
             .map_err(|error| StateError::ResetFailed(error.to_string()))
@@ -1107,7 +1107,7 @@ impl MlxKeyValueState {
     pub fn retained_arrays(&self) -> Vec<&Array> {
         self.layers
             .iter()
-            .flat_map(RuntimeLayerState::<MlxBackend>::retained_values)
+            .flat_map(RuntimeLayerState::<MlxNeuralBackend>::retained_values)
             .map(MlxTensor::as_array)
             .collect()
     }
@@ -1259,7 +1259,7 @@ impl SemanticStateTransaction for MlxKeyValueState {
     }
 }
 
-impl RuntimeState<MlxBackend> for MlxKeyValueState {
+impl RuntimeState<MlxNeuralBackend> for MlxKeyValueState {
     type RetainedValues<'a> = RetainedArrayIter<'a>;
 
     fn layout(&self) -> &StateLayout {
@@ -1282,7 +1282,7 @@ impl RuntimeState<MlxBackend> for MlxKeyValueState {
     }
 }
 
-impl LayerRuntimeState<MlxBackend> for MlxKeyValueState {
+impl LayerRuntimeState<MlxNeuralBackend> for MlxKeyValueState {
     type LayerState = MlxKeyValueLayerState;
 
     fn layer(&mut self, layer: usize) -> Result<&mut Self::LayerState, StateError> {
@@ -1293,7 +1293,7 @@ impl LayerRuntimeState<MlxBackend> for MlxKeyValueState {
     }
 }
 
-impl ResettableRuntimeState<MlxBackend> for MlxKeyValueState {
+impl ResettableRuntimeState<MlxNeuralBackend> for MlxKeyValueState {
     fn reset_segment(&mut self, segment: &StateSegmentId) -> Result<(), StateError> {
         let range = self
             .layout
@@ -1313,7 +1313,7 @@ impl ResettableRuntimeState<MlxBackend> for MlxKeyValueState {
             ));
         }
         for layer in &mut self.layers[range] {
-            ResettableRuntimeLayerState::<MlxBackend>::reset(layer)?;
+            ResettableRuntimeLayerState::<MlxNeuralBackend>::reset(layer)?;
         }
         Ok(())
     }
@@ -1382,10 +1382,10 @@ impl MlxHybridAttentionState {
     fn retained_values(&self) -> Vec<&MlxTensor> {
         match self {
             Self::KeyValue(cache) => {
-                RuntimeLayerState::<MlxBackend>::retained_values(cache).collect()
+                RuntimeLayerState::<MlxNeuralBackend>::retained_values(cache).collect()
             }
             Self::Compressed(cache) => {
-                RuntimeLayerState::<MlxBackend>::retained_values(cache).collect()
+                RuntimeLayerState::<MlxNeuralBackend>::retained_values(cache).collect()
             }
         }
     }
@@ -1551,7 +1551,7 @@ impl MlxHybridLayerState {
     }
 }
 
-impl RuntimeLayerState<MlxBackend> for MlxHybridLayerState {
+impl RuntimeLayerState<MlxNeuralBackend> for MlxHybridLayerState {
     type RetainedValues<'a> = std::vec::IntoIter<&'a MlxTensor>;
 
     fn retained_values(&self) -> Self::RetainedValues<'_> {
@@ -1567,7 +1567,7 @@ impl RuntimeLayerState<MlxBackend> for MlxHybridLayerState {
     }
 }
 
-impl RuntimeStateComponents<MlxBackend> for MlxHybridLayerState {
+impl RuntimeStateComponents<MlxNeuralBackend> for MlxHybridLayerState {
     fn position(&self) -> i32 {
         self.attention
             .as_ref()
@@ -2159,7 +2159,7 @@ impl MlxHybridState {
     }
 }
 
-impl RuntimeState<MlxBackend> for MlxHybridState {
+impl RuntimeState<MlxNeuralBackend> for MlxHybridState {
     type RetainedValues<'a> = std::vec::IntoIter<&'a MlxTensor>;
 
     fn layout(&self) -> &StateLayout {
@@ -2182,7 +2182,7 @@ impl RuntimeState<MlxBackend> for MlxHybridState {
     }
 }
 
-impl LayerRuntimeState<MlxBackend> for MlxHybridState {
+impl LayerRuntimeState<MlxNeuralBackend> for MlxHybridState {
     type LayerState = MlxHybridLayerState;
 
     fn layer(&mut self, layer: usize) -> Result<&mut Self::LayerState, StateError> {

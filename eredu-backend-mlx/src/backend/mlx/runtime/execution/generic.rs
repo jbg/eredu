@@ -20,7 +20,7 @@ use safemlx::{transforms::async_eval_with_event, Event, Stream};
 
 use crate::backend::mlx::{
     error::Error,
-    nn::shared::{MlxBackend, MlxModule},
+    nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
         checkpoint::binding::{binding_bytes, build_module_bindings, populate_module_from_lease},
         execution::layerwise::{
@@ -147,8 +147,8 @@ pub fn construct_architecture_unit<A, S>(
     _state: std::marker::PhantomData<S>,
 ) -> Result<A::Unit, Error>
 where
-    A: LayeredArchitecture<MlxBackend, S>,
-    S: RuntimeState<MlxBackend>,
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
+    S: RuntimeState<MlxNeuralBackend>,
     A::Error: std::fmt::Display,
 {
     let address = layout.address(ordinal).ok_or_else(|| {
@@ -338,8 +338,8 @@ impl<U, P> MlxLayerwisePolicy<U, P> {
     where
         U: Parameterized<MlxTensor>,
         P: MlxUnitPopulator<U>,
-        A: LayeredArchitecture<MlxBackend, S, Unit = U>,
-        S: RuntimeState<MlxBackend>,
+        A: LayeredArchitecture<MlxNeuralBackend, S, Unit = U>,
+        S: RuntimeState<MlxNeuralBackend>,
         A::Error: std::fmt::Display,
     {
         self.drain()?;
@@ -425,7 +425,7 @@ impl<U> MlxResidentPolicy<U> {
     }
 }
 
-impl<U> LayerwisePolicy<MlxBackend, U> for MlxResidentPolicy<U> {
+impl<U> LayerwisePolicy<MlxNeuralBackend, U> for MlxResidentPolicy<U> {
     type Lease = MlxResidentUnit<U>;
     type Error = Error;
 
@@ -586,8 +586,8 @@ fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error>
 
 fn architecture_policy_layout<A, S>(architecture: &A) -> Result<ExecutionUnitLayout, Error>
 where
-    A: LayeredArchitecture<MlxBackend, S>,
-    S: RuntimeState<MlxBackend>,
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
+    S: RuntimeState<MlxNeuralBackend>,
     A::Error: std::fmt::Display,
 {
     let graph = architecture
@@ -617,8 +617,8 @@ pub fn prepare_layerwise_policy<A, S, P, I>(
     ignored: I,
 ) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
 where
-    A: LayeredArchitecture<MlxBackend, S>,
-    S: RuntimeState<MlxBackend>,
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
+    S: RuntimeState<MlxNeuralBackend>,
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
     P: MlxUnitPopulator<A::Unit>,
@@ -663,8 +663,8 @@ pub fn prepare_layerwise_policy_with_bindings<A, S, P, I, SB, UB>(
     mut unit_bindings: UB,
 ) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
 where
-    A: LayeredArchitecture<MlxBackend, S>,
-    S: RuntimeState<MlxBackend>,
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
+    S: RuntimeState<MlxNeuralBackend>,
     A::Error: std::fmt::Display,
     P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
@@ -861,7 +861,7 @@ where
     Ok((policy, metadata))
 }
 
-impl<U, P> LayerwisePolicy<MlxBackend, U> for MlxLayerwisePolicy<U, P>
+impl<U, P> LayerwisePolicy<MlxNeuralBackend, U> for MlxLayerwisePolicy<U, P>
 where
     U: Parameterized<MlxTensor>,
     P: MlxUnitPopulator<U>,

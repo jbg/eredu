@@ -24,7 +24,7 @@ use safemlx::{
 
 use crate::backend::mlx::{
     error::Error,
-    nn::shared::{MlxBackend, MlxModule},
+    nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
         cache::residency::{open_prompt_cache, CacheResidencyManager},
         cache::state::MlxKeyValueState,
@@ -53,9 +53,9 @@ use crate::backend::mlx::{
 };
 use crate::composition::mlx::artifact::find_sibling_mmproj;
 
-type NeutralArchitecture = Architecture<MlxBackend>;
-type NeutralUnit = Unit<MlxBackend>;
-type NeutralDFlash = eredu_architectures::muse_glimmer::DFlash<MlxBackend>;
+type NeutralArchitecture = Architecture<MlxNeuralBackend>;
+type NeutralUnit = Unit<MlxNeuralBackend>;
+type NeutralDFlash = eredu_architectures::muse_glimmer::DFlash<MlxNeuralBackend>;
 pub type MuseGlimmerPipelineUnit = MlxModule<NeutralUnit>;
 
 fn group_kind(
@@ -63,32 +63,32 @@ fn group_kind(
     group: usize,
 ) -> eredu_runtime::ArchitectureGroupKind {
     <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxKeyValueState,
     >>::group_transport(architecture, group)
     .kind
 }
 type Resident = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxResidentPolicy<NeutralUnit>,
 >;
 type Bounded = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxLayerwisePolicy<NeutralUnit, UnitPopulator>,
 >;
 type ParallelResident = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxResidentPolicy<NeutralUnit>,
 >;
 type ParallelBounded = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxLayerwisePolicy<NeutralUnit, UnitPopulator>,
 >;
@@ -128,7 +128,7 @@ impl Execution {
             Self::ParallelBounded(runtime) => runtime.architecture(),
         };
         <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             MlxKeyValueState,
         >>::execution_graph(architecture)
         .map(|graph| graph.output())
@@ -149,11 +149,11 @@ fn forward_external_experts<P>(
     provider: &mut P,
 ) -> Result<crate::MlxTensor, eredu_nn::Error>
 where
-    P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
     <NeutralArchitecture as eredu_runtime::RoutedLayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxKeyValueState,
     >>::forward_unit_with_provider(
         architecture,
@@ -439,7 +439,7 @@ impl MuseGlimmerPipelineBindings {
         group: usize,
     ) -> Result<usize, Error> {
         <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             MlxKeyValueState,
         >>::group_unit_count(architecture, group)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
@@ -1086,7 +1086,7 @@ impl MuseGlimmerModel {
                          parallel,
                          stream| {
                             <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                                MlxBackend,
+                                MlxNeuralBackend,
                                 MlxKeyValueState,
                             >>::forward_unit_parallel_with_provider(
                                 architecture,
@@ -1122,7 +1122,7 @@ impl MuseGlimmerModel {
                      parallel,
                      stream| {
                         <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                            MlxBackend,
+                            MlxNeuralBackend,
                             MlxKeyValueState,
                         >>::forward_unit_parallel_with_provider(
                             architecture,
@@ -1332,12 +1332,12 @@ fn quantize_store(
     let source_layout = layout(source)?;
     let target_layout = layout(&target)?;
     let source_static = <NeutralArchitecture as LayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxKeyValueState,
     >>::static_modules(&source_architecture)
     .clone();
     let target_static = <NeutralArchitecture as LayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxKeyValueState,
     >>::static_modules(&target_architecture)
     .clone();
@@ -1492,7 +1492,7 @@ fn load_parallel_store(
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let global_static = MlxModule::new(
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::static_modules(
+        <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::static_modules(
             &global_architecture,
         )
         .clone(),
@@ -1574,7 +1574,7 @@ fn load_parallel_store(
             }
             let index = address.index();
             let global = MlxModule::new(NeutralUnit::Text(
-                eredu_architectures::muse_glimmer::TransformerBlock::<MlxBackend>::new(
+                eredu_architectures::muse_glimmer::TransformerBlock::<MlxNeuralBackend>::new(
                     &binding_args,
                     index,
                     stream,

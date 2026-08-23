@@ -1141,7 +1141,7 @@ mod tests {
 
     impl
         LayeredTraversalHook<
-            crate::backend::mlx::nn::shared::MlxBackend,
+            crate::backend::mlx::nn::shared::MlxNeuralBackend,
             eredu_architectures::moshi::ForwardContext<crate::MlxTensor>,
             eredu_nn::Error,
         > for TeacherObservationCapture

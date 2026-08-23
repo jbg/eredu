@@ -19,7 +19,7 @@ use safemlx::{
 use crate::{
     backend::mlx::{
         error::Error,
-        nn::shared::{MlxBackend, MlxModule},
+        nn::shared::{MlxModule, MlxNeuralBackend},
         runtime::{
             cache::{
                 residency::{
@@ -60,29 +60,29 @@ use crate::{
     },
 };
 
-type NeutralBlock = Unit<MlxBackend>;
-type NeutralArchitecture = LayeredModel<MlxBackend>;
+type NeutralBlock = Unit<MlxNeuralBackend>;
+type NeutralArchitecture = LayeredModel<MlxNeuralBackend>;
 type ResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type BoundedRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxLayerwisePolicy<NeutralBlock, NemotronHUnitPopulator>,
 >;
 type ParallelResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type ParallelBoundedRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxLayerwisePolicy<NeutralBlock, NemotronHParallelUnitPopulator>,
 >;
@@ -92,7 +92,7 @@ type ParallelBoundedRuntime = LayerwiseRuntime<
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
 pub struct NemotronHCheckpointTemplate {
-    pub static_modules: eredu_architectures::decoder::StaticModules<MlxBackend>,
+    pub static_modules: eredu_architectures::decoder::StaticModules<MlxNeuralBackend>,
     pub layers: Vec<NeutralBlock>,
 }
 
@@ -303,7 +303,7 @@ impl NemotronHBindings {
         match layout {
             Some(layout) => {
                 let root = <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-                    MlxBackend,
+                    MlxNeuralBackend,
                     MlxHybridState,
                 >>::unit_path(architecture, group, index)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -653,9 +653,10 @@ fn load_neutral_parallel(
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
     let mut planner = build.planner();
-    for group in eredu_architectures::nemotron_h::static_parallel_parameter_groups::<MlxBackend>(
-        global_architecture.static_modules(),
-    )? {
+    for group in eredu_architectures::nemotron_h::static_parallel_parameter_groups::<
+        MlxNeuralBackend,
+    >(global_architecture.static_modules())?
+    {
         planner.register(group)?;
     }
     for layer in 0..count {
@@ -1192,7 +1193,7 @@ impl NemotronHModel {
         stream: &Stream,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         self.forward_with_provider_context(tokens, mask, cache, provider, stream)
@@ -1214,7 +1215,7 @@ impl NemotronHModel {
         Error,
     >
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         let input = eredu_architectures::nemotron_h::EmbeddedInput::target(
@@ -1392,7 +1393,7 @@ impl NemotronHModel {
         Error,
     >
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         let hook =
@@ -1487,7 +1488,7 @@ impl NemotronHModel {
         observer: &mut NeutralNemotronHObserver<'_>,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         let input = eredu_architectures::nemotron_h::EmbeddedInput::target(

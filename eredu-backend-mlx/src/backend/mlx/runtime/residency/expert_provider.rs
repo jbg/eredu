@@ -12,7 +12,7 @@ use eredu_runtime::{
 use safemlx::{module::Param, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::backend::mlx::nn::moe::{PackedGatedProductExperts, PackedRelu2Experts};
-use crate::backend::mlx::nn::shared::MlxBackend;
+use crate::backend::mlx::nn::shared::MlxNeuralBackend;
 use crate::backend::mlx::runtime::residency::expert_cache::{ExpertCache, ExpertRouteBatch};
 use crate::backend::mlx::Error;
 use crate::MlxTensor;
@@ -41,7 +41,7 @@ impl<'a, F> CachedRelu2ExpertProvider<'a, F> {
     }
 }
 
-impl<F> RoutedExpertProvider<MlxBackend> for CachedRelu2ExpertProvider<'_, F>
+impl<F> RoutedExpertProvider<MlxNeuralBackend> for CachedRelu2ExpertProvider<'_, F>
 where
     F: FnMut(usize) -> Result<Relu2ExpertBankSpec, Error>,
 {
@@ -49,7 +49,7 @@ where
 
     fn forward_routed(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         _request: RoutedExpertRequest<'_, MlxTensor>,
         _stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -60,7 +60,7 @@ where
 
     fn forward_relu2_routed(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -89,12 +89,12 @@ impl<'a> CachedGatedProductExpertProvider<'a> {
     }
 }
 
-impl RoutedExpertProvider<MlxBackend> for CachedGatedProductExpertProvider<'_> {
+impl RoutedExpertProvider<MlxNeuralBackend> for CachedGatedProductExpertProvider<'_> {
     type Error = Error;
 
     fn forward_routed(
         &mut self,
-        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -113,7 +113,7 @@ impl RoutedExpertProvider<MlxBackend> for CachedGatedProductExpertProvider<'_> {
 
     fn forward_routed_tensor_parallel(
         &mut self,
-        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         partitions: usize,
         stream: &Stream,
@@ -135,7 +135,7 @@ impl RoutedExpertProvider<MlxBackend> for CachedGatedProductExpertProvider<'_> {
 
     fn forward_relu2_routed(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
         _request: RoutedExpertRequest<'_, MlxTensor>,
         _stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -190,7 +190,7 @@ where
         .map(MlxTensor::from_array)
 }
 
-impl<F> RoutedExpertProvider<MlxBackend> for ExpertExecutorProvider<'_, F>
+impl<F> RoutedExpertProvider<MlxNeuralBackend> for ExpertExecutorProvider<'_, F>
 where
     F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, safemlx::error::Exception>,
 {
@@ -198,7 +198,7 @@ where
 
     fn forward_routed(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -207,7 +207,7 @@ where
 
     fn forward_routed_tensor_parallel(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         _partitions: usize,
         stream: &Stream,
@@ -218,7 +218,7 @@ where
 
     fn forward_relu2_routed(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -227,7 +227,7 @@ where
 
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         _partitions: usize,
         stream: &Stream,
@@ -305,7 +305,7 @@ fn reshape_gated_product_callback_output(
 
 fn execute_gated_product_callback<F>(
     execute: &mut F,
-    resident_bank: &<MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+    resident_bank: &<MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
     request: RoutedExpertRequest<'_, MlxTensor>,
     mode: GatedProductExpertExecutionMode,
     stream: &Stream,
@@ -350,7 +350,7 @@ where
     reshape_gated_product_callback_output(output, &original_shape, stream)
 }
 
-impl<F> RoutedExpertProvider<MlxBackend> for GatedProductExpertExecutorProvider<'_, F>
+impl<F> RoutedExpertProvider<MlxNeuralBackend> for GatedProductExpertExecutorProvider<'_, F>
 where
     F: FnMut(
         GatedProductExpertExecution,
@@ -361,7 +361,7 @@ where
 
     fn forward_routed(
         &mut self,
-        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -381,7 +381,7 @@ where
 
     fn forward_routed_tensor_parallel(
         &mut self,
-        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         partitions: usize,
         stream: &Stream,
@@ -397,7 +397,7 @@ where
 
     fn forward_relu2_routed(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
         _request: RoutedExpertRequest<'_, MlxTensor>,
         _stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -418,10 +418,10 @@ impl<'a, F> ResidentExpertExecutorProvider<'a, F> {
     }
 }
 
-impl<F> RoutedExpertProvider<MlxBackend> for ResidentExpertExecutorProvider<'_, F>
+impl<F> RoutedExpertProvider<MlxNeuralBackend> for ResidentExpertExecutorProvider<'_, F>
 where
     F: FnMut(
-        &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         &Array,
         &Array,
         &Array,
@@ -433,7 +433,7 @@ where
 
     fn forward_routed(
         &mut self,
-        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
@@ -456,7 +456,7 @@ where
 
     fn forward_routed_tensor_parallel(
         &mut self,
-        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, MlxTensor>,
         partitions: usize,
         stream: &Stream,
@@ -475,7 +475,7 @@ where
 
     fn forward_relu2_routed(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
         _request: RoutedExpertRequest<'_, MlxTensor>,
         _stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {

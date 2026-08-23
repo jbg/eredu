@@ -50,7 +50,7 @@ fn neutral_input_parts<'a>(
 
 use crate::backend::mlx::{
     error::Error,
-    nn::shared::{MlxBackend, MlxModule},
+    nn::shared::{MlxNeuralBackend, MlxModule},
     runtime::{
         cache::{
             residency::{
@@ -80,11 +80,11 @@ use crate::backend::mlx::{
     },
 };
 
-type Architecture = vl::LayeredModel<MlxBackend>;
-type Unit = vl::Unit<MlxBackend>;
+type Architecture = vl::LayeredModel<MlxNeuralBackend>;
+type Unit = vl::Unit<MlxNeuralBackend>;
 
 fn group_kind(architecture: &Architecture, group: usize) -> eredu_runtime::ArchitectureGroupKind {
-    <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::group_transport(
+    <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_transport(
         architecture,
         group,
     )
@@ -96,7 +96,7 @@ fn group_kind(architecture: &Architecture, group: usize) -> eredu_runtime::Archi
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
 pub struct QwenVlCheckpointTemplate {
-    pub static_modules: vl::StaticModules<MlxBackend>,
+    pub static_modules: vl::StaticModules<MlxNeuralBackend>,
     pub units: Vec<Unit>,
 }
 
@@ -106,7 +106,7 @@ impl QwenVlCheckpointTemplate {
         let architecture = Architecture::new(args.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let static_modules =
-            <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
+            <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
                 &architecture,
             )
             .clone();
@@ -501,10 +501,10 @@ impl MlxUnitPopulator<Unit> for UnitPopulator {
     }
 }
 
-type Resident = LayerwiseRuntime<Architecture, MlxBackend, MlxHybridState, MlxResidentPolicy<Unit>>;
+type Resident = LayerwiseRuntime<Architecture, MlxNeuralBackend, MlxHybridState, MlxResidentPolicy<Unit>>;
 type Bounded = LayerwiseRuntime<
     Architecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxLayerwisePolicy<Unit, UnitPopulator>,
 >;
@@ -706,7 +706,7 @@ impl QwenVlModel {
         stream: &Stream,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         let parts = neutral_input_parts(input.parts);
@@ -957,13 +957,13 @@ impl CausalModel<MlxHybridState> for QwenVlModel {
 }
 
 fn unit_layout(architecture: &Architecture) -> Result<ExecutionUnitLayout, Error> {
-    let graph = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::execution_graph(
+    let graph = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::execution_graph(
         architecture,
     )
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let counts = (0..graph.groups().len())
         .map(|group| {
-            <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::group_unit_count(
+            <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_unit_count(
                 architecture,
                 group,
             )
@@ -1023,12 +1023,12 @@ fn quantize_store(
     let source_layout = unit_layout(&source_architecture)?;
     let target_layout = unit_layout(&target_architecture)?;
     let source_static =
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &source_architecture,
         )
         .clone();
     let target_static =
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &target_architecture,
         )
         .clone();

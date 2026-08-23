@@ -6,13 +6,13 @@ use safemlx::Stream;
 
 use crate::backend::mlx::{
     error::Error,
-    nn::shared::MlxBackend,
+    nn::shared::MlxNeuralBackend,
     runtime::{cache::state::MlxKeyValueState, distributed::parallel::ParallelPlanBuilder},
 };
 
 /// Registers neutral parameter groups with the general MLX planner.
 pub fn register_parallel_parameters(
-    architecture: &LayeredModel<MlxBackend>,
+    architecture: &LayeredModel<MlxNeuralBackend>,
     planner: &mut ParallelPlanBuilder,
     stream: &Stream,
 ) -> Result<(), Error> {
@@ -20,13 +20,13 @@ pub fn register_parallel_parameters(
         planner.register(group)?;
     }
     for group_index in 0..2 {
-        let count = <LayeredModel<MlxBackend> as LayeredArchitecture<
-            MlxBackend,
+        let count = <LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
             MlxKeyValueState,
         >>::group_unit_count(architecture, group_index)?;
         for index in 0..count {
-            let unit = <LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            let unit = <LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxKeyValueState,
             >>::build_unit(architecture, group_index, index, stream)?;
             for group in

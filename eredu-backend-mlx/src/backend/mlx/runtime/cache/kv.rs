@@ -14,7 +14,7 @@ use eredu_nn::{
 };
 
 use crate::{
-    backend::mlx::nn::shared::MlxBackend,
+    backend::mlx::nn::shared::MlxNeuralBackend,
     backend::mlx::runtime::cache::residency::{CacheBlockArrays, CacheResidencyManager},
 };
 use eredu_core::cache::{CacheBlockId, CacheRankIdentity, CacheRepresentation};
@@ -753,7 +753,7 @@ impl CompressedLatentCache {
     }
 }
 
-impl eredu_runtime::RuntimeLayerState<MlxBackend> for CompressedLatentCache {
+impl eredu_runtime::RuntimeLayerState<MlxNeuralBackend> for CompressedLatentCache {
     type RetainedValues<'a> = RetainedArrayVecIter<'a>;
 
     fn retained_values(&self) -> Self::RetainedValues<'_> {
@@ -2429,7 +2429,7 @@ impl KeyValueCache for PagedKeyValueCache {
     }
 }
 
-impl eredu_runtime::RuntimeLayerState<MlxBackend> for PagedKeyValueCache {
+impl eredu_runtime::RuntimeLayerState<MlxNeuralBackend> for PagedKeyValueCache {
     type RetainedValues<'a> = RetainedArrayIter<'a>;
 
     fn retained_values(&self) -> Self::RetainedValues<'_> {
@@ -3274,7 +3274,7 @@ impl KeyValueCache for ConcatKeyValueCache {
     }
 }
 
-impl eredu_runtime::RuntimeLayerState<MlxBackend> for ConcatKeyValueCache {
+impl eredu_runtime::RuntimeLayerState<MlxNeuralBackend> for ConcatKeyValueCache {
     type RetainedValues<'a> = RetainedArrayIter<'a>;
 
     fn retained_values(&self) -> Self::RetainedValues<'_> {

@@ -92,7 +92,7 @@ fn packed_expert_companion_spec(weight: &ParameterSpec, component: &str) -> Para
     }
 }
 
-impl BlockwiseAttentionBackend for MlxBackend {
+impl BlockwiseAttentionBackend for MlxNeuralBackend {
     type BlockwiseAccumulator = BlockwiseAttentionAccumulator;
 
     fn begin_blockwise_attention(
@@ -1333,7 +1333,7 @@ impl crate::backend::mlx::runtime::distributed::expert::LocalExpertBank
 
 /// Zero-sized MLX backend selector. All calls are statically dispatched.
 #[derive(Debug, Clone, Copy)]
-pub struct MlxBackend;
+pub struct MlxNeuralBackend;
 
 /// Exact MLX completion retaining every Rust-side submission resource.
 pub struct MlxSubmissionCompletion {
@@ -1386,7 +1386,7 @@ impl Drop for MlxSubmissionCompletion {
     }
 }
 
-impl SubmissionBackend for MlxBackend {
+impl SubmissionBackend for MlxNeuralBackend {
     type Executor = Stream;
     type OwnedExecutor = Stream;
     type Completion = MlxSubmissionCompletion;
@@ -1436,7 +1436,7 @@ impl SubmissionBackend for MlxBackend {
     }
 }
 
-impl TransferBackend for MlxBackend {
+impl TransferBackend for MlxNeuralBackend {
     type HostBuffer = Arc<ImmutableHostTransferBuffer>;
     type Transfer = MlxSubmissionCompletion;
     type TransferError = safemlx::error::Exception;
@@ -1485,7 +1485,7 @@ pub enum MlxParameterError {
     Mlx(#[from] safemlx::error::Exception),
 }
 
-impl ParameterBackend for MlxBackend {
+impl ParameterBackend for MlxNeuralBackend {
     type Parameter = MlxTensor;
     type MaterializedWeight = MlxTensor;
     type MaterializationContext =
@@ -1564,7 +1564,7 @@ impl ParameterBackend for MlxBackend {
     }
 }
 
-impl NeuralBackend for MlxBackend {
+impl NeuralBackend for MlxNeuralBackend {
     const OPERATOR_CAPABILITIES: eredu_nn::NeuralOperatorCapabilities =
         eredu_nn::NeuralOperatorCapabilities::ALL;
 
@@ -2660,7 +2660,7 @@ impl NeuralBackend for MlxBackend {
     }
 }
 
-impl HyperNeuralBackend for MlxBackend {
+impl HyperNeuralBackend for MlxNeuralBackend {
     type HyperConnection = MlxHyperConnection;
     type HyperHead = MlxHyperHead;
 
@@ -2708,7 +2708,7 @@ impl HyperNeuralBackend for MlxBackend {
     }
 }
 
-impl RoutedNeuralBackend for MlxBackend {
+impl RoutedNeuralBackend for MlxNeuralBackend {
     type Router = MlxTopKRouter;
     type GatedProductExpertBank = MlxGatedProductExpertBank;
     type Relu2ExpertBank = MlxRelu2ExpertBank;
@@ -3026,11 +3026,11 @@ mod neutral_semantic_operator_tests {
 
     use crate::backend::mlx::nn::tensor::TokenValidationScope;
 
-    use super::{MlxBackend, MlxEmbedding, MlxLinear, MlxTensor};
+    use super::{MlxEmbedding, MlxLinear, MlxNeuralBackend, MlxTensor};
 
     #[test]
     fn mlx_declares_every_supported_architecture_operator_set() {
-        let declared = <MlxBackend as NeuralBackend>::OPERATOR_CAPABILITIES;
+        let declared = <MlxNeuralBackend as NeuralBackend>::OPERATOR_CAPABILITIES;
         for required in [
             operator_requirements::KIMI_LINEAR,
             operator_requirements::QWEN_HYBRID,
@@ -3068,9 +3068,10 @@ mod neutral_semantic_operator_tests {
                 .unwrap(),
         );
         let weight = MlxTensor::from_array(Array::from_slice(&[1.0_f32; 4], &[4]));
-        let output =
-            <MlxBackend as NeuralBackend>::rms_norm_with_weight(&input, &weight, 1e-5, stream)
-                .unwrap();
+        let output = <MlxNeuralBackend as NeuralBackend>::rms_norm_with_weight(
+            &input, &weight, 1e-5, stream,
+        )
+        .unwrap();
         assert_eq!(output.as_array().dtype(), Dtype::Bfloat16);
         output.as_array().evaluated().unwrap();
     }
@@ -3118,7 +3119,7 @@ mod neutral_semantic_operator_tests {
         weight: &[f32],
         stream: &safemlx::Stream,
     ) -> MlxLinear {
-        let mut linear = <MlxBackend as NeuralBackend>::linear(
+        let mut linear = <MlxNeuralBackend as NeuralBackend>::linear(
             LinearSpec {
                 input,
                 output,
@@ -3165,7 +3166,7 @@ mod neutral_semantic_operator_tests {
         weight: &[f32],
         stream: &safemlx::Stream,
     ) -> MlxEmbedding {
-        let mut embedding = <MlxBackend as NeuralBackend>::embedding(
+        let mut embedding = <MlxNeuralBackend as NeuralBackend>::embedding(
             EmbeddingSpec {
                 vocabulary,
                 dimensions,
@@ -3210,7 +3211,7 @@ mod neutral_semantic_operator_tests {
             linear.forward(input, stream)
         }
         fn sum(
-            embeddings: &mut MultiTableEmbedding<MlxBackend>,
+            embeddings: &mut MultiTableEmbedding<MlxNeuralBackend>,
             tokens: &[&MlxTensor],
             stream: &safemlx::Stream,
         ) -> Result<MlxTensor, eredu_nn::Error> {
@@ -3228,7 +3229,7 @@ mod neutral_semantic_operator_tests {
             &safemlx::Stream,
         ) -> Result<MlxTensor, eredu_nn::Error> = project;
         let _: fn(
-            &mut MultiTableEmbedding<MlxBackend>,
+            &mut MultiTableEmbedding<MlxNeuralBackend>,
             &[&MlxTensor],
             &safemlx::Stream,
         ) -> Result<MlxTensor, eredu_nn::Error> = sum;
@@ -3409,7 +3410,8 @@ mod neutral_semantic_operator_tests {
                     lookup: EmbeddingLookupPolicy::ZeroSentinel(-1),
                 })
                 .collect::<Vec<_>>();
-            let mut embeddings = MultiTableEmbedding::<MlxBackend>::new(specs, stream).unwrap();
+            let mut embeddings =
+                MultiTableEmbedding::<MlxNeuralBackend>::new(specs, stream).unwrap();
             for (table, named) in embeddings.tables.iter_mut().enumerate() {
                 let weight = (0..4 * dimensions)
                     .map(|index| (table as f32 + 1.0) * (index as f32 + 1.0) / 128.0)
@@ -3451,7 +3453,7 @@ mod neutral_semantic_operator_tests {
         let values = MlxTensor::from_array(Array::from_slice(&[10.0_f32, 20.0], &[1, 1, 2, 1]));
         let profiles =
             MlxTensor::from_array(Array::from_slice(&[0.0_f32, 3.0_f32.ln()], &[1, 1, 1, 2]));
-        let output = <MlxBackend as NeuralBackend>::relative_attention(
+        let output = <MlxNeuralBackend as NeuralBackend>::relative_attention(
             RelativeAttentionInput {
                 queries: &queries,
                 keys: &keys,
@@ -3478,7 +3480,7 @@ mod neutral_semantic_operator_tests {
         let weight = MlxTensor::from_array(Array::from_slice(&[0.0_f32, 1.0, 2.0], &[3, 1]));
         let correction = MlxTensor::from_array(Array::from_slice(&[10.0_f32, 0.0], &[2]));
         let global = MlxTensor::from_array(Array::from_slice(&[0.5_f32], &[1]));
-        let routes = <MlxBackend as NeuralBackend>::joint_expert_routing(
+        let routes = <MlxNeuralBackend as NeuralBackend>::joint_expert_routing(
             JointExpertRoutingInput {
                 hidden: &hidden,
                 weight: &weight,
@@ -3510,7 +3512,7 @@ mod neutral_semantic_operator_tests {
         let input = MlxTensor::from_array(Array::from_slice(&values, &[1, 4]));
         let epsilon = 1e-5;
 
-        let mut normalization = <MlxBackend as NeuralBackend>::normalization(
+        let mut normalization = <MlxNeuralBackend as NeuralBackend>::normalization(
             NormalizationConstructionSpec {
                 dimensions: 4,
                 epsilon,
@@ -3530,7 +3532,7 @@ mod neutral_semantic_operator_tests {
         let l2 = (values.iter().map(|value| value * value).sum::<f32>() + epsilon).sqrt();
         let expected_l2 = values.map(|value| value / l2);
         close(
-            &<MlxBackend as NeuralBackend>::l2_normalize(&input, epsilon, stream).unwrap(),
+            &<MlxNeuralBackend as NeuralBackend>::l2_normalize(&input, epsilon, stream).unwrap(),
             &expected_l2,
             1e-5,
         );
@@ -3559,7 +3561,7 @@ mod neutral_semantic_operator_tests {
                 expected[index] = values[index] * scale * weights[index] * silu_gate;
             }
         }
-        let actual = <MlxBackend as NeuralBackend>::silu_gated_group_rms_norm(
+        let actual = <MlxNeuralBackend as NeuralBackend>::silu_gated_group_rms_norm(
             &input, &gate, &weight, 2, epsilon, stream,
         )
         .unwrap();
@@ -3579,7 +3581,7 @@ mod neutral_semantic_operator_tests {
             target_heads: 4,
         };
         let actual =
-            <MlxBackend as NeuralBackend>::expand_heads(&input, expansion, stream).unwrap();
+            <MlxNeuralBackend as NeuralBackend>::expand_heads(&input, expansion, stream).unwrap();
         let (expected, shape) = reference_expand_heads(&values, &[1, 2, 2], 1, 4).unwrap();
         let shape = shape
             .into_iter()
@@ -3602,7 +3604,7 @@ mod neutral_semantic_operator_tests {
         let value = MlxTensor::from_array(Array::from_slice(&values, &[4, 1, 2]));
         let segments = [2, 2];
         let scale = 2.0_f32.sqrt().recip();
-        let actual = <MlxBackend as NeuralBackend>::segmented_attention(
+        let actual = <MlxNeuralBackend as NeuralBackend>::segmented_attention(
             SegmentedAttentionInput {
                 queries: &query,
                 keys: &key,

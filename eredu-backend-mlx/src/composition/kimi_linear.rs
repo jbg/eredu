@@ -18,7 +18,7 @@ use safemlx::{
 use crate::{
     backend::mlx::{
         error::Error,
-        nn::shared::{MlxBackend, MlxModule},
+        nn::shared::{MlxModule, MlxNeuralBackend},
         runtime::{
             cache::{
                 residency::{
@@ -61,29 +61,29 @@ use crate::{
     },
 };
 
-type NeutralBlock = Block<MlxBackend>;
-type NeutralArchitecture = LayeredModel<MlxBackend>;
+type NeutralBlock = Block<MlxNeuralBackend>;
+type NeutralArchitecture = LayeredModel<MlxNeuralBackend>;
 type ResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type BoundedRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxLayerwisePolicy<NeutralBlock, KimiLinearUnitPopulator>,
 >;
 type ParallelResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type ParallelBoundedRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxLayerwisePolicy<NeutralBlock, KimiLinearParallelUnitPopulator>,
 >;
@@ -93,7 +93,7 @@ type ParallelBoundedRuntime = LayerwiseRuntime<
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
 pub struct KimiLinearCheckpointTemplate {
-    pub static_modules: eredu_architectures::decoder::StaticModules<MlxBackend>,
+    pub static_modules: eredu_architectures::decoder::StaticModules<MlxNeuralBackend>,
     pub layers: Vec<NeutralBlock>,
 }
 
@@ -208,7 +208,7 @@ impl KimiLinearBindings {
         group: usize,
     ) -> Result<usize, Error> {
         <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             MlxHybridState,
         >>::group_unit_count(architecture, group)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
@@ -525,13 +525,14 @@ fn load_neutral_parallel(
             .targets_for_role(ParameterRole::ExpertIntermediate),
     );
     let mut planner = build.planner();
-    for group in eredu_architectures::kimi_linear::static_parallel_parameter_groups::<MlxBackend>(
-        global_architecture.static_modules(),
-    )? {
+    for group in eredu_architectures::kimi_linear::static_parallel_parameter_groups::<
+        MlxNeuralBackend,
+    >(global_architecture.static_modules())?
+    {
         planner.register(group)?;
     }
     for layer in 0..count {
-        let block = Block::<MlxBackend>::new(&args, layer, stream)
+        let block = Block::<MlxNeuralBackend>::new(&args, layer, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         for group in
             eredu_architectures::kimi_linear::layer_parallel_parameter_groups(&block, &args, layer)?
@@ -561,7 +562,7 @@ fn load_neutral_parallel(
     let global_static_bindings = build_module_bindings(&global_static, "", store.as_ref())?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
     for layer in 0..count {
-        let block = Block::<MlxBackend>::new(&args, layer, stream)
+        let block = Block::<MlxNeuralBackend>::new(&args, layer, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let bindings = build_module_bindings_with_recipes_excluding(
             &MlxModule::new(block),
@@ -603,7 +604,7 @@ fn load_neutral_parallel(
         },
         move |address, path, _local, store, stream| {
             let layer = address.index();
-            let global = Block::<MlxBackend>::new(&binding_args, layer, stream)
+            let global = Block::<MlxNeuralBackend>::new(&binding_args, layer, stream)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let bindings = build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(global),
@@ -696,11 +697,11 @@ fn quantize_store(
         source.static_modules(),
         destination.static_modules(),
         move |index, stream| {
-            Block::<MlxBackend>::new(&source_args, index, stream)
+            Block::<MlxNeuralBackend>::new(&source_args, index, stream)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         },
         move |index, stream| {
-            Block::<MlxBackend>::new(&target_args, index, stream)
+            Block::<MlxNeuralBackend>::new(&target_args, index, stream)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         },
         usize::try_from(args.num_hidden_layers).map_err(|_| {
@@ -991,7 +992,7 @@ impl KimiLinearModel {
         stream: &Stream,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         let pass = if tokens.dim(1) > 1 {
@@ -1013,7 +1014,7 @@ impl KimiLinearModel {
              forward: &mut eredu_architectures::kimi_linear::ForwardContext<crate::MlxTensor>,
              context: &Stream| {
                 <NeutralArchitecture as eredu_runtime::RoutedLayeredArchitecture<
-                    MlxBackend,
+                    MlxNeuralBackend,
                     MlxHybridState,
                 >>::forward_unit_with_provider(
                     architecture,
@@ -1098,7 +1099,7 @@ impl KimiLinearModel {
         observer: &mut NeutralKimiLinearObserver<'_>,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         let pass = if tokens.dim(1) > 1 {
@@ -1205,7 +1206,7 @@ impl KimiLinearModel {
              parallel: &safemlx::distributed::Group,
              context: &Stream| {
                 <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                    MlxBackend,
+                    MlxNeuralBackend,
                     MlxHybridState,
                 >>::forward_unit_parallel_with_provider(
                     architecture,

@@ -57,7 +57,7 @@ fn neutral_input_parts<'a>(
 
 use crate::backend::mlx::{
     error::Error,
-    nn::shared::{MlxBackend, MlxModule},
+    nn::shared::{MlxNeuralBackend, MlxModule},
     runtime::{
         cache::{
             residency::{
@@ -90,15 +90,15 @@ use crate::backend::mlx::{
     },
 };
 
-type Architecture = hybrid::LayeredModel<MlxBackend>;
-type Block = Unit<MlxBackend>;
+type Architecture = hybrid::LayeredModel<MlxNeuralBackend>;
+type Block = Unit<MlxNeuralBackend>;
 
 #[derive(eredu_nn::Parameterized)]
 #[parameterized(tensor = "crate::MlxTensor")]
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
 pub struct QwenHybridCheckpointTemplate {
-    pub static_modules: eredu_architectures::decoder::StaticModules<MlxBackend>,
+    pub static_modules: eredu_architectures::decoder::StaticModules<MlxNeuralBackend>,
     pub units: Vec<Block>,
 }
 
@@ -133,8 +133,8 @@ impl QwenHybridCheckpointTemplate {
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
 pub struct QwenConditionalCheckpointTemplate {
-    pub static_modules: hybrid::ConditionalStaticModules<MlxBackend>,
-    pub units: Vec<hybrid::ConditionalUnit<MlxBackend>>,
+    pub static_modules: hybrid::ConditionalStaticModules<MlxNeuralBackend>,
+    pub units: Vec<hybrid::ConditionalUnit<MlxNeuralBackend>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -143,21 +143,21 @@ impl QwenConditionalCheckpointTemplate {
         let architecture = ConditionalArchitecture::new(parsed, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let graph = <ConditionalArchitecture as LayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             MlxHybridState,
         >>::execution_graph(&architecture)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let mut units = Vec::new();
         for group in 0..graph.groups().len() {
             let count = <ConditionalArchitecture as LayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::group_unit_count(&architecture, group)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             for index in 0..count {
                 units.push(
                     <ConditionalArchitecture as LayeredArchitecture<
-                        MlxBackend,
+                        MlxNeuralBackend,
                         MlxHybridState,
                     >>::build_unit(&architecture, group, index, stream)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
@@ -166,7 +166,7 @@ impl QwenConditionalCheckpointTemplate {
         }
         Ok(Self {
             static_modules: <ConditionalArchitecture as LayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::static_modules(&architecture)
             .clone(),
@@ -187,10 +187,10 @@ struct ConditionalUnitPopulator {
     expert_targets: Arc<BTreeSet<String>>,
 }
 
-impl MlxUnitPopulator<ConditionalUnit<MlxBackend>> for ConditionalUnitPopulator {
+impl MlxUnitPopulator<ConditionalUnit<MlxNeuralBackend>> for ConditionalUnitPopulator {
     fn populate(
         &mut self,
-        unit: &mut MlxModule<ConditionalUnit<MlxBackend>>,
+        unit: &mut MlxModule<ConditionalUnit<MlxNeuralBackend>>,
         lease: &crate::backend::mlx::runtime::residency::manager::ResidentUnitLease,
     ) -> Result<(), Error> {
         populate_module_from_lease_excluding(unit, lease, |name| {
@@ -216,7 +216,7 @@ fn conditional_expert_targets(
     architecture: &ConditionalArchitecture,
     group: usize,
     index: usize,
-    unit: &MlxModule<ConditionalUnit<MlxBackend>>,
+    unit: &MlxModule<ConditionalUnit<MlxNeuralBackend>>,
 ) -> Result<BTreeSet<String>, Error> {
     let groups = match &unit.inner {
         ConditionalUnit::Vision(_) => return Ok(BTreeSet::new()),
@@ -429,12 +429,12 @@ impl QwenConditionalPipelineBindings {
         architecture: &ConditionalArchitecture,
         group: usize,
         index: usize,
-        layer: &MlxModule<ConditionalUnit<MlxBackend>>,
+        layer: &MlxModule<ConditionalUnit<MlxNeuralBackend>>,
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let expert_targets = conditional_expert_targets(architecture, group, index, layer)?;
         let is_vision = <ConditionalArchitecture as LayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             MlxHybridState,
         >>::group_transport(architecture, group)
         .kind
@@ -451,7 +451,7 @@ impl QwenConditionalPipelineBindings {
             let vision_units = (0..layout.group_count())
                 .filter(|&slot| {
                     <ConditionalArchitecture as LayeredArchitecture<
-                        MlxBackend,
+                        MlxNeuralBackend,
                         MlxHybridState,
                     >>::group_transport(architecture, slot)
                     .kind
@@ -477,13 +477,13 @@ impl QwenConditionalPipelineBindings {
         architecture: &ConditionalArchitecture,
         group: usize,
         index: usize,
-        global_layer: &MlxModule<ConditionalUnit<MlxBackend>>,
+        global_layer: &MlxModule<ConditionalUnit<MlxNeuralBackend>>,
         store: &dyn CheckpointSource,
         layout: Option<&eredu_runtime::LocalModelLayout>,
     ) -> Result<Vec<WeightBinding>, Error> {
         let expert_targets = conditional_expert_targets(architecture, group, index, global_layer)?;
         let is_vision = <ConditionalArchitecture as LayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             MlxHybridState,
         >>::group_transport(architecture, group)
         .kind
@@ -500,7 +500,7 @@ impl QwenConditionalPipelineBindings {
             let vision_units = (0..layout.group_count())
                 .filter(|&slot| {
                     <ConditionalArchitecture as LayeredArchitecture<
-                        MlxBackend,
+                        MlxNeuralBackend,
                         MlxHybridState,
                     >>::group_transport(architecture, slot)
                     .kind
@@ -525,7 +525,7 @@ impl QwenConditionalPipelineBindings {
         match layout {
             Some(layout) => {
                 let root = <ConditionalArchitecture as LayeredArchitecture<
-                    MlxBackend,
+                    MlxNeuralBackend,
                     MlxHybridState,
                 >>::unit_path(architecture, group, index)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -590,7 +590,7 @@ impl QwenHybridPipelineBindings {
     }
 
     pub fn layer_count(&self, architecture: &Architecture, group: usize) -> Result<usize, Error> {
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::group_unit_count(
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_unit_count(
             architecture,
             group,
         )
@@ -682,7 +682,7 @@ impl QwenHybridPipelineBindings {
         match layout {
             Some(layout) => {
                 let root =
-                    <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::unit_path(
+                    <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::unit_path(
                         architecture,
                         group,
                         index,
@@ -966,25 +966,25 @@ impl MlxUnitPopulator<Block> for UnitPopulator {
 }
 
 type Resident =
-    LayerwiseRuntime<Architecture, MlxBackend, MlxHybridState, MlxResidentPolicy<Block>>;
+    LayerwiseRuntime<Architecture, MlxNeuralBackend, MlxHybridState, MlxResidentPolicy<Block>>;
 type Bounded = LayerwiseRuntime<
     Architecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxLayerwisePolicy<Block, UnitPopulator>,
 >;
-type ConditionalArchitecture = ConditionalLayeredModel<MlxBackend>;
+type ConditionalArchitecture = ConditionalLayeredModel<MlxNeuralBackend>;
 type ConditionalResident = LayerwiseRuntime<
     ConditionalArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
-    MlxResidentPolicy<ConditionalUnit<MlxBackend>>,
+    MlxResidentPolicy<ConditionalUnit<MlxNeuralBackend>>,
 >;
 type ConditionalBounded = LayerwiseRuntime<
     ConditionalArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
-    MlxLayerwisePolicy<ConditionalUnit<MlxBackend>, ConditionalUnitPopulator>,
+    MlxLayerwisePolicy<ConditionalUnit<MlxNeuralBackend>, ConditionalUnitPopulator>,
 >;
 
 enum Execution {
@@ -1238,7 +1238,7 @@ impl QwenHybridModel {
         stream: &Stream,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         if self.parsed.vision.is_some() {
@@ -1251,7 +1251,7 @@ impl QwenHybridModel {
             let hook = |architecture: &mut ConditionalArchitecture,
                         group: usize,
                         index: usize,
-                        unit: &mut ConditionalUnit<MlxBackend>,
+                        unit: &mut ConditionalUnit<MlxNeuralBackend>,
                         hidden: &crate::MlxTensor,
                         state: &mut MlxHybridState,
                         forward: &mut hybrid::ConditionalForwardContext<crate::MlxTensor>,
@@ -1697,7 +1697,7 @@ impl QwenHybridModel {
         stream: &Stream,
     ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Exception>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         if self.parsed.vision.is_some() {
@@ -1713,7 +1713,7 @@ impl QwenHybridModel {
                         |architecture: &mut ConditionalArchitecture,
                          group: usize,
                          index: usize,
-                         unit: &mut ConditionalUnit<MlxBackend>,
+                         unit: &mut ConditionalUnit<MlxNeuralBackend>,
                          hidden: &crate::MlxTensor,
                          state: &mut MlxHybridState,
                          forward: &mut hybrid::ConditionalForwardContext<crate::MlxTensor>,
@@ -1756,7 +1756,7 @@ impl QwenHybridModel {
                         |architecture: &mut ConditionalArchitecture,
                          group: usize,
                          index: usize,
-                         unit: &mut ConditionalUnit<MlxBackend>,
+                         unit: &mut ConditionalUnit<MlxNeuralBackend>,
                          hidden: &crate::MlxTensor,
                          state: &mut MlxHybridState,
                          forward: &mut hybrid::ConditionalForwardContext<crate::MlxTensor>,
@@ -2016,13 +2016,13 @@ impl crate::composition::mlx::speculative::embedded::EmbeddedMtpTarget for QwenH
 }
 
 fn unit_layout(architecture: &Architecture) -> Result<ExecutionUnitLayout, Error> {
-    let graph = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::execution_graph(
+    let graph = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::execution_graph(
         architecture,
     )
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let counts = (0..graph.groups().len())
         .map(|group| {
-            <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::group_unit_count(
+            <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_unit_count(
                 architecture,
                 group,
             )
@@ -2037,14 +2037,14 @@ fn conditional_unit_layout(
     architecture: &ConditionalArchitecture,
 ) -> Result<ExecutionUnitLayout, Error> {
     let graph = <ConditionalArchitecture as LayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxHybridState,
     >>::execution_graph(architecture)
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let counts = (0..graph.groups().len())
         .map(|group| {
             <ConditionalArchitecture as LayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::group_unit_count(architecture, group)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
@@ -2104,12 +2104,12 @@ fn quantize_store(
     let source_layout = unit_layout(&source_architecture)?;
     let target_layout = unit_layout(&target_architecture)?;
     let source_static =
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &source_architecture,
         )
         .clone();
     let target_static =
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &target_architecture,
         )
         .clone();
@@ -2181,12 +2181,12 @@ fn quantize_conditional_store(
     let source_layout = conditional_unit_layout(&source_architecture)?;
     let target_layout = conditional_unit_layout(&target_architecture)?;
     let source_static = <ConditionalArchitecture as LayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxHybridState,
     >>::static_modules(&source_architecture)
     .clone();
     let target_static = <ConditionalArchitecture as LayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxHybridState,
     >>::static_modules(&target_architecture)
     .clone();

@@ -8,7 +8,7 @@ use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
 use eredu_nn::Parameterized;
 use eredu_runtime::StaticUnitBindings;
 
-use crate::{backend::mlx::error::Error, backend::mlx::nn::shared::MlxBackend};
+use crate::{backend::mlx::error::Error, backend::mlx::nn::shared::MlxNeuralBackend};
 
 struct StaticBindingVisitor<'a> {
     store: &'a dyn CheckpointSource,
@@ -16,7 +16,7 @@ struct StaticBindingVisitor<'a> {
     units: Vec<StaticUnitBindings>,
 }
 
-impl StaticParameterVisitor<MlxBackend> for StaticBindingVisitor<'_> {
+impl StaticParameterVisitor<MlxNeuralBackend> for StaticBindingVisitor<'_> {
     type Error = Error;
 
     fn visit<M>(&mut self, role: &str, module: &M) -> Result<(), Self::Error>
@@ -39,7 +39,7 @@ pub(crate) fn architecture_static_units<A>(
     store: &dyn CheckpointSource,
 ) -> Result<Vec<StaticUnitBindings>, Error>
 where
-    A: BindableStaticParameters<MlxBackend>,
+    A: BindableStaticParameters<MlxNeuralBackend>,
 {
     let recipes = architecture
         .static_parameter_recipes(store)

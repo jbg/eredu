@@ -9,7 +9,7 @@ use safemlx::Stream;
 
 use crate::backend::mlx::{
     error::Error,
-    nn::shared::{MlxBackend, MlxModule},
+    nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
         checkpoint::binding::{
             build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
@@ -51,7 +51,7 @@ pub fn expert_catalog(
             (resolved.target_gate_up, resolved.gate_up),
             (resolved.target_down, resolved.down),
         ]);
-        let block = DenseBlock::<MlxBackend>::new(args, layer, stream)
+        let block = DenseBlock::<MlxNeuralBackend>::new(args, layer, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let expert_targets = parameter_role_targets(
             &eredu_architectures::gemma4::layer_parameter_groups(args, layer)?,

@@ -59,7 +59,7 @@ use crate::backend::mlx::runtime::checkpoint::quantization::quantize_tensor;
 use crate::{
     backend::mlx::error::Error,
     backend::mlx::nn::{
-        shared::{MlxBackend, MlxModule, MlxModuleRef},
+        shared::{MlxModule, MlxModuleRef, MlxNeuralBackend},
         tensor::{TokenValidationBatch, TokenValidationScope},
     },
     backend::mlx::runtime::cache::residency::{
@@ -146,7 +146,7 @@ use eredu_runtime::{
 
 use safemlx::ops::indexing::TryIndexOp;
 
-type LlamaBlock = MlxModule<eredu_architectures::llama::TransformerBlock<MlxBackend>>;
+type LlamaBlock = MlxModule<eredu_architectures::llama::TransformerBlock<MlxNeuralBackend>>;
 
 fn qwen_model_kind(args: &eredu_architectures::qwen::ModelArgs) -> ModelKind {
     match args.variant {
@@ -285,7 +285,7 @@ macro_rules! impl_pipeline_architecture_bindings {
                 index: usize,
                 stream: &Stream,
             ) -> Result<Self::Layer, Error> {
-                <$architecture as LayeredArchitecture<MlxBackend, $state>>::build_unit(
+                <$architecture as LayeredArchitecture<MlxNeuralBackend, $state>>::build_unit(
                     architecture,
                     group,
                     index,
@@ -311,69 +311,69 @@ macro_rules! impl_pipeline_architecture_bindings {
 
 impl_pipeline_architecture_bindings!(
     MuseGlimmerPipelineBindings,
-    muse_glimmer::LayeredModel<MlxBackend>,
+    muse_glimmer::LayeredModel<MlxNeuralBackend>,
     MlxKeyValueState,
     MuseGlimmerPipelineUnit
 );
 impl_pipeline_architecture_bindings!(
     InklingBindings,
-    eredu_architectures::inkling::LayeredModel<MlxBackend>,
+    eredu_architectures::inkling::LayeredModel<MlxNeuralBackend>,
     MlxHybridState,
     InklingPipelineUnit
 );
 impl_pipeline_architecture_bindings!(
     Gemma4Bindings,
-    eredu_architectures::gemma4::LayeredModel<MlxBackend>,
+    eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend>,
     MlxHybridState,
     Gemma4PipelineUnit
 );
 impl_pipeline_architecture_bindings!(
     KimiLinearBindings,
-    eredu_architectures::kimi_linear::LayeredModel<MlxBackend>,
+    eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend>,
     MlxHybridState,
-    MlxModule<eredu_architectures::kimi_linear::Block<MlxBackend>>
+    MlxModule<eredu_architectures::kimi_linear::Block<MlxNeuralBackend>>
 );
 impl_pipeline_architecture_bindings!(
     QwenHybridPipelineBindings,
-    eredu_architectures::qwen::hybrid::LayeredModel<MlxBackend>,
+    eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend>,
     MlxHybridState,
-    MlxModule<eredu_architectures::qwen::hybrid::Unit<MlxBackend>>
+    MlxModule<eredu_architectures::qwen::hybrid::Unit<MlxNeuralBackend>>
 );
 impl_pipeline_architecture_bindings!(
     QwenConditionalPipelineBindings,
-    eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend>,
+    eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend>,
     MlxHybridState,
-    MlxModule<eredu_architectures::qwen::hybrid::ConditionalUnit<MlxBackend>>
+    MlxModule<eredu_architectures::qwen::hybrid::ConditionalUnit<MlxNeuralBackend>>
 );
 impl_pipeline_architecture_bindings!(
     QwenVlPipelineBindings,
-    eredu_architectures::qwen::vl::LayeredModel<MlxBackend>,
+    eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend>,
     MlxHybridState,
-    MlxModule<eredu_architectures::qwen::vl::Unit<MlxBackend>>
+    MlxModule<eredu_architectures::qwen::vl::Unit<MlxNeuralBackend>>
 );
 impl_pipeline_architecture_bindings!(
     crate::composition::qwen::QwenPipelineBindings,
-    eredu_architectures::qwen::LayeredModel<MlxBackend>,
+    eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>,
     MlxKeyValueState,
-    MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>
+    MlxModule<eredu_architectures::qwen::TransformerBlock<MlxNeuralBackend>>
 );
 impl_pipeline_architecture_bindings!(
     Lfm2Bindings,
-    eredu_architectures::lfm2::LayeredModel<MlxBackend>,
+    eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend>,
     MlxHybridState,
-    MlxModule<eredu_architectures::lfm2::Block<MlxBackend>>
+    MlxModule<eredu_architectures::lfm2::Block<MlxNeuralBackend>>
 );
 impl_pipeline_architecture_bindings!(
     NemotronHBindings,
-    eredu_architectures::nemotron_h::LayeredModel<MlxBackend>,
+    eredu_architectures::nemotron_h::LayeredModel<MlxNeuralBackend>,
     MlxHybridState,
-    MlxModule<eredu_architectures::nemotron_h::Unit<MlxBackend>>
+    MlxModule<eredu_architectures::nemotron_h::Unit<MlxNeuralBackend>>
 );
 impl_pipeline_architecture_bindings!(
     crate::composition::gpt_oss::GptOssPipelineBindings,
-    eredu_architectures::gpt_oss::LayeredModel<MlxBackend>,
+    eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend>,
     MlxKeyValueState,
-    MlxModule<eredu_architectures::gpt_oss::TransformerBlock<MlxBackend>>
+    MlxModule<eredu_architectures::gpt_oss::TransformerBlock<MlxNeuralBackend>>
 );
 
 fn quantize_pipeline_stage_store<A: PipelineQuantizationAdapter>(
@@ -605,9 +605,9 @@ impl InklingPipelinePartition {
 
     fn static_modules_mut(
         &mut self,
-    ) -> &mut eredu_architectures::inkling::StaticModules<MlxBackend> {
-        <eredu_architectures::inkling::LayeredModel<MlxBackend> as LayeredArchitecture<
-            MlxBackend,
+    ) -> &mut eredu_architectures::inkling::StaticModules<MlxNeuralBackend> {
+        <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::static_modules_mut(&mut self.architecture)
     }
@@ -618,8 +618,8 @@ impl InklingPipelinePartition {
         index: usize,
         stream: &Stream,
     ) -> Result<InklingPipelineUnit, Error> {
-        <eredu_architectures::inkling::LayeredModel<MlxBackend> as LayeredArchitecture<
-            MlxBackend,
+        <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::build_unit(&self.architecture, group, index, stream)
         .map(MlxModule::new)
@@ -671,12 +671,12 @@ impl InklingPipelinePartition {
         };
         let mut state = MlxHybridState::device(self.state_layout()?)?;
         let forward = match execution.and_then(ParallelExecutionContext::group) {
-            Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxBackend> as ParallelLayeredArchitecture<
-                MlxBackend,
+            Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::begin_forward_parallel(&mut self.architecture, input, &mut state, parallel, stream),
-            None => <eredu_architectures::inkling::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            None => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::begin_forward(&mut self.architecture, input, &mut state, stream),
         }
@@ -690,8 +690,8 @@ impl InklingPipelinePartition {
             eredu_runtime::ArchitectureGroupKind::VisionEncoder,
         )
         .expect("validated Inkling vision group");
-        <eredu_architectures::inkling::LayeredModel<MlxBackend> as LayeredArchitecture<
-            MlxBackend,
+        <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::should_execute_group(&self.architecture, vision_group, &state.forward.context)
     }
@@ -724,8 +724,8 @@ impl InklingPipelinePartition {
             eredu_runtime::ArchitectureGroupKind::VisionEncoder,
         )?;
         state.forward.hidden = match execution.and_then(ParallelExecutionContext::group) {
-            Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxBackend> as ParallelLayeredArchitecture<
-                MlxBackend,
+            Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::forward_unit_parallel(
                 &mut self.architecture,
@@ -738,8 +738,8 @@ impl InklingPipelinePartition {
                 parallel,
                 stream,
             ),
-            None => <eredu_architectures::inkling::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            None => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::forward_unit(
                 &mut self.architecture,
@@ -768,8 +768,8 @@ impl InklingPipelinePartition {
                 eredu_runtime::ArchitectureGroupKind::VisionEncoder,
             )?;
             state.forward.hidden = match execution.and_then(ParallelExecutionContext::group) {
-                Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxBackend> as ParallelLayeredArchitecture<
-                    MlxBackend,
+                Some(parallel) => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                    MlxNeuralBackend,
                     MlxHybridState,
                 >>::complete_execution_group_parallel(
                     &mut self.architecture,
@@ -780,8 +780,8 @@ impl InklingPipelinePartition {
                     parallel,
                     stream,
                 ),
-                None => <eredu_architectures::inkling::LayeredModel<MlxBackend> as LayeredArchitecture<
-                    MlxBackend,
+                None => <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                    MlxNeuralBackend,
                     MlxHybridState,
                 >>::complete_execution_group(
                     &mut self.architecture,
@@ -1554,18 +1554,18 @@ impl Gemma4PipelinePartition {
             .ok_or_else(|| Error::Parallel("Gemma 4 partition has no runtime state".into()))
     }
 
-    fn static_modules(&self) -> &eredu_architectures::gemma4::StaticModules<MlxBackend> {
-        <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+    fn static_modules(&self) -> &eredu_architectures::gemma4::StaticModules<MlxNeuralBackend> {
+        <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::static_modules(&self.architecture)
     }
 
     fn static_modules_mut(
         &mut self,
-    ) -> &mut eredu_architectures::gemma4::StaticModules<MlxBackend> {
-        <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+    ) -> &mut eredu_architectures::gemma4::StaticModules<MlxNeuralBackend> {
+        <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::static_modules_mut(&mut self.architecture)
     }
@@ -1576,8 +1576,8 @@ impl Gemma4PipelinePartition {
         index: usize,
         stream: &Stream,
     ) -> Result<Gemma4PipelineUnit, Error> {
-        <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+        <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::build_unit(&self.architecture, group, index, stream)
         .map(MlxModule::new)
@@ -1595,16 +1595,16 @@ impl Gemma4PipelinePartition {
     }
 
     fn canonical_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+        <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::execution_graph(&self.architecture)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
     }
 
     fn group_kind(&self, group: usize) -> eredu_runtime::ArchitectureGroupKind {
-        <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+        <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::group_transport(&self.architecture, group)
         .kind
@@ -1707,12 +1707,12 @@ impl Gemma4PipelinePartition {
             mask: None,
         };
         let mut forward = match execution.and_then(ParallelExecutionContext::group) {
-            Some(group) => <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::ParallelLayeredArchitecture<
-                MlxBackend,
+            Some(group) => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::ParallelLayeredArchitecture<
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::begin_forward_parallel(&mut self.architecture, input, &mut state, group, stream),
-            None => <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-                MlxBackend,
+            None => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::begin_forward(&mut self.architecture, input, &mut state, stream),
         }
@@ -1729,16 +1729,16 @@ impl Gemma4PipelinePartition {
         let vision_group = media_group(eredu_runtime::ArchitectureGroupKind::VisionEncoder)?;
         let audio_group = media_group(eredu_runtime::ArchitectureGroupKind::AudioEncoder)?;
         let mut begin_group = |group_index| {
-            if !<eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-                MlxBackend,
+            if !<eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::should_execute_group(&self.architecture, group_index, &forward.context)
             {
                 return Ok::<Option<crate::MlxTensor>, Error>(None);
             }
             let hidden = match execution.and_then(ParallelExecutionContext::group) {
-                Some(group) => <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::ParallelLayeredArchitecture<
-                    MlxBackend,
+                Some(group) => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::ParallelLayeredArchitecture<
+                    MlxNeuralBackend,
                     MlxHybridState,
                 >>::begin_execution_group_parallel(
                     &mut self.architecture,
@@ -1750,8 +1750,8 @@ impl Gemma4PipelinePartition {
                     group,
                     stream,
                 ),
-                None => <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-                    MlxBackend,
+                None => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+                    MlxNeuralBackend,
                     MlxHybridState,
                 >>::begin_execution_group(
                     &mut self.architecture,
@@ -1832,8 +1832,8 @@ impl Gemma4PipelinePartition {
         .clone();
         let output = if let Some(forward) = state.forward.as_mut() {
             match execution.and_then(ParallelExecutionContext::group) {
-                Some(parallel) => <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::ParallelLayeredArchitecture<
-                    MlxBackend,
+                Some(parallel) => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::ParallelLayeredArchitecture<
+                    MlxNeuralBackend,
                     MlxHybridState,
                 >>::forward_unit_parallel(
                     &mut self.architecture,
@@ -1846,8 +1846,8 @@ impl Gemma4PipelinePartition {
                     parallel,
                     stream,
                 ),
-                None => <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-                    MlxBackend,
+                None => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+                    MlxNeuralBackend,
                     MlxHybridState,
                 >>::forward_unit(
                     &mut self.architecture,
@@ -1940,7 +1940,7 @@ impl Gemma4PipelinePartition {
         Error,
     >
     where
-        S: eredu_runtime::LayerRuntimeState<MlxBackend>,
+        S: eredu_runtime::LayerRuntimeState<MlxNeuralBackend>,
         S::LayerState: eredu_nn::AttentionCache<crate::MlxTensor>,
     {
         let parts = [eredu_architectures::gemma4::DecoderInputPart::Text(
@@ -1955,19 +1955,19 @@ impl Gemma4PipelinePartition {
         };
         let decoder_group = architecture_decoder_group::<_, S>(&self.architecture)?;
         let mut forward = match execution.and_then(ParallelExecutionContext::group) {
-            Some(parallel) => <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::ParallelLayeredArchitecture<
-                MlxBackend,
+            Some(parallel) => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::ParallelLayeredArchitecture<
+                MlxNeuralBackend,
                 S,
             >>::begin_forward_parallel(&mut self.architecture, input, state, parallel, stream),
-            None => <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-                MlxBackend,
+            None => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+                MlxNeuralBackend,
                 S,
             >>::begin_forward(&mut self.architecture, input, state, stream),
         }
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         forward.hidden = match execution.and_then(ParallelExecutionContext::group) {
-            Some(parallel) => <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::ParallelLayeredArchitecture<
-                MlxBackend,
+            Some(parallel) => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::ParallelLayeredArchitecture<
+                MlxNeuralBackend,
                 S,
             >>::begin_execution_group_parallel(
                 &mut self.architecture,
@@ -1979,8 +1979,8 @@ impl Gemma4PipelinePartition {
                 parallel,
                 stream,
             ),
-            None => <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-                MlxBackend,
+            None => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+                MlxNeuralBackend,
                 S,
             >>::begin_execution_group(
                 &mut self.architecture,
@@ -1997,7 +1997,7 @@ impl Gemma4PipelinePartition {
     }
 }
 
-impl eredu_runtime::RuntimeState<MlxBackend> for PipelineRangeState<'_> {
+impl eredu_runtime::RuntimeState<MlxNeuralBackend> for PipelineRangeState<'_> {
     type RetainedValues<'a>
         = std::vec::IntoIter<&'a crate::MlxTensor>
     where
@@ -2037,7 +2037,7 @@ impl eredu_runtime::RuntimeState<MlxBackend> for PipelineRangeState<'_> {
     }
 }
 
-impl<'a> eredu_runtime::LayerRuntimeState<MlxBackend> for PipelineRangeState<'a> {
+impl<'a> eredu_runtime::LayerRuntimeState<MlxNeuralBackend> for PipelineRangeState<'a> {
     type LayerState = PipelineHybridLayerState<'a>;
 
     fn layer(&mut self, layer: usize) -> Result<&mut Self::LayerState, eredu_runtime::StateError> {
@@ -2076,7 +2076,7 @@ fn validate_pipeline_hybrid_cache_layer(
     }
 }
 
-impl eredu_runtime::RuntimeLayerState<MlxBackend> for PipelineHybridLayerState<'_> {
+impl eredu_runtime::RuntimeLayerState<MlxNeuralBackend> for PipelineHybridLayerState<'_> {
     type RetainedValues<'a>
         = std::vec::IntoIter<&'a crate::MlxTensor>
     where
@@ -2092,7 +2092,7 @@ impl eredu_runtime::RuntimeLayerState<MlxBackend> for PipelineHybridLayerState<'
     }
 }
 
-impl eredu_runtime::RuntimeStateComponents<MlxBackend> for PipelineHybridLayerState<'_> {
+impl eredu_runtime::RuntimeStateComponents<MlxNeuralBackend> for PipelineHybridLayerState<'_> {
     fn position(&self) -> i32 {
         match &*self.0 {
             PipelineLayerCache::KeyValue { cache, .. } => match cache {
@@ -2150,7 +2150,7 @@ impl eredu_runtime::RuntimeStateComponents<MlxBackend> for PipelineHybridLayerSt
 
 impl eredu_nn::AttentionCache<crate::MlxTensor> for PipelineHybridLayerState<'_> {
     fn offset(&self) -> i32 {
-        eredu_runtime::RuntimeStateComponents::<MlxBackend>::position(self)
+        eredu_runtime::RuntimeStateComponents::<MlxNeuralBackend>::position(self)
     }
 
     fn max_size(&self) -> Option<i32> {
@@ -2209,7 +2209,7 @@ impl eredu_nn::CompressedAttentionCache<crate::MlxTensor> for PipelineHybridLaye
     type Checkpoint = CompressedLatentCache;
 
     fn offset(&self) -> i32 {
-        eredu_runtime::RuntimeStateComponents::<MlxBackend>::position(self)
+        eredu_runtime::RuntimeStateComponents::<MlxNeuralBackend>::position(self)
     }
 
     fn is_paged(&self) -> bool {
@@ -2311,7 +2311,7 @@ impl eredu_nn::PoolingAttentionCache<crate::MlxTensor> for PipelineHybridLayerSt
     type Checkpoint = MlxPoolingAttentionCache;
 
     fn offset(&self) -> i32 {
-        eredu_runtime::RuntimeStateComponents::<MlxBackend>::position(self)
+        eredu_runtime::RuntimeStateComponents::<MlxNeuralBackend>::position(self)
     }
 
     fn pooling_ratio(&self, stream: u32) -> Option<i32> {
@@ -2488,7 +2488,7 @@ impl eredu_nn::AuxiliaryConvolutionState<crate::MlxTensor> for PipelineHybridLay
         &mut self,
         slot: u32,
     ) -> Result<&mut Option<crate::MlxTensor>, eredu_nn::Error> {
-        eredu_runtime::RuntimeStateComponents::<MlxBackend>::fixed_component(
+        eredu_runtime::RuntimeStateComponents::<MlxNeuralBackend>::fixed_component(
             self,
             StateTensorRole::Convolution { slot },
         )
@@ -2542,24 +2542,24 @@ impl<A, G, C, L> DecoderPipelineBuilder<A, G, C, L> {
 }
 
 type LlamaPipelinePartition = DecoderPipelineRealization<
-    eredu_architectures::llama::LayeredModel<MlxBackend>,
+    eredu_architectures::llama::LayeredModel<MlxNeuralBackend>,
     eredu_architectures::llama::LocalGeometry,
     crate::composition::llama::LlamaPipelineBindings,
     LlamaBlock,
 >;
 
 type QwenPipelinePartition = DecoderPipelineRealization<
-    eredu_architectures::qwen::LayeredModel<MlxBackend>,
+    eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>,
     eredu_architectures::qwen::LocalGeometry,
     crate::composition::qwen::QwenPipelineBindings,
-    MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>,
+    MlxModule<eredu_architectures::qwen::TransformerBlock<MlxNeuralBackend>>,
 >;
 
 type GptOssPipelinePartition = DecoderPipelineRealization<
-    eredu_architectures::gpt_oss::LayeredModel<MlxBackend>,
+    eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend>,
     eredu_architectures::gpt_oss::LocalGeometry,
     crate::composition::gpt_oss::GptOssPipelineBindings,
-    MlxModule<eredu_architectures::gpt_oss::TransformerBlock<MlxBackend>>,
+    MlxModule<eredu_architectures::gpt_oss::TransformerBlock<MlxNeuralBackend>>,
 >;
 
 impl<A, G, C, L> DecoderPipelineRealization<A, G, C, L> {
@@ -2569,12 +2569,12 @@ impl<A, G, C, L> DecoderPipelineRealization<A, G, C, L> {
 }
 
 fn construct_qwen_partition_unit(
-    architecture: &eredu_architectures::qwen::LayeredModel<MlxBackend>,
+    architecture: &eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>,
     bindings: &crate::composition::qwen::QwenPipelineBindings,
     index: usize,
     assignment: Option<&ExpertAssignment>,
     stream: &Stream,
-) -> Result<MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>, Error> {
+) -> Result<MlxModule<eredu_architectures::qwen::TransformerBlock<MlxNeuralBackend>>, Error> {
     let local_intermediate_size = architecture
         .shared_parallel_geometry()
         .and_then(|geometry| geometry.block(index).map(|args| args.moe_intermediate_size))
@@ -2595,12 +2595,12 @@ fn construct_qwen_partition_unit(
 }
 
 fn construct_gpt_oss_partition_unit(
-    architecture: &eredu_architectures::gpt_oss::LayeredModel<MlxBackend>,
+    architecture: &eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend>,
     bindings: &crate::composition::gpt_oss::GptOssPipelineBindings,
     index: usize,
     assignment: Option<&ExpertAssignment>,
     stream: &Stream,
-) -> Result<MlxModule<eredu_architectures::gpt_oss::TransformerBlock<MlxBackend>>, Error> {
+) -> Result<MlxModule<eredu_architectures::gpt_oss::TransformerBlock<MlxNeuralBackend>>, Error> {
     let local_intermediate_size = architecture
         .shared_parallel_geometry()
         .and_then(|geometry| geometry.block(index).map(|args| args.intermediate_size))
@@ -2620,10 +2620,10 @@ fn construct_gpt_oss_partition_unit(
     Ok(unit)
 }
 
-type NeutralV3Architecture = eredu_architectures::deepseek::v3::Model<MlxBackend>;
-type NeutralV3Unit = MlxModule<eredu_architectures::deepseek::v3::Unit<MlxBackend>>;
-type NeutralV4Architecture = eredu_architectures::deepseek::v4::Model<MlxBackend>;
-type NeutralV4Unit = MlxModule<eredu_architectures::deepseek::v4::Unit<MlxBackend>>;
+type NeutralV3Architecture = eredu_architectures::deepseek::v3::Model<MlxNeuralBackend>;
+type NeutralV3Unit = MlxModule<eredu_architectures::deepseek::v3::Unit<MlxNeuralBackend>>;
+type NeutralV4Architecture = eredu_architectures::deepseek::v4::Model<MlxNeuralBackend>;
+type NeutralV4Unit = MlxModule<eredu_architectures::deepseek::v4::Unit<MlxNeuralBackend>>;
 
 struct PredictionPipelineRealization<A, G, B, U> {
     architecture: A,
@@ -2684,8 +2684,8 @@ struct MediaPipelineRealization<A, P, C, U, I> {
 impl<A, P, C, U, I> MediaPipelineRealization<A, P, C, U, I> {
     fn media_range<S>(&self, kind: eredu_runtime::ArchitectureGroupKind) -> Range<usize>
     where
-        S: eredu_runtime::RuntimeState<MlxBackend>,
-        A: eredu_runtime::LayeredArchitecture<MlxBackend, S>,
+        S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+        A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
         A::Error: std::fmt::Display,
         P: GroupedPartition,
     {
@@ -2694,7 +2694,7 @@ impl<A, P, C, U, I> MediaPipelineRealization<A, P, C, U, I> {
 }
 
 type Gemma4PipelinePartition = MediaPipelineRealization<
-    eredu_architectures::gemma4::LayeredModel<MlxBackend>,
+    eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend>,
     eredu_runtime::ArchitecturePartition<
         Arc<eredu_architectures::gemma4::LocalGeometry>,
         eredu_architectures::gemma4::TextBoundarySchema,
@@ -2705,7 +2705,7 @@ type Gemma4PipelinePartition = MediaPipelineRealization<
 >;
 
 type MuseGlimmerPipelinePartition = MediaPipelineRealization<
-    muse_glimmer::LayeredModel<MlxBackend>,
+    muse_glimmer::LayeredModel<MlxNeuralBackend>,
     eredu_runtime::ArchitecturePartition<
         Option<Arc<muse_glimmer::LocalGeometry>>,
         eredu_runtime::NoAuxiliaryBoundary,
@@ -2716,24 +2716,24 @@ type MuseGlimmerPipelinePartition = MediaPipelineRealization<
 >;
 
 type QwenVlPipelinePartition = MediaPipelineRealization<
-    eredu_architectures::qwen::vl::LayeredModel<MlxBackend>,
+    eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend>,
     eredu_runtime::ArchitecturePartition<
         Option<Arc<eredu_architectures::qwen::vl::LocalGeometry>>,
         eredu_architectures::qwen::vl::PipelineBoundarySchema,
     >,
     QwenVlPipelineBindings,
-    MlxModule<eredu_architectures::qwen::vl::Unit<MlxBackend>>,
+    MlxModule<eredu_architectures::qwen::vl::Unit<MlxNeuralBackend>>,
     eredu_architectures::qwen::vl::PipelineVisionState<crate::MlxTensor>,
 >;
 
 type QwenConditionalPipelinePartition = MediaPipelineRealization<
-    eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend>,
+    eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend>,
     eredu_runtime::ArchitecturePartition<
         Option<Arc<eredu_architectures::qwen::hybrid::ConditionalLocalGeometry>>,
         eredu_architectures::qwen::hybrid::ConditionalPipelineBoundarySchema,
     >,
     QwenConditionalPipelineBindings,
-    MlxModule<eredu_architectures::qwen::hybrid::ConditionalUnit<MlxBackend>>,
+    MlxModule<eredu_architectures::qwen::hybrid::ConditionalUnit<MlxNeuralBackend>>,
     eredu_architectures::qwen::hybrid::ConditionalPipelineVisionState<crate::MlxTensor>,
 >;
 
@@ -2768,10 +2768,10 @@ struct PipelineRealization<A, G, B, U> {
 }
 
 type Lfm2PipelinePartition = PipelineRealization<
-    eredu_architectures::lfm2::LayeredModel<MlxBackend>,
+    eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend>,
     Arc<eredu_architectures::lfm2::LocalGeometry>,
     eredu_runtime::NoAuxiliaryBoundary,
-    MlxModule<eredu_architectures::lfm2::Block<MlxBackend>>,
+    MlxModule<eredu_architectures::lfm2::Block<MlxNeuralBackend>>,
 >;
 
 struct GroupedPredictionPipelineRealization<A, P, C, U> {
@@ -2797,30 +2797,30 @@ impl<G, B> GroupedPartition for eredu_runtime::ArchitecturePartition<G, B> {
 }
 
 type NemotronHPipelinePartition = GroupedPredictionPipelineRealization<
-    eredu_architectures::nemotron_h::LayeredModel<MlxBackend>,
+    eredu_architectures::nemotron_h::LayeredModel<MlxNeuralBackend>,
     eredu_runtime::ArchitecturePartition<
         Arc<eredu_architectures::nemotron_h::LocalGeometry>,
         eredu_architectures::nemotron_h::TargetBoundarySchema,
     >,
     (),
-    MlxModule<eredu_architectures::nemotron_h::Unit<MlxBackend>>,
+    MlxModule<eredu_architectures::nemotron_h::Unit<MlxNeuralBackend>>,
 >;
 
 type QwenHybridPipelinePartition = GroupedPredictionPipelineRealization<
-    eredu_architectures::qwen::hybrid::LayeredModel<MlxBackend>,
+    eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend>,
     eredu_runtime::ArchitecturePartition<
         Option<Arc<eredu_architectures::qwen::hybrid::LocalGeometry>>,
         eredu_runtime::NoAuxiliaryBoundary,
     >,
     QwenHybridPipelineBindings,
-    MlxModule<eredu_architectures::qwen::hybrid::Unit<MlxBackend>>,
+    MlxModule<eredu_architectures::qwen::hybrid::Unit<MlxNeuralBackend>>,
 >;
 
 impl<A, P, C, U> GroupedPredictionPipelineRealization<A, P, C, U> {
     fn range(&self) -> Range<usize>
     where
         P: GroupedPartition,
-        A: LayeredArchitecture<MlxBackend, MlxHybridState>,
+        A: LayeredArchitecture<MlxNeuralBackend, MlxHybridState>,
         A::Error: std::fmt::Display,
     {
         let group = architecture_decoder_group::<A, MlxHybridState>(&self.architecture)
@@ -2830,10 +2830,10 @@ impl<A, P, C, U> GroupedPredictionPipelineRealization<A, P, C, U> {
 }
 
 type KimiLinearPipelinePartition = PipelineRealization<
-    eredu_architectures::kimi_linear::LayeredModel<MlxBackend>,
+    eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend>,
     Arc<eredu_architectures::kimi_linear::LocalGeometry>,
     eredu_runtime::NoAuxiliaryBoundary,
-    MlxModule<eredu_architectures::kimi_linear::Block<MlxBackend>>,
+    MlxModule<eredu_architectures::kimi_linear::Block<MlxNeuralBackend>>,
 >;
 
 struct InklingIngressState {
@@ -2855,7 +2855,7 @@ impl InklingIngressState {
 }
 
 type InklingPipelinePartition = MediaPipelineRealization<
-    eredu_architectures::inkling::LayeredModel<MlxBackend>,
+    eredu_architectures::inkling::LayeredModel<MlxNeuralBackend>,
     eredu_runtime::ArchitecturePartition<
         Arc<eredu_architectures::inkling::LocalGeometry>,
         eredu_runtime::NoAuxiliaryBoundary,
@@ -3800,12 +3800,12 @@ where
     U: eredu_nn::Parameterized<crate::MlxTensor>,
     F: 'static,
     for<'state> A: eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             PipelineRangeState<'state>,
             Unit = U,
             ForwardContext = F,
-        > + eredu_runtime::ParallelLayeredArchitecture<MlxBackend, PipelineRangeState<'state>>,
-    for<'state> <A as eredu_runtime::LayeredArchitecture<MlxBackend, PipelineRangeState<'state>>>::Error:
+        > + eredu_runtime::ParallelLayeredArchitecture<MlxNeuralBackend, PipelineRangeState<'state>>,
+    for<'state> <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, PipelineRangeState<'state>>>::Error:
         std::fmt::Display,
 {
     struct Owner<'a, A, F> {
@@ -3835,7 +3835,7 @@ where
         &mut owner,
         |owner, global_layer, stream| {
             <A as eredu_runtime::LayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::build_unit(owner.architecture, owner.group_index, global_layer, stream)
             .map(MlxModule::new)
@@ -3849,7 +3849,7 @@ where
             )?;
             let output = match owner.parallel {
                 Some(parallel) => <A as eredu_runtime::ParallelLayeredArchitecture<
-                    MlxBackend,
+                    MlxNeuralBackend,
                     PipelineRangeState<'_>,
                 >>::forward_unit_parallel(
                     owner.architecture,
@@ -3863,7 +3863,7 @@ where
                     stream,
                 ),
                 None => <A as eredu_runtime::LayeredArchitecture<
-                    MlxBackend,
+                    MlxNeuralBackend,
                     PipelineRangeState<'_>,
                 >>::forward_unit(
                     owner.architecture,
@@ -3880,7 +3880,7 @@ where
             drop(state);
             PipelineHybridLayerState(cache).synchronize_attention_fixed_offsets();
             let retained = <A as eredu_runtime::LayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::retained_context_values(
                 owner.architecture,
@@ -3901,7 +3901,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn execute_resident_distributed_experts(
-    bank: &mut <MlxBackend as RoutedNeuralBackend>::GatedProductExpertBank,
+    bank: &mut <MlxNeuralBackend as RoutedNeuralBackend>::GatedProductExpertBank,
     hidden: &Array,
     expert_ids: &Array,
     weights: &Array,
@@ -3950,15 +3950,18 @@ fn execute_neutral_routed_partition_group<A, U, F, P>(
 where
     U: eredu_nn::Parameterized<crate::MlxTensor>,
     F: 'static,
-    P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
     for<'state> A: eredu_runtime::RoutedLayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             PipelineRangeState<'state>,
             Unit = U,
             ForwardContext = F,
-        > + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxBackend, PipelineRangeState<'state>>,
-    for<'state> <A as eredu_runtime::LayeredArchitecture<MlxBackend, PipelineRangeState<'state>>>::Error:
+        > + eredu_runtime::ParallelRoutedLayeredArchitecture<
+            MlxNeuralBackend,
+            PipelineRangeState<'state>,
+        >,
+    for<'state> <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, PipelineRangeState<'state>>>::Error:
         std::fmt::Display,
 {
     struct Owner<'a, A, F, P> {
@@ -3992,7 +3995,7 @@ where
         &mut owner,
         |owner, global_layer, stream| {
             <A as eredu_runtime::LayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::build_unit(owner.architecture, owner.group_index, global_layer, stream)
             .map(MlxModule::new)
@@ -4006,7 +4009,7 @@ where
             )?;
             let output = match owner.parallel {
                 Some(parallel) => <A as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                    MlxBackend,
+                    MlxNeuralBackend,
                     PipelineRangeState<'_>,
                 >>::forward_unit_parallel_with_provider(
                     owner.architecture,
@@ -4022,7 +4025,7 @@ where
                     stream,
                 ),
                 None => <A as eredu_runtime::RoutedLayeredArchitecture<
-                    MlxBackend,
+                    MlxNeuralBackend,
                     PipelineRangeState<'_>,
                 >>::forward_unit_with_provider(
                     owner.architecture,
@@ -4041,7 +4044,7 @@ where
             drop(state);
             PipelineHybridLayerState(cache).synchronize_attention_fixed_offsets();
             let retained = <A as eredu_runtime::LayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::retained_context_values(
                 owner.architecture,
@@ -4062,8 +4065,8 @@ where
 
 fn architecture_decoder_group<A, S>(architecture: &A) -> Result<usize, Error>
 where
-    S: eredu_runtime::RuntimeState<MlxBackend>,
-    A: eredu_runtime::LayeredArchitecture<MlxBackend, S>,
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
 {
     let graph = architecture
@@ -4083,8 +4086,8 @@ fn architecture_group_by_kind<A, S>(
     kind: eredu_runtime::ArchitectureGroupKind,
 ) -> Result<usize, Error>
 where
-    S: eredu_runtime::RuntimeState<MlxBackend>,
-    A: eredu_runtime::LayeredArchitecture<MlxBackend, S>,
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
 {
     let graph = architecture
@@ -4109,8 +4112,8 @@ fn architecture_parameter_unit_owner<A, S>(
     global_unit: usize,
 ) -> Result<eredu_runtime::ParameterGroupOwner, Error>
 where
-    A: LayeredArchitecture<MlxBackend, S>,
-    S: eredu_runtime::RuntimeState<MlxBackend>,
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
     A::Error: std::fmt::Display,
 {
     let graph = architecture
@@ -4133,8 +4136,8 @@ fn architecture_group_id_by_kind<A, S>(
     kind: eredu_runtime::ArchitectureGroupKind,
 ) -> Result<String, Error>
 where
-    S: eredu_runtime::RuntimeState<MlxBackend>,
-    A: eredu_runtime::LayeredArchitecture<MlxBackend, S>,
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
 {
     let group = architecture_group_by_kind::<A, S>(architecture, kind)?;
@@ -4150,8 +4153,8 @@ fn architecture_partition_range<A, S, P>(
     kind: eredu_runtime::ArchitectureGroupKind,
 ) -> Range<usize>
 where
-    S: eredu_runtime::RuntimeState<MlxBackend>,
-    A: eredu_runtime::LayeredArchitecture<MlxBackend, S>,
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
     P: GroupedPartition,
 {
@@ -4174,8 +4177,8 @@ where
 
 fn architecture_prediction_group<A, S>(architecture: &A, depth: usize) -> Result<usize, Error>
 where
-    S: eredu_runtime::RuntimeState<MlxBackend>,
-    A: eredu_runtime::LayeredArchitecture<MlxBackend, S>,
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
+    A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
 {
     let graph = architecture
@@ -4206,7 +4209,9 @@ where
 #[allow(clippy::too_many_arguments)]
 fn execute_neutral_routed_output_group<'input, A, U, P>(
     architecture: &mut A,
-    input: <A as eredu_runtime::LayeredArchitecture<MlxBackend, MlxHybridState>>::Input<'input>,
+    input: <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::Input<
+        'input,
+    >,
     group: usize,
     units: &mut [MlxModule<U>],
     state: &mut MlxHybridState,
@@ -4217,21 +4222,22 @@ fn execute_neutral_routed_output_group<'input, A, U, P>(
 ) -> Result<(crate::MlxTensor, crate::MlxTensor), Error>
 where
     U: eredu_nn::Parameterized<crate::MlxTensor>,
-    P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
-    A: eredu_runtime::RoutedLayeredArchitecture<MlxBackend, MlxHybridState, Unit = U>
-        + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxBackend, MlxHybridState>,
-    <A as eredu_runtime::LayeredArchitecture<MlxBackend, MlxHybridState>>::Error: std::fmt::Display,
+    A: eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState, Unit = U>
+        + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>,
+    <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::Error:
+        std::fmt::Display,
 {
     let mut forward = match parallel {
         Some(parallel) => <A as eredu_runtime::ParallelLayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             MlxHybridState,
         >>::begin_forward_parallel(
             architecture, input, state, parallel, stream
         ),
         None => {
-            <A as eredu_runtime::LayeredArchitecture<MlxBackend, MlxHybridState>>::begin_forward(
+            <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::begin_forward(
                 architecture,
                 input,
                 state,
@@ -4241,7 +4247,7 @@ where
     }
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let graph =
-        <A as eredu_runtime::LayeredArchitecture<MlxBackend, MlxHybridState>>::execution_graph(
+        <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::execution_graph(
             architecture,
         )
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -4257,7 +4263,7 @@ where
         )));
     }
     if units.len()
-        != <A as eredu_runtime::LayeredArchitecture<MlxBackend, MlxHybridState>>::group_unit_count(
+        != <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_unit_count(
             architecture,
             group,
         )
@@ -4267,7 +4273,7 @@ where
             "neutral output group {group} resident unit count does not match its architecture"
         )));
     }
-    if !<A as eredu_runtime::LayeredArchitecture<MlxBackend, MlxHybridState>>::should_execute_group(
+    if !<A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::should_execute_group(
         architecture,
         group,
         &forward.context,
@@ -4280,7 +4286,7 @@ where
     let dependency = initial.clone();
     let mut hidden = match parallel {
         Some(parallel) => <A as eredu_runtime::ParallelLayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             MlxHybridState,
         >>::begin_execution_group_parallel(
             architecture,
@@ -4292,7 +4298,7 @@ where
             parallel,
             stream,
         ),
-        None => <A as eredu_runtime::LayeredArchitecture<MlxBackend, MlxHybridState>>::begin_execution_group(
+        None => <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::begin_execution_group(
             architecture,
             group,
             &initial,
@@ -4304,45 +4310,44 @@ where
     }
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     for (index, unit) in units.iter_mut().enumerate() {
-        hidden =
-            match parallel {
-                Some(parallel) => <A as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                    MlxBackend,
-                    MlxHybridState,
-                >>::forward_unit_parallel_with_provider(
-                    architecture,
-                    group,
-                    index,
-                    &mut unit.inner,
-                    &hidden,
-                    state,
-                    &mut forward.context,
-                    pass,
-                    provider,
-                    parallel,
-                    stream,
-                ),
-                None => <A as eredu_runtime::RoutedLayeredArchitecture<
-                    MlxBackend,
-                    MlxHybridState,
-                >>::forward_unit_with_provider(
-                    architecture,
-                    group,
-                    index,
-                    &mut unit.inner,
-                    &hidden,
-                    state,
-                    &mut forward.context,
-                    pass,
-                    provider,
-                    stream,
-                ),
-            }
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        hidden = match parallel {
+            Some(parallel) => <A as eredu_runtime::ParallelRoutedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::forward_unit_parallel_with_provider(
+                architecture,
+                group,
+                index,
+                &mut unit.inner,
+                &hidden,
+                state,
+                &mut forward.context,
+                pass,
+                provider,
+                parallel,
+                stream,
+            ),
+            None => <A as eredu_runtime::RoutedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            >>::forward_unit_with_provider(
+                architecture,
+                group,
+                index,
+                &mut unit.inner,
+                &hidden,
+                state,
+                &mut forward.context,
+                pass,
+                provider,
+                stream,
+            ),
+        }
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     }
     hidden = match parallel {
         Some(parallel) => <A as eredu_runtime::ParallelLayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             MlxHybridState,
         >>::complete_execution_group_parallel(
             architecture,
@@ -4353,7 +4358,7 @@ where
             parallel,
             stream,
         ),
-        None => <A as eredu_runtime::LayeredArchitecture<MlxBackend, MlxHybridState>>::complete_execution_group(
+        None => <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::complete_execution_group(
             architecture,
             group,
             &hidden,
@@ -4365,7 +4370,7 @@ where
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let logits = match parallel {
         Some(parallel) => <A as eredu_runtime::ParallelLayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             MlxHybridState,
         >>::finish_forward_parallel(
             architecture,
@@ -4376,7 +4381,7 @@ where
             stream,
         ),
         None => {
-            <A as eredu_runtime::LayeredArchitecture<MlxBackend, MlxHybridState>>::finish_forward(
+            <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::finish_forward(
                 architecture,
                 &hidden,
                 state,
@@ -4397,10 +4402,10 @@ where
 /// output projection remain methods of the neutral architecture.
 fn execute_neutral_decoder_partition<C, P, Bindings>(
     stage: &mut DecoderPipelineRealization<
-        eredu_architectures::decoder::LayeredModel<MlxBackend, C, P>,
+        eredu_architectures::decoder::LayeredModel<MlxNeuralBackend, C, P>,
         eredu_architectures::decoder::LocalGeometry<C>,
         Bindings,
-        MlxModule<eredu_architectures::decoder::TransformerBlock<MlxBackend, P::FeedForward>>,
+        MlxModule<eredu_architectures::decoder::TransformerBlock<MlxNeuralBackend, P::FeedForward>>,
     >,
     input: PipelineStageInput<'_>,
     step: PipelineStep,
@@ -4411,8 +4416,8 @@ fn execute_neutral_decoder_partition<C, P, Bindings>(
 ) -> Result<PipelineStageOutput, Error>
 where
     C: eredu_architectures::decoder::Config,
-    P: eredu_architectures::decoder::BlockFactory<MlxBackend, C>,
-    eredu_architectures::decoder::TransformerBlock<MlxBackend, P::FeedForward>:
+    P: eredu_architectures::decoder::BlockFactory<MlxNeuralBackend, C>,
+    eredu_architectures::decoder::TransformerBlock<MlxNeuralBackend, P::FeedForward>:
         eredu_nn::Parameterized<crate::MlxTensor>,
 {
     let partition = &stage.partition;
@@ -4503,11 +4508,11 @@ where
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         forward.hidden = match parallel {
             Some(parallel) => <eredu_architectures::decoder::LayeredModel<
-                MlxBackend,
+                MlxNeuralBackend,
                 C,
                 P,
             > as eredu_runtime::ParallelLayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::begin_execution_group_parallel(
                 architecture,
@@ -4520,11 +4525,11 @@ where
                 execution_stream,
             ),
             None => <eredu_architectures::decoder::LayeredModel<
-                MlxBackend,
+                MlxNeuralBackend,
                 C,
                 P,
             > as eredu_runtime::LayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::begin_execution_group(
                 architecture,
@@ -4558,11 +4563,11 @@ where
         let mut state = PipelineRangeState::new(state_layout, range, caches)?;
         let logits = match parallel {
             Some(parallel) => <eredu_architectures::decoder::LayeredModel<
-                MlxBackend,
+                MlxNeuralBackend,
                 C,
                 P,
             > as eredu_runtime::ParallelLayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::finish_forward_parallel(
                 architecture,
@@ -4573,11 +4578,11 @@ where
                 execution_stream,
             ),
             None => <eredu_architectures::decoder::LayeredModel<
-                MlxBackend,
+                MlxNeuralBackend,
                 C,
                 P,
             > as eredu_runtime::LayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::finish_forward(
                 architecture,
@@ -4601,10 +4606,12 @@ where
 #[allow(clippy::too_many_arguments)]
 fn execute_neutral_routed_decoder_partition<C, BF, Bindings, P>(
     stage: &mut DecoderPipelineRealization<
-        eredu_architectures::decoder::LayeredModel<MlxBackend, C, BF>,
+        eredu_architectures::decoder::LayeredModel<MlxNeuralBackend, C, BF>,
         eredu_architectures::decoder::LocalGeometry<C>,
         Bindings,
-        MlxModule<eredu_architectures::decoder::TransformerBlock<MlxBackend, BF::FeedForward>>,
+        MlxModule<
+            eredu_architectures::decoder::TransformerBlock<MlxNeuralBackend, BF::FeedForward>,
+        >,
     >,
     input: PipelineStageInput<'_>,
     step: PipelineStep,
@@ -4617,11 +4624,11 @@ fn execute_neutral_routed_decoder_partition<C, BF, Bindings, P>(
 ) -> Result<PipelineStageOutput, Error>
 where
     C: eredu_architectures::decoder::Config,
-    BF: eredu_architectures::decoder::BlockFactory<MlxBackend, C>,
-    BF::FeedForward: eredu_architectures::decoder::RoutedFeedForwardOperator<MlxBackend>,
-    eredu_architectures::decoder::TransformerBlock<MlxBackend, BF::FeedForward>:
+    BF: eredu_architectures::decoder::BlockFactory<MlxNeuralBackend, C>,
+    BF::FeedForward: eredu_architectures::decoder::RoutedFeedForwardOperator<MlxNeuralBackend>,
+    eredu_architectures::decoder::TransformerBlock<MlxNeuralBackend, BF::FeedForward>:
         eredu_nn::Parameterized<crate::MlxTensor>,
-    P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
     let partition = &stage.partition;
@@ -4702,11 +4709,11 @@ where
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         forward.hidden = match parallel {
             Some(parallel) => <eredu_architectures::decoder::LayeredModel<
-                MlxBackend,
+                MlxNeuralBackend,
                 C,
                 BF,
             > as eredu_runtime::ParallelLayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::begin_execution_group_parallel(
                 architecture,
@@ -4719,11 +4726,11 @@ where
                 execution_stream,
             ),
             None => <eredu_architectures::decoder::LayeredModel<
-                MlxBackend,
+                MlxNeuralBackend,
                 C,
                 BF,
             > as eredu_runtime::LayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::begin_execution_group(
                 architecture,
@@ -4757,11 +4764,11 @@ where
         let mut state = PipelineRangeState::new(state_layout, range, caches)?;
         let logits = match parallel {
             Some(parallel) => <eredu_architectures::decoder::LayeredModel<
-                MlxBackend,
+                MlxNeuralBackend,
                 C,
                 BF,
             > as eredu_runtime::ParallelLayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::finish_forward_parallel(
                 architecture,
@@ -4772,11 +4779,11 @@ where
                 execution_stream,
             ),
             None => <eredu_architectures::decoder::LayeredModel<
-                MlxBackend,
+                MlxNeuralBackend,
                 C,
                 BF,
             > as eredu_runtime::LayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::finish_forward(
                 architecture,
@@ -4883,8 +4890,8 @@ fn execute_neutral_lfm2_partition(
         }
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         forward.hidden = match parallel {
-            Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxBackend> as ParallelLayeredArchitecture<
-                MlxBackend,
+            Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::begin_execution_group_parallel(
                 &mut stage.architecture,
@@ -4896,8 +4903,8 @@ fn execute_neutral_lfm2_partition(
                 parallel,
                 execution_stream,
             ),
-            None => <eredu_architectures::lfm2::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            None => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::begin_execution_group(
                 &mut stage.architecture,
@@ -4928,8 +4935,8 @@ fn execute_neutral_lfm2_partition(
     if owns_output {
         let mut state = PipelineRangeState::new(state_layout, range, caches)?;
         let logits = match parallel {
-            Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxBackend> as ParallelLayeredArchitecture<
-                MlxBackend,
+            Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::finish_forward_parallel(
                 &mut stage.architecture,
@@ -4939,8 +4946,8 @@ fn execute_neutral_lfm2_partition(
                 parallel,
                 execution_stream,
             ),
-            None => <eredu_architectures::lfm2::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            None => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::finish_forward(
                 &mut stage.architecture,
@@ -4973,7 +4980,7 @@ fn execute_neutral_routed_lfm2_partition<P>(
     stream: &Stream,
 ) -> Result<PipelineStageOutput, Error>
 where
-    P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
     let [group] = stage.partition.groups() else {
@@ -5041,8 +5048,8 @@ where
         }
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         forward.hidden = match parallel {
-            Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxBackend> as ParallelLayeredArchitecture<
-                MlxBackend,
+            Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::begin_execution_group_parallel(
                 &mut stage.architecture,
@@ -5054,8 +5061,8 @@ where
                 parallel,
                 execution_stream,
             ),
-            None => <eredu_architectures::lfm2::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            None => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::begin_execution_group(
                 &mut stage.architecture,
@@ -5088,8 +5095,8 @@ where
     if owns_output {
         let mut state = PipelineRangeState::new(state_layout, range, caches)?;
         let logits = match parallel {
-            Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxBackend> as ParallelLayeredArchitecture<
-                MlxBackend,
+            Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::finish_forward_parallel(
                 &mut stage.architecture,
@@ -5099,8 +5106,8 @@ where
                 parallel,
                 execution_stream,
             ),
-            None => <eredu_architectures::lfm2::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            None => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::finish_forward(
                 &mut stage.architecture,
@@ -5133,7 +5140,7 @@ fn execute_neutral_routed_kimi_partition<P>(
     stream: &Stream,
 ) -> Result<PipelineStageOutput, Error>
 where
-    P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
     let [group] = stage.partition.groups() else {
@@ -5202,8 +5209,8 @@ where
         }
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         forward.hidden = match parallel {
-            Some(parallel) => <eredu_architectures::kimi_linear::LayeredModel<MlxBackend> as ParallelLayeredArchitecture<
-                MlxBackend,
+            Some(parallel) => <eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::begin_execution_group_parallel(
                 &mut stage.architecture,
@@ -5215,8 +5222,8 @@ where
                 parallel,
                 execution_stream,
             ),
-            None => <eredu_architectures::kimi_linear::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            None => <eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::begin_execution_group(
                 &mut stage.architecture,
@@ -5249,8 +5256,8 @@ where
     if owns_output {
         let mut state = PipelineRangeState::new(state_layout, range, caches)?;
         let logits = match parallel {
-            Some(parallel) => <eredu_architectures::kimi_linear::LayeredModel<MlxBackend> as ParallelLayeredArchitecture<
-                MlxBackend,
+            Some(parallel) => <eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::finish_forward_parallel(
                 &mut stage.architecture,
@@ -5260,8 +5267,8 @@ where
                 parallel,
                 execution_stream,
             ),
-            None => <eredu_architectures::kimi_linear::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            None => <eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 PipelineRangeState<'_>,
             >>::finish_forward(
                 &mut stage.architecture,
@@ -7385,8 +7392,8 @@ impl PipelinePlacedIngress for MuseGlimmerPipelinePartition {
             eredu_runtime::ArchitectureGroupKind::VisionEncoder,
         )?;
         Ok(
-            <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxKeyValueState,
             >>::should_execute_group(
                 &self.architecture, vision_group, &state.forward.context
@@ -7460,14 +7467,14 @@ impl PipelinePlacedIngress for MuseGlimmerPipelinePartition {
             &self.architecture,
             eredu_runtime::ArchitectureGroupKind::VisionEncoder,
         )?;
-        if <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-            MlxBackend,
+        if <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
             MlxKeyValueState,
         >>::should_execute_group(&self.architecture, vision_group, &state.forward.context)
         {
             state.forward.hidden =
-                <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-                    MlxBackend,
+                <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                    MlxNeuralBackend,
                     MlxKeyValueState,
                 >>::complete_execution_group(
                     &mut self.architecture,
@@ -7502,15 +7509,15 @@ impl PipelinePlacedIngress for MuseGlimmerPipelinePartition {
             &self.architecture,
             eredu_runtime::ArchitectureGroupKind::VisionEncoder,
         )?;
-        if <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-            MlxBackend,
+        if <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
             MlxKeyValueState,
         >>::should_execute_group(
             &self.architecture, vision_group, &ingress.forward.context
         ) {
             ingress.forward.hidden =
-                <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-                    MlxBackend,
+                <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                    MlxNeuralBackend,
                     MlxKeyValueState,
                 >>::complete_execution_group(
                     &mut self.architecture,
@@ -7954,7 +7961,7 @@ impl QwenVlPipelinePartition {
     }
 
     fn new(
-        architecture: eredu_architectures::qwen::vl::LayeredModel<MlxBackend>,
+        architecture: eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Option<Arc<eredu_architectures::qwen::vl::LocalGeometry>>,
             eredu_architectures::qwen::vl::PipelineBoundarySchema,
@@ -8061,7 +8068,7 @@ impl QwenVlPipelinePartition {
                     .forward_pipeline_vision(index, block, state, tensor_group, stream)
                     .map_err(|error| Error::Parallel(error.to_string()))?;
                 synchronize_outputs(
-                    eredu_architectures::qwen::vl::LayeredModel::<MlxBackend>::pipeline_retained_values(state)
+                    eredu_architectures::qwen::vl::LayeredModel::<MlxNeuralBackend>::pipeline_retained_values(state)
                         .iter()
                         .map(crate::MlxTensor::as_array),
                 )?;
@@ -8382,11 +8389,9 @@ impl PipelinePlacedIngress for QwenVlPipelinePartition {
             .ingress_state
             .as_ref()
             .ok_or_else(|| Error::Parallel("Qwen3-VL ingress state is unavailable".into()))?;
-        Ok(
-            eredu_architectures::qwen::vl::LayeredModel::<MlxBackend>::pipeline_vision_active(
-                state,
-            ),
-        )
+        Ok(eredu_architectures::qwen::vl::LayeredModel::<
+            MlxNeuralBackend,
+        >::pipeline_vision_active(state))
     }
 
     fn placed_ingress_arrays(&self, _group: &str) -> Result<Vec<Array>, Error> {
@@ -8395,7 +8400,7 @@ impl PipelinePlacedIngress for QwenVlPipelinePartition {
             .as_ref()
             .ok_or_else(|| Error::Parallel("Qwen3-VL ingress state is unavailable".into()))?;
         Ok(
-            eredu_architectures::qwen::vl::LayeredModel::<MlxBackend>::pipeline_retained_values(
+            eredu_architectures::qwen::vl::LayeredModel::<MlxNeuralBackend>::pipeline_retained_values(
                 state,
             )
             .into_iter()
@@ -8413,7 +8418,7 @@ impl PipelinePlacedIngress for QwenVlPipelinePartition {
             .ingress_state
             .as_mut()
             .ok_or_else(|| Error::Parallel("Qwen3-VL ingress state is unavailable".into()))?;
-        eredu_architectures::qwen::vl::LayeredModel::<MlxBackend>::replace_pipeline_retained_values(
+        eredu_architectures::qwen::vl::LayeredModel::<MlxNeuralBackend>::replace_pipeline_retained_values(
             state,
             arrays
                 .into_iter()
@@ -8505,8 +8510,9 @@ impl PipelinePlacedIngress for QwenVlPipelinePartition {
         let group = execution
             .filter(|execution| execution.is_tensor_parallel())
             .and_then(ParallelExecutionContext::group);
-        if eredu_architectures::qwen::vl::LayeredModel::<MlxBackend>::pipeline_vision_active(&state)
-        {
+        if eredu_architectures::qwen::vl::LayeredModel::<MlxNeuralBackend>::pipeline_vision_active(
+            &state,
+        ) {
             self.execute_vision_state(&mut state, group, stream)?;
         }
         let prepared = self
@@ -8586,7 +8592,7 @@ impl QwenConditionalPipelinePartition {
     }
 
     fn new(
-        architecture: eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend>,
+        architecture: eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Option<Arc<eredu_architectures::qwen::hybrid::ConditionalLocalGeometry>>,
             eredu_architectures::qwen::hybrid::ConditionalPipelineBoundarySchema,
@@ -8697,7 +8703,7 @@ impl QwenConditionalPipelinePartition {
                     .forward_pipeline_vision(index, block, state, tensor_group, stream)
                     .map_err(|error| Error::Parallel(error.to_string()))?;
                 synchronize_outputs(
-                    eredu_architectures::qwen::hybrid::ConditionalLayeredModel::<MlxBackend>::pipeline_retained_values(state)
+                    eredu_architectures::qwen::hybrid::ConditionalLayeredModel::<MlxNeuralBackend>::pipeline_retained_values(state)
                         .iter()
                         .map(crate::MlxTensor::as_array),
                 )?;
@@ -9136,7 +9142,7 @@ impl PipelinePlacedIngress for QwenConditionalPipelinePartition {
             Error::Parallel("conditional Qwen3.5 ingress state is unavailable".into())
         })?;
         Ok(eredu_architectures::qwen::hybrid::ConditionalLayeredModel::<
-                MlxBackend,
+                MlxNeuralBackend,
             >::pipeline_vision_active(state))
     }
 
@@ -9145,7 +9151,7 @@ impl PipelinePlacedIngress for QwenConditionalPipelinePartition {
             Error::Parallel("conditional Qwen3.5 ingress state is unavailable".into())
         })?;
         Ok(eredu_architectures::qwen::hybrid::ConditionalLayeredModel::<
-                MlxBackend,
+                MlxNeuralBackend,
             >::pipeline_retained_values(state)
             .into_iter()
             .map(crate::MlxTensor::into_array)
@@ -9160,7 +9166,7 @@ impl PipelinePlacedIngress for QwenConditionalPipelinePartition {
         let state = self.ingress_state.as_mut().ok_or_else(|| {
             Error::Parallel("conditional Qwen3.5 ingress state is unavailable".into())
         })?;
-        eredu_architectures::qwen::hybrid::ConditionalLayeredModel::<MlxBackend>::replace_pipeline_retained_values(
+        eredu_architectures::qwen::hybrid::ConditionalLayeredModel::<MlxNeuralBackend>::replace_pipeline_retained_values(
             state,
             arrays.into_iter().map(crate::MlxTensor::from_array).collect(),
         )
@@ -9245,7 +9251,7 @@ impl PipelinePlacedIngress for QwenConditionalPipelinePartition {
             .filter(|execution| execution.is_tensor_parallel())
             .and_then(ParallelExecutionContext::group);
         if eredu_architectures::qwen::hybrid::ConditionalLayeredModel::<
-                MlxBackend,
+                MlxNeuralBackend,
             >::pipeline_vision_active(&state)
             {
                 self.execute_vision_state(&mut state, group, stream)?;
@@ -12252,9 +12258,9 @@ fn architecture_transport_placement<A, S>(
     pipeline_stages: usize,
 ) -> Result<PlacedExecutionDag, Error>
 where
-    A: LayeredArchitecture<MlxBackend, S>,
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
-    S: eredu_runtime::RuntimeState<MlxBackend>,
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
 {
     let graph = architecture
         .execution_graph()
@@ -12323,9 +12329,9 @@ fn decoder_architecture_transport<A, S>(
     pipeline_stages: usize,
 ) -> Result<PlacedExecutionDag, Error>
 where
-    A: LayeredArchitecture<MlxBackend, S>,
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
-    S: eredu_runtime::RuntimeState<MlxBackend>,
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
 {
     let graph = architecture
         .execution_graph()
@@ -12344,9 +12350,9 @@ fn prediction_architecture_transport<A, S>(
     pipeline_stages: usize,
 ) -> Result<PlacedExecutionDag, Error>
 where
-    A: LayeredArchitecture<MlxBackend, S>,
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
-    S: eredu_runtime::RuntimeState<MlxBackend>,
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
 {
     architecture_transport_placement(architecture, pipeline_stages)
 }
@@ -12356,9 +12362,9 @@ fn media_architecture_transport<A, S>(
     pipeline_stages: usize,
 ) -> Result<PlacedExecutionDag, Error>
 where
-    A: LayeredArchitecture<MlxBackend, S>,
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
     A::Error: std::fmt::Display,
-    S: eredu_runtime::RuntimeState<MlxBackend>,
+    S: eredu_runtime::RuntimeState<MlxNeuralBackend>,
 {
     architecture_transport_placement(architecture, pipeline_stages)
 }
@@ -12879,7 +12885,7 @@ struct ArchitectureStaticLoader<'a> {
     stream: &'a Stream,
 }
 
-impl StaticParameterVisitorMut<MlxBackend> for ArchitectureStaticLoader<'_> {
+impl StaticParameterVisitorMut<MlxNeuralBackend> for ArchitectureStaticLoader<'_> {
     type Error = Error;
 
     fn visit_mut<M>(&mut self, role: &str, module: &mut M) -> Result<(), Self::Error>
@@ -12939,7 +12945,7 @@ fn load_architecture_static_parameters<A>(
     stream: &Stream,
 ) -> Result<(), Error>
 where
-    A: BindableStaticParameters<MlxBackend>,
+    A: BindableStaticParameters<MlxNeuralBackend>,
 {
     let mut visitor = ArchitectureStaticLoader {
         selected_roles: roles.iter().map(|role| (*role).to_owned()).collect(),
@@ -14585,25 +14591,27 @@ fn load_llama_pipeline(
     };
     let range = topology.layer_range(source_args.attention_schedule.len())?;
     let binding_adapter = crate::composition::llama::LlamaPipelineBindings::new();
-    let seed_architecture =
-        eredu_architectures::llama::LayeredModel::<MlxBackend>::new(target_args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let seed_architecture = eredu_architectures::llama::LayeredModel::<MlxNeuralBackend>::new(
+        target_args.clone(),
+        stream,
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut parameter_groups =
-        eredu_architectures::llama::static_parallel_parameter_groups::<MlxBackend>(
+        eredu_architectures::llama::static_parallel_parameter_groups::<MlxNeuralBackend>(
             &seed_architecture.static_modules().embeddings,
             &seed_architecture.static_modules().norm,
             seed_architecture.static_modules().lm_head.as_ref(),
             "model",
         )?;
     for layer in 0..target_args.num_hidden_layers as usize {
-        let block = eredu_architectures::llama::TransformerBlock::<MlxBackend>::new(
+        let block = eredu_architectures::llama::TransformerBlock::<MlxNeuralBackend>::new(
             &target_args,
             layer,
             stream,
         )
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         parameter_groups.extend(
-            eredu_architectures::llama::layer_parallel_parameter_groups::<MlxBackend>(
+            eredu_architectures::llama::layer_parallel_parameter_groups::<MlxNeuralBackend>(
                 &block,
                 &target_args,
                 layer,
@@ -14619,12 +14627,13 @@ fn load_llama_pipeline(
         let (_, layout) = planner.finish()?;
         let geometry = eredu_architectures::llama::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let architecture = eredu_architectures::llama::LayeredModel::<MlxBackend>::new_parallel(
-            target_args.clone(),
-            geometry,
-            stream,
-        )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let architecture =
+            eredu_architectures::llama::LayeredModel::<MlxNeuralBackend>::new_parallel(
+                target_args.clone(),
+                geometry,
+                stream,
+            )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         (architecture, Some(layout))
     } else {
         (seed_architecture, None)
@@ -14647,7 +14656,7 @@ fn load_llama_pipeline(
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
@@ -14662,7 +14671,7 @@ fn load_llama_pipeline(
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
             Some((local_state, range.start)),
@@ -14927,17 +14936,18 @@ fn load_qwen_pipeline(
         .take()
         .expect("Qwen partition constructor owns a neutral architecture");
     let mut parameter_groups =
-        eredu_architectures::qwen::static_parallel_parameter_groups::<MlxBackend>(
+        eredu_architectures::qwen::static_parallel_parameter_groups::<MlxNeuralBackend>(
             &seed_architecture.static_modules().embeddings,
             &seed_architecture.static_modules().norm,
             seed_architecture.static_modules().lm_head.as_ref(),
             &target_args.parameter_root,
         )?;
     for layer in 0..target_args.num_hidden_layers as usize {
-        let block = eredu_architectures::qwen::new_block::<MlxBackend>(&target_args, layer, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let block =
+            eredu_architectures::qwen::new_block::<MlxNeuralBackend>(&target_args, layer, stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         parameter_groups.extend(
-            eredu_architectures::qwen::layer_parallel_parameter_groups::<MlxBackend>(
+            eredu_architectures::qwen::layer_parallel_parameter_groups::<MlxNeuralBackend>(
                 &block,
                 &target_args,
                 layer,
@@ -14954,7 +14964,7 @@ fn load_qwen_pipeline(
         let geometry = eredu_architectures::qwen::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         stage.architecture = Some(
-            eredu_architectures::qwen::LayeredModel::<MlxBackend>::new_parallel(
+            eredu_architectures::qwen::LayeredModel::<MlxNeuralBackend>::new_parallel(
                 target_args.clone(),
                 geometry,
                 stream,
@@ -14998,7 +15008,7 @@ fn load_qwen_pipeline(
         .shared_parallel_geometry();
     let ownership_probe = info
         .placement
-        .realize_architecture_partition::<MlxBackend, PipelineRangeState<'_>, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, PipelineRangeState<'_>, _, _, _>(
             stage.architecture.as_ref().unwrap(),
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
@@ -15015,7 +15025,7 @@ fn load_qwen_pipeline(
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info
         .placement
-        .realize_architecture_partition::<MlxBackend, PipelineRangeState<'_>, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, PipelineRangeState<'_>, _, _, _>(
             stage.architecture.as_ref().unwrap(),
             info.pipeline_stage,
             Some((local_state, range.start)),
@@ -15041,13 +15051,13 @@ fn load_qwen_pipeline(
         Some(quantization) => {
             let source_architecture = match stage.architecture.shared_parallel_geometry() {
                 Some(geometry) => {
-                    eredu_architectures::qwen::LayeredModel::<MlxBackend>::new_parallel(
+                    eredu_architectures::qwen::LayeredModel::<MlxNeuralBackend>::new_parallel(
                         source_args.clone(),
                         (*geometry).clone(),
                         stream,
                     )
                 }
-                None => eredu_architectures::qwen::LayeredModel::<MlxBackend>::new(
+                None => eredu_architectures::qwen::LayeredModel::<MlxNeuralBackend>::new(
                     source_args.clone(),
                     stream,
                 ),
@@ -15297,7 +15307,7 @@ fn load_muse_glimmer_pipeline(
         parameter_groups.extend(muse_glimmer::layer_parameter_groups(&target_args, layer)?);
     }
     let seed_architecture =
-        muse_glimmer::LayeredModel::<MlxBackend>::new(target_args.clone(), stream)
+        muse_glimmer::LayeredModel::<MlxNeuralBackend>::new(target_args.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let (architecture, parallel_layout) = if topology.tensor_parallel_size > 1 {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
@@ -15308,7 +15318,7 @@ fn load_muse_glimmer_pipeline(
         let (_, layout) = planner.finish()?;
         let geometry = muse_glimmer::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let architecture = muse_glimmer::LayeredModel::<MlxBackend>::new_parallel(
+        let architecture = muse_glimmer::LayeredModel::<MlxNeuralBackend>::new_parallel(
             target_args.clone(),
             geometry,
             stream,
@@ -15336,7 +15346,7 @@ fn load_muse_glimmer_pipeline(
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxKeyValueState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxKeyValueState, _, _, _>(
             &architecture,
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
@@ -15351,7 +15361,7 @@ fn load_muse_glimmer_pipeline(
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxKeyValueState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxKeyValueState, _, _, _>(
             &architecture,
             info.pipeline_stage,
             Some((local_state, range.start)),
@@ -15377,8 +15387,8 @@ fn load_muse_glimmer_pipeline(
     let vision_layers = vision_range
         .clone()
         .map(|index| {
-            <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxKeyValueState,
             >>::build_unit(&architecture, vision_group, index, stream)
             .map(MlxModule::new)
@@ -15387,8 +15397,8 @@ fn load_muse_glimmer_pipeline(
         .collect::<Result<Vec<_>, _>>()?;
     let layers = decoder_range
         .map(|index| {
-            <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxKeyValueState,
             >>::build_unit(&architecture, decoder_group, index, stream)
             .map(MlxModule::new)
@@ -15424,12 +15434,14 @@ fn load_muse_glimmer_pipeline(
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
             let source_architecture = match stage.architecture.shared_parallel_geometry() {
-                Some(geometry) => muse_glimmer::LayeredModel::<MlxBackend>::new_parallel(
+                Some(geometry) => muse_glimmer::LayeredModel::<MlxNeuralBackend>::new_parallel(
                     source_args.clone(),
                     (*geometry).clone(),
                     stream,
                 ),
-                None => muse_glimmer::LayeredModel::<MlxBackend>::new(source_args.clone(), stream),
+                None => {
+                    muse_glimmer::LayeredModel::<MlxNeuralBackend>::new(source_args.clone(), stream)
+                }
             }
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let source_quantization =
@@ -15478,8 +15490,8 @@ fn load_muse_glimmer_pipeline(
             store.as_ref(),
             parallel_layout.as_ref(),
         )?;
-        let modules = <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-            MlxBackend,
+        let modules = <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
             MlxKeyValueState,
         >>::static_modules_mut(&mut stage.architecture);
         let mut vision = crate::backend::mlx::nn::shared::MlxModuleRef::new(&mut modules.vision);
@@ -15500,8 +15512,8 @@ fn load_muse_glimmer_pipeline(
             store.as_ref(),
             parallel_layout.as_ref(),
         )?;
-        let modules = <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-            MlxBackend,
+        let modules = <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
             MlxKeyValueState,
         >>::static_modules_mut(&mut stage.architecture);
         loaded.load(
@@ -15515,8 +15527,8 @@ fn load_muse_glimmer_pipeline(
         )?;
     }
     if static_roles.contains(&"norm") {
-        let modules = <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-            MlxBackend,
+        let modules = <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
             MlxKeyValueState,
         >>::static_modules_mut(&mut stage.architecture);
         loaded.load(
@@ -15535,8 +15547,8 @@ fn load_muse_glimmer_pipeline(
                 store.as_ref(),
                 parallel_layout.as_ref(),
             )?;
-            let modules = <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            let modules = <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxKeyValueState,
             >>::static_modules_mut(&mut stage.architecture);
             if let Some(module) = &mut modules.text.head {
@@ -15636,8 +15648,8 @@ fn load_muse_glimmer_pipeline(
                 } else {
                     (decoder_group, text_start + ordinal - vision_count)
                 };
-                <eredu_architectures::muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-                    MlxBackend,
+                <eredu_architectures::muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                    MlxNeuralBackend,
                     MlxKeyValueState,
                 >>::build_unit(architecture, group, index, stream)
                     .map(MlxModule::new)
@@ -15795,19 +15807,19 @@ fn load_neutral_qwen_vl_pipeline(
         eredu_architectures::qwen::vl::LayeredModel::new(target_args.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let static_modules =
-        <eredu_architectures::qwen::vl::LayeredModel<MlxBackend> as LayeredArchitecture<
-            MlxBackend,
+        <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::static_modules(&binding_architecture);
     let mut parameter_groups =
-        eredu_architectures::qwen::static_parallel_parameter_groups::<MlxBackend>(
+        eredu_architectures::qwen::static_parallel_parameter_groups::<MlxNeuralBackend>(
             &static_modules.text.embeddings,
             &static_modules.text.norm,
             static_modules.text.lm_head.as_ref(),
             &target_args.text.parameter_root,
         )?;
     parameter_groups.extend(
-        eredu_architectures::qwen::vision::static_parallel_parameter_groups::<MlxBackend>(
+        eredu_architectures::qwen::vision::static_parallel_parameter_groups::<MlxNeuralBackend>(
             &static_modules.vision,
             &target_args.vision,
             "model.visual",
@@ -15842,7 +15854,7 @@ fn load_neutral_qwen_vl_pipeline(
             unreachable!()
         };
         parameter_groups.extend(
-            eredu_architectures::qwen::layer_parallel_parameter_groups::<MlxBackend>(
+            eredu_architectures::qwen::layer_parallel_parameter_groups::<MlxNeuralBackend>(
                 &block,
                 &target_args.text,
                 index,
@@ -15889,7 +15901,7 @@ fn load_neutral_qwen_vl_pipeline(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let ownership_probe = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
             None,
@@ -15905,7 +15917,7 @@ fn load_neutral_qwen_vl_pipeline(
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
             Some((local_state, range.start)),
@@ -15938,36 +15950,35 @@ fn load_neutral_qwen_vl_pipeline(
     let static_roles = parameter_description.select_static_roles(&stage.partition);
     let need_vision = static_roles.contains(&"vision");
     let need_embedding = static_roles.contains(&"embedding");
-    let (store, materialization) = match quantize_on_load {
-        Some(quantization) => {
-            let source_architecture =
-                eredu_architectures::qwen::vl::LayeredModel::<MlxBackend>::new(
-                    source_args.clone(),
-                    stream,
-                )
+    let (store, materialization) =
+        match quantize_on_load {
+            Some(quantization) => {
+                let source_architecture = eredu_architectures::qwen::vl::LayeredModel::<
+                    MlxNeuralBackend,
+                >::new(source_args.clone(), stream)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-            let source_quantization =
-                BoundPipelineBindings::new(&binding_adapter, &source_architecture);
-            let target_quantization =
-                BoundPipelineBindings::new(&target_adapter, &binding_architecture);
-            let (store, report) = quantize_pipeline_stage_store(
-                store,
-                &source_quantization,
-                &target_quantization,
-                stage.partition.parameter_bindings(),
-                PipelineStageQuantizationSelection::new(
-                    &static_roles,
-                    decoder_group,
-                    stage.range().clone(),
-                )
-                .with_layer_group(vision_group, stage.vision_range().clone()),
-                quantization,
-                stream,
-            )?;
-            (store, Some(report))
-        }
-        None => (store, None),
-    };
+                let source_quantization =
+                    BoundPipelineBindings::new(&binding_adapter, &source_architecture);
+                let target_quantization =
+                    BoundPipelineBindings::new(&target_adapter, &binding_architecture);
+                let (store, report) = quantize_pipeline_stage_store(
+                    store,
+                    &source_quantization,
+                    &target_quantization,
+                    stage.partition.parameter_bindings(),
+                    PipelineStageQuantizationSelection::new(
+                        &static_roles,
+                        decoder_group,
+                        stage.range().clone(),
+                    )
+                    .with_layer_group(vision_group, stage.vision_range().clone()),
+                    quantization,
+                    stream,
+                )?;
+                (store, Some(report))
+            }
+            None => (store, None),
+        };
     let quantize_on_load = materialization
         .is_none()
         .then_some(quantize_on_load)
@@ -15992,8 +16003,8 @@ fn load_neutral_qwen_vl_pipeline(
         } else {
             bindings
         };
-        let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+        let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::static_modules_mut(&mut stage.architecture);
         loaded.load(
@@ -16013,8 +16024,8 @@ fn load_neutral_qwen_vl_pipeline(
         } else {
             bindings
         };
-        let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+        let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::static_modules_mut(&mut stage.architecture);
         loaded.load(
@@ -16028,8 +16039,8 @@ fn load_neutral_qwen_vl_pipeline(
         )?;
     }
     if static_roles.contains(&"norm") {
-        let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+        let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::static_modules_mut(&mut stage.architecture);
         loaded.load(
@@ -16284,10 +16295,10 @@ impl QwenPipelinePartition {
         stream: &Stream,
     ) -> Result<
         DecoderPipelineBuilder<
-            eredu_architectures::qwen::LayeredModel<MlxBackend>,
+            eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>,
             eredu_architectures::qwen::LocalGeometry,
             crate::composition::qwen::QwenPipelineBindings,
-            MlxModule<eredu_architectures::qwen::TransformerBlock<MlxBackend>>,
+            MlxModule<eredu_architectures::qwen::TransformerBlock<MlxNeuralBackend>>,
         >,
         Error,
     > {
@@ -16297,7 +16308,7 @@ impl QwenPipelinePartition {
             crate::composition::qwen::QwenPipelineBindings::new()
         };
         let architecture =
-            eredu_architectures::qwen::LayeredModel::<MlxBackend>::new(args.clone(), stream)
+            eredu_architectures::qwen::LayeredModel::<MlxNeuralBackend>::new(args.clone(), stream)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let layers = range
             .clone()
@@ -16367,8 +16378,8 @@ impl MuseGlimmerPipelinePartition {
         };
         let forward = if let Some(execution) = execution.filter(|value| value.is_tensor_parallel())
         {
-            <muse_glimmer::LayeredModel<MlxBackend> as ParallelLayeredArchitecture<
-                MlxBackend,
+            <muse_glimmer::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                MlxNeuralBackend,
                 MlxKeyValueState,
             >>::begin_forward_parallel(
                 &mut self.architecture,
@@ -16380,8 +16391,8 @@ impl MuseGlimmerPipelinePartition {
                 stream,
             )
         } else {
-            <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxKeyValueState,
             >>::begin_forward(&mut self.architecture, model_input, &mut state, stream)
         };
@@ -16423,8 +16434,8 @@ impl MuseGlimmerPipelinePartition {
                     .then(|| storage.prepare_layerwise_absolute(ordinal))
                     .transpose()?;
                 let mut layer = MlxModule::new(
-                    <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-                        MlxBackend,
+                    <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                        MlxNeuralBackend,
                         MlxKeyValueState,
                     >>::build_unit(
                         &self.architecture, vision_group, index, stream
@@ -16439,40 +16450,41 @@ impl MuseGlimmerPipelinePartition {
                         .or(lease.as_ref())
                         .expect("Muse-Glimmer placed vision residency lease"),
                 )?;
-                let hidden =
-                    if let Some(execution) = execution.filter(|value| value.is_tensor_parallel()) {
-                        <muse_glimmer::LayeredModel<MlxBackend> as ParallelLayeredArchitecture<
-                            MlxBackend,
-                            MlxKeyValueState,
-                        >>::forward_unit_parallel(
-                            &mut self.architecture,
-                            vision_group,
-                            index,
-                            &mut *layer,
-                            &state.forward.hidden,
-                            &mut state.state,
-                            &mut state.forward.context,
-                            execution.group().ok_or_else(|| {
-                                Error::Parallel("Muse-Glimmer TP group is missing".into())
-                            })?,
-                            stream,
-                        )
-                    } else {
-                        <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-                            MlxBackend,
-                            MlxKeyValueState,
-                        >>::forward_unit(
-                            &mut self.architecture,
-                            vision_group,
-                            index,
-                            &mut *layer,
-                            &state.forward.hidden,
-                            &mut state.state,
-                            &mut state.forward.context,
-                            stream,
-                        )
-                    }
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                let hidden = if let Some(execution) =
+                    execution.filter(|value| value.is_tensor_parallel())
+                {
+                    <muse_glimmer::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                        MlxNeuralBackend,
+                        MlxKeyValueState,
+                    >>::forward_unit_parallel(
+                        &mut self.architecture,
+                        vision_group,
+                        index,
+                        &mut *layer,
+                        &state.forward.hidden,
+                        &mut state.state,
+                        &mut state.forward.context,
+                        execution.group().ok_or_else(|| {
+                            Error::Parallel("Muse-Glimmer TP group is missing".into())
+                        })?,
+                        stream,
+                    )
+                } else {
+                    <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                        MlxNeuralBackend,
+                        MlxKeyValueState,
+                    >>::forward_unit(
+                        &mut self.architecture,
+                        vision_group,
+                        index,
+                        &mut *layer,
+                        &state.forward.hidden,
+                        &mut state.state,
+                        &mut state.forward.context,
+                        stream,
+                    )
+                }
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
                 state.forward.hidden = hidden;
                 synchronize_outputs([state.hidden().as_array()])?;
                 drop(transfer);
@@ -16492,40 +16504,41 @@ impl MuseGlimmerPipelinePartition {
             }
         } else {
             for (index, layer) in self.vision_range().clone().zip(&mut self.vision_layers) {
-                let hidden =
-                    if let Some(execution) = execution.filter(|value| value.is_tensor_parallel()) {
-                        <muse_glimmer::LayeredModel<MlxBackend> as ParallelLayeredArchitecture<
-                            MlxBackend,
-                            MlxKeyValueState,
-                        >>::forward_unit_parallel(
-                            &mut self.architecture,
-                            vision_group,
-                            index,
-                            &mut **layer,
-                            &state.forward.hidden,
-                            &mut state.state,
-                            &mut state.forward.context,
-                            execution.group().ok_or_else(|| {
-                                Error::Parallel("Muse-Glimmer TP group is missing".into())
-                            })?,
-                            stream,
-                        )
-                    } else {
-                        <muse_glimmer::LayeredModel<MlxBackend> as LayeredArchitecture<
-                            MlxBackend,
-                            MlxKeyValueState,
-                        >>::forward_unit(
-                            &mut self.architecture,
-                            vision_group,
-                            index,
-                            &mut **layer,
-                            &state.forward.hidden,
-                            &mut state.state,
-                            &mut state.forward.context,
-                            stream,
-                        )
-                    }
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                let hidden = if let Some(execution) =
+                    execution.filter(|value| value.is_tensor_parallel())
+                {
+                    <muse_glimmer::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
+                        MlxNeuralBackend,
+                        MlxKeyValueState,
+                    >>::forward_unit_parallel(
+                        &mut self.architecture,
+                        vision_group,
+                        index,
+                        &mut **layer,
+                        &state.forward.hidden,
+                        &mut state.state,
+                        &mut state.forward.context,
+                        execution.group().ok_or_else(|| {
+                            Error::Parallel("Muse-Glimmer TP group is missing".into())
+                        })?,
+                        stream,
+                    )
+                } else {
+                    <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                        MlxNeuralBackend,
+                        MlxKeyValueState,
+                    >>::forward_unit(
+                        &mut self.architecture,
+                        vision_group,
+                        index,
+                        &mut **layer,
+                        &state.forward.hidden,
+                        &mut state.state,
+                        &mut state.forward.context,
+                        stream,
+                    )
+                }
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
                 state.forward.hidden = hidden;
             }
         }
@@ -16691,7 +16704,7 @@ impl MuseGlimmerPipelinePartition {
 
 impl Gemma4PipelinePartition {
     fn new(
-        architecture: eredu_architectures::gemma4::LayeredModel<MlxBackend>,
+        architecture: eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Arc<eredu_architectures::gemma4::LocalGeometry>,
             eredu_architectures::gemma4::TextBoundarySchema,
@@ -16946,8 +16959,8 @@ impl Gemma4PipelinePartition {
                 Some(parallel) => {
                     let mut state =
                         PipelineRangeState::new(state_layout, self.range().clone(), caches)?;
-                    <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::ParallelLayeredArchitecture<
-                        MlxBackend,
+                    <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::ParallelLayeredArchitecture<
+                        MlxNeuralBackend,
                         PipelineRangeState<'_>,
                     >>::finish_forward_parallel(
                         &mut self.architecture,
@@ -16987,7 +17000,7 @@ impl Gemma4PipelinePartition {
 
 impl InklingPipelinePartition {
     fn new(
-        architecture: eredu_architectures::inkling::LayeredModel<MlxBackend>,
+        architecture: eredu_architectures::inkling::LayeredModel<MlxNeuralBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Arc<eredu_architectures::inkling::LocalGeometry>,
             eredu_runtime::NoAuxiliaryBoundary,
@@ -17228,7 +17241,7 @@ impl QwenPipelinePartition {
         validate_pipeline_expert_dispatch(&assignment, Some(expert_group), false)?;
         let mut statistics = std::mem::take(&mut self.routing_statistics);
         let mut execute =
-            |bank: &mut <MlxBackend as RoutedNeuralBackend>::GatedProductExpertBank,
+            |bank: &mut <MlxNeuralBackend as RoutedNeuralBackend>::GatedProductExpertBank,
              hidden: &Array,
              ids: &Array,
              weights: &Array,
@@ -17789,18 +17802,20 @@ fn load_gpt_oss_pipeline(
         .architecture
         .take()
         .expect("GPT-OSS neutral architecture");
-    let mut parameter_groups = gpt_oss::static_parameter_groups::<MlxBackend>(
+    let mut parameter_groups = gpt_oss::static_parameter_groups::<MlxNeuralBackend>(
         seed_architecture.static_modules(),
         &target_args,
     )?;
     for layer in 0..target_args.num_hidden_layers as usize {
-        let block = gpt_oss::new_block::<MlxBackend>(&target_args, layer, stream)
+        let block = gpt_oss::new_block::<MlxNeuralBackend>(&target_args, layer, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        parameter_groups.extend(gpt_oss::layer_parallel_parameter_groups::<MlxBackend>(
-            &block,
-            &target_args,
-            layer,
-        )?);
+        parameter_groups.extend(
+            gpt_oss::layer_parallel_parameter_groups::<MlxNeuralBackend>(
+                &block,
+                &target_args,
+                layer,
+            )?,
+        );
     }
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
@@ -17812,7 +17827,7 @@ fn load_gpt_oss_pipeline(
         let geometry = gpt_oss::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         stage.architecture = Some(
-            gpt_oss::LayeredModel::<MlxBackend>::new_parallel(
+            gpt_oss::LayeredModel::<MlxNeuralBackend>::new_parallel(
                 target_args.clone(),
                 geometry,
                 stream,
@@ -17856,7 +17871,7 @@ fn load_gpt_oss_pipeline(
         .shared_parallel_geometry();
     let probe = info
         .placement
-        .realize_architecture_partition::<MlxBackend, PipelineRangeState<'_>, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, PipelineRangeState<'_>, _, _, _>(
             stage.architecture.as_ref().unwrap(),
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
@@ -17870,7 +17885,7 @@ fn load_gpt_oss_pipeline(
     let bindings = local_architecture_parameter_bindings(&parameter_description, &probe);
     let partition = info
         .placement
-        .realize_architecture_partition::<MlxBackend, PipelineRangeState<'_>, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, PipelineRangeState<'_>, _, _, _>(
             stage.architecture.as_ref().unwrap(),
             info.pipeline_stage,
             Some((local_state, range.start)),
@@ -18151,7 +18166,7 @@ impl GptOssPipelinePartition {
         validate_pipeline_expert_dispatch(&assignment, Some(expert_group), false)?;
         let mut statistics = std::mem::take(&mut self.routing_statistics);
         let mut execute =
-            |bank: &mut <MlxBackend as RoutedNeuralBackend>::GatedProductExpertBank,
+            |bank: &mut <MlxNeuralBackend as RoutedNeuralBackend>::GatedProductExpertBank,
              hidden: &Array,
              ids: &Array,
              weights: &Array,
@@ -18252,10 +18267,10 @@ impl GptOssPipelinePartition {
         stream: &Stream,
     ) -> Result<
         DecoderPipelineBuilder<
-            gpt_oss::LayeredModel<MlxBackend>,
+            gpt_oss::LayeredModel<MlxNeuralBackend>,
             gpt_oss::LocalGeometry,
             neutral_gpt_oss::GptOssPipelineBindings,
-            MlxModule<gpt_oss::TransformerBlock<MlxBackend>>,
+            MlxModule<gpt_oss::TransformerBlock<MlxNeuralBackend>>,
         >,
         Error,
     > {
@@ -18264,7 +18279,7 @@ impl GptOssPipelinePartition {
         } else {
             neutral_gpt_oss::GptOssPipelineBindings::new()
         };
-        let architecture = gpt_oss::LayeredModel::<MlxBackend>::new(args.clone(), stream)
+        let architecture = gpt_oss::LayeredModel::<MlxNeuralBackend>::new(args.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let layers = range
             .clone()
@@ -18335,11 +18350,13 @@ fn load_lfm2_pipeline(
         Lfm2Bindings::new()
     };
     let range = topology.layer_range(source_args.layer_schedule.len())?;
-    let global_architecture =
-        eredu_architectures::lfm2::LayeredModel::<MlxBackend>::new(target_args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let global_architecture = eredu_architectures::lfm2::LayeredModel::<MlxNeuralBackend>::new(
+        target_args.clone(),
+        stream,
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut parameter_groups = eredu_architectures::lfm2::static_parallel_parameter_groups::<
-        MlxBackend,
+        MlxNeuralBackend,
     >(global_architecture.static_modules())?;
     let global_decoder_group =
         architecture_decoder_group::<_, MlxHybridState>(&global_architecture)?;
@@ -18363,7 +18380,7 @@ fn load_lfm2_pipeline(
         eredu_architectures::lfm2::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
     );
-    let architecture = eredu_architectures::lfm2::LayeredModel::<MlxBackend>::new_parallel(
+    let architecture = eredu_architectures::lfm2::LayeredModel::<MlxNeuralBackend>::new_parallel(
         target_args.clone(),
         (*geometry).clone(),
         stream,
@@ -18385,7 +18402,7 @@ fn load_lfm2_pipeline(
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let ownership_probe = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
             None,
@@ -18401,7 +18418,7 @@ fn load_lfm2_pipeline(
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
             Some((local_state, range.start)),
@@ -18677,7 +18694,7 @@ impl Lfm2PipelinePartition {
         validate_pipeline_expert_dispatch(&assignment, Some(expert_group), false)?;
         let mut statistics = std::mem::take(&mut self.routing_statistics);
         let mut execute =
-            |bank: &mut <MlxBackend as RoutedNeuralBackend>::GatedProductExpertBank,
+            |bank: &mut <MlxNeuralBackend as RoutedNeuralBackend>::GatedProductExpertBank,
              hidden: &Array,
              ids: &Array,
              weights: &Array,
@@ -18785,7 +18802,7 @@ impl Lfm2PipelinePartition {
     }
 
     fn new(
-        architecture: eredu_architectures::lfm2::LayeredModel<MlxBackend>,
+        architecture: eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Arc<eredu_architectures::lfm2::LocalGeometry>,
             eredu_runtime::NoAuxiliaryBoundary,
@@ -18815,7 +18832,7 @@ impl Lfm2PipelinePartition {
 
     fn static_modules_mut(
         &mut self,
-    ) -> &mut eredu_architectures::decoder::StaticModules<MlxBackend> {
+    ) -> &mut eredu_architectures::decoder::StaticModules<MlxNeuralBackend> {
         self.architecture.static_modules_mut()
     }
 
@@ -18823,7 +18840,7 @@ impl Lfm2PipelinePartition {
         &self,
         index: usize,
         stream: &Stream,
-    ) -> Result<MlxModule<eredu_architectures::lfm2::Block<MlxBackend>>, Error> {
+    ) -> Result<MlxModule<eredu_architectures::lfm2::Block<MlxNeuralBackend>>, Error> {
         let group = architecture_decoder_group::<_, MlxHybridState>(&self.architecture)?;
         self.architecture
             .construct_unit(group, index, stream)
@@ -18878,13 +18895,14 @@ fn load_nemotron_h_pipeline(
         NemotronHBindings::new()
     };
     let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
-    let global_architecture = eredu_architectures::nemotron_h::LayeredModel::<MlxBackend>::new(
-        target_args.clone(),
-        stream,
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let global_architecture =
+        eredu_architectures::nemotron_h::LayeredModel::<MlxNeuralBackend>::new(
+            target_args.clone(),
+            stream,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut parameter_groups = eredu_architectures::nemotron_h::static_parallel_parameter_groups::<
-        MlxBackend,
+        MlxNeuralBackend,
     >(global_architecture.static_modules())?;
     let target_units = target_args.num_hidden_layers as usize;
     let prediction_steps = target_args.num_nextn_predict_layers as usize;
@@ -18936,12 +18954,13 @@ fn load_nemotron_h_pipeline(
         eredu_architectures::nemotron_h::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
     );
-    let architecture = eredu_architectures::nemotron_h::LayeredModel::<MlxBackend>::new_parallel(
-        target_args.clone(),
-        (*geometry).clone(),
-        stream,
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let architecture =
+        eredu_architectures::nemotron_h::LayeredModel::<MlxNeuralBackend>::new_parallel(
+            target_args.clone(),
+            (*geometry).clone(),
+            stream,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let runtime_state = architecture
         .runtime_state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -18957,7 +18976,7 @@ fn load_nemotron_h_pipeline(
         source_args.hidden_size,
     );
     let ownership_probe = neutral_placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
             None,
@@ -18977,7 +18996,7 @@ fn load_nemotron_h_pipeline(
     let local_parameter_groups =
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = neutral_placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
             Some((local_state, range.start)),
@@ -19318,7 +19337,7 @@ impl NemotronHPipelinePartition {
     }
 
     fn new(
-        architecture: eredu_architectures::nemotron_h::LayeredModel<MlxBackend>,
+        architecture: eredu_architectures::nemotron_h::LayeredModel<MlxNeuralBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Arc<eredu_architectures::nemotron_h::LocalGeometry>,
             eredu_architectures::nemotron_h::TargetBoundarySchema,
@@ -19351,7 +19370,7 @@ impl NemotronHPipelinePartition {
 
     fn static_modules_mut(
         &mut self,
-    ) -> &mut eredu_architectures::decoder::StaticModules<MlxBackend> {
+    ) -> &mut eredu_architectures::decoder::StaticModules<MlxNeuralBackend> {
         self.architecture.static_modules_mut()
     }
 
@@ -19360,7 +19379,7 @@ impl NemotronHPipelinePartition {
         group: usize,
         index: usize,
         stream: &Stream,
-    ) -> Result<MlxModule<eredu_architectures::nemotron_h::Unit<MlxBackend>>, Error> {
+    ) -> Result<MlxModule<eredu_architectures::nemotron_h::Unit<MlxNeuralBackend>>, Error> {
         self.architecture
             .construct_unit(group, index, stream)
             .map(MlxModule::new)
@@ -19525,7 +19544,7 @@ impl NemotronHPipelinePartition {
                 Error::Parallel("Nemotron-H expert assignment requires its EP communicator".into())
             })?;
             let mut execute =
-                |bank: &mut <MlxBackend as RoutedNeuralBackend>::GatedProductExpertBank,
+                |bank: &mut <MlxNeuralBackend as RoutedNeuralBackend>::GatedProductExpertBank,
                  routed_hidden: &Array,
                  ids: &Array,
                  weights: &Array,
@@ -19675,7 +19694,7 @@ impl QwenHybridPipelinePartition {
     }
 
     fn new(
-        architecture: eredu_architectures::qwen::hybrid::LayeredModel<MlxBackend>,
+        architecture: eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Option<Arc<eredu_architectures::qwen::hybrid::LocalGeometry>>,
             eredu_runtime::NoAuxiliaryBoundary,
@@ -20206,18 +20225,20 @@ fn load_neutral_qwen_hybrid_pipeline(
     } else {
         ModelKind::Qwen35
     };
-    let binding_architecture = eredu_architectures::qwen::hybrid::LayeredModel::<MlxBackend>::new(
-        target_args.clone(),
-        stream,
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let mut architecture = eredu_architectures::qwen::hybrid::LayeredModel::<MlxBackend>::new(
-        target_args.clone(),
-        stream,
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let binding_architecture =
+        eredu_architectures::qwen::hybrid::LayeredModel::<MlxNeuralBackend>::new(
+            target_args.clone(),
+            stream,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let mut architecture =
+        eredu_architectures::qwen::hybrid::LayeredModel::<MlxNeuralBackend>::new(
+            target_args.clone(),
+            stream,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut parameter_groups =
-        eredu_architectures::decoder::static_parallel_parameter_groups::<MlxBackend>(
+        eredu_architectures::decoder::static_parallel_parameter_groups::<MlxNeuralBackend>(
             &binding_architecture.static_modules().embeddings,
             &binding_architecture.static_modules().norm,
             binding_architecture.static_modules().lm_head.as_ref(),
@@ -20226,8 +20247,8 @@ fn load_neutral_qwen_hybrid_pipeline(
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&binding_architecture)?;
     for layer in 0..target_args.num_hidden_layers as usize {
         let unit =
-            <eredu_architectures::qwen::hybrid::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            <eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::build_unit(&binding_architecture, decoder_group, layer, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -20244,8 +20265,8 @@ fn load_neutral_qwen_hybrid_pipeline(
         let prediction_group =
             architecture_prediction_group::<_, MlxHybridState>(&binding_architecture, depth)?;
         let unit =
-            <eredu_architectures::qwen::hybrid::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            <eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::build_unit(&binding_architecture, prediction_group, 0, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -20267,12 +20288,13 @@ fn load_neutral_qwen_hybrid_pipeline(
         let (_, layout) = planner.finish()?;
         let geometry = eredu_architectures::qwen::hybrid::local_geometry(&target_args, &layout)
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        architecture = eredu_architectures::qwen::hybrid::LayeredModel::<MlxBackend>::new_parallel(
-            target_args.clone(),
-            geometry,
-            stream,
-        )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        architecture =
+            eredu_architectures::qwen::hybrid::LayeredModel::<MlxNeuralBackend>::new_parallel(
+                target_args.clone(),
+                geometry,
+                stream,
+            )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         Some(layout)
     } else {
         None
@@ -20300,7 +20322,7 @@ fn load_neutral_qwen_hybrid_pipeline(
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
@@ -20315,7 +20337,7 @@ fn load_neutral_qwen_hybrid_pipeline(
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
             Some((local_state, range.start)),
@@ -20348,8 +20370,8 @@ fn load_neutral_qwen_hybrid_pipeline(
     };
     if owns_mtp {
         for &group in &prediction_groups {
-            let unit = <eredu_architectures::qwen::hybrid::LayeredModel<MlxBackend> as LayeredArchitecture<
-                MlxBackend,
+            let unit = <eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                MlxNeuralBackend,
                 MlxHybridState,
             >>::build_unit(&stage.architecture, group, 0, stream)
             .map(MlxModule::new)
@@ -20735,12 +20757,13 @@ fn load_neutral_qwen_conditional_pipeline(
     let mut architecture =
         eredu_architectures::qwen::hybrid::ConditionalLayeredModel::new(target.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let static_modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend> as LayeredArchitecture<
-        MlxBackend,
-        MlxHybridState,
-    >>::static_modules(&binding_architecture);
+    let static_modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<
+        MlxNeuralBackend,
+    > as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
+        &binding_architecture,
+    );
     let mut parameter_groups =
-        eredu_architectures::decoder::static_parallel_parameter_groups::<MlxBackend>(
+        eredu_architectures::decoder::static_parallel_parameter_groups::<MlxNeuralBackend>(
             &static_modules.text.embeddings,
             &static_modules.text.norm,
             static_modules.text.lm_head.as_ref(),
@@ -20751,7 +20774,7 @@ fn load_neutral_qwen_conditional_pipeline(
         .as_ref()
         .expect("validated conditional vision");
     parameter_groups.extend(
-        eredu_architectures::qwen::vision::static_parallel_parameter_groups::<MlxBackend>(
+        eredu_architectures::qwen::vision::static_parallel_parameter_groups::<MlxNeuralBackend>(
             &static_modules.vision,
             vision,
             "model.visual",
@@ -20812,25 +20835,23 @@ fn load_neutral_qwen_conditional_pipeline(
             )?,
         );
     }
-    let parallel_layout =
-        if topology.tensor_parallel_size > 1 {
-            let mut planner =
-                ParallelBuildContext::new(topology, ShardingPolicy::Require).planner();
-            for group in parameter_groups.iter().cloned() {
-                planner.register(group)?;
-            }
-            let (_, layout) = planner.finish()?;
-            let geometry =
-                eredu_architectures::qwen::hybrid::conditional_local_geometry(&target, &layout)
-                    .map_err(|error| Error::Parallel(error.to_string()))?;
-            architecture = eredu_architectures::qwen::hybrid::ConditionalLayeredModel::<
-                MlxBackend,
+    let parallel_layout = if topology.tensor_parallel_size > 1 {
+        let mut planner = ParallelBuildContext::new(topology, ShardingPolicy::Require).planner();
+        for group in parameter_groups.iter().cloned() {
+            planner.register(group)?;
+        }
+        let (_, layout) = planner.finish()?;
+        let geometry =
+            eredu_architectures::qwen::hybrid::conditional_local_geometry(&target, &layout)
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+        architecture = eredu_architectures::qwen::hybrid::ConditionalLayeredModel::<
+                MlxNeuralBackend,
             >::new_parallel(target.clone(), geometry, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-            Some(layout)
-        } else {
-            None
-        };
+        Some(layout)
+    } else {
+        None
+    };
     let placement = Arc::new(media_architecture_transport::<_, MlxHybridState>(
         &architecture,
         topology.pipeline_parallel_size,
@@ -20852,7 +20873,7 @@ fn load_neutral_qwen_conditional_pipeline(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let ownership_probe = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
             None,
@@ -20875,7 +20896,7 @@ fn load_neutral_qwen_conditional_pipeline(
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
             Some((local_state, range.start)),
@@ -20990,8 +21011,8 @@ fn load_neutral_qwen_conditional_pipeline(
         } else {
             bindings
         };
-        let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+        let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::static_modules_mut(&mut stage.architecture);
         loaded.load(
@@ -21011,8 +21032,8 @@ fn load_neutral_qwen_conditional_pipeline(
         } else {
             bindings
         };
-        let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+        let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::static_modules_mut(&mut stage.architecture);
         loaded.load(
@@ -21026,8 +21047,8 @@ fn load_neutral_qwen_conditional_pipeline(
         )?;
     }
     if static_roles.contains(&"norm") {
-        let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+        let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+            MlxNeuralBackend,
             MlxHybridState,
         >>::static_modules_mut(&mut stage.architecture);
         loaded.load(
@@ -21363,13 +21384,14 @@ fn load_kimi_linear_pipeline(
         KimiLinearBindings::new()
     };
     let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
-    let global_architecture = eredu_architectures::kimi_linear::LayeredModel::<MlxBackend>::new(
-        target_args.clone(),
-        stream,
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let global_architecture =
+        eredu_architectures::kimi_linear::LayeredModel::<MlxNeuralBackend>::new(
+            target_args.clone(),
+            stream,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut parameter_groups = eredu_architectures::kimi_linear::static_parallel_parameter_groups::<
-        MlxBackend,
+        MlxNeuralBackend,
     >(global_architecture.static_modules())?;
     let global_decoder_group =
         architecture_decoder_group::<_, MlxHybridState>(&global_architecture)?;
@@ -21395,12 +21417,13 @@ fn load_kimi_linear_pipeline(
         eredu_architectures::kimi_linear::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
     );
-    let architecture = eredu_architectures::kimi_linear::LayeredModel::<MlxBackend>::new_parallel(
-        target_args.clone(),
-        (*geometry).clone(),
-        stream,
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let architecture =
+        eredu_architectures::kimi_linear::LayeredModel::<MlxNeuralBackend>::new_parallel(
+            target_args.clone(),
+            (*geometry).clone(),
+            stream,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let placement = Arc::new(decoder_architecture_transport::<_, MlxHybridState>(
         &architecture,
         topology.pipeline_parallel_size,
@@ -21417,7 +21440,7 @@ fn load_kimi_linear_pipeline(
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let ownership_probe = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
             None,
@@ -21433,7 +21456,7 @@ fn load_kimi_linear_pipeline(
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
             Some((local_state, range.start)),
@@ -21713,7 +21736,7 @@ impl KimiLinearPipelinePartition {
         validate_pipeline_expert_dispatch(&assignment, Some(expert_group), false)?;
         let mut statistics = std::mem::take(&mut self.routing_statistics);
         let mut execute =
-            |bank: &mut <MlxBackend as RoutedNeuralBackend>::GatedProductExpertBank,
+            |bank: &mut <MlxNeuralBackend as RoutedNeuralBackend>::GatedProductExpertBank,
              hidden: &Array,
              ids: &Array,
              weights: &Array,
@@ -21821,7 +21844,7 @@ impl KimiLinearPipelinePartition {
     }
 
     fn new(
-        architecture: eredu_architectures::kimi_linear::LayeredModel<MlxBackend>,
+        architecture: eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend>,
         partition: eredu_runtime::ArchitecturePartition<
             Arc<eredu_architectures::kimi_linear::LocalGeometry>,
             eredu_runtime::NoAuxiliaryBoundary,
@@ -21851,7 +21874,7 @@ impl KimiLinearPipelinePartition {
 
     fn static_modules_mut(
         &mut self,
-    ) -> &mut eredu_architectures::decoder::StaticModules<MlxBackend> {
+    ) -> &mut eredu_architectures::decoder::StaticModules<MlxNeuralBackend> {
         self.architecture.static_modules_mut()
     }
 
@@ -21859,7 +21882,7 @@ impl KimiLinearPipelinePartition {
         &self,
         index: usize,
         stream: &Stream,
-    ) -> Result<MlxModule<eredu_architectures::kimi_linear::Block<MlxBackend>>, Error> {
+    ) -> Result<MlxModule<eredu_architectures::kimi_linear::Block<MlxNeuralBackend>>, Error> {
         let group = architecture_decoder_group::<_, MlxHybridState>(&self.architecture)?;
         self.architecture
             .construct_unit(group, index, stream)
@@ -21945,12 +21968,13 @@ fn load_neutral_inkling_pipeline(
         eredu_architectures::inkling::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
     );
-    let architecture = eredu_architectures::inkling::LayeredModel::<MlxBackend>::new_parallel(
-        target_args.clone(),
-        Arc::clone(&geometry),
-        stream,
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let architecture =
+        eredu_architectures::inkling::LayeredModel::<MlxNeuralBackend>::new_parallel(
+            target_args.clone(),
+            Arc::clone(&geometry),
+            stream,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let runtime_state = architecture
         .runtime_state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -21966,7 +21990,7 @@ fn load_neutral_inkling_pipeline(
         source_args.text_config.hidden_size,
     );
     let ownership_probe = neutral_placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
             None,
@@ -21987,7 +22011,7 @@ fn load_neutral_inkling_pipeline(
     let local_parameter_groups =
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = neutral_placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
             Some((local_state, range.start)),
@@ -22257,15 +22281,15 @@ fn load_neutral_inkling_pipeline(
             weights_stream,
             |ordinal, stream| {
                 if ordinal < vision_count {
-                    <eredu_architectures::inkling::LayeredModel<MlxBackend> as LayeredArchitecture<
-                        MlxBackend,
+                    <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                        MlxNeuralBackend,
                         MlxHybridState,
                     >>::build_unit(architecture, vision_group, vision_start + ordinal, stream)
                     .map(MlxModule::new)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
                 } else {
-                    <eredu_architectures::inkling::LayeredModel<MlxBackend> as LayeredArchitecture<
-                        MlxBackend,
+                    <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+                        MlxNeuralBackend,
                         MlxHybridState,
                     >>::build_unit(
                         architecture,
@@ -22466,7 +22490,7 @@ fn load_neutral_gemma4_pipeline(
         eredu_architectures::gemma4::local_geometry(&target_args, &planned_layout)
             .map_err(|error| Error::Parallel(error.to_string()))?,
     );
-    let architecture = eredu_architectures::gemma4::LayeredModel::<MlxBackend>::new_parallel(
+    let architecture = eredu_architectures::gemma4::LayeredModel::<MlxNeuralBackend>::new_parallel(
         target_args.clone(),
         (*geometry).clone(),
         stream,
@@ -22487,7 +22511,7 @@ fn load_neutral_gemma4_pipeline(
         source_args.text.hidden_size,
     );
     let ownership_probe = neutral_placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
             None,
@@ -22505,7 +22529,7 @@ fn load_neutral_gemma4_pipeline(
     let local_parameter_groups =
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = neutral_placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             topology.pipeline_parallel_rank,
             Some((local_state, range.start)),
@@ -22572,7 +22596,7 @@ fn load_neutral_gemma4_pipeline(
             .with_layer_group(vision_group, stage.vision_range().clone())
             .with_layer_group(audio_group, stage.audio_range().clone());
             let source_architecture =
-                eredu_architectures::gemma4::LayeredModel::<MlxBackend>::new_parallel(
+                eredu_architectures::gemma4::LayeredModel::<MlxNeuralBackend>::new_parallel(
                     source_args.clone(),
                     (*geometry).clone(),
                     stream,
@@ -22919,15 +22943,15 @@ fn load_neutral_gemma4_pipeline(
             weights_stream,
             |ordinal, stream| {
                 if ordinal < vision_count {
-                    <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-                        MlxBackend,
+                    <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+                        MlxNeuralBackend,
                         MlxHybridState,
                     >>::build_unit(architecture, vision_group, vision_start + ordinal, stream)
                     .map(MlxModule::new)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
                 } else if ordinal < media_count {
-                    <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-                        MlxBackend,
+                    <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+                        MlxNeuralBackend,
                         MlxHybridState,
                     >>::build_unit(
                         architecture,
@@ -22938,8 +22962,8 @@ fn load_neutral_gemma4_pipeline(
                     .map(MlxModule::new)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
                 } else {
-                    <eredu_architectures::gemma4::LayeredModel<MlxBackend> as eredu_runtime::LayeredArchitecture<
-                        MlxBackend,
+                    <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
+                        MlxNeuralBackend,
                         MlxHybridState,
                     >>::build_unit(
                         architecture,
@@ -23231,7 +23255,7 @@ fn load_neutral_deepseek_v3_pipeline(
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
             Some((local_state.clone(), range.start)),
@@ -23246,7 +23270,7 @@ fn load_neutral_deepseek_v3_pipeline(
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info
         .placement
-        .realize_architecture_partition::<MlxBackend, MlxHybridState, _, _, _>(
+        .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
             &architecture,
             info.pipeline_stage,
             Some((local_state, range.start)),
@@ -23620,11 +23644,11 @@ fn load_neutral_deepseek_v4_pipeline(
     };
     let decoder_group = architecture_decoder_group::<
         _,
-        eredu_runtime::DeviceState<MlxBackend, MlxPoolingAttentionCache>,
+        eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
     >(&architecture)?;
     let placement = Arc::new(prediction_architecture_transport::<
         _,
-        eredu_runtime::DeviceState<MlxBackend, MlxPoolingAttentionCache>,
+        eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
     >(&architecture, topology.pipeline_parallel_size)?);
     let mut info = base_info(
         topology,
@@ -23654,8 +23678,8 @@ fn load_neutral_deepseek_v4_pipeline(
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info.placement.realize_architecture_partition::<
-        MlxBackend,
-        eredu_runtime::DeviceState<MlxBackend, MlxPoolingAttentionCache>,
+        MlxNeuralBackend,
+        eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
         _,
         _,
         _,
@@ -23673,8 +23697,8 @@ fn load_neutral_deepseek_v4_pipeline(
     let local_parameter_groups =
         local_architecture_parameter_bindings(&parameter_description, &ownership_probe);
     let partition = info.placement.realize_architecture_partition::<
-        MlxBackend,
-        eredu_runtime::DeviceState<MlxBackend, MlxPoolingAttentionCache>,
+        MlxNeuralBackend,
+        eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
         _,
         _,
         _,
@@ -23765,7 +23789,7 @@ fn load_neutral_deepseek_v4_pipeline(
                 loaded.load_excluding_roles(
                     architecture_parameter_unit_owner::<
                         _,
-                        eredu_runtime::DeviceState<MlxBackend, MlxPoolingAttentionCache>,
+                        eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
                     >(&architecture, decoder_group, global_layer)?,
                     unit,
                     store.as_ref(),
@@ -23779,7 +23803,7 @@ fn load_neutral_deepseek_v4_pipeline(
                 loaded.load(
                     architecture_parameter_unit_owner::<
                         _,
-                        eredu_runtime::DeviceState<MlxBackend, MlxPoolingAttentionCache>,
+                        eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
                     >(&architecture, decoder_group, global_layer)?,
                     unit,
                     store.as_ref(),
@@ -23797,7 +23821,7 @@ fn load_neutral_deepseek_v4_pipeline(
             .map(|depth| {
                 let prediction_group = architecture_prediction_group::<
                     _,
-                    eredu_runtime::DeviceState<MlxBackend, MlxPoolingAttentionCache>,
+                    eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
                 >(&architecture, depth)?;
                 architecture
                     .construct_unit(prediction_group, 0, stream)
@@ -23811,7 +23835,7 @@ fn load_neutral_deepseek_v4_pipeline(
     for (depth, unit) in mtp_layers.iter_mut().enumerate() {
         let prediction_group = architecture_prediction_group::<
             _,
-            eredu_runtime::DeviceState<MlxBackend, MlxPoolingAttentionCache>,
+            eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
         >(&architecture, depth)?;
         let bindings = match &parallel_layout {
             Some(layout) => v4_sharded_unit_bindings(
@@ -23834,7 +23858,7 @@ fn load_neutral_deepseek_v4_pipeline(
             loaded.load_excluding_roles(
                 architecture_parameter_unit_owner::<
                     _,
-                    eredu_runtime::DeviceState<MlxBackend, MlxPoolingAttentionCache>,
+                    eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
                 >(&architecture, prediction_group, 0)?,
                 unit,
                 store.as_ref(),
@@ -23848,7 +23872,7 @@ fn load_neutral_deepseek_v4_pipeline(
             loaded.load(
                 architecture_parameter_unit_owner::<
                     _,
-                    eredu_runtime::DeviceState<MlxBackend, MlxPoolingAttentionCache>,
+                    eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
                 >(&architecture, prediction_group, 0)?,
                 unit,
                 store.as_ref(),
@@ -23908,7 +23932,7 @@ fn load_neutral_deepseek_v4_pipeline(
                 |layer| {
                     architecture_parameter_unit_owner::<
                         _,
-                        eredu_runtime::DeviceState<MlxBackend, MlxPoolingAttentionCache>,
+                        eredu_runtime::DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>,
                     >(streamed_architecture, decoder_group, layer)
                 },
             )

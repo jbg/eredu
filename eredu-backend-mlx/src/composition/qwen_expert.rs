@@ -76,15 +76,15 @@ pub fn expert_catalog_cartesian(
     let experts = usize::try_from(args.num_experts)
         .map_err(|_| Error::UnsupportedArchitecture("Qwen expert count is negative".into()))?;
     let architecture = eredu_architectures::qwen::LayeredModel::<
-        crate::backend::mlx::nn::shared::MlxBackend,
+        crate::backend::mlx::nn::shared::MlxNeuralBackend,
     >::new(args.clone(), stream)
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let description = eredu_architectures::qwen::parameter_description(&architecture, stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let graph = <eredu_architectures::qwen::LayeredModel<
-        crate::backend::mlx::nn::shared::MlxBackend,
+        crate::backend::mlx::nn::shared::MlxNeuralBackend,
     > as LayeredArchitecture<
-        crate::backend::mlx::nn::shared::MlxBackend,
+        crate::backend::mlx::nn::shared::MlxNeuralBackend,
         super::MlxKeyValueState,
     >>::execution_graph(&architecture)
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -121,9 +121,9 @@ pub fn expert_catalog_cartesian(
                 ))
             })?;
         let unit_path = <eredu_architectures::qwen::LayeredModel<
-            crate::backend::mlx::nn::shared::MlxBackend,
+            crate::backend::mlx::nn::shared::MlxNeuralBackend,
         > as LayeredArchitecture<
-            crate::backend::mlx::nn::shared::MlxBackend,
+            crate::backend::mlx::nn::shared::MlxNeuralBackend,
             super::MlxKeyValueState,
         >>::unit_path(&architecture, group, layer)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;

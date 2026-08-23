@@ -24,7 +24,7 @@ use eredu_core::cache::{
 use crate::backend::mlx::runtime::checkpoint::load::gguf_quantization_configs;
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::nn::shared::{MlxBackend, MlxModule},
+    backend::mlx::nn::shared::{MlxModule, MlxNeuralBackend},
     backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
     backend::mlx::runtime::cache::state::MlxKeyValueState,
     backend::mlx::runtime::checkpoint::binding::{
@@ -70,13 +70,13 @@ use eredu_runtime::{
 
 use eredu_runtime::{ResidencyReport, WeightBinding};
 
-type NeutralBlock = eredu_architectures::qwen::TransformerBlock<MlxBackend>;
+type NeutralBlock = eredu_architectures::qwen::TransformerBlock<MlxNeuralBackend>;
 
-type NeutralArchitecture = eredu_architectures::qwen::LayeredModel<MlxBackend>;
+type NeutralArchitecture = eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>;
 
 fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Result<(), Error> {
     let transport = <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxKeyValueState,
     >>::group_transport(architecture, group);
     if transport.kind == eredu_runtime::ArchitectureGroupKind::Decoder {
@@ -95,7 +95,7 @@ fn decoder_unit_path(
 ) -> Result<String, Error> {
     require_decoder_group(architecture, group)?;
     <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxKeyValueState,
     >>::unit_path(architecture, group, index)
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
@@ -103,26 +103,26 @@ fn decoder_unit_path(
 
 type NeutralResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type NeutralLayerwiseRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxLayerwisePolicy<NeutralBlock, QwenUnitPopulator>,
 >;
 
 type NeutralParallelResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type NeutralParallelLayerwiseRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxLayerwisePolicy<NeutralBlock, QwenUnitPopulator>,
 >;
@@ -362,12 +362,20 @@ pub fn quantize_neutral_qwen_store(
         source.static_modules(),
         target.static_modules(),
         move |index, stream| {
-            eredu_architectures::qwen::new_block::<MlxBackend>(&source_unit_args, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            eredu_architectures::qwen::new_block::<MlxNeuralBackend>(
+                &source_unit_args,
+                index,
+                stream,
+            )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         },
         move |index, stream| {
-            eredu_architectures::qwen::new_block::<MlxBackend>(&target_unit_args, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            eredu_architectures::qwen::new_block::<MlxNeuralBackend>(
+                &target_unit_args,
+                index,
+                stream,
+            )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         },
         count,
         quantization,
@@ -687,7 +695,7 @@ impl QwenModel {
         observer: &mut NeutralQwenObserver<'_>,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         let expert_count = self.args.num_experts;
@@ -824,7 +832,7 @@ impl QwenModel {
         stream: &Stream,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         self.validate_cache(cache)?;
@@ -842,7 +850,7 @@ impl QwenModel {
                     forward: &mut eredu_architectures::qwen::ForwardContext<crate::MlxTensor>,
                     context: &Stream| {
             <NeutralArchitecture as eredu_runtime::RoutedLayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 MlxKeyValueState,
             >>::forward_unit_with_provider(
                 architecture,
@@ -909,7 +917,7 @@ impl QwenModel {
         stream: &Stream,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         self.validate_cache(cache)?;
@@ -928,7 +936,7 @@ impl QwenModel {
                     parallel: &safemlx::distributed::Group,
                     context: &Stream| {
             <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                MlxBackend,
+                MlxNeuralBackend,
                 MlxKeyValueState,
             >>::forward_unit_parallel_with_provider(
                 architecture,
@@ -1158,7 +1166,7 @@ fn load_neutral_qwen_parallel(
     );
     let mut planner = build.planner();
     let static_modules = global_architecture.static_modules();
-    for group in eredu_architectures::qwen::static_parallel_parameter_groups::<MlxBackend>(
+    for group in eredu_architectures::qwen::static_parallel_parameter_groups::<MlxNeuralBackend>(
         &static_modules.embeddings,
         &static_modules.norm,
         static_modules.lm_head.as_ref(),
@@ -1167,9 +1175,9 @@ fn load_neutral_qwen_parallel(
         planner.register(group)?;
     }
     for index in 0..layer_count {
-        let unit = eredu_architectures::qwen::new_block::<MlxBackend>(&args, index, stream)
+        let unit = eredu_architectures::qwen::new_block::<MlxNeuralBackend>(&args, index, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        for group in eredu_architectures::qwen::layer_parallel_parameter_groups::<MlxBackend>(
+        for group in eredu_architectures::qwen::layer_parallel_parameter_groups::<MlxNeuralBackend>(
             &unit, &args, index,
         )? {
             planner.register(group)?;
@@ -1195,7 +1203,7 @@ fn load_neutral_qwen_parallel(
     )?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
     for index in 0..layer_count {
-        let unit = eredu_architectures::qwen::new_block::<MlxBackend>(&args, index, stream)
+        let unit = eredu_architectures::qwen::new_block::<MlxNeuralBackend>(&args, index, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let recipes = if external_experts {
             BTreeMap::new()
@@ -1243,9 +1251,12 @@ fn load_neutral_qwen_parallel(
         },
         |address, path, _local, store, stream| {
             let index = address.index();
-            let global =
-                eredu_architectures::qwen::new_block::<MlxBackend>(&binding_args, index, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            let global = eredu_architectures::qwen::new_block::<MlxNeuralBackend>(
+                &binding_args,
+                index,
+                stream,
+            )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let recipes = if external_experts {
                 BTreeMap::new()
             } else {
@@ -1542,7 +1553,7 @@ impl QwenPipelineBindings {
             let count = i32::try_from(assignment.local_global_expert_ids().len())
                 .map_err(|_| Error::Parallel("local Qwen expert count exceeds i32".into()))?;
             if count > 0 {
-                moe.experts = <MlxBackend as RoutedNeuralBackend>::gated_product_expert_bank(
+                moe.experts = <MlxNeuralBackend as RoutedNeuralBackend>::gated_product_expert_bank(
                     eredu_architectures::qwen::localized_expert_bank_spec(
                         args,
                         index,

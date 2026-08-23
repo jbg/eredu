@@ -1915,7 +1915,7 @@ fn write_gemma_fixture(directory: &Path) {
     )
     .unwrap();
     type Architecture = eredu_architectures::gemma4::LayeredModel<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
     >;
     type State = eredu_backend_mlx::testing::backend::mlx::runtime::cache::state::MlxHybridState;
     struct Collector<'a> {
@@ -1939,19 +1939,19 @@ fn write_gemma_fixture(directory: &Path) {
         arrays: Vec::new(),
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     for group in 0..3 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -3498,7 +3498,7 @@ fn write_inkling_mtp_fixture(directory: &Path) {
     )
     .unwrap();
     type Architecture = eredu_architectures::inkling::LayeredModel<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
     >;
     type State = eredu_backend_mlx::testing::backend::mlx::runtime::cache::state::MlxHybridState;
     let architecture = Architecture::new(args, stream).unwrap();
@@ -3526,24 +3526,24 @@ fn write_inkling_mtp_fixture(directory: &Path) {
         arrays: &mut arrays,
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     let graph = <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
         State,
     >>::execution_graph(&architecture)
     .unwrap();
     for group in 0..graph.groups().len() {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -3644,7 +3644,7 @@ fn write_gemma4_tensor_parallel_fixture_with_options(
     )
     .unwrap();
     type Architecture = eredu_architectures::gemma4::LayeredModel<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
     >;
     type State = eredu_backend_mlx::testing::backend::mlx::runtime::cache::state::MlxHybridState;
     let architecture = Architecture::new(args, stream).unwrap();
@@ -3672,19 +3672,19 @@ fn write_gemma4_tensor_parallel_fixture_with_options(
         arrays: &mut arrays,
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     for group in 0..3 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -3777,7 +3777,7 @@ fn write_muse_glimmer_tensor_parallel_fixture(directory: &Path) {
     )
     .unwrap();
     type Architecture = eredu_architectures::muse_glimmer::LayeredModel<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
     >;
     type State = eredu_backend_mlx::testing::backend::mlx::runtime::cache::state::MlxKeyValueState;
     let architecture = Architecture::new(args, stream).unwrap();
@@ -3805,19 +3805,19 @@ fn write_muse_glimmer_tensor_parallel_fixture(directory: &Path) {
         arrays: &mut arrays,
     };
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules(&architecture)
     .visit_parameters(&mut collector);
     for group in 0..2 {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap()
@@ -3848,7 +3848,7 @@ fn initialized_inkling_parameters(
     BTreeMap<String, Array>,
 ) {
     type Architecture = eredu_architectures::inkling::LayeredModel<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
     >;
     type State = eredu_backend_mlx::testing::backend::mlx::runtime::cache::state::MlxHybridState;
 
@@ -3893,7 +3893,7 @@ fn initialized_inkling_parameters(
     let mut architecture = Architecture::new(args.clone(), stream).unwrap();
     let mut parameters = BTreeMap::new();
     <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
         State,
     >>::static_modules_mut(&mut architecture)
     .visit_parameters_mut(&mut Initializer {
@@ -3901,19 +3901,19 @@ fn initialized_inkling_parameters(
         parameters: &mut parameters,
     });
     let graph = <Architecture as eredu_runtime::LayeredArchitecture<
-        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+        eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
         State,
     >>::execution_graph(&architecture)
     .unwrap();
     for group in 0..graph.groups().len() {
         let count = <Architecture as eredu_runtime::LayeredArchitecture<
-            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+            eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
             State,
         >>::group_unit_count(&architecture, group)
         .unwrap();
         for index in 0..count {
             let mut unit = <Architecture as eredu_runtime::LayeredArchitecture<
-                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxBackend,
+                eredu_backend_mlx::testing::backend::mlx::nn::shared::MlxNeuralBackend,
                 State,
             >>::build_unit(&architecture, group, index, stream)
             .unwrap();

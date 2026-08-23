@@ -9,7 +9,7 @@ use safemlx::{module::ModuleParameters, Stream};
 
 use crate::backend::mlx::{
     error::Error,
-    nn::shared::{MlxBackend, MlxModule},
+    nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
         checkpoint::binding::build_module_bindings_with_recipes_excluding,
         residency::{
@@ -48,7 +48,7 @@ pub fn expert_catalog(
         {
             continue;
         }
-        let block = DecoderLayer::<MlxBackend>::new(&args.text_config, layer, stream)
+        let block = DecoderLayer::<MlxNeuralBackend>::new(&args.text_config, layer, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let module = MlxModule::new(block);
         let recipes = module_recipes(&module, args, store)?;

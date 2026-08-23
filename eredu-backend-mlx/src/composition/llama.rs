@@ -21,7 +21,7 @@ use eredu_core::cache::{
 
 use crate::{
     backend::mlx::error::Error,
-    backend::mlx::nn::shared::{MlxBackend, MlxModule},
+    backend::mlx::nn::shared::{MlxModule, MlxNeuralBackend},
     backend::mlx::runtime::cache::residency::{open_prompt_cache, CacheResidencyManager},
     backend::mlx::runtime::cache::state::MlxKeyValueState,
     backend::mlx::runtime::checkpoint::binding::{binding_bytes, build_module_bindings},
@@ -44,31 +44,31 @@ use eredu_runtime::{
 
 use eredu_runtime::{ResidencyReport, WeightBinding};
 
-type NeutralBlock = eredu_architectures::llama::TransformerBlock<MlxBackend>;
+type NeutralBlock = eredu_architectures::llama::TransformerBlock<MlxNeuralBackend>;
 
-type NeutralArchitecture = eredu_architectures::llama::LayeredModel<MlxBackend>;
+type NeutralArchitecture = eredu_architectures::llama::LayeredModel<MlxNeuralBackend>;
 type NeutralResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type NeutralLayerwiseRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxLayerwisePolicy<NeutralBlock>,
 >;
 
 type NeutralParallelResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type NeutralParallelLayerwiseRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxLayerwisePolicy<NeutralBlock>,
 >;
@@ -680,7 +680,7 @@ fn load_neutral_llama_parallel(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let mut planner = build.planner();
     let static_modules = global_architecture.static_modules();
-    for group in eredu_architectures::llama::static_parallel_parameter_groups::<MlxBackend>(
+    for group in eredu_architectures::llama::static_parallel_parameter_groups::<MlxNeuralBackend>(
         &static_modules.embeddings,
         &static_modules.norm,
         static_modules.lm_head.as_ref(),
@@ -691,7 +691,7 @@ fn load_neutral_llama_parallel(
     for index in 0..layer_count {
         let unit = NeutralBlock::new(&args, index, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        for group in eredu_architectures::llama::layer_parallel_parameter_groups::<MlxBackend>(
+        for group in eredu_architectures::llama::layer_parallel_parameter_groups::<MlxNeuralBackend>(
             &unit, &args, index,
         )? {
             planner.register(group)?;

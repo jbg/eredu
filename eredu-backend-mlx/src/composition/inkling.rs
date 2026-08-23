@@ -27,7 +27,7 @@ use safemlx::{
 
 use crate::backend::mlx::{
     error::Error,
-    nn::shared::{MlxBackend, MlxModule},
+    nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
         cache::{
             residency::{
@@ -60,8 +60,8 @@ use crate::backend::mlx::{
 };
 use crate::composition::mlx::artifact::find_sibling_mmproj;
 
-type NeutralArchitecture = Architecture<MlxBackend>;
-type NeutralUnit = Unit<MlxBackend>;
+type NeutralArchitecture = Architecture<MlxNeuralBackend>;
+type NeutralUnit = Unit<MlxNeuralBackend>;
 pub type InklingPipelineUnit = MlxModule<NeutralUnit>;
 
 fn group_kind(
@@ -69,33 +69,33 @@ fn group_kind(
     group: usize,
 ) -> eredu_runtime::ArchitectureGroupKind {
     <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxHybridState,
     >>::group_transport(architecture, group)
     .kind
 }
 type Resident = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxResidentPolicy<NeutralUnit>,
 >;
 type Bounded = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxLayerwisePolicy<NeutralUnit, UnitPopulator>,
 >;
 
 type ParallelResident = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxResidentPolicy<NeutralUnit>,
 >;
 type ParallelBounded = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxLayerwisePolicy<NeutralUnit, ParallelUnitPopulator>,
 >;
@@ -170,7 +170,7 @@ impl InklingBindings {
         group: usize,
     ) -> Result<usize, Error> {
         <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             MlxHybridState,
         >>::group_unit_count(architecture, group)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
@@ -288,7 +288,7 @@ impl Execution {
             Self::ParallelBounded(runtime) => runtime.architecture(),
         };
         <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-            MlxBackend,
+            MlxNeuralBackend,
             MlxHybridState,
         >>::execution_graph(architecture)
         .map(|graph| graph.output())
@@ -309,11 +309,11 @@ fn forward_external_experts<P>(
     provider: &mut P,
 ) -> Result<crate::MlxTensor, eredu_nn::Error>
 where
-    P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
     <NeutralArchitecture as eredu_runtime::RoutedLayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxHybridState,
     >>::forward_unit_with_provider(
         architecture,
@@ -1637,13 +1637,13 @@ fn quantize_store(
     let source_layout = inkling_execution_layout(source)?;
     let target_layout = inkling_execution_layout(&target)?;
     let source_static = MlxModule::new(
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
+        <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &source_architecture,
         )
         .clone(),
     );
     let target_static = MlxModule::new(
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
+        <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &target_architecture,
         )
         .clone(),
@@ -1834,7 +1834,7 @@ fn load_parallel_store(
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let global_static = MlxModule::new(
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
+        <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &global_architecture,
         )
         .clone(),
@@ -1852,7 +1852,7 @@ fn load_parallel_store(
     if let Some(vision) = &args.vision_config {
         for (index, spec) in vision.layer_specs().into_iter().enumerate() {
             let layer = MlxModule::new(
-                eredu_architectures::inkling::VisionLayer::<MlxBackend>::new(
+                eredu_architectures::inkling::VisionLayer::<MlxNeuralBackend>::new(
                     vision, index, spec, stream,
                 )
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
@@ -1873,7 +1873,7 @@ fn load_parallel_store(
         .ok_or_else(|| Error::Parallel("Inkling global parameter bytes overflowed".into()))?;
     for index in 0..layer_count {
         let unit = MlxModule::new(
-            eredu_architectures::inkling::DecoderLayer::<MlxBackend>::new(
+            eredu_architectures::inkling::DecoderLayer::<MlxNeuralBackend>::new(
                 &args.text_config,
                 index,
                 stream,
@@ -1920,7 +1920,7 @@ fn load_parallel_store(
                     Error::UnsupportedArchitecture("Inkling vision config is missing".into())
                 })?;
                 MlxModule::new(NeutralUnit::Vision(
-                    eredu_architectures::inkling::VisionLayer::<MlxBackend>::new(
+                    eredu_architectures::inkling::VisionLayer::<MlxNeuralBackend>::new(
                         vision,
                         address.index(),
                         vision.layer_specs()[address.index()],
@@ -1930,7 +1930,7 @@ fn load_parallel_store(
                 ))
             } else {
                 MlxModule::new(NeutralUnit::Text(
-                    eredu_architectures::inkling::DecoderLayer::<MlxBackend>::new(
+                    eredu_architectures::inkling::DecoderLayer::<MlxNeuralBackend>::new(
                         &binding_args.text_config,
                         address.index(),
                         stream,

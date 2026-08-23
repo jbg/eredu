@@ -21,7 +21,7 @@ use safemlx::{module::ModuleParameters, Array, Stream};
 use crate::backend::mlx::{
     ensure_replicated_load_options,
     error::Error,
-    nn::shared::{MlxBackend, MlxModule},
+    nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
         cache::state::MlxKeyValueState,
         checkpoint::{
@@ -46,16 +46,32 @@ use crate::backend::mlx::{
     ModelLoadOptions,
 };
 
-type Architecture = LayeredModel<MlxBackend>;
-type MoshiUnit = Unit<MlxBackend>;
-type ResidentRuntime =
-    LayerwiseRuntime<Architecture, MlxBackend, MlxKeyValueState, MlxResidentPolicy<MoshiUnit>>;
-type BoundedRuntime =
-    LayerwiseRuntime<Architecture, MlxBackend, MlxKeyValueState, MlxLayerwisePolicy<MoshiUnit>>;
-type ParallelResidentRuntime =
-    LayerwiseRuntime<Architecture, MlxBackend, MlxKeyValueState, MlxResidentPolicy<MoshiUnit>>;
-type ParallelBoundedRuntime =
-    LayerwiseRuntime<Architecture, MlxBackend, MlxKeyValueState, MlxLayerwisePolicy<MoshiUnit>>;
+type Architecture = LayeredModel<MlxNeuralBackend>;
+type MoshiUnit = Unit<MlxNeuralBackend>;
+type ResidentRuntime = LayerwiseRuntime<
+    Architecture,
+    MlxNeuralBackend,
+    MlxKeyValueState,
+    MlxResidentPolicy<MoshiUnit>,
+>;
+type BoundedRuntime = LayerwiseRuntime<
+    Architecture,
+    MlxNeuralBackend,
+    MlxKeyValueState,
+    MlxLayerwisePolicy<MoshiUnit>,
+>;
+type ParallelResidentRuntime = LayerwiseRuntime<
+    Architecture,
+    MlxNeuralBackend,
+    MlxKeyValueState,
+    MlxResidentPolicy<MoshiUnit>,
+>;
+type ParallelBoundedRuntime = LayerwiseRuntime<
+    Architecture,
+    MlxNeuralBackend,
+    MlxKeyValueState,
+    MlxLayerwisePolicy<MoshiUnit>,
+>;
 
 enum Execution {
     Resident(ResidentRuntime),
@@ -194,7 +210,7 @@ impl MoshiModel {
     ) -> Result<(Array, moshi::ForwardContext<crate::MlxTensor>), Error>
     where
         H: LayeredTraversalHook<
-            MlxBackend,
+            MlxNeuralBackend,
             moshi::ForwardContext<crate::MlxTensor>,
             eredu_nn::Error,
         >,
@@ -669,12 +685,12 @@ fn bindings(
 
 fn execution_layout(architecture: &Architecture) -> Result<ExecutionUnitLayout, Error> {
     let graph =
-        <Architecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::execution_graph(
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::execution_graph(
             architecture,
         )?;
     let counts = (0..graph.groups().len())
         .map(|group| {
-            <Architecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::group_unit_count(
+            <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::group_unit_count(
                 architecture,
                 group,
             )
@@ -706,7 +722,7 @@ fn build_addressed_unit(
     stream: &Stream,
 ) -> Result<MoshiUnit, Error> {
     let architecture = Architecture::new(config.clone(), stream)?;
-    <Architecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::build_unit(
+    <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::build_unit(
         &architecture,
         address.group(),
         address.index(),

@@ -12,7 +12,7 @@ use safemlx::{distributed::Group, Array, Stream};
 
 use crate::backend::mlx::{
     error::Error,
-    nn::shared::MlxBackend,
+    nn::shared::MlxNeuralBackend,
     runtime::{
         checkpoint::binding_plan::{BindingPlan, PlannedBinding},
         distributed::expert::{
@@ -43,15 +43,15 @@ pub fn expert_catalog_cartesian(
     layout: Option<&eredu_runtime::LocalModelLayout>,
     stream: &Stream,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    let architecture = eredu_architectures::gpt_oss::LayeredModel::<MlxBackend>::new(
+    let architecture = eredu_architectures::gpt_oss::LayeredModel::<MlxNeuralBackend>::new(
         args.clone(),
         stream,
     )
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let description = eredu_architectures::gpt_oss::parameter_description(&architecture, stream)
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let graph = <eredu_architectures::gpt_oss::LayeredModel<MlxBackend> as LayeredArchitecture<
-        MlxBackend,
+    let graph = <eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+        MlxNeuralBackend,
         super::Cache,
     >>::execution_graph(&architecture)
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -94,8 +94,8 @@ pub fn expert_catalog_cartesian(
                     "GPT-OSS expert owner group {owner_group:?} is absent from the execution graph"
                 ))
             })?;
-        let unit_path = <eredu_architectures::gpt_oss::LayeredModel<MlxBackend> as LayeredArchitecture<
-            MlxBackend,
+        let unit_path = <eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
+            MlxNeuralBackend,
             super::Cache,
         >>::unit_path(&architecture, group, layer)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
@@ -218,7 +218,7 @@ pub fn distributed_provider<'a>(
     expert_group: Option<&'a Group>,
     cache: &'a ExpertCache,
     statistics: &'a mut RoutingStatistics,
-) -> impl RoutedExpertProvider<MlxBackend, Error = Error> + 'a {
+) -> impl RoutedExpertProvider<MlxNeuralBackend, Error = Error> + 'a {
     DistributedCachedProvider {
         assignment,
         expert_group,
@@ -293,12 +293,12 @@ impl LocalExpertBank for CachedLocalBank<'_> {
     }
 }
 
-impl RoutedExpertProvider<MlxBackend> for DistributedCachedProvider<'_> {
+impl RoutedExpertProvider<MlxNeuralBackend> for DistributedCachedProvider<'_> {
     type Error = Error;
 
     fn forward_routed(
         &mut self,
-        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, crate::MlxTensor>,
         stream: &Stream,
     ) -> Result<crate::MlxTensor, Self::Error> {
@@ -347,7 +347,7 @@ impl RoutedExpertProvider<MlxBackend> for DistributedCachedProvider<'_> {
 
     fn forward_routed_tensor_parallel(
         &mut self,
-        resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
+        resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::GatedProductExpertBank,
         request: RoutedExpertRequest<'_, crate::MlxTensor>,
         partitions: usize,
         stream: &Stream,
@@ -404,7 +404,7 @@ impl RoutedExpertProvider<MlxBackend> for DistributedCachedProvider<'_> {
 
     fn forward_relu2_routed(
         &mut self,
-        _resident_bank: &mut <MlxBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
+        _resident_bank: &mut <MlxNeuralBackend as eredu_nn::RoutedNeuralBackend>::Relu2ExpertBank,
         _request: RoutedExpertRequest<'_, crate::MlxTensor>,
         _stream: &Stream,
     ) -> Result<crate::MlxTensor, Self::Error> {

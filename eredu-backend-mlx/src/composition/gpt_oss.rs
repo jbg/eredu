@@ -24,7 +24,7 @@ use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 use crate::{
     backend::mlx::{
         error::Error,
-        nn::shared::{MlxBackend, MlxModule},
+        nn::shared::{MlxModule, MlxNeuralBackend},
         runtime::{
             cache::{
                 residency::{open_prompt_cache, CacheResidencyManager},
@@ -69,8 +69,8 @@ pub mod expert {
 /// The architecture-erased cache representation used by GPT-OSS.
 pub type Cache = MlxKeyValueState;
 
-type NeutralBlock = eredu_architectures::gpt_oss::TransformerBlock<MlxBackend>;
-type NeutralArchitecture = eredu_architectures::gpt_oss::LayeredModel<MlxBackend>;
+type NeutralBlock = eredu_architectures::gpt_oss::TransformerBlock<MlxNeuralBackend>;
+type NeutralArchitecture = eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend>;
 
 fn expert_parameter_targets(
     architecture: &NeutralArchitecture,
@@ -142,7 +142,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
 
 fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Result<(), Error> {
     let transport = <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxKeyValueState,
     >>::group_transport(architecture, group);
     if transport.kind == eredu_runtime::ArchitectureGroupKind::Decoder {
@@ -161,32 +161,32 @@ fn decoder_unit_path(
 ) -> Result<String, Error> {
     require_decoder_group(architecture, group)?;
     <NeutralArchitecture as eredu_runtime::LayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxKeyValueState,
     >>::unit_path(architecture, group, index)
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 type ResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type LayerwiseExecution = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxLayerwisePolicy<NeutralBlock, GptOssUnitPopulator>,
 >;
 type ParallelResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxResidentPolicy<NeutralBlock>,
 >;
 type ParallelLayerwiseExecution = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxKeyValueState,
     MlxLayerwisePolicy<NeutralBlock, GptOssParallelUnitPopulator>,
 >;
@@ -194,7 +194,7 @@ type ParallelLayerwiseExecution = LayerwiseRuntime<
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
 pub struct GptOssCheckpointTemplate {
-    pub static_modules: eredu_architectures::decoder::StaticModules<MlxBackend>,
+    pub static_modules: eredu_architectures::decoder::StaticModules<MlxNeuralBackend>,
     pub layers: Vec<NeutralBlock>,
     expert_targets: BTreeSet<String>,
     native_experts: Vec<GptOssCheckpointParameter>,
@@ -216,7 +216,7 @@ impl GptOssCheckpointTemplate {
         let expert_targets = expert_parameter_targets(&architecture, stream)?;
         let layers = (0..args.num_hidden_layers as usize)
             .map(|index| {
-                eredu_architectures::gpt_oss::new_block::<MlxBackend>(&args, index, stream)
+                eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(&args, index, stream)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -482,7 +482,7 @@ pub fn load_neutral_with_store(
     external_experts: bool,
 ) -> Result<GptOssModel, Error> {
     let mut architecture =
-        eredu_architectures::gpt_oss::new_layered_model::<MlxBackend>(args.clone(), stream)
+        eredu_architectures::gpt_oss::new_layered_model::<MlxNeuralBackend>(args.clone(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let expert_targets = Arc::new(expert_parameter_targets(&architecture, stream)?);
     let factory = GptOssUnitPopulator {
@@ -570,18 +570,20 @@ fn load_neutral_parallel_with_store(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let expert_targets = Arc::new(expert_parameter_targets(&global_architecture, stream)?);
     let mut planner = build.planner();
-    for group in eredu_architectures::gpt_oss::static_parameter_groups::<MlxBackend>(
+    for group in eredu_architectures::gpt_oss::static_parameter_groups::<MlxNeuralBackend>(
         global_architecture.static_modules(),
         &args,
     )? {
         planner.register(group)?;
     }
     for layer in 0..layer_count {
-        let block = eredu_architectures::gpt_oss::new_block::<MlxBackend>(&args, layer, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        for group in eredu_architectures::gpt_oss::layer_parallel_parameter_groups::<MlxBackend>(
-            &block, &args, layer,
-        )? {
+        let block =
+            eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(&args, layer, stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        for group in eredu_architectures::gpt_oss::layer_parallel_parameter_groups::<
+            MlxNeuralBackend,
+        >(&block, &args, layer)?
+        {
             planner.register(group)?;
         }
     }
@@ -607,8 +609,9 @@ fn load_neutral_parallel_with_store(
     let mut global_parameter_bytes =
         binding_bytes(&build_module_bindings(&global_static, "", store.as_ref())?)?;
     for layer in 0..layer_count {
-        let block = eredu_architectures::gpt_oss::new_block::<MlxBackend>(&args, layer, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let block =
+            eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(&args, layer, stream)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let recipes = if external_experts {
             BTreeMap::new()
         } else {
@@ -653,9 +656,12 @@ fn load_neutral_parallel_with_store(
         },
         move |address, path, _local, store, stream| {
             let layer = address.index();
-            let global =
-                eredu_architectures::gpt_oss::new_block::<MlxBackend>(&binding_args, layer, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            let global = eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(
+                &binding_args,
+                layer,
+                stream,
+            )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let recipes = if external_experts {
                 BTreeMap::new()
             } else {
@@ -749,12 +755,16 @@ pub fn quantize_neutral_store(
 > {
     let mut target_args = source_args.clone();
     target_args.quantization = Some(quantization);
-    let source =
-        eredu_architectures::gpt_oss::new_layered_model::<MlxBackend>(source_args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let target =
-        eredu_architectures::gpt_oss::new_layered_model::<MlxBackend>(target_args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let source = eredu_architectures::gpt_oss::new_layered_model::<MlxNeuralBackend>(
+        source_args.clone(),
+        stream,
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let target = eredu_architectures::gpt_oss::new_layered_model::<MlxNeuralBackend>(
+        target_args.clone(),
+        stream,
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let source_expert_targets = Arc::new(expert_parameter_targets(&source, stream)?);
     let target_expert_targets = Arc::new(expert_parameter_targets(&target, stream)?);
     let count = usize::try_from(source_args.num_hidden_layers)
@@ -768,20 +778,28 @@ pub fn quantize_neutral_store(
         source.static_modules(),
         target.static_modules(),
         move |index, stream| {
-            eredu_architectures::gpt_oss::new_block::<MlxBackend>(&source_unit_args, index, stream)
-                .map(|block| DenseUnit {
-                    block,
-                    expert_targets: Arc::clone(&source_unit_expert_targets),
-                })
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(
+                &source_unit_args,
+                index,
+                stream,
+            )
+            .map(|block| DenseUnit {
+                block,
+                expert_targets: Arc::clone(&source_unit_expert_targets),
+            })
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         },
         move |index, stream| {
-            eredu_architectures::gpt_oss::new_block::<MlxBackend>(&target_unit_args, index, stream)
-                .map(|block| DenseUnit {
-                    block,
-                    expert_targets: Arc::clone(&target_unit_expert_targets),
-                })
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(
+                &target_unit_args,
+                index,
+                stream,
+            )
+            .map(|block| DenseUnit {
+                block,
+                expert_targets: Arc::clone(&target_unit_expert_targets),
+            })
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
         },
         count,
         quantization,
@@ -863,7 +881,7 @@ impl GptOssPipelineBindings {
                 ));
             }
             layer.inner.mlp.experts =
-                <MlxBackend as RoutedNeuralBackend>::gated_product_expert_bank(
+                <MlxNeuralBackend as RoutedNeuralBackend>::gated_product_expert_bank(
                     eredu_architectures::gpt_oss::localized_expert_bank_spec(
                         args,
                         index,
@@ -1247,7 +1265,7 @@ impl GptOssModel {
         stream: &Stream,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         self.validate_cache(cache)?;
@@ -1266,7 +1284,7 @@ impl GptOssModel {
              forward: &mut eredu_architectures::gpt_oss::ForwardContext<crate::MlxTensor>,
              context: &Stream| {
                 <NeutralArchitecture as eredu_runtime::RoutedLayeredArchitecture<
-                    MlxBackend,
+                    MlxNeuralBackend,
                     Cache,
                 >>::forward_unit_with_provider(
                     architecture,
@@ -1354,7 +1372,7 @@ impl GptOssModel {
         stream: &Stream,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         self.validate_cache(cache)?;
@@ -1374,7 +1392,7 @@ impl GptOssModel {
              parallel: &safemlx::distributed::Group,
              context: &Stream| {
                 <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                    MlxBackend,
+                    MlxNeuralBackend,
                     Cache,
                 >>::forward_unit_parallel_with_provider(
                     architecture,
@@ -1458,7 +1476,7 @@ impl GptOssModel {
         observer: &mut NeutralGptOssObserver<'_>,
     ) -> Result<Array, Error>
     where
-        P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+        P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
         self.validate_cache(cache)?;

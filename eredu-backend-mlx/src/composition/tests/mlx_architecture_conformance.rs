@@ -6,7 +6,7 @@ use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, Exec
 use std::sync::OnceLock;
 
 use crate::backend::mlx::{
-    nn::{shared::MlxBackend, tensor::TokenValidationScope},
+    nn::{shared::MlxNeuralBackend, tensor::TokenValidationScope},
     runtime::cache::{
         state::{MlxHybridState, MlxKeyValueState, MlxPoolingAttentionStateFactory},
         CompressedLatentCache,
@@ -16,20 +16,21 @@ use crate::MlxTensor;
 
 #[test]
 fn every_pipeline_composed_family_exposes_architecture_owned_static_bindings() {
-    fn assert_bindable<A: eredu_architectures::BindableStaticParameters<MlxBackend>>() {}
+    fn assert_bindable<A: eredu_architectures::BindableStaticParameters<MlxNeuralBackend>>() {}
 
-    assert_bindable::<eredu_architectures::llama::LayeredModel<MlxBackend>>();
-    assert_bindable::<eredu_architectures::gpt_oss::LayeredModel<MlxBackend>>();
-    assert_bindable::<eredu_architectures::qwen::LayeredModel<MlxBackend>>();
-    assert_bindable::<eredu_architectures::lfm2::LayeredModel<MlxBackend>>();
-    assert_bindable::<eredu_architectures::kimi_linear::LayeredModel<MlxBackend>>();
-    assert_bindable::<eredu_architectures::nemotron_h::LayeredModel<MlxBackend>>();
-    assert_bindable::<eredu_architectures::gemma4::LayeredModel<MlxBackend>>();
-    assert_bindable::<eredu_architectures::inkling::LayeredModel<MlxBackend>>();
-    assert_bindable::<eredu_architectures::muse_glimmer::LayeredModel<MlxBackend>>();
-    assert_bindable::<eredu_architectures::qwen::hybrid::LayeredModel<MlxBackend>>();
-    assert_bindable::<eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend>>();
-    assert_bindable::<eredu_architectures::qwen::vl::LayeredModel<MlxBackend>>();
+    assert_bindable::<eredu_architectures::llama::LayeredModel<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::nemotron_h::LayeredModel<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::inkling::LayeredModel<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::muse_glimmer::LayeredModel<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend>>(
+    );
+    assert_bindable::<eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend>>();
 }
 
 fn mlx_execution() -> Option<ExecutionContext> {
@@ -58,7 +59,7 @@ fn mlx_execution() -> Option<ExecutionContext> {
 
 macro_rules! execute_group {
     ($architecture_ty:ty, $state_ty:ty, $architecture:expr, $state:expr, $context:expr, $group:expr, $initial:expr, $dependencies:expr, $stream:expr) => {{
-        let mut hidden = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::begin_execution_group(
+        let mut hidden = <$architecture_ty as LayeredArchitecture<MlxNeuralBackend, $state_ty>>::begin_execution_group(
             &mut $architecture,
             $group,
             $initial,
@@ -69,14 +70,14 @@ macro_rules! execute_group {
         )
         .unwrap();
         let unit_count =
-            <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::group_unit_count(
+            <$architecture_ty as LayeredArchitecture<MlxNeuralBackend, $state_ty>>::group_unit_count(
                 &$architecture,
                 $group,
             )
             .unwrap();
         for index in 0..unit_count {
             let mut unit =
-                <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::build_unit(
+                <$architecture_ty as LayeredArchitecture<MlxNeuralBackend, $state_ty>>::build_unit(
                     &$architecture,
                     $group,
                     index,
@@ -84,7 +85,7 @@ macro_rules! execute_group {
                 )
                 .unwrap();
             hidden =
-                <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::forward_unit(
+                <$architecture_ty as LayeredArchitecture<MlxNeuralBackend, $state_ty>>::forward_unit(
                     &mut $architecture,
                     $group,
                     index,
@@ -96,7 +97,7 @@ macro_rules! execute_group {
                 )
                 .unwrap();
         }
-        hidden = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::complete_execution_group(
+        hidden = <$architecture_ty as LayeredArchitecture<MlxNeuralBackend, $state_ty>>::complete_execution_group(
             &mut $architecture,
             $group,
             &hidden,
@@ -115,7 +116,7 @@ macro_rules! execute_target_group {
         let LayeredForwardState {
             hidden: initial,
             mut context,
-        } = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::begin_forward(
+        } = <$architecture_ty as LayeredArchitecture<MlxNeuralBackend, $state_ty>>::begin_forward(
             &mut $architecture,
             $input,
             &mut $state,
@@ -134,7 +135,7 @@ macro_rules! execute_target_group {
             $stream
         );
         let logits =
-            <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::finish_forward(
+            <$architecture_ty as LayeredArchitecture<MlxNeuralBackend, $state_ty>>::finish_forward(
                 &mut $architecture,
                 &hidden,
                 &mut $state,
@@ -158,7 +159,7 @@ macro_rules! execute_vision_text_groups {
         let LayeredForwardState {
             hidden: initial,
             mut context,
-        } = <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::begin_forward(
+        } = <$architecture_ty as LayeredArchitecture<MlxNeuralBackend, $state_ty>>::begin_forward(
             &mut $architecture,
             $input,
             &mut $state,
@@ -188,7 +189,7 @@ macro_rules! execute_vision_text_groups {
             $stream
         );
         let logits =
-            <$architecture_ty as LayeredArchitecture<MlxBackend, $state_ty>>::finish_forward(
+            <$architecture_ty as LayeredArchitecture<MlxNeuralBackend, $state_ty>>::finish_forward(
                 &mut $architecture,
                 &hidden,
                 &mut $state,
@@ -208,7 +209,7 @@ macro_rules! execute_vision_text_groups {
 
 #[test]
 fn neutral_gemma4_text_forward_monomorphizes_on_mlx() {
-    type Architecture = eredu_architectures::gemma4::LayeredModel<MlxBackend>;
+    type Architecture = eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend>;
     let args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
         &serde_json::to_vec(&serde_json::json!({
           "model_type":"gemma4","tie_word_embeddings":true,
@@ -234,7 +235,7 @@ fn neutral_gemma4_text_forward_monomorphizes_on_mlx() {
     let LayeredForwardState {
         hidden: initial,
         mut context,
-    } = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::begin_forward(
+    } = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::begin_forward(
         &mut architecture,
         eredu_architectures::gemma4::ModelInput {
             parts: &parts,
@@ -248,7 +249,7 @@ fn neutral_gemma4_text_forward_monomorphizes_on_mlx() {
     )
     .unwrap();
     let mut hidden =
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::begin_execution_group(
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::begin_execution_group(
             &mut architecture,
             2,
             &initial,
@@ -258,14 +259,15 @@ fn neutral_gemma4_text_forward_monomorphizes_on_mlx() {
             stream,
         )
         .unwrap();
-    let mut unit = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::build_unit(
-        &architecture,
-        2,
-        0,
-        stream,
-    )
-    .unwrap();
-    hidden = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::forward_unit(
+    let mut unit =
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::build_unit(
+            &architecture,
+            2,
+            0,
+            stream,
+        )
+        .unwrap();
+    hidden = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::forward_unit(
         &mut architecture,
         2,
         0,
@@ -276,21 +278,22 @@ fn neutral_gemma4_text_forward_monomorphizes_on_mlx() {
         stream,
     )
     .unwrap();
-    let logits = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::finish_forward(
-        &mut architecture,
-        &hidden,
-        &mut state,
-        &context,
-        stream,
-    )
-    .unwrap();
+    let logits =
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::finish_forward(
+            &mut architecture,
+            &hidden,
+            &mut state,
+            &context,
+            stream,
+        )
+        .unwrap();
     assert_eq!(logits.shape(), &[1, 2, 32]);
     logits.as_array().evaluated().unwrap();
 }
 
 #[test]
 fn neutral_inkling_text_forward_monomorphizes_on_mlx() {
-    type Architecture = eredu_architectures::inkling::LayeredModel<MlxBackend>;
+    type Architecture = eredu_architectures::inkling::LayeredModel<MlxNeuralBackend>;
     let args = eredu_architectures::inkling::ModelArgs::from_hf_json(
         &serde_json::to_vec(&serde_json::json!({
           "model_type":"inkling_mm_model","image_token_id":60,"audio_token_id":61,
@@ -318,7 +321,7 @@ fn neutral_inkling_text_forward_monomorphizes_on_mlx() {
     let LayeredForwardState {
         hidden: initial,
         mut context,
-    } = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::begin_forward(
+    } = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::begin_forward(
         &mut architecture,
         eredu_architectures::inkling::ModelInput {
             parts: &parts,
@@ -330,7 +333,7 @@ fn neutral_inkling_text_forward_monomorphizes_on_mlx() {
     )
     .unwrap();
     let mut hidden =
-        <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::begin_execution_group(
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::begin_execution_group(
             &mut architecture,
             1,
             &initial,
@@ -340,14 +343,15 @@ fn neutral_inkling_text_forward_monomorphizes_on_mlx() {
             stream,
         )
         .unwrap();
-    let mut unit = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::build_unit(
-        &architecture,
-        1,
-        0,
-        stream,
-    )
-    .unwrap();
-    hidden = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::forward_unit(
+    let mut unit =
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::build_unit(
+            &architecture,
+            1,
+            0,
+            stream,
+        )
+        .unwrap();
+    hidden = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::forward_unit(
         &mut architecture,
         1,
         0,
@@ -358,21 +362,22 @@ fn neutral_inkling_text_forward_monomorphizes_on_mlx() {
         stream,
     )
     .unwrap();
-    let logits = <Architecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::finish_forward(
-        &mut architecture,
-        &hidden,
-        &mut state,
-        &context,
-        stream,
-    )
-    .unwrap();
+    let logits =
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::finish_forward(
+            &mut architecture,
+            &hidden,
+            &mut state,
+            &context,
+            stream,
+        )
+        .unwrap();
     assert_eq!(logits.shape(), &[1, 2, 64]);
     logits.as_array().evaluated().unwrap();
 }
 
 #[test]
 fn neutral_muse_glimmer_text_forward_monomorphizes_on_mlx() {
-    type Architecture = eredu_architectures::muse_glimmer::LayeredModel<MlxBackend>;
+    type Architecture = eredu_architectures::muse_glimmer::LayeredModel<MlxNeuralBackend>;
     let args = eredu_architectures::muse_glimmer::DecoderConfig::from_hf_json(
         &serde_json::to_vec(&serde_json::json!({
             "architectures":["MuseGlimmerForConditionalGeneration"],
@@ -412,7 +417,7 @@ fn neutral_muse_glimmer_text_forward_monomorphizes_on_mlx() {
     let LayeredForwardState {
         hidden: initial,
         mut context,
-    } = <Architecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::begin_forward(
+    } = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::begin_forward(
         &mut architecture,
         eredu_architectures::muse_glimmer::ModelInput {
             parts: &parts,
@@ -424,7 +429,7 @@ fn neutral_muse_glimmer_text_forward_monomorphizes_on_mlx() {
     )
     .unwrap();
     let mut hidden =
-        <Architecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::begin_execution_group(
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::begin_execution_group(
             &mut architecture,
             1,
             &initial,
@@ -434,26 +439,28 @@ fn neutral_muse_glimmer_text_forward_monomorphizes_on_mlx() {
             stream,
         )
         .unwrap();
-    let mut unit = <Architecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::build_unit(
-        &architecture,
-        1,
-        0,
-        stream,
-    )
-    .unwrap();
-    hidden = <Architecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::forward_unit(
-        &mut architecture,
-        1,
-        0,
-        &mut unit,
-        &hidden,
-        &mut state,
-        &mut context,
-        stream,
-    )
-    .unwrap();
+    let mut unit =
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::build_unit(
+            &architecture,
+            1,
+            0,
+            stream,
+        )
+        .unwrap();
+    hidden =
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::forward_unit(
+            &mut architecture,
+            1,
+            0,
+            &mut unit,
+            &hidden,
+            &mut state,
+            &mut context,
+            stream,
+        )
+        .unwrap();
     let logits =
-        <Architecture as LayeredArchitecture<MlxBackend, MlxKeyValueState>>::finish_forward(
+        <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>>::finish_forward(
             &mut architecture,
             &hidden,
             &mut state,
@@ -467,7 +474,7 @@ fn neutral_muse_glimmer_text_forward_monomorphizes_on_mlx() {
 
 #[test]
 fn neutral_llama_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::llama::LayeredModel<MlxBackend>;
+    type Architecture = eredu_architectures::llama::LayeredModel<MlxNeuralBackend>;
     let args = eredu_architectures::llama::model_args_from_config_value(&serde_json::json!({
         "model_type":"llama","hidden_size":16,"num_hidden_layers":1,
         "intermediate_size":32,"num_attention_heads":4,"num_key_value_heads":2,
@@ -499,7 +506,7 @@ fn neutral_llama_forward_executes_on_mlx() {
 
 #[test]
 fn neutral_qwen_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::qwen::LayeredModel<MlxBackend>;
+    type Architecture = eredu_architectures::qwen::LayeredModel<MlxNeuralBackend>;
     let args = eredu_architectures::qwen::model_args_from_config_value(&serde_json::json!({
         "model_type":"qwen3","hidden_size":16,"num_hidden_layers":1,
         "intermediate_size":32,"num_attention_heads":4,"num_key_value_heads":2,
@@ -531,7 +538,7 @@ fn neutral_qwen_forward_executes_on_mlx() {
 
 #[test]
 fn neutral_qwen3_next_hybrid_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::qwen::hybrid::LayeredModel<MlxBackend>;
+    type Architecture = eredu_architectures::qwen::hybrid::LayeredModel<MlxNeuralBackend>;
     let args =
         eredu_architectures::qwen::hybrid::model_args_from_config_value(&serde_json::json!({
             "model_type":"qwen3_next","vocab_size":32,"hidden_size":16,
@@ -570,7 +577,8 @@ fn neutral_qwen3_next_hybrid_forward_executes_on_mlx() {
 
 #[test]
 fn neutral_qwen35_conditional_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxBackend>;
+    type Architecture =
+        eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend>;
     let args =
         eredu_architectures::qwen::hybrid::model_args_from_config_value(&serde_json::json!({
             "model_type":"qwen3_5","image_token_id":30,"video_token_id":31,
@@ -628,7 +636,7 @@ fn neutral_qwen35_conditional_forward_executes_on_mlx() {
 
 #[test]
 fn neutral_qwen3_vl_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::qwen::vl::LayeredModel<MlxBackend>;
+    type Architecture = eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend>;
     let args = eredu_architectures::qwen::vl::model_args_from_config_value(&serde_json::json!({
         "model_type":"qwen3_vl","image_token_id":30,"video_token_id":31,
         "tie_word_embeddings":false,
@@ -684,7 +692,7 @@ fn neutral_qwen3_vl_forward_executes_on_mlx() {
 
 #[test]
 fn neutral_gpt_oss_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::gpt_oss::LayeredModel<MlxBackend>;
+    type Architecture = eredu_architectures::gpt_oss::LayeredModel<MlxNeuralBackend>;
     let args = eredu_architectures::gpt_oss::model_args_from_config_value(&serde_json::json!({
         "model_type":"gpt_oss","hidden_size":32,"intermediate_size":32,
         "num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":2,
@@ -700,7 +708,7 @@ fn neutral_gpt_oss_forward_executes_on_mlx() {
     };
     let stream = execution.stream();
     let mut architecture =
-        eredu_architectures::gpt_oss::new_layered_model::<MlxBackend>(args.clone(), stream)
+        eredu_architectures::gpt_oss::new_layered_model::<MlxNeuralBackend>(args.clone(), stream)
             .unwrap();
     let mut state =
         MlxKeyValueState::device(eredu_architectures::gpt_oss::state_layout(&args).unwrap())
@@ -722,7 +730,7 @@ fn neutral_gpt_oss_forward_executes_on_mlx() {
 
 #[test]
 fn neutral_kimi_linear_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::kimi_linear::LayeredModel<MlxBackend>;
+    type Architecture = eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend>;
     let args = eredu_architectures::kimi_linear::model_args_from_config_value(&serde_json::json!({
         "model_type":"kimi_linear","vocab_size":32,"hidden_size":12,
         "num_hidden_layers":2,"num_attention_heads":3,"num_key_value_heads":3,
@@ -761,7 +769,7 @@ fn neutral_kimi_linear_forward_executes_on_mlx() {
 
 #[test]
 fn neutral_lfm2_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::lfm2::LayeredModel<MlxBackend>;
+    type Architecture = eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend>;
     let args = eredu_architectures::lfm2::model_args_from_config_value(&serde_json::json!({
         "model_type":"lfm2","vocab_size":32,"hidden_size":16,
         "intermediate_size":32,"num_hidden_layers":2,"num_attention_heads":4,
@@ -795,7 +803,7 @@ fn neutral_lfm2_forward_executes_on_mlx() {
 
 #[test]
 fn neutral_nemotron_h_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::nemotron_h::LayeredModel<MlxBackend>;
+    type Architecture = eredu_architectures::nemotron_h::LayeredModel<MlxNeuralBackend>;
     let args = eredu_architectures::nemotron_h::model_args_from_config_value(&serde_json::json!({
         "model_type":"nemotron_h","vocab_size":32,"hidden_size":16,
         "intermediate_size":24,"num_hidden_layers":4,
@@ -830,8 +838,8 @@ fn neutral_nemotron_h_forward_executes_on_mlx() {
 
 #[test]
 fn neutral_deepseek_v3_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::deepseek::v3::Model<MlxBackend>;
-    type State = DeviceState<MlxBackend, CompressedLatentCache>;
+    type Architecture = eredu_architectures::deepseek::v3::Model<MlxNeuralBackend>;
+    type State = DeviceState<MlxNeuralBackend, CompressedLatentCache>;
     let args = eredu_architectures::deepseek::parse_v3_config(&serde_json::json!({
         "hidden_size":8,"intermediate_size":16,"moe_intermediate_size":8,
         "num_hidden_layers":2,"num_attention_heads":2,"vocab_size":31,
@@ -866,7 +874,7 @@ fn neutral_deepseek_v3_forward_executes_on_mlx() {
 
 #[test]
 fn neutral_deepseek_v4_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::deepseek::v4::Model<MlxBackend>;
+    type Architecture = eredu_architectures::deepseek::v4::Model<MlxNeuralBackend>;
     type State = crate::backend::mlx::runtime::cache::state::MlxPoolingAttentionState;
     let args = eredu_architectures::deepseek::parse_v4_config(&serde_json::json!({
         "hidden_size":8,"moe_intermediate_size":8,"num_hidden_layers":3,
@@ -903,7 +911,7 @@ fn neutral_deepseek_v4_forward_executes_on_mlx() {
 
 #[test]
 fn neutral_moshi_forward_executes_on_mlx() {
-    type Architecture = eredu_architectures::moshi::LayeredModel<MlxBackend>;
+    type Architecture = eredu_architectures::moshi::LayeredModel<MlxNeuralBackend>;
     let config = eredu_architectures::moshi::MoshiConfig::from_json(
         r#"{
             "model_type":"moshi","dim":16,"text_card":31,

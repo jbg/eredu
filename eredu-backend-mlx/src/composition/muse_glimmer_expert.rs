@@ -9,7 +9,7 @@ use safemlx::{module::ModuleParameters, Stream};
 
 use crate::backend::mlx::{
     error::Error,
-    nn::shared::{MlxBackend, MlxModule},
+    nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
         checkpoint::binding::{
             build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
@@ -47,7 +47,7 @@ pub fn expert_catalog(
     }
     let mut entries = Vec::new();
     for layer in 0..args.num_hidden_layers as usize {
-        let block = TransformerBlock::<MlxBackend>::new(args, layer, stream)
+        let block = TransformerBlock::<MlxNeuralBackend>::new(args, layer, stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         let module = MlxModule::new(block);
         let expert_targets = parameter_role_targets(

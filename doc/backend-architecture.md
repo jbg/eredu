@@ -447,7 +447,10 @@ The complete concrete implementation lives in `eredu-backend-mlx`, split
 between public reusable backend mechanics and private family/backend
 composition:
 
-- `MlxBackend` owns execution and weight-materialization streams.
+- `MlxBackend` is the facade backend provider and owns execution and
+  weight-materialization streams. `MlxNeuralBackend` is the distinct
+  zero-sized selector that implements the neutral neural, parameter,
+  submission, and transfer traits for architecture specialization.
 - `MlxTensor` is a transparent, zero-copy wrapper around `safemlx::Array` and
   is the sole MLX implementation of `eredu_nn::Tensor`;
 - `composition::mlx::MlxModelSession` owns the executable model, cache,

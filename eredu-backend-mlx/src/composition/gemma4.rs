@@ -33,7 +33,7 @@ use safemlx::{
 
 use crate::backend::mlx::{
     error::Error,
-    nn::shared::{MlxBackend, MlxModule},
+    nn::shared::{MlxModule, MlxNeuralBackend},
     runtime::{
         cache::{
             residency::{
@@ -66,16 +66,16 @@ use crate::backend::mlx::{
 };
 use crate::composition::mlx::artifact::find_sibling_mmproj;
 
-type NeutralArchitecture = Architecture<MlxBackend>;
-type NeutralUnit = Unit<MlxBackend>;
-type NeutralAssistant = eredu_architectures::gemma4::Assistant<MlxBackend>;
+type NeutralArchitecture = Architecture<MlxNeuralBackend>;
+type NeutralUnit = Unit<MlxNeuralBackend>;
+type NeutralAssistant = eredu_architectures::gemma4::Assistant<MlxNeuralBackend>;
 pub type Gemma4PipelineUnit = MlxModule<NeutralUnit>;
 
 fn group_kind(
     architecture: &NeutralArchitecture,
     group: usize,
 ) -> eredu_runtime::ArchitectureGroupKind {
-    <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::group_transport(
+    <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_transport(
         architecture,
         group,
     )
@@ -186,25 +186,25 @@ impl Gemma4Bindings {
 }
 type Resident = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxResidentPolicy<NeutralUnit>,
 >;
 type Bounded = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxLayerwisePolicy<NeutralUnit, UnitPopulator>,
 >;
 type ParallelResident = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxResidentPolicy<NeutralUnit>,
 >;
 type ParallelBounded = LayerwiseRuntime<
     NeutralArchitecture,
-    MlxBackend,
+    MlxNeuralBackend,
     MlxHybridState,
     MlxLayerwisePolicy<NeutralUnit, UnitPopulator>,
 >;
@@ -243,7 +243,7 @@ impl Execution {
             Self::ParallelResident(runtime) => runtime.architecture(),
             Self::ParallelBounded(runtime) => runtime.architecture(),
         };
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::execution_graph(
+        <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::execution_graph(
             architecture,
         )
         .map(|graph| graph.output())
@@ -264,11 +264,11 @@ fn forward_external_experts<P>(
     provider: &mut P,
 ) -> Result<crate::MlxTensor, eredu_nn::Error>
 where
-    P: eredu_runtime::RoutedExpertProvider<MlxBackend>,
+    P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
     P::Error: std::fmt::Display,
 {
     <NeutralArchitecture as eredu_runtime::RoutedLayeredArchitecture<
-        MlxBackend,
+        MlxNeuralBackend,
         MlxHybridState,
     >>::forward_unit_with_provider(
         architecture,
@@ -963,7 +963,7 @@ impl Gemma4Model {
                          parallel,
                          stream| {
                             <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                                MlxBackend,
+                                MlxNeuralBackend,
                                 MlxHybridState,
                             >>::forward_unit_parallel_with_provider(
                                 architecture,
@@ -999,7 +999,7 @@ impl Gemma4Model {
                      parallel,
                      stream| {
                         <NeutralArchitecture as eredu_runtime::ParallelRoutedLayeredArchitecture<
-                            MlxBackend,
+                            MlxNeuralBackend,
                             MlxHybridState,
                         >>::forward_unit_parallel_with_provider(
                             architecture,
@@ -1460,13 +1460,13 @@ impl CausalModel<MlxHybridState> for Gemma4Model {
 
 fn execution_layout(architecture: &NeutralArchitecture) -> Result<ExecutionUnitLayout, Error> {
     let graph =
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::execution_graph(
+        <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::execution_graph(
             architecture,
         )
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let counts = (0..graph.groups().len())
         .map(|group| {
-            <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::group_unit_count(
+            <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_unit_count(
                 architecture,
                 group,
             )
@@ -1538,16 +1538,16 @@ fn quantize_store(
         ));
     }
     let unit_count = source_layout.len();
-    let source_static =
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-            &source_architecture,
-        )
-        .clone();
-    let target_static =
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
-            &target_architecture,
-        )
-        .clone();
+    let source_static = <NeutralArchitecture as LayeredArchitecture<
+        MlxNeuralBackend,
+        MlxHybridState,
+    >>::static_modules(&source_architecture)
+    .clone();
+    let target_static = <NeutralArchitecture as LayeredArchitecture<
+        MlxNeuralBackend,
+        MlxHybridState,
+    >>::static_modules(&target_architecture)
+    .clone();
     let (store, report) = quantize_parameterized_store(
         store,
         &source_static,
@@ -1761,7 +1761,7 @@ fn load_parallel_store(
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let global_static = MlxModule::new(
-        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
+        <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &global_architecture,
         )
         .clone(),
@@ -1837,7 +1837,7 @@ fn load_parallel_store(
             }
             let layer = address.index();
             let global = MlxModule::new(NeutralUnit::Text(
-                eredu_architectures::gemma4::DenseBlock::<MlxBackend>::new(
+                eredu_architectures::gemma4::DenseBlock::<MlxNeuralBackend>::new(
                     &binding_family.text,
                     layer,
                     stream,
