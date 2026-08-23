@@ -20,6 +20,34 @@ pub struct ExpertParameterRecipe {
     binding_name: String,
     logical_target: String,
     recipe: DerivedWeightRecipe,
+    role: ExpertParameterRole,
+}
+
+/// Quantization semantics of one independently resident expert parameter.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ExpertParameterRole {
+    /// Preserve this binding exactly as declared by the architecture.
+    Preserved,
+    /// Quantize this projection and publish companions under these exact local names.
+    QuantizableProjection {
+        /// Local binding name for packed quantization scales.
+        scales_binding: String,
+        /// Local binding name for packed affine biases, when the format uses them.
+        biases_binding: String,
+    },
+}
+
+impl ExpertParameterRole {
+    /// Declares a projection eligible for load-time quantization.
+    pub fn quantizable_projection(
+        scales_binding: impl Into<String>,
+        biases_binding: impl Into<String>,
+    ) -> Self {
+        Self::QuantizableProjection {
+            scales_binding: scales_binding.into(),
+            biases_binding: biases_binding.into(),
+        }
+    }
 }
 
 impl ExpertParameterRecipe {
@@ -28,6 +56,7 @@ impl ExpertParameterRecipe {
         binding_name: impl Into<String>,
         logical_target: impl Into<String>,
         recipe: DerivedWeightRecipe,
+        role: ExpertParameterRole,
     ) -> Result<Self, ExpertResidencyCatalogError> {
         let binding_name = binding_name.into();
         if binding_name.trim().is_empty() {
@@ -44,10 +73,40 @@ impl ExpertParameterRecipe {
                 binding: binding_name,
             });
         }
+        if let ExpertParameterRole::QuantizableProjection {
+            scales_binding,
+            biases_binding,
+        } = &role
+        {
+            for companion in [scales_binding, biases_binding] {
+                if companion.trim().is_empty() {
+                    return Err(ExpertResidencyCatalogError::EmptyQuantizationCompanion {
+                        binding: binding_name,
+                    });
+                }
+                if companion == &binding_name {
+                    return Err(
+                        ExpertResidencyCatalogError::QuantizationCompanionCollision {
+                            binding: binding_name,
+                            companion: companion.clone(),
+                        },
+                    );
+                }
+            }
+            if scales_binding == biases_binding {
+                return Err(
+                    ExpertResidencyCatalogError::QuantizationCompanionCollision {
+                        binding: binding_name,
+                        companion: scales_binding.clone(),
+                    },
+                );
+            }
+        }
         Ok(Self {
             binding_name,
             logical_target,
             recipe,
+            role,
         })
     }
 
@@ -66,9 +125,19 @@ impl ExpertParameterRecipe {
         &self.recipe
     }
 
-    /// Consumes the declaration into its local name, logical target, and recipe.
-    pub fn into_parts(self) -> (String, String, DerivedWeightRecipe) {
-        (self.binding_name, self.logical_target, self.recipe)
+    /// Returns the architecture-declared parameter and quantization semantics.
+    pub const fn role(&self) -> &ExpertParameterRole {
+        &self.role
+    }
+
+    /// Consumes the declaration into its local name, logical target, recipe, and role.
+    pub fn into_parts(self) -> (String, String, DerivedWeightRecipe, ExpertParameterRole) {
+        (
+            self.binding_name,
+            self.logical_target,
+            self.recipe,
+            self.role,
+        )
     }
 }
 
@@ -115,6 +184,25 @@ impl ExpertResidencyUnit {
                     identity,
                     target: parameter.logical_target.clone(),
                 });
+            }
+            if let ExpertParameterRole::QuantizableProjection {
+                scales_binding,
+                biases_binding,
+            } = parameter.role()
+            {
+                for companion in [scales_binding, biases_binding] {
+                    if parameters
+                        .iter()
+                        .any(|candidate| candidate.binding_name() == companion)
+                    {
+                        return Err(
+                            ExpertResidencyCatalogError::QuantizationCompanionCollision {
+                                binding: parameter.binding_name.clone(),
+                                companion: companion.clone(),
+                            },
+                        );
+                    }
+                }
             }
         }
         Ok(Self {
@@ -240,6 +328,20 @@ pub enum ExpertResidencyCatalogError {
     EmptyRecipe {
         /// Invalid local binding name.
         binding: String,
+    },
+    /// A quantizable binding did not declare a usable companion name.
+    #[error("expert residency binding {binding:?} has an empty quantization companion")]
+    EmptyQuantizationCompanion {
+        /// Invalid projection binding.
+        binding: String,
+    },
+    /// A packed companion collides with its projection or another declared binding.
+    #[error("expert residency binding {binding:?} quantization companion {companion:?} collides with an existing binding")]
+    QuantizationCompanionCollision {
+        /// Quantizable projection binding.
+        binding: String,
+        /// Colliding packed companion binding.
+        companion: String,
     },
     /// An expert is not attached to an architecture execution unit.
     #[error("expert {identity:?} has an empty architecture unit path")]

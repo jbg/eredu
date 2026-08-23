@@ -117,6 +117,7 @@ pub struct WeightBinding {
     checkpoint_key: String,
     selection: TensorSelection,
     recipe: Option<DerivedWeightRecipe>,
+    quantization_companions: Option<(String, String)>,
     expected_bytes: u64,
 }
 
@@ -141,6 +142,7 @@ impl WeightBinding {
             checkpoint_key,
             selection,
             recipe: None,
+            quantization_companions: None,
             expected_bytes,
         })
     }
@@ -161,6 +163,7 @@ impl WeightBinding {
             checkpoint_key,
             selection: TensorSelection::Full,
             recipe: Some(recipe),
+            quantization_companions: None,
             expected_bytes,
         })
     }
@@ -182,6 +185,7 @@ impl WeightBinding {
             checkpoint_key: String::new(),
             selection: TensorSelection::Full,
             recipe: None,
+            quantization_companions: None,
             expected_bytes,
         })
     }
@@ -220,6 +224,35 @@ impl WeightBinding {
     ) -> Result<Self, ResidencyDeclarationError> {
         self.logical_target = Some(validate_name(target.into())?);
         Ok(self)
+    }
+
+    /// Declares exact local companion names produced by load-time quantization.
+    pub fn with_quantization_companions(
+        mut self,
+        scales_binding: impl Into<String>,
+        biases_binding: impl Into<String>,
+    ) -> Result<Self, ResidencyDeclarationError> {
+        let scales_binding = validate_name(scales_binding.into())?;
+        let biases_binding = validate_name(biases_binding.into())?;
+        if scales_binding == self.name
+            || biases_binding == self.name
+            || scales_binding == biases_binding
+        {
+            return Err(ResidencyDeclarationError::InvalidQuantizationCompanions {
+                name: self.name,
+                scales: scales_binding,
+                biases: biases_binding,
+            });
+        }
+        self.quantization_companions = Some((scales_binding, biases_binding));
+        Ok(self)
+    }
+
+    /// Returns exact local scale and affine-bias bindings for load-time quantization.
+    pub fn quantization_companions(&self) -> Option<(&str, &str)> {
+        self.quantization_companions
+            .as_ref()
+            .map(|(scales, biases)| (scales.as_str(), biases.as_str()))
     }
 
     /// Returns the first physical checkpoint source.
@@ -1543,6 +1576,18 @@ pub enum ResidencyDeclarationError {
     EmptyRecipeSources {
         /// Invalid local name.
         name: String,
+    },
+    /// Load-time quantization companion names collide with one another.
+    #[error(
+        "weight binding {name:?} has invalid quantization companions {scales:?} and {biases:?}"
+    )]
+    InvalidQuantizationCompanions {
+        /// Quantizable weight binding.
+        name: String,
+        /// Declared scale binding.
+        scales: String,
+        /// Declared affine-bias binding.
+        biases: String,
     },
     /// A binding declared no bytes.
     #[error("weight binding {name:?} must contain at least one byte")]

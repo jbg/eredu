@@ -1162,7 +1162,18 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                 let recipe = recipe
                     .select_bounded(catalog, selection.clone())
                     .map_err(|error| error.to_string())?;
-                crate::ExpertParameterRecipe::new(binding, target, recipe)
+                let role = match binding {
+                    "gate_up_proj" => crate::ExpertParameterRole::quantizable_projection(
+                        "gate_up_proj_scales",
+                        "gate_up_proj_biases",
+                    ),
+                    "down_proj" => crate::ExpertParameterRole::quantizable_projection(
+                        "down_proj_scales",
+                        "down_proj_biases",
+                    ),
+                    _ => crate::ExpertParameterRole::Preserved,
+                };
+                crate::ExpertParameterRecipe::new(binding, target, recipe, role)
                     .map_err(|error| error.to_string())
             })
             .collect::<Result<Vec<_>, _>>()?;

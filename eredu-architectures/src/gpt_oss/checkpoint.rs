@@ -407,8 +407,13 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                         .clone()
                         .select_bounded(catalog, selection.clone())
                         .map_err(|error| error.to_string())?;
-                    crate::ExpertParameterRecipe::new(binding, target, recipe)
-                        .map_err(|error| error.to_string())
+                    crate::ExpertParameterRecipe::new(
+                        binding,
+                        target,
+                        recipe,
+                        crate::ExpertParameterRole::Preserved,
+                    )
+                    .map_err(|error| error.to_string())
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             units.push(
@@ -861,6 +866,10 @@ mod tests {
         assert!(first.parameters().iter().all(|parameter| parameter
             .logical_target()
             .starts_with("model.layers.0.mlp.experts.")));
+        assert!(first
+            .parameters()
+            .iter()
+            .all(|parameter| parameter.role() == &crate::ExpertParameterRole::Preserved));
         assert_eq!(
             residency.units()[1].identity(),
             eredu_runtime::ExpertIdentity::new(0, 1)

@@ -7,11 +7,11 @@ use std::{
 };
 
 use eredu_architectures::lfm2::{Block, LayeredModel, ModelArgs};
-use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource, WeightQuantization};
+use eredu_checkpoint::{store::CheckpointSource, WeightQuantization};
 use eredu_runtime::{
-    CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, ExpertIdentity, LayerWeightResidency,
-    LayerwiseModelMetadata, LayerwiseRuntime, OffloadUnit, PagedCacheOptions, ParallelModelInfo,
-    ParameterRole, ResidencyReport, StaticUnitBindings, WeightBinding, WeightResidency,
+    CacheResidencyPolicy, CausalModel, DenseDiskStreamReport, LayerWeightResidency,
+    LayerwiseModelMetadata, LayerwiseRuntime, PagedCacheOptions, ParallelModelInfo, ParameterRole,
+    ResidencyReport, StaticUnitBindings, WeightBinding, WeightResidency,
 };
 use safemlx::{
     error::Exception,
@@ -35,7 +35,6 @@ use crate::backend::{
                 parameter_name_in_targets, parameter_role_targets,
                 populate_module_from_lease_excluding,
             },
-            binding_plan::{BindingPlan, PlannedBinding},
             load::{gguf_quantization_configs, GgufTensorNames},
             quantization::should_quantize_on_load,
             store::open_gguf_checkpoint_source,
@@ -379,57 +378,13 @@ fn resolve_store(
     ))
 }
 
-fn planned_expert_binding(
-    name: impl Into<String>,
-    recipe: DerivedWeightRecipe,
-    store: &dyn CheckpointSource,
-) -> Result<PlannedBinding, Error> {
-    let metadata = recipe.infer(store)?;
-    Ok(PlannedBinding {
-        target_name: name.into(),
-        expected_shape: metadata.shape().to_vec(),
-        expected_dtype: metadata.dtype().clone(),
-        recipe,
-    })
-}
-
 pub fn expert_catalog(
     args: &ModelArgs,
     store: &dyn CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    if !args.has_sparse_moe_layers() {
-        return Err(Error::UnsupportedArchitecture(
-            "independent expert caching requires LFM2-MoE".into(),
-        ));
-    }
-    let mut entries = Vec::new();
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != eredu_architectures::lfm2::FeedForwardPolicy::SparseMoe {
-            continue;
-        }
-        for expert in 0..args.num_experts as usize {
-            let identity = ExpertIdentity::new(layer, expert);
-            let planned = eredu_architectures::lfm2::expert_recipes(store, args, layer, expert)
-                .map_err(Error::UnsupportedArchitecture)?
-                .into_iter()
-                .map(|(name, recipe)| planned_expert_binding(name, recipe, store))
-                .collect::<Result<Vec<_>, _>>()?;
-            let bindings = BindingPlan::new(planned)
-                .and_then(|plan| plan.build_bindings(store))
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
-                total
-                    .checked_add(binding.expected_bytes())
-                    .ok_or_else(|| Error::UnsupportedArchitecture("expert bytes overflowed".into()))
-            })?;
-            entries.push(ExpertCatalogEntry::new(
-                identity,
-                OffloadUnit::new(identity.unit_id(), bindings)?,
-                bytes,
-            )?);
-        }
-    }
-    Ok(entries)
+    let catalog = eredu_architectures::lfm2::expert_residency_catalog(store, args)
+        .map_err(Error::UnsupportedArchitecture)?;
+    crate::composition::architecture_expert_units(catalog, store, None)
 }
 
 const fn cached_provider<'a>(

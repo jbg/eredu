@@ -462,11 +462,31 @@ fn add_expert_residency_units(
     let owner_group = eredu_runtime::ExecutionGroupId::new(topology.owner_group)
         .map_err(|error| error.to_string())?;
     for expert in 0..experts {
-        let parameters = expert_recipes(store, args, topology.identity_layer, expert)?
+        let recipes = expert_recipes(store, args, topology.identity_layer, expert)?;
+        let gate_up_quantizable = !recipes.contains_key("gate_up_proj_scales")
+            && !recipes.contains_key("gate_up_proj_biases");
+        let down_quantizable =
+            !recipes.contains_key("down_proj_scales") && !recipes.contains_key("down_proj_biases");
+        let parameters = recipes
             .into_iter()
             .map(|(binding, recipe)| {
                 let target = format!("{}.{binding}", topology.expert_root);
-                crate::ExpertParameterRecipe::new(binding, target, recipe)
+                let role = match binding.as_str() {
+                    "gate_up_proj" if gate_up_quantizable => {
+                        crate::ExpertParameterRole::quantizable_projection(
+                            "gate_up_proj_scales",
+                            "gate_up_proj_biases",
+                        )
+                    }
+                    "down_proj" if down_quantizable => {
+                        crate::ExpertParameterRole::quantizable_projection(
+                            "down_proj_scales",
+                            "down_proj_biases",
+                        )
+                    }
+                    _ => crate::ExpertParameterRole::Preserved,
+                };
+                crate::ExpertParameterRecipe::new(binding, target, recipe, role)
                     .map_err(|error| error.to_string())
             })
             .collect::<Result<Vec<_>, _>>()?;

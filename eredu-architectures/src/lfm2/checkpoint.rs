@@ -245,6 +245,69 @@ pub fn expert_recipes(
     Ok(recipes)
 }
 
+/// Builds the complete architecture-owned schedule for independently resident experts.
+pub fn expert_residency_catalog(
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+) -> Result<crate::ExpertResidencyCatalog, String> {
+    if !args.has_sparse_moe_layers() {
+        return Err("independent expert residency requires LFM2-MoE".into());
+    }
+    let experts = dimension(args.num_experts, "expert count")?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(|error| error.to_string())?;
+    let mut units = Vec::new();
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
+            continue;
+        }
+        let unit_path = format!("model.layers.{layer}");
+        let expert_root = format!("{unit_path}.feed_forward.experts");
+        for expert in 0..experts {
+            let recipes = expert_recipes(store, args, layer, expert)?;
+            let gate_up_quantizable = !recipes.contains_key("gate_up_proj_scales")
+                && !recipes.contains_key("gate_up_proj_biases");
+            let down_quantizable = !recipes.contains_key("down_proj_scales")
+                && !recipes.contains_key("down_proj_biases");
+            let parameters = recipes
+                .into_iter()
+                .map(|(binding, recipe)| {
+                    let role = match binding.as_str() {
+                        "gate_up_proj" if gate_up_quantizable => {
+                            crate::ExpertParameterRole::quantizable_projection(
+                                "gate_up_proj_scales",
+                                "gate_up_proj_biases",
+                            )
+                        }
+                        "down_proj" if down_quantizable => {
+                            crate::ExpertParameterRole::quantizable_projection(
+                                "down_proj_scales",
+                                "down_proj_biases",
+                            )
+                        }
+                        _ => crate::ExpertParameterRole::Preserved,
+                    };
+                    let target = format!("{expert_root}.{binding}");
+                    crate::ExpertParameterRecipe::new(binding, target, recipe, role)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            units.push(
+                crate::ExpertResidencyUnit::new(
+                    eredu_runtime::ExpertIdentity::new(layer, expert),
+                    owner_group.clone(),
+                    layer,
+                    &unit_path,
+                    crate::ExpertResidencyDistribution::ExpertParallel,
+                    parameters,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+}
+
 /// Rehomes split expert GGUF formats onto their canonical fused runtime weights.
 pub fn normalize_weight_formats<V>(args: &ModelArgs, formats: &mut HashMap<String, V>) {
     for (layer, policy) in args.layer_schedule.iter().enumerate() {
@@ -959,13 +1022,16 @@ mod tests {
         let args = fixture();
         let prefix = "model.layers.1.feed_forward.experts";
         let mut tensors = Vec::new();
-        for expert in 0..args.num_experts {
-            for (name, shape) in [
-                ("w1", vec![8, 16]),
-                ("w3", vec![8, 16]),
-                ("w2", vec![16, 8]),
-            ] {
-                tensors.push((format!("{prefix}.{expert}.{name}.weight"), shape));
+        for layer in 1..3 {
+            let layer_prefix = format!("model.layers.{layer}.feed_forward.experts");
+            for expert in 0..args.num_experts {
+                for (name, shape) in [
+                    ("w1", vec![8, 16]),
+                    ("w3", vec![8, 16]),
+                    ("w2", vec![16, 8]),
+                ] {
+                    tensors.push((format!("{layer_prefix}.{expert}.{name}.weight"), shape));
+                }
             }
         }
         let store = memory_store(tensors);
@@ -976,6 +1042,16 @@ mod tests {
         ));
         let expert = expert_recipes(&store, &args, 1, 2).unwrap();
         assert_eq!(expert.len(), 2);
+        let residency = expert_residency_catalog(&store, &args).unwrap();
+        assert_eq!(residency.units().len(), 8);
+        assert_eq!(residency.units()[0].unit_path(), "model.layers.1");
+        assert!(residency.units()[0]
+            .parameters()
+            .iter()
+            .all(|parameter| matches!(
+                parameter.role(),
+                crate::ExpertParameterRole::QuantizableProjection { .. }
+            )));
 
         let mut formats = HashMap::from([
             (format!("{prefix}.gate_proj"), 1),

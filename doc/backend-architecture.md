@@ -125,9 +125,14 @@ Independent expert residency is exposed as a validated neutral catalog. Each
 catalog entry carries the router/cache identity, the owning architecture group,
 unit index and parameter path, expert-parallel versus replicated placement,
 exact acquired-bank binding names, exact logical parameter targets, and
-checkpoint-derived recipes. Family code owns sparse-layer selection, routed
+checkpoint-derived recipes. Each parameter also declares whether it must be
+preserved or is a load-time-quantizable projection; quantizable projections
+carry the exact local scale and affine-bias companion binding names. Backends
+consume that declaration directly and never infer eligibility or companion
+identity from binding spelling, dtype, or rank. Family code owns sparse-layer selection, routed
 versus shared-bank scheduling, expert counts, and cache-layer numbering.
-This applies uniformly to Gemma 4, Muse-Glimmer, DeepSeek, GPT-OSS, and later
+This applies uniformly to Gemma 4, Muse-Glimmer, DeepSeek, GPT-OSS, LFM2,
+Kimi Linear, and later
 families: each architecture checkpoint module emits its complete
 `ExpertResidencyCatalog`, including compact acquired-bank names and every
 per-expert or rank-local selection recipe. Backend family adapters may request

@@ -431,11 +431,31 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
         let unit_path = format!("{}.layers.{layer}", args.parameter_root);
         let expert_root = format!("{unit_path}.mlp.experts");
         for expert in 0..experts {
-            let parameters = expert_unit_recipes(catalog, args, layer, expert)?
+            let recipes = expert_unit_recipes(catalog, args, layer, expert)?;
+            let gate_up_quantizable = !recipes.contains_key("gate_up_proj_scales")
+                && !recipes.contains_key("gate_up_proj_biases");
+            let down_quantizable = !recipes.contains_key("down_proj_scales")
+                && !recipes.contains_key("down_proj_biases");
+            let parameters = recipes
                 .into_iter()
                 .map(|(binding, recipe)| {
                     let target = format!("{expert_root}.{binding}");
-                    crate::ExpertParameterRecipe::new(binding, target, recipe)
+                    let role = match binding.as_str() {
+                        "gate_up_proj" if gate_up_quantizable => {
+                            crate::ExpertParameterRole::quantizable_projection(
+                                "gate_up_proj_scales",
+                                "gate_up_proj_biases",
+                            )
+                        }
+                        "down_proj" if down_quantizable => {
+                            crate::ExpertParameterRole::quantizable_projection(
+                                "down_proj_scales",
+                                "down_proj_biases",
+                            )
+                        }
+                        _ => crate::ExpertParameterRole::Preserved,
+                    };
+                    crate::ExpertParameterRecipe::new(binding, target, recipe, role)
                         .map_err(|error| error.to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1180,6 +1200,10 @@ mod tests {
                 ("gate_up_proj", "model.layers.0.mlp.experts.gate_up_proj"),
             ]
         );
+        assert!(first.parameters().iter().all(|parameter| matches!(
+            parameter.role(),
+            crate::ExpertParameterRole::QuantizableProjection { .. }
+        )));
         assert_eq!(
             catalog.units()[7].identity(),
             eredu_runtime::ExpertIdentity::new(1, 3)

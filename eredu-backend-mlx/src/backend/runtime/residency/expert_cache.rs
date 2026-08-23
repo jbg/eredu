@@ -5,7 +5,7 @@
 //! inspected once per routed block, validated before acquisition, coalesced in
 //! deterministic global-id order, and rewritten to a temporary compact bank.
 
-use eredu_checkpoint::{recipe::RecipeDtype, store::TensorSelection, WeightQuantization};
+use eredu_checkpoint::{store::TensorSelection, WeightQuantization};
 use eredu_runtime::{
     ExpertCacheLoadOptions, ExpertIdentity, ExpertPass, OffloadUnit, ResidencyReport,
     WeightBinding, WeightMaterializationReport,
@@ -142,18 +142,16 @@ pub fn quantize_expert_catalog(
     for entry in entries {
         let (identity, unit) = entry.into_parts();
         for binding in unit.bindings() {
+            let Some((scales_binding, biases_binding)) = binding.quantization_companions() else {
+                continue;
+            };
             let recipe = binding.source_recipe();
             let metadata = recipe.infer(source.as_ref())?;
-            if !quantizable_expert_binding(binding.name(), metadata.dtype(), metadata.shape()) {
-                continue;
-            }
-            let stem = binding
-                .name()
-                .strip_suffix(".weight")
-                .unwrap_or(binding.name());
             let target_name = format!(
-                "__eredu.expert.layer.{:05}.global.{:05}.{stem}.weight",
-                identity.layer, identity.global_expert
+                "__eredu.expert.layer.{:05}.global.{:05}.{}.weight",
+                identity.layer,
+                identity.global_expert,
+                binding.name()
             );
             let target = BoundedQuantizationTarget::from_recipe(target_name, recipe)?;
             packed_catalog_bytes = packed_catalog_bytes
@@ -161,7 +159,14 @@ pub fn quantize_expert_catalog(
                 .ok_or_else(|| {
                     Error::Quantization("packed expert catalog size overflowed".into())
                 })?;
-            target_by_binding.insert((identity, binding.name().to_string()), target.clone());
+            target_by_binding.insert(
+                (identity, binding.name().to_string()),
+                (
+                    target.clone(),
+                    scales_binding.to_owned(),
+                    biases_binding.to_owned(),
+                ),
+            );
             targets.push(target);
         }
         units.push((identity, unit));
@@ -187,7 +192,8 @@ pub fn quantize_expert_catalog(
     for (identity, unit) in units {
         let mut bindings = Vec::new();
         for binding in unit.bindings() {
-            let Some(target) = target_by_binding.get(&(identity, binding.name().to_string()))
+            let Some((target, scales_name, biases_name)) =
+                target_by_binding.get(&(identity, binding.name().to_string()))
             else {
                 bindings.push(binding.clone());
                 continue;
@@ -197,15 +203,14 @@ pub fn quantize_expert_catalog(
                 target.weight_name(),
                 store.as_ref(),
             )?);
-            let (scales_name, biases_name) = local_companion_names(binding.name());
             bindings.push(packed_binding(
-                &scales_name,
+                scales_name,
                 &target.scales_name(),
                 store.as_ref(),
             )?);
             if quantization.has_biases() {
                 bindings.push(packed_binding(
-                    &biases_name,
+                    biases_name,
                     &target.biases_name(),
                     store.as_ref(),
                 )?);
@@ -227,16 +232,6 @@ pub fn quantize_expert_catalog(
         entries: rebuilt,
         report,
     })
-}
-
-fn quantizable_expert_binding(name: &str, dtype: &RecipeDtype, shape: &[usize]) -> bool {
-    matches!(
-        dtype,
-        RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
-    ) && shape.len() >= 2
-        && !name.contains("scale")
-        && !name.contains("bias")
-        && !name.ends_with("_blocks")
 }
 
 fn packed_projection_bytes(
@@ -279,18 +274,6 @@ fn packed_projection_bytes(
         .ok_or_else(|| Error::Quantization("packed expert row total overflowed".into()))?;
     rows.checked_mul(row_bytes)
         .ok_or_else(|| Error::Quantization("packed expert projection size overflowed".into()))
-}
-
-fn local_companion_names(weight_name: &str) -> (String, String) {
-    weight_name.strip_suffix(".weight").map_or_else(
-        || {
-            (
-                format!("{weight_name}_scales"),
-                format!("{weight_name}_biases"),
-            )
-        },
-        |prefix| (format!("{prefix}.scales"), format!("{prefix}.biases")),
-    )
 }
 
 fn packed_binding(
@@ -1507,7 +1490,13 @@ mod tests {
                             end: expert * 2 + 2,
                         },
                     };
-                    WeightBinding::from_recipe(format!("{projection}_proj"), tp, 512).unwrap()
+                    WeightBinding::from_recipe(format!("{projection}_proj"), tp, 512)
+                        .unwrap()
+                        .with_quantization_companions(
+                            format!("{projection}_proj_scales"),
+                            format!("{projection}_proj_biases"),
+                        )
+                        .unwrap()
                 });
                 let unit = OffloadUnit::new(identity.unit_id(), bindings).unwrap();
                 ExpertCatalogEntry::new(identity, unit, 1_024).unwrap()
@@ -1563,6 +1552,81 @@ mod tests {
                 .unwrap()
                 .shape(),
             &[1, 2, 1]
+        );
+    }
+
+    #[test]
+    fn expert_quantization_uses_only_declared_roles_and_companion_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let values = (0..8 * 64)
+            .map(|index| index as f32 / 16.0)
+            .collect::<Vec<_>>();
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            [
+                (
+                    "legitimate.bias_scale_blocks",
+                    TensorView::new(StoredDtype::F32, vec![8, 64], &bytes).unwrap(),
+                ),
+                (
+                    "preserved.matrix",
+                    TensorView::new(StoredDtype::F32, vec![8, 64], &bytes).unwrap(),
+                ),
+            ],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let store: Arc<dyn CheckpointSource> =
+            Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
+        let identity = ExpertIdentity::new(0, 0);
+        let quantized = WeightBinding::from_recipe(
+            "legitimate.bias_scale_blocks",
+            DerivedWeightRecipe::source("legitimate.bias_scale_blocks", TensorSelection::Full),
+            bytes.len() as u64,
+        )
+        .unwrap()
+        .with_quantization_companions("declared.scale", "declared.bias")
+        .unwrap();
+        let preserved = WeightBinding::from_recipe(
+            "ordinary_matrix",
+            DerivedWeightRecipe::source("preserved.matrix", TensorSelection::Full),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        let entry = ExpertCatalogEntry::new(
+            identity,
+            OffloadUnit::new(identity.unit_id(), [quantized, preserved]).unwrap(),
+            (bytes.len() * 2) as u64,
+        )
+        .unwrap();
+
+        let transformed = quantize_expert_catalog(
+            store,
+            vec![entry],
+            WeightQuantization::Affine(Default::default()),
+            1_024,
+            &stream(),
+        )
+        .unwrap();
+
+        assert_eq!(transformed.report.transformed_weights, 1);
+        assert_eq!(
+            transformed.entries[0]
+                .unit
+                .bindings()
+                .iter()
+                .map(WeightBinding::name)
+                .collect::<Vec<_>>(),
+            [
+                "declared.bias",
+                "declared.scale",
+                "legitimate.bias_scale_blocks",
+                "ordinary_matrix",
+            ]
         );
     }
 

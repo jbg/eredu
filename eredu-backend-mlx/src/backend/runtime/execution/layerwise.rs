@@ -994,6 +994,9 @@ pub fn shard_layer_bindings(
                 binding.name()
             ));
         let logical_target = binding.logical_target().map(str::to_owned);
+        let quantization_companions = binding
+            .quantization_companions()
+            .map(|(scales, biases)| (scales.to_owned(), biases.to_owned()));
         let tensor = logical_target
             .as_deref()
             .and_then(|target| layout.tensor(target))
@@ -1061,6 +1064,9 @@ pub fn shard_layer_bindings(
             if let Some(target) = logical_target {
                 sharded = sharded.with_logical_target(target)?;
             }
+            if let Some((scales, biases)) = quantization_companions {
+                sharded = sharded.with_quantization_companions(scales, biases)?;
+            }
             output.push(sharded);
             continue;
         }
@@ -1076,6 +1082,9 @@ pub fn shard_layer_bindings(
         let mut sharded = WeightBinding::from_recipe(binding.name(), recipe, expected_bytes)?;
         if let Some(target) = logical_target {
             sharded = sharded.with_logical_target(target)?;
+        }
+        if let Some((scales, biases)) = quantization_companions {
+            sharded = sharded.with_quantization_companions(scales, biases)?;
         }
         output.push(sharded);
     }

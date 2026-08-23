@@ -844,7 +844,18 @@ fn append_expert_residency_units<C: RecipeCatalog + ?Sized>(
         ]
         .into_iter()
         .map(|(binding, target, recipe)| {
-            crate::ExpertParameterRecipe::new(binding, target, recipe)
+            let role = match binding {
+                "gate_up_proj" => crate::ExpertParameterRole::quantizable_projection(
+                    "gate_up_proj_scales",
+                    "gate_up_proj_biases",
+                ),
+                "down_proj" => crate::ExpertParameterRole::quantizable_projection(
+                    "down_proj_scales",
+                    "down_proj_biases",
+                ),
+                _ => crate::ExpertParameterRole::Preserved,
+            };
+            crate::ExpertParameterRecipe::new(binding, target, recipe, role)
                 .map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;

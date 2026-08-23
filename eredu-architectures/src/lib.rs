@@ -34,8 +34,8 @@ pub use static_parameters::{
 /// Backend-neutral schedules and recipes for independent expert residency.
 pub mod expert_residency;
 pub use expert_residency::{
-    ExpertParameterRecipe, ExpertResidencyCatalog, ExpertResidencyCatalogError,
-    ExpertResidencyDistribution, ExpertResidencyUnit,
+    ExpertParameterRecipe, ExpertParameterRole, ExpertResidencyCatalog,
+    ExpertResidencyCatalogError, ExpertResidencyDistribution, ExpertResidencyUnit,
 };
 
 /// Shared decoder mechanics used by backend-neutral text architectures.

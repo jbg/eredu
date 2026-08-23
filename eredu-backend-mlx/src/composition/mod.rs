@@ -76,17 +76,25 @@ pub(crate) fn architecture_expert_units(
                 .into_parameters()
                 .into_iter()
                 .map(|parameter| {
-                    let (binding_name, logical_target, mut recipe) = parameter.into_parts();
+                    let (binding_name, logical_target, mut recipe, role) = parameter.into_parts();
                     if recipe.infer(store)?.dtype() == &eredu_checkpoint::recipe::RecipeDtype::F4 {
                         recipe = crate::backend::runtime::checkpoint::recipe::lower_mxfp4_recipe(
                             recipe, store,
                         )?;
                     }
                     let metadata = recipe.infer(store)?;
-                    Ok(
+                    let mut binding =
                         WeightBinding::from_recipe(binding_name, recipe, metadata.byte_len())?
-                            .with_logical_target(logical_target)?,
-                    )
+                            .with_logical_target(logical_target)?;
+                    if let eredu_architectures::ExpertParameterRole::QuantizableProjection {
+                        scales_binding,
+                        biases_binding,
+                    } = role
+                    {
+                        binding =
+                            binding.with_quantization_companions(scales_binding, biases_binding)?;
+                    }
+                    Ok(binding)
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
             if let Some(layout) = layout {

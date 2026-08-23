@@ -331,6 +331,69 @@ pub fn expert_recipes(
     Ok(recipes)
 }
 
+/// Builds the complete architecture-owned schedule for independently resident experts.
+pub fn expert_residency_catalog(
+    store: &dyn CheckpointSource,
+    args: &ModelArgs,
+) -> Result<crate::ExpertResidencyCatalog, String> {
+    if !args.has_sparse_moe_layers() {
+        return Err("independent expert residency requires Kimi Linear-MoE".into());
+    }
+    let experts = dimension(args.num_experts, "expert count")?;
+    let owner_group =
+        eredu_runtime::ExecutionGroupId::new("text_decoder").map_err(|error| error.to_string())?;
+    let mut units = Vec::new();
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
+            continue;
+        }
+        let unit_path = format!("model.layers.{layer}");
+        let expert_root = format!("{unit_path}.mlp.experts");
+        for expert in 0..experts {
+            let recipes = expert_recipes(store, args, layer, expert)?;
+            let gate_up_quantizable = !recipes.contains_key("gate_up_proj_scales")
+                && !recipes.contains_key("gate_up_proj_biases");
+            let down_quantizable = !recipes.contains_key("down_proj_scales")
+                && !recipes.contains_key("down_proj_biases");
+            let parameters = recipes
+                .into_iter()
+                .map(|(binding, recipe)| {
+                    let role = match binding.as_str() {
+                        "gate_up_proj" if gate_up_quantizable => {
+                            crate::ExpertParameterRole::quantizable_projection(
+                                "gate_up_proj_scales",
+                                "gate_up_proj_biases",
+                            )
+                        }
+                        "down_proj" if down_quantizable => {
+                            crate::ExpertParameterRole::quantizable_projection(
+                                "down_proj_scales",
+                                "down_proj_biases",
+                            )
+                        }
+                        _ => crate::ExpertParameterRole::Preserved,
+                    };
+                    let target = format!("{expert_root}.{binding}");
+                    crate::ExpertParameterRecipe::new(binding, target, recipe, role)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            units.push(
+                crate::ExpertResidencyUnit::new(
+                    eredu_runtime::ExpertIdentity::new(layer, expert),
+                    owner_group.clone(),
+                    layer,
+                    &unit_path,
+                    crate::ExpertResidencyDistribution::ExpertParallel,
+                    parameters,
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    crate::ExpertResidencyCatalog::new(units).map_err(|error| error.to_string())
+}
+
 /// Builds the strict SafeTensors catalog plan.
 pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
     let hidden = dimension(args.hidden_size, "hidden size")?;
@@ -1327,5 +1390,15 @@ mod tests {
                 .get("gate_up_proj"),
             Some(DerivedWeightRecipe::Stack { axis: 0, inputs }) if inputs.len() == 1
         ));
+        let residency = expert_residency_catalog(&catalog, &args).unwrap();
+        assert_eq!(residency.units().len(), 2);
+        assert_eq!(residency.units()[0].unit_path(), "model.layers.1");
+        assert!(residency.units()[0]
+            .parameters()
+            .iter()
+            .all(|parameter| matches!(
+                parameter.role(),
+                crate::ExpertParameterRole::QuantizableProjection { .. }
+            )));
     }
 }

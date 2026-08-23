@@ -339,11 +339,33 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
             eredu_runtime::ExecutionGroupId::new(owner_group).map_err(|error| error.to_string())?;
         let expert_root = format!("{unit_path}.mlp.experts");
         for expert in 0..experts {
-            let parameters = expert_recipes(catalog, config, layer, expert)?
+            let recipes = expert_recipes(catalog, config, layer, expert)?;
+            let gate_up_quantizable = !recipes.contains_key("gate_up_proj_scales")
+                && !recipes.contains_key("gate_up_proj_biases")
+                && !recipes.contains_key("gate_up_proj_scale_inv");
+            let down_quantizable = !recipes.contains_key("down_proj_scales")
+                && !recipes.contains_key("down_proj_biases")
+                && !recipes.contains_key("down_proj_scale_inv");
+            let parameters = recipes
                 .into_iter()
                 .map(|(binding, recipe)| {
                     let target = format!("{expert_root}.{binding}");
-                    crate::ExpertParameterRecipe::new(binding, target, recipe)
+                    let role = match binding.as_str() {
+                        "gate_up_proj" if gate_up_quantizable => {
+                            crate::ExpertParameterRole::quantizable_projection(
+                                "gate_up_proj_scales",
+                                "gate_up_proj_biases",
+                            )
+                        }
+                        "down_proj" if down_quantizable => {
+                            crate::ExpertParameterRole::quantizable_projection(
+                                "down_proj_scales",
+                                "down_proj_biases",
+                            )
+                        }
+                        _ => crate::ExpertParameterRole::Preserved,
+                    };
+                    crate::ExpertParameterRecipe::new(binding, target, recipe, role)
                         .map_err(|error| error.to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;

@@ -1045,6 +1045,17 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                     start: expert,
                     end: expert + 1,
                 };
+                let has_member = |binding: &str| {
+                    let target = format!("{bank_root}.{binding}");
+                    group
+                        .members()
+                        .iter()
+                        .any(|member| member.target() == target)
+                };
+                let gate_up_quantizable =
+                    !has_member("gate_up_proj_scales") && !has_member("gate_up_proj_biases");
+                let down_quantizable =
+                    !has_member("down_proj_scales") && !has_member("down_proj_biases");
                 let parameters = group
                     .members()
                     .iter()
@@ -1065,7 +1076,22 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
                             input: Box::new(bank_recipe),
                             selection: selection.clone(),
                         };
-                        crate::ExpertParameterRecipe::new(binding, target, recipe)
+                        let role = match binding {
+                            "gate_up_proj" if gate_up_quantizable => {
+                                crate::ExpertParameterRole::quantizable_projection(
+                                    "gate_up_proj_scales",
+                                    "gate_up_proj_biases",
+                                )
+                            }
+                            "down_proj" if down_quantizable => {
+                                crate::ExpertParameterRole::quantizable_projection(
+                                    "down_proj_scales",
+                                    "down_proj_biases",
+                                )
+                            }
+                            _ => crate::ExpertParameterRole::Preserved,
+                        };
+                        crate::ExpertParameterRecipe::new(binding, target, recipe, role)
                             .map_err(|error| error.to_string())
                     })
                     .collect::<Result<Vec<_>, String>>()?;
