@@ -1,5 +1,7 @@
 //! Curated application-facing MLX adapter API.
 
+pub use eredu_architectures::moshi::EffectiveModelType;
+
 pub use crate::backend::error::Error as MlxError;
 pub use crate::backend::runtime::checkpoint::quantization::{
     quantize_checkpoint, CheckpointQuantizationOptions, CheckpointQuantizationReport,
@@ -21,7 +23,6 @@ pub use crate::composition::mlx::realtime::{
     generate_encoded_greedy, MlxEncodedAudioOutput, MlxRealtimeBackend, MlxRealtimeCompletion,
     MlxRealtimeInput, MlxRealtimeModel, MlxRealtimeModelIdentity, MlxRealtimeModelState,
     MlxRealtimeModelStateBranch, MlxRealtimeOutput, MlxRealtimeSession, MlxRealtimeSessionBranch,
-    RealtimeModelKind,
 };
 pub use crate::composition::mlx::speculative::{MlxDrafter, MtpComponentTimingGuard};
 pub use crate::composition::mlx::{

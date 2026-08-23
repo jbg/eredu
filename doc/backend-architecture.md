@@ -296,7 +296,10 @@ architecture declares PersonaPlex's released silence, sine-conditioning, and
 text-padding tokens, system-text framing, accepted prompt geometry, and
 ordered forced-frame plan. A concrete backend only slices and materializes
 native arrays from that plan and enqueues the resulting frames; it does not
-redeclare PersonaPlex application policy.
+redeclare PersonaPlex application policy. Realtime model identity is likewise
+architecture-owned: backend models return the Moshi architecture's
+`EffectiveModelType` directly, and backend adapters may re-export that type but
+must not wrap it in a backend-specific family enum.
 
 Prepared-media admission follows the same boundary after tensor construction.
 Architecture media plans validate family payload shapes,

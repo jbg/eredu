@@ -5,6 +5,7 @@ pub mod personaplex_prompt;
 
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
+use eredu_architectures::moshi::{ArtifactProfile, EffectiveModelType, MoshiConfig};
 use eredu_core::{
     backend::{Completion, Submission},
     realtime::{
@@ -41,25 +42,6 @@ use crate::{
     MlxTensor,
 };
 
-/// Supported MLX realtime speech-to-speech model-family dispatch target.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum RealtimeModelKind {
-    /// Moshi-family realtime token model with a native Moshi/MLX checkpoint layout.
-    Moshi,
-    /// NVIDIA PersonaPlex realtime token model with its released PyTorch safetensors layout.
-    PersonaPlex,
-}
-
-impl RealtimeModelKind {
-    /// Returns the model type string used for user-facing dispatch messages.
-    pub fn model_type(self) -> &'static str {
-        match self {
-            Self::Moshi => "moshi",
-            Self::PersonaPlex => "personaplex",
-        }
-    }
-}
-
 /// Loaded MLX realtime speech-to-speech token model.
 pub struct MlxRealtimeModel {
     model: NeutralMoshiModel,
@@ -70,28 +52,23 @@ impl MlxRealtimeModel {
         self.model.artifact_identity()
     }
 
-    /// Returns the loaded realtime model family.
-    pub fn kind(&self) -> RealtimeModelKind {
-        match self.model.config().effective_model_type() {
-            eredu_architectures::moshi::EffectiveModelType::Moshi => RealtimeModelKind::Moshi,
-            eredu_architectures::moshi::EffectiveModelType::PersonaPlex => {
-                RealtimeModelKind::PersonaPlex
-            }
-        }
+    /// Returns the architecture-owned effective model identity.
+    pub fn effective_model_type(&self) -> EffectiveModelType {
+        self.model.config().effective_model_type()
     }
 
     /// Returns the loaded realtime model family as a model type string.
     pub fn model_type(&self) -> &'static str {
-        self.kind().model_type()
+        self.effective_model_type().as_str()
     }
 
     /// Returns the normalized Moshi-family configuration.
-    pub fn config(&self) -> &eredu_architectures::moshi::MoshiConfig {
+    pub fn config(&self) -> &MoshiConfig {
         self.model.config()
     }
 
     /// Returns the normalized source artifact profile.
-    pub fn profile(&self) -> eredu_architectures::moshi::ArtifactProfile {
+    pub fn profile(&self) -> ArtifactProfile {
         self.model.source_config().artifact_profile()
     }
 
@@ -1872,7 +1849,7 @@ mod tests {
     fn run_released_teacher_fixture(
         model_env: &str,
         reference_env: &str,
-        expected_kind: RealtimeModelKind,
+        expected_model_type: EffectiveModelType,
     ) {
         let model_path = std::env::var_os(model_env).unwrap_or_else(|| {
             panic!(
@@ -1896,7 +1873,7 @@ mod tests {
         let mut model = backend
             .prepare_realtime_model(Path::new(&model_path), ModelLoadOptions::default())
             .unwrap_or_else(|error| panic!("load {model_env}: {error}"));
-        assert_eq!(model.kind(), expected_kind);
+        assert_eq!(model.effective_model_type(), expected_model_type);
         run_teacher_forced_fixture(&mut model, Path::new(&reference_path), execution.stream());
     }
 
@@ -2101,7 +2078,7 @@ mod tests {
         run_released_teacher_fixture(
             "EREDU_MOSHI_FIXTURE",
             "EREDU_MOSHI_TEACHER_FIXTURE",
-            RealtimeModelKind::Moshi,
+            EffectiveModelType::Moshi,
         );
     }
 
@@ -2111,7 +2088,7 @@ mod tests {
         run_released_teacher_fixture(
             "EREDU_PERSONAPLEX_FIXTURE",
             "EREDU_PERSONAPLEX_TEACHER_FIXTURE",
-            RealtimeModelKind::PersonaPlex,
+            EffectiveModelType::PersonaPlex,
         );
     }
 
@@ -2142,7 +2119,10 @@ mod tests {
                 ModelLoadOptions::default().with_weight_residency(residency),
             )
             .expect("load PersonaPlex residency mode");
-            assert_eq!(model.model().kind(), RealtimeModelKind::PersonaPlex);
+            assert_eq!(
+                model.model().effective_model_type(),
+                EffectiveModelType::PersonaPlex
+            );
             run_personaplex_frame_fixture(&mut model, &fixture, "generation", false);
             run_personaplex_frame_fixture(&mut model, &fixture, "prompt", true);
         }
@@ -2211,7 +2191,10 @@ mod tests {
         let model = backend
             .prepare_realtime_model(Path::new(&fixture), ModelLoadOptions::default())
             .unwrap();
-        assert_eq!(model.kind(), RealtimeModelKind::PersonaPlex);
+        assert_eq!(
+            model.effective_model_type(),
+            EffectiveModelType::PersonaPlex
+        );
         let session = backend
             .create_session(&model, RealtimeSampling::greedy())
             .unwrap();
