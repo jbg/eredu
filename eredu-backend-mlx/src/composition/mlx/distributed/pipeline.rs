@@ -603,15 +603,6 @@ impl InklingPipelinePartition {
             .ok_or_else(|| Error::Parallel("Inkling partition has no runtime state".into()))
     }
 
-    fn static_modules_mut(
-        &mut self,
-    ) -> &mut eredu_architectures::inkling::StaticModules<MlxNeuralBackend> {
-        <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::static_modules_mut(&mut self.architecture)
-    }
-
     fn build_unit(
         &self,
         group: usize,
@@ -12772,36 +12763,6 @@ impl PipelineLoadAccumulator {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn load_excluding<M: ModuleParameters + ?Sized>(
-        &mut self,
-        owner: eredu_runtime::ParameterGroupOwner,
-        module: &mut M,
-        store: &dyn eredu_checkpoint::store::CheckpointSource,
-        bindings: &[WeightBinding],
-        quantize_on_load: Option<WeightQuantization>,
-        weights_stream: &Stream,
-        stream: &Stream,
-        excluded: &dyn Fn(&str) -> bool,
-    ) -> Result<(), Error> {
-        validate_partition_owner_bindings(&self.binding_authority, &owner, bindings)?;
-        let (bytes, names, dtype) = load_bound_module_excluding(
-            module,
-            store,
-            bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-            excluded,
-        )?;
-        self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
-            Error::Parallel(format!("{} pipeline byte total overflowed", self.family))
-        })?;
-        self.activation_dtype = self.activation_dtype.or(dtype);
-        self.owned_tensors.extend(names);
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn load_excluding_roles<M: ModuleParameters + ?Sized>(
         &mut self,
         owner: eredu_runtime::ParameterGroupOwner,
@@ -12975,44 +12936,6 @@ where
     Ok(())
 }
 
-fn pipeline_cartesian_static_bindings(
-    units: &[StaticUnitBindings],
-    role: &str,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-    layout: Option<&eredu_runtime::LocalModelLayout>,
-) -> Result<Vec<WeightBinding>, Error> {
-    let bindings = pipeline_static_bindings(units, role)?.to_vec();
-    match layout {
-        Some(layout) => shard_layer_bindings(bindings, "", store, layout),
-        None => Ok(bindings),
-    }
-}
-
-fn pipeline_static_role_binding_selection(
-    authority: &[eredu_runtime::OwnedParameterGroupSpec],
-    role: &str,
-    bindings: &[WeightBinding],
-) -> (BTreeSet<String>, Vec<WeightBinding>) {
-    let targets = authority
-        .iter()
-        .filter(|group| match group.owner() {
-            eredu_runtime::ParameterGroupOwner::StaticRole(candidate) => candidate == role,
-            eredu_runtime::ParameterGroupOwner::StaticAnyOf(candidates) => candidates
-                .first()
-                .is_some_and(|candidate| candidate == role),
-            eredu_runtime::ParameterGroupOwner::ExecutionUnit { .. } => false,
-        })
-        .flat_map(|group| group.members())
-        .map(|member| member.target().to_owned())
-        .collect::<BTreeSet<_>>();
-    let selected = bindings
-        .iter()
-        .filter(|binding| parameter_name_in_targets(binding_target(binding), &targets))
-        .cloned()
-        .collect();
-    (targets, selected)
-}
-
 fn decoder_partition_state_layout(
     complete: &eredu_runtime::StateLayout,
     layers: Range<usize>,
@@ -13040,22 +12963,6 @@ fn local_architecture_parameter_bindings<G, A>(
     partition: &eredu_runtime::ArchitecturePartition<G, A>,
 ) -> Vec<eredu_runtime::OwnedParameterGroupSpec> {
     description.select_owned(partition)
-}
-
-fn local_architecture_static_binding_targets<G, A>(
-    partition: &eredu_runtime::ArchitecturePartition<G, A>,
-) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut targets = BTreeSet::new();
-    let mut vocabulary_targets = BTreeSet::new();
-    for group in partition.parameter_bindings() {
-        for member in group.members() {
-            targets.insert(member.target().to_owned());
-            if group.role() == eredu_runtime::ParameterRole::Vocabulary {
-                vocabulary_targets.insert(member.target().to_owned());
-            }
-        }
-    }
-    (targets, vocabulary_targets)
 }
 
 fn validate_partition_owner_bindings(
@@ -13605,6 +13512,28 @@ fn select_static_binding_units_by_owner(
         selected.push(StaticUnitBindings::new(*role, unit.bindings().to_vec())?);
     }
     Ok(selected)
+}
+
+fn split_static_binding_units_by_owner(
+    authority: &[eredu_runtime::OwnedParameterGroupSpec],
+    bindings: &[WeightBinding],
+    roles: &[&str],
+) -> Result<Vec<StaticUnitBindings>, Error> {
+    roles
+        .iter()
+        .map(|role| {
+            let owner = eredu_runtime::ParameterGroupOwner::static_role(*role);
+            let (expected, _) = owner_parameter_targets(authority, &owner, &[])?;
+            let bindings = bindings
+                .iter()
+                .filter(|binding| expected.contains(&canonical_binding_target(binding)))
+                .cloned()
+                .collect::<Vec<_>>();
+            validate_partition_owner_bindings(authority, &owner, &bindings)?;
+            StaticUnitBindings::new(*role, bindings)
+                .map_err(|error| Error::Parallel(error.to_string()))
+        })
+        .collect()
 }
 
 fn checkpoint_backing_shards<'a>(
@@ -15492,87 +15421,17 @@ fn load_muse_glimmer_pipeline(
         &static_roles,
     )?;
     let mut loaded = PipelineLoadAccumulator::new("Muse-Glimmer", &stage.partition);
-    if static_roles.contains(&"vision") {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "vision",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        let modules = <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxKeyValueState,
-        >>::static_modules_mut(&mut stage.architecture);
-        let mut vision = crate::backend::mlx::nn::shared::MlxModuleRef::new(&mut modules.vision);
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("vision"),
-            &mut vision,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"embedding") {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "embedding",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        let modules = <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxKeyValueState,
-        >>::static_modules_mut(&mut stage.architecture);
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            &mut modules.text.embeddings,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"norm") {
-        let modules = <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxKeyValueState,
-        >>::static_modules_mut(&mut stage.architecture);
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("norm"),
-            &mut modules.text.final_norm,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "norm")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-        if static_roles.contains(&"output") {
-            let bindings = pipeline_cartesian_static_bindings(
-                &static_units,
-                "output",
-                store.as_ref(),
-                parallel_layout.as_ref(),
-            )?;
-            let modules = <muse_glimmer::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
-                MlxNeuralBackend,
-                MlxKeyValueState,
-            >>::static_modules_mut(&mut stage.architecture);
-            if let Some(module) = &mut modules.text.head {
-                loaded.load(
-                    eredu_runtime::ParameterGroupOwner::static_role("output"),
-                    module,
-                    store.as_ref(),
-                    &bindings,
-                    quantize_on_load,
-                    weights_stream,
-                    stream,
-                )?;
-            }
-        }
-    }
+    load_architecture_static_parameters(
+        &mut stage.architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        quantize_on_load,
+        weights_stream,
+        stream,
+    )?;
     if dense_stream.is_none() {
         let architecture = &stage.architecture;
         for (index, layer) in stage.vision_range().clone().zip(&mut stage.vision_layers) {
@@ -15957,8 +15816,6 @@ fn load_neutral_qwen_vl_pipeline(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let static_roles = parameter_description.select_static_roles(&stage.partition);
-    let need_vision = static_roles.contains(&"vision");
-    let need_embedding = static_roles.contains(&"embedding");
     let (store, materialization) =
         match quantize_on_load {
             Some(quantization) => {
@@ -16005,82 +15862,17 @@ fn load_neutral_qwen_vl_pipeline(
         &static_roles,
     )?;
     let mut loaded = PipelineLoadAccumulator::new("Qwen3-VL", &stage.partition);
-    if need_vision {
-        let bindings = pipeline_static_bindings(&static_units, "vision")?.to_vec();
-        let bindings = if let Some(layout) = parallel_layout.as_ref() {
-            shard_layer_bindings(bindings, "", store.as_ref(), layout)?
-        } else {
-            bindings
-        };
-        let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::static_modules_mut(&mut stage.architecture);
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("vision"),
-            &mut MlxModuleRef::new(&mut modules.vision),
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if need_embedding {
-        let bindings = pipeline_static_bindings(&static_units, "embedding")?.to_vec();
-        let bindings = if let Some(layout) = parallel_layout.as_ref() {
-            shard_layer_bindings(bindings, "", store.as_ref(), layout)?
-        } else {
-            bindings
-        };
-        let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::static_modules_mut(&mut stage.architecture);
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            &mut modules.text.embeddings,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"norm") {
-        let modules = <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::static_modules_mut(&mut stage.architecture);
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("norm"),
-            &mut modules.text.norm,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "norm")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-        if static_roles.contains(&"output") {
-            let bindings = pipeline_static_bindings(&static_units, "output")?.to_vec();
-            let bindings = if let Some(layout) = parallel_layout.as_ref() {
-                shard_layer_bindings(bindings, "", store.as_ref(), layout)?
-            } else {
-                bindings
-            };
-            if let Some(head) = &mut modules.text.lm_head {
-                loaded.load(
-                    eredu_runtime::ParameterGroupOwner::static_role("output"),
-                    head,
-                    store.as_ref(),
-                    &bindings,
-                    quantize_on_load,
-                    weights_stream,
-                    stream,
-                )?;
-            }
-        }
-    }
+    load_architecture_static_parameters(
+        &mut stage.architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        quantize_on_load,
+        weights_stream,
+        stream,
+    )?;
     if dense_stream.is_none() {
         for (index, layer) in stage.vision_range().clone().zip(&mut stage.vision_layers) {
             let binding_layer = binding_architecture
@@ -17963,62 +17755,17 @@ fn load_gpt_oss_pipeline(
     let mut loaded = PipelineLoadAccumulator::new("GPT-OSS", &stage.partition);
     let decoder_group =
         architecture_decoder_group::<_, PipelineRangeState<'_>>(&stage.architecture)?;
-    if static_roles.contains(&"embedding") {
-        let bindings = match parallel_layout.as_ref() {
-            Some(layout) => shard_layer_bindings(
-                pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
-                "",
-                store.as_ref(),
-                layout,
-            )?,
-            None => pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
-        };
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            &mut &mut stage.architecture.static_modules_mut().embeddings,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"norm") {
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("norm"),
-            &mut &mut stage.architecture.static_modules_mut().norm,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "norm")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"output") {
-        let bindings = match parallel_layout.as_ref() {
-            Some(layout) => shard_layer_bindings(
-                pipeline_static_bindings(&static_units, "output")?.to_vec(),
-                "",
-                store.as_ref(),
-                layout,
-            )?,
-            None => pipeline_static_bindings(&static_units, "output")?.to_vec(),
-        };
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("output"),
-            &mut stage
-                .architecture
-                .static_modules_mut()
-                .lm_head
-                .as_mut()
-                .expect("GPT-OSS output head"),
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
+    load_architecture_static_parameters(
+        &mut stage.architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        quantize_on_load,
+        weights_stream,
+        stream,
+    )?;
     if dense_stream.is_none() {
         let architecture = &stage.architecture;
         for (global_layer, layer) in range.clone().zip(&mut stage.layers) {
@@ -18500,56 +18247,17 @@ fn load_lfm2_pipeline(
         &static_roles,
     )?;
     let mut loaded = PipelineLoadAccumulator::new("LFM2", &stage.partition);
-    if static_roles.contains(&"embedding") {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "embedding",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            &mut stage.static_modules_mut().embeddings,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"norm") {
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("norm"),
-            &mut stage.static_modules_mut().norm,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "norm")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"output") {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "output",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        let output = stage
-            .static_modules_mut()
-            .lm_head
-            .as_mut()
-            .expect("untied LFM2 output head");
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("output"),
-            output,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
+    load_architecture_static_parameters(
+        &mut stage.architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        quantize_on_load,
+        weights_stream,
+        stream,
+    )?;
     if dense_stream.is_none() {
         let architecture = &stage.architecture;
         for (global_layer, layer) in stage.range().zip(&mut stage.layers) {
@@ -18842,12 +18550,6 @@ impl Lfm2PipelinePartition {
         })
     }
 
-    fn static_modules_mut(
-        &mut self,
-    ) -> &mut eredu_architectures::decoder::StaticModules<MlxNeuralBackend> {
-        self.architecture.static_modules_mut()
-    }
-
     fn build_unit(
         &self,
         index: usize,
@@ -19091,56 +18793,17 @@ fn load_nemotron_h_pipeline(
         &static_roles,
     )?;
     let mut loaded = PipelineLoadAccumulator::new("Nemotron-H", &stage.partition);
-    if static_roles.contains(&"embedding") {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "embedding",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            &mut stage.static_modules_mut().embeddings,
-            store.as_ref(),
-            &bindings,
-            requested,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"norm") {
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("norm"),
-            &mut stage.static_modules_mut().norm,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "norm")?,
-            requested,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"output") {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "output",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        let output = stage
-            .static_modules_mut()
-            .lm_head
-            .as_mut()
-            .expect("untied Nemotron-H output head");
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("output"),
-            output,
-            store.as_ref(),
-            &bindings,
-            requested,
-            weights_stream,
-            stream,
-        )?;
-    }
+    load_architecture_static_parameters(
+        &mut stage.architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        requested,
+        weights_stream,
+        stream,
+    )?;
     if dense_stream.is_none() {
         let architecture = &stage.architecture;
         for (global_layer, layer) in stage.range().clone().zip(&mut stage.layers) {
@@ -19378,12 +19041,6 @@ impl NemotronHPipelinePartition {
             },
             routing_statistics: RoutingStatistics::default(),
         })
-    }
-
-    fn static_modules_mut(
-        &mut self,
-    ) -> &mut eredu_architectures::decoder::StaticModules<MlxNeuralBackend> {
-        self.architecture.static_modules_mut()
     }
 
     fn build_unit(
@@ -20439,59 +20096,17 @@ fn load_neutral_qwen_hybrid_pipeline(
         &static_roles,
     )?;
     let mut loaded = PipelineLoadAccumulator::new("Qwen hybrid", &stage.partition);
-    if static_roles.contains(&"embedding") {
-        let bindings = match parallel_layout.as_ref() {
-            Some(layout) => shard_layer_bindings(
-                pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
-                "",
-                store.as_ref(),
-                layout,
-            )?,
-            None => pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
-        };
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            &mut stage.architecture.static_modules_mut().embeddings,
-            store.as_ref(),
-            &bindings,
-            requested,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"norm") {
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("norm"),
-            &mut stage.architecture.static_modules_mut().norm,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "norm")?,
-            requested,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"output") {
-        let bindings = match parallel_layout.as_ref() {
-            Some(layout) => shard_layer_bindings(
-                pipeline_static_bindings(&static_units, "output")?.to_vec(),
-                "",
-                store.as_ref(),
-                layout,
-            )?,
-            None => pipeline_static_bindings(&static_units, "output")?.to_vec(),
-        };
-        if let Some(module) = &mut stage.architecture.static_modules_mut().lm_head {
-            loaded.load(
-                eredu_runtime::ParameterGroupOwner::static_role("output"),
-                module,
-                store.as_ref(),
-                &bindings,
-                requested,
-                weights_stream,
-                stream,
-            )?;
-        }
-    }
+    load_architecture_static_parameters(
+        &mut stage.architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        requested,
+        weights_stream,
+        stream,
+    )?;
     if dense_stream.is_none() {
         let architecture = &stage.architecture;
         for (global_layer, layer) in stage.range().clone().zip(&mut stage.layers) {
@@ -20962,8 +20577,6 @@ fn load_neutral_qwen_conditional_pipeline(
         }
     }
     let static_roles = parameter_description.select_static_roles(&stage.partition);
-    let need_vision = static_roles.contains(&"vision");
-    let need_embedding = static_roles.contains(&"embedding");
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
             let mut selection = PipelineStageQuantizationSelection::new(
@@ -21016,82 +20629,17 @@ fn load_neutral_qwen_conditional_pipeline(
         &static_roles,
     )?;
     let mut loaded = PipelineLoadAccumulator::new("conditional Qwen3.5", &stage.partition);
-    if need_vision {
-        let bindings = pipeline_static_bindings(&static_units, "vision")?.to_vec();
-        let bindings = if let Some(layout) = parallel_layout.as_ref() {
-            shard_layer_bindings(bindings, "", store.as_ref(), layout)?
-        } else {
-            bindings
-        };
-        let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::static_modules_mut(&mut stage.architecture);
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("vision"),
-            &mut MlxModuleRef::new(&mut modules.vision),
-            store.as_ref(),
-            &bindings,
-            requested,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if need_embedding {
-        let bindings = pipeline_static_bindings(&static_units, "embedding")?.to_vec();
-        let bindings = if let Some(layout) = parallel_layout.as_ref() {
-            shard_layer_bindings(bindings, "", store.as_ref(), layout)?
-        } else {
-            bindings
-        };
-        let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::static_modules_mut(&mut stage.architecture);
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            &mut modules.text.embeddings,
-            store.as_ref(),
-            &bindings,
-            requested,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"norm") {
-        let modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::static_modules_mut(&mut stage.architecture);
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("norm"),
-            &mut modules.text.norm,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "norm")?,
-            requested,
-            weights_stream,
-            stream,
-        )?;
-        if static_roles.contains(&"output") {
-            let bindings = pipeline_static_bindings(&static_units, "output")?.to_vec();
-            let bindings = if let Some(layout) = parallel_layout.as_ref() {
-                shard_layer_bindings(bindings, "", store.as_ref(), layout)?
-            } else {
-                bindings
-            };
-            if let Some(head) = &mut modules.text.lm_head {
-                loaded.load(
-                    eredu_runtime::ParameterGroupOwner::static_role("output"),
-                    head,
-                    store.as_ref(),
-                    &bindings,
-                    requested,
-                    weights_stream,
-                    stream,
-                )?;
-            }
-        }
-    }
+    load_architecture_static_parameters(
+        &mut stage.architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        requested,
+        weights_stream,
+        stream,
+    )?;
     if dense_stream.is_none() {
         let architecture = &stage.architecture;
         for (index, layer) in stage.vision_range().clone().zip(&mut stage.vision_layers) {
@@ -21540,56 +21088,17 @@ fn load_kimi_linear_pipeline(
         &static_roles,
     )?;
     let mut loaded = PipelineLoadAccumulator::new("Kimi Linear", &stage.partition);
-    if static_roles.contains(&"embedding") {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "embedding",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            &mut stage.static_modules_mut().embeddings,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"norm") {
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("norm"),
-            &mut stage.static_modules_mut().norm,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "norm")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"output") {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "output",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        let output = stage
-            .static_modules_mut()
-            .lm_head
-            .as_mut()
-            .expect("untied Kimi Linear output head");
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("output"),
-            output,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
+    load_architecture_static_parameters(
+        &mut stage.architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        quantize_on_load,
+        weights_stream,
+        stream,
+    )?;
     if dense_stream.is_none() {
         let architecture = &stage.architecture;
         for (global_layer, layer) in stage.range().zip(&mut stage.layers) {
@@ -21884,12 +21393,6 @@ impl KimiLinearPipelinePartition {
         })
     }
 
-    fn static_modules_mut(
-        &mut self,
-    ) -> &mut eredu_architectures::decoder::StaticModules<MlxNeuralBackend> {
-        self.architecture.static_modules_mut()
-    }
-
     fn build_unit(
         &self,
         index: usize,
@@ -22099,116 +21602,17 @@ fn load_neutral_inkling_pipeline(
         &static_roles,
     )?;
     let mut loaded = PipelineLoadAccumulator::new("Inkling", &stage.partition);
-    if static_roles.contains(&"embedding") {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "embedding",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            &mut stage.static_modules_mut().embeddings,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"embedding_norm") {
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding_norm"),
-            &mut stage.static_modules_mut().embedding_norm,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "embedding_norm")?,
-            None,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"audio") {
-        let mut module = crate::backend::mlx::nn::shared::MlxModuleRef::new(
-            stage
-                .static_modules_mut()
-                .audio
-                .as_mut()
-                .expect("Inkling audio static"),
-        );
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("audio"),
-            &mut module,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "audio")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"vision") {
-        let mut module = crate::backend::mlx::nn::shared::MlxModuleRef::new(
-            stage
-                .static_modules_mut()
-                .vision
-                .as_mut()
-                .expect("Inkling vision static"),
-        );
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("vision"),
-            &mut module,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "vision")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"norm") {
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("norm"),
-            &mut stage.static_modules_mut().final_norm,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "norm")?,
-            None,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"output") {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "output",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("output"),
-            &mut stage.static_modules_mut().output,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"mtp") {
-        let mut module = crate::backend::mlx::nn::shared::MlxModuleRef::new(
-            stage
-                .static_modules_mut()
-                .mtp
-                .as_mut()
-                .expect("Inkling MTP static"),
-        );
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("mtp"),
-            &mut module,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "mtp")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
+    load_architecture_static_parameters(
+        &mut stage.architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        quantize_on_load,
+        weights_stream,
+        stream,
+    )?;
     let inkling_resident_layers = dense_stream.is_none();
     if inkling_resident_layers {
         let architecture = &stage.architecture;
@@ -23098,50 +22502,24 @@ fn load_neutral_deepseek_v3_pipeline(
             eredu_architectures::deepseek::v3::TargetBoundarySchema::from_args(&args),
             local_parameter_groups,
         )?;
-    let (static_targets, vocabulary_targets) =
-        local_architecture_static_binding_targets(&partition);
-    let static_bindings = all_static_bindings
-        .into_iter()
-        .filter(|binding| parameter_name_in_targets(binding_target(binding), &static_targets))
-        .collect::<Vec<_>>();
-    let architecture_static_bindings = match parallel_layout.as_ref() {
-        Some(layout) => {
-            let (vocabulary, mut replicated): (Vec<_>, Vec<_>) =
-                static_bindings.into_iter().partition(|binding| {
-                    parameter_name_in_targets(binding_target(binding), &vocabulary_targets)
-                });
-            replicated.extend(shard_layer_bindings(
-                vocabulary,
-                "",
-                store.as_ref(),
-                layout,
-            )?);
-            replicated
-        }
-        None => static_bindings,
-    };
-    let mut static_module = MlxModule::new(architecture.static_modules().clone());
+    let static_roles = parameter_description.select_static_roles(&partition);
+    let static_units = split_static_binding_units_by_owner(
+        partition.parameter_bindings(),
+        &all_static_bindings,
+        &static_roles,
+    )?;
     let mut loaded = PipelineLoadAccumulator::new("neutral DeepSeek V3", &partition);
-    for role in ["embedding", "norm", "output"] {
-        let (role_targets, bindings) = pipeline_static_role_binding_selection(
-            partition.parameter_bindings(),
-            role,
-            &architecture_static_bindings,
-        );
-        if !bindings.is_empty() {
-            loaded.load_excluding(
-                eredu_runtime::ParameterGroupOwner::static_role(role),
-                &mut static_module,
-                store.as_ref(),
-                &bindings,
-                None,
-                weights_stream,
-                stream,
-                &|name| !role_targets.contains(name),
-            )?;
-        }
-    }
-    architecture.replace_static_modules(static_module.inner);
+    load_architecture_static_parameters(
+        &mut architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        None,
+        weights_stream,
+        stream,
+    )?;
     let unit_args = architecture
         .shared_parallel_geometry()
         .map_or_else(|| args.clone(), |geometry| geometry.args().clone());
@@ -23530,50 +22908,24 @@ fn load_neutral_deepseek_v4_pipeline(
         eredu_architectures::deepseek::v4::TargetBoundarySchema::from_args(&args),
         local_parameter_groups,
     )?;
-    let (static_targets, vocabulary_targets) =
-        local_architecture_static_binding_targets(&partition);
-    let static_bindings = all_static_bindings
-        .into_iter()
-        .filter(|binding| parameter_name_in_targets(binding_target(binding), &static_targets))
-        .collect::<Vec<_>>();
-    let architecture_static_bindings = match parallel_layout.as_ref() {
-        Some(layout) => {
-            let (vocabulary, mut replicated): (Vec<_>, Vec<_>) =
-                static_bindings.into_iter().partition(|binding| {
-                    parameter_name_in_targets(binding_target(binding), &vocabulary_targets)
-                });
-            replicated.extend(shard_layer_bindings(
-                vocabulary,
-                "",
-                store.as_ref(),
-                layout,
-            )?);
-            replicated
-        }
-        None => static_bindings,
-    };
-    let mut static_module = MlxModule::new(architecture.static_modules().clone());
+    let static_roles = parameter_description.select_static_roles(&partition);
+    let static_units = split_static_binding_units_by_owner(
+        partition.parameter_bindings(),
+        &all_static_bindings,
+        &static_roles,
+    )?;
     let mut loaded = PipelineLoadAccumulator::new("neutral DeepSeek V4", &partition);
-    for role in ["embedding", "norm", "output", "mtp"] {
-        let (role_targets, bindings) = pipeline_static_role_binding_selection(
-            partition.parameter_bindings(),
-            role,
-            &architecture_static_bindings,
-        );
-        if !bindings.is_empty() {
-            loaded.load_excluding(
-                eredu_runtime::ParameterGroupOwner::static_role(role),
-                &mut static_module,
-                store.as_ref(),
-                &bindings,
-                None,
-                weights_stream,
-                stream,
-                &|name| !role_targets.contains(name),
-            )?;
-        }
-    }
-    architecture.replace_static_modules(static_module.inner);
+    load_architecture_static_parameters(
+        &mut architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        None,
+        weights_stream,
+        stream,
+    )?;
     let unit_args = architecture
         .shared_parallel_geometry()
         .map_or_else(|| args.clone(), |geometry| geometry.args().clone());

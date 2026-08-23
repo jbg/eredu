@@ -589,7 +589,7 @@ pub fn v3_parameter_description(
 pub fn v4_parameter_description(
     args: &V4Args,
 ) -> Result<ArchitectureParameterDescription, ParallelPlanError> {
-    let mut static_roles = vec!["embedding", "norm", "output", "norm"];
+    let mut static_roles = vec!["embedding", "norm", "output", "hyper_head"];
     if args.dspark.is_some() {
         static_roles.push("mtp");
     }
@@ -1300,6 +1300,34 @@ mod tests {
         assert!(draft
             .iter()
             .all(|group| group.logical_name().starts_with("mtp.0")));
+    }
+
+    #[test]
+    fn v4_static_modules_have_distinct_architecture_owned_roles() {
+        let description = v4_parameter_description(&v4_args()).unwrap();
+        let roles = description
+            .groups()
+            .iter()
+            .filter_map(|group| match group.owner() {
+                ParameterGroupOwner::StaticRole(role) => {
+                    Some((group.group().logical_name(), role.as_str()))
+                }
+                ParameterGroupOwner::StaticAnyOf(roles) => Some((
+                    group.group().logical_name(),
+                    roles.first().expect("shared static owner").as_str(),
+                )),
+                ParameterGroupOwner::ExecutionUnit { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            [
+                ("embed", "embedding"),
+                ("norm", "norm"),
+                ("head", "output"),
+                ("hyper_head", "hyper_head"),
+            ]
+        );
     }
 
     #[test]

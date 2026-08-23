@@ -229,6 +229,35 @@ pub struct Model<B: RoutedNeuralBackend + BlockwiseAttentionBackend> {
     parallel_geometry: Option<Arc<super::parallel::V3LocalGeometry>>,
 }
 
+impl<B> crate::BindableStaticParameters<B> for Model<B>
+where
+    B: RoutedNeuralBackend + BlockwiseAttentionBackend,
+{
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitor<B>,
+    {
+        visitor.visit("embedding", &self.static_modules.embeddings)?;
+        visitor.visit("norm", &self.static_modules.norm)?;
+        if let Some(head) = &self.static_modules.lm_head {
+            visitor.visit("output", head)?;
+        }
+        Ok(())
+    }
+
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitorMut<B>,
+    {
+        visitor.visit_mut("embedding", &mut self.static_modules.embeddings)?;
+        visitor.visit_mut("norm", &mut self.static_modules.norm)?;
+        if let Some(head) = &mut self.static_modules.lm_head {
+            visitor.visit_mut("output", head)?;
+        }
+        Ok(())
+    }
+}
+
 impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
     /// Builds the unloaded pinned V3 modules.
     pub fn new(args: V3Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
@@ -294,12 +323,6 @@ impl<B: RoutedNeuralBackend + BlockwiseAttentionBackend> Model<B> {
     /// Mutably borrows pinned modules for neutral checkpoint binding.
     pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
         &mut self.static_modules
-    }
-
-    /// Replaces the pinned module set after a backend composition has loaded
-    /// exactly the static parameters owned by its placement.
-    pub fn replace_static_modules(&mut self, static_modules: StaticModules<B>) {
-        self.static_modules = static_modules;
     }
 
     /// Constructs one target or prediction unit from this model's authoritative

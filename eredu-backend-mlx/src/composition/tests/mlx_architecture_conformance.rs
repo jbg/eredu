@@ -31,6 +31,8 @@ fn every_pipeline_composed_family_exposes_architecture_owned_static_bindings() {
     assert_bindable::<eredu_architectures::qwen::hybrid::ConditionalLayeredModel<MlxNeuralBackend>>(
     );
     assert_bindable::<eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::deepseek::v3::Model<MlxNeuralBackend>>();
+    assert_bindable::<eredu_architectures::deepseek::v4::Model<MlxNeuralBackend>>();
 }
 
 fn mlx_execution() -> Option<ExecutionContext> {

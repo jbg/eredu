@@ -305,6 +305,43 @@ where
     parallel_geometry: Option<Arc<super::parallel::V4LocalGeometry>>,
 }
 
+impl<B> crate::BindableStaticParameters<B> for Model<B>
+where
+    B: HyperNeuralBackend + RoutedNeuralBackend,
+{
+    fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitor<B>,
+    {
+        visitor.visit("embedding", &self.static_modules.text.embeddings)?;
+        visitor.visit("norm", &self.static_modules.text.norm)?;
+        if let Some(head) = &self.static_modules.text.lm_head {
+            visitor.visit("output", head)?;
+        }
+        visitor.visit("hyper_head", &self.static_modules.hyper_head)?;
+        if let Some(dspark) = &self.static_modules.dspark {
+            visitor.visit("mtp", dspark)?;
+        }
+        Ok(())
+    }
+
+    fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
+    where
+        V: crate::StaticParameterVisitorMut<B>,
+    {
+        visitor.visit_mut("embedding", &mut self.static_modules.text.embeddings)?;
+        visitor.visit_mut("norm", &mut self.static_modules.text.norm)?;
+        if let Some(head) = &mut self.static_modules.text.lm_head {
+            visitor.visit_mut("output", head)?;
+        }
+        visitor.visit_mut("hyper_head", &mut self.static_modules.hyper_head)?;
+        if let Some(dspark) = &mut self.static_modules.dspark {
+            visitor.visit_mut("mtp", dspark)?;
+        }
+        Ok(())
+    }
+}
+
 impl<B> Model<B>
 where
     B: HyperNeuralBackend + RoutedNeuralBackend,
@@ -561,12 +598,6 @@ where
     /// Mutably borrows pinned modules for checkpoint binding.
     pub fn static_modules_mut(&mut self) -> &mut StaticModules<B> {
         &mut self.static_modules
-    }
-
-    /// Replaces the pinned module set after a backend composition has loaded
-    /// exactly the static parameters owned by its placement.
-    pub fn replace_static_modules(&mut self, static_modules: StaticModules<B>) {
-        self.static_modules = static_modules;
     }
 
     /// Constructs one target, sequential MTP, or DSpark unit from this model's
@@ -1959,7 +1990,7 @@ where
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
         if group == 0 {
-            eredu_runtime::ArchitectureGroupTransport::decoder()
+            target_group_transport()
         } else {
             let mut transport = eredu_runtime::ArchitectureGroupTransport::prediction();
             if group == 1 {
@@ -2339,6 +2370,12 @@ where
         ])
         .with_extras(&forward.captures)
     }
+}
+
+fn target_group_transport() -> eredu_runtime::ArchitectureGroupTransport {
+    let mut transport = eredu_runtime::ArchitectureGroupTransport::decoder();
+    transport.last_owner_static_roles.push("hyper_head".into());
+    transport
 }
 
 impl<B, S> ParallelLayeredArchitecture<B, S> for Model<B>
@@ -2940,5 +2977,14 @@ mod boundary_tests {
         assert_eq!(tensors[1].role(), "capture.0");
         assert_eq!(tensors[1].shape(), [1, 5, 24]);
         assert_eq!(tensors[2].role(), "capture.1");
+    }
+
+    #[test]
+    fn target_transport_owns_the_distinct_hyper_head_role() {
+        let transport = target_group_transport();
+        assert_eq!(
+            transport.last_owner_static_roles,
+            ["norm", "output", "hyper_head"]
+        );
     }
 }

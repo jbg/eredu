@@ -147,7 +147,10 @@ family, including multimodal and hybrid graphs, implements this interface;
 concrete backend adapters use one shared visitor rather than family binding tables.
 Pipeline stage loaders use that same visitor for both ordinary decoder families
 and multimodal families, leaving tensor-parallel binding selection generic and
-the role-to-module mapping entirely within the architecture.
+the role-to-module mapping entirely within the architecture. Distinct pinned
+modules use distinct storage roles even when they share a broader semantic
+parameter class; for example, DeepSeek V4 exposes its target hyper-connection
+head as `hyper_head` and its optional DSpark static bundle as `mtp`.
 Architecture implementations also provide any released-checkpoint rewrite
 recipes for their static modules, so alias and fused-layout handling does not
 reintroduce checkpoint roots into a backend.
