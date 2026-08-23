@@ -1563,15 +1563,6 @@ impl Gemma4PipelinePartition {
         >>::static_modules(&self.architecture)
     }
 
-    fn static_modules_mut(
-        &mut self,
-    ) -> &mut eredu_architectures::gemma4::StaticModules<MlxNeuralBackend> {
-        <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::static_modules_mut(&mut self.architecture)
-    }
-
     fn build_unit(
         &self,
         group: usize,
@@ -14761,63 +14752,17 @@ fn load_llama_pipeline(
     let quantize_on_load = None;
     let mut loaded = PipelineLoadAccumulator::new("Llama", &stage.partition);
     let decoder_group = architecture_decoder_group::<_, MlxHybridState>(&stage.architecture)?;
-    if static_roles.contains(&"embedding") {
-        let bindings = match parallel_layout.as_ref() {
-            Some(layout) => shard_layer_bindings(
-                pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
-                "",
-                store.as_ref(),
-                layout,
-            )?,
-            None => pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
-        };
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            &mut &mut stage.architecture.static_modules_mut().embeddings,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"norm") {
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("norm"),
-            &mut &mut stage.architecture.static_modules_mut().norm,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "norm")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if static_roles.contains(&"output") {
-        let bindings = match parallel_layout.as_ref() {
-            Some(layout) => shard_layer_bindings(
-                pipeline_static_bindings(&static_units, "output")?.to_vec(),
-                "",
-                store.as_ref(),
-                layout,
-            )?,
-            None => pipeline_static_bindings(&static_units, "output")?.to_vec(),
-        };
-        let head = &mut stage
-            .architecture
-            .static_modules_mut()
-            .lm_head
-            .as_mut()
-            .expect("untied Llama partition output head");
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("output"),
-            head,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
+    load_architecture_static_parameters(
+        &mut stage.architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        quantize_on_load,
+        weights_stream,
+        stream,
+    )?;
     if dense_stream.is_none() {
         for (global_layer, layer) in range.clone().zip(&mut stage.layers) {
             let bindings = stage.bindings.cartesian_layer_bindings(
@@ -22633,10 +22578,7 @@ fn load_neutral_gemma4_pipeline(
         .map(|index| stage.build_unit(decoder_group, index, stream))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let tensor_parallel = parallel_layout.is_some();
     let static_roles = parameter_description.select_static_roles(&stage.partition);
-    let load_full_embedding = !tensor_parallel && static_roles.contains(&"embedding");
-    let load_parallel_embedding = tensor_parallel && static_roles.contains(&"embedding");
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
             let selection = PipelineStageQuantizationSelection::new(
@@ -22687,201 +22629,17 @@ fn load_neutral_gemma4_pipeline(
         &static_roles,
     )?;
     let mut loaded = PipelineLoadAccumulator::new("Gemma 4", &stage.partition);
-    if load_full_embedding {
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            &mut stage.static_modules_mut().text.embeddings,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "embedding")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if load_parallel_embedding {
-        let bindings = pipeline_cartesian_static_bindings(
-            &static_units,
-            "embedding",
-            store.as_ref(),
-            parallel_layout.as_ref(),
-        )?;
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("embedding"),
-            &mut stage.static_modules_mut().text.embeddings,
-            store.as_ref(),
-            &bindings,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if stage
-        .partition
-        .ownership()
-        .owns_static_role("per_layer_embedding")
-        && target_args.text.hidden_size_per_layer_input > 0
-    {
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("per_layer_embedding"),
-            stage
-                .static_modules_mut()
-                .text
-                .per_layer_embeddings
-                .as_mut()
-                .expect("Gemma 4 per-layer embedding"),
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "per_layer_embedding")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("per_layer_projection"),
-            stage
-                .static_modules_mut()
-                .text
-                .per_layer_projection
-                .as_mut()
-                .expect("Gemma 4 per-layer projection"),
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "per_layer_projection")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("per_layer_norm"),
-            stage
-                .static_modules_mut()
-                .text
-                .per_layer_norm
-                .as_mut()
-                .expect("Gemma 4 per-layer norm"),
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "per_layer_norm")?,
-            None,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if stage.partition.ownership().owns_static_role("norm") {
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("norm"),
-            &mut stage.static_modules_mut().text.norm,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "norm")?,
-            None,
-            weights_stream,
-            stream,
-        )?;
-        if !target_args.text.tie_word_embeddings {
-            if tensor_parallel {
-                let bindings = pipeline_cartesian_static_bindings(
-                    &static_units,
-                    "output",
-                    store.as_ref(),
-                    parallel_layout.as_ref(),
-                )?;
-                loaded.load(
-                    eredu_runtime::ParameterGroupOwner::static_role("output"),
-                    stage
-                        .static_modules_mut()
-                        .text
-                        .head
-                        .as_mut()
-                        .expect("Gemma 4 TP output"),
-                    store.as_ref(),
-                    &bindings,
-                    quantize_on_load,
-                    weights_stream,
-                    stream,
-                )?;
-            } else {
-                loaded.load(
-                    eredu_runtime::ParameterGroupOwner::static_role("output"),
-                    stage
-                        .static_modules_mut()
-                        .text
-                        .head
-                        .as_mut()
-                        .expect("Gemma 4 output"),
-                    store.as_ref(),
-                    pipeline_static_bindings(&static_units, "output")?,
-                    quantize_on_load,
-                    weights_stream,
-                    stream,
-                )?;
-            }
-        }
-    }
-    if target_args.vision.is_some() && stage.partition.ownership().owns_static_role("vision") {
-        let mut vision = crate::backend::mlx::nn::shared::MlxModuleRef::new(
-            stage
-                .static_modules_mut()
-                .vision
-                .as_mut()
-                .expect("Gemma 4 vision"),
-        );
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("vision"),
-            &mut vision,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "vision")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-        let mut projection = crate::backend::mlx::nn::shared::MlxModuleRef::new(
-            stage
-                .static_modules_mut()
-                .vision_projection
-                .as_mut()
-                .expect("Gemma 4 vision projection"),
-        );
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("vision_projection"),
-            &mut projection,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "vision_projection")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
-    if target_args.audio.is_some() && stage.partition.ownership().owns_static_role("audio") {
-        let mut audio = crate::backend::mlx::nn::shared::MlxModuleRef::new(
-            stage
-                .static_modules_mut()
-                .audio
-                .as_mut()
-                .expect("Gemma 4 audio"),
-        );
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("audio"),
-            &mut audio,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "audio")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-        let mut projection = crate::backend::mlx::nn::shared::MlxModuleRef::new(
-            stage
-                .static_modules_mut()
-                .audio_projection
-                .as_mut()
-                .expect("Gemma 4 audio projection"),
-        );
-        loaded.load(
-            eredu_runtime::ParameterGroupOwner::static_role("audio_projection"),
-            &mut projection,
-            store.as_ref(),
-            pipeline_static_bindings(&static_units, "audio_projection")?,
-            quantize_on_load,
-            weights_stream,
-            stream,
-        )?;
-    }
+    load_architecture_static_parameters(
+        &mut stage.architecture,
+        &static_roles,
+        &static_units,
+        &mut loaded,
+        store.as_ref(),
+        parallel_layout.as_ref(),
+        quantize_on_load,
+        weights_stream,
+        stream,
+    )?;
     let gemma4_resident_layers = dense_stream.is_none();
     if gemma4_resident_layers {
         let architecture = &stage.architecture;

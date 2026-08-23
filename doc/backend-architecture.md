@@ -128,6 +128,9 @@ residency identifiers, or checkpoint roots. Stable parameter identities on the
 visited module are the checkpoint-binding namespace. Every pipeline-composed
 family, including multimodal and hybrid graphs, implements this interface;
 concrete backend adapters use one shared visitor rather than family binding tables.
+Pipeline stage loaders use that same visitor for both ordinary decoder families
+and multimodal families, leaving tensor-parallel binding selection generic and
+the role-to-module mapping entirely within the architecture.
 Architecture implementations also provide any released-checkpoint rewrite
 recipes for their static modules, so alias and fused-layout handling does not
 reintroduce checkpoint roots into a backend.
