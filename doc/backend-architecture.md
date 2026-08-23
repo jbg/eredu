@@ -28,10 +28,11 @@ the facade's development dependency; the production `mlx` feature does not
 enable backend `test-support`.
 
 The facade root and `api` namespace expose portable application concepts plus
-the narrow selected-backend adapter. `eredu-backend-mlx` likewise exposes its
-adapter types and operations as an explicit flat root API; its backend runtime,
-family composition, and architecture-erased dispatch modules are crate-private.
-The feature-gated `testing` namespace exists only for cross-crate integration
+the narrow selected-backend adapter. `eredu-backend-mlx` exposes the same
+application-facing adapter as an explicit flat root API and deliberately makes
+its reusable `backend` module tree public for backend authors. Family
+composition and architecture-erased dispatch remain crate-private. The
+feature-gated `testing` namespace exists only for cross-crate integration
 fixtures and is not enabled by the production `mlx` feature.
 
 ## Ownership boundary
@@ -423,7 +424,8 @@ collective tensor math remain backend-specific.
 ## MLX implementation
 
 The complete concrete implementation lives in `eredu-backend-mlx`, split
-internally between reusable backend mechanics and family/backend composition:
+between public reusable backend mechanics and private family/backend
+composition:
 
 - `MlxBackend` owns execution and weight-materialization streams.
 - `MlxTensor` is a transparent, zero-copy wrapper around `safemlx::Array` and

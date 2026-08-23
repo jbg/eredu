@@ -15,17 +15,13 @@ mod session;
 pub mod speculative;
 pub mod structural;
 
-pub use capability::available_memory;
 pub use inspection::{inspect_model, MlxInspectionOptions};
 pub use loading::{gguf_eos_token_ids, validate_gguf_quantization_source};
 pub use model::{Model, ModelCache};
 #[cfg(feature = "media")]
 pub use processor::{load_processor, ModelProcessor};
 pub use session::{submit_decode_with_cache, submit_prefill_with_cache};
-pub use session::{
-    MlxGeneration, MlxModelInput, MlxModelOutput, MlxModelSession, MlxSessionCompletion,
-    MlxTextCompletion, MlxTextGenerationState, MlxTextToken,
-};
+pub use session::{MlxModelInput, MlxModelOutput, MlxModelSession, MlxSessionCompletion};
 
 pub use crate::backend::mlx::{
     error::Error, MlxBackend, MlxCompletion, MlxDistributedSession, MlxModel, ModelLoadOptions,

@@ -68,10 +68,6 @@ impl MlxMtpCache {
     pub fn len(&self) -> usize {
         self.lanes.len()
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.lanes.is_empty()
-    }
 }
 
 impl MlxDrafter {
@@ -298,7 +294,7 @@ impl<'a> MtpExecutionStreams<'a> {
 /// Exact completion for one retained MLX speculative verification.
 pub struct MlxSpeculativeCompletion {
     event: Event,
-    retained: Vec<Array>,
+    _retained: Vec<Array>,
 }
 
 impl MlxSpeculativeCompletion {
@@ -306,12 +302,10 @@ impl MlxSpeculativeCompletion {
     pub fn submit<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<Self, Exception> {
         let retained = outputs.into_iter().cloned().collect::<Vec<_>>();
         let event = async_eval_with_event(retained.iter())?;
-        Ok(Self { event, retained })
-    }
-
-    /// Number of output handles retained through exact completion.
-    pub fn retained_resources(&self) -> usize {
-        self.retained.len()
+        Ok(Self {
+            event,
+            _retained: retained,
+        })
     }
 }
 

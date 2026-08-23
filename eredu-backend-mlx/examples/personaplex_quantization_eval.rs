@@ -1,9 +1,8 @@
 use std::{error::Error, fs, io, io::Write, path::Path, path::PathBuf, time::Instant};
 
+use eredu_architectures::moshi::personaplex_prompt::AUDIO_TOKENS_PER_STREAM;
 use eredu_backend_mlx::{
-    codec::mimi::load,
-    composition::mlx::realtime::{generate_encoded_greedy, personaplex_prompt, MlxRealtimeBackend},
-    MlxTensor,
+    codec::mimi::load, generate_encoded_greedy, MlxRealtimeBackend, MlxTensor,
 };
 use eredu_codec::mimi::Mimi;
 use eredu_core::load_realtime_model;
@@ -51,11 +50,7 @@ fn main() -> EvalResult<()> {
     let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = gpu.stream();
     let weights_stream = cpu.stream();
-    let mut mimi = load(
-        &mimi_path,
-        Some(personaplex_prompt::AUDIO_TOKENS_PER_STREAM as i32),
-        stream,
-    )?;
+    let mut mimi = load(&mimi_path, Some(AUDIO_TOKENS_PER_STREAM as i32), stream)?;
     let pcm_array =
         MlxTensor::from_array(Array::from_slice(&pcm, &[1, 1, pcm.len() as i32]).copy(stream)?);
     let input_tokens = mimi.encode(&pcm_array, stream)?;

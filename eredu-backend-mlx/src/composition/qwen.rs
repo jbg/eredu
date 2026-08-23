@@ -1315,30 +1315,6 @@ fn load_neutral_qwen_parallel(
     })
 }
 
-/// Loads only Qwen static and nonexpert layer weights, leaving routed expert
-/// materialization to the runtime expert provider.
-pub fn load_qwen_external_experts_with_store(
-    store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
-    args: ModelArgs,
-    options: LayerWeightResidency,
-    build: Option<crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<QwenModel, Error> {
-    if !args.is_moe() {
-        return Err(Error::Parallel(
-            "external Qwen expert residency requires a routed Qwen model".into(),
-        ));
-    }
-    let store = resolve_qwen_safetensors_store(store, &args)?;
-    match build {
-        Some(build) if build.topology().tensor_parallel_size > 1 => {
-            load_neutral_qwen_parallel(store, args, options, build, stream, weights_stream, true)
-        }
-        _ => load_neutral_qwen(store, args, options, stream, weights_stream, None, true),
-    }
-}
-
 /// Loads Qwen/Mistral through the generalized tensor-parallel execution engine.
 pub fn load_qwen_tensor_parallel_model(
     model_dir: impl AsRef<Path>,

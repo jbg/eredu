@@ -259,15 +259,12 @@ impl StrictLoadConfig {
     }
 
     pub fn candidates(&self, key: &str) -> Vec<String> {
-        let mut candidates = Vec::new();
-        candidates.push(key.to_string());
-
+        let mut candidates = vec![key.to_string()];
         for prefix in &self.key_prefixes_to_strip {
             if let Some(stripped) = key.strip_prefix(prefix) {
                 candidates.push(stripped.to_string());
             }
         }
-
         for (from, to) in &self.key_prefix_rewrites {
             if let Some(stripped) = key.strip_prefix(from) {
                 candidates.push(format!("{to}{stripped}"));
@@ -375,37 +372,6 @@ impl StrictLoadReport {
     }
 }
 
-/// Loads a safetensors file into `model` and records strict-loading diagnostics.
-pub fn load_safetensors_strict<M: ModuleParameters>(
-    model: &mut M,
-    path: impl AsRef<Path>,
-    stream: &Stream,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    let mut params = model.parameters_mut().flatten();
-
-    for_each_safetensor_array(path, stream, |key, value| {
-        load_array_strict(&mut params, key, value, config, report);
-        Ok(())
-    })
-}
-
-pub fn load_arrays_strict<M: ModuleParameters>(
-    model: &mut M,
-    loaded: HashMap<String, Array>,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    let mut params = model.parameters_mut().flatten();
-
-    for (key, value) in loaded {
-        load_array_strict(&mut params, key, value, config, report);
-    }
-
-    Ok(())
-}
-
 /// Strict-loads and quantizes eligible tensors from an in-memory named-array
 /// source such as an unquantized GGUF. The map is consumed so each dense source
 /// array can be released after its packed replacement is materialized.
@@ -456,6 +422,31 @@ where
     Ok(())
 }
 
+#[cfg(test)]
+fn quantize_safetensors_for_test<M: ModuleParameters>(
+    model: &mut M,
+    path: impl AsRef<Path>,
+    weights_stream: &Stream,
+    quantization_stream: &Stream,
+    quantization: WeightQuantization,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
+    quantization.validate()?;
+    let mut params = model.parameters_mut().flatten();
+    for_each_safetensor_array(path, weights_stream, |key, value| {
+        load_array_quantized_strict(
+            &mut params,
+            key,
+            value,
+            quantization_stream,
+            quantization,
+            config,
+            report,
+        )
+    })
+}
+
 pub fn load_array_strict(
     params: &mut FlattenedModuleParamMut<'_>,
     key: String,
@@ -504,28 +495,6 @@ pub fn load_array_strict(
     }
 }
 
-/// Loads a safetensors file into matching model parameters without strict validation.
-///
-/// This preserves the behavior of `ModuleParametersExt::load_safetensors`, but streams tensors
-/// from a mmap instead of materializing the whole checkpoint file as a `HashMap`.
-pub fn load_safetensors_lenient<M: ModuleParameters>(
-    model: &mut M,
-    path: impl AsRef<Path>,
-    stream: &Stream,
-) -> Result<(), Error> {
-    let mut params = model.parameters_mut().flatten();
-    let config = StrictLoadConfig::default();
-    for_each_safetensor_array(path, stream, |key, value| {
-        for candidate in config.candidates(&key) {
-            if let Some(param) = params.get_mut(candidate.as_str()) {
-                **param = value;
-                break;
-            }
-        }
-        Ok(())
-    })
-}
-
 /// Strict-loads a dense safetensors file into a model whose selected parameters
 /// use the standard MLX affine quantized layout.
 ///
@@ -533,30 +502,6 @@ pub fn load_safetensors_lenient<M: ModuleParameters>(
 /// read, bounding the lazy graph and active allocation peak. A target module is
 /// recognized either by the standard safemlx `inner.weight` parameter plus
 /// sibling `scales`/`biases`, or by a packed `weight` with those siblings.
-pub fn load_safetensors_quantized_strict<M: ModuleParameters>(
-    model: &mut M,
-    path: impl AsRef<Path>,
-    weights_stream: &Stream,
-    quantization_stream: &Stream,
-    quantization: WeightQuantization,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    quantization.validate()?;
-    let mut params = model.parameters_mut().flatten();
-    for_each_safetensor_array(path, weights_stream, |key, value| {
-        load_array_quantized_strict(
-            &mut params,
-            key,
-            value,
-            quantization_stream,
-            quantization,
-            config,
-            report,
-        )
-    })
-}
-
 pub fn load_array_quantized_strict(
     params: &mut FlattenedModuleParamMut<'_>,
     key: String,
@@ -627,48 +572,9 @@ pub fn load_array_quantized_strict(
     Ok(())
 }
 
-/// Strict-loads and quantizes every safetensors shard in a model directory.
-pub fn load_safetensors_dir_quantized_strict<M: ModuleParameters>(
-    model: &mut M,
-    model_dir: impl AsRef<Path>,
-    weights_stream: &Stream,
-    quantization_stream: &Stream,
-    quantization: WeightQuantization,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    for file in safetensors_files(model_dir)? {
-        load_safetensors_quantized_strict(
-            model,
-            file,
-            weights_stream,
-            quantization_stream,
-            quantization,
-            config,
-            report,
-        )?;
-    }
-    Ok(())
-}
-
-/// Loads all safetensors files from `model_dir` into matching parameters without validation.
-pub fn load_safetensors_dir_lenient<M: ModuleParameters>(
-    model: &mut M,
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-) -> Result<(), Error> {
-    for file in safetensors_files(model_dir)? {
-        load_safetensors_lenient(model, file, stream)?;
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Deserialize)]
 /// Hugging Face safetensors index file.
 pub struct WeightMap {
-    /// Index metadata.
-    #[serde(default)]
-    pub metadata: HashMap<String, serde_json::Value>,
     /// Mapping from tensor name to shard file name.
     pub weight_map: HashMap<String, String>,
 }
@@ -691,45 +597,6 @@ pub fn safetensors_files(model_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Er
     }
 
     Ok(vec![model_dir.join("model.safetensors")])
-}
-
-/// Loads all safetensors files from `model_dir` into `model` with strict validation.
-pub fn load_safetensors_dir_strict<M: ModuleParameters>(
-    model: &mut M,
-    model_dir: impl AsRef<Path>,
-    stream: &Stream,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-) -> Result<(), Error> {
-    for file in safetensors_files(model_dir)? {
-        load_safetensors_strict(model, file, stream, config, report)?;
-    }
-    Ok(())
-}
-
-/// Loads and merges all safetensors files, transforms them, then strict-loads the result.
-///
-/// This is useful when a checkpoint stores split per-expert tensors across shards but the runtime
-/// module owns packed expert banks.
-pub fn load_safetensors_dir_merged_strict_with_transform<M, F>(
-    model: &mut M,
-    model_dir: impl AsRef<Path>,
-    weights_stream: &Stream,
-    transform_stream: &Stream,
-    config: &StrictLoadConfig,
-    report: &mut StrictLoadReport,
-    transform: F,
-) -> Result<(), Error>
-where
-    M: ModuleParameters,
-    F: FnOnce(HashMap<String, Array>, &Stream) -> Result<HashMap<String, Array>, Error>,
-{
-    let mut loaded = HashMap::new();
-    for file in safetensors_files(model_dir)? {
-        loaded.extend(Array::load_safetensors(file, weights_stream)?);
-    }
-    let loaded = transform(loaded, transform_stream)?;
-    load_arrays_strict(model, loaded, config, report)
 }
 
 /// Strict-loads a model directory while streaming and packing split ReLU2 experts.
@@ -1269,8 +1136,9 @@ mod tests {
     };
 
     use super::{
-        gguf_quantization_configs, load_arrays_quantized_strict, load_safetensors_quantized_strict,
-        parse_split_gated_product_expert_projection_key, StrictLoadConfig, StrictLoadReport,
+        gguf_quantization_configs, load_arrays_quantized_strict,
+        parse_split_gated_product_expert_projection_key, quantize_safetensors_for_test,
+        StrictLoadConfig, StrictLoadReport,
     };
 
     #[test]
@@ -1465,7 +1333,7 @@ mod tests {
 
         let config = StrictLoadConfig::default().rewrite_prefix("checkpoint.", "");
         let mut report = StrictLoadReport::default();
-        load_safetensors_quantized_strict(
+        quantize_safetensors_for_test(
             &mut model,
             &path,
             weights_stream,
@@ -1541,7 +1409,7 @@ mod tests {
         Array::save_safetensors([("projection.weight", &dense)], None, &path).unwrap();
         let config = StrictLoadConfig::default();
         let mut report = StrictLoadReport::default();
-        load_safetensors_quantized_strict(
+        quantize_safetensors_for_test(
             &mut model,
             &path,
             weights_stream,

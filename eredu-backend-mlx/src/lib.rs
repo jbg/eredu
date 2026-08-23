@@ -14,12 +14,11 @@
 )]
 
 mod adapter;
-#[allow(dead_code, unused_imports)]
-mod backend;
+/// Reusable MLX tensors, operators, runtime facilities, and distributed primitives.
+pub mod backend;
 /// Optional MLX bindings for backend-neutral audio codecs.
 #[cfg(feature = "codec")]
 pub mod codec;
-#[allow(dead_code, unused_imports)]
 mod composition;
 
 pub use adapter::*;
@@ -44,7 +43,7 @@ pub use tensor::MlxTensor;
 ///
 /// This module is not part of the production adapter API. It is available only
 /// when the explicit `test-support` feature is enabled.
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod testing {
     pub mod backend {

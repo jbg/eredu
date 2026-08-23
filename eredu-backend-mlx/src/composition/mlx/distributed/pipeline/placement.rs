@@ -330,12 +330,12 @@ impl PlacedExecutionDag {
     pub const fn semantic(&self) -> &ExecutionGraph {
         &self.semantic
     }
-    /// Returns the canonical complete execution-unit layout.
-    pub const fn unit_layout(&self) -> &ExecutionUnitLayout {
+    #[cfg(test)]
+    fn unit_layout(&self) -> &ExecutionUnitLayout {
         &self.unit_layout
     }
-    /// Resolves a group by identity.
-    pub fn group(&self, id: &str) -> Option<&ExecutionGroupPlacement> {
+    #[cfg(test)]
+    fn group(&self, id: &str) -> Option<&ExecutionGroupPlacement> {
         self.groups.iter().find(|group| group.id == id)
     }
     /// Resolves a stable architecture slot by group identity.

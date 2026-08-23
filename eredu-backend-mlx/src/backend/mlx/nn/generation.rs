@@ -1,21 +1,10 @@
 //! Causal language-model generation traits, sampling, and iterators.
 
-use std::marker::PhantomData;
-
-use eredu_runtime::CausalModel;
-
 use safemlx::{
     argmax_axis, array,
     error::Exception,
-    ops::indexing::{NewAxis, TryIndexOp},
     random::{self, RandomState},
     Array, Stream,
-};
-
-use crate::MlxTensor;
-use crate::{
-    backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler},
-    backend::mlx::runtime::media::input,
 };
 
 /// Samples a token id from logits.
@@ -37,152 +26,6 @@ pub fn sample(
             let key = prng_state.next_key(stream)?;
             let logits = logits.multiply(array!(1.0 / temp), stream)?;
             random::categorical(&logits, None, None, &key, stream)
-        }
-    }
-}
-
-/// Current state of a generic generation iterator.
-pub enum GenerateState<'a> {
-    /// The iterator has not consumed the prompt yet.
-    Prefill {
-        /// Typed input used for the initial prefill pass.
-        input: input::ModelInput<'a>,
-    },
-    /// The iterator is decoding from the previous sampled token.
-    Decode {
-        /// Previously sampled token id array.
-        y: Array,
-    },
-}
-
-/// Generic token iterator for a causal LM.
-pub struct Generate<'a, M, C, S = DefaultSampler>
-where
-    M: CausalModel<C, Tensor = MlxTensor, Error = Exception>,
-    for<'input> M: CausalModel<C, Input<'input> = input::ModelInput<'input>>,
-    S: Sampler,
-{
-    model: &'a mut M,
-    cache: &'a mut C,
-    temp: f32,
-    prng_state: Option<RandomState>,
-    sampler: S,
-    stream: &'a Stream,
-    state: GenerateState<'a>,
-    _cache: PhantomData<C>,
-}
-
-impl<'a, M, C> Generate<'a, M, C, DefaultSampler>
-where
-    M: CausalModel<C, Tensor = MlxTensor, Error = Exception>,
-    for<'input> M: CausalModel<C, Input<'input> = input::ModelInput<'input>>,
-{
-    /// Creates a generation iterator over token-id arrays using the default sampler.
-    pub fn new(
-        model: &'a mut M,
-        cache: &'a mut C,
-        temp: f32,
-        input: input::ModelInput<'a>,
-        prng_key: Option<Array>,
-        stream: &'a Stream,
-    ) -> Self {
-        Self::with_sampler(model, cache, temp, input, prng_key, stream, DefaultSampler)
-    }
-}
-
-impl<'a, M, C, S> Generate<'a, M, C, S>
-where
-    M: CausalModel<C, Tensor = MlxTensor, Error = Exception>,
-    for<'input> M: CausalModel<C, Input<'input> = input::ModelInput<'input>>,
-    S: Sampler,
-{
-    /// Creates a generation iterator over token-id arrays using a caller-provided sampler.
-    pub fn with_sampler(
-        model: &'a mut M,
-        cache: &'a mut C,
-        temp: f32,
-        input: input::ModelInput<'a>,
-        prng_key: Option<Array>,
-        stream: &'a Stream,
-        sampler: S,
-    ) -> Self {
-        Self {
-            model,
-            cache,
-            temp,
-            prng_state: prng_key.map(RandomState::from_key),
-            sampler,
-            stream,
-            state: GenerateState::Prefill { input },
-            _cache: PhantomData,
-        }
-    }
-
-    /// Returns the sampler state associated with committed generated tokens.
-    pub fn sampler_mut(&mut self) -> &mut S {
-        &mut self.sampler
-    }
-}
-
-impl<M, C, S> Iterator for Generate<'_, M, C, S>
-where
-    M: CausalModel<C, Tensor = MlxTensor, Error = Exception>,
-    for<'input> M: CausalModel<C, Input<'input> = input::ModelInput<'input>>,
-    S: Sampler,
-{
-    type Item = Result<Array, Exception>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &self.state {
-            GenerateState::Prefill { input } => {
-                let logits = match self
-                    .model
-                    .prefill_input_logits(*input, self.cache, self.stream)
-                {
-                    Ok(logits) => logits,
-                    Err(err) => return Some(Err(err)),
-                };
-                let logits = match self
-                    .model
-                    .adjust_prefill_logits(logits, self.cache, self.stream)
-                {
-                    Ok(logits) => logits,
-                    Err(err) => return Some(Err(err)),
-                };
-                let y = match self.sampler.sample(
-                    logits.as_array(),
-                    self.temp,
-                    self.prng_state.as_mut(),
-                    self.stream,
-                ) {
-                    Ok(y) => y,
-                    Err(err) => return Some(Err(err)),
-                };
-                self.state = GenerateState::Decode { y: y.clone() };
-                Some(Ok(y))
-            }
-            GenerateState::Decode { y } => {
-                let inputs = match y.try_index_device((.., NewAxis), self.stream) {
-                    Ok(inputs) => inputs,
-                    Err(err) => return Some(Err(err)),
-                };
-                let inputs = MlxTensor::from_array(inputs);
-                let logits = match self.model.decode_logits(&inputs, self.cache, self.stream) {
-                    Ok(logits) => logits,
-                    Err(err) => return Some(Err(err)),
-                };
-                let y = match self.sampler.sample(
-                    logits.as_array(),
-                    self.temp,
-                    self.prng_state.as_mut(),
-                    self.stream,
-                ) {
-                    Ok(y) => y,
-                    Err(err) => return Some(Err(err)),
-                };
-                self.state = GenerateState::Decode { y: y.clone() };
-                Some(Ok(y))
-            }
         }
     }
 }

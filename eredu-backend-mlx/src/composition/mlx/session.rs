@@ -16,7 +16,7 @@ use safemlx::{
 use std::path::Path;
 
 use crate::{
-    backend::mlx::runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
+    backend::mlx::runtime::generation::sampler::{Sampler, SpeculativeSampler},
     backend::mlx::runtime::media::input,
     backend::mlx::{error::Error, MlxModelKind},
     composition::mlx::distributed::pipeline::{
@@ -1324,119 +1324,6 @@ fn forward_model_tensor_parallel(
             "tensor-parallel MLX cache does not match model type {}",
             model.model_type()
         ))),
-    }
-}
-
-enum GenerationState {
-    Prefill(MlxModelInput),
-    Decode(Array),
-}
-
-/// Architecture-erased token generation over one MLX model session.
-pub struct MlxGeneration<'a, S = DefaultSampler>
-where
-    S: Sampler,
-{
-    runtime: &'a mut ModelRuntime<MlxBackend<'static>>,
-    temperature: f32,
-    prng_state: Option<RandomState>,
-    sampler: S,
-    state: GenerationState,
-    completions: Vec<MlxSessionCompletion>,
-}
-
-impl<'a> MlxGeneration<'a, DefaultSampler> {
-    /// Creates an architecture-erased generation session with the default sampler.
-    pub fn new(
-        runtime: &'a mut ModelRuntime<MlxBackend<'static>>,
-        temperature: f32,
-        input: input::ModelInput<'_>,
-        prng_key: Option<Array>,
-    ) -> Self {
-        Self::with_sampler(runtime, temperature, input, prng_key, DefaultSampler)
-    }
-}
-
-impl<'a, S> MlxGeneration<'a, S>
-where
-    S: Sampler,
-{
-    /// Creates an architecture-erased generation session with a caller sampler.
-    pub fn with_sampler(
-        runtime: &'a mut ModelRuntime<MlxBackend<'static>>,
-        temperature: f32,
-        input: input::ModelInput<'_>,
-        prng_key: Option<Array>,
-        sampler: S,
-    ) -> Self {
-        Self {
-            runtime,
-            temperature,
-            prng_state: prng_key.map(RandomState::from_key),
-            sampler,
-            state: GenerationState::Prefill(input.into()),
-            completions: Vec::new(),
-        }
-    }
-
-    /// Returns the sampler at its committed generated prefix.
-    pub fn sampler_mut(&mut self) -> &mut S {
-        &mut self.sampler
-    }
-
-    fn retain_completion(&mut self, completion: MlxSessionCompletion) -> Result<(), Error> {
-        let mut retained = Vec::with_capacity(self.completions.len() + 1);
-        for pending in self.completions.drain(..) {
-            if !pending.is_complete()? {
-                retained.push(pending);
-            }
-        }
-        retained.push(completion);
-        self.completions = retained;
-        Ok(())
-    }
-}
-
-impl<S> Iterator for MlxGeneration<'_, S>
-where
-    S: Sampler,
-{
-    type Item = Result<Array, safemlx::error::Exception>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let stream = self.runtime.backend().stream().clone();
-        let submission = match &self.state {
-            GenerationState::Prefill(input) => self.runtime.prefill(input.clone()),
-            GenerationState::Decode(token) => {
-                let input = match token.try_index_device((.., NewAxis), &stream) {
-                    Ok(input) => input,
-                    Err(error) => return Some(Err(error)),
-                };
-                self.runtime.decode(input)
-            }
-        };
-        let submission = match submission {
-            Ok(submission) => submission,
-            Err(error) => return Some(Err(safemlx::error::Exception::custom(error.to_string()))),
-        };
-        let Some(logits) = submission.output.into_logits() else {
-            return Some(Err(safemlx::error::Exception::custom(
-                "token generation requires logits on the local session rank",
-            )));
-        };
-        if let Err(error) = self.retain_completion(submission.completion) {
-            return Some(Err(safemlx::error::Exception::custom(error.to_string())));
-        }
-        let token =
-            match self
-                .sampler
-                .sample(&logits, self.temperature, self.prng_state.as_mut(), &stream)
-            {
-                Ok(token) => token,
-                Err(error) => return Some(Err(error)),
-            };
-        self.state = GenerationState::Decode(token.clone());
-        Some(Ok(token))
     }
 }
 

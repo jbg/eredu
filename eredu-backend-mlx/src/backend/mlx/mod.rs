@@ -21,8 +21,6 @@ pub use config::ensure_replicated_load_options;
 pub use config::ModelLoadOptions;
 pub use distributed::MlxDistributedConfig;
 pub use distributed::MlxDistributedSession;
-pub use runtime::distributed::topology::{PlacementPlan, RankPartition};
-pub use runtime::residency::expert_cache::ExpertCacheReport;
 pub use topology::{DeviceAssignment, MlxParallelContext};
 
 use eredu_core::backend::{

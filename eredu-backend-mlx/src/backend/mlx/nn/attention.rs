@@ -1,101 +1,17 @@
 //! Shared attention inputs, projection transforms, cache updates, and kernels.
 
 use safemlx::{
-    builder::Builder,
     error::Exception,
     fast::ScaledDotProductAttentionMask,
-    module::Module,
-    nn,
     ops::{
         broadcast_to, concatenate_axis, einsum,
         indexing::{take_along_axis, NewAxis, TryIndexOp},
-        matmul, r#where, softmax_axis,
+        r#where, softmax_axis,
     },
     Array, Dtype, Stream,
 };
 
-use crate::{
-    backend::mlx::nn::tensor::{
-        create_causal_mask, rope::RopeVariant, scaled_dot_product_attention,
-    },
-    backend::mlx::runtime::cache::KeyValueCache,
-};
-
-/// Common attention-layer input.
-pub struct AttentionInput<'a, C> {
-    /// Hidden states with shape `[batch, sequence, hidden]`.
-    pub x: &'a Array,
-    /// Optional attention mask.
-    pub mask: Option<&'a Array>,
-    /// Optional mutable key/value cache.
-    pub cache: Option<&'a mut C>,
-}
-
-/// Returns the batch size and sequence length from a hidden-state tensor.
-pub fn batch_seq(x: &Array) -> (i32, i32) {
-    let shape = x.shape();
-    (shape[0], shape[1])
-}
-
-/// Reshapes a projected Q/K/V tensor to `[batch, heads, sequence, head_dim]`.
-pub fn reshape_attention_projection(
-    projection: Array,
-    batch: i32,
-    seq_len: i32,
-    heads: i32,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    projection
-        .reshape(&[batch, seq_len, heads, -1], stream)?
-        .transpose_axes(&[0, 2, 1, 3], stream)
-}
-
-/// Computes explicit attention probabilities for inspection views.
-pub fn attention_probabilities(
-    queries: &Array,
-    keys: &Array,
-    scale: f32,
-    mask: Option<&Array>,
-    stream: &Stream,
-) -> Result<Array, Exception> {
-    let queries_shape = queries.shape();
-    let keys_shape = keys.shape();
-    let batch = queries_shape[0];
-    let query_heads = queries_shape[1];
-    let key_heads = keys_shape[1];
-    let key_len = keys_shape[2];
-    let head_dim = keys_shape[3];
-    let keys = if query_heads == key_heads {
-        keys.clone()
-    } else if query_heads % key_heads == 0 {
-        let repeats = query_heads / key_heads;
-        broadcast_to(
-            &keys.reshape(&[batch, key_heads, 1, key_len, head_dim], stream)?,
-            &[batch, key_heads, repeats, key_len, head_dim],
-            stream,
-        )?
-        .reshape(&[batch, query_heads, key_len, head_dim], stream)?
-    } else {
-        return Err(Exception::custom(
-            "query attention heads are not divisible by key/value heads",
-        ));
-    };
-
-    let mut scores = matmul(
-        &queries.multiply(Array::from_f32(scale), stream)?,
-        &keys.swap_axes(-1, -2, stream)?,
-        stream,
-    )?;
-    if let Some(mask) = mask {
-        if mask.dtype() == Dtype::Bool {
-            let finfo_min = scores.dtype().finfo_min()?;
-            scores = r#where(mask, scores, Array::from_f32(finfo_min as f32), stream)?;
-        } else {
-            scores = scores.add(mask, stream)?;
-        }
-    }
-    softmax_axis(&scores, -1, true, stream)
-}
+use crate::backend::mlx::nn::tensor::create_causal_mask;
 
 /// Sparse attention over a bounded local window and indexed compressed tokens.
 ///
@@ -247,37 +163,6 @@ fn apply_score_mask(
     Ok(())
 }
 
-/// Applies RoPE to queries and keys, then updates a cache when provided.
-pub fn apply_rope_and_update_cache<C>(
-    rope: &mut RopeVariant,
-    mut queries: Array,
-    mut keys: Array,
-    mut values: Array,
-    cache: &mut Option<&mut C>,
-    stream: &Stream,
-) -> Result<(Array, Array, Array), Exception>
-where
-    C: KeyValueCache + ?Sized,
-{
-    if let Some(cache) = cache.as_mut() {
-        let offset = cache.offset();
-        queries = rope.forward(
-            nn::RopeInputBuilder::new(&queries).offset(offset).build()?,
-            stream,
-        )?;
-        keys = rope.forward(
-            nn::RopeInputBuilder::new(&keys).offset(offset).build()?,
-            stream,
-        )?;
-        (keys, values) = cache.update_for_attention(keys, values, stream)?;
-    } else {
-        queries = rope.forward(nn::RopeInput::new(&queries), stream)?;
-        keys = rope.forward(nn::RopeInput::new(&keys), stream)?;
-    }
-
-    Ok((queries, keys, values))
-}
-
 /// Applies caller-provided rotary cosine and sine tensors to one head view.
 pub fn apply_rotary_embeddings(
     value: &Array,
@@ -315,51 +200,6 @@ pub fn apply_rotary_embeddings(
     value
         .multiply(&cos, stream)?
         .add(rotate_half(value)?.multiply(&sin, stream)?, stream)
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Runs scaled dot-product attention and reshapes the output back to hidden states.
-pub fn finish_attention<C>(
-    queries: Array,
-    keys: Array,
-    values: Array,
-    cache: Option<&mut C>,
-    scale: f32,
-    mask: Option<&Array>,
-    batch: i32,
-    seq_len: i32,
-    stream: &Stream,
-) -> Result<Array, Exception>
-where
-    C: KeyValueCache + ?Sized,
-{
-    let attention = if let Some(cache) = cache {
-        match cache.paged_attention(&queries, scale, mask, None, stream)? {
-            Some(output) => output,
-            None => scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                Some(cache),
-                scale,
-                mask,
-                stream,
-            )?,
-        }
-    } else {
-        scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            Option::<&mut C>::None,
-            scale,
-            mask,
-            stream,
-        )?
-    };
-    attention
-        .transpose_axes(&[0, 2, 1, 3], stream)?
-        .reshape(&[batch, seq_len, -1], stream)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -456,28 +296,12 @@ pub fn sliding_window_prefill_attention(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        attention_probabilities, indexed_sparse_attention, sliding_window_prefill_attention,
-    };
+    use super::{indexed_sparse_attention, sliding_window_prefill_attention};
     use safemlx::{
-        fast::ScaledDotProductAttentionMask, Array, Device, DeviceType, Dtype, ExecutionContext,
+        fast::ScaledDotProductAttentionMask, Array, Device, DeviceType, ExecutionContext,
     };
 
     use crate::backend::mlx::nn::tensor::create_causal_mask;
-
-    #[test]
-    #[ignore = "requires MLX runtime execution"]
-    fn bool_attention_mask_keeps_attention_probabilities_float32() {
-        let ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let stream = ctx.stream();
-        let queries = Array::from_slice(&[1.0f32, 2.0], &[1, 1, 2, 1]);
-        let keys = Array::from_slice(&[1.0f32, 2.0], &[1, 1, 2, 1]);
-        let mask = Array::from_slice(&[false, true, false, false], &[1, 1, 2, 2]);
-
-        let probs = attention_probabilities(&queries, &keys, 1.0, Some(&mask), stream).unwrap();
-
-        assert_eq!(probs.dtype(), Dtype::Float32);
-    }
 
     #[test]
     #[ignore = "requires MLX runtime execution"]

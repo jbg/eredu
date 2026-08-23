@@ -1743,32 +1743,6 @@ pub fn load_gpt_oss_tensor_parallel_model(
     load_neutral_parallel_with_store(store, args, options, build, stream, weights_stream, false)
 }
 
-/// Loads only static and nonexpert block weights for an external provider.
-pub fn load_external_experts_with_store(
-    store: Arc<dyn CheckpointSource>,
-    args: ModelArgs,
-    options: LayerWeightResidency,
-    build: Option<crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<GptOssModel, Error> {
-    let store = resolve_safetensors_store(store, &args)?;
-    match build {
-        Some(build) if build.topology().tensor_parallel_size > 1 => {
-            load_neutral_parallel_with_store(
-                store,
-                args,
-                options,
-                build,
-                stream,
-                weights_stream,
-                true,
-            )
-        }
-        _ => load_neutral_with_store(store, args, options, stream, weights_stream, None, true),
-    }
-}
-
 /// Header-only results needed to open a portable GGUF GPT-OSS checkpoint.
 pub(crate) struct PreparedGptOssGguf {
     pub args: ModelArgs,

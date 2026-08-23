@@ -5,9 +5,7 @@
 //! to a single checkpoint key. They are validated from checkpoint metadata and
 //! materialized on the residency source stream before device promotion.
 
-pub use eredu_checkpoint::recipe::{
-    DerivedWeightRecipe, RecipeDtype, RecipeMetadata as WeightRecipeMetadata,
-};
+pub use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype};
 use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, TensorReadRequest};
 
 use safemlx::{

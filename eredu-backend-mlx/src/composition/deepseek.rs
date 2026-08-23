@@ -2577,60 +2577,13 @@ pub fn load_safetensors(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekModel, Error> {
-    load_safetensors_internal(
-        model_dir,
-        residency,
-        quantization,
-        false,
-        None,
-        stream,
-        weights_stream,
-    )
-}
-
-pub fn load_safetensors_external_experts(
-    model_dir: &Path,
-    residency: LayerWeightResidency,
-    quantization: Option<WeightQuantization>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<DeepSeekModel, Error> {
-    load_safetensors_internal(
-        model_dir,
-        WeightResidency::with_layers(residency),
-        quantization,
-        true,
-        None,
-        stream,
-        weights_stream,
-    )
-}
-
-pub fn load_safetensors_external_experts_parallel(
-    model_dir: &Path,
-    residency: LayerWeightResidency,
-    quantization: Option<WeightQuantization>,
-    build: ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<DeepSeekModel, Error> {
-    load_safetensors_internal(
-        model_dir,
-        WeightResidency::with_layers(residency),
-        quantization,
-        true,
-        Some(build),
-        stream,
-        weights_stream,
-    )
+    load_safetensors_internal(model_dir, residency, quantization, stream, weights_stream)
 }
 
 fn load_safetensors_internal(
     model_dir: &Path,
     residency: WeightResidency,
     quantization: Option<WeightQuantization>,
-    force_external_experts: bool,
-    parallel: Option<ParallelBuildContext>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekModel, Error> {
@@ -2653,28 +2606,16 @@ fn load_safetensors_internal(
                 }
                 None => (store, args, None),
             };
-            let mut model = match parallel {
-                Some(build) => DeepSeekModel::load_v3_external_expert_parallel(
-                    store,
-                    args,
-                    residency.layers(),
-                    build,
-                    stream,
-                    weights_stream,
-                )?,
-                None => DeepSeekModel::load_v3(
-                    store,
-                    args,
-                    residency.layers(),
-                    stream,
-                    weights_stream,
-                    force_external_experts || expert_options.is_some(),
-                )?,
-            };
-            if !force_external_experts {
-                if let Some(options) = expert_options {
-                    model.attach_expert_cache(options, stream, weights_stream)?;
-                }
+            let mut model = DeepSeekModel::load_v3(
+                store,
+                args,
+                residency.layers(),
+                stream,
+                weights_stream,
+                expert_options.is_some(),
+            )?;
+            if let Some(options) = expert_options {
+                model.attach_expert_cache(options, stream, weights_stream)?;
             }
             if let Some(report) = materialization {
                 model.set_materialization(report);
@@ -2694,28 +2635,16 @@ fn load_safetensors_internal(
                 }
                 None => (store, args, None),
             };
-            let mut model = match parallel {
-                Some(build) => DeepSeekModel::load_v4_external_expert_parallel(
-                    store,
-                    args,
-                    residency.layers(),
-                    build,
-                    stream,
-                    weights_stream,
-                )?,
-                None => DeepSeekModel::load_v4(
-                    store,
-                    args,
-                    residency.layers(),
-                    stream,
-                    weights_stream,
-                    force_external_experts || expert_options.is_some(),
-                )?,
-            };
-            if !force_external_experts {
-                if let Some(options) = expert_options {
-                    model.attach_expert_cache(options, stream, weights_stream)?;
-                }
+            let mut model = DeepSeekModel::load_v4(
+                store,
+                args,
+                residency.layers(),
+                stream,
+                weights_stream,
+                expert_options.is_some(),
+            )?;
+            if let Some(options) = expert_options {
+                model.attach_expert_cache(options, stream, weights_stream)?;
             }
             if let Some(report) = materialization {
                 model.set_materialization(report);
@@ -2743,49 +2672,6 @@ pub fn load_gguf(
         _metadata,
         family_v4,
         residency,
-        false,
-        None,
-        stream,
-        weights_stream,
-    )
-}
-
-pub fn load_gguf_external_experts(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-    family_v4: bool,
-    residency: LayerWeightResidency,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<(DeepSeekModel, Vec<u32>), Error> {
-    load_gguf_internal(
-        checkpoint,
-        metadata,
-        family_v4,
-        WeightResidency::with_layers(residency),
-        true,
-        None,
-        stream,
-        weights_stream,
-    )
-}
-
-pub fn load_gguf_external_experts_parallel(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-    family_v4: bool,
-    residency: LayerWeightResidency,
-    build: ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<(DeepSeekModel, Vec<u32>), Error> {
-    load_gguf_internal(
-        checkpoint,
-        metadata,
-        family_v4,
-        WeightResidency::with_layers(residency),
-        true,
-        Some(build),
         stream,
         weights_stream,
     )
@@ -2796,8 +2682,6 @@ fn load_gguf_internal(
     _metadata: &HashMap<String, GgufMetadataValue>,
     family_v4: bool,
     residency: WeightResidency,
-    force_external_experts: bool,
-    parallel: Option<ParallelBuildContext>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(DeepSeekModel, Vec<u32>), Error> {
@@ -2827,24 +2711,14 @@ fn load_gguf_internal(
             deepseek::translate_v4_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
-        match parallel {
-            Some(build) => DeepSeekModel::load_v4_external_expert_parallel(
-                store,
-                args,
-                options,
-                build,
-                stream,
-                weights_stream,
-            )?,
-            None => DeepSeekModel::load_v4(
-                store,
-                args,
-                options,
-                stream,
-                weights_stream,
-                force_external_experts || expert_options.is_some(),
-            )?,
-        }
+        DeepSeekModel::load_v4(
+            store,
+            args,
+            options,
+            stream,
+            weights_stream,
+            expert_options.is_some(),
+        )?
     } else {
         let catalog = PortableCatalog(checkpoint.catalog());
         let mut args = deepseek::parse_v3_gguf(&catalog, &portable_metadata)
@@ -2863,30 +2737,18 @@ fn load_gguf_internal(
             deepseek::translate_v3_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
-        match parallel {
-            Some(build) => DeepSeekModel::load_v3_external_expert_parallel(
-                store,
-                args,
-                options,
-                build,
-                stream,
-                weights_stream,
-            )?,
-            None => DeepSeekModel::load_v3(
-                store,
-                args,
-                options,
-                stream,
-                weights_stream,
-                force_external_experts || expert_options.is_some(),
-            )?,
-        }
+        DeepSeekModel::load_v3(
+            store,
+            args,
+            options,
+            stream,
+            weights_stream,
+            expert_options.is_some(),
+        )?
     };
     let mut model = model;
-    if !force_external_experts {
-        if let Some(options) = expert_options {
-            model.attach_expert_cache(options, stream, weights_stream)?;
-        }
+    if let Some(options) = expert_options {
+        model.attach_expert_cache(options, stream, weights_stream)?;
     }
     Ok((model, eos))
 }

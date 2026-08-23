@@ -2119,31 +2119,6 @@ pub fn load_nemotron_h_tensor_parallel_model(
     load_neutral_parallel(store, args, options, build, stream, weights_stream, false)
 }
 
-/// Loads only nonexpert Nemotron-H weights for an external expert-placement policy.
-pub fn load_external_expert_base_with_store(
-    store: Arc<dyn CheckpointSource>,
-    args: ModelArgs,
-    options: LayerWeightResidency,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<NemotronHModel, Error> {
-    let store = resolve_store(store, &args)?;
-    load_neutral(store, args, options, stream, weights_stream, None, true)
-}
-
-/// Loads tensor-partitioned nonexpert Nemotron-H weights for TP+EP execution.
-pub fn load_external_expert_parallel_base_with_store(
-    store: Arc<dyn CheckpointSource>,
-    args: ModelArgs,
-    options: LayerWeightResidency,
-    build: crate::backend::mlx::runtime::distributed::parallel::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<NemotronHModel, Error> {
-    let store = resolve_store(store, &args)?;
-    load_neutral_parallel(store, args, options, build, stream, weights_stream, true)
-}
-
 struct GgufCatalog<'a>(&'a GgufCheckpoint);
 
 impl eredu_architectures::nemotron_h::GgufTensorCatalog for GgufCatalog<'_> {
