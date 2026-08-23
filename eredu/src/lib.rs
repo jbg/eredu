@@ -24,6 +24,10 @@ pub mod runtime;
 pub use api::{inspect_text_model, PlannedModelLoadError, TextInspectionOptions};
 pub use eredu_architectures::configuration::inspect_artifact;
 pub use eredu_architectures::{GgufArchitecture, ModelKind};
+pub use eredu_checkpoint::{
+    store::{WeightStoreBackend, WeightStoreDiagnostics},
+    AffineQuantization, WeightQuantization,
+};
 /// Canonical backend-neutral runtime types.
 pub use eredu_core as core;
 pub use eredu_core::artifact::{

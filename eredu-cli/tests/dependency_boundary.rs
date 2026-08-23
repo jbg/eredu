@@ -22,10 +22,15 @@ fn assert_facade_only_execution_dependency(manifest: &Path) {
     );
     let tree = String::from_utf8(output.stdout).unwrap();
     assert!(tree.lines().any(|line| line.starts_with("eredu v")));
-    for forbidden in ["eredu-backend-mlx ", "safemlx ", "safemlx-sys "] {
+    for forbidden in [
+        "eredu-backend-mlx ",
+        "eredu-checkpoint ",
+        "safemlx ",
+        "safemlx-sys ",
+    ] {
         assert!(
             !tree.lines().any(|line| line.starts_with(forbidden)),
-            "application has direct concrete-backend dependency {forbidden:?} in:\n{tree}"
+            "application has direct implementation-crate dependency {forbidden:?} in:\n{tree}"
         );
     }
 }

@@ -37,6 +37,10 @@ fixtures and is not enabled by the production `mlx` feature. The backend crate
 does not alias neutral crates into its namespace; direct backend consumers
 import neutral contracts from their owning crates.
 
+Portable checkpoint quantization requests and storage diagnostics used by
+applications are re-exported by the facade; applications do not depend on
+`eredu-checkpoint` to name those contracts.
+
 Application targets, including the CLI and platform examples, depend only on
 the `eredu` facade. The selected-local-backend API owns device-plan creation,
 process runtime configuration, synchronization, allocator telemetry, and

@@ -27,15 +27,14 @@ use eredu::{
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
-    AutomaticPlanRequest, AutomaticPlanner, DenseDiskStreamLoadOptions, DevicePlan,
-    DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
-    ExpertCachePlan, FinishReason, GenerationCancellationToken, GenerationConfigOverrides,
-    HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, MtpSchedulerOptions, Observed,
-    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, SemanticEvent,
-    TextGenerationConfig, TimingTelemetry, TokenOutput, WeightTransformationPlan,
-    EXECUTION_PLAN_SCHEMA_VERSION,
+    AffineQuantization, AutomaticPlanRequest, AutomaticPlanner, DenseDiskStreamLoadOptions,
+    DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanReport,
+    ExecutionTelemetry, ExpertCachePlan, FinishReason, GenerationCancellationToken,
+    GenerationConfigOverrides, HardwareMemorySemantics, HardwareProfile, ModelResourceProfile,
+    MtpSchedulerOptions, Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
+    SemanticEvent, TextGenerationConfig, TimingTelemetry, TokenOutput, WeightQuantization,
+    WeightStoreDiagnostics, WeightTransformationPlan, EXECUTION_PLAN_SCHEMA_VERSION,
 };
-use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
 use serde::{Deserialize, Serialize};
 
@@ -2740,9 +2739,7 @@ fn format_bytes(bytes: usize) -> String {
     format!("{value:.2} {unit} ({bytes} bytes)")
 }
 
-fn format_weight_store_diagnostics(
-    diagnostics: &eredu_checkpoint::store::WeightStoreDiagnostics,
-) -> String {
+fn format_weight_store_diagnostics(diagnostics: &WeightStoreDiagnostics) -> String {
     format!(
         "backend={:?}, mapping_hits={}, mapping_misses={}, evictions={}, currently_mapped_shards={}, touched_shards={}, physical_reads={}, physical_read_bytes={}, coalesced_group_hits={}",
         diagnostics.backend,
@@ -4624,8 +4621,8 @@ mod tests {
 
     #[test]
     fn concise_weight_store_diagnostics_omit_shard_paths() {
-        let diagnostics = eredu_checkpoint::store::WeightStoreDiagnostics {
-            backend: eredu_checkpoint::store::WeightStoreBackend::Safetensors,
+        let diagnostics = eredu::WeightStoreDiagnostics {
+            backend: eredu::WeightStoreBackend::Safetensors,
             mapping_hits: 17,
             mapping_misses: 2,
             evictions: 1,
