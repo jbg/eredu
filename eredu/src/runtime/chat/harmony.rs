@@ -63,7 +63,7 @@ impl HarmonyDialect {
             |text: &str| structural_literal(text, STRUCTURAL_TOKENS, structural_token_ids);
         let tools = parse_tools(tools)?;
         if tool_choice == ToolChoice::None {
-            return Ok("start: \"__safemlx_harmony_tools_disabled__\"\n".into());
+            return Ok("start: \"__eredu_harmony_tools_disabled__\"\n".into());
         }
 
         let mut grammar = String::new();
@@ -101,7 +101,7 @@ impl HarmonyDialect {
         }
 
         if tools.is_empty() {
-            grammar.push_str("auto_function_call: \"__safemlx_unreachable_harmony_function__\"\n");
+            grammar.push_str("auto_function_call: \"__eredu_unreachable_harmony_function__\"\n");
             return Ok(grammar);
         }
 

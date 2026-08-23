@@ -29,11 +29,11 @@ def main() -> None:
 #include <cuda_runtime.h>
 #include <cute/numeric/numeric_types.hpp>
 #include <cutlass/numeric_conversion.h>
-extern \"C\" __global__ void safemlx_header_smoke() {}
+extern \"C\" __global__ void eredu_header_smoke() {}
 """
     check(
         nvrtc.nvrtcCreateProgram(
-            ctypes.byref(program), source, b"safemlx_header_smoke.cu", 0, None, None
+            ctypes.byref(program), source, b"eredu_header_smoke.cu", 0, None, None
         ),
         "nvrtcCreateProgram",
     )

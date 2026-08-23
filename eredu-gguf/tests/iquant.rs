@@ -247,7 +247,7 @@ fn catalog_exposes_native_formats_as_one_packed_u8_logical_tensor() {
         assert_eq!(tensor.outputs()[0].name, tensor.descriptor().name);
         let (block_values, block_bytes) = tensor.descriptor().ggml_type.block_and_bytes().unwrap();
         assert_eq!(tensor.outputs()[0].shape, [block_bytes]);
-        assert_eq!(tensor.descriptor().mlx_shape(), [block_values]);
+        assert_eq!(tensor.descriptor().row_major_shape(), [block_values]);
         assert_eq!(tensor.outputs()[0].dtype, LogicalDtype::U8);
     }
 }

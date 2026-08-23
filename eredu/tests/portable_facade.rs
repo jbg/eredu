@@ -201,7 +201,7 @@ fn automatic_planning_documents_are_available_without_mlx() {
 #[test]
 fn tokenizer_and_text_inspection_are_available_without_mlx() {
     let directory = std::env::temp_dir().join(format!(
-        "safemlx-portable-inspection-{}-{:?}",
+        "eredu-portable-inspection-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));

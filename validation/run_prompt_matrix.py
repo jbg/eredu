@@ -25,7 +25,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--manifest", type=pathlib.Path, default=SCRIPT_DIR / "models.yaml")
     parser.add_argument("--output-root", type=pathlib.Path, required=True)
     parser.add_argument(
-        "--model-root", type=pathlib.Path, default=pathlib.Path("/tmp/safemlx-models")
+        "--model-root", type=pathlib.Path, default=pathlib.Path("/tmp/eredu-models")
     )
     parser.add_argument("--prompt-id", action="append", dest="prompt_ids")
     parser.add_argument("--overwrite", action="store_true")
@@ -103,7 +103,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "return_code": completed.returncode,
                 "status": pilot["status"],
                 "token_count": pilot.get("evidence", {})
-                .get("safemlx_correctness", {})
+                .get("eredu_correctness", {})
                 .get("input", {})
                 .get("token_count"),
                 "comparison": comparison,

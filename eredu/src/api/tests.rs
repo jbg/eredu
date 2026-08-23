@@ -2430,10 +2430,10 @@ fn inkling_native_tools_render_constrain_and_parse_protocol() {
 }
 
 #[test]
-#[ignore = "requires SAFEMLX_INKLING_MODEL_DIR pointing to a local Inkling checkpoint"]
+#[ignore = "requires EREDU_INKLING_MODEL_DIR pointing to a local Inkling checkpoint"]
 fn inkling_real_checkpoint_template_is_recognized() {
-    let Ok(model_dir) = std::env::var("SAFEMLX_INKLING_MODEL_DIR") else {
-        eprintln!("skipping real Inkling checkpoint test: SAFEMLX_INKLING_MODEL_DIR is not set");
+    let Ok(model_dir) = std::env::var("EREDU_INKLING_MODEL_DIR") else {
+        eprintln!("skipping real Inkling checkpoint test: EREDU_INKLING_MODEL_DIR is not set");
         return;
     };
     let model_dir = std::path::PathBuf::from(model_dir);
@@ -3138,7 +3138,7 @@ fn synthetic_profile_compiles_request_tools_before_rendering() {
     .unwrap();
     assert_eq!(
         prepared.format_profile_identity(),
-        Some("safemlx.synthetic-tools.v1")
+        Some("eredu.synthetic-tools.v1")
     );
     let plan = prepared
         .tool_runtime_plan()

@@ -61,10 +61,10 @@ fn load_test_model(
 }
 
 #[test]
-#[ignore = "requires MLX runtime execution and SAFEMLX_INSPECTION_MODEL_DIR"]
+#[ignore = "requires MLX runtime execution and EREDU_INSPECTION_MODEL_DIR"]
 fn observer_forward_reports_attention_and_residual_hooks() {
-    let model_dir = std::env::var("SAFEMLX_INSPECTION_MODEL_DIR")
-        .expect("set SAFEMLX_INSPECTION_MODEL_DIR to a local model directory");
+    let model_dir = std::env::var("EREDU_INSPECTION_MODEL_DIR")
+        .expect("set EREDU_INSPECTION_MODEL_DIR to a local model directory");
     let ctx = eredu_backend_mlx::native::ExecutionContext::new(
         eredu_backend_mlx::native::Device::new(eredu_backend_mlx::native::DeviceType::Gpu, 0),
     );

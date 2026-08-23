@@ -158,7 +158,7 @@ pub fn quantize_expert_catalog(
                 .strip_suffix(".weight")
                 .unwrap_or(binding.name());
             let target_name = format!(
-                "__safemlx.expert.layer.{:05}.global.{:05}.{stem}.weight",
+                "__eredu.expert.layer.{:05}.global.{:05}.{stem}.weight",
                 identity.layer, identity.global_expert
             );
             let target = BoundedQuantizationTarget::from_recipe(target_name, recipe)?;

@@ -231,67 +231,67 @@ fn qwen_residency_smoke(environment: &str) {
 }
 
 #[test]
-#[ignore = "requires SAFEMLX_GEMMA4_TOOL_CHECKPOINT and an MLX Metal device"]
+#[ignore = "requires EREDU_GEMMA4_TOOL_CHECKPOINT and an MLX Metal device"]
 fn gemma4_real_checkpoint_native_tool_smoke() {
-    smoke("SAFEMLX_GEMMA4_TOOL_CHECKPOINT", "google.gemma4.");
+    smoke("EREDU_GEMMA4_TOOL_CHECKPOINT", "google.gemma4.");
 }
 
 #[test]
-#[ignore = "requires SAFEMLX_GPT_OSS_TOOL_CHECKPOINT and an MLX Metal device"]
+#[ignore = "requires EREDU_GPT_OSS_TOOL_CHECKPOINT and an MLX Metal device"]
 fn gpt_oss_real_checkpoint_native_tool_smoke() {
-    smoke("SAFEMLX_GPT_OSS_TOOL_CHECKPOINT", "openai.gpt-oss.harmony.");
+    smoke("EREDU_GPT_OSS_TOOL_CHECKPOINT", "openai.gpt-oss.harmony.");
 }
 
 #[test]
-#[ignore = "requires SAFEMLX_QWEN_TOOL_CHECKPOINT and an MLX Metal device"]
+#[ignore = "requires EREDU_QWEN_TOOL_CHECKPOINT and an MLX Metal device"]
 fn qwen_real_checkpoint_native_tool_smoke() {
-    smoke("SAFEMLX_QWEN_TOOL_CHECKPOINT", "qwen.");
+    smoke("EREDU_QWEN_TOOL_CHECKPOINT", "qwen.");
 }
 
 #[test]
-#[ignore = "requires SAFEMLX_QWEN2_CHECKPOINT and an MLX Metal device"]
+#[ignore = "requires EREDU_QWEN2_CHECKPOINT and an MLX Metal device"]
 fn qwen2_real_checkpoint_resident_and_bounded_smoke() {
-    qwen_residency_smoke("SAFEMLX_QWEN2_CHECKPOINT");
+    qwen_residency_smoke("EREDU_QWEN2_CHECKPOINT");
 }
 
 #[test]
-#[ignore = "requires SAFEMLX_QWEN3_CHECKPOINT and an MLX Metal device"]
+#[ignore = "requires EREDU_QWEN3_CHECKPOINT and an MLX Metal device"]
 fn qwen3_real_checkpoint_resident_and_bounded_smoke() {
-    qwen_residency_smoke("SAFEMLX_QWEN3_CHECKPOINT");
+    qwen_residency_smoke("EREDU_QWEN3_CHECKPOINT");
 }
 
 #[test]
-#[ignore = "requires SAFEMLX_QWEN3_MOE_CHECKPOINT and an MLX Metal device"]
+#[ignore = "requires EREDU_QWEN3_MOE_CHECKPOINT and an MLX Metal device"]
 fn qwen3_moe_real_checkpoint_resident_and_bounded_smoke() {
-    qwen_residency_smoke("SAFEMLX_QWEN3_MOE_CHECKPOINT");
+    qwen_residency_smoke("EREDU_QWEN3_MOE_CHECKPOINT");
 }
 
 #[test]
-#[ignore = "requires SAFEMLX_MISTRAL_TOOL_CHECKPOINT and an MLX Metal device"]
+#[ignore = "requires EREDU_MISTRAL_TOOL_CHECKPOINT and an MLX Metal device"]
 fn mistral_real_checkpoint_native_tool_smoke() {
-    smoke("SAFEMLX_MISTRAL_TOOL_CHECKPOINT", "mistral.");
+    smoke("EREDU_MISTRAL_TOOL_CHECKPOINT", "mistral.");
 }
 
 #[test]
-#[ignore = "requires SAFEMLX_LFM2_TOOL_CHECKPOINT and an MLX Metal device"]
+#[ignore = "requires EREDU_LFM2_TOOL_CHECKPOINT and an MLX Metal device"]
 fn lfm2_real_checkpoint_native_tool_smoke() {
-    smoke("SAFEMLX_LFM2_TOOL_CHECKPOINT", "liquid.lfm2");
+    smoke("EREDU_LFM2_TOOL_CHECKPOINT", "liquid.lfm2");
 }
 
 #[test]
-#[ignore = "requires SAFEMLX_DEEPSEEK_TOOL_CHECKPOINT and an MLX Metal device"]
+#[ignore = "requires EREDU_DEEPSEEK_TOOL_CHECKPOINT and an MLX Metal device"]
 fn deepseek_real_checkpoint_native_tool_smoke() {
-    smoke("SAFEMLX_DEEPSEEK_TOOL_CHECKPOINT", "deepseek.");
+    smoke("EREDU_DEEPSEEK_TOOL_CHECKPOINT", "deepseek.");
 }
 
 #[test]
-#[ignore = "requires SAFEMLX_LLAMA_TOOL_CHECKPOINT and an MLX Metal device"]
+#[ignore = "requires EREDU_LLAMA_TOOL_CHECKPOINT and an MLX Metal device"]
 fn llama_real_checkpoint_native_tool_smoke() {
-    smoke("SAFEMLX_LLAMA_TOOL_CHECKPOINT", "meta.llama-");
+    smoke("EREDU_LLAMA_TOOL_CHECKPOINT", "meta.llama-");
 }
 
 #[test]
-#[ignore = "requires SAFEMLX_NEMOTRON_TOOL_CHECKPOINT and an MLX Metal device"]
+#[ignore = "requires EREDU_NEMOTRON_TOOL_CHECKPOINT and an MLX Metal device"]
 fn nemotron_real_checkpoint_native_tool_smoke() {
-    smoke("SAFEMLX_NEMOTRON_TOOL_CHECKPOINT", "nvidia.");
+    smoke("EREDU_NEMOTRON_TOOL_CHECKPOINT", "nvidia.");
 }

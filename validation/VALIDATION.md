@@ -24,7 +24,7 @@ headers with NVRTC. At runtime, `MLX_CUDA_JIT_INCLUDE_DIRS` gives MLX explicit
 header roots instead of relying on the executable's installed location.
 
 ```text
-ghcr.io/jbg/safemlx-validation:cuda12.9.1-rust1.89.0-torch2.8.0-v1
+ghcr.io/jbg/eredu-validation:cuda12.9.1-rust1.89.0-torch2.8.0-v1
 ```
 
 Run it on a host with the NVIDIA Container Toolkit, mounting checkpoints and
@@ -34,7 +34,7 @@ results separately so downloaded weights do not become container layers:
 docker run --rm --gpus all \
   -v "$PWD/models:/models:ro" \
   -v "$PWD/validation/results:/data/results" \
-  ghcr.io/jbg/safemlx-validation:cuda12.9.1-rust1.89.0-torch2.8.0-v1 \
+  ghcr.io/jbg/eredu-validation:cuda12.9.1-rust1.89.0-torch2.8.0-v1 \
   checkpoint_probe --help
 ```
 
@@ -47,7 +47,7 @@ MXFP4 JIT path:
 
 ```bash
 docker run --rm --gpus all \
-  ghcr.io/jbg/safemlx-validation:<immutable-tag-or-digest> \
+  ghcr.io/jbg/eredu-validation:<immutable-tag-or-digest> \
   cuda_mxfp4_smoke
 ```
 
@@ -61,14 +61,14 @@ cargo run -p eredu --features cuda --example checkpoint_probe -- \
   --model /models/tinyllama \
   --input-ids 1,2,3,4 \
   --teacher-forced-ids 5,6,7,8 \
-  --output validation/results/tinyllama_safemlx
+  --output validation/results/tinyllama_eredu
 ```
 
 Run the reference along the exact same token path:
 
 ```bash
 python validation/reference_runner.py \
-  --probe validation/results/tinyllama_safemlx.json \
+  --probe validation/results/tinyllama_eredu.json \
   --output validation/results/tinyllama_transformers \
   --device cuda:0 --dtype bfloat16
 ```
@@ -77,7 +77,7 @@ Compare using the case's tolerance profile from the manifest:
 
 ```bash
 python validation/compare_checkpoints.py \
-  --actual validation/results/tinyllama_safemlx.json \
+  --actual validation/results/tinyllama_eredu.json \
   --reference validation/results/tinyllama_transformers.json \
   --manifest validation/models.yaml \
   --case llama_dense_untied \
@@ -101,10 +101,11 @@ modality-specific reference runners.
 3. compare the logits with the manifest tolerance profile; and
 4. run a Eredu 128-token prefill plus 128-token decode performance smoke.
 
-The pilot uses this immutable image reference:
+After publishing the Eredu validation image, pin the reported digest in the
+pilot environment using this form:
 
 ```text
-ghcr.io/jbg/safemlx-validation@sha256:3a2cd1dff93aa3dac986b1b21392fe4518f0cc6d674aa8d57a934b71097cdff0
+ghcr.io/jbg/eredu-validation@sha256:<published-digest>
 ```
 
 Mount this directory at `/opt/pilot` and a persistent artifact destination at
@@ -114,7 +115,7 @@ Mount this directory at `/opt/pilot` and a persistent artifact destination at
 python /opt/pilot/run_pilot_case.py \
   --case qwen3_dense \
   --manifest /opt/pilot/models.yaml \
-  --output-root /artifacts/safemlx-cuda-pilot/<pilot-id>
+  --output-root /artifacts/eredu-cuda-pilot/<pilot-id>
 ```
 
 The case directory always receives `pilot-summary.json`, including partial
@@ -128,10 +129,10 @@ For numerical localization, `run_prompt_matrix.py` runs one case across every
 manifest prompt in a single GPU allocation while reusing the checkpoint:
 
 ```bash
-python /opt/safemlx/validation/run_prompt_matrix.py \
+python /opt/eredu/validation/run_prompt_matrix.py \
   --case nemotron_h_dense \
-  --manifest /opt/safemlx/validation/models.yaml \
-  --output-root /artifacts/safemlx-cuda-pilot/<matrix-id>
+  --manifest /opt/eredu/validation/models.yaml \
+  --output-root /artifacts/eredu-cuda-pilot/<matrix-id>
 ```
 
 Pass `--prompt-id <id>` repeatedly to select a subset. The matrix writes an

@@ -1,5 +1,5 @@
 // Conversion layout translated from MLX v0.32.0 `mlx/io/gguf_quants.cpp`
-// (Apple Inc., MIT license) and safemlx's former MLX patch set. The resulting
+// (Apple Inc., MIT license) and Eredu's former in-tree MLX patch set. The resulting
 // buffers intentionally match MLX affine quantization byte-for-byte.
 use crate::{Endian, Error, GgmlType, Result, TensorDescriptor};
 use half::f16;
@@ -156,7 +156,7 @@ pub(crate) fn affine_shapes(
     bits: u8,
     group_size: u32,
 ) -> Result<(Vec<u64>, Vec<u64>)> {
-    let mut weight_shape = desc.mlx_shape();
+    let mut weight_shape = desc.row_major_shape();
     let last = weight_shape
         .last_mut()
         .ok_or_else(|| Error::tensor(&desc.name, "quantized scalar is invalid"))?;
@@ -170,7 +170,7 @@ pub(crate) fn affine_shapes(
         .checked_mul(u64::from(bits))
         .ok_or(Error::Overflow("affine packed dimension"))?
         / 32;
-    let mut scale_shape = desc.mlx_shape();
+    let mut scale_shape = desc.row_major_shape();
     *scale_shape.last_mut().unwrap() /= u64::from(group_size);
     Ok((weight_shape, scale_shape))
 }
@@ -195,7 +195,7 @@ pub(crate) fn iquant_packed_shape(shape: &[u64], ty: GgmlType) -> Result<Vec<u64
 }
 
 pub(crate) fn mxfp4_shapes(desc: &TensorDescriptor) -> Result<(Vec<u64>, Vec<u64>)> {
-    let mut weight_shape = desc.mlx_shape();
+    let mut weight_shape = desc.row_major_shape();
     let columns = weight_shape
         .last_mut()
         .ok_or_else(|| Error::tensor(&desc.name, "MXFP4 scalar is invalid"))?;
@@ -206,7 +206,7 @@ pub(crate) fn mxfp4_shapes(desc: &TensorDescriptor) -> Result<(Vec<u64>, Vec<u64
         ));
     }
     *columns /= 8;
-    let mut scale_shape = desc.mlx_shape();
+    let mut scale_shape = desc.row_major_shape();
     *scale_shape.last_mut().unwrap() /= 32;
     Ok((weight_shape, scale_shape))
 }
@@ -225,14 +225,14 @@ pub(crate) fn convert(
     match conversion_kind(desc.ggml_type, endian)? {
         ConversionKind::Dense(dtype) => {
             return Ok(ConvertedTensor::Dense(DenseTensor {
-                shape: desc.mlx_shape(),
+                shape: desc.row_major_shape(),
                 dtype,
                 data: normalize_dense(raw, dtype, endian),
             }));
         }
         ConversionKind::IQuant => {
             return Ok(ConvertedTensor::IQuant(IQuantTensor {
-                shape: desc.mlx_shape(),
+                shape: desc.row_major_shape(),
                 ggml_type: desc.ggml_type,
                 endian,
                 data: raw.to_vec(),

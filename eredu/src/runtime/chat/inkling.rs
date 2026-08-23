@@ -88,7 +88,7 @@ impl InklingToolDialect {
 
         let (_, maximum) = tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
         if tool_choice == ToolChoice::None {
-            return Ok("start: \"__safemlx_inkling_tools_disabled__\"\n".into());
+            return Ok("start: \"__eredu_inkling_tools_disabled__\"\n".into());
         }
 
         let tools = parse_tools(tools)?;
@@ -138,8 +138,8 @@ impl InklingToolDialect {
 
         if tools.is_empty() {
             grammar.push_str(
-                "tool_call: \"__safemlx_unreachable_inkling_tool_call__\"\n\
-                 auto_tool_call: \"__safemlx_unreachable_inkling_auto_tool_call__\"\n",
+                "tool_call: \"__eredu_unreachable_inkling_tool_call__\"\n\
+                 auto_tool_call: \"__eredu_unreachable_inkling_auto_tool_call__\"\n",
             );
             return Ok(grammar);
         }

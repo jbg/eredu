@@ -99,7 +99,7 @@ fn reads_one_reshaped_contiguous_span_from_a_dense_bank() {
     let descriptor = checkpoint.shards()[0].tensors()[0].descriptor();
     let selection = DenseTensorSpan::new(8, vec![1, 2, 4]).unwrap();
     let plan = DenseTensorSpanPlan::new(descriptor, selection.clone()).unwrap();
-    assert_eq!(plan.selected_descriptor().mlx_shape(), [1, 2, 4]);
+    assert_eq!(plan.selected_descriptor().row_major_shape(), [1, 2, 4]);
     assert_eq!(plan.encoded_byte_len(), 32);
     assert_eq!(plan.encoded_span().offset(), descriptor.data_offset + 8 * 4);
 
@@ -238,7 +238,7 @@ fn plans_and_reads_dense_inner_axis_ranges_as_strided_spans() {
     assert_eq!(plan.alignment().block_values(), 1);
     assert_eq!(plan.alignment().block_bytes(), 4);
     assert_eq!(plan.alignment().selected_axis_multiple(), 1);
-    assert_eq!(plan.selected_descriptor().mlx_shape(), [4, 2]);
+    assert_eq!(plan.selected_descriptor().row_major_shape(), [4, 2]);
     assert_eq!(plan.encoded_byte_len(), 32);
     let spans = plan.encoded_spans().collect::<Vec<_>>();
     assert_eq!(spans.len(), 4);
@@ -291,7 +291,7 @@ fn reads_reordered_dense_indices_on_an_intermediate_axis() {
     let descriptor = checkpoint.shards()[0].tensors()[0].descriptor();
     let plan = TensorSelectionPlan::new(descriptor, selection.clone()).unwrap();
     assert_eq!(plan.gguf_dimension(), 1);
-    assert_eq!(plan.selected_descriptor().mlx_shape(), [2, 2, 2]);
+    assert_eq!(plan.selected_descriptor().row_major_shape(), [2, 2, 2]);
     assert_eq!(plan.encoded_spans().count(), 4);
 
     let selected = checkpoint

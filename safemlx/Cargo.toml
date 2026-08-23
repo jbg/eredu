@@ -8,7 +8,7 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true
-documentation = "https://github.com/jbg/safemlx"
+documentation = "https://github.com/jbg/eredu"
 description = "Low-level MLX execution layer used by the Eredu model runtime"
 readme = "README.md"
 

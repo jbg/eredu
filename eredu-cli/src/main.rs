@@ -1513,7 +1513,7 @@ fn cli_device_for_plan(device: &DevicePlan) -> Result<CliDevice> {
 
 fn temporary_trial_path(label: &str, candidate: usize, run: usize) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "safemlx-auto-{label}-{}-{candidate}-{run}.json",
+        "eredu-auto-{label}-{}-{candidate}-{run}.json",
         std::process::id()
     ))
 }
@@ -2089,7 +2089,7 @@ fn main() -> Result<()> {
     );
 
     if args.verbose {
-        eprintln!("--- safemlx diagnostics (stderr) ---");
+        eprintln!("--- Eredu MLX diagnostics (stderr) ---");
         eprintln!("model: {}", model_path.display());
         eprintln!("device: {}", args.device);
         if let Some(bytes) = args.mlx_cache_limit_bytes {
@@ -2461,7 +2461,7 @@ fn main() -> Result<()> {
     stdout.flush()?;
 
     if args.verbose {
-        eprintln!("--- safemlx diagnostics (stderr) ---");
+        eprintln!("--- Eredu MLX diagnostics (stderr) ---");
     }
     if tools_requested || should_report_stop_reason(stop_reason, args.verbose) {
         eprintln!("stop_reason: {}", stop_reason.label());

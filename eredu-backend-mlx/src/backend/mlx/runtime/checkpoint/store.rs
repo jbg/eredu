@@ -1180,13 +1180,13 @@ fn materialize_range(
             usize::try_from(end - start).map_err(|_| WeightStoreError::Overflow {
                 context: format!("selected range length for tensor {key:?}"),
             })?;
-        let mlx_shape = output_shape
+        let row_major_shape = output_shape
             .iter()
             .map(|dimension| to_i32(key, "selected dimension", *dimension))
             .collect::<Result<Vec<_>, _>>()?;
         selected
             .flatten(None, None, source_stream)
-            .and_then(|value| value.reshape(&mlx_shape, source_stream))
+            .and_then(|value| value.reshape(&row_major_shape, source_stream))
             .map_err(|source| mlx_error(key, "range compaction", source))?
     };
     selected

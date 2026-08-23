@@ -72,7 +72,7 @@ pub fn fingerprint_artifact(
     }
 
     let mut hasher = Sha256::new();
-    hash_component(&mut hasher, b"safemlx-checkpoint-artifact-v1");
+    hash_component(&mut hasher, b"eredu-checkpoint-artifact-v1");
     hash_component(&mut hasher, domain.as_bytes());
     hasher.update((files.len() as u64).to_le_bytes());
     let mut buffer = vec![0u8; 1024 * 1024];

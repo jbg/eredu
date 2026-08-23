@@ -735,8 +735,7 @@ impl DeclarativeDialectSpec {
                     argument_rules.push_str(&format!("named_arguments_{index}: %json {schema}\n"));
                 }
                 if alternatives.is_empty() {
-                    alternatives
-                        .push("\"__safemlx_unreachable_named_json_tool_call__\"".to_owned());
+                    alternatives.push("\"__eredu_unreachable_named_json_tool_call__\"".to_owned());
                 }
                 if self.output.prefix.is_empty() {
                     grammar.push_str(&format!("tool_output: {calls}\n"));
@@ -898,7 +897,7 @@ fn tagged_parameters_grammar(
 ) -> Result<String, String> {
     let tools = parse_tools(tools)?;
     if tools.is_empty() {
-        return Ok("tagged_call: \"__safemlx_unreachable_tagged_tool_call__\"\n".into());
+        return Ok("tagged_call: \"__eredu_unreachable_tagged_tool_call__\"\n".into());
     }
 
     let mut rules = String::new();
@@ -1218,7 +1217,7 @@ fn structural_object_grammar(
 ) -> Result<String, String> {
     let tools = parse_tools(tools)?;
     if tools.is_empty() {
-        return Ok("structural_call: \"__safemlx_unreachable_structural_tool_call__\"\n".into());
+        return Ok("structural_call: \"__eredu_unreachable_structural_tool_call__\"\n".into());
     }
 
     let resolver = StructuralLiteralResolver {

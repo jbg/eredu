@@ -567,7 +567,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "safemlx-neutral-quantization-config-{}-{suffix}",
+            "eredu-mlx-neutral-quantization-config-{}-{suffix}",
             std::process::id()
         ));
         let source = root.join("source");
@@ -595,7 +595,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "safemlx-prequantized-rejection-{}-{suffix}",
+            "eredu-mlx-prequantized-rejection-{}-{suffix}",
             std::process::id()
         ));
         let source = root.join("source");
@@ -674,7 +674,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "safemlx-mxfp4-save-test-{}-{suffix}",
+            "eredu-mlx-mxfp4-save-test-{}-{suffix}",
             std::process::id()
         ));
         let source = root.join("source");
@@ -717,7 +717,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "safemlx-quantization-test-{}-{suffix}",
+            "eredu-mlx-quantization-test-{}-{suffix}",
             std::process::id()
         ));
         let source = root.join("source");

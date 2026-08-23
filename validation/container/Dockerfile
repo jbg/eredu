@@ -32,15 +32,15 @@ RUN apt-get update \
 RUN --mount=type=bind,from=rust-toolchain,source=/usr/local/cargo/bin,target=/opt/rust/bin,readonly \
     --mount=type=bind,from=rust-toolchain,source=/usr/local/rustup,target=/opt/rustup,readonly \
     --mount=type=bind,source=.,target=/src,readonly \
-    --mount=type=cache,id=safemlx-cargo-registry-amd64,target=/tmp/safemlx-cargo/registry \
-    --mount=type=cache,id=safemlx-cargo-git-amd64,target=/tmp/safemlx-cargo/git \
-    --mount=type=cache,id=safemlx-cargo-target-amd64,target=/tmp/safemlx-target \
+    --mount=type=cache,id=eredu-cargo-registry-amd64,target=/tmp/eredu-cargo/registry \
+    --mount=type=cache,id=eredu-cargo-git-amd64,target=/tmp/eredu-cargo/git \
+    --mount=type=cache,id=eredu-cargo-target-amd64,target=/tmp/eredu-target \
     set -eux; \
     export PATH="/opt/rust/bin:${PATH}"; \
     export RUSTUP_HOME=/opt/rustup; \
     export RUSTUP_TOOLCHAIN=1.89.0-x86_64-unknown-linux-gnu; \
-    export CARGO_HOME=/tmp/safemlx-cargo; \
-    export CARGO_TARGET_DIR=/tmp/safemlx-target; \
+    export CARGO_HOME=/tmp/eredu-cargo; \
+    export CARGO_TARGET_DIR=/tmp/eredu-target; \
     cd /src; \
     rustc --version | grep -F 'rustc 1.89.0'; \
     cargo build --locked --release \
@@ -54,17 +54,17 @@ RUN --mount=type=bind,from=rust-toolchain,source=/usr/local/cargo/bin,target=/op
         --features cuda \
         --example cuda_mxfp4_smoke; \
     install -m 0755 \
-        /tmp/safemlx-target/release/examples/checkpoint_probe \
+        /tmp/eredu-target/release/examples/checkpoint_probe \
         /usr/local/bin/checkpoint_probe; \
     install -m 0755 \
-        /tmp/safemlx-target/release/examples/cuda_mxfp4_smoke \
+        /tmp/eredu-target/release/examples/cuda_mxfp4_smoke \
         /usr/local/bin/cuda_mxfp4_smoke; \
-    mlx_cute_header="$(find /tmp/safemlx-target/release/build \
+    mlx_cute_header="$(find /tmp/eredu-target/release/build \
         -path '*/include/cute/numeric/numeric_types.hpp' \
         -print -quit)"; \
     test -n "${mlx_cute_header}"; \
     mlx_include_root="$(dirname "$(dirname "$(dirname "${mlx_cute_header}")")")"; \
-    mlx_cccl_include_root="$(find /tmp/safemlx-target/release/build \
+    mlx_cccl_include_root="$(find /tmp/eredu-target/release/build \
         -type d -path '*/_deps/cccl-src/include' \
         -print -quit)"; \
     test -n "${mlx_cccl_include_root}"; \
@@ -88,7 +88,7 @@ ARG IMAGE_VERSION=cuda12.9.1-rust1.89.0-torch2.8.0-v1
 
 LABEL org.opencontainers.image.title="Eredu CUDA checkpoint validation" \
       org.opencontainers.image.description="Pinned CUDA environment for Eredu checkpoint correctness and performance probes" \
-      org.opencontainers.image.source="https://github.com/jbg/safemlx" \
+      org.opencontainers.image.source="https://github.com/jbg/eredu" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
@@ -96,8 +96,8 @@ LABEL org.opencontainers.image.title="Eredu CUDA checkpoint validation" \
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/data/huggingface \
-    PYTHONPATH=/opt/safemlx \
-    SAFEMLX_RESULTS=/data/results \
+    PYTHONPATH=/opt/eredu \
+    EREDU_RESULTS=/data/results \
     TOKENIZERS_PARALLELISM=false \
     PYTHONUNBUFFERED=1
 
@@ -113,7 +113,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin the direct Python validation dependencies. The complete resolved set is
-# recorded in /opt/safemlx/python-packages.lock.txt in the published image.
+# recorded in /opt/eredu/python-packages.lock.txt in the published image.
 RUN python -m pip install --no-cache-dir \
         accelerate==1.14.0 \
         huggingface-hub==1.24.0 \
@@ -136,9 +136,9 @@ COPY --from=checkpoint-probe-builder /usr/local/include /usr/local/include
 COPY --from=checkpoint-probe-builder /usr/local/bin/checkpoint_probe /usr/local/bin/checkpoint_probe
 COPY --from=checkpoint-probe-builder /usr/local/bin/cuda_mxfp4_smoke /usr/local/bin/cuda_mxfp4_smoke
 
-COPY validation /opt/safemlx/validation
+COPY validation /opt/eredu/validation
 RUN set -eux; \
-    mv /tmp/python-packages.lock.txt /opt/safemlx/python-packages.lock.txt; \
+    mv /tmp/python-packages.lock.txt /opt/eredu/python-packages.lock.txt; \
     test -f "${CUDA_HOME}/include/cuda_runtime.h"; \
     test -f /usr/local/include/cute/numeric/numeric_types.hpp; \
     test -f /usr/local/include/cutlass/numeric_conversion.h; \
@@ -148,7 +148,7 @@ RUN set -eux; \
         | LC_ALL=C sort > /etc/ld.so.conf.d/pytorch-nvidia.conf; \
     test -s /etc/ld.so.conf.d/pytorch-nvidia.conf; \
     ldconfig; \
-    python /opt/safemlx/validation/nvrtc_header_smoke.py; \
+    python /opt/eredu/validation/nvrtc_header_smoke.py; \
     ldd /usr/local/bin/checkpoint_probe > /tmp/checkpoint-probe.ldd; \
     unexpected_missing="$(awk '/not found/ && $1 != "libcuda.so.1" { print $1 }' /tmp/checkpoint-probe.ldd)"; \
     if [ -n "${unexpected_missing}" ]; then \
@@ -157,7 +157,7 @@ RUN set -eux; \
     fi; \
     rm /tmp/checkpoint-probe.ldd; \
     python -m unittest discover \
-        -s /opt/safemlx/validation \
+        -s /opt/eredu/validation \
         -p 'test_*.py' \
         -q; \
     python -c 'import torch, transformers; assert torch.__version__.startswith("2.8.0"); assert torch.version.cuda == "12.9"; assert transformers.__version__ == "5.14.1"'

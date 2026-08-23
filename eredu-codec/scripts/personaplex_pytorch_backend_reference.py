@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate an upstream PyTorch PersonaPlex reference from safemlx token fixtures.
+"""Generate an upstream PyTorch PersonaPlex reference from eredu token fixtures.
 
 The input JSON is produced by the eredu-codec
 `personaplex_quantization_eval` example. Voice, text, and user-audio codec
@@ -32,13 +32,13 @@ TAIL_ACTIVITY_FRAMES = 3
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare dense safemlx PersonaPlex with upstream PyTorch."
+        description="Compare dense eredu PersonaPlex with upstream PyTorch."
     )
     parser.add_argument("--moshi-source", required=True, type=Path)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--mimi", required=True, type=Path)
     parser.add_argument("--tokenizer", required=True, type=Path)
-    parser.add_argument("--safemlx-eval-dir", required=True, type=Path)
+    parser.add_argument("--eredu-eval-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--device", default="mps")
     parser.add_argument(
@@ -273,7 +273,7 @@ def best_sequence_alignment(left: list[int], right: list[int]) -> dict[str, Any]
     return {
         "agreement": agreement,
         "compared_tokens": count,
-        "pytorch_frame_offset_relative_to_safemlx": right_offset,
+        "pytorch_frame_offset_relative_to_eredu": right_offset,
     }
 
 
@@ -282,7 +282,7 @@ def dense_wav(eval_dir: Path) -> Path:
     for sample in ("sample_a", "sample_b"):
         if key[sample] == "dense":
             return eval_dir / f"{sample}.wav"
-    raise ValueError("safemlx answer key does not contain a dense sample")
+    raise ValueError("eredu answer key does not contain a dense sample")
 
 
 def main() -> None:
@@ -292,7 +292,7 @@ def main() -> None:
     sys.path.insert(0, str(args.moshi_source))
     from moshi.models import LMGen, loaders  # pylint: disable=import-outside-toplevel
 
-    eval_dir = args.safemlx_eval_dir
+    eval_dir = args.eredu_eval_dir
     fixture = json.loads((eval_dir / "token_diagnostics.json").read_text())
     validate_frames("input", fixture["input"], 8)
     validate_frames("voice_prompt", fixture["conditioning"]["voice_prompt"], 8)
@@ -344,14 +344,14 @@ def main() -> None:
     args.output_dir.mkdir()
     pytorch_wav = args.output_dir / "pytorch_unblinded.tmp.wav"
     write_wav(pytorch_wav, pytorch_pcm)
-    safemlx_wav = dense_wav(eval_dir)
+    eredu_wav = dense_wav(eval_dir)
     assignment_hash = hashlib.sha256(str(args.output_dir).encode()).digest()[0]
     if assignment_hash & 1:
-        assignment = {"sample_a": "pytorch", "sample_b": "safemlx"}
-        source_a, source_b = pytorch_wav, safemlx_wav
+        assignment = {"sample_a": "pytorch", "sample_b": "eredu"}
+        source_a, source_b = pytorch_wav, eredu_wav
     else:
-        assignment = {"sample_a": "safemlx", "sample_b": "pytorch"}
-        source_a, source_b = safemlx_wav, pytorch_wav
+        assignment = {"sample_a": "eredu", "sample_b": "pytorch"}
+        source_a, source_b = eredu_wav, pytorch_wav
     shutil.copyfile(source_a, args.output_dir / "sample_a.wav")
     shutil.copyfile(source_b, args.output_dir / "sample_b.wav")
     pytorch_wav.unlink()
@@ -377,7 +377,7 @@ def main() -> None:
     }
     metrics = {
         "format_version": 1,
-        "comparison": "dense safemlx versus upstream PyTorch PersonaPlex",
+        "comparison": "dense eredu versus upstream PyTorch PersonaPlex",
         "conditioning": {
             "source": str(eval_dir / "token_diagnostics.json"),
             "voice_frames": len(fixture["conditioning"]["voice_prompt"]),

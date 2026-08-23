@@ -107,7 +107,7 @@ python eredu-codec/scripts/personaplex_pytorch_backend_reference.py \
   --model /path/to/personaplex/model.safetensors \
   --mimi /path/to/tokenizer.safetensors \
   --tokenizer /path/to/tokenizer_spm_32k_3.model \
-  --safemlx-eval-dir /tmp/personaplex-eval \
+  --eredu-eval-dir /tmp/personaplex-eval \
   --output-dir /tmp/personaplex-backend-comparison \
   --device mps
 ```

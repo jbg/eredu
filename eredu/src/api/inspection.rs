@@ -240,7 +240,7 @@ fn inspect_chat_behavior(
     }
 
     let semantic_request = ChatTemplateRequest {
-        messages: vec![json!({"role": "user", "content": "__safemlx_inspection_probe__"})],
+        messages: vec![json!({"role": "user", "content": "__eredu_inspection_probe__"})],
         tool_choice: ToolChoice::None,
         add_generation_prompt: true,
         ..ChatTemplateRequest::default()
@@ -279,11 +279,11 @@ fn inspect_chat_behavior(
     }
 
     let tool_request = ChatTemplateRequest {
-        messages: vec![json!({"role": "user", "content": "__safemlx_tool_probe__"})],
+        messages: vec![json!({"role": "user", "content": "__eredu_tool_probe__"})],
         tools: vec![json!({
             "type": "function",
             "function": {
-                "name": "safemlx_probe",
+                "name": "eredu_probe",
                 "description": "inspection probe",
                 "parameters": {
                     "type": "object",

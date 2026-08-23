@@ -90,7 +90,7 @@ const TOOL_USE_CHAT_TEMPLATE_NAME: &str = "tool_use";
 pub fn vocabulary_fingerprint(tokenizer: &tokenizers::Tokenizer) -> [u8; 32] {
     let vocabulary_size = tokenizer.get_vocab_size(true);
     let mut hasher = Sha256::new();
-    hasher.update(b"safemlx-token-id-vocabulary-v1");
+    hasher.update(b"eredu-token-id-vocabulary-v1");
     hasher.update((vocabulary_size as u64).to_le_bytes());
     for token_id in 0..vocabulary_size {
         hasher.update((token_id as u64).to_le_bytes());

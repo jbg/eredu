@@ -57,7 +57,7 @@ impl Lfm2Dialect {
         }
 
         if tool_choice == ToolChoice::None {
-            return Ok("start: \"__safemlx_lfm2_tools_disabled__\"\n".into());
+            return Ok("start: \"__eredu_lfm2_tools_disabled__\"\n".into());
         }
 
         let (_, maximum) = tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
@@ -98,7 +98,7 @@ impl Lfm2Dialect {
             structural(TOOL_CALL_END)?,
         );
         if alternatives.is_empty() {
-            grammar.push_str("python_call: \"__safemlx_unreachable_lfm2_function_call__\"\n");
+            grammar.push_str("python_call: \"__eredu_unreachable_lfm2_function_call__\"\n");
         } else {
             grammar.push_str(&format!(
                 "python_call: {}\n",

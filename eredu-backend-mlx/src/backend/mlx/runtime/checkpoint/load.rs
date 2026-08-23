@@ -1455,7 +1455,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "safemlx-rewritten-quantized-load-{}-{suffix}.safetensors",
+            "eredu-mlx-rewritten-quantized-load-{}-{suffix}.safetensors",
             std::process::id()
         ));
         Array::save_safetensors([("checkpoint.projection.weight", &dense)], None, &path).unwrap();
@@ -1532,7 +1532,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "safemlx-mxfp4-strict-load-{}-{suffix}.safetensors",
+            "eredu-mlx-mxfp4-strict-load-{}-{suffix}.safetensors",
             std::process::id()
         ));
         Array::save_safetensors([("projection.weight", &dense)], None, &path).unwrap();

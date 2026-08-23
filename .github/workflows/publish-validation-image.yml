@@ -26,7 +26,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/jbg/safemlx-validation
+  IMAGE: ghcr.io/jbg/eredu-validation
   VERSION_TAG: cuda12.9.1-rust1.89.0-torch2.8.0-v1
 
 jobs:

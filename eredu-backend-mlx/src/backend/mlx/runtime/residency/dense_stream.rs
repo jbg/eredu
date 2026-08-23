@@ -40,7 +40,7 @@ impl BackgroundLayerPrefetch {
         operation: HostPrefetchOperation,
     ) -> Result<Self, DenseStreamError> {
         let worker =
-            BackgroundPrefetchWorker::new(capacity, "safemlx-dense-layer-prefetch", move |id| {
+            BackgroundPrefetchWorker::new(capacity, "eredu-mlx-dense-layer-prefetch", move |id| {
                 operation(id)
             })?;
         Ok(Self { manager, worker })

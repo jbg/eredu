@@ -92,7 +92,7 @@ impl AtemDialect {
 
         let tools = parse_tools(tools)?;
         if tools.is_empty() {
-            grammar.push_str("tool_collection: \"__safemlx_unreachable_atem_call__\"\n");
+            grammar.push_str("tool_collection: \"__eredu_unreachable_atem_call__\"\n");
             return Ok(grammar);
         }
         grammar.push_str(&format!(

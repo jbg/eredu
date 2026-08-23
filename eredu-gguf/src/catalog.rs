@@ -761,7 +761,7 @@ fn catalog_tensor(descriptor: &TensorDescriptor, endian: Endian) -> Result<Catal
             descriptor: descriptor.clone(),
             outputs: vec![LogicalTensorLayout {
                 name: descriptor.name.clone(),
-                shape: iquant_packed_shape(&descriptor.mlx_shape(), descriptor.ggml_type)?,
+                shape: iquant_packed_shape(&descriptor.row_major_shape(), descriptor.ggml_type)?,
                 dtype: LogicalDtype::U8,
             }],
             affine: None,
@@ -772,7 +772,7 @@ fn catalog_tensor(descriptor: &TensorDescriptor, endian: Endian) -> Result<Catal
             descriptor: descriptor.clone(),
             outputs: vec![LogicalTensorLayout {
                 name: descriptor.name.clone(),
-                shape: descriptor.mlx_shape(),
+                shape: descriptor.row_major_shape(),
                 dtype: dtype.into(),
             }],
             affine: None,

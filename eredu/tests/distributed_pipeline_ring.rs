@@ -4320,8 +4320,8 @@ fn deepseek_gguf_metadata() -> BTreeMap<String, GgufMetadataValue> {
 }
 
 fn deepseek_gguf_tensors() -> Vec<GgufFixtureTensor> {
-    let tensor = |name: &str, mlx_shape: &[u64], phase: usize| {
-        let mut dimensions = mlx_shape.to_vec();
+    let tensor = |name: &str, row_major_shape: &[u64], phase: usize| {
+        let mut dimensions = row_major_shape.to_vec();
         dimensions.reverse();
         let elements = dimensions.iter().product::<u64>() as usize;
         f32_gguf_tensor(name, dimensions, patterned_values(elements, 0.003, phase))
@@ -4493,8 +4493,8 @@ fn kimi_linear_gguf_metadata() -> BTreeMap<String, GgufMetadataValue> {
 }
 
 fn kimi_linear_gguf_specs() -> Vec<GgufFixtureTensor> {
-    let tensor = |name: &str, mlx_shape: &[u64], phase: usize| {
-        let mut dimensions = mlx_shape.to_vec();
+    let tensor = |name: &str, row_major_shape: &[u64], phase: usize| {
+        let mut dimensions = row_major_shape.to_vec();
         dimensions.reverse();
         let elements = dimensions.iter().product::<u64>() as usize;
         f32_gguf_tensor(name, dimensions, patterned_values(elements, 0.003, phase))

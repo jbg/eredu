@@ -18,8 +18,8 @@ use eredu_backend_mlx::testing::backend::mlx::{
 };
 use eredu_backend_mlx::MlxTensor;
 
-const WORKER_ENV: &str = "SAFEMLX_CARTESIAN_RING_WORKER";
-const TRIPLE_WORKER_ENV: &str = "SAFEMLX_CARTESIAN_TRIPLE_RING_WORKER";
+const WORKER_ENV: &str = "EREDU_CARTESIAN_RING_WORKER";
+const TRIPLE_WORKER_ENV: &str = "EREDU_CARTESIAN_TRIPLE_RING_WORKER";
 
 fn topology(rank: usize, tp: usize, pp: usize, ep: usize) -> MlxParallelContext {
     MlxParallelContext::for_rank(rank, tp, pp, ep, DeviceAssignment::new(DeviceType::Cpu, 0))

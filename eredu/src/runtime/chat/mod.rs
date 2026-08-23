@@ -621,13 +621,13 @@ impl ReasoningTemplateControl {
 #[allow(dead_code)]
 pub(crate) const SYNTHETIC_TOOL_TEMPLATE: &str = concat!(
     "{% if fail_render %}{{ raise_exception('rendered before constraint compilation') }}",
-    "{% endif %}safemlx synthetic tool template",
+    "{% endif %}eredu synthetic tool template",
 );
 
 #[cfg(test)]
 const SYNTHETIC_TOOL_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x5e, 0xc6, 0xe8, 0xcc, 0x55, 0x35, 0x8f, 0x00, 0x81, 0xdf, 0x23, 0xf7, 0x16, 0x52, 0x95, 0xc0,
-    0x2a, 0x4b, 0xf7, 0x9c, 0x15, 0x33, 0xd6, 0x8d, 0x04, 0x77, 0x90, 0x30, 0x3d, 0xd8, 0x59, 0xf4,
+    0x60, 0x18, 0xea, 0x94, 0x96, 0x0f, 0x70, 0x0f, 0x41, 0x62, 0xda, 0xb8, 0x4f, 0x57, 0xdc, 0xca,
+    0xc4, 0x66, 0xf8, 0x41, 0x21, 0xd8, 0x2e, 0x84, 0xb5, 0x7e, 0x77, 0x04, 0xf2, 0xd7, 0x39, 0x90,
 ];
 
 pub(crate) const QWEN_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
@@ -1049,7 +1049,7 @@ const SYNTHETIC_DECLARATIVE_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpe
 };
 
 #[cfg(test)]
-pub(crate) const SYNTHETIC_STRUCTURAL_TOKEN: &str = "<|safemlx_tool_frame|>";
+pub(crate) const SYNTHETIC_STRUCTURAL_TOKEN: &str = "<|eredu_tool_frame|>";
 
 #[cfg(test)]
 pub(crate) fn template_signature(template: &str) -> [u8; 32] {
@@ -1119,7 +1119,7 @@ pub(crate) fn prepare_format_profile(_template: &str) -> PreparedFormatProfile {
     if _template == SYNTHETIC_TOOL_TEMPLATE {
         let parameters = DialectParameters::Declarative(&SYNTHETIC_DECLARATIVE_SPEC);
         return PreparedFormatProfile {
-            identity: Some("safemlx.synthetic-tools.v1".into()),
+            identity: Some("eredu.synthetic-tools.v1".into()),
             dialect: Some(&DECLARATIVE_DIALECT),
             dialect_parameters: Some(parameters),
             tool_dialect: Some(&DECLARATIVE_DIALECT),
@@ -1205,7 +1205,7 @@ mod tests {
         let prepared = prepare_format_profile(SYNTHETIC_TOOL_TEMPLATE);
         assert_eq!(
             prepared.identity.as_deref(),
-            Some("safemlx.synthetic-tools.v1")
+            Some("eredu.synthetic-tools.v1")
         );
         assert!(prepared.dialect.is_some());
         assert!(prepared.dialect_parameters.is_some());

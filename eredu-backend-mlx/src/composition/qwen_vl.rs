@@ -145,7 +145,7 @@ impl vision::VisionGgufCatalog for VisionGgufCatalog<'_> {
             .catalog()
             .tensors()
             .find(|tensor| tensor.descriptor().name == name)
-            .map(|tensor| tensor.descriptor().mlx_shape())
+            .map(|tensor| tensor.descriptor().row_major_shape())
             .and_then(|shape| {
                 shape
                     .into_iter()

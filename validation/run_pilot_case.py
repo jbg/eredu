@@ -27,7 +27,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-root", type=pathlib.Path, required=True)
     parser.add_argument(
-        "--model-root", type=pathlib.Path, default=pathlib.Path("/tmp/safemlx-models")
+        "--model-root", type=pathlib.Path, default=pathlib.Path("/tmp/eredu-models")
     )
     parser.add_argument("--performance-prompt-tokens", type=int, default=128)
     parser.add_argument("--performance-decode-steps", type=int, default=128)
@@ -211,7 +211,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "branch": case["branch"],
         "model": case["model"],
         "hardware_profile": case["hardware_profile"],
-        "container_image": os.environ.get("SAFEMLX_VALIDATION_IMAGE"),
+        "container_image": os.environ.get("EREDU_VALIDATION_IMAGE"),
         "job_id": os.environ.get("JOB_ID") or os.environ.get("HF_JOB_ID"),
         "host": {
             "platform": platform.platform(),
@@ -245,7 +245,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         write_json(summary_path, summary)
 
-        actual_prefix = output_dir / "correctness-safemlx"
+        actual_prefix = output_dir / "correctness-eredu"
         actual_json = actual_prefix.with_suffix(".json")
         run_command(
             [
@@ -268,10 +268,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 str(actual_prefix),
                 "--overwrite",
             ],
-            summary["phases"].setdefault("safemlx_correctness", {}),
-            output_dir / "safemlx-correctness.log",
+            summary["phases"].setdefault("eredu_correctness", {}),
+            output_dir / "eredu-correctness.log",
         )
-        summary["artifacts"]["safemlx_correctness"] = str(actual_json)
+        summary["artifacts"]["eredu_correctness"] = str(actual_json)
         write_json(summary_path, summary)
 
         reference_prefix = output_dir / "correctness-transformers"
@@ -338,7 +338,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             performance_ids = repeat_token_ids(
                 correctness_report["input"]["token_ids"], args.performance_prompt_tokens
             )
-            performance_prefix = output_dir / "performance-safemlx-128x128"
+            performance_prefix = output_dir / "performance-eredu-128x128"
             performance_json = performance_prefix.with_suffix(".json")
             run_command(
                 [
@@ -357,17 +357,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     str(performance_prefix),
                     "--overwrite",
                 ],
-                summary["phases"].setdefault("safemlx_performance", {}),
-                output_dir / "safemlx-performance.log",
+                summary["phases"].setdefault("eredu_performance", {}),
+                output_dir / "eredu-performance.log",
             )
-            summary["artifacts"]["safemlx_performance"] = str(performance_json)
+            summary["artifacts"]["eredu_performance"] = str(performance_json)
         summary["evidence"] = {
             "comparison": json.loads(comparison_json.read_text()),
-            "safemlx_correctness": artifact_metrics(actual_json),
+            "eredu_correctness": artifact_metrics(actual_json),
             "transformers_correctness": artifact_metrics(reference_json),
         }
         if performance_json is not None:
-            summary["evidence"]["safemlx_performance"] = artifact_metrics(performance_json)
+            summary["evidence"]["eredu_performance"] = artifact_metrics(performance_json)
         summary["status"] = "passed" if comparison_status == 0 else "correctness_failed"
         return_code = 0 if comparison_status == 0 else 1
     except Exception as error:

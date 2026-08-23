@@ -437,7 +437,7 @@ impl HostDemotionWorker {
     fn new() -> Result<Self, CacheResidencyError> {
         let (sender, receiver) = mpsc::channel();
         let handle = thread::Builder::new()
-            .name("safemlx-cache-host-demotion".into())
+            .name("eredu-mlx-cache-host-demotion".into())
             .spawn(move || {
                 while let Ok(request) = receiver.recv() {
                     match request {
@@ -464,7 +464,7 @@ impl HostDemotionWorker {
             })
             .map_err(|source| CacheResidencyError::Io {
                 action: "start cache host demotion worker",
-                path: PathBuf::from("safemlx-cache-host-demotion"),
+                path: PathBuf::from("eredu-mlx-cache-host-demotion"),
                 source,
             })?;
         Ok(Self {
@@ -746,7 +746,7 @@ impl DiskWorker {
         Ok(Self {
             inner: RuntimeDiskWorker::new(
                 capacity,
-                "safemlx-cache-disk",
+                "eredu-mlx-cache-disk",
                 execute_disk_task,
                 discard_disk_result,
             )
@@ -5229,7 +5229,7 @@ mod tests {
                     CacheTier::Disk => MlxCacheBlockStorage::disk(
                         id.clone(),
                         missing_location(
-                            Path::new("/tmp/safemlx-cache-report-test"),
+                            Path::new("/tmp/eredu-mlx-cache-report-test"),
                             &format!("layer-{global_layer}.safetensors"),
                         ),
                     ),

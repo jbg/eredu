@@ -548,7 +548,7 @@ fn recognize_gemma_protocol(
     let tools = vec![serde_json::json!({
         "type": "function",
         "function": {
-            "name": "safemlx_probe",
+            "name": "eredu_probe",
             "description": "protocol probe",
             "parameters": {
                 "type": "object",
@@ -557,10 +557,10 @@ fn recognize_gemma_protocol(
             }
         }
     })];
-    let reasoning_sentinel = "__safemlx_reasoning_probe_7c91__";
-    let visible_sentinel = "__safemlx_visible_probe_28ad__";
+    let reasoning_sentinel = "__eredu_reasoning_probe_7c91__";
+    let visible_sentinel = "__eredu_visible_probe_28ad__";
     let probe_messages = vec![
-        serde_json::json!({"role": "user", "content": "__safemlx_user_probe__"}),
+        serde_json::json!({"role": "user", "content": "__eredu_user_probe__"}),
         serde_json::json!({
             "role": "assistant",
             "reasoning_content": reasoning_sentinel,
@@ -569,7 +569,7 @@ fn recognize_gemma_protocol(
                 "id": "reasoning-probe-call",
                 "type": "function",
                 "function": {
-                    "name": "safemlx_probe",
+                    "name": "eredu_probe",
                     "arguments": {"value": "reasoning-probe"}
                 }
             }]
@@ -597,7 +597,7 @@ fn recognize_gemma_protocol(
     let mut thinking_off = serde_json::Map::new();
     thinking_off.insert("enable_thinking".into(), serde_json::Value::Bool(false));
     let generation_messages =
-        vec![serde_json::json!({"role": "user", "content": "__safemlx_prompt_probe__"})];
+        vec![serde_json::json!({"role": "user", "content": "__eredu_prompt_probe__"})];
     for kwargs in [&thinking_on, &thinking_off] {
         let with_prompt = match tokenizer.apply_chat_template_json(
             selected_template.clone(),
@@ -646,7 +646,7 @@ fn recognize_gemma_protocol(
                 "id": "probe-call",
                 "type": "function",
                 "function": {
-                    "name": "safemlx_probe",
+                    "name": "eredu_probe",
                     "arguments": {"value": "probe-value"}
                 }
             }]
@@ -670,7 +670,7 @@ fn recognize_gemma_protocol(
             .ok()
             .and_then(|rendered| rendered.into_iter().next())
             .is_some_and(|rendered| {
-                rendered.contains(&format!("{TOOL_CALL_OPEN}call:safemlx_probe{{"))
+                rendered.contains(&format!("{TOOL_CALL_OPEN}call:eredu_probe{{"))
                     && rendered.contains(TOOL_CALL_CLOSE)
                     && rendered.contains(TOOL_RESPONSE_OPEN)
                     && rendered.contains("probe-response")
@@ -684,7 +684,7 @@ fn recognize_gemma_protocol(
                 "id": "probe-call",
                 "type": "function",
                 "function": {
-                    "name": "safemlx_probe",
+                    "name": "eredu_probe",
                     "arguments": "{\"value\":\"probe-value\"}"
                 }
             }]
@@ -708,7 +708,7 @@ fn recognize_gemma_protocol(
             .ok()
             .and_then(|rendered| rendered.into_iter().next())
             .is_some_and(|rendered| {
-                rendered.contains(&format!("{TOOL_CALL_OPEN}call:safemlx_probe{{"))
+                rendered.contains(&format!("{TOOL_CALL_OPEN}call:eredu_probe{{"))
                     && rendered.contains(TOOL_CALL_CLOSE)
                     && rendered.contains(TOOL_RESPONSE_OPEN)
                     && rendered.contains("probe-response")
@@ -771,13 +771,13 @@ fn recognize_inkling_protocol(
     .to_vec();
     resolve_structural_tokens(tokenizer, &structural_tokens).ok()?;
 
-    let reasoning_sentinel = "__safemlx_inkling_reasoning_probe_7c91__";
-    let visible_sentinel = "__safemlx_inkling_visible_probe_28ad__";
+    let reasoning_sentinel = "__eredu_inkling_reasoning_probe_7c91__";
+    let visible_sentinel = "__eredu_inkling_visible_probe_28ad__";
     let rendered = tokenizer
         .apply_chat_template_json(
             selected_template.clone(),
             [vec![
-                serde_json::json!({"role": "user", "content": "__safemlx_inkling_user_probe__"}),
+                serde_json::json!({"role": "user", "content": "__eredu_inkling_user_probe__"}),
                 serde_json::json!({
                     "role": "assistant",
                     "reasoning_content": reasoning_sentinel,
@@ -800,7 +800,7 @@ fn recognize_inkling_protocol(
     }
 
     let generation_messages =
-        vec![serde_json::json!({"role": "user", "content": "__safemlx_inkling_prompt_probe__"})];
+        vec![serde_json::json!({"role": "user", "content": "__eredu_inkling_prompt_probe__"})];
     for (effort, expected) in [("none", "0"), ("high", "0.9")] {
         let kwargs = serde_json::Map::from_iter([(
             "reasoning_effort".into(),
@@ -848,14 +848,14 @@ fn recognize_inkling_protocol(
             rendered.contains(concat!(
                 "<|message_system|>tool_declare<|content_xml|>",
                 "[{\"description\":\"protocol recognition probe\",\"name\":",
-                "\"safemlx_probe_7c91\",\"parameters\":"
+                "\"eredu_probe_7c91\",\"parameters\":"
             )) && rendered.contains(concat!(
-                "<|message_model|>safemlx_probe_7c91<|content_invoke_tool_json|>",
-                "{\"name\":\"safemlx_probe_7c91\",\"args\":{\"value\":\"probe-value\"}}",
+                "<|message_model|>eredu_probe_7c91<|content_invoke_tool_json|>",
+                "{\"name\":\"eredu_probe_7c91\",\"args\":{\"value\":\"probe-value\"}}",
                 "<|end_message|>"
             )) && rendered.contains(concat!(
-                "<|message_tool|>safemlx_probe_7c91<|content_text|>",
-                "\"__safemlx_tool_result_probe__\"<|end_message|>"
+                "<|message_tool|>eredu_probe_7c91<|content_text|>",
+                "\"__eredu_tool_result_probe__\"<|end_message|>"
             ))
         });
     let string_tool_arguments = tool_tokens_valid
@@ -867,7 +867,7 @@ fn recognize_inkling_protocol(
         )
         .is_some_and(|rendered| {
             rendered.contains(CONTENT_INVOKE_TOOL_JSON)
-                && rendered.contains("__safemlx_tool_result_probe__")
+                && rendered.contains("__eredu_tool_result_probe__")
         });
     let tool_output_protocol = mapping_tool_arguments || string_tool_arguments;
 
@@ -919,15 +919,15 @@ fn recognize_muse_atem_protocol(
 
     let rendered = render_reasoning_protocol_probe(tokenizer, selected_template, model_id)?;
     let expected = concat!(
-        "<|start|>assistant to=self<|message|>__safemlx_reasoning_probe__<|eom|>",
-        "<|start|>assistant to=user<|message|>__safemlx_visible_probe__<|eot|>"
+        "<|start|>assistant to=self<|message|>__eredu_reasoning_probe__<|eom|>",
+        "<|start|>assistant to=user<|message|>__eredu_visible_probe__<|eot|>"
     );
     if !rendered.contains(expected) {
         return None;
     }
 
     let generation_messages =
-        vec![serde_json::json!({"role": "user", "content": "__safemlx_atem_prompt__"})];
+        vec![serde_json::json!({"role": "user", "content": "__eredu_atem_prompt__"})];
     for strength in ["low", "medium", "high", "xhigh"] {
         let kwargs = serde_json::Map::from_iter([(
             "reasoning_strength".into(),
@@ -960,13 +960,13 @@ fn recognize_muse_atem_protocol(
     );
     let mapping_tool_arguments = mapping.as_deref().is_some_and(|rendered| {
         [
-            "<|start|>assistant to=self<|message|>__safemlx_reasoning_probe__<|eom|>",
-            "<|start|>assistant to=safemlx_probe_7c91<|message|>",
+            "<|start|>assistant to=self<|message|>__eredu_reasoning_probe__<|eom|>",
+            "<|start|>assistant to=eredu_probe_7c91<|message|>",
             "<atem:function_calls>",
-            "<atem:invoke name=\"safemlx_probe_7c91\">",
+            "<atem:invoke name=\"eredu_probe_7c91\">",
             "<atem:parameter name=\"value\">probe-value</atem:parameter>",
-            "<|start|>tool safemlx_probe_7c91<|message|><tool_output name=\"safemlx_probe_7c91\">",
-            "__safemlx_tool_result_probe__",
+            "<|start|>tool eredu_probe_7c91<|message|><tool_output name=\"eredu_probe_7c91\">",
+            "__eredu_tool_result_probe__",
         ]
         .iter()
         .all(|marker| rendered.contains(marker))
@@ -1015,7 +1015,7 @@ fn render_protocol_probe(
     let tools = vec![serde_json::json!({
         "type": "function",
         "function": {
-            "name": "safemlx_probe_7c91",
+            "name": "eredu_probe_7c91",
             "description": "protocol recognition probe",
             "parameters": {
                 "type": "object",
@@ -1026,32 +1026,32 @@ fn render_protocol_probe(
         }
     })];
     let messages = vec![
-        serde_json::json!({"role": "user", "content": "__safemlx_user_probe__"}),
+        serde_json::json!({"role": "user", "content": "__eredu_user_probe__"}),
         serde_json::json!({
             "role": "assistant",
             "content": "",
-            "reasoning_content": "__safemlx_reasoning_probe__",
-            "thinking": "__safemlx_reasoning_probe__",
+            "reasoning_content": "__eredu_reasoning_probe__",
+            "thinking": "__eredu_reasoning_probe__",
             "tool_calls": [{
                 "id": "abc123456",
                 "type": "function",
                 "function": {
-                    "name": "safemlx_probe_7c91",
+                    "name": "eredu_probe_7c91",
                     "arguments": arguments
                 }
             }]
         }),
         serde_json::json!({
             "role": "tool",
-            "name": "safemlx_probe_7c91",
+            "name": "eredu_probe_7c91",
             "tool_call_id": "abc123456",
-            "content": "\"__safemlx_tool_result_probe__\""
+            "content": "\"__eredu_tool_result_probe__\""
         }),
         serde_json::json!({
             "role": "assistant",
-            "content": "__safemlx_intermediate_assistant_probe__"
+            "content": "__eredu_intermediate_assistant_probe__"
         }),
-        serde_json::json!({"role": "user", "content": "__safemlx_followup_probe__"}),
+        serde_json::json!({"role": "user", "content": "__eredu_followup_probe__"}),
     ];
     tokenizer
         .apply_chat_template_json(
@@ -1076,11 +1076,11 @@ fn render_reasoning_protocol_probe(
         .apply_chat_template_json(
             selected_template.clone(),
             [vec![
-                serde_json::json!({"role": "user", "content": "__safemlx_user_probe__"}),
+                serde_json::json!({"role": "user", "content": "__eredu_user_probe__"}),
                 serde_json::json!({
                     "role": "assistant",
-                    "reasoning_content": "__safemlx_reasoning_probe__",
-                    "content": "__safemlx_visible_probe__"
+                    "reasoning_content": "__eredu_reasoning_probe__",
+                    "content": "__eredu_visible_probe__"
                 }),
             ]],
             Some(&[]),
@@ -1165,13 +1165,13 @@ fn recognize_remaining_protocols(
         tokenizer,
         selected_template,
         model_id,
-        serde_json::json!({"value": "__safemlx_mapping_argument_probe__"}),
+        serde_json::json!({"value": "__eredu_mapping_argument_probe__"}),
     );
     let string = render_protocol_probe(
         tokenizer,
         selected_template,
         model_id,
-        serde_json::Value::String(r#"{"value":"__safemlx_string_argument_probe__"}"#.into()),
+        serde_json::Value::String(r#"{"value":"__eredu_string_argument_probe__"}"#.into()),
     );
     let supports = |rendered: &Option<String>, required: &[&str]| {
         rendered
@@ -1186,7 +1186,7 @@ fn recognize_remaining_protocols(
         "<|tool_call_end|>",
         "<|tool_calls_section_end|>",
         "## Return of abc123456",
-        "__safemlx_tool_result_probe__",
+        "__eredu_tool_result_probe__",
     ];
     let kimi_mapping = supports(&mapping, &kimi_markers);
     let kimi_string = supports(&string, &kimi_markers);
@@ -1202,11 +1202,11 @@ fn recognize_remaining_protocols(
     }
 
     let harmony_markers = [
-        "assistant to=functions.safemlx_probe_7c91",
+        "assistant to=functions.eredu_probe_7c91",
         "<|message|>",
         "<|call|>",
-        "functions.safemlx_probe_7c91 to=assistant",
-        "__safemlx_tool_result_probe__",
+        "functions.eredu_probe_7c91 to=assistant",
+        "__eredu_tool_result_probe__",
     ];
     let harmony_mapping = supports(&mapping, &harmony_markers);
     let harmony_string = supports(&string, &harmony_markers);
@@ -1225,23 +1225,23 @@ fn recognize_remaining_protocols(
         "<｜tool▁calls▁begin｜>",
         "<｜tool▁call▁begin｜>",
         "<｜tool▁sep｜>",
-        "safemlx_probe_7c91",
+        "eredu_probe_7c91",
         "<｜tool▁call▁end｜>",
         "<｜tool▁calls▁end｜>",
-        "__safemlx_tool_result_probe__",
+        "__eredu_tool_result_probe__",
     ];
     let deepseek_mapping = supports(&mapping, &deepseek_common);
     let deepseek_string = supports(&string, &deepseek_common);
     if deepseek_mapping || deepseek_string {
         let rendered = mapping.as_deref().or(string.as_deref())?;
         let (identity, spec) = if rendered
-            .contains("<｜tool▁call▁begin｜>function<｜tool▁sep｜>safemlx_probe_7c91\n```json\n")
+            .contains("<｜tool▁call▁begin｜>function<｜tool▁sep｜>eredu_probe_7c91\n```json\n")
         {
             (
                 "deepseek.structural-json-tools.v1",
                 &DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC,
             )
-        } else if rendered.contains("<｜tool▁call▁begin｜>safemlx_probe_7c91<｜tool▁sep｜>")
+        } else if rendered.contains("<｜tool▁call▁begin｜>eredu_probe_7c91<｜tool▁sep｜>")
         {
             (
                 "deepseek.structural-json-tools.v2",
@@ -1262,9 +1262,9 @@ fn recognize_remaining_protocols(
 
     let lfm2_markers = [
         "<|tool_call_start|>",
-        "safemlx_probe_7c91(",
+        "eredu_probe_7c91(",
         "<|tool_call_end|>",
-        "__safemlx_tool_result_probe__",
+        "__eredu_tool_result_probe__",
     ];
     let lfm2_mapping = supports(&mapping, &lfm2_markers);
     let lfm2_string = supports(&string, &lfm2_markers);
@@ -1281,21 +1281,21 @@ fn recognize_remaining_protocols(
 
     let qwen_markers = [
         "<tool_call>",
-        "safemlx_probe_7c91",
+        "eredu_probe_7c91",
         "<tool_response>",
-        "__safemlx_tool_result_probe__",
+        "__eredu_tool_result_probe__",
     ];
     let qwen_mapping = supports(&mapping, &qwen_markers);
     let qwen_string = supports(&string, &qwen_markers);
     if qwen_mapping || qwen_string {
         let tagged_mapping = mapping.as_deref().is_some_and(|rendered| {
             rendered.contains(
-                "<tool_call>\n<function=safemlx_probe_7c91>\n<parameter=value>\n__safemlx_mapping_argument_probe__\n</parameter>\n</function>\n</tool_call>",
+                "<tool_call>\n<function=eredu_probe_7c91>\n<parameter=value>\n__eredu_mapping_argument_probe__\n</parameter>\n</function>\n</tool_call>",
             )
         });
         let tagged_string = string.as_deref().is_some_and(|rendered| {
-            rendered.contains("<function=safemlx_probe_7c91>\n<parameter=value>")
-                && rendered.contains("__safemlx_string_argument_probe__")
+            rendered.contains("<function=eredu_probe_7c91>\n<parameter=value>")
+                && rendered.contains("__eredu_string_argument_probe__")
         });
         if tagged_mapping || tagged_string {
             let mut effort_kwargs = serde_json::Map::new();
@@ -1305,7 +1305,7 @@ fn recognize_remaining_protocols(
                     selected_template.clone(),
                     [vec![serde_json::json!({
                         "role": "user",
-                        "content": "__safemlx_effort_probe__"
+                        "content": "__eredu_effort_probe__"
                     })]],
                     Some(&[]),
                     model_id,
@@ -1341,7 +1341,7 @@ fn recognize_remaining_protocols(
         }
         let json_in_xml = |rendered: &Option<String>| {
             rendered.as_deref().is_some_and(|rendered| {
-                rendered.contains("\"name\": \"safemlx_probe_7c91\"")
+                rendered.contains("\"name\": \"eredu_probe_7c91\"")
                     && rendered.contains("\"arguments\":")
             })
         };
@@ -1353,7 +1353,7 @@ fn recognize_remaining_protocols(
         let reasoning = render_reasoning_protocol_probe(tokenizer, selected_template, model_id)
             .is_some_and(|rendered| {
                 rendered.contains(
-                    "<think>\n__safemlx_reasoning_probe__\n</think>\n\n__safemlx_visible_probe__",
+                    "<think>\n__eredu_reasoning_probe__\n</think>\n\n__eredu_visible_probe__",
                 )
             });
         let (identity, spec) = if reasoning {
@@ -1373,10 +1373,10 @@ fn recognize_remaining_protocols(
 
     let mistral_markers = [
         "[TOOL_CALLS]",
-        "safemlx_probe_7c91",
+        "eredu_probe_7c91",
         "abc123456",
         "[TOOL_RESULTS]",
-        "__safemlx_tool_result_probe__",
+        "__eredu_tool_result_probe__",
     ];
     let mistral_mapping = supports(&mapping, &mistral_markers);
     let mistral_string = supports(&string, &mistral_markers);
@@ -1404,9 +1404,9 @@ fn recognize_remaining_protocols(
 
     let nemotron_markers = [
         "<TOOLCALL>[",
-        "safemlx_probe_7c91",
+        "eredu_probe_7c91",
         "<TOOL_RESPONSE>[",
-        "__safemlx_tool_result_probe__",
+        "__eredu_tool_result_probe__",
     ];
     let nemotron_mapping = supports(&mapping, &nemotron_markers);
     let nemotron_string = supports(&string, &nemotron_markers);
@@ -1434,9 +1434,9 @@ fn recognize_remaining_protocols(
     }
 
     let llama_markers = [
-        "safemlx_probe_7c91",
+        "eredu_probe_7c91",
         "\"parameters\"",
-        "__safemlx_tool_result_probe__",
+        "__eredu_tool_result_probe__",
     ];
     let llama_mapping = supports(&mapping, &llama_markers);
     let llama_string = supports(&string, &llama_markers);

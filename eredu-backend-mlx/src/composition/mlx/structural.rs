@@ -999,7 +999,7 @@ impl eredu_architectures::qwen::vision::VisionGgufCatalog for NeutralQwenVisionG
             .catalog()
             .tensors()
             .find(|tensor| tensor.descriptor().name == name)
-            .map(|tensor| tensor.descriptor().mlx_shape())
+            .map(|tensor| tensor.descriptor().row_major_shape())
             .and_then(|shape| {
                 shape
                     .into_iter()

@@ -148,7 +148,7 @@ impl GgufWeightStoreBuilder {
                 }
                 let descriptor = tensor.descriptor().clone();
                 let physical_shape = descriptor
-                    .mlx_shape()
+                    .row_major_shape()
                     .into_iter()
                     .map(|dimension| {
                         usize::try_from(dimension).map_err(|_| StoreError::Overflow {
@@ -779,7 +779,7 @@ fn logical_units_per_block(
     logical_shape: &[usize],
 ) -> Result<Option<usize>, StoreError> {
     let physical_shape = descriptor
-        .mlx_shape()
+        .row_major_shape()
         .into_iter()
         .map(|dimension| {
             usize::try_from(dimension).map_err(|_| StoreError::Overflow {

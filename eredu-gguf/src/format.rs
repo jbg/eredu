@@ -248,7 +248,7 @@ impl MetadataValue {
     }
 }
 
-/// GGML tensor encodings relevant to the safemlx public path.
+/// GGML tensor encodings relevant to Eredu's checkpoint path.
 ///
 /// Numeric codes and block geometry are pinned to llama.cpp commit
 /// `c0bc8591e8815c63cb01dd3f051a8b0df02501c9` (`ggml/include/ggml.h`,
@@ -415,8 +415,7 @@ impl GgmlType {
         )
     }
 
-    /// Whether safemlx has a checkpoint-native execution backend for this
-    /// block encoding.
+    /// Whether this block encoding has checkpoint-native execution support.
     ///
     /// These formats remain packed when converted instead of being expanded
     /// into the generic affine weight/scales/biases representation.
@@ -446,8 +445,8 @@ impl TensorDescriptor {
                 .ok_or(Error::Overflow("tensor element count"))
         })
     }
-    /// Shape in MLX/row-major order.
-    pub fn mlx_shape(&self) -> Vec<u64> {
+    /// Shape in row-major order.
+    pub fn row_major_shape(&self) -> Vec<u64> {
         self.dimensions.iter().rev().copied().collect()
     }
 }

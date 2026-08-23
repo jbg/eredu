@@ -437,7 +437,7 @@ fn gguf_catalog(checkpoint: &GgufCheckpoint) -> BTreeMap<String, PhysicalMetadat
                 descriptor.name.clone(),
                 PhysicalMetadata {
                     shape: descriptor
-                        .mlx_shape()
+                        .row_major_shape()
                         .into_iter()
                         .map(|dimension| usize::try_from(dimension).unwrap_or(usize::MAX))
                         .collect(),
