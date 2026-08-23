@@ -192,39 +192,18 @@ pub fn load_named_array_strict<M: ModuleParameters>(
 /// Options for strict checkpoint loading.
 ///
 /// This configuration controls how checkpoint tensor names are matched to model
-/// parameters and which missing or unused names are accepted.
+/// parameters and which unused names are accepted.
 #[derive(Debug, Clone, Default)]
 pub struct StrictLoadConfig {
-    allow_all_unused: bool,
     allowed_unused_prefixes: Vec<String>,
-    allowed_missing_suffixes: Vec<String>,
-    allowed_missing_contains: Vec<String>,
     key_prefixes_to_strip: Vec<String>,
     key_prefix_rewrites: Vec<(String, String)>,
 }
 
 impl StrictLoadConfig {
-    /// Allows every unused checkpoint tensor while preserving missing-parameter validation.
-    pub fn allow_all_unused(mut self) -> Self {
-        self.allow_all_unused = true;
-        self
-    }
-
     /// Allows unused checkpoint tensors whose names start with `prefix`.
     pub fn allow_unused_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.allowed_unused_prefixes.push(prefix.into());
-        self
-    }
-
-    /// Allows missing model parameters whose names end with `suffix`.
-    pub fn allow_missing_suffix(mut self, suffix: impl Into<String>) -> Self {
-        self.allowed_missing_suffixes.push(suffix.into());
-        self
-    }
-
-    /// Allows missing model parameters whose names contain `needle`.
-    pub fn allow_missing_contains(mut self, needle: impl Into<String>) -> Self {
-        self.allowed_missing_contains.push(needle.into());
         self
     }
 
@@ -241,21 +220,9 @@ impl StrictLoadConfig {
     }
 
     pub fn is_unused_allowed(&self, key: &str) -> bool {
-        self.allow_all_unused
-            || self
-                .allowed_unused_prefixes
-                .iter()
-                .any(|prefix| key.starts_with(prefix))
-    }
-
-    fn is_missing_allowed(&self, key: &str) -> bool {
-        self.allowed_missing_suffixes
+        self.allowed_unused_prefixes
             .iter()
-            .any(|suffix| key.ends_with(suffix))
-            || self
-                .allowed_missing_contains
-                .iter()
-                .any(|needle| key.contains(needle))
+            .any(|prefix| key.starts_with(prefix))
     }
 
     pub fn candidates(&self, key: &str) -> Vec<String> {
@@ -351,7 +318,6 @@ impl StrictLoadReport {
             .map(|key| key.to_string())
             .filter(|key| !excluded(key))
             .filter(|key| !self.loaded.contains(key))
-            .filter(|key| !config.is_missing_allowed(key))
             .collect::<Vec<_>>();
 
         let mut unused = self
