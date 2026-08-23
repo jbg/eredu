@@ -1586,13 +1586,9 @@ fn load_store(
             }) {
                 continue;
             }
-            let resolved = eredu_architectures::gemma4::expert_recipes(
-                store.as_ref(),
-                &args.text,
-                "model.language_model.layers",
-                layer,
-            )
-            .map_err(Error::UnsupportedArchitecture)?;
+            let resolved =
+                eredu_architectures::gemma4::expert_recipes(store.as_ref(), &args.text, layer)
+                    .map_err(Error::UnsupportedArchitecture)?;
             keys.extend(
                 resolved
                     .gate_up
@@ -1630,13 +1626,9 @@ fn load_store(
                     policy.feed_forward
                         == eredu_architectures::gemma4::FeedForwardPolicy::DenseWithSparseMoe
                 }) {
-                    let resolved = eredu_architectures::gemma4::expert_recipes(
-                        store,
-                        &binding_args,
-                        "model.language_model.layers",
-                        layer,
-                    )
-                    .map_err(Error::UnsupportedArchitecture)?;
+                    let resolved =
+                        eredu_architectures::gemma4::expert_recipes(store, &binding_args, layer)
+                            .map_err(Error::UnsupportedArchitecture)?;
                     BTreeMap::from([
                         (resolved.target_gate_up, resolved.gate_up),
                         (resolved.target_down, resolved.down),
@@ -1691,13 +1683,8 @@ fn gemma4_unit_recipes(
     if args.layer_policy(layer).is_some_and(|policy| {
         policy.feed_forward == eredu_architectures::gemma4::FeedForwardPolicy::DenseWithSparseMoe
     }) {
-        let resolved = eredu_architectures::gemma4::expert_recipes(
-            store,
-            args,
-            "model.language_model.layers",
-            layer,
-        )
-        .map_err(Error::UnsupportedArchitecture)?;
+        let resolved = eredu_architectures::gemma4::expert_recipes(store, args, layer)
+            .map_err(Error::UnsupportedArchitecture)?;
         Ok(BTreeMap::from([
             (resolved.target_gate_up, resolved.gate_up),
             (resolved.target_down, resolved.down),

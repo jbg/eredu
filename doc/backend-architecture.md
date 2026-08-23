@@ -121,6 +121,9 @@ name discovery or recipe construction into backend composition.
 Architecture checkpoint APIs also derive rank-local independently resident
 expert recipes, including segmented fused-projection selection; backend
 composition binds those recipes without reconstructing the segment equation.
+Family recipe APIs derive their own checkpoint roots; in particular, Gemma 4
+expert recipe callers provide only the catalog, normalized configuration, and
+layer identity, never a backend-selected layer namespace.
 Independent expert residency is exposed as a validated neutral catalog. Each
 catalog entry carries the router/cache identity, the owning architecture group,
 unit index and parameter path, expert-parallel versus replicated placement,

@@ -23,6 +23,12 @@ use eredu_nn::AttentionValueSource;
 
 use super::{FamilyConfig, FeedForwardPolicy, ModelArgs};
 
+const RELEASED_LAYER_ROOT: &str = "model.language_model.layers";
+
+fn released_layer_path(layer: usize) -> String {
+    format!("{RELEASED_LAYER_ROOT}.{layer}")
+}
+
 /// Backend-independent artifact geometry needed before weight loading.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Gemma4ArtifactConfig {
@@ -288,7 +294,7 @@ fn add_safetensors_layer(
     let policy = args
         .layer_policy(layer)
         .ok_or_else(|| format!("Gemma 4 layer {layer} has no normalized policy"))?;
-    let released = format!("model.language_model.layers.{layer}");
+    let released = released_layer_path(layer);
     let canonical = format!("model.layers.{layer}");
     let head = policy.head_dim.get() as usize;
     let query = checked_mul(
@@ -1087,7 +1093,6 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
 pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,
     args: &ModelArgs,
-    root: &str,
     layer: usize,
 ) -> Result<GatedProductExpertRecipes, String> {
     let policy = args
@@ -1096,7 +1101,7 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     if policy.feed_forward != FeedForwardPolicy::DenseWithSparseMoe {
         return Err(format!("Gemma 4 layer {layer} has no routed experts"));
     }
-    let prefix = format!("{root}.{layer}.experts.switch_glu");
+    let prefix = format!("{}.experts.switch_glu", released_layer_path(layer));
     let source = |base: &str| {
         if catalog.tensor_metadata(base).is_ok() {
             base.to_owned()
@@ -1139,8 +1144,8 @@ pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
         {
             continue;
         }
-        let unit_path = format!("model.language_model.layers.{layer}");
-        let bank = expert_recipes(catalog, args, "model.language_model.layers", layer)?;
+        let unit_path = released_layer_path(layer);
+        let bank = expert_recipes(catalog, args, layer)?;
         for expert in 0..experts {
             let selection = TensorSelection::Range {
                 axis: 0,
@@ -1321,8 +1326,7 @@ mod tests {
 
     #[test]
     fn separate_expert_bank_derives_exact_fused_neutral_targets() {
-        let root = "model.language_model.layers";
-        let prefix = format!("{root}.0.experts.switch_glu");
+        let prefix = "model.language_model.layers.0.experts.switch_glu";
         let tensors = BTreeMap::from([
             (
                 format!("{prefix}.gate_proj.weight"),
@@ -1338,7 +1342,7 @@ mod tests {
             ),
         ]);
         let catalog = Catalog(tensors);
-        let recipes = expert_recipes(&catalog, &sparse_args(), root, 0).unwrap();
+        let recipes = expert_recipes(&catalog, &sparse_args(), 0).unwrap();
         assert_eq!(
             recipes.layout,
             GatedProductExpertStorageLayout::SeparatePacked
