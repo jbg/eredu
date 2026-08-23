@@ -1458,32 +1458,23 @@ impl CausalModel<MlxHybridState> for Gemma4Model {
     }
 }
 
-fn execution_layout(args: &FamilyConfig) -> Result<ExecutionUnitLayout, Error> {
-    let graph = eredu_runtime::ExecutionGraph::new(
-        vec![
-            eredu_runtime::ExecutionGroupSpec::root("vision"),
-            eredu_runtime::ExecutionGroupSpec::root("audio"),
-            eredu_runtime::ExecutionGroupSpec::with_dependencies(
-                "text_decoder",
-                ["vision", "audio"],
-            ),
-        ],
-        "text_decoder",
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    ExecutionUnitLayout::new(
-        &graph,
-        [
-            args.vision
-                .as_ref()
-                .map_or(0, |config| config.num_hidden_layers as usize),
-            args.audio
-                .as_ref()
-                .map_or(0, |config| config.num_hidden_layers as usize),
-            args.text.num_hidden_layers(),
-        ],
-    )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+fn execution_layout(architecture: &NeutralArchitecture) -> Result<ExecutionUnitLayout, Error> {
+    let graph =
+        <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::execution_graph(
+            architecture,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let counts = (0..graph.groups().len())
+        .map(|group| {
+            <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::group_unit_count(
+                architecture,
+                group,
+            )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ExecutionUnitLayout::new(&graph, counts)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 pub fn resolve_pipeline_store(
@@ -1539,20 +1530,14 @@ fn quantize_store(
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let target_architecture = NeutralArchitecture::new(target.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let unit_count = source
-        .vision
-        .as_ref()
-        .map_or(0, |config| config.num_hidden_layers as usize)
-        .checked_add(
-            source
-                .audio
-                .as_ref()
-                .map_or(0, |config| config.num_hidden_layers as usize),
-        )
-        .and_then(|count| count.checked_add(source.text.num_hidden_layers()))
-        .ok_or_else(|| Error::Quantization("Gemma 4 unit count overflowed".into()))?;
-    let source_layout = execution_layout(source)?;
-    let target_layout = execution_layout(&target)?;
+    let source_layout = execution_layout(&source_architecture)?;
+    let target_layout = execution_layout(&target_architecture)?;
+    if source_layout.len() != target_layout.len() {
+        return Err(Error::Quantization(
+            "Gemma 4 quantization changed the architecture execution layout".into(),
+        ));
+    }
+    let unit_count = source_layout.len();
     let source_static =
         <NeutralArchitecture as LayeredArchitecture<MlxBackend, MlxHybridState>>::static_modules(
             &source_architecture,
@@ -1773,10 +1758,6 @@ fn load_parallel_store(
     let state_layout = architecture
         .runtime_state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    let vision_layers = geometry.vision_layers();
-    let audio_layers = geometry.audio_layers();
-    let text_start = vision_layers + audio_layers;
-
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let global_static = MlxModule::new(
@@ -1787,11 +1768,24 @@ fn load_parallel_store(
     );
     let global_static_bindings = build_module_bindings(&global_static, "", store.as_ref())?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
-    let total_units = text_start
-        .checked_add(layer_count)
-        .ok_or_else(|| Error::Parallel("Gemma 4 unit count overflowed".into()))?;
-    let global_layout = execution_layout(&args)?;
-    for ordinal in 0..total_units {
+    let global_layout = execution_layout(&global_architecture)?;
+    let decoder_groups = (0..global_layout.group_count())
+        .filter(|&group| {
+            group_kind(&global_architecture, group) == eredu_runtime::ArchitectureGroupKind::Decoder
+        })
+        .collect::<Vec<_>>();
+    let [decoder_group] = decoder_groups.as_slice() else {
+        return Err(Error::Parallel(
+            "Gemma 4 must declare exactly one decoder execution group".into(),
+        ));
+    };
+    let decoder_group = *decoder_group;
+    for ordinal in 0..global_layout.len() {
+        let address = global_layout.address(ordinal).ok_or_else(|| {
+            Error::Parallel(format!(
+                "Gemma 4 execution ordinal {ordinal} is outside its architecture layout"
+            ))
+        })?;
         let unit = MlxModule::new(construct_architecture_unit(
             &global_architecture,
             &global_layout,
@@ -1799,8 +1793,8 @@ fn load_parallel_store(
             stream,
             std::marker::PhantomData::<MlxHybridState>,
         )?);
-        let recipes = if ordinal >= text_start {
-            gemma4_unit_recipes(&args.text, ordinal - text_start, store.as_ref())?
+        let recipes = if address.group() == decoder_group {
+            gemma4_unit_recipes(&args.text, address.index(), store.as_ref())?
         } else {
             BTreeMap::new()
         };
@@ -1837,7 +1831,7 @@ fn load_parallel_store(
             shard_layer_bindings(global_static_bindings, "", store, &static_layout)
         },
         move |address, path, local, store, stream| {
-            if address.group() != 2 {
+            if address.group() != decoder_group {
                 return build_module_bindings(&MlxModule::new(local.clone()), "", store)
                     .map_err(Into::into);
             }

@@ -326,6 +326,12 @@ conversion, but must not independently reconstruct family mask or geometry
 policy. Gemma 4 exposes this contract through its vision and audio ingress
 part/batch plans.
 
+Layered model execution topology follows the same ownership rule. Loaders and
+materializers derive execution graphs and per-group unit counts through
+`LayeredArchitecture`; they do not reconstruct a family's group order,
+dependencies, or layer counts from configuration. This keeps quantization,
+residency, and parallel placement aligned with architecture execution.
+
 The facade owns tokenizer and chat-template discovery. A backend may request
 tokenization of checkpoint-defined framing text through typed callbacks, but it
 does not implement a parallel tokenizer or chat lifecycle.
