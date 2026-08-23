@@ -113,10 +113,6 @@ pub use eredu_core::scheduler::{
     SchedulerLimits, SchedulerProgress, SchedulerReport, SemanticStateTransaction,
     TransitionOutput, WorkDescriptor, WorkId, WorkLifecycle,
 };
-pub use eredu_core::scheduler::{
-    SchedulerCapabilities as RealtimeSchedulerCapabilities,
-    SchedulerReport as RealtimeSchedulerReport,
-};
 pub use eredu_runtime::{
     finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
     resolve_prompt_cache_root, safe_prompt_cache_shard_path, validate_prompt_cache_manifest,

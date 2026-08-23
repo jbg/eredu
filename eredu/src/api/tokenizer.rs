@@ -46,9 +46,9 @@ pub enum TextMetadataError {
 
 /// Loads only the tokenizer from a supported model directory or GGUF file.
 ///
-/// Loading from GGUF parses embedded tokenizer metadata without creating an
-/// MLX stream. A sibling `tokenizer.json` remains a fallback for missing or
-/// unsupported embedded tokenizer formats.
+/// Loading from GGUF uses embedded tokenizer metadata. A sibling
+/// `tokenizer.json` remains a fallback for missing or unsupported embedded
+/// tokenizer formats.
 pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, TextMetadataError> {
     let model_dir = model_dir.as_ref();
     if is_gguf_file(model_dir) {
