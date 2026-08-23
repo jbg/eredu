@@ -72,24 +72,26 @@ impl Model {
         use eredu_architectures::capability;
 
         match self {
-            Self::DeepSeek(model) => {
+            Self::DeepSeek(_, model) => {
                 if let Some(args) = model.v3_args() {
                     capability::deepseek_v3(args)
                 } else {
                     capability::deepseek_v4(model.v4_args().expect("DeepSeek family"))
                 }
             }
-            Self::Llama(model) => capability::llama(model.args()),
-            Self::Qwen(model) => capability::qwen(model.args()),
-            Self::MuseGlimmer(model) => capability::muse_glimmer(model.args()),
-            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => capability::qwen_vl(model.args()),
-            Self::GptOss(model) => capability::gpt_oss(model.args()),
-            Self::Gemma4(model) => capability::gemma4(model.args()),
-            Self::Inkling(model) => capability::inkling(model.args()),
-            Self::KimiLinear(model) => capability::kimi_linear(model.args()),
-            Self::Lfm2(model) => capability::lfm2(model.args()),
-            Self::NemotronH(model) => capability::nemotron_h(model.args()),
-            Self::Qwen3Next(model) | Self::Qwen35(model) => {
+            Self::Llama(_, model) => capability::llama(model.args()),
+            Self::Qwen(_, model) => capability::qwen(model.args()),
+            Self::MuseGlimmer(_, model) => capability::muse_glimmer(model.args()),
+            Self::Qwen3Vl(_, model) | Self::Qwen3VlMoe(_, model) => {
+                capability::qwen_vl(model.args())
+            }
+            Self::GptOss(_, model) => capability::gpt_oss(model.args()),
+            Self::Gemma4(_, model) => capability::gemma4(model.args()),
+            Self::Inkling(_, model) => capability::inkling(model.args()),
+            Self::KimiLinear(_, model) => capability::kimi_linear(model.args()),
+            Self::Lfm2(_, model) => capability::lfm2(model.args()),
+            Self::NemotronH(_, model) => capability::nemotron_h(model.args()),
+            Self::Qwen3Next(_, model) | Self::Qwen35(_, model) => {
                 capability::qwen_hybrid(model.parsed_args())
             }
         }
@@ -200,24 +202,24 @@ impl Model {
         input: &PreparedMediaInput,
     ) -> Result<MediaShapePlan, CapabilityError> {
         match self {
-            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
+            Self::Qwen3Vl(_, model) | Self::Qwen3VlMoe(_, model) => {
                 media_plan::qwen_vision(&model.args().vision, input, self.effective_model_type())
             }
-            Self::Qwen3Next(model) | Self::Qwen35(model) => media_plan::qwen_hybrid_vision(
+            Self::Qwen3Next(_, model) | Self::Qwen35(_, model) => media_plan::qwen_hybrid_vision(
                 model.vision_config(),
                 input,
                 self.effective_model_type(),
             ),
-            Self::Gemma4(model) => media_plan::gemma4(model.args(), input),
-            Self::Inkling(model) => media_plan::inkling(model.args(), input),
-            Self::MuseGlimmer(model) => media_plan::muse_glimmer(model.args(), input),
-            Self::DeepSeek(_)
-            | Self::GptOss(_)
-            | Self::KimiLinear(_)
-            | Self::Llama(_)
-            | Self::Lfm2(_)
-            | Self::NemotronH(_)
-            | Self::Qwen(_) => media_plan::text_only(self.effective_model_type(), input),
+            Self::Gemma4(_, model) => media_plan::gemma4(model.args(), input),
+            Self::Inkling(_, model) => media_plan::inkling(model.args(), input),
+            Self::MuseGlimmer(_, model) => media_plan::muse_glimmer(model.args(), input),
+            Self::DeepSeek(_, _)
+            | Self::GptOss(_, _)
+            | Self::KimiLinear(_, _)
+            | Self::Llama(_, _)
+            | Self::Lfm2(_, _)
+            | Self::NemotronH(_, _)
+            | Self::Qwen(_, _) => media_plan::text_only(self.effective_model_type(), input),
         }
     }
 }

@@ -761,9 +761,9 @@ impl<'a> MlxModelSession<'a> {
     ) -> Result<Array, Error> {
         let mut observer = ArrayObserverAdapter { inner: observer };
         let result = match (model, cache) {
-            (Model::DeepSeek(model), ModelCache::DeepSeek(cache)) => model
+            (Model::DeepSeek(_, model), ModelCache::DeepSeek(cache)) => model
                 .forward_with_observer(input_tokens, mask, cache, stream, &mut observer),
-            (Model::KimiLinear(model), ModelCache::Hybrid(cache)) => {
+            (Model::KimiLinear(_, model), ModelCache::Hybrid(cache)) => {
                 if mask.is_some() {
                     return Err(Error::UnsupportedArchitecture(
                         "an explicit Kimi Linear observer mask is unsupported; the adapter constructs the causal mask from cache state".into(),
@@ -771,16 +771,16 @@ impl<'a> MlxModelSession<'a> {
                 }
                 model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
             }
-            (Model::Lfm2(model), ModelCache::Hybrid(cache)) => {
+            (Model::Lfm2(_, model), ModelCache::Hybrid(cache)) => {
                 model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
             }
-            (Model::Llama(model), ModelCache::Llama(cache)) => {
+            (Model::Llama(_, model), ModelCache::Llama(cache)) => {
                 model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
             }
-            (Model::Qwen(model), ModelCache::Qwen(cache)) => {
+            (Model::Qwen(_, model), ModelCache::Qwen(cache)) => {
                 model.forward_with_observer(input_tokens, mask, cache, stream, &mut observer)
             }
-            (Model::MuseGlimmer(model), ModelCache::MuseGlimmer(cache)) => {
+            (Model::MuseGlimmer(_, model), ModelCache::MuseGlimmer(cache)) => {
                 if mask.is_some() {
                     return Err(Error::UnsupportedArchitecture(
                         "explicit Muse-Glimmer observer masks are not bound yet".into(),
@@ -791,8 +791,8 @@ impl<'a> MlxModelSession<'a> {
                 observer.observe("model.logits", output.as_array())?;
                 Ok(output.into_array())
             }
-            (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
-            | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => {
+            (Model::Qwen3Next(_, model), ModelCache::Qwen3Next(cache))
+            | (Model::Qwen35(_, model), ModelCache::Qwen35(cache)) => {
                 if mask.is_some() {
                     return Err(Error::UnsupportedArchitecture(
                         "an explicit Qwen hybrid observer mask is unsupported; the adapter constructs the causal mask from cache state".into(),
@@ -800,7 +800,7 @@ impl<'a> MlxModelSession<'a> {
                 }
                 model.forward_with_observer(input_tokens, cache, stream, &mut observer)
             }
-            (Model::Gemma4(model), ModelCache::Hybrid(cache)) => {
+            (Model::Gemma4(_, model), ModelCache::Hybrid(cache)) => {
                 if mask.is_some() {
                     return Err(Error::UnsupportedArchitecture(
                         "an explicit Gemma observer mask is unsupported; the adapter constructs its per-layer masks from cache state".into(),
@@ -850,8 +850,8 @@ impl<'a> MlxModelSession<'a> {
         observer: &mut impl RuntimeActivationObserver<MlxTensor, Exception>,
     ) -> Result<Submission<Array, MlxCompletion>, Error> {
         let output = input.with_borrowed(|input| match (&mut *model, &mut *cache) {
-            (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
-            | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => model
+            (Model::Qwen3Next(_, model), ModelCache::Qwen3Next(cache))
+            | (Model::Qwen35(_, model), ModelCache::Qwen35(cache)) => model
                 .prefill_input_with_observer(
                     input,
                     cache,
@@ -1148,42 +1148,44 @@ fn prefill_model(
     stream: &Stream,
 ) -> Result<Array, Error> {
     match (model, cache) {
-        (Model::DeepSeek(model), ModelCache::DeepSeek(cache)) => {
+        (Model::DeepSeek(_, model), ModelCache::DeepSeek(cache)) => {
             prefill_pair(model.as_mut(), cache, input, stream)
         }
-        (Model::Gemma4(model), ModelCache::Hybrid(cache)) => {
+        (Model::Gemma4(_, model), ModelCache::Hybrid(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::GptOss(model), ModelCache::GptOss(cache)) => {
+        (Model::GptOss(_, model), ModelCache::GptOss(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::Inkling(model), ModelCache::Inkling(cache)) => {
+        (Model::Inkling(_, model), ModelCache::Inkling(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::KimiLinear(model), ModelCache::Hybrid(cache)) => {
+        (Model::KimiLinear(_, model), ModelCache::Hybrid(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::Llama(model), ModelCache::Llama(cache)) => {
+        (Model::Llama(_, model), ModelCache::Llama(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::MuseGlimmer(model), ModelCache::MuseGlimmer(cache)) => {
+        (Model::MuseGlimmer(_, model), ModelCache::MuseGlimmer(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::Lfm2(model), ModelCache::Hybrid(cache)) => {
+        (Model::Lfm2(_, model), ModelCache::Hybrid(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::NemotronH(model), ModelCache::Hybrid(cache)) => {
+        (Model::NemotronH(_, model), ModelCache::Hybrid(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::Qwen(model), ModelCache::Qwen(cache)) => prefill_pair(model, cache, input, stream),
-        (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
-        | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => {
+        (Model::Qwen(_, model), ModelCache::Qwen(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
+        (Model::Qwen3Next(_, model), ModelCache::Qwen3Next(cache))
+        | (Model::Qwen35(_, model), ModelCache::Qwen35(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (Model::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
+        (Model::Qwen3Vl(_, model), ModelCache::Qwen3Vl(cache)) => {
+            prefill_pair(model, cache, input, stream)
+        }
+        (Model::Qwen3VlMoe(_, model), ModelCache::Qwen3VlMoe(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
         (model, _) => Err(Error::UnsupportedArchitecture(format!(
@@ -1200,38 +1202,44 @@ fn decode_model(
     stream: &Stream,
 ) -> Result<Array, Error> {
     match (model, cache) {
-        (Model::DeepSeek(model), ModelCache::DeepSeek(cache)) => {
+        (Model::DeepSeek(_, model), ModelCache::DeepSeek(cache)) => {
             decode_pair(model.as_mut(), cache, input, stream)
         }
-        (Model::Gemma4(model), ModelCache::Hybrid(cache)) => {
+        (Model::Gemma4(_, model), ModelCache::Hybrid(cache)) => {
             decode_pair(model, cache, input, stream)
         }
-        (Model::GptOss(model), ModelCache::GptOss(cache)) => {
+        (Model::GptOss(_, model), ModelCache::GptOss(cache)) => {
             decode_pair(model, cache, input, stream)
         }
-        (Model::Inkling(model), ModelCache::Inkling(cache)) => {
+        (Model::Inkling(_, model), ModelCache::Inkling(cache)) => {
             decode_pair(model, cache, input, stream)
         }
-        (Model::KimiLinear(model), ModelCache::Hybrid(cache)) => {
+        (Model::KimiLinear(_, model), ModelCache::Hybrid(cache)) => {
             decode_pair(model, cache, input, stream)
         }
-        (Model::Llama(model), ModelCache::Llama(cache)) => decode_pair(model, cache, input, stream),
-        (Model::MuseGlimmer(model), ModelCache::MuseGlimmer(cache)) => {
+        (Model::Llama(_, model), ModelCache::Llama(cache)) => {
             decode_pair(model, cache, input, stream)
         }
-        (Model::Lfm2(model), ModelCache::Hybrid(cache)) => decode_pair(model, cache, input, stream),
-        (Model::NemotronH(model), ModelCache::Hybrid(cache)) => {
+        (Model::MuseGlimmer(_, model), ModelCache::MuseGlimmer(cache)) => {
             decode_pair(model, cache, input, stream)
         }
-        (Model::Qwen(model), ModelCache::Qwen(cache)) => decode_pair(model, cache, input, stream),
-        (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
-        | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => {
+        (Model::Lfm2(_, model), ModelCache::Hybrid(cache)) => {
             decode_pair(model, cache, input, stream)
         }
-        (Model::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
+        (Model::NemotronH(_, model), ModelCache::Hybrid(cache)) => {
             decode_pair(model, cache, input, stream)
         }
-        (Model::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
+        (Model::Qwen(_, model), ModelCache::Qwen(cache)) => {
+            decode_pair(model, cache, input, stream)
+        }
+        (Model::Qwen3Next(_, model), ModelCache::Qwen3Next(cache))
+        | (Model::Qwen35(_, model), ModelCache::Qwen35(cache)) => {
+            decode_pair(model, cache, input, stream)
+        }
+        (Model::Qwen3Vl(_, model), ModelCache::Qwen3Vl(cache)) => {
+            decode_pair(model, cache, input, stream)
+        }
+        (Model::Qwen3VlMoe(_, model), ModelCache::Qwen3VlMoe(cache)) => {
             decode_pair(model, cache, input, stream)
         }
         (model, _) => Err(Error::UnsupportedArchitecture(format!(
@@ -1278,23 +1286,23 @@ fn prefill_model_tensor_parallel(
         Error::Parallel("tensor-parallel model session has no tensor communicator".into())
     })?;
     let logits = match (model, cache) {
-        (Model::Gemma4(model), ModelCache::Hybrid(cache)) => model
+        (Model::Gemma4(_, model), ModelCache::Hybrid(cache)) => model
             .prefill_tensor_parallel(input, cache, group, stream)?
             .into_array(),
-        (Model::Inkling(model), ModelCache::Inkling(cache)) => model
+        (Model::Inkling(_, model), ModelCache::Inkling(cache)) => model
             .prefill_tensor_parallel(input, cache, group, stream)?
             .into_array(),
-        (Model::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
+        (Model::Qwen3Vl(_, model), ModelCache::Qwen3Vl(cache)) => {
             model.prefill_tensor_parallel(input, cache, group, stream)?
         }
-        (Model::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
+        (Model::Qwen3VlMoe(_, model), ModelCache::Qwen3VlMoe(cache)) => {
             model.prefill_tensor_parallel(input, cache, group, stream)?
         }
-        (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
-        | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => {
+        (Model::Qwen3Next(_, model), ModelCache::Qwen3Next(cache))
+        | (Model::Qwen35(_, model), ModelCache::Qwen35(cache)) => {
             model.prefill_tensor_parallel(input, cache, group, stream)?
         }
-        (Model::MuseGlimmer(model), ModelCache::MuseGlimmer(cache)) => model
+        (Model::MuseGlimmer(_, model), ModelCache::MuseGlimmer(cache)) => model
             .prefill_tensor_parallel(input, cache, group, stream)?
             .into_array(),
         (model, cache) => {
@@ -1328,41 +1336,41 @@ fn forward_model_tensor_parallel(
 ) -> Result<Array, Error> {
     let tensor_input = MlxTensor::from_array(input.clone());
     match (model, cache) {
-        (Model::GptOss(model), ModelCache::GptOss(cache)) => {
+        (Model::GptOss(_, model), ModelCache::GptOss(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
-        (Model::Inkling(model), ModelCache::Inkling(cache)) => model
+        (Model::Inkling(_, model), ModelCache::Inkling(cache)) => model
             .forward_tensor_parallel(&tensor_input, cache, group, stream)
             .map(MlxTensor::into_array),
-        (Model::KimiLinear(model), ModelCache::Hybrid(cache)) => {
+        (Model::KimiLinear(_, model), ModelCache::Hybrid(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
-        (Model::Llama(model), ModelCache::Llama(cache)) => {
+        (Model::Llama(_, model), ModelCache::Llama(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
-        (Model::Lfm2(model), ModelCache::Hybrid(cache)) => {
+        (Model::Lfm2(_, model), ModelCache::Hybrid(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
-        (Model::NemotronH(model), ModelCache::Hybrid(cache)) => {
+        (Model::NemotronH(_, model), ModelCache::Hybrid(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
-        (Model::Gemma4(model), ModelCache::Hybrid(cache)) => model
+        (Model::Gemma4(_, model), ModelCache::Hybrid(cache)) => model
             .forward_tensor_parallel(&tensor_input, cache, group, stream)
             .map(MlxTensor::into_array),
-        (Model::Qwen(model), ModelCache::Qwen(cache)) => {
+        (Model::Qwen(_, model), ModelCache::Qwen(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
-        (Model::MuseGlimmer(model), ModelCache::MuseGlimmer(cache)) => model
+        (Model::MuseGlimmer(_, model), ModelCache::MuseGlimmer(cache)) => model
             .forward_tensor_parallel(&tensor_input, cache, group, stream)
             .map(MlxTensor::into_array),
-        (Model::Qwen3Next(model), ModelCache::Qwen3Next(cache))
-        | (Model::Qwen35(model), ModelCache::Qwen35(cache)) => {
+        (Model::Qwen3Next(_, model), ModelCache::Qwen3Next(cache))
+        | (Model::Qwen35(_, model), ModelCache::Qwen35(cache)) => {
             model.forward_tensor_parallel(input, cache, group, stream)
         }
-        (Model::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
+        (Model::Qwen3Vl(_, model), ModelCache::Qwen3Vl(cache)) => {
             model.decode_tensor_parallel(input, cache, group, stream)
         }
-        (Model::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
+        (Model::Qwen3VlMoe(_, model), ModelCache::Qwen3VlMoe(cache)) => {
             model.decode_tensor_parallel(input, cache, group, stream)
         }
         (model, _) => Err(Error::UnsupportedArchitecture(format!(

@@ -103,8 +103,10 @@ never a second raw `model_type` or `general.architecture` dispatch table.
 Loaded backend models and sessions preserve these as two distinct identities:
 `model_family()` returns the canonical architecture-owned `ModelKind`, while
 `effective_model_type()` returns the parsed implementation or nested text-model
-type. Both identities are invariant across replicated, tensor-parallel, and
-pipeline-parallel placement.
+type. Complete-model materialization stores the already resolved `ModelKind`
+alongside the concrete model implementation; it does not reconstruct family
+identity from the effective type. Both identities are invariant across
+replicated, tensor-parallel, and pipeline-parallel placement.
 
 Architecture checkpoint modules also own canonical name translation and the
 complete derived-weight recipe catalogs for static modules, execution units,

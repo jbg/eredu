@@ -74,7 +74,7 @@ pub fn validate_external_drafter(
 ) -> Result<(), Error> {
     let model = runtime.session().complete_model();
     match (model, drafter.kind()) {
-        (Model::Gemma4(target), MlxDrafterKind::Gemma4Assistant) => {
+        (Model::Gemma4(_, target), MlxDrafterKind::Gemma4Assistant) => {
             let assistant = drafter.gemma4();
             let target = &target.args().text;
             let _compatibility = assistant
@@ -82,7 +82,7 @@ pub fn validate_external_drafter(
                 .prove_compatibility(target)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
         }
-        (Model::MuseGlimmer(target), MlxDrafterKind::MuseGlimmerDFlash) => {
+        (Model::MuseGlimmer(_, target), MlxDrafterKind::MuseGlimmerDFlash) => {
             let assistant = drafter.muse_glimmer();
             let _compatibility = assistant
                 .config
@@ -359,7 +359,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         let prepared_lanes = self.prepare_speculative_batch_lanes(lanes, &mut cache)?;
 
         match (self.model_and_cache().0, drafter.kind()) {
-            (Model::Gemma4(target), MlxDrafterKind::Gemma4Assistant) => {
+            (Model::Gemma4(_, target), MlxDrafterKind::Gemma4Assistant) => {
                 let mut backend =
                     crate::composition::mlx::speculative::external::Gemma4ExternalExecutor::new(
                         target,
@@ -375,7 +375,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
-            (Model::MuseGlimmer(target), MlxDrafterKind::MuseGlimmerDFlash) => {
+            (Model::MuseGlimmer(_, target), MlxDrafterKind::MuseGlimmerDFlash) => {
                 let mut backend = crate::composition::mlx::speculative::external::MuseGlimmerExternalExecutor::new(
                     target,
                     drafter.muse_glimmer_mut(),
@@ -411,7 +411,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         let prepared_lanes = self.prepare_speculative_batch_lanes(lanes, &mut cache)?;
         let streams = MtpExecutionStreams::single(&stream);
         match self.model_and_cache().0 {
-            Model::DeepSeek(target) => {
+            Model::DeepSeek(_, target) => {
                 let mut backend =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target.as_mut(),
@@ -426,7 +426,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
-            Model::NemotronH(target) => {
+            Model::NemotronH(_, target) => {
                 let mut backend =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target,
@@ -441,7 +441,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
-            Model::Inkling(target) => {
+            Model::Inkling(_, target) => {
                 let mut backend =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target,
@@ -456,7 +456,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
-            Model::Qwen3Next(target) => {
+            Model::Qwen3Next(_, target) => {
                 let mut backend =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target,
@@ -471,7 +471,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
                 )
                 .map_err(|error| Error::Speculative(error.to_string()))
             }
-            Model::Qwen35(target) => {
+            Model::Qwen35(_, target) => {
                 let mut backend =
                     crate::composition::mlx::speculative::embedded::EmbeddedMtpExecutor::new(
                         target,
