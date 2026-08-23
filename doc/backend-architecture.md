@@ -35,6 +35,13 @@ composition and architecture-erased dispatch remain crate-private. The
 feature-gated `testing` namespace exists only for cross-crate integration
 fixtures and is not enabled by the production `mlx` feature.
 
+Application targets, including the CLI and platform examples, depend only on
+the `eredu` facade. The selected-local-backend API owns device-plan creation,
+process runtime configuration, synchronization, allocator telemetry, and
+diagnostic benchmarks without exposing native tensors, streams, devices, or
+random state. Direct native access remains an explicit backend-author escape
+hatch under `eredu-backend-mlx::native`; it is not an application dependency.
+
 ## Ownership boundary
 
 Portable crates split tensor-independent ownership by responsibility:
@@ -283,6 +290,12 @@ configuration. `LoadedModel::load_execution_plan` and
 `LoadedModel::plan_and_load` therefore do not require callers to construct
 backend devices, queues, streams, or assistant models.
 
+`eredu::api::local_device_plan` maps the facade's CPU or accelerator choice to
+the currently selected local backend. `LocalRuntimeConfiguration` applies any
+process-global allocator or embedded accelerator-library configuration before
+the factory realizes that plan. Platform applications therefore do not need a
+concrete backend crate merely to create and complete a model session.
+
 Architecture inspection also reports embedded-draft depth from the normalized
 family configuration in `ModelResourceProfile`. The neutral automatic planner
 consumes that observation directly; concrete backends must not infer family
@@ -474,6 +487,11 @@ The adapter translates native failures into structured backend errors and
 populates portable capability, inspection, memory, admission, and telemetry
 reports. MLX arrays, streams, devices, events, groups, and exceptions do not
 appear in core or generic facade signatures.
+
+Backend-neutral `TextGenerationConfig` also selects standard or Mirostat V2
+sampling. The chosen backend owns the corresponding logits, random state, and
+adaptive sampler state, so applications do not fall back to a native tensor
+loop for alternate sampling policies.
 
 ## Implementing another backend
 

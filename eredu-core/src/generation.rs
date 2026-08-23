@@ -882,6 +882,12 @@ pub enum GenerationError {
     /// Stochastic sampling cannot use zero temperature.
     #[error("do_sample=true requires a temperature greater than zero")]
     StochasticZeroTemperature,
+    /// Mirostat V2 target surprise is non-finite or non-positive.
+    #[error("Mirostat V2 tau must be finite and positive, got {0}")]
+    InvalidMirostatTau(f32),
+    /// Mirostat V2 adaptation rate is non-finite or non-positive.
+    #[error("Mirostat V2 eta must be finite and positive, got {0}")]
+    InvalidMirostatEta(f32),
     /// Top-k is negative.
     #[error("top_k must be non-negative, got {0}")]
     InvalidTopK(i32),

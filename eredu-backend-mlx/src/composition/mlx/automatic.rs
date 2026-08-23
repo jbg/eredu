@@ -73,6 +73,7 @@ pub fn discover_hardware() -> HardwareProfile {
             HardwareMemorySemantics::Unknown,
         ),
     };
+    #[allow(unused_mut)] // Native-device probes are target and feature gated.
     let mut devices = vec![HardwareDeviceProfile {
         id: "cpu:0".into(),
         family: "cpu".into(),
@@ -80,7 +81,8 @@ pub fn discover_hardware() -> HardwareProfile {
         total_memory_bytes: physical_memory_bytes.clone(),
         available_memory_bytes: available_memory_bytes.clone(),
     }];
-    let mut details = Vec::new();
+    #[allow(unused_mut)] // Native-device probe diagnostics are target and feature gated.
+    let mut details: Vec<String> = Vec::new();
 
     #[cfg(target_os = "macos")]
     {

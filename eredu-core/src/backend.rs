@@ -13,7 +13,7 @@ use crate::{
         StaticMemoryReport,
     },
     checkpoint::TensorDtype,
-    generation::ResolvedGenerationConfig,
+    generation::{GenerationError, ResolvedGenerationConfig},
     media::TokenizedMultimodalRequest,
     topology::{ParallelAxis, ParallelTopology},
 };
@@ -484,18 +484,50 @@ impl<B: ModelLoadingBackend> ModelRuntime<B> {
 pub struct TextGenerationConfig {
     sampling: ResolvedGenerationConfig,
     seed: u64,
+    strategy: TextSamplingStrategy,
+}
+
+/// Backend-neutral token-sampling strategy for one text-generation session.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum TextSamplingStrategy {
+    /// Apply the resolved top-k, top-p, min-p, and penalty controls.
+    #[default]
+    Standard,
+    /// Adapt the surprise cutoff toward `tau` bits at rate `eta`.
+    MirostatV2 {
+        /// Target surprise in bits.
+        tau: f32,
+        /// Adaptation rate.
+        eta: f32,
+    },
 }
 
 impl TextGenerationConfig {
     /// Uses resolved checkpoint/request sampling with deterministic seed zero.
     pub const fn new(sampling: ResolvedGenerationConfig) -> Self {
-        Self { sampling, seed: 0 }
+        Self {
+            sampling,
+            seed: 0,
+            strategy: TextSamplingStrategy::Standard,
+        }
     }
 
     /// Selects the deterministic root seed used by a stochastic backend.
     pub const fn with_seed(mut self, seed: u64) -> Self {
         self.seed = seed;
         self
+    }
+
+    /// Selects adaptive Mirostat V2 sampling.
+    pub fn with_mirostat_v2(mut self, tau: f32, eta: f32) -> Result<Self, GenerationError> {
+        if !tau.is_finite() || tau <= 0.0 {
+            return Err(GenerationError::InvalidMirostatTau(tau));
+        }
+        if !eta.is_finite() || eta <= 0.0 {
+            return Err(GenerationError::InvalidMirostatEta(eta));
+        }
+        self.strategy = TextSamplingStrategy::MirostatV2 { tau, eta };
+        Ok(self)
     }
 
     /// Returns the validated sampling configuration.
@@ -506,6 +538,11 @@ impl TextGenerationConfig {
     /// Returns the deterministic root seed.
     pub const fn seed(&self) -> u64 {
         self.seed
+    }
+
+    /// Returns the selected backend-neutral sampling strategy.
+    pub const fn strategy(&self) -> TextSamplingStrategy {
+        self.strategy
     }
 }
 
@@ -1082,6 +1119,35 @@ pub trait DistributedBackend: BackendProvider {
 mod tests {
     use super::*;
     use std::{convert::Infallible, io::Write};
+
+    #[test]
+    fn text_generation_config_validates_portable_mirostat_strategy() {
+        let sampling = crate::generation::resolve_generation_config(
+            None,
+            crate::generation::GenerationConfigOverrides {
+                temperature: Some(0.8),
+                ..crate::generation::GenerationConfigOverrides::default()
+            },
+        )
+        .unwrap();
+        let config = TextGenerationConfig::new(sampling)
+            .with_seed(7)
+            .with_mirostat_v2(5.0, 0.1)
+            .unwrap();
+        assert_eq!(config.seed(), 7);
+        assert_eq!(
+            config.strategy(),
+            TextSamplingStrategy::MirostatV2 { tau: 5.0, eta: 0.1 }
+        );
+        assert!(matches!(
+            TextGenerationConfig::new(sampling).with_mirostat_v2(0.0, 0.1),
+            Err(GenerationError::InvalidMirostatTau(0.0))
+        ));
+        assert!(matches!(
+            TextGenerationConfig::new(sampling).with_mirostat_v2(5.0, f32::NAN),
+            Err(GenerationError::InvalidMirostatEta(value)) if value.is_nan()
+        ));
+    }
 
     #[derive(Debug, Clone, Copy)]
     struct Done;

@@ -2,7 +2,7 @@
 
 use eredu_core::{
     BackendSession, Completion, ModelRuntime, Submission, TextGenerationBackend,
-    TextGenerationConfig, TokenFilter, TokenOutput,
+    TextGenerationConfig, TextSamplingStrategy, TokenFilter, TokenOutput,
 };
 use eredu_runtime::ActivationObserver as RuntimeActivationObserver;
 use eredu_runtime::CausalModel;
@@ -142,7 +142,27 @@ impl Completion for MlxTextCompletion {
 pub struct MlxTextGenerationState {
     temperature: f32,
     prng: Option<RandomState>,
-    sampler: crate::backend::mlx::runtime::generation::sampler::GenerationSampler,
+    sampler: MlxTextSampler,
+}
+
+enum MlxTextSampler {
+    Standard(crate::backend::mlx::runtime::generation::sampler::GenerationSampler),
+    MirostatV2(crate::backend::mlx::runtime::generation::sampler::MirostatV2Sampler),
+}
+
+impl MlxTextSampler {
+    fn sample(
+        &mut self,
+        logits: &Array,
+        temperature: f32,
+        random: Option<&mut RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Standard(sampler) => sampler.sample(logits, temperature, random, stream),
+            Self::MirostatV2(sampler) => sampler.sample(logits, temperature, random, stream),
+        }
+    }
 }
 
 enum MlxSessionCompletionKind {
@@ -961,13 +981,35 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         } else {
             Some(RandomState::from_key(safemlx::random::key(config.seed())?))
         };
-        Ok(MlxTextGenerationState {
-            temperature: sampling.temperature,
-            prng,
-            sampler:
+        let sampler = match config.strategy() {
+            TextSamplingStrategy::Standard => MlxTextSampler::Standard(
                 crate::backend::mlx::runtime::generation::sampler::GenerationSampler::from_resolved(
                     sampling,
                 ),
+            ),
+            TextSamplingStrategy::MirostatV2 { tau, eta } => {
+                let sampler =
+                    crate::backend::mlx::runtime::generation::sampler::MirostatV2Sampler::new(
+                        tau, eta,
+                    )
+                    .map_err(|error| eredu_core::BackendError::Execution {
+                        session: "text-generation".into(),
+                        operation: "configure Mirostat V2".into(),
+                        message: error.to_string(),
+                    })?
+                    .penalties(
+                        sampling.repetition_penalty,
+                        sampling.repeat_last_n,
+                        sampling.frequency_penalty,
+                        sampling.presence_penalty,
+                    );
+                MlxTextSampler::MirostatV2(sampler)
+            }
+        };
+        Ok(MlxTextGenerationState {
+            temperature: sampling.temperature,
+            prng,
+            sampler,
         })
     }
 

@@ -10,11 +10,13 @@ use std::{
 };
 
 use eredu::{
-    api::{LoadedModel, LocalBackend},
+    api::{
+        configure_local_runtime, local_device_plan, synchronize_local_backend, LoadedModel,
+        LocalBackend, LocalBackendFactory, LocalDevice, LocalRuntimeConfiguration,
+    },
     runtime::chat::ChatTemplateRequest,
-    GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
+    ExecutionPlan, GenerationConfigOverrides, TextGenerationConfig, TokenOutput,
 };
-use safemlx::{metal::set_metallib_path, Device, DeviceType, ExecutionContext};
 
 /// Receives one UTF-8 text fragment. The bytes are valid only during the call.
 pub type TextCallback = unsafe extern "C" fn(*const u8, usize, *mut c_void);
@@ -159,19 +161,16 @@ fn worker_main(
     ready: Sender<Result<(), String>>,
 ) {
     let initialized = (|| {
-        set_metallib_path(&metallib_path).map_err(|error| error.to_string())?;
-        let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut model = LoadedModel::load(
-            LocalBackend::new(execution.stream(), weights.stream()),
-            &model_path,
-            Default::default(),
+        configure_local_runtime(
+            &LocalRuntimeConfiguration::default().with_accelerator_library(metallib_path),
         )
         .map_err(|error| error.to_string())?;
-        execution
-            .stream()
-            .synchronize()
-            .map_err(|error| error.to_string())?;
+        let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Accelerator(0)));
+        let planned =
+            LoadedModel::load_execution_plan(&LocalBackendFactory::default(), &model_path, &plan)
+                .map_err(|error| error.to_string())?;
+        let (mut model, _) = planned.into_parts();
+        synchronize_local_backend(model.runtime().backend()).map_err(|error| error.to_string())?;
         ready
             .send(Ok(()))
             .map_err(|_| "loader disconnected".to_string())?;

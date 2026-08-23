@@ -10,5 +10,4 @@ crate-type = ["staticlib"]
 
 [dependencies]
 eredu = { path = "../../../eredu", default-features = false, features = ["mlx"] }
-safemlx.workspace = true
 serde_json.workspace = true

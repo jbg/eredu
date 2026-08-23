@@ -71,8 +71,8 @@ pub use backend::{
     ModelCapabilityBackend, ModelLoadError, ModelLoadingBackend, ModelRuntime,
     MultimodalPreparationBackend, MultimodalPreparationFailure, PreparedModel,
     SpeculativeTokenFilterController, Submission, TextGeneration, TextGenerationBackend,
-    TextGenerationConfig, TokenFilter, TokenFilterController, TokenFilterError, TokenOutput,
-    ValueDescriptor,
+    TextGenerationConfig, TextSamplingStrategy, TokenFilter, TokenFilterController,
+    TokenFilterError, TokenOutput, ValueDescriptor,
 };
 pub use capability::{
     apply_admission_policy, estimate_runtime_state, Admission, AdmissionRejection,

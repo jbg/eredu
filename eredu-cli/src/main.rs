@@ -13,39 +13,30 @@ use anyhow::{bail, Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use eredu::{
     api::{
-        discover_local_hardware, inspect_local_model, local_expert_cache_telemetry,
-        local_mtp_telemetry, local_residency_telemetry, LoadedModel, LocalBackend,
-        LocalBackendFactory, LocalExpertPassStatistics, LocalExpertTierStatistics, LocalInputPart,
-        LocalInspectionOptions, LocalMirostatV2Sampler, LocalModelInput,
-        LocalMtpComponentTimingGuard, LocalPreparedModelInput, LocalSampler,
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-        PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, ResidencyPlan,
-        TextDecoder, TextModelError,
+        benchmark_local_expert_cache, configure_local_runtime, discover_local_hardware,
+        inspect_local_model, local_allocator_telemetry, local_device_plan,
+        local_expert_cache_telemetry, local_mtp_telemetry, local_residency_telemetry,
+        reset_local_allocator_peak, synchronize_local_backend, LoadedModel, LocalBackendFactory,
+        LocalDevice, LocalExpertCacheBenchmarkSample, LocalInspectionOptions,
+        LocalMtpComponentTimingGuard, LocalRuntimeConfiguration, PreparedChatGenerationRequest,
+        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
+        PreparedChatMtpGenerationRequest, ResidencyPlan, TextDecoder, TextModelError,
     },
     core::residency::{CacheEvictionPolicy, MemoryTier, TransferDirection},
     core::speculative::MtpStats,
     runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
-    AllocatorTelemetry, AutomaticPlanRequest, AutomaticPlanner, DenseDiskStreamLoadOptions,
-    DevicePlan, DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanReport,
-    ExecutionTelemetry, ExpertCachePlan, FinishReason, GenerationCancellationToken,
-    GenerationConfigOverrides, HardwareMemorySemantics, HardwareProfile, ModelResourceProfile,
-    MtpSchedulerOptions, Observed, PlanExplanation, PlanExplanationEntry, PlanExplanationLevel,
-    SemanticEvent, TextGenerationConfig, TimingTelemetry, TokenOutput, WeightTransformationPlan,
+    AutomaticPlanRequest, AutomaticPlanner, DenseDiskStreamLoadOptions, DevicePlan,
+    DraftPlacementPlan, DraftingPlan, ExecutionPlan, ExecutionPlanReport, ExecutionTelemetry,
+    ExpertCachePlan, FinishReason, GenerationCancellationToken, GenerationConfigOverrides,
+    HardwareMemorySemantics, HardwareProfile, ModelResourceProfile, MtpSchedulerOptions, Observed,
+    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, SemanticEvent,
+    TextGenerationConfig, TimingTelemetry, TokenOutput, WeightTransformationPlan,
     EXECUTION_PLAN_SCHEMA_VERSION,
 };
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
-use safemlx::{
-    memory::{active_memory, cache_memory, peak_memory, reset_peak_memory, set_cache_limit},
-    ops::indexing::{NewAxis, TryIndexOp},
-    random::{key, RandomState},
-    transforms::eval,
-    Array, Stream,
-};
-#[cfg(test)]
-use safemlx::{Device, DeviceType, ExecutionContext};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -106,11 +97,10 @@ enum CliDevice {
 }
 
 impl CliDevice {
-    #[cfg(test)]
-    fn mlx(self) -> Device {
+    fn local(self) -> LocalDevice {
         match self {
-            Self::Cpu => Device::new(DeviceType::Cpu, 0),
-            Self::Gpu(index) => Device::new(DeviceType::Gpu, index),
+            Self::Cpu => LocalDevice::Cpu,
+            Self::Gpu(index) => LocalDevice::Accelerator(index as u32),
         }
     }
 }
@@ -2076,7 +2066,10 @@ fn main() -> Result<()> {
         });
     if let Some(bytes) = args.mlx_cache_limit_bytes {
         let bytes = usize::try_from(bytes).context("--mlx-cache-limit-bytes exceeds usize")?;
-        set_cache_limit(bytes).context("failed to set the MLX allocator-cache limit")?;
+        configure_local_runtime(
+            &LocalRuntimeConfiguration::default().with_allocator_cache_limit(bytes),
+        )
+        .context("failed to set the local allocator-cache limit")?;
     }
     let prompt = read_prompt(args.prompt.as_deref())?;
 
@@ -2108,7 +2101,7 @@ fn main() -> Result<()> {
 
     if args.verbose || args.telemetry_json.is_some() {
         // Capture the complete model-load and generation high-water mark.
-        reset_peak_memory()?;
+        reset_local_allocator_peak()?;
     }
     let resource_profile = if let Some(report) = &automatic_report {
         Some(report.resources.clone())
@@ -2131,8 +2124,6 @@ fn main() -> Result<()> {
     let planned = LoadedModel::load_execution_plan(&factory, &model_path, &execution_plan)
         .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let (mut model, mut drafting) = planned.into_parts();
-    let stream_owner = model.runtime().backend().stream().clone();
-    let stream = &stream_owner;
     let mut resolved_generation = model.resolve_generation_config(GenerationConfigOverrides {
         temperature: args.temperature,
         top_k: args.top_k,
@@ -2165,7 +2156,7 @@ fn main() -> Result<()> {
             resolved_generation.do_sample
         );
     }
-    stream.synchronize()?;
+    synchronize_local_backend(model.runtime().backend())?;
     let load_elapsed = load_started.elapsed();
 
     let tools_requested = args.tools.is_some();
@@ -2244,10 +2235,11 @@ fn main() -> Result<()> {
     if prompt_token_ids.is_empty() {
         bail!("the prompt produced no input tokens");
     }
-    let tokens = Array::from(prompt_token_ids.as_slice()).try_index_device(NewAxis, stream)?;
-
     if args.expert_cache_benchmark {
-        run_expert_cache_benchmark(&mut model, &tokens, stream)?;
+        let benchmark = benchmark_local_expert_cache(model.runtime_mut(), &prompt_token_ids)?;
+        print_expert_benchmark_result("cold_prefill", benchmark.cold_prefill);
+        print_expert_benchmark_result("repeated_prefill", benchmark.repeated_prefill);
+        print_expert_benchmark_result("cached_decode", benchmark.cached_decode);
         model.runtime_mut().session_mut().reset()?;
     }
 
@@ -2381,47 +2373,13 @@ fn main() -> Result<()> {
         bail!(
             "speculative generation requires a prepared chat with executable semantic support; raw and unrecognized-template fallbacks use ordinary generation"
         );
-    } else if args.mirostat_v2 {
-        let mut sampler = LocalMirostatV2Sampler::new(args.mirostat_tau, args.mirostat_eta)?
-            .penalties(
-                args.repeat_penalty,
-                args.repeat_last_n,
-                args.frequency_penalty,
-                args.presence_penalty,
-            );
-        let mut random = RandomState::from_key(key(args.seed)?);
-        let parts = [LocalInputPart::text_token_ids(&tokens)];
-        let prompt = LocalPreparedModelInput::from(LocalModelInput::new(&parts));
-        let mut logits = model
-            .runtime_mut()
-            .prefill(prompt)?
-            .wait()?
-            .into_logits()
-            .context("raw generation requires logits on the local MLX rank")?;
-        for index in 0..max_tokens {
-            let token = sampler.sample(&logits, temperature, Some(&mut random), stream)?;
-            let token_id = token.clone().item::<u32>(stream);
-            if time_to_first_token.is_none() {
-                time_to_first_token = Some(generation_started.elapsed());
-            }
-            output_ids.push(token_id);
-            if eos_token_ids.contains(&token_id) {
-                break;
-            }
-            write_streamed_token(&mut decoder, &mut stdout, &mut streamed_text, token_id)?;
-            if index + 1 == max_tokens {
-                break;
-            }
-            let input = token.try_index_device((.., NewAxis), stream)?;
-            logits = model
-                .runtime_mut()
-                .decode(input)?
-                .wait()?
-                .into_logits()
-                .context("raw generation requires logits on the local MLX rank")?;
-        }
     } else {
         let config = TextGenerationConfig::new(resolved_generation).with_seed(args.seed);
+        let config = if args.mirostat_v2 {
+            config.with_mirostat_v2(args.mirostat_tau, args.mirostat_eta)?
+        } else {
+            config
+        };
         let generator = model.generate_tokens(prompt_token_ids.clone(), config)?;
         for token in generator {
             let token_id = token?.token_id()?;
@@ -2468,12 +2426,7 @@ fn main() -> Result<()> {
     }
 
     let allocator_telemetry = if args.verbose || args.telemetry_json.is_some() {
-        stream.synchronize()?;
-        Some(AllocatorTelemetry {
-            peak_bytes: peak_memory()? as u64,
-            active_bytes: active_memory()? as u64,
-            cache_bytes: cache_memory()? as u64,
-        })
+        Some(local_allocator_telemetry(model.runtime().backend())?)
     } else {
         None
     };
@@ -2486,7 +2439,7 @@ fn main() -> Result<()> {
         eprintln!(
             "model_type: {}, prompt_tokens: {}, generated_tokens: {}",
             model.model_type(),
-            tokens.shape()[1],
+            prompt_token_ids.len(),
             output_ids.len(),
         );
         write_timing_report(
@@ -2646,7 +2599,7 @@ fn main() -> Result<()> {
             }
         }
     } else if args.timing {
-        stream.synchronize()?;
+        synchronize_local_backend(model.runtime().backend())?;
         write_timing_report(
             &mut io::stderr().lock(),
             load_elapsed,
@@ -2690,7 +2643,7 @@ fn main() -> Result<()> {
             plan_explanation: Some(plan_explanation),
             hardware: hardware_profile,
             resources: resource_profile,
-            prompt_tokens: tokens.shape()[1] as usize,
+            prompt_tokens: prompt_token_ids.len(),
             generated_tokens: output_ids.len(),
             stop_reason: stop_reason.label().into(),
             timing: TimingTelemetry::new(
@@ -2715,19 +2668,7 @@ fn main() -> Result<()> {
 }
 
 fn device_plan(device: CliDevice) -> DevicePlan {
-    match device {
-        CliDevice::Cpu => DevicePlan::new("mlx", "cpu:0").expect("valid MLX CPU device"),
-        CliDevice::Gpu(index) => {
-            let family = if cfg!(feature = "cuda") {
-                "cuda"
-            } else if cfg!(target_os = "macos") {
-                "metal"
-            } else {
-                "gpu"
-            };
-            DevicePlan::new("mlx", format!("{family}:{index}")).expect("valid MLX GPU device")
-        }
-    }
+    local_device_plan(device.local())
 }
 
 fn cli_execution_plan(args: &Cli, draft_model: Option<&Path>, embedded_mtp: bool) -> ExecutionPlan {
@@ -2838,152 +2779,26 @@ fn format_weight_store_diagnostics(
     )
 }
 
-#[derive(Clone, Copy)]
-struct ExpertBenchmarkSnapshot {
-    prefill: LocalExpertPassStatistics,
-    decode: LocalExpertPassStatistics,
-    host_experts: usize,
-    device_experts: usize,
-    host_bytes: u64,
-    device_bytes: u64,
-}
-
-fn expert_benchmark_snapshot(
-    model: &LoadedModel<LocalBackend<'static>>,
-) -> Result<ExpertBenchmarkSnapshot> {
-    let report = model
-        .runtime()
-        .session()
-        .expert_cache_report()?
-        .context("sparse expert cache benchmark requires an expert-cache model")?;
-    Ok(ExpertBenchmarkSnapshot {
-        prefill: report.prefill,
-        decode: report.decode,
-        host_experts: report.host_resident_experts,
-        device_experts: report.device_resident_experts,
-        host_bytes: report.host_resident_bytes,
-        device_bytes: report.device_resident_bytes,
-    })
-}
-
-fn tier_delta(
-    after: LocalExpertTierStatistics,
-    before: LocalExpertTierStatistics,
-) -> LocalExpertTierStatistics {
-    LocalExpertTierStatistics {
-        requests: after.requests.saturating_sub(before.requests),
-        hits: after.hits.saturating_sub(before.hits),
-        misses: after.misses.saturating_sub(before.misses),
-        evictions: after.evictions.saturating_sub(before.evictions),
-        eviction_bytes: after.eviction_bytes.saturating_sub(before.eviction_bytes),
-    }
-}
-
-fn print_expert_benchmark_result(
-    label: &str,
-    elapsed: std::time::Duration,
-    before: LocalExpertPassStatistics,
-    after: LocalExpertPassStatistics,
-    occupancy: ExpertBenchmarkSnapshot,
-) {
-    let host = tier_delta(after.host, before.host);
-    let device = tier_delta(after.device, before.device);
+fn print_expert_benchmark_result(label: &str, sample: LocalExpertCacheBenchmarkSample) {
     eprintln!(
         "expert_cache_benchmark_{label}: latency={:.3}s routes={} distinct={} coalesced={} compact_banks={} compact_bytes={} host_hits={} host_misses={} host_evictions={} device_hits={} device_misses={} device_evictions={} host_resident={}({} bytes) device_resident={}({} bytes)",
-        elapsed.as_secs_f64(),
-        after.requested_routes.saturating_sub(before.requested_routes),
-        after.distinct_experts.saturating_sub(before.distinct_experts),
-        after
-            .coalesced_duplicates
-            .saturating_sub(before.coalesced_duplicates),
-        after.compact_banks.saturating_sub(before.compact_banks),
-        after
-            .compact_bank_bytes
-            .saturating_sub(before.compact_bank_bytes),
-        host.hits,
-        host.misses,
-        host.evictions,
-        device.hits,
-        device.misses,
-        device.evictions,
-        occupancy.host_experts,
-        occupancy.host_bytes,
-        occupancy.device_experts,
-        occupancy.device_bytes,
+        sample.elapsed.as_secs_f64(),
+        sample.requested_routes,
+        sample.distinct_experts,
+        sample.coalesced_duplicates,
+        sample.compact_banks,
+        sample.compact_bank_bytes,
+        sample.host_hits,
+        sample.host_misses,
+        sample.host_evictions,
+        sample.device_hits,
+        sample.device_misses,
+        sample.device_evictions,
+        sample.host_resident_experts,
+        sample.host_resident_bytes,
+        sample.device_resident_experts,
+        sample.device_resident_bytes,
     );
-}
-
-fn run_expert_cache_benchmark(
-    model: &mut LoadedModel<LocalBackend<'static>>,
-    tokens: &Array,
-    stream: &Stream,
-) -> Result<()> {
-    let parts = [LocalInputPart::text_token_ids(tokens)];
-    let prompt = LocalPreparedModelInput::from(LocalModelInput::new(&parts));
-
-    let before_cold = expert_benchmark_snapshot(model)?;
-    model.runtime_mut().session_mut().reset()?;
-    let started = Instant::now();
-    let logits = model
-        .runtime_mut()
-        .prefill(prompt.clone())?
-        .wait()?
-        .into_logits()
-        .context("expert-cache benchmark requires logits on the local MLX rank")?;
-    eval([&logits])?;
-    stream.synchronize()?;
-    let cold_elapsed = started.elapsed();
-    let after_cold = expert_benchmark_snapshot(model)?;
-    print_expert_benchmark_result(
-        "cold_prefill",
-        cold_elapsed,
-        before_cold.prefill,
-        after_cold.prefill,
-        after_cold,
-    );
-
-    let before_repeated = after_cold;
-    model.runtime_mut().session_mut().reset()?;
-    let started = Instant::now();
-    let logits = model
-        .runtime_mut()
-        .prefill(prompt)?
-        .wait()?
-        .into_logits()
-        .context("expert-cache benchmark requires logits on the local MLX rank")?;
-    eval([&logits])?;
-    stream.synchronize()?;
-    let repeated_elapsed = started.elapsed();
-    let after_repeated = expert_benchmark_snapshot(model)?;
-    print_expert_benchmark_result(
-        "repeated_prefill",
-        repeated_elapsed,
-        before_repeated.prefill,
-        after_repeated.prefill,
-        after_repeated,
-    );
-
-    let last = tokens.try_index_device((.., tokens.dim(1) - 1..), stream)?;
-    let before_decode = after_repeated;
-    let started = Instant::now();
-    let logits = model
-        .runtime_mut()
-        .decode(last)?
-        .wait()?
-        .into_logits()
-        .context("expert-cache benchmark requires logits on the local MLX rank")?;
-    eval([&logits])?;
-    stream.synchronize()?;
-    let decode_elapsed = started.elapsed();
-    let after_decode = expert_benchmark_snapshot(model)?;
-    print_expert_benchmark_result(
-        "cached_decode",
-        decode_elapsed,
-        before_decode.decode,
-        after_decode.decode,
-        after_decode,
-    );
-    Ok(())
 }
 
 fn validate_args(args: &Cli) -> Result<()> {
@@ -3617,17 +3432,17 @@ mod tests {
     use super::{
         apply_automatic_plan, artifact_file_stamps, base_automatic_candidates,
         cached_automatic_report, choose_automatic_residency, cli_execution_plan, device_plan,
-        discover_local_hardware, embedded_mtp_count, eval, format_bytes,
-        format_weight_store_diagnostics, median, model_advertises_embedded_mtp,
-        read_automatic_feedback, requested_load_quantization, select_cached_gguf_from_revisions,
+        discover_local_hardware, embedded_mtp_count, format_bytes, format_weight_store_diagnostics,
+        median, model_advertises_embedded_mtp, read_automatic_feedback,
+        requested_load_quantization, select_cached_gguf_from_revisions,
         select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
         select_unique_cached_gguf, should_report_stop_reason, split_hf_model_spec, stop_reason,
         use_semantic_generation, validate_args, validate_artifact_pair, write_auto_plan_cache,
-        write_semantic_event, write_timing_report, Array, AutoMode, AutoPlanCacheKey,
-        AutomaticCliOverrides, CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType,
-        DraftingPlan, ExecutionPlan, MtpDraftDevice, MtpSchedulerOptions, NativeToolSupport,
-        ReasoningOutput, ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent,
-        SemanticSupport, StopReason, WeightQuantization, WeightTransformationPlan,
+        write_semantic_event, write_timing_report, AutoMode, AutoPlanCacheKey,
+        AutomaticCliOverrides, CachedGgufRole, Cli, CliDevice, CliToolChoice, DraftingPlan,
+        ExecutionPlan, MtpDraftDevice, MtpSchedulerOptions, NativeToolSupport, ReasoningOutput,
+        ReasoningStream, ResidencyPlan, ResolvedModel, SemanticEvent, SemanticSupport, StopReason,
+        WeightQuantization, WeightTransformationPlan,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -4448,19 +4263,6 @@ mod tests {
             .unwrap();
             validate_args(&with_drafter).unwrap();
         }
-    }
-
-    #[test]
-    #[ignore = "requires an MLX execution device even when selecting the CPU stream"]
-    fn cpu_execution_device_runs_mlx_work() {
-        let context = super::ExecutionContext::new(CliDevice::Cpu.mlx());
-        assert_eq!(context.device().get_type().unwrap(), DeviceType::Cpu);
-        let values = Array::from_slice(&[1.0f32, 2.0], &[2])
-            .copy(context.stream())
-            .unwrap();
-        eval([&values]).unwrap();
-        context.stream().synchronize().unwrap();
-        assert_eq!(values.evaluated().unwrap().as_slice::<f32>(), &[1.0, 2.0]);
     }
 
     #[test]
