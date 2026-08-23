@@ -300,56 +300,17 @@ impl QwenConditionalPipelineBindings {
                     modality @ (input::Modality::Image | input::Modality::Video),
                     input::InputPayload::Tensor(tensor),
                 ) => {
-                    let grid = part.metadata.patch_grid.ok_or_else(|| {
-                        Error::Parallel(format!(
-                            "Qwen3.5 {} input requires patch_grid metadata",
-                            modality.as_str()
-                        ))
-                    })?;
-                    let grid = input::patch_grid_from_array(grid, stream)?;
-                    let merge = parsed
-                        .vision
-                        .as_ref()
-                        .expect("validated conditional vision")
-                        .spatial_merge_size;
-                    let merged = grid
-                        .iter()
-                        .try_fold(0_i32, |total, &(time, height, width)| {
-                            if time <= 0
-                                || height <= 0
-                                || width <= 0
-                                || height % merge != 0
-                                || width % merge != 0
-                            {
-                                return Err(Error::Parallel(
-                                    "Qwen3.5 patch grid is not divisible by spatial merge size"
-                                        .into(),
-                                ));
-                            }
-                            total
-                                .checked_add(time * (height / merge) * (width / merge))
-                                .ok_or_else(|| {
-                                    Error::Parallel("Qwen3.5 placeholder count overflowed".into())
-                                })
-                        })?;
-                    let token_id = if modality == input::Modality::Image {
-                        parsed.image_token_id
-                    } else {
-                        parsed.video_token_id
-                    }
-                    .ok_or_else(|| Error::Parallel("Qwen3.5 media token ID is absent".into()))?;
-                    token_storage.push(input::token_ids_array(
-                        &vec![
-                            u32::try_from(token_id).map_err(|_| Error::Parallel(
-                                "negative Qwen3.5 media token".into()
-                            ))?;
-                            usize::try_from(merged).map_err(|_| Error::Parallel(
-                                "invalid Qwen3.5 placeholder count".into()
-                            ))?
-                        ],
+                    let ingress = super::qwen_media_ingress(
+                        modality,
+                        tensor,
+                        part.metadata,
                         stream,
-                    )?);
-                    grids.push(grid);
+                        |input| {
+                            eredu_architectures::media_plan::qwen_hybrid_ingress(&parsed, input)
+                        },
+                    )?;
+                    token_storage.push(ingress.tokens);
+                    grids.push(ingress.patch_grid);
                     pixels.push(tensor.clone());
                     let token = token_storage.len() - 1;
                     let grid = grids.len() - 1;
@@ -1371,52 +1332,20 @@ impl QwenHybridModel {
                     modality @ (input::Modality::Image | input::Modality::Video),
                     input::InputPayload::Tensor(tensor),
                 ) => {
-                    let grid = part.metadata.patch_grid.ok_or_else(|| {
-                        Exception::custom(format!(
-                            "Qwen3.5 {} input requires patch_grid metadata",
-                            modality.as_str()
-                        ))
-                    })?;
-                    let grid = input::patch_grid_from_array(grid, stream)?;
-                    let merge = self
-                        .parsed
-                        .vision
-                        .as_ref()
-                        .expect("conditional vision")
-                        .spatial_merge_size;
-                    let merged = grid
-                        .iter()
-                        .try_fold(0_i32, |total, &(time, height, width)| {
-                            if time <= 0
-                                || height <= 0
-                                || width <= 0
-                                || height % merge != 0
-                                || width % merge != 0
-                            {
-                                return Err(Exception::custom(
-                                    "Qwen3.5 patch grid is not divisible by merge size",
-                                ));
-                            }
-                            total
-                                .checked_add(time * (height / merge) * (width / merge))
-                                .ok_or_else(|| Exception::custom("Qwen3.5 media length overflowed"))
-                        })?;
-                    let token_id = if modality == input::Modality::Image {
-                        self.parsed.image_token_id
-                    } else {
-                        self.parsed.video_token_id
-                    }
-                    .expect("validated media token");
-                    token_storage.push(input::token_ids_array(
-                        &vec![
-                            u32::try_from(token_id)
-                                .map_err(|_| Exception::custom("negative Qwen3.5 media token"))?;
-                            usize::try_from(merged)
-                                .map_err(|_| Exception::custom("invalid Qwen3.5 media length"))?
-                        ],
+                    let ingress = super::qwen_media_ingress(
+                        modality,
+                        tensor,
+                        part.metadata,
                         stream,
-                    )?);
-                    grids.push(grid);
+                        |input| {
+                            eredu_architectures::media_plan::qwen_hybrid_ingress(
+                                &self.parsed,
+                                input,
+                            )
+                        },
+                    )?;
+                    token_storage.push(ingress.tokens);
+                    grids.push(ingress.patch_grid);
                     pixels.push(tensor.clone());
                     let token = token_storage.len() - 1;
                     let grid = grids.len() - 1;

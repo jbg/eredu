@@ -424,7 +424,11 @@ padding logits, and subsampling masks from portable extents. Concrete backends
 materialize those declared values and may perform generic padding or dtype
 conversion, but must not independently reconstruct family mask or geometry
 policy. Gemma 4 exposes this contract through its vision and audio ingress
-part/batch plans.
+part/batch plans. Qwen vision ingress validates the prepared payload against
+its patch grid with checked geometry, selects the image or video placeholder
+token, and returns the exact placeholder span and validated grid; an accelerator
+adapter only reads the small metadata tensor and materializes the returned token
+array.
 
 Layered model execution topology follows the same ownership rule. Loaders and
 materializers derive execution graphs and per-group unit counts through

@@ -6,7 +6,11 @@
 
 use eredu_core::CapabilityError;
 
-use crate::qwen::vision::{VisionAttentionPolicy, VisionConfig};
+use crate::qwen::{
+    hybrid::ParsedHybridConfig,
+    vision::{VisionAttentionPolicy, VisionConfig},
+    vl::ModelArgs as QwenVlModelArgs,
+};
 
 /// A non-text input modality presented to an architecture media tower.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +64,17 @@ pub struct MediaShapePlan {
     pub decoder_positions: u64,
     /// Conservative count of temporary execution scalars.
     pub execution_workspace_scalars: u64,
+}
+
+/// Architecture-owned Qwen image/video ingress policy for one prepared tensor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QwenVisionIngressPlan {
+    /// Placeholder token selected for the input modality.
+    pub placeholder_token_id: u32,
+    /// Decoder placeholder span after spatial merging.
+    pub placeholder_count: u64,
+    /// Validated `(time, height, width)` rows consumed by Qwen position policy.
+    pub patch_grid: Vec<(i32, i32, i32)>,
 }
 
 fn positive(value: i32, field: &'static str) -> Result<u64, CapabilityError> {
@@ -400,6 +415,70 @@ pub fn qwen_hybrid_vision(
     config
         .ok_or_else(|| unsupported(architecture, "loaded model has no vision configuration"))
         .and_then(|config| qwen_vision(config, input, architecture))
+}
+
+fn qwen_vision_ingress(
+    config: Option<&VisionConfig>,
+    image_token_id: Option<i32>,
+    video_token_id: Option<i32>,
+    input: &PreparedMediaInput,
+    architecture: &str,
+) -> Result<QwenVisionIngressPlan, CapabilityError> {
+    let shape = qwen_hybrid_vision(config, input, architecture)?;
+    let token_id = match input.modality {
+        MediaModality::Image => image_token_id,
+        MediaModality::Video => video_token_id,
+        MediaModality::Audio => None,
+    }
+    .ok_or_else(|| unsupported(architecture, "prepared media placeholder token is absent"))?;
+    let placeholder_token_id =
+        u32::try_from(token_id).map_err(|_| CapabilityError::InvalidConfiguration {
+            field: "Qwen media placeholder token",
+            detail: format!("expected a non-negative token ID, got {token_id}"),
+        })?;
+    let metadata = input
+        .patch_grid
+        .as_ref()
+        .ok_or_else(|| unsupported(architecture, "prepared Qwen media has no grid_thw metadata"))?;
+    let patch_grid = metadata
+        .values
+        .chunks_exact(3)
+        .map(|row| (row[0], row[1], row[2]))
+        .collect();
+    Ok(QwenVisionIngressPlan {
+        placeholder_token_id,
+        placeholder_count: shape.decoder_positions,
+        patch_grid,
+    })
+}
+
+/// Validates prepared Qwen3-VL media and derives its execution ingress policy.
+pub fn qwen_vl_ingress(
+    args: &QwenVlModelArgs,
+    input: &PreparedMediaInput,
+) -> Result<QwenVisionIngressPlan, CapabilityError> {
+    qwen_vision_ingress(
+        Some(&args.vision),
+        Some(args.image_token_id),
+        Some(args.video_token_id),
+        input,
+        &args.model_type,
+    )
+}
+
+/// Validates prepared conditional Qwen3.5 media and derives its execution
+/// ingress policy.
+pub fn qwen_hybrid_ingress(
+    args: &ParsedHybridConfig,
+    input: &PreparedMediaInput,
+) -> Result<QwenVisionIngressPlan, CapabilityError> {
+    qwen_vision_ingress(
+        args.vision.as_ref(),
+        args.image_token_id,
+        args.video_token_id,
+        input,
+        &args.text.model_type,
+    )
 }
 
 fn gemma_valid_patch_count(
@@ -997,10 +1076,30 @@ mod tests {
         assert_eq!(plan.decoder_positions, 1);
         assert!(plan.execution_workspace_scalars > 4 * 8);
 
+        let ingress =
+            qwen_vision_ingress(Some(&config), Some(22), Some(23), &prepared, "qwen3_vl").unwrap();
+        assert_eq!(ingress.placeholder_token_id, 22);
+        assert_eq!(ingress.placeholder_count, 1);
+        assert_eq!(ingress.patch_grid, vec![(1, 2, 2)]);
+
+        prepared.modality = MediaModality::Video;
+        assert_eq!(
+            qwen_vision_ingress(Some(&config), Some(22), Some(23), &prepared, "qwen3_vl",)
+                .unwrap()
+                .placeholder_token_id,
+            23
+        );
+
         prepared.patch_grid.as_mut().unwrap().values = vec![1, 2, 4];
         assert!(matches!(
-            qwen_vision(&config, &prepared, "qwen3_vl"),
+            qwen_vision_ingress(Some(&config), Some(22), Some(23), &prepared, "qwen3_vl",),
             Err(CapabilityError::UnsupportedInput { .. })
+        ));
+
+        prepared.patch_grid.as_mut().unwrap().values = vec![i32::MAX, i32::MAX, i32::MAX];
+        assert!(matches!(
+            qwen_vision_ingress(Some(&config), Some(22), Some(23), &prepared, "qwen3_vl",),
+            Err(CapabilityError::ArithmeticOverflow { .. })
         ));
     }
 

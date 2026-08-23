@@ -238,51 +238,15 @@ impl QwenVlPipelineBindings {
                     modality @ (input::Modality::Image | input::Modality::Video),
                     input::InputPayload::Tensor(tensor),
                 ) => {
-                    let grid = part.metadata.patch_grid.ok_or_else(|| {
-                        Error::Parallel(format!(
-                            "Qwen3-VL {} input requires patch_grid metadata",
-                            modality.as_str()
-                        ))
-                    })?;
-                    let grid = input::patch_grid_from_array(grid, stream)?;
-                    let merge = args.vision.spatial_merge_size;
-                    let merged = grid
-                        .iter()
-                        .try_fold(0_i32, |total, &(time, height, width)| {
-                            if time <= 0
-                                || height <= 0
-                                || width <= 0
-                                || height % merge != 0
-                                || width % merge != 0
-                            {
-                                return Err(Error::Parallel(
-                                    "Qwen3-VL patch grid is not divisible by spatial merge size"
-                                        .into(),
-                                ));
-                            }
-                            total
-                                .checked_add(time * (height / merge) * (width / merge))
-                                .ok_or_else(|| {
-                                    Error::Parallel("Qwen3-VL placeholder count overflowed".into())
-                                })
-                        })?;
-                    let token_id = if modality == input::Modality::Image {
-                        args.image_token_id
-                    } else {
-                        args.video_token_id
-                    };
-                    token_storage.push(input::token_ids_array(
-                        &vec![
-                            u32::try_from(token_id).map_err(|_| Error::Parallel(
-                                "negative Qwen3-VL media token".into()
-                            ))?;
-                            usize::try_from(merged).map_err(|_| Error::Parallel(
-                                "invalid Qwen3-VL placeholder count".into()
-                            ))?
-                        ],
+                    let ingress = super::qwen_media_ingress(
+                        modality,
+                        tensor,
+                        part.metadata,
                         stream,
-                    )?);
-                    grids.push(grid);
+                        |input| eredu_architectures::media_plan::qwen_vl_ingress(&args, input),
+                    )?;
+                    token_storage.push(ingress.tokens);
+                    grids.push(ingress.patch_grid);
                     pixels.push(tensor.clone());
                     let token = token_storage.len() - 1;
                     let grid = grids.len() - 1;
@@ -777,48 +741,17 @@ impl QwenVlModel {
                     modality @ (input::Modality::Image | input::Modality::Video),
                     input::InputPayload::Tensor(tensor),
                 ) => {
-                    let grid = part.metadata.patch_grid.ok_or_else(|| {
-                        Exception::custom(format!(
-                            "Qwen3-VL {} input requires patch_grid metadata",
-                            modality.as_str()
-                        ))
-                    })?;
-                    let grid = input::patch_grid_from_array(grid, stream)?;
-                    let merge = self.args.vision.spatial_merge_size;
-                    let merged = grid
-                        .iter()
-                        .try_fold(0_i32, |total, &(time, height, width)| {
-                            if time <= 0
-                                || height <= 0
-                                || width <= 0
-                                || height % merge != 0
-                                || width % merge != 0
-                            {
-                                return Err(Exception::custom(
-                                    "Qwen3-VL patch grid is not divisible by spatial merge size",
-                                ));
-                            }
-                            total
-                                .checked_add(time * (height / merge) * (width / merge))
-                                .ok_or_else(|| {
-                                    Exception::custom("Qwen3-VL placeholder count overflowed")
-                                })
-                        })?;
-                    let token_id = if modality == input::Modality::Image {
-                        self.args.image_token_id
-                    } else {
-                        self.args.video_token_id
-                    };
-                    let ids = vec![
-                        u32::try_from(token_id).map_err(|_| Exception::custom(
-                            "negative Qwen3-VL media token"
-                        ))?;
-                        usize::try_from(merged).map_err(|_| Exception::custom(
-                            "invalid Qwen3-VL placeholder count"
-                        ))?
-                    ];
-                    token_storage.push(input::token_ids_array(&ids, stream)?);
-                    grids.push(grid);
+                    let ingress = super::qwen_media_ingress(
+                        modality,
+                        tensor,
+                        part.metadata,
+                        stream,
+                        |input| {
+                            eredu_architectures::media_plan::qwen_vl_ingress(&self.args, input)
+                        },
+                    )?;
+                    token_storage.push(ingress.tokens);
+                    grids.push(ingress.patch_grid);
                     pixels.push(tensor.clone());
                     let token_index = token_storage.len() - 1;
                     let grid_index = grids.len() - 1;
