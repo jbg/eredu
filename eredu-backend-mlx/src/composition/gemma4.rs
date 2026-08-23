@@ -1619,7 +1619,7 @@ fn load_store(
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
-        move |address, _path, unit, store, _stream| {
+        move |_ordinal, address, _path, unit, store, _stream| {
             let recipes = if !external_experts && address.group() == 2 {
                 let layer = address.index();
                 if binding_args.layer_policy(layer).is_some_and(|policy| {
@@ -1800,7 +1800,7 @@ fn load_parallel_store(
         move |_modules, store| {
             shard_layer_bindings(global_static_bindings, "", store, &static_layout)
         },
-        move |address, path, local, store, stream| {
+        move |_ordinal, address, path, local, store, stream| {
             if address.group() != decoder_group {
                 return build_module_bindings(&MlxModule::new(local.clone()), "", store)
                     .map_err(Into::into);

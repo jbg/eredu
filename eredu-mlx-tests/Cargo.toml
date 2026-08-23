@@ -7,8 +7,19 @@ repository.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "MLX-specific integration tests for the Eredu facade"
+description = "MLX-specific test harness for the Eredu facade"
 autotests = false
+
+[lib]
+name = "eredu"
+path = "../eredu/src/lib.rs"
+doctest = false
+
+[features]
+default = ["mlx-test-support"]
+mlx = ["dep:eredu-backend-mlx"]
+mlx-test-support = ["mlx", "eredu-backend-mlx/test-support"]
+cuda = ["mlx", "eredu-backend-mlx/cuda"]
 
 [[test]]
 name = "automatic_planner_api"
@@ -27,9 +38,26 @@ name = "native_tool_checkpoints"
 path = "../eredu/tests/native_tool_checkpoints.rs"
 
 [dependencies]
-eredu = { path = "../eredu", default-features = false, features = ["mlx-test-support"] }
-eredu-architectures.workspace = true
-eredu-backend-mlx = { workspace = true, features = ["test-support"] }
+eredu-backend-mlx = { workspace = true, optional = true }
+eredu-core.workspace = true
+eredu-text = { workspace = true, default-features = false }
+eredu-gguf.workspace = true
+eredu-checkpoint.workspace = true
+eredu-nn = { workspace = true, default-features = false }
 eredu-runtime.workspace = true
-serde_json.workspace = true
+eredu-architectures.workspace = true
+
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+idna_adapter = "1"
+thiserror = "2"
+serde_json = "1"
+minijinja = "2"
+sha2.workspace = true
+llguidance = { version = "=1.7.6", default-features = false, features = ["ahash", "lark"] }
+toktrie_hf_tokenizers = "=1.7.6"
+
+[dev-dependencies]
+safetensors = "0.8"
 tempfile.workspace = true

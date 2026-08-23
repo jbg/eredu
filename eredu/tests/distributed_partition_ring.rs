@@ -109,7 +109,7 @@ fn render_failure(rank: usize, output: &Output) -> String {
 }
 
 /// Run with:
-/// `cargo test -p eredu --features mlx-test-support --lib distributed_partition_ring::ring_two_process_partition_load -- --ignored --exact --nocapture`
+/// `cargo test -p eredu-mlx-tests --lib distributed_partition_ring::ring_two_process_partition_load -- --ignored --exact --nocapture`
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_partition_load() {

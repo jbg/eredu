@@ -400,7 +400,7 @@ pub fn load(
                 static_recipes.as_ref(),
             )
         },
-        move |_address, _path, unit, store, _stream| {
+        move |_ordinal, _address, _path, unit, store, _stream| {
             bindings(&MlxModule::new(unit), store, unit_recipes.as_ref())
         },
     )?;
@@ -510,7 +510,7 @@ fn load_parallel(
                 static_sharding.as_ref(),
             )
         },
-        move |address, _path, _local, store, stream| {
+        move |_ordinal, address, _path, _local, store, stream| {
             let global = build_addressed_unit(&unit_config, address, stream)?;
             shard_layer_bindings(
                 bindings(&MlxModule::new(global), store, unit_recipes.as_ref())?,

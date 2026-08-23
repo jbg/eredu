@@ -637,7 +637,7 @@ where
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
-        |_address, _path, unit, store, _stream| {
+        |_ordinal, _address, _path, unit, store, _stream| {
             build_module_bindings(&MlxModule::new(unit), "", store).map_err(Into::into)
         },
     )
@@ -648,8 +648,9 @@ where
 /// Parallel composition uses this entry point to provide rank-local checkpoint
 /// selections while retaining the same residency, overlap, and completion
 /// algorithm used by replicated execution. The unit-binding callback receives
-/// the architecture's validated group-local address and canonical unit path;
-/// callers must not reconstruct either identity from residency order.
+/// the architecture's validated flat ordinal, group-local address, and
+/// canonical unit path; callers must not reconstruct those identities from
+/// residency order.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_layerwise_policy_with_bindings<A, S, P, I, SB, UB>(
     store: SharedCheckpointSource,
@@ -674,6 +675,7 @@ where
         &dyn eredu_checkpoint::store::CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error>,
     UB: FnMut(
+        usize,
         ExecutionUnitAddress,
         &str,
         A::Unit,
@@ -727,7 +729,7 @@ where
         let unit = architecture
             .build_unit(address.group(), address.index(), stream)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        let bindings = unit_bindings(address, &path, unit, store.as_ref(), stream)?;
+        let bindings = unit_bindings(index, address, &path, unit, store.as_ref(), stream)?;
         let bytes = binding_bytes(&bindings)?;
         layer_parameter_bytes = layer_parameter_bytes
             .checked_add(bytes)

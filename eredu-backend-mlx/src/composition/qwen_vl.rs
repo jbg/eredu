@@ -1314,7 +1314,7 @@ fn load_store(
             )
             .map_err(Into::into)
         },
-        move |address, _path, unit, store, _| {
+        move |_ordinal, address, _path, unit, store, _| {
             let flat = if address.group() == 0 {
                 address.index()
             } else {

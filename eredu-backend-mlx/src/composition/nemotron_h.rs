@@ -459,7 +459,7 @@ fn load_neutral(
             )
             .map_err(Into::into)
         },
-        move |address, _path, unit, store, _| {
+        move |_ordinal, address, _path, unit, store, _| {
             build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(unit),
                 "",
@@ -634,7 +634,7 @@ fn load_neutral_parallel(
             )?;
             shard_layer_bindings(bindings, "", store, &static_layout)
         },
-        move |address, path, _local, store, stream| {
+        move |_ordinal, address, path, _local, store, stream| {
             let global = <NeutralArchitecture as LayeredArchitecture<
                 MlxNeuralBackend,
                 MlxHybridState,

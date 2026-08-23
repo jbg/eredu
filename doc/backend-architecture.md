@@ -576,10 +576,11 @@ composition:
 - generic layerwise policy construction derives its execution graph and unit
   layout directly from the concrete neutral architecture before binding
   checkpoint units; composition cannot supply or reconstruct that layout.
-  Unit-binding adapters receive the validated group-local address and the
-  architecture's canonical `unit_path`, rather than a flattened residency
-  ordinal, so heterogeneous group boundaries and parameter roots remain
-  architecture-owned; and
+  Unit-binding adapters receive the validated architecture-flat ordinal,
+  group-local address, and canonical `unit_path`. Composite-family recipe
+  selection uses the flat ordinal instead of mistaking a group-local index for
+  a model-wide layer index, while group ownership and parameter roots remain
+  authoritative in the address and path; and
 - MLX events provide exact completion while retaining arrays and source
   resources required by submitted work.
 
@@ -635,8 +636,9 @@ The repository mechanically verifies stable dependency and behavior boundaries:
 - the feature-disabled `portable_facade` and `backend_conformance` suites compile
   and exercise the public contracts through mock backends, with the facade's
   complete normal, build, and development dependency graph remaining free of
-  MLX; MLX-specific facade tests are owned by the separate `eredu-mlx-tests`
-  package; and
+  MLX; the separate `eredu-mlx-tests` package compiles the facade source as
+  its own library target and therefore owns and runs the facade's MLX unit
+  tests as well as the MLX integration targets; and
 - architecture, runtime, and backend conformance tests cover the relevant
   production contracts.
 

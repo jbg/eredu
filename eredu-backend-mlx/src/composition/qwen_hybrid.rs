@@ -2220,7 +2220,7 @@ fn load_conditional_store(
             )
             .map_err(Into::into)
         },
-        move |address, _path, unit, store, _| {
+        move |_ordinal, address, _path, unit, store, _| {
             let recipes = if address.group() == 0 {
                 BTreeMap::new()
             } else {
@@ -2309,7 +2309,7 @@ fn load_store(
             build_module_bindings_with_recipes(&MlxModule::new(modules.clone()), "", store, recipes)
                 .map_err(Into::into)
         },
-        move |address, _path, unit, store, _| {
+        move |_ordinal, address, _path, unit, store, _| {
             let flat = if address.group() == 0 {
                 address.index()
             } else {

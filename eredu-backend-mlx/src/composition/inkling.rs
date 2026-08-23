@@ -1717,7 +1717,7 @@ fn load_store(
             build_module_bindings_with_recipes_excluding(&module, "", store, recipes, |_| false)
                 .map_err(Into::into)
         },
-        move |_address, _path, unit, store, _stream| {
+        move |_ordinal, _address, _path, unit, store, _stream| {
             let module = MlxModule::new(unit);
             let recipes =
                 crate::composition::inkling_expert::module_recipes(&module, &unit_args, store)?;
@@ -1877,7 +1877,7 @@ fn load_parallel_store(
         move |_modules, store| {
             shard_layer_bindings(global_static_bindings, "", store, &static_layout)
         },
-        move |address, path, _local, store, stream| {
+        move |_ordinal, address, path, _local, store, stream| {
             let global =
                 MlxModule::new(
                     <NeutralArchitecture as LayeredArchitecture<

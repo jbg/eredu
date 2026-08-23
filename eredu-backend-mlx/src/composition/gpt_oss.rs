@@ -501,7 +501,7 @@ pub fn load_neutral_with_store(
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
-        move |address, _path, unit, store, _stream| {
+        move |_ordinal, address, _path, unit, store, _stream| {
             let index = address.index();
             let recipes = if external_experts {
                 BTreeMap::new()
@@ -643,7 +643,7 @@ fn load_neutral_parallel_with_store(
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, "", store, &static_layout)
         },
-        move |address, path, _local, store, stream| {
+        move |_ordinal, address, path, _local, store, stream| {
             let layer = address.index();
             let global = eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(
                 &binding_args,

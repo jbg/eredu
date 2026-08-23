@@ -267,14 +267,14 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     let loaded = load_test_model(&directory, ModelLoadOptions::default(), stream, stream).unwrap();
     assert_eq!(loaded.model_family(), ModelKind::Qwen35);
     assert_eq!(loaded.effective_model_type(), "qwen3_5_text");
-    let Model::Qwen35(qwen) = loaded.into_inner().into_complete().unwrap() else {
+    let Model::Qwen35(kind, qwen) = loaded.into_inner().into_complete().unwrap() else {
         panic!("expected canonical Qwen3.5 model");
     };
     let runtime = eredu_core::ModelRuntime::from_prepared(
         eredu_backend_mlx::native::backend(stream, stream),
         eredu_core::PreparedModel::new(
             eredu_backend_mlx::testing::backend::MlxModel::complete_for_test(
-                Model::Qwen35(qwen),
+                Model::Qwen35(kind, qwen),
                 std::num::NonZeroU8::new(4).unwrap(),
             ),
         ),
@@ -1174,7 +1174,7 @@ fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
             .into_inner()
             .into_complete()
             .unwrap();
-        let Model::Llama(model) = &loaded else {
+        let Model::Llama(_, model) = &loaded else {
             panic!("expected Llama GGUF model");
         };
         let materialization = model.metadata().materialization().unwrap();
@@ -2046,7 +2046,7 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
     .into_inner()
     .into_complete()
     .unwrap();
-    let Model::GptOss(mut model) = model else {
+    let Model::GptOss(_, mut model) = model else {
         panic!("expected GPT-OSS model")
     };
     assert_eq!(
@@ -2961,7 +2961,7 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     .into_inner()
     .into_complete()
     .unwrap();
-    let Model::Qwen3Vl(model) = &quantized else {
+    let Model::Qwen3Vl(_, model) = &quantized else {
         panic!("expected Qwen3-VL model");
     };
     assert_eq!(
@@ -3022,7 +3022,7 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     .into_inner()
     .into_complete()
     .unwrap();
-    let Model::Qwen3Vl(saved_model) = &saved_quantized else {
+    let Model::Qwen3Vl(_, saved_model) = &saved_quantized else {
         panic!("expected saved Qwen3-VL model");
     };
     assert_eq!(
@@ -3101,7 +3101,7 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
     .into_inner()
     .into_complete()
     .unwrap();
-    let Model::Qwen35(quantized_model) = &quantized else {
+    let Model::Qwen35(_, quantized_model) = &quantized else {
         panic!("expected Qwen3.5-MoE model");
     };
     assert_eq!(

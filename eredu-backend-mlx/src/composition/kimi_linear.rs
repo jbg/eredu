@@ -414,7 +414,7 @@ fn load_neutral(
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
-        move |address, _path, unit, store, _| {
+        move |_ordinal, address, _path, unit, store, _| {
             let index = address.index();
             build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(unit),
@@ -549,7 +549,7 @@ fn load_neutral_parallel(
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, "", store, &static_layout)
         },
-        move |address, path, _local, store, stream| {
+        move |_ordinal, address, path, _local, store, stream| {
             let layer = address.index();
             let global = Block::<MlxNeuralBackend>::new(&binding_args, layer, stream)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;

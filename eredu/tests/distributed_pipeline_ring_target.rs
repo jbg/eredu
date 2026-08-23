@@ -7,9 +7,7 @@ fn run_library_ring_selection(selection: &str) {
         .args([
             "test",
             "-p",
-            "eredu",
-            "--features",
-            "mlx-test-support",
+            "eredu-mlx-tests",
             "--lib",
             selection,
             "--",

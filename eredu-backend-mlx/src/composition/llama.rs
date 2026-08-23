@@ -744,7 +744,7 @@ fn load_neutral_llama_parallel(
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, "", store, &binding_layout)
         },
-        |address, path, _local, store, stream| {
+        |_ordinal, address, path, _local, store, stream| {
             let index = address.index();
             let global = NeutralBlock::new(&binding_args, index, stream)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;

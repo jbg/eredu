@@ -348,7 +348,7 @@ fn load_neutral_qwen(
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
-        move |address, _path, unit, store, _stream| {
+        move |_ordinal, address, _path, unit, store, _stream| {
             let index = address.index();
             let recipes = if external_experts {
                 BTreeMap::new()
@@ -1304,7 +1304,7 @@ fn load_neutral_qwen_parallel(
             let bindings = build_module_bindings(&global, "", store)?;
             shard_layer_bindings(bindings, "", store, &binding_layout)
         },
-        |address, path, _local, store, stream| {
+        |_ordinal, address, path, _local, store, stream| {
             let index = address.index();
             let global = eredu_architectures::qwen::new_block::<MlxNeuralBackend>(
                 &binding_args,
