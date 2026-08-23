@@ -21,45 +21,42 @@ use eredu_runtime::{
 };
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
-use crate::{
-    backend::mlx::{
-        error::Error,
-        nn::shared::{MlxModule, MlxNeuralBackend},
-        runtime::{
-            cache::{
-                residency::{open_prompt_cache, CacheResidencyManager},
-                state::MlxKeyValueState,
-            },
-            checkpoint::{
-                binding::{
-                    binding_bytes, build_module_binding_plan_with_recipes_excluding,
-                    build_module_bindings, build_module_bindings_with_recipes_excluding,
-                    parameter_name_in_targets, parameter_role_targets,
-                    populate_module_from_lease_excluding,
-                },
-                load::gguf_quantization_configs,
-                quantization::should_quantize_on_load,
-                store::open_gguf_checkpoint_source,
-            },
-            execution::{
-                generic::{
-                    prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
-                    MlxUnitPopulator,
-                },
-                layerwise::{
-                    open_safetensors_weight_store, quantize_parameterized_store,
-                    shard_layer_bindings,
-                },
-            },
-            media::input,
-            residency::expert_cache::{ExpertCache, ExpertCacheReport, ExpertCatalogEntry},
-            residency::manager::ResidentUnitLease,
+use crate::backend::mlx::{
+    error::Error,
+    nn::shared::{MlxModule, MlxNeuralBackend},
+    runtime::{
+        cache::{
+            residency::{open_prompt_cache, CacheResidencyManager},
+            state::MlxKeyValueState,
         },
+        checkpoint::{
+            binding::{
+                binding_bytes, build_module_binding_plan_with_recipes_excluding,
+                build_module_bindings, build_module_bindings_with_recipes_excluding,
+                parameter_name_in_targets, parameter_role_targets,
+                populate_module_from_lease_excluding,
+            },
+            load::gguf_quantization_configs,
+            quantization::should_quantize_on_load,
+            store::open_gguf_checkpoint_source,
+        },
+        execution::{
+            generic::{
+                prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
+                MlxUnitPopulator,
+            },
+            layerwise::{
+                open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
+            },
+        },
+        media::input,
+        residency::expert_cache::{ExpertCache, ExpertCacheReport, ExpertCatalogEntry},
+        residency::manager::ResidentUnitLease,
     },
-    core::cache::{
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-        PromptCacheTopology,
-    },
+};
+use eredu_core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheTopology,
 };
 
 pub mod expert {

@@ -17,15 +17,16 @@ backend development and backend-specific low-level tooling:
 
 ```toml
 [dependencies]
+eredu-core = "0.1"
 eredu-backend-mlx = "0.1"
 ```
 
 ```rust,no_run
 use eredu_backend_mlx::{
-    core::load_model,
     native::{backend, Device, DeviceType, ExecutionContext},
     ModelLoadOptions,
 };
+use eredu_core::load_model;
 
 let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
 let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));

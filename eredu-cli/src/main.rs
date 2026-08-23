@@ -2498,28 +2498,6 @@ fn main() -> Result<()> {
             "mlx_cache_memory: {}",
             format_bytes(allocator.cache_bytes as usize)
         );
-        if let Some(stats) = model.runtime().session().native_quantization_stats() {
-            eprintln!(
-                "native_quantization: {} tensors / {}, fallback: {} tensors / {} checkpoint bytes",
-                stats.native_tensor_count,
-                format_bytes(stats.native_bytes as usize),
-                stats.fallback_tensor_count,
-                format_bytes(stats.fallback_checkpoint_bytes as usize),
-            );
-            eprintln!(
-                "native_quantization_formats: Q4_K={} tensors/{}, Q5_K={} tensors/{}, Q6_K={} tensors/{}, Q5_1={} tensors/{}, Q8_0={} tensors/{}",
-                stats.q4k_tensor_count,
-                format_bytes(stats.q4k_bytes as usize),
-                stats.q5k_tensor_count,
-                format_bytes(stats.q5k_bytes as usize),
-                stats.q6k_tensor_count,
-                format_bytes(stats.q6k_bytes as usize),
-                stats.q5_1_tensor_count,
-                format_bytes(stats.q5_1_bytes as usize),
-                stats.q8_0_tensor_count,
-                format_bytes(stats.q8_0_bytes as usize),
-            );
-        }
         if let Some(report) = model.runtime().session().residency_report()? {
             let offload = report.offload();
             eprintln!(

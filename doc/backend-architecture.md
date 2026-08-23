@@ -33,7 +33,9 @@ application-facing adapter as an explicit flat root API and deliberately makes
 its reusable `backend` module tree public for backend authors. Family
 composition and architecture-erased dispatch remain crate-private. The
 feature-gated `testing` namespace exists only for cross-crate integration
-fixtures and is not enabled by the production `mlx` feature.
+fixtures and is not enabled by the production `mlx` feature. The backend crate
+does not alias neutral crates into its namespace; direct backend consumers
+import neutral contracts from their owning crates.
 
 Application targets, including the CLI and platform examples, depend only on
 the `eredu` facade. The selected-local-backend API owns device-plan creation,

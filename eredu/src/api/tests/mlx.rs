@@ -342,8 +342,6 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         session.prompt_cache_layer_prefix_offsets().unwrap(),
         [0, -1]
     );
-    assert!(session.native_quantization_stats().is_none());
-
     let output = model
         .generate_prepared_chat_mtp_batch(PreparedChatMtpBatchRequest {
             drafting: SpeculativeDraft::Embedded,

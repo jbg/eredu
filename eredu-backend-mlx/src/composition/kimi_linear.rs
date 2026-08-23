@@ -15,50 +15,45 @@ use safemlx::{
     Array, Stream,
 };
 
-use crate::{
-    backend::mlx::{
-        error::Error,
-        nn::shared::{MlxModule, MlxNeuralBackend},
-        runtime::{
-            cache::{
-                residency::{
-                    load_prompt_cache_state_tensors, open_prompt_cache, CacheResidencyManager,
-                },
-                state::MlxHybridState,
+use crate::backend::mlx::{
+    error::Error,
+    nn::shared::{MlxModule, MlxNeuralBackend},
+    runtime::{
+        cache::{
+            residency::{
+                load_prompt_cache_state_tensors, open_prompt_cache, CacheResidencyManager,
             },
-            checkpoint::{
-                binding::{
-                    binding_bytes, build_module_bindings,
-                    build_module_bindings_with_recipes_excluding, parameter_name_in_targets,
-                    parameter_role_targets, populate_module_from_lease_excluding,
-                },
-                binding_plan::{BindingPlan, PlannedBinding},
-                load::{gguf_quantization_configs, GgufTensorNames},
-                quantization::should_quantize_on_load,
-                store::open_gguf_checkpoint_source,
+            state::MlxHybridState,
+        },
+        checkpoint::{
+            binding::{
+                binding_bytes, build_module_bindings, build_module_bindings_with_recipes_excluding,
+                parameter_name_in_targets, parameter_role_targets,
+                populate_module_from_lease_excluding,
             },
-            execution::{
-                generic::{
-                    prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
-                    MlxUnitPopulator,
-                },
-                layerwise::{
-                    open_safetensors_weight_store, quantize_parameterized_store,
-                    shard_layer_bindings,
-                },
+            binding_plan::{BindingPlan, PlannedBinding},
+            load::{gguf_quantization_configs, GgufTensorNames},
+            quantization::should_quantize_on_load,
+            store::open_gguf_checkpoint_source,
+        },
+        execution::{
+            generic::{
+                prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
+                MlxUnitPopulator,
             },
-            media::input,
-            residency::expert_cache::ExpertCatalogEntry,
-            residency::expert_cache::{ExpertCache, ExpertCacheReport},
-            residency::expert_provider::{
-                CachedGatedProductExpertProvider, ExpertExecutorProvider,
+            layerwise::{
+                open_safetensors_weight_store, quantize_parameterized_store, shard_layer_bindings,
             },
         },
+        media::input,
+        residency::expert_cache::ExpertCatalogEntry,
+        residency::expert_cache::{ExpertCache, ExpertCacheReport},
+        residency::expert_provider::{CachedGatedProductExpertProvider, ExpertExecutorProvider},
     },
-    core::cache::{
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-        PromptCacheTopology,
-    },
+};
+use eredu_core::cache::{
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    PromptCacheTopology,
 };
 
 type NeutralBlock = Block<MlxNeuralBackend>;

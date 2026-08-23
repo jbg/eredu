@@ -412,17 +412,6 @@ impl<'a> MlxModelSession<'a> {
         }
     }
 
-    /// Returns checkpoint-native quantization storage statistics when the
-    /// selected session has one complete local model.
-    pub fn native_quantization_stats(
-        &self,
-    ) -> Option<&safemlx::native_quantization::NativeQuantizationStats> {
-        match &self.inner {
-            MlxSessionKind::Complete(model, _) => model.native_quantization_stats(),
-            MlxSessionKind::Pipeline(_, _) => None,
-        }
-    }
-
     /// Returns the canonical cache-relevant architecture identity.
     pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
         match &self.inner {

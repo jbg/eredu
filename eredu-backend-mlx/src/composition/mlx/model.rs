@@ -592,13 +592,6 @@ impl Model {
         }
     }
 
-    /// Returns checkpoint-native quantization storage statistics when available.
-    pub fn native_quantization_stats(
-        &self,
-    ) -> Option<&safemlx::native_quantization::NativeQuantizationStats> {
-        None
-    }
-
     /// Returns the canonical cache-relevant architecture identity derived from the loaded model.
     pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Exception> {
         match self {

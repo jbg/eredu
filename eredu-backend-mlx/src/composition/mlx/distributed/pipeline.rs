@@ -124,18 +124,18 @@ use crate::{
             vl::QwenVlPipelineBindings,
         },
     },
-    core::cache::{CacheRankIdentity, StateTensorOwner, StateTensorPolicy, StateTensorRole},
-    core::generation::MtpConfig,
-    core::residency::{
-        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
-    },
-    core::ParallelCoordinates,
-    core::{MtpCapability, MtpCheckpointKind},
 };
 
 use eredu_architectures::{gpt_oss, ModelKind};
 use eredu_checkpoint::store::SharedCheckpointSource;
-use eredu_core::MtpStats;
+use eredu_core::{
+    cache::{CacheRankIdentity, StateTensorOwner, StateTensorPolicy, StateTensorRole},
+    generation::MtpConfig,
+    residency::{
+        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
+    },
+    MtpCapability, MtpCheckpointKind, MtpStats, ParallelCoordinates,
+};
 use eredu_runtime::DenseDiskStreamReport;
 use eredu_runtime::ExecutionGroupReadySet;
 use eredu_runtime::ResidentLayerGroup;

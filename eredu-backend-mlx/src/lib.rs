@@ -19,9 +19,6 @@ mod composition;
 
 pub use adapter::*;
 
-/// Backend-neutral core contracts used by the extracted implementation.
-pub use eredu_core as core;
-
 /// Deliberate access to the native MLX handles needed by applications that
 /// configure devices, streams, memory, or low-level tensor inputs.
 pub mod native {
