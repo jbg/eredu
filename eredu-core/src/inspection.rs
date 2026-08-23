@@ -1,6 +1,6 @@
 //! Portable model-artifact inspection results.
 
-use crate::{ArtifactFormat, ModelKind, ModelResourceProfile};
+use crate::{ArtifactFormat, ModelResourceProfile};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -159,7 +159,7 @@ pub struct ModelInspectionReport {
     pub artifact_format: ArtifactFormat,
     /// Resolved high-level model family.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_kind: Option<ModelKind>,
+    pub model_family: Option<String>,
     /// Submitted model type or architecture value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub architecture: Option<String>,
@@ -212,7 +212,7 @@ impl ModelInspectionReport {
         Self {
             path: path.to_path_buf(),
             artifact_format,
-            model_kind: None,
+            model_family: None,
             architecture: None,
             gguf_versions: None,
             checkpoint_shards: None,

@@ -34,6 +34,7 @@ pub use inspection::{inspect_text_model, TextInspectionOptions};
 pub use loaded::{LoadedModelLoadError, PlannedModelLoadError};
 pub use media::MultimodalPreparationError;
 
+pub use eredu_architectures::ModelKind;
 pub use eredu_core::{
     Admission, AdmissionRejection, AdmissionRequest, AdmissionResult, AllocatorTelemetry,
     ArtifactModality, ArtifactTensorEncoding, Audio, AutomaticPlanRequest, AutomaticPlanner,
@@ -44,15 +45,14 @@ pub use eredu_core::{
     HardwareDeviceProfile, HardwareMemorySemantics, HardwareProfile, InputModalities,
     InputTokenCount, InspectionIssue, InspectionIssueCode, InspectionReadiness,
     InspectionRequirement, InspectionSeverity, Media, MediaBinding, MediaRequestError,
-    ModelCapabilities, ModelCapabilityBackend, ModelInspectionReport, ModelKind,
-    ModelResourceProfile, MtpTelemetry, MultimodalPreparationBackend, MultimodalPreparationFailure,
-    MultimodalRequest, MultimodalSegment, ObservationKind, Observed, PhysicalMemorySemantics,
-    PlanExplanation, PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry,
-    RgbImage, RuntimeStateEstimate, SlidingWindowLayerCount, SpeculativeDraft,
-    SpeculativeGenerationBackend, SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput,
-    StateMemoryAssumptions, StaticMemoryReport, TimingTelemetry, TokenizedMultimodalRequest,
-    TokenizedMultimodalSegment, TransferTelemetry, Video, VideoSampling, WeightTransformationPlan,
-    AUTOMATIC_SCHEMA_VERSION,
+    ModelCapabilities, ModelCapabilityBackend, ModelInspectionReport, ModelResourceProfile,
+    MtpTelemetry, MultimodalPreparationBackend, MultimodalPreparationFailure, MultimodalRequest,
+    MultimodalSegment, ObservationKind, Observed, PhysicalMemorySemantics, PlanExplanation,
+    PlanExplanationEntry, PlanExplanationLevel, ResidencyPlan, ResidencyTelemetry, RgbImage,
+    RuntimeStateEstimate, SlidingWindowLayerCount, SpeculativeDraft, SpeculativeGenerationBackend,
+    SpeculativeGenerationBatchOutput, SpeculativeGenerationOutput, StateMemoryAssumptions,
+    StaticMemoryReport, TimingTelemetry, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
+    TransferTelemetry, Video, VideoSampling, WeightTransformationPlan, AUTOMATIC_SCHEMA_VERSION,
 };
 pub use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 pub use portable::{

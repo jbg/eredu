@@ -129,12 +129,11 @@ use crate::{
     core::residency::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
-    core::ModelKind,
     core::ParallelCoordinates,
     core::{MtpCapability, MtpCheckpointKind},
 };
 
-use eredu_architectures::gpt_oss;
+use eredu_architectures::{gpt_oss, ModelKind};
 use eredu_checkpoint::store::SharedCheckpointSource;
 use eredu_core::MtpStats;
 use eredu_runtime::DenseDiskStreamReport;
@@ -2883,7 +2882,7 @@ trait PipelinePartitionMetadata {
         &self,
         input: &eredu_architectures::media_plan::PreparedMediaInput,
     ) -> Result<eredu_architectures::media_plan::MediaShapePlan, eredu_core::CapabilityError> {
-        eredu_architectures::media_plan::text_only(self.model_kind().model_type_name(), input)
+        eredu_architectures::media_plan::text_only(self.model_kind().canonical_name(), input)
     }
 
     fn boundary_wire_schema(&self) -> Result<eredu_runtime::BoundaryWireSchema, Error> {
@@ -8245,7 +8244,7 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
         eredu_architectures::media_plan::qwen_vision(
             &self.args().vision,
             input,
-            self.model_kind().model_type_name(),
+            self.model_kind().canonical_name(),
         )
     }
 
@@ -8970,7 +8969,7 @@ impl PipelinePartitionMetadata for QwenConditionalPipelinePartition {
         eredu_architectures::media_plan::qwen_hybrid_vision(
             self.args().vision.as_ref(),
             input,
-            self.model_kind().model_type_name(),
+            self.model_kind().canonical_name(),
         )
     }
 
@@ -13833,8 +13832,7 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
             ]
         }
     });
-    let resolved =
-        eredu_architectures::configuration::resolve_model_configuration(&config).unwrap();
+    let resolved = eredu_architectures::configuration::resolve_model_identity(&config).unwrap();
     assert_eq!(resolved.effective_model_type, "qwen3_5_moe");
     let capabilities =
         eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config).unwrap();
@@ -13858,8 +13856,7 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
 
     config["text_config"]["model_type"] = serde_json::json!("qwen3_5_text");
     config["text_config"]["intermediate_size"] = serde_json::json!(48);
-    let resolved =
-        eredu_architectures::configuration::resolve_model_configuration(&config).unwrap();
+    let resolved = eredu_architectures::configuration::resolve_model_identity(&config).unwrap();
     assert_eq!(resolved.effective_model_type, "qwen3_5_text");
     let capabilities =
         eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config).unwrap();
@@ -14259,8 +14256,8 @@ pub fn load_pipeline_model_with_options(
 
     let config: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
-    let resolved = eredu_architectures::configuration::resolve_model_configuration(&config)?;
-    if resolved.kind.requires_realtime_loader() {
+    let resolved = eredu_architectures::configuration::resolve_model_identity(&config)?;
+    if resolved.kind.loading_protocol() == eredu_core::LoadingProtocol::Realtime {
         return Err(Error::UnsupportedArchitecture(
             "Moshi-family models use a realtime multi-stream temporal/depth contract, not the decoder pipeline"
                 .into(),

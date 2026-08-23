@@ -261,11 +261,11 @@ impl ModelProcessor {
 pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcessor>, Error> {
     let model_dir = model_dir.as_ref();
     let config = serde_json::from_slice(&fs::read(model_dir.join("config.json"))?)?;
-    let configuration = eredu_architectures::configuration::resolve_model_configuration(&config)?;
+    let configuration = eredu_architectures::configuration::resolve_model_identity(&config)?;
     match configuration.kind {
-        eredu_core::ModelKind::Inkling => ModelProcessor::load_inkling(model_dir),
-        eredu_core::ModelKind::Gemma4 => ModelProcessor::load_gemma4(model_dir),
-        eredu_core::ModelKind::MuseGlimmer => {
+        eredu_architectures::ModelKind::Inkling => ModelProcessor::load_inkling(model_dir),
+        eredu_architectures::ModelKind::Gemma4 => ModelProcessor::load_gemma4(model_dir),
+        eredu_architectures::ModelKind::MuseGlimmer => {
             #[cfg(feature = "image")]
             {
                 ModelProcessor::load_muse_glimmer(model_dir)
@@ -275,9 +275,9 @@ pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcess
                 Ok(None)
             }
         }
-        eredu_core::ModelKind::Qwen3Vl
-        | eredu_core::ModelKind::Qwen3VlMoe
-        | eredu_core::ModelKind::Qwen35 => {
+        eredu_architectures::ModelKind::Qwen3Vl
+        | eredu_architectures::ModelKind::Qwen3VlMoe
+        | eredu_architectures::ModelKind::Qwen35 => {
             #[cfg(feature = "image")]
             {
                 ModelProcessor::load_qwen(model_dir)

@@ -4,8 +4,8 @@ use eredu_checkpoint::WeightQuantization;
 
 use std::path::Path;
 
-use eredu_architectures::GgufArchitecture;
-use eredu_core::{ModelArtifact, ModelKind, ModelPreparationPlan};
+use eredu_architectures::{GgufArchitecture, ModelKind};
+use eredu_core::{ModelArtifact, ModelPreparationPlan};
 #[cfg(feature = "media")]
 use safemlx::ops::GgufCheckpoint;
 use safemlx::{ops::GgufMetadataValue, Stream};
@@ -277,7 +277,9 @@ pub fn materialize_model_plan(
         };
         let kind = match &artifact {
             ModelArtifact::Gguf { configuration, .. }
-            | ModelArtifact::SafeTensors { configuration, .. } => configuration.kind,
+            | ModelArtifact::SafeTensors { configuration, .. } => {
+                ModelKind::resolve_family(&configuration.family)?
+            }
         };
         if requires_distributed_stage_loader(kind, topology) {
             let model =
@@ -297,7 +299,7 @@ pub fn materialize_model_plan(
         } = &artifact
         {
             let model = materialize_tensor_parallel(
-                configuration.kind,
+                ModelKind::resolve_family(&configuration.family)?,
                 path,
                 options,
                 stream,
@@ -317,9 +319,14 @@ pub fn materialize_model_plan(
             configuration,
             ..
         } => {
-            let model =
-                materialize_safetensors(configuration.kind, &path, options, stream, weights_stream)
-                    .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
+            let model = materialize_safetensors(
+                ModelKind::resolve_family(&configuration.family)?,
+                &path,
+                options,
+                stream,
+                weights_stream,
+            )
+            .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
             attach_safetensors_processor(model, &path)
         }
     }
@@ -352,7 +359,7 @@ fn inspected_runtime_state_dtype_bytes(
         )
     })?;
     let source = eredu_architectures::preparation::safetensors_runtime_state_dtype_source(
-        configuration.kind,
+        ModelKind::resolve_family(&configuration.family)?,
         config,
         inspection.tensors(),
     )
@@ -388,7 +395,8 @@ fn mlx_runtime_state_dtype_bytes(
 mod runtime_state_dtype_tests {
     use super::{mlx_runtime_state_dtype_bytes, requires_distributed_stage_loader};
     use crate::backend::mlx::{DeviceAssignment, MlxParallelContext};
-    use eredu_core::{checkpoint::TensorDtype, ModelKind};
+    use eredu_architectures::ModelKind;
+    use eredu_core::checkpoint::TensorDtype;
     use safemlx::DeviceType;
 
     #[test]
@@ -514,7 +522,7 @@ fn materialize_tensor_parallel(
     if options.quantization.is_some() && kind != ModelKind::DeepSeekV4 {
         return Err(Error::Quantization(format!(
             "load-time quantization is not implemented for tensor-parallel {} materialization",
-            kind.model_type_name()
+            kind.canonical_name()
         )));
     }
     let execution = options.weight_residency.layers();
@@ -1064,7 +1072,7 @@ pub(super) fn materialize_safetensors(
             )),
             _ => Err(Error::UnsupportedArchitecture(format!(
                 "independent expert caching requires a supported safetensors MoE architecture, not {}",
-                kind.model_type_name()
+                kind.canonical_name()
             ))),
         };
     }

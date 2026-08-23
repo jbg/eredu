@@ -4,7 +4,7 @@ use std::any::TypeId;
 fn facade_exports_are_the_canonical_core_types() {
     assert_eq!(
         TypeId::of::<eredu::ModelKind>(),
-        TypeId::of::<eredu::core::artifact::ModelKind>(),
+        TypeId::of::<eredu_architectures::ModelKind>(),
     );
     assert_eq!(
         TypeId::of::<eredu::PreparationPolicy>(),

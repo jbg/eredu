@@ -2638,9 +2638,9 @@ fn load_safetensors_internal(
     let value: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
     let store = open_safetensors_weight_store(model_dir, residency.max_mapped_shards())?;
-    let configuration = eredu_architectures::configuration::resolve_model_configuration(&value)?;
+    let configuration = eredu_architectures::configuration::resolve_model_identity(&value)?;
     match configuration.kind {
-        eredu_core::ModelKind::DeepSeekV3 => {
+        eredu_architectures::ModelKind::DeepSeekV3 => {
             let args = deepseek::parse_v3_config(&value)
                 .map_err(|error| unsupported(error.to_string()))?;
             let plan = deepseek::v3_safetensors_plan(&args, true).map_err(unsupported)?;
@@ -2681,7 +2681,7 @@ fn load_safetensors_internal(
             }
             Ok(model)
         }
-        eredu_core::ModelKind::DeepSeekV4 => {
+        eredu_architectures::ModelKind::DeepSeekV4 => {
             let args = deepseek::parse_v4_config(&value)
                 .map_err(|error| unsupported(error.to_string()))?;
             let plan = deepseek::v4_safetensors_plan(&args).map_err(unsupported)?;
@@ -2724,7 +2724,7 @@ fn load_safetensors_internal(
         }
         kind => Err(unsupported(format!(
             "neutral DeepSeek loader received {}",
-            kind.model_type_name()
+            kind.canonical_name()
         ))),
     }
 }

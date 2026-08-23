@@ -6,8 +6,7 @@ use std::path::Path;
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue};
 use serde_json::Value;
 
-use eredu_architectures::GgufArchitecture;
-use eredu_core::ModelKind;
+use eredu_architectures::{GgufArchitecture, ModelKind};
 
 use super::ModelLoadOptions;
 use crate::backend::mlx::runtime::checkpoint::load::GgufTensorNames;
@@ -122,7 +121,7 @@ fn validate_expert_cache_capability(
     Err(Error::Artifact(
         eredu_core::artifact::ArtifactError::UnsupportedResidencyPolicy(format!(
             "independent expert caching is unavailable for the normalized {} architecture on MLX",
-            kind.model_type_name()
+            kind.canonical_name()
         )),
     ))
 }
@@ -142,7 +141,7 @@ fn validate_preparation_capability_intersection(
         return Err(Error::Artifact(
             eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(format!(
                 "load-time quantization is unavailable for the normalized {} architecture with nonresident weights on MLX",
-                kind.model_type_name()
+                kind.canonical_name()
             )),
         ));
     }
@@ -168,7 +167,7 @@ pub(crate) fn validate_safetensors_preparation(
     options: ModelLoadOptions,
 ) -> Result<(), Error> {
     let policy = options.preparation_policy()?;
-    eredu_core::validate_preparation_policy(kind, policy)?;
+    eredu_core::validate_preparation_policy(kind.loading_protocol(), policy)?;
     if !requires_architecture_capabilities(eredu_core::ArtifactFormat::SafeTensors, policy) {
         return Ok(());
     }
@@ -188,7 +187,7 @@ pub(crate) fn validate_gguf_preparation(
     options: ModelLoadOptions,
 ) -> Result<(), Error> {
     let policy = options.preparation_policy()?;
-    eredu_core::validate_preparation_policy(architecture.model_kind(), policy)?;
+    eredu_core::validate_preparation_policy(architecture.model_kind().loading_protocol(), policy)?;
     if !requires_architecture_capabilities(eredu_core::ArtifactFormat::Gguf, policy) {
         return Ok(());
     }
@@ -207,15 +206,16 @@ pub(crate) fn validate_inspected_preparation(
     inspection: &eredu_core::ArtifactInspection,
     policy: eredu_core::PreparationPolicy,
 ) -> Result<(), Error> {
-    eredu_core::validate_preparation_policy(inspection.configuration().kind, policy)?;
+    eredu_core::validate_preparation_policy(inspection.configuration().loading_protocol, policy)?;
     if !requires_architecture_capabilities(inspection.format(), policy) {
         return Ok(());
     }
     let configuration = inspection.configuration();
+    let kind = ModelKind::resolve_family(&configuration.family)?;
     let capabilities = match inspection.format() {
         eredu_core::ArtifactFormat::SafeTensors => {
             eredu_architectures::preparation::safetensors_capabilities(
-                configuration.kind,
+                kind,
                 configuration.json.as_ref().ok_or_else(|| {
                     Error::UnsupportedArchitecture(
                         "SafeTensors inspection omitted normalized JSON configuration".into(),
@@ -233,12 +233,7 @@ pub(crate) fn validate_inspected_preparation(
         ),
     }
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    validate_preparation_capability_intersection(
-        configuration.kind,
-        inspection.format(),
-        policy,
-        capabilities,
-    )
+    validate_preparation_capability_intersection(kind, inspection.format(), policy, capabilities)
 }
 
 fn validate_gguf_load_policy(
@@ -246,7 +241,7 @@ fn validate_gguf_load_policy(
     options: ModelLoadOptions,
 ) -> Result<(), Error> {
     let policy = options.preparation_policy()?;
-    eredu_core::validate_preparation_policy(architecture.model_kind(), policy)?;
+    eredu_core::validate_preparation_policy(architecture.model_kind().loading_protocol(), policy)?;
     Ok(())
 }
 

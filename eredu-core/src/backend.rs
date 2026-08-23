@@ -1134,7 +1134,8 @@ mod tests {
             Ok(crate::ModelConfiguration {
                 declared_model_type: "llama".into(),
                 effective_model_type: "llama".into(),
-                kind: crate::ModelKind::Llama,
+                family: "llama".into(),
+                loading_protocol: crate::LoadingProtocol::Model,
                 json: Some(json.clone()),
             })
         }
@@ -1152,7 +1153,8 @@ mod tests {
             Ok(crate::ModelConfiguration {
                 declared_model_type: architecture.into(),
                 effective_model_type: architecture.into(),
-                kind: crate::ModelKind::Llama,
+                family: "llama".into(),
+                loading_protocol: crate::LoadingProtocol::Model,
                 json: None,
             })
         }
@@ -1182,10 +1184,7 @@ mod tests {
             &self,
             (plan, model): Self::ModelConfig,
         ) -> Result<PreparedModel<Self::Model>, Self::Error> {
-            assert_eq!(
-                plan.inspection().configuration().kind,
-                crate::ModelKind::Llama
-            );
+            assert_eq!(plan.inspection().configuration().family, "llama");
             Ok(PreparedModel::new(model))
         }
 

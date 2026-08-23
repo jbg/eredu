@@ -5,7 +5,7 @@
 //! matching, and the serialized planning and telemetry documents.
 
 use crate::{
-    artifact::{ArtifactFormat, ModelKind},
+    artifact::ArtifactFormat,
     backend::{BackendProvider, ModelLoadingBackend, ModelRuntime},
     execution::{
         DevicePlan, DraftingPlan, ExecutionPlan, ExpertCachePlan, ResidencyPlan,
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
 
 /// Schema version shared by automatic-planning and telemetry documents.
-pub const AUTOMATIC_SCHEMA_VERSION: u32 = 2;
+pub const AUTOMATIC_SCHEMA_VERSION: u32 = 3;
 
 /// Confidence attached to an observed or derived value.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -106,7 +106,7 @@ pub struct ModelResourceProfile {
     pub artifact_format: ArtifactFormat,
     /// Resolved model family, when architecture inspection succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_kind: Option<ModelKind>,
+    pub model_family: Option<String>,
     /// Resolved architecture name, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub architecture: Option<String>,
@@ -145,7 +145,7 @@ impl ModelResourceProfile {
             schema_version: AUTOMATIC_SCHEMA_VERSION,
             path,
             artifact_format,
-            model_kind: None,
+            model_family: None,
             architecture: None,
             tensor_count: None,
             checkpoint_shards: None,
@@ -1205,7 +1205,7 @@ fn select_feedback_plan<B: AutomaticPlanningBackend>(
             || plan.device != request.device
             || prior_resources.path != resources.path
             || prior_resources.artifact_format != resources.artifact_format
-            || prior_resources.model_kind != resources.model_kind
+            || prior_resources.model_family != resources.model_family
             || prior_hardware.operating_system != hardware.operating_system
             || prior_hardware.architecture != hardware.architecture
             || (matches!(plan.drafting, DraftingPlan::Embedded { .. })
@@ -1304,7 +1304,7 @@ mod tests {
         ) -> Result<ModelResourceProfile, AutomaticPlanningError> {
             let mut profile =
                 ModelResourceProfile::unmeasured(path.into(), ArtifactFormat::SafeTensors);
-            profile.model_kind = Some(ModelKind::Llama);
+            profile.model_family = Some("llama".into());
             profile.embedded_draft_layers =
                 Observed::exact(self.embedded_layers, "normalized architecture fixture");
             profile.stored_tensor_bytes = Observed::exact(self.model_bytes, "fixture");

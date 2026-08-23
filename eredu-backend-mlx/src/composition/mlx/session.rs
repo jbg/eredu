@@ -347,7 +347,7 @@ impl<'a> MlxModelSession<'a> {
     pub fn model_type(&self) -> &str {
         match &self.inner {
             MlxSessionKind::Complete(model, _) => model.model_type(),
-            MlxSessionKind::Pipeline(model, _) => model.stage_info().model_kind.model_type_name(),
+            MlxSessionKind::Pipeline(model, _) => model.stage_info().model_kind.canonical_name(),
         }
     }
 

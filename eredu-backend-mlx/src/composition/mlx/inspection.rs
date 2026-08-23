@@ -51,7 +51,7 @@ pub fn inspect_model(
             path.display()
         )));
     };
-    report.resources.model_kind = report.model_kind;
+    report.resources.model_family = report.model_family.clone();
     report.resources.architecture = report.architecture.clone();
     report.resources.tensor_count = report.tensor_count;
     report.resources.checkpoint_shards = report.checkpoint_shards;
@@ -136,7 +136,7 @@ fn inspect_safetensors(path: &Path, options: MlxInspectionOptions) -> ModelInspe
     if let Some(config) = &config {
         match eredu_architectures::configuration::resolve_model_config(config) {
             Ok(supported) => {
-                report.model_kind = Some(supported.kind);
+                report.model_family = Some(supported.kind.canonical_name().into());
                 report.architecture = Some(supported.effective_model_type);
                 match eredu_architectures::preparation::safetensors_capabilities(
                     supported.kind,
@@ -329,7 +329,7 @@ fn inspect_gguf(path: &Path, options: MlxInspectionOptions) -> ModelInspectionRe
             .expect("GGUF inspection must resolve through the architecture registry");
     let checkpoint = GgufCheckpoint::from_portable(validated.checkpoint().clone());
     report.container = InspectionReadiness::Ready;
-    report.model_kind = Some(gguf_architecture.model_kind());
+    report.model_family = Some(gguf_architecture.model_kind().canonical_name().into());
     report.architecture = Some(gguf_architecture.metadata_name().into());
     report.architecture_support = InspectionReadiness::Ready;
     report.checkpoint_shards = Some(checkpoint.catalog().shards().len());

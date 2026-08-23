@@ -2,9 +2,10 @@
 
 use std::{collections::HashMap, fmt::Display};
 
+use crate::ModelKind;
 use eredu_checkpoint::schema::SafetensorsCheckpointPlan;
 use eredu_core::checkpoint::{TensorCatalog, TensorDtype};
-use eredu_core::{InputModalities, ModelKind};
+use eredu_core::InputModalities;
 use eredu_gguf::{Checkpoint as GgufCheckpoint, MetadataValue};
 use serde_json::Value;
 

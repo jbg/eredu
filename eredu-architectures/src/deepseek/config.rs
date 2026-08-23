@@ -1385,7 +1385,7 @@ mod tests {
         value["num_nextn_predict_layers"] = Value::from(2);
 
         let capabilities =
-            crate::preparation::safetensors_capabilities(eredu_core::ModelKind::DeepSeekV3, &value)
+            crate::preparation::safetensors_capabilities(crate::ModelKind::DeepSeekV3, &value)
                 .unwrap();
 
         assert_eq!(capabilities.embedded_draft_layers(), Some(2));

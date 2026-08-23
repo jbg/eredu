@@ -14,95 +14,17 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-/// Supported architecture family selected before backend materialization.
+/// Backend-neutral loader contract required by an inspected artifact.
+///
+/// Architecture registries select this protocol while resolving family identity.
+/// Core uses it to route preparation without knowing any concrete model family.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ModelKind {
-    /// DeepSeek-V3/R1 MLA and MoE architecture.
-    DeepSeekV3,
-    /// DeepSeek-V4 compressed sparse-attention and mHC architecture.
-    DeepSeekV4,
-    /// Gemma 4 text or unified multimodal architecture.
-    Gemma4,
-    /// OpenAI GPT-OSS sparse decoder.
-    GptOss,
-    /// Thinking Machines Lab Inkling multimodal architecture.
-    Inkling,
-    /// Moonshot Kimi Linear architecture.
-    KimiLinear,
-    /// Llama-compatible dense decoders, including Mistral.
-    Llama,
-    /// Meta Muse-Glimmer multimodal decoder.
-    MuseGlimmer,
-    /// Liquid AI LFM2/LFM2.5 dense or MoE architecture.
-    Lfm2,
-    /// Nemotron-H hybrid architecture.
-    NemotronH,
-    /// Moshi-family realtime speech architecture, including PersonaPlex.
-    Moshi,
-    /// Qwen2/Qwen2.5 dense decoder.
-    Qwen2,
-    /// Qwen3 dense or MoE decoder.
-    Qwen3,
-    /// Qwen3-Next hybrid decoder.
-    Qwen3Next,
-    /// Qwen3-VL multimodal decoder.
-    Qwen3Vl,
-    /// Qwen3-VL multimodal MoE decoder.
-    Qwen3VlMoe,
-    /// Qwen3.5 dense or MoE decoder.
-    Qwen35,
-}
-
-impl ModelKind {
-    /// Every architecture family recognized by the general model loader.
-    pub const ALL: [Self; 17] = [
-        Self::DeepSeekV3,
-        Self::DeepSeekV4,
-        Self::Gemma4,
-        Self::GptOss,
-        Self::Inkling,
-        Self::KimiLinear,
-        Self::Llama,
-        Self::MuseGlimmer,
-        Self::Lfm2,
-        Self::NemotronH,
-        Self::Moshi,
-        Self::Qwen2,
-        Self::Qwen3,
-        Self::Qwen3Next,
-        Self::Qwen3Vl,
-        Self::Qwen3VlMoe,
-        Self::Qwen35,
-    ];
-
-    /// Stable diagnostic name for this family.
-    pub const fn model_type_name(self) -> &'static str {
-        match self {
-            Self::DeepSeekV3 => "deepseek_v3",
-            Self::DeepSeekV4 => "deepseek_v4",
-            Self::Gemma4 => "gemma4",
-            Self::GptOss => "gpt_oss",
-            Self::Inkling => "inkling_mm_model",
-            Self::KimiLinear => "kimi_linear",
-            Self::Llama => "llama/mistral",
-            Self::MuseGlimmer => "muse_glimmer",
-            Self::Lfm2 => "lfm2/lfm2_moe",
-            Self::NemotronH => "nemotron_h",
-            Self::Moshi => "moshi",
-            Self::Qwen2 => "qwen2",
-            Self::Qwen3 => "qwen3",
-            Self::Qwen3Next => "qwen3_next",
-            Self::Qwen3Vl => "qwen3_vl",
-            Self::Qwen3VlMoe => "qwen3_vl_moe",
-            Self::Qwen35 => "qwen3_5",
-        }
-    }
-
-    /// Whether this family requires the realtime multi-stream loader contract.
-    pub const fn requires_realtime_loader(self) -> bool {
-        matches!(self, Self::Moshi)
-    }
+pub enum LoadingProtocol {
+    /// Ordinary whole-model preparation followed by a model session.
+    Model,
+    /// Realtime multi-stream preparation followed by a realtime session.
+    Realtime,
 }
 
 /// Artifact container selected during inspection.
@@ -122,8 +44,10 @@ pub struct ModelConfiguration {
     pub declared_model_type: String,
     /// Nested text architecture selected for dispatch where applicable.
     pub effective_model_type: String,
-    /// Canonical architecture family.
-    pub kind: ModelKind,
+    /// Open canonical family name supplied by the architecture registry.
+    pub family: String,
+    /// Neutral loader contract selected by the architecture registry.
+    pub loading_protocol: LoadingProtocol,
     /// Raw JSON configuration for SafeTensors artifacts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json: Option<Value>,
@@ -353,7 +277,7 @@ pub fn plan_model_preparation(
     inspection: ArtifactInspection,
     policy: PreparationPolicy,
 ) -> Result<ModelPreparationPlan, ArtifactError> {
-    let route = validate_preparation_policy(inspection.configuration.kind, policy)?;
+    let route = validate_preparation_policy(inspection.configuration.loading_protocol, policy)?;
     Ok(ModelPreparationPlan {
         inspection,
         policy,
@@ -363,11 +287,11 @@ pub fn plan_model_preparation(
 
 /// Validate a preparation policy against resolved portable artifact facts.
 pub fn validate_preparation_policy(
-    kind: ModelKind,
+    protocol: LoadingProtocol,
     policy: PreparationPolicy,
 ) -> Result<MaterializationRoute, ArtifactError> {
-    if kind.requires_realtime_loader() {
-        return Err(ArtifactError::RealtimeModelRequiresRealtimeLoader);
+    if protocol != LoadingProtocol::Model {
+        return Err(ArtifactError::UnsupportedLoadingProtocol(protocol));
     }
     let route = match policy.residency {
         ResidencyRequest::FullyResident => MaterializationRoute::Resident,
@@ -661,9 +585,9 @@ pub enum ArtifactError {
     /// Requested residency mode is unavailable for the artifact.
     #[error("unsupported model residency policy: {0}")]
     UnsupportedResidencyPolicy(String),
-    /// Moshi-family models use a distinct realtime model/session contract.
-    #[error("Moshi-family models must be prepared through the realtime model loader")]
-    RealtimeModelRequiresRealtimeLoader,
+    /// The general model planner cannot satisfy the resolved loader contract.
+    #[error("model artifact requires the {0:?} loading protocol")]
+    UnsupportedLoadingProtocol(LoadingProtocol),
     /// Ordinary filesystem error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -692,15 +616,17 @@ mod tests {
                 .get("model_type")
                 .and_then(Value::as_str)
                 .ok_or_else(|| ArtifactError::InvalidArtifact("missing model_type".into()))?;
-            let kind = match model_type {
-                "llama" => ModelKind::Llama,
-                "gemma4" => ModelKind::Gemma4,
+            let family = match model_type {
+                "llama" => "llama",
+                "gemma4" => "gemma4",
+                "future" => "future_family",
                 other => return Err(ArtifactError::UnsupportedModelType(other.into())),
             };
             Ok(ModelConfiguration {
                 declared_model_type: model_type.into(),
                 effective_model_type: model_type.into(),
-                kind,
+                family: family.into(),
+                loading_protocol: LoadingProtocol::Model,
                 json: Some(json.clone()),
             })
         }
@@ -710,14 +636,15 @@ mod tests {
             architecture: &str,
             _checkpoint: &GgufCheckpoint,
         ) -> Result<ModelConfiguration, ArtifactError> {
-            let kind = match architecture {
-                "llama" => ModelKind::Llama,
+            let family = match architecture {
+                "llama" => "llama",
                 other => return Err(ArtifactError::UnsupportedGgufArchitecture(other.into())),
             };
             Ok(ModelConfiguration {
                 declared_model_type: architecture.into(),
                 effective_model_type: architecture.into(),
-                kind,
+                family: family.into(),
+                loading_protocol: LoadingProtocol::Model,
                 json: None,
             })
         }
@@ -739,12 +666,13 @@ mod tests {
     }
 
     #[test]
-    fn model_kind_retains_only_backend_neutral_runtime_policy() {
-        assert!(ModelKind::Moshi.requires_realtime_loader());
-        assert_eq!(
-            serde_json::to_value(ModelKind::Moshi).unwrap(),
-            serde_json::json!("moshi")
-        );
+    fn loading_protocol_is_family_agnostic() {
+        assert!(matches!(
+            validate_preparation_policy(LoadingProtocol::Realtime, PreparationPolicy::default()),
+            Err(ArtifactError::UnsupportedLoadingProtocol(
+                LoadingProtocol::Realtime
+            ))
+        ));
     }
 
     #[test]
@@ -777,7 +705,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_safetensors_fixture(root.path(), "llama");
         let inspection = inspect_artifact(root.path(), &FixtureResolver).unwrap();
-        assert_eq!(inspection.configuration().kind, ModelKind::Llama);
+        assert_eq!(inspection.configuration().family, "llama");
         assert_eq!(inspection.tensors().len(), 1);
         let plan = plan_model_preparation(inspection, PreparationPolicy::default()).unwrap();
         assert_eq!(plan.route(), MaterializationRoute::Resident);
@@ -785,6 +713,19 @@ mod tests {
             plan.into_parts().0,
             ModelArtifact::SafeTensors { .. }
         ));
+    }
+
+    #[test]
+    fn core_accepts_families_defined_only_by_the_resolver() {
+        let root = tempfile::tempdir().unwrap();
+        write_safetensors_fixture(root.path(), "future");
+        let inspection = inspect_artifact(root.path(), &FixtureResolver).unwrap();
+        assert_eq!(inspection.configuration().family, "future_family");
+        assert_eq!(
+            inspection.configuration().loading_protocol,
+            LoadingProtocol::Model
+        );
+        assert!(plan_model_preparation(inspection, PreparationPolicy::default()).is_ok());
     }
 
     #[test]
@@ -901,7 +842,7 @@ mod tests {
         else {
             panic!("expected GGUF artifact");
         };
-        assert_eq!(configuration.kind, ModelKind::Llama);
+        assert_eq!(configuration.family, "llama");
         assert_eq!(checkpoint.physical_tensor_count(), 1);
     }
 }

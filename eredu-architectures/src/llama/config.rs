@@ -690,8 +690,7 @@ mod tests {
         });
 
         let capabilities =
-            crate::preparation::safetensors_capabilities(eredu_core::ModelKind::Llama, &value)
-                .unwrap();
+            crate::preparation::safetensors_capabilities(crate::ModelKind::Llama, &value).unwrap();
 
         assert_eq!(capabilities.embedded_draft_layers(), Some(0));
     }

@@ -71,12 +71,15 @@ family aliases, GGUF `general.architecture` spellings, nested-wrapper
 normalization, assistant-family identity, and the exhaustive dispatch to
 family parsers. `eredu-core` accepts that registry through
 `ModelConfigurationResolver` while inspecting both SafeTensors and GGUF
-artifacts; it does not recognize family strings or expose an exhaustive GGUF
-family type. The typed `GgufArchitecture` identity and family-specific GGUF
-structural admission live in `eredu-architectures`. Facades and concrete
-backend adapters select that shared registry. Backend composition consumes the
-resolved `ModelKind` and architecture parser outputs, never a second raw
-`model_type` or `general.architecture` dispatch table.
+artifacts. The resolver returns an open canonical family string and the neutral
+`LoadingProtocol` required to prepare the artifact. Core routes that protocol;
+it neither recognizes family strings nor exposes an exhaustive family type.
+The typed `ModelKind` and `GgufArchitecture` identities, their aliases, the
+family-to-protocol mapping, and family-specific GGUF structural admission live
+in `eredu-architectures`. Facades and concrete backend adapters select that
+shared registry. Backend composition converts the resolved canonical family
+through the architecture registry and consumes architecture parser outputs,
+never a second raw `model_type` or `general.architecture` dispatch table.
 
 Architecture checkpoint modules also own canonical name translation and the
 complete derived-weight recipe catalogs for static modules, execution units,
@@ -161,7 +164,7 @@ Pre-materialization capabilities follow the same rule. The normalized
 architecture reports whether independently addressable routed experts exist;
 the selected backend intersects that fact with its expert-cache
 materializers. Core selects the neutral expert-cache route but does not infer
-support from `ModelKind`, because one kind may contain both dense and MoE
+support from a family name, because one family may contain both dense and MoE
 variants. Nonresident SafeTensors load-time quantization follows the same
 intersection: the architecture declares whether its normalized parameter
 topology can be transformed before bounded materialization, and the backend
@@ -171,11 +174,11 @@ allowlist.
 The same architecture capability report carries a typed parallel plan for
 tensor sharding, pipeline staging, and expert partitioning. Each axis is
 declared from the parsed family variant rather than inferred from parameter
-addressability or a broad `ModelKind`. Independent expert residency remains a
-separate artifact capability because it does not imply an expert-parallel
-execution plan. Distributed backend preflight consumes these facts from that
-exact normalized report instead of reconstructing support from raw or wrapper
-`model_type` values.
+addressability or a broad family identity. Independent expert residency
+remains a separate artifact capability because it does not imply an
+expert-parallel execution plan. Distributed backend preflight consumes these
+facts from that exact normalized report instead of reconstructing support from
+raw or wrapper `model_type` values.
 
 The MLX backend materializes every active expert-parallel axis through its
 single distributed-stage loader. Pure EP, PP+EP, TP+EP, and TP+PP+EP therefore
@@ -246,7 +249,8 @@ per-layer and per-token paths.
 Artifact loading has four stages:
 
 1. Portable inspection validates checkpoint metadata and tensor catalogs and
-   resolves a model kind.
+   asks the architecture registry for a canonical family and neutral loading
+   protocol.
 2. The selected backend validates the requested policy against normalized
    architecture facts and its own capabilities.
 3. Portable planning combines the artifact description with topology,

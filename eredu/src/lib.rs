@@ -23,13 +23,13 @@ pub mod api;
 pub mod runtime;
 pub use api::{inspect_text_model, PlannedModelLoadError, TextInspectionOptions};
 pub use eredu_architectures::configuration::inspect_artifact;
-pub use eredu_architectures::GgufArchitecture;
+pub use eredu_architectures::{GgufArchitecture, ModelKind};
 /// Canonical backend-neutral runtime types.
 pub use eredu_core as core;
 pub use eredu_core::artifact::{
-    plan_model_preparation, ArtifactFormat, ArtifactInspection, MaterializationRoute,
-    ModelArtifact, ModelConfiguration, ModelKind, ModelPreparationPlan, PreparationPolicy,
-    QuantizationRequest, ResidencyRequest,
+    plan_model_preparation, ArtifactFormat, ArtifactInspection, LoadingProtocol,
+    MaterializationRoute, ModelArtifact, ModelConfiguration, ModelPreparationPlan,
+    PreparationPolicy, QuantizationRequest, ResidencyRequest,
 };
 pub use eredu_core::generation::{
     CheckpointGenerationConfig, FinishReason, GenerationCancellationToken,

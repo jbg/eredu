@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use eredu_core::ModelKind;
+use eredu_architectures::ModelKind;
 use eredu_gguf::MetadataValue as GgufMetadataValue;
 use eredu_text::gguf::{self as gguf_tokenizer, GgufTokenizer};
 use eredu_text::tokenizer::{
@@ -127,11 +127,13 @@ pub fn chat_template_kwargs(model_dir: impl AsRef<Path>) -> Result<Vec<String>, 
 
 pub(super) fn read_model_configuration(
     model_dir: &Path,
-) -> Result<eredu_core::ModelConfiguration, TextMetadataError> {
+) -> Result<eredu_architectures::configuration::ResolvedModelConfig, TextMetadataError> {
     let config_path = model_dir.join("config.json");
     let file = std::fs::File::open(config_path)?;
     let json = serde_json::from_reader(file)?;
-    Ok(eredu_architectures::configuration::resolve_model_configuration(&json)?)
+    Ok(eredu_architectures::configuration::resolve_model_identity(
+        &json,
+    )?)
 }
 
 pub(crate) fn is_gguf_file(path: &Path) -> bool {
@@ -201,7 +203,7 @@ pub(crate) fn load_chat_template(
 
     let configuration = read_model_configuration(model_dir)?;
     if matches!(
-        configuration.declared_model_type.as_str(),
+        configuration.model_type.as_str(),
         "gemma4" | "gemma4_unified"
     ) || matches!(
         configuration.effective_model_type.as_str(),

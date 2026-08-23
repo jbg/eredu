@@ -2,7 +2,7 @@ use eredu_checkpoint::AffineQuantization;
 
 use eredu_architectures::{
     configuration::{resolve_model_config, ResolvedModelConfig},
-    kimi_linear,
+    kimi_linear, ModelKind,
 };
 use eredu_backend_mlx::MlxTensor;
 use eredu_checkpoint::WeightQuantization;
@@ -12,7 +12,7 @@ use super::*;
 use crate::api::{LoadedModel, PreparedChatInput, PreparedChatMtpBatchRequest, SpeculativeDraft};
 use crate::{
     core::generation::MtpSchedulerOptions,
-    core::{ModelKind, SpeculativeExecutionTopology},
+    core::SpeculativeExecutionTopology,
     runtime::chat::constraints::{ConstraintController, ConstraintError},
     runtime::chat::PreparedChat,
 };
@@ -3036,10 +3036,7 @@ fn load_policy_admits_fully_resident_inkling_and_nemotron_materialization() {
         WeightQuantization::MxFp4,
     ] {
         let options = ModelLoadOptions::with_quantization(quantization);
-        for kind in [
-            crate::core::ModelKind::Inkling,
-            crate::core::ModelKind::NemotronH,
-        ] {
+        for kind in [crate::ModelKind::Inkling, crate::ModelKind::NemotronH] {
             options
                 .validate_preparation(kind, eredu_core::ArtifactFormat::SafeTensors)
                 .unwrap();

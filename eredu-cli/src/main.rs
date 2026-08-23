@@ -3718,7 +3718,7 @@ mod tests {
             schema_version: eredu::AUTOMATIC_SCHEMA_VERSION,
             path: model_path.clone(),
             artifact_format: eredu::ArtifactFormat::Gguf,
-            model_kind: None,
+            model_family: None,
             architecture: Some("fixture".into()),
             tensor_count: Some(1),
             checkpoint_shards: Some(1),

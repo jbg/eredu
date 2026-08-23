@@ -4714,7 +4714,7 @@ mod tests {
 
         let manager = manager_with_leased_block();
         let mut pipeline = PipelineCache::new(
-            eredu_core::ModelKind::Llama,
+            eredu_architectures::ModelKind::Llama,
             vec![PipelineLayerCache::KeyValue {
                 global_layer: 0,
                 cache: PipelineKeyValueCache::Paged(

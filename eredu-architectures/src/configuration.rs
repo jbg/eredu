@@ -1,7 +1,7 @@
 //! Authoritative Hugging Face and GGUF family identity and configuration validation.
 
 use eredu_core::{
-    artifact::ArtifactError, ModelConfiguration, ModelConfigurationResolver, ModelKind,
+    artifact::ArtifactError, LoadingProtocol, ModelConfiguration, ModelConfigurationResolver,
 };
 use eredu_gguf::Checkpoint as GgufCheckpoint;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ pub static MODEL_CONFIGURATIONS: ModelConfigurations = ModelConfigurations;
 
 impl ModelConfigurationResolver for ModelConfigurations {
     fn resolve_safetensors(&self, json: &Value) -> Result<ModelConfiguration, ArtifactError> {
-        resolve_model_configuration(json)
+        resolve_portable_model_configuration(json)
     }
 
     fn resolve_gguf(
@@ -26,6 +26,112 @@ impl ModelConfigurationResolver for ModelConfigurations {
         checkpoint: &GgufCheckpoint,
     ) -> Result<ModelConfiguration, ArtifactError> {
         resolve_gguf_configuration(architecture, checkpoint)
+    }
+}
+
+/// Architecture family identity owned by the architecture registry.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    /// DeepSeek-V3/R1 MLA and MoE architecture.
+    DeepSeekV3,
+    /// DeepSeek-V4 compressed sparse-attention and mHC architecture.
+    DeepSeekV4,
+    /// Gemma 4 text or unified multimodal architecture.
+    Gemma4,
+    /// OpenAI GPT-OSS sparse decoder.
+    GptOss,
+    /// Thinking Machines Lab Inkling multimodal architecture.
+    Inkling,
+    /// Moonshot Kimi Linear architecture.
+    KimiLinear,
+    /// Llama-compatible dense decoders, including Mistral.
+    Llama,
+    /// Meta Muse-Glimmer multimodal decoder.
+    MuseGlimmer,
+    /// Liquid AI LFM2/LFM2.5 dense or MoE architecture.
+    Lfm2,
+    /// Nemotron-H hybrid architecture.
+    NemotronH,
+    /// Moshi-family realtime speech architecture, including PersonaPlex.
+    Moshi,
+    /// Qwen2/Qwen2.5 dense decoder.
+    Qwen2,
+    /// Qwen3 dense or MoE decoder.
+    Qwen3,
+    /// Qwen3-Next hybrid decoder.
+    Qwen3Next,
+    /// Qwen3-VL multimodal decoder.
+    Qwen3Vl,
+    /// Qwen3-VL multimodal MoE decoder.
+    Qwen3VlMoe,
+    /// Qwen3.5 dense or MoE decoder.
+    Qwen35,
+}
+
+impl ModelKind {
+    /// Every architecture family implemented by this crate.
+    pub const ALL: [Self; 17] = [
+        Self::DeepSeekV3,
+        Self::DeepSeekV4,
+        Self::Gemma4,
+        Self::GptOss,
+        Self::Inkling,
+        Self::KimiLinear,
+        Self::Llama,
+        Self::MuseGlimmer,
+        Self::Lfm2,
+        Self::NemotronH,
+        Self::Moshi,
+        Self::Qwen2,
+        Self::Qwen3,
+        Self::Qwen3Next,
+        Self::Qwen3Vl,
+        Self::Qwen3VlMoe,
+        Self::Qwen35,
+    ];
+
+    /// Canonical family name published through the neutral artifact protocol.
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::DeepSeekV3 => "deepseek_v3",
+            Self::DeepSeekV4 => "deepseek_v4",
+            Self::Gemma4 => "gemma4",
+            Self::GptOss => "gpt_oss",
+            Self::Inkling => "inkling",
+            Self::KimiLinear => "kimi_linear",
+            Self::Llama => "llama",
+            Self::MuseGlimmer => "muse_glimmer",
+            Self::Lfm2 => "lfm2",
+            Self::NemotronH => "nemotron_h",
+            Self::Moshi => "moshi",
+            Self::Qwen2 => "qwen2",
+            Self::Qwen3 => "qwen3",
+            Self::Qwen3Next => "qwen3_next",
+            Self::Qwen3Vl => "qwen3_vl",
+            Self::Qwen3VlMoe => "qwen3_vl_moe",
+            Self::Qwen35 => "qwen3_5",
+        }
+    }
+
+    /// Neutral loader protocol required by this family.
+    pub const fn loading_protocol(self) -> LoadingProtocol {
+        match self {
+            Self::Moshi => LoadingProtocol::Realtime,
+            _ => LoadingProtocol::Model,
+        }
+    }
+
+    /// Resolves an architecture-owned canonical family name from a neutral artifact.
+    pub fn resolve_family(name: &str) -> Result<Self, ArtifactError> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.canonical_name() == name)
+            .ok_or_else(|| {
+                ArtifactError::InvalidArtifact(format!(
+                    "architecture registry returned unknown canonical family {name:?}"
+                ))
+            })
     }
 }
 
@@ -168,7 +274,8 @@ fn resolve_gguf_configuration(
     Ok(ModelConfiguration {
         declared_model_type: name.into(),
         effective_model_type: name.into(),
-        kind: architecture.model_kind(),
+        family: architecture.model_kind().canonical_name().into(),
+        loading_protocol: architecture.model_kind().loading_protocol(),
         json: None,
     })
 }
@@ -253,15 +360,25 @@ fn effective_model_type(metadata: &ConfigMetadata) -> String {
     }
 }
 
-/// Resolves the canonical family and nested text identity of a Hugging Face config.
-pub fn resolve_model_configuration(json: &Value) -> Result<ModelConfiguration, ArtifactError> {
+/// Resolves family aliases and nested wrappers without parsing family geometry.
+pub fn resolve_model_identity(json: &Value) -> Result<ResolvedModelConfig, ArtifactError> {
     let metadata: ConfigMetadata = serde_json::from_value(json.clone())?;
     let effective_model_type = effective_model_type(&metadata);
     let kind = model_kind(&effective_model_type)?;
-    Ok(ModelConfiguration {
-        declared_model_type: metadata.model_type,
+    Ok(ResolvedModelConfig {
+        model_type: metadata.model_type,
         effective_model_type,
         kind,
+    })
+}
+
+fn resolve_portable_model_configuration(json: &Value) -> Result<ModelConfiguration, ArtifactError> {
+    let resolved = resolve_model_identity(json)?;
+    Ok(ModelConfiguration {
+        declared_model_type: resolved.model_type,
+        effective_model_type: resolved.effective_model_type,
+        family: resolved.kind.canonical_name().into(),
+        loading_protocol: resolved.kind.loading_protocol(),
         json: Some(json.clone()),
     })
 }
@@ -269,20 +386,12 @@ pub fn resolve_model_configuration(json: &Value) -> Result<ModelConfiguration, A
 fn invalid_configuration(kind: ModelKind, error: impl std::fmt::Display) -> ArtifactError {
     ArtifactError::InvalidArtifact(format!(
         "invalid {} configuration: {error}",
-        kind.model_type_name()
+        kind.canonical_name()
     ))
 }
 
 /// Validates a resolved Hugging Face config with its architecture-owned parser.
-pub fn validate_model_configuration(
-    configuration: &ModelConfiguration,
-) -> Result<(), ArtifactError> {
-    let json = configuration.json.as_ref().ok_or_else(|| {
-        ArtifactError::InvalidArtifact(
-            "Hugging Face configuration validation requires raw JSON".into(),
-        )
-    })?;
-    let kind = configuration.kind;
+fn validate_model_configuration(json: &Value, kind: ModelKind) -> Result<(), ArtifactError> {
     match kind {
         ModelKind::DeepSeekV3 => crate::deepseek::parse_v3_config(json)
             .map(|_| ())
@@ -345,16 +454,7 @@ pub fn validate_model_configuration(
     }
 }
 
-/// Resolves and validates one Hugging Face config through the authoritative registry.
-pub fn resolve_and_validate_model_configuration(
-    json: &Value,
-) -> Result<ModelConfiguration, ArtifactError> {
-    let configuration = resolve_model_configuration(json)?;
-    validate_model_configuration(&configuration)?;
-    Ok(configuration)
-}
-
-/// Validated family identity consumed by backend composition and inspection.
+/// Architecture-owned family identity consumed by backend composition and inspection.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ResolvedModelConfig {
     /// Canonical architecture family.
@@ -367,12 +467,9 @@ pub struct ResolvedModelConfig {
 
 /// Resolves and validates one config into its architecture-owned dispatch identity.
 pub fn resolve_model_config(json: &Value) -> Result<ResolvedModelConfig, ArtifactError> {
-    let configuration = resolve_and_validate_model_configuration(json)?;
-    Ok(ResolvedModelConfig {
-        kind: configuration.kind,
-        model_type: configuration.declared_model_type,
-        effective_model_type: configuration.effective_model_type,
-    })
+    let resolved = resolve_model_identity(json)?;
+    validate_model_configuration(json, resolved.kind)?;
+    Ok(resolved)
 }
 
 /// Inspects an artifact using this crate's authoritative family registry.
@@ -415,22 +512,24 @@ mod tests {
             "model_type": "qwen3_5",
             "text_config": { "model_type": "qwen3_5_moe" }
         });
-        let resolved = resolve_model_configuration(&json).unwrap();
+        let resolved = resolve_model_identity(&json).unwrap();
         assert_eq!(resolved.kind, ModelKind::Qwen35);
-        assert_eq!(resolved.declared_model_type, "qwen3_5");
+        assert_eq!(resolved.model_type, "qwen3_5");
         assert_eq!(resolved.effective_model_type, "qwen3_5_moe");
 
         for model_type in ["moshi", "personaplex"] {
-            let resolved =
-                resolve_model_configuration(&serde_json::json!({"model_type": model_type}))
-                    .unwrap();
+            let json = serde_json::json!({"model_type": model_type});
+            let resolved = resolve_model_identity(&json).unwrap();
             assert_eq!(resolved.kind, ModelKind::Moshi);
+            let portable = MODEL_CONFIGURATIONS.resolve_safetensors(&json).unwrap();
+            assert_eq!(portable.family, "moshi");
+            assert_eq!(portable.loading_protocol, LoadingProtocol::Realtime);
         }
     }
 
     #[test]
     fn unknown_wrapper_can_delegate_to_a_known_nested_text_family() {
-        let resolved = resolve_model_configuration(&serde_json::json!({
+        let resolved = resolve_model_identity(&serde_json::json!({
             "model_type": "third_party_wrapper",
             "text_config": { "model_type": "qwen3_vl_moe_text" }
         }))

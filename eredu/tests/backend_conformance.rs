@@ -478,10 +478,7 @@ impl ModelLoadingBackend for MockBackend {
         plan: eredu_core::ModelPreparationPlan,
         _: Self::LoadOptions,
     ) -> Result<Self::ModelConfig, Self::Error> {
-        assert_eq!(
-            plan.inspection().configuration().kind,
-            eredu_core::ModelKind::Llama
-        );
+        assert_eq!(plan.inspection().configuration().family, "llama");
         Ok(())
     }
 }
@@ -522,7 +519,7 @@ impl AutomaticPlanningBackend for MockBackend {
         assert!(model_path.join("model.safetensors").is_file());
         let mut profile =
             ModelResourceProfile::unmeasured(model_path.into(), ArtifactFormat::SafeTensors);
-        profile.model_kind = Some(ModelKind::Llama);
+        profile.model_family = Some(ModelKind::Llama.canonical_name().into());
         profile.architecture = Some("llama".into());
         profile.tensor_count = Some(1);
         profile.checkpoint_shards = Some(1);

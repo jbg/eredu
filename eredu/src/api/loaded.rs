@@ -638,7 +638,7 @@ fn loaded_text_artifact(
 ) -> Result<(ChatTokenizer, LoadedTextModelConfig), TextMetadataError> {
     let path = inspection.path();
     let configuration = inspection.configuration();
-    if configuration.kind.requires_realtime_loader() {
+    if configuration.loading_protocol == eredu_core::LoadingProtocol::Realtime {
         return Err(TextMetadataError::UnsupportedArchitecture(
             "Moshi-family models use a realtime speech-to-speech token contract; use the realtime backend contract instead of LoadedModel".into(),
         ));
@@ -653,7 +653,8 @@ fn loaded_text_artifact(
 
     let (mut tokenizer, chat_template, eos_token_ids, model_id) = match inspection.format() {
         eredu_core::ArtifactFormat::SafeTensors => {
-            let tokenizer = load_tokenizer_for_kind(configuration.kind, path)?;
+            let kind = eredu_architectures::ModelKind::resolve_family(&configuration.family)?;
+            let tokenizer = load_tokenizer_for_kind(kind, path)?;
             (
                 ChatTokenizer::from_tokenizer(tokenizer),
                 load_chat_template(path)?,

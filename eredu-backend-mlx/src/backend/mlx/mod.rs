@@ -128,7 +128,7 @@ impl MlxModel {
     pub fn model_type(&self) -> &str {
         match &self.inner {
             MlxModelKind::Complete(model) => model.model_type(),
-            MlxModelKind::Pipeline(model) => model.stage_info().model_kind.model_type_name(),
+            MlxModelKind::Pipeline(model) => model.stage_info().model_kind.canonical_name(),
         }
     }
 
