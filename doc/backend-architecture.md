@@ -143,12 +143,18 @@ architecture reports whether independently addressable routed experts exist;
 the selected backend intersects that fact with its expert-cache
 materializers. Core selects the neutral expert-cache route but does not infer
 support from `ModelKind`, because one kind may contain both dense and MoE
-variants. The same architecture capability report carries a typed parallel
-plan for tensor sharding, pipeline staging, and expert partitioning. Each axis
-is declared from the parsed family variant rather than inferred from parameter
+variants. Nonresident SafeTensors load-time quantization follows the same
+intersection: the architecture declares whether its normalized parameter
+topology can be transformed before bounded materialization, and the backend
+declares whether its family composition implements that route. Core preserves
+the neutral quantization and residency request without maintaining a family
+allowlist.
+The same architecture capability report carries a typed parallel plan for
+tensor sharding, pipeline staging, and expert partitioning. Each axis is
+declared from the parsed family variant rather than inferred from parameter
 addressability or a broad `ModelKind`. Independent expert residency remains a
 separate artifact capability because it does not imply an expert-parallel
-execution plan. Distributed backend preflight consumes both facts from that
+execution plan. Distributed backend preflight consumes these facts from that
 exact normalized report instead of reconstructing support from raw or wrapper
 `model_type` values.
 

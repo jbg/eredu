@@ -485,8 +485,7 @@ pub fn plan_model_preparation(
     inspection: ArtifactInspection,
     policy: PreparationPolicy,
 ) -> Result<ModelPreparationPlan, ArtifactError> {
-    let route =
-        validate_preparation_policy(inspection.configuration.kind, inspection.format, policy)?;
+    let route = validate_preparation_policy(inspection.configuration.kind, policy)?;
     Ok(ModelPreparationPlan {
         inspection,
         policy,
@@ -497,25 +496,10 @@ pub fn plan_model_preparation(
 /// Validate a preparation policy against resolved portable artifact facts.
 pub fn validate_preparation_policy(
     kind: ModelKind,
-    format: ArtifactFormat,
     policy: PreparationPolicy,
 ) -> Result<MaterializationRoute, ArtifactError> {
     if kind.requires_realtime_loader() {
         return Err(ArtifactError::RealtimeModelRequiresRealtimeLoader);
-    }
-    if policy.quantization.is_some()
-        && format == ArtifactFormat::SafeTensors
-        && policy.residency != ResidencyRequest::FullyResident
-        && policy.residency != ResidencyRequest::ExpertCache
-        && !matches!(
-            kind,
-            ModelKind::DeepSeekV4 | ModelKind::Qwen2 | ModelKind::Qwen3
-        )
-    {
-        return Err(ArtifactError::UnsupportedQuantizationPolicy(format!(
-            "load-time quantization is unsupported for {} nonresident loading",
-            kind.model_type_name()
-        )));
     }
     let route = match policy.residency {
         ResidencyRequest::FullyResident => MaterializationRoute::Resident,
@@ -990,6 +974,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.route(), MaterializationRoute::ExpertCache);
+    }
+
+    #[test]
+    fn policy_leaves_nonresident_quantization_capability_to_architecture_and_backend() {
+        let root = tempfile::tempdir().unwrap();
+        write_safetensors_fixture(root.path(), "llama");
+        let policy = PreparationPolicy {
+            quantization: Some(QuantizationRequest::MxFp4),
+            residency: ResidencyRequest::LayerwiseHost,
+            ..PreparationPolicy::default()
+        };
+        let plan = plan_model_preparation(
+            inspect_artifact(root.path(), &FixtureResolver).unwrap(),
+            policy,
+        )
+        .unwrap();
+        assert_eq!(plan.policy(), policy);
+        assert_eq!(plan.route(), MaterializationRoute::Layerwise);
     }
 
     #[test]

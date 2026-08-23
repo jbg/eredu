@@ -89,6 +89,28 @@ const fn mlx_supports_expert_cache(kind: ModelKind) -> bool {
     )
 }
 
+const fn mlx_supports_nonresident_safetensors_quantization(kind: ModelKind) -> bool {
+    matches!(
+        kind,
+        ModelKind::DeepSeekV3
+            | ModelKind::DeepSeekV4
+            | ModelKind::Gemma4
+            | ModelKind::GptOss
+            | ModelKind::Inkling
+            | ModelKind::KimiLinear
+            | ModelKind::Lfm2
+            | ModelKind::Llama
+            | ModelKind::MuseGlimmer
+            | ModelKind::NemotronH
+            | ModelKind::Qwen2
+            | ModelKind::Qwen3
+            | ModelKind::Qwen3Next
+            | ModelKind::Qwen3Vl
+            | ModelKind::Qwen3VlMoe
+            | ModelKind::Qwen35
+    )
+}
+
 fn validate_expert_cache_capability(
     kind: ModelKind,
     capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
@@ -104,18 +126,59 @@ fn validate_expert_cache_capability(
     ))
 }
 
+fn validate_preparation_capability_intersection(
+    kind: ModelKind,
+    format: eredu_core::ArtifactFormat,
+    policy: eredu_core::PreparationPolicy,
+    capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
+) -> Result<(), Error> {
+    if format == eredu_core::ArtifactFormat::SafeTensors
+        && policy.quantization.is_some()
+        && policy.residency != eredu_core::ResidencyRequest::FullyResident
+        && !(capabilities.nonresident_safetensors_quantization()
+            && mlx_supports_nonresident_safetensors_quantization(kind))
+    {
+        return Err(Error::Artifact(
+            eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(format!(
+                "load-time quantization is unavailable for the normalized {} architecture with nonresident weights on MLX",
+                kind.model_type_name()
+            )),
+        ));
+    }
+    if policy.residency == eredu_core::ResidencyRequest::ExpertCache {
+        validate_expert_cache_capability(kind, capabilities)?;
+    }
+    Ok(())
+}
+
+fn requires_architecture_capabilities(
+    format: eredu_core::ArtifactFormat,
+    policy: eredu_core::PreparationPolicy,
+) -> bool {
+    policy.residency == eredu_core::ResidencyRequest::ExpertCache
+        || (format == eredu_core::ArtifactFormat::SafeTensors
+            && policy.quantization.is_some()
+            && policy.residency != eredu_core::ResidencyRequest::FullyResident)
+}
+
 pub(crate) fn validate_safetensors_preparation(
     kind: ModelKind,
     config: &Value,
     options: ModelLoadOptions,
 ) -> Result<(), Error> {
-    options.validate_preparation(kind, eredu_core::ArtifactFormat::SafeTensors)?;
-    if options.preparation_policy()?.residency != eredu_core::ResidencyRequest::ExpertCache {
+    let policy = options.preparation_policy()?;
+    eredu_core::validate_preparation_policy(kind, policy)?;
+    if !requires_architecture_capabilities(eredu_core::ArtifactFormat::SafeTensors, policy) {
         return Ok(());
     }
     let capabilities = eredu_architectures::preparation::safetensors_capabilities(kind, config)
         .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    validate_expert_cache_capability(kind, capabilities)
+    validate_preparation_capability_intersection(
+        kind,
+        eredu_core::ArtifactFormat::SafeTensors,
+        policy,
+        capabilities,
+    )
 }
 
 pub(crate) fn validate_gguf_preparation(
@@ -123,21 +186,28 @@ pub(crate) fn validate_gguf_preparation(
     checkpoint: &GgufCheckpoint,
     options: ModelLoadOptions,
 ) -> Result<(), Error> {
-    validate_gguf_load_policy(architecture, options)?;
-    if options.preparation_policy()?.residency != eredu_core::ResidencyRequest::ExpertCache {
+    let policy = options.preparation_policy()?;
+    eredu_core::validate_preparation_policy(architecture.model_kind(), policy)?;
+    if !requires_architecture_capabilities(eredu_core::ArtifactFormat::Gguf, policy) {
         return Ok(());
     }
     let capabilities =
         eredu_architectures::preparation::gguf_capabilities(architecture, checkpoint)
             .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    validate_expert_cache_capability(architecture.model_kind(), capabilities)
+    validate_preparation_capability_intersection(
+        architecture.model_kind(),
+        eredu_core::ArtifactFormat::Gguf,
+        policy,
+        capabilities,
+    )
 }
 
 pub(crate) fn validate_inspected_preparation(
     inspection: &eredu_core::ArtifactInspection,
     policy: eredu_core::PreparationPolicy,
 ) -> Result<(), Error> {
-    if policy.residency != eredu_core::ResidencyRequest::ExpertCache {
+    eredu_core::validate_preparation_policy(inspection.configuration().kind, policy)?;
+    if !requires_architecture_capabilities(inspection.format(), policy) {
         return Ok(());
     }
     let configuration = inspection.configuration();
@@ -166,14 +236,20 @@ pub(crate) fn validate_inspected_preparation(
         ),
     }
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    validate_expert_cache_capability(configuration.kind, capabilities)
+    validate_preparation_capability_intersection(
+        configuration.kind,
+        inspection.format(),
+        policy,
+        capabilities,
+    )
 }
 
 fn validate_gguf_load_policy(
     architecture: GgufArchitecture,
     options: ModelLoadOptions,
 ) -> Result<(), Error> {
-    options.validate_preparation(architecture.model_kind(), eredu_core::ArtifactFormat::Gguf)?;
+    let policy = options.preparation_policy()?;
+    eredu_core::validate_preparation_policy(architecture.model_kind(), policy)?;
     Ok(())
 }
 
@@ -1070,6 +1146,17 @@ mod admission_policy_tests {
         )
     }
 
+    fn kimi_linear_config() -> Value {
+        serde_json::json!({
+            "model_type":"kimi_linear","vocab_size":16,"hidden_size":12,"num_hidden_layers":2,
+            "num_attention_heads":3,"num_key_value_heads":3,"intermediate_size":17,"head_dim":4,
+            "model_max_length":64,"linear_attn_config":{"kda_layers":[1],"full_attn_layers":[2],"num_heads":3,"head_dim":4,"short_conv_kernel_size":3},
+            "num_experts":2,"moe_intermediate_size":9,"kv_lora_rank":6,"qk_nope_head_dim":4,"qk_rope_head_dim":2,"v_head_dim":4,
+            "mla_use_nope":true,"num_experts_per_token":1,"num_shared_experts":1,"routed_scaling_factor":1.0,
+            "first_k_dense_replace":1,"num_expert_group":1,"topk_group":1
+        })
+    }
+
     fn gemma4_config(routed: bool) -> Value {
         let mut config = serde_json::json!({
             "model_type":"gemma4", "tie_word_embeddings":true,
@@ -1149,6 +1236,17 @@ mod admission_policy_tests {
             options,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn nonresident_quantization_admits_kimi_linear_capability_intersection() {
+        let options =
+            ModelLoadOptions::with_quantization(eredu_checkpoint::WeightQuantization::MxFp4)
+                .with_weight_residency(eredu_runtime::WeightResidency::layerwise_host(
+                    eredu_runtime::LayerwiseLoadOptions::default(),
+                ));
+        validate_safetensors_preparation(ModelKind::KimiLinear, &kimi_linear_config(), options)
+            .unwrap();
     }
 
     #[test]

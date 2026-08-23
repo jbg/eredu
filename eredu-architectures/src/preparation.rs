@@ -13,6 +13,7 @@ use serde_json::Value;
 pub struct ArchitectureCapabilities {
     parallel: ParallelCapabilityPlan,
     independently_addressable_experts: bool,
+    nonresident_safetensors_quantization: bool,
     input_modalities: InputModalities,
     embedded_draft_layers: Option<usize>,
 }
@@ -21,6 +22,12 @@ impl ArchitectureCapabilities {
     /// Whether routed expert parameters can be managed independently.
     pub const fn independently_addressable_experts(self) -> bool {
         self.independently_addressable_experts
+    }
+
+    /// Whether the normalized architecture can transform a SafeTensors weight
+    /// store before handing it to a nonresident execution policy.
+    pub const fn nonresident_safetensors_quantization(self) -> bool {
+        self.nonresident_safetensors_quantization
     }
 
     /// Distributed semantics supported by this exact normalized architecture.
@@ -44,12 +51,14 @@ impl ArchitectureCapabilities {
     const fn new(
         parallel: ParallelCapabilityPlan,
         independently_addressable_experts: bool,
+        nonresident_safetensors_quantization: bool,
         input_modalities: InputModalities,
         embedded_draft_layers: Option<usize>,
     ) -> Self {
         Self {
             parallel,
             independently_addressable_experts,
+            nonresident_safetensors_quantization,
             input_modalities,
             embedded_draft_layers,
         }
@@ -61,6 +70,7 @@ impl Default for ArchitectureCapabilities {
         Self {
             parallel: ParallelCapabilityPlan::default(),
             independently_addressable_experts: false,
+            nonresident_safetensors_quantization: false,
             input_modalities: InputModalities::TEXT,
             embedded_draft_layers: None,
         }
@@ -605,9 +615,29 @@ pub fn safetensors_capabilities(
                 )
             }
         };
+    let nonresident_safetensors_quantization = matches!(
+        kind,
+        ModelKind::DeepSeekV3
+            | ModelKind::DeepSeekV4
+            | ModelKind::Gemma4
+            | ModelKind::GptOss
+            | ModelKind::Inkling
+            | ModelKind::KimiLinear
+            | ModelKind::Lfm2
+            | ModelKind::Llama
+            | ModelKind::MuseGlimmer
+            | ModelKind::NemotronH
+            | ModelKind::Qwen2
+            | ModelKind::Qwen3
+            | ModelKind::Qwen3Next
+            | ModelKind::Qwen3Vl
+            | ModelKind::Qwen3VlMoe
+            | ModelKind::Qwen35
+    );
     Ok(ArchitectureCapabilities::new(
         parallel,
         independently_addressable_experts,
+        nonresident_safetensors_quantization,
         input_modalities,
         Some(embedded_draft_layers),
     ))
@@ -692,6 +722,7 @@ pub fn gguf_capabilities(
     Ok(ArchitectureCapabilities::new(
         parallel,
         independently_addressable_experts,
+        false,
         input_modalities,
         None,
     ))
@@ -839,6 +870,7 @@ mod tests {
         let capabilities = ArchitectureCapabilities::new(
             ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT,
             false,
+            false,
             InputModalities::TEXT,
             None,
         );
@@ -848,11 +880,26 @@ mod tests {
         let capabilities = ArchitectureCapabilities::new(
             ParallelCapabilityPlan::TENSOR_PIPELINE,
             true,
+            false,
             InputModalities::TEXT,
             None,
         );
         assert!(!capabilities.parallel_plan().expert_parallel());
         assert!(capabilities.independently_addressable_experts());
+    }
+
+    #[test]
+    fn kimi_linear_declares_nonresident_load_time_quantization() {
+        let config = serde_json::json!({
+            "model_type":"kimi_linear","vocab_size":16,"hidden_size":12,"num_hidden_layers":2,
+            "num_attention_heads":3,"num_key_value_heads":3,"intermediate_size":17,"head_dim":4,
+            "model_max_length":64,"linear_attn_config":{"kda_layers":[1],"full_attn_layers":[2],"num_heads":3,"head_dim":4,"short_conv_kernel_size":3},
+            "num_experts":2,"moe_intermediate_size":9,"kv_lora_rank":6,"qk_nope_head_dim":4,"qk_rope_head_dim":2,"v_head_dim":4,
+            "mla_use_nope":true,"num_experts_per_token":1,"num_shared_experts":1,"routed_scaling_factor":1.0,
+            "first_k_dense_replace":1,"num_expert_group":1,"topk_group":1
+        });
+        let capabilities = safetensors_capabilities(ModelKind::KimiLinear, &config).unwrap();
+        assert!(capabilities.nonresident_safetensors_quantization());
     }
 
     #[test]

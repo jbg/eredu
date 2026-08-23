@@ -84,18 +84,6 @@ impl ModelLoadOptions {
                 .is_some_and(|topology| !topology.is_replicated()),
         })
     }
-
-    pub fn validate_preparation(
-        self,
-        kind: eredu_core::ModelKind,
-        format: eredu_core::ArtifactFormat,
-    ) -> Result<eredu_core::MaterializationRoute, Error> {
-        Ok(eredu_core::validate_preparation_policy(
-            kind,
-            format,
-            self.preparation_policy()?,
-        )?)
-    }
 }
 
 pub fn ensure_replicated_load_options(options: ModelLoadOptions) -> Result<(), Error> {
@@ -120,16 +108,19 @@ mod tests {
     use eredu_runtime::WeightResidency;
 
     #[test]
-    fn quantization_composes_with_nonresident_layers() {
+    fn preparation_policy_preserves_quantized_nonresident_request() {
         let options = ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
             .with_weight_residency(WeightResidency::layerwise_host(
                 LayerwiseLoadOptions::default(),
             ));
-        options
-            .validate_preparation(
-                eredu_core::ModelKind::GptOss,
-                eredu_core::ArtifactFormat::Gguf,
-            )
-            .unwrap();
+        let policy = options.preparation_policy().unwrap();
+        assert_eq!(
+            policy.quantization,
+            Some(eredu_core::QuantizationRequest::MxFp4)
+        );
+        assert_eq!(
+            policy.residency,
+            eredu_core::ResidencyRequest::LayerwiseHost
+        );
     }
 }
