@@ -17,9 +17,9 @@ use eredu_runtime::{
 };
 
 use super::{
-    layer_parameter_groups, mtp_parameter_groups, state_layout, static_parameter_groups,
-    vision_layer_parameter_groups, AudioInput, AudioTower, DecoderLayer, LocalGeometry, ModelArgs,
-    MtpModel, MtpOutput, VisionLayer, VisionStatic,
+    layer_parameter_groups, mtp_parameter_groups, mtp_state_layout, state_layout,
+    static_parameter_groups, vision_layer_parameter_groups, AudioInput, AudioTower, DecoderLayer,
+    LocalGeometry, ModelArgs, MtpModel, MtpOutput, VisionLayer, VisionStatic,
 };
 
 /// Pinned text, audio, and image modules.
@@ -1468,22 +1468,42 @@ impl<T> ForwardContext<T> {
 }
 
 /// Declares prompt-cache identity from the exact local state geometry and global offset.
+///
+/// The global state order is the target decoder followed by any embedded
+/// prediction layers. Prediction layers consume shifted token/hidden pairs and
+/// therefore persist a frontier one token behind the target decoder.
 pub fn state_identity(
     args: &ModelArgs,
     layout: &StateLayout,
     global_layer_start: usize,
     topology: PromptCacheTopology,
 ) -> Result<ModelStateIdentity, Error> {
-    let layer_count =
+    let target_layer_count =
         usize::try_from(args.text_config.num_hidden_layers).map_err(Error::backend)?;
+    let prediction_layer_count = mtp_state_layout(args)
+        .map_err(Error::backend)?
+        .as_ref()
+        .map_or(0, StateLayout::len);
+    let layer_count = target_layer_count
+        .checked_add(prediction_layer_count)
+        .ok_or_else(|| Error::backend("Inkling state layer count overflowed"))?;
     let global_layer_end = global_layer_start
         .checked_add(layout.len())
-        .ok_or_else(|| Error::backend("Inkling owned layer range overflowed"))?;
+        .ok_or_else(|| Error::backend("Inkling owned state range overflowed"))?;
     if global_layer_end > layer_count {
         return Err(Error::backend(format!(
-            "Inkling owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
+            "Inkling owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
+    let layer_prefix_offsets = (global_layer_start..global_layer_end)
+        .map(|global_layer| {
+            if global_layer < target_layer_count {
+                0
+            } else {
+                -1
+            }
+        })
+        .collect();
     Ok(ModelStateIdentity {
         model_family: "inkling".into(),
         effective_model_type: args.model_type.clone(),
@@ -1491,7 +1511,7 @@ pub fn state_identity(
         layer_count,
         global_layer_start,
         sink_tokens: 0,
-        layer_prefix_offsets: vec![0; layout.len()],
+        layer_prefix_offsets,
         topology,
     })
 }

@@ -369,5 +369,24 @@ mod tests {
             composite.segments()[1].lifetime(),
             StateSegmentLifetime::Persistent
         );
+        let identity = super::super::state_identity(
+            &args,
+            &composite,
+            0,
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap();
+        assert_eq!(identity.layer_count, 4);
+        assert_eq!(identity.layer_prefix_offsets, [0, 0, -1, -1]);
+
+        let prediction_identity = super::super::state_identity(
+            &args,
+            &layout,
+            target.len(),
+            eredu_core::cache::PromptCacheTopology::default(),
+        )
+        .unwrap();
+        assert_eq!(prediction_identity.layer_count, 4);
+        assert_eq!(prediction_identity.layer_prefix_offsets, [-1, -1]);
     }
 }

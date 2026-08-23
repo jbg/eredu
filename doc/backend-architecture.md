@@ -139,7 +139,10 @@ append-only pooling streams, and named segment boundaries and lifetimes.
 Concrete backends derive native cache objects directly from those policies;
 model-family arguments are not a second source of state geometry. Composite
 model layouts, such as a target decoder plus embedded prediction state, are
-assembled by the architecture before a backend consumes them.
+assembled by the architecture before a backend consumes them. Architecture
+state identity also declares the composite global layer count and each
+segment's processed-token frontier offset; backends must not reconstruct
+target/prediction boundaries or shifted-prediction offsets.
 
 Pre-materialization capabilities follow the same rule. The normalized
 architecture reports whether independently addressable routed experts exist;

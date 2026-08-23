@@ -533,15 +533,23 @@ impl InklingModel {
             .transpose()
     }
 
-    pub fn prompt_cache_layer_prefix_offsets(&self) -> Vec<i32> {
-        let mut offsets = vec![0; self.state_layout.len()];
-        offsets.extend(std::iter::repeat_n(
-            -1,
-            self.mtp_state_layout
-                .as_ref()
-                .map_or(0, eredu_runtime::StateLayout::len),
-        ));
-        offsets
+    fn prompt_state_identity(
+        &self,
+        topology: eredu_core::cache::PromptCacheTopology,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
+        eredu_architectures::inkling::state_identity(
+            &self.args,
+            &self.prompt_state_layout,
+            0,
+            topology,
+        )
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+    }
+
+    pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
+        Ok(self
+            .prompt_state_identity(eredu_core::cache::PromptCacheTopology::default())?
+            .layer_prefix_offsets)
     }
 
     pub fn new_cache(&self) -> InklingState {
@@ -603,18 +611,9 @@ impl InklingModel {
             .map_or_else(eredu_core::cache::PromptCacheTopology::default, |info| {
                 crate::backend::mlx::cache::prompt_cache_topology(info.topology())
             });
-        eredu_runtime::ModelStateIdentity {
-            model_family: "inkling".into(),
-            effective_model_type: self.args.model_type.clone(),
-            architecture_fingerprint: self.args.architecture_fingerprint(),
-            layer_count: self.prompt_state_layout.len(),
-            global_layer_start: 0,
-            sink_tokens: 0,
-            layer_prefix_offsets: self.prompt_cache_layer_prefix_offsets(),
-            topology,
-        }
-        .prompt_cache_identity(&self.prompt_state_layout)
-        .map_err(|error| Error::Parallel(error.to_string()))
+        self.prompt_state_identity(topology)?
+            .prompt_cache_identity(&self.prompt_state_layout)
+            .map_err(|error| Error::Parallel(error.to_string()))
     }
 
     pub fn load_prompt_cache(
@@ -641,7 +640,7 @@ impl InklingModel {
             .into_iter()
             .map(|state| ((state.owner, state.role), state.array))
             .collect::<BTreeMap<_, _>>();
-        let offsets = self.prompt_cache_layer_prefix_offsets();
+        let offsets = self.prompt_cache_layer_prefix_offsets()?;
         let processed = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Error::Parallel("prompt-cache prefix length exceeds i32".into()))?;
         let target_len = self.state_layout.len();
@@ -696,7 +695,7 @@ impl InklingModel {
         .map_err(|error| Error::Parallel(error.to_string()))?;
         let processed = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Error::Parallel("prompt-cache prefix length exceeds i32".into()))?;
-        let offsets = self.prompt_cache_layer_prefix_offsets();
+        let offsets = self.prompt_cache_layer_prefix_offsets()?;
         let target_len = self.state_layout.len();
         let manager = state
             .target

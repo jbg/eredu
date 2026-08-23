@@ -656,7 +656,9 @@ impl Model {
             Self::DeepSeek(model) => model
                 .prompt_cache_layer_prefix_offsets()
                 .map_err(|error| Exception::custom(error.to_string())),
-            Self::Inkling(model) => Ok(model.prompt_cache_layer_prefix_offsets()),
+            Self::Inkling(model) => model
+                .prompt_cache_layer_prefix_offsets()
+                .map_err(|error| Exception::custom(error.to_string())),
             _ => Ok(vec![0; self.prompt_cache_layer_layout()?.len()]),
         }
     }
