@@ -198,6 +198,20 @@ impl ExpertResidencyCatalog {
     pub fn into_units(self) -> Vec<ExpertResidencyUnit> {
         self.units
     }
+
+    /// Consumes the catalog and retains units owned by a caller's execution partition.
+    ///
+    /// Selection is expressed only in the architecture's canonical group-local address
+    /// space so adapters do not flatten heterogeneous execution groups back into layer
+    /// ordinals.
+    pub fn into_units_selected_by_owner(
+        self,
+        mut owns_unit: impl FnMut(&ExecutionGroupId, usize) -> bool,
+    ) -> impl Iterator<Item = ExpertResidencyUnit> {
+        self.units
+            .into_iter()
+            .filter(move |unit| owns_unit(unit.owner_group(), unit.owner_unit()))
+    }
 }
 
 impl IntoIterator for ExpertResidencyCatalog {

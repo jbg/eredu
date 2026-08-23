@@ -1656,5 +1656,13 @@ mod tests {
             prediction.distribution(),
             crate::ExpertResidencyDistribution::ExpertParallel
         );
+
+        let prediction_units = catalog
+            .into_units_selected_by_owner(|group, unit| group.as_str() == "mtp.0" && unit == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(prediction_units.len(), 4);
+        assert!(prediction_units
+            .iter()
+            .all(|unit| unit.identity().layer == 2));
     }
 }

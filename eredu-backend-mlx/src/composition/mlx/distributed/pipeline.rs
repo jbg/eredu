@@ -20281,12 +20281,11 @@ fn load_neutral_qwen_hybrid_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if external_experts {
-        let target = source_args.num_hidden_layers as usize;
         let entries = crate::composition::qwen::hybrid::expert_catalog_selected(
             &source_args,
             store.as_ref(),
             parallel_layout.as_ref(),
-            |layer| stage.range().contains(&layer) || (owns_mtp && layer >= target),
+            |group, unit| stage.partition.owns_unit(group.as_str(), unit),
         )?
         .into_iter()
         .filter(|entry| {
@@ -20859,12 +20858,11 @@ fn load_neutral_qwen_conditional_pipeline(
         info.planned_owned_parameter_bytes = static_bytes;
     }
     if external_experts {
-        let target_layers = source.text.num_hidden_layers as usize;
         let entries = crate::composition::qwen::hybrid::expert_catalog_selected(
             &source.text,
             store.as_ref(),
             parallel_layout.as_ref(),
-            |layer| stage.range().contains(&layer) || (owns_mtp && layer >= target_layers),
+            |group, unit| stage.partition.owns_unit(group.as_str(), unit),
         )?
         .into_iter()
         .filter(|entry| {

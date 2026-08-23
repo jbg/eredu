@@ -692,19 +692,16 @@ impl QwenHybridPipelineBindings {
     }
 }
 
-/// Canonical independent-expert catalog for selected target/MTP units.
+/// Canonical independent-expert catalog for selected architecture-owned units.
 pub fn expert_catalog_selected(
     config: &HybridConfig,
     store: &dyn CheckpointSource,
     layout: Option<&eredu_runtime::LocalModelLayout>,
-    mut include_layer: impl FnMut(usize) -> bool,
+    owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = hybrid::expert_residency_catalog(store, config)
         .map_err(Error::UnsupportedArchitecture)?;
-    let units = catalog
-        .into_units()
-        .into_iter()
-        .filter(|unit| include_layer(unit.identity().layer));
+    let units = catalog.into_units_selected_by_owner(owns_unit);
     crate::composition::architecture_expert_units(units, store, layout)
 }
 
@@ -2434,7 +2431,7 @@ fn attach_expert_cache(
     weights_stream: &Stream,
 ) -> Result<(), Error> {
     let store = model.checkpoint_store_arc();
-    let entries = expert_catalog_selected(model.args(), store.as_ref(), None, |_| true)?;
+    let entries = expert_catalog_selected(model.args(), store.as_ref(), None, |_, _| true)?;
     model.expert_cache = Some(ExpertCache::new_shared(
         store,
         entries,

@@ -134,7 +134,9 @@ per-expert or rank-local selection recipe. Backend family adapters may request
 and filter that catalog, but do not calculate a parallel expert topology.
 Hybrid target/MTP families additionally declare the execution group, physical
 MTP unit, checkpoint root, and cache identity of every sparse unit in this
-catalog; backend adapters only filter catalog units selected for a stage.
+catalog; backend adapters filter catalog units against the realized partition
+using that canonical group-local owner address, without recovering placement
+from flattened cache identities, target-layer counts, or inferred MTP ownership.
 Concrete backends lower catalog entries into native storage and may apply the
 declared unit path to a rank-local placement; they do not rebuild the schedule,
 instantiate a family block to discover expert parameters, or match parameter
