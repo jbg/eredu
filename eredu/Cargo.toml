@@ -19,6 +19,11 @@ path = "examples/cartesian_topology.rs"
 required-features = ["mlx"]
 
 [[example]]
+name = "checkpoint_probe"
+path = "examples/checkpoint_probe.rs"
+required-features = ["mlx"]
+
+[[example]]
 name = "expert_parallel_generate"
 path = "examples/expert_parallel_generate.rs"
 required-features = ["mlx"]
@@ -151,5 +156,6 @@ toktrie_hf_tokenizers = "=1.7.6"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 lazy_static = "1"
+libc = "0.2"
 safetensors = "0.8"
 tempfile.workspace = true

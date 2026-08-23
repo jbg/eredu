@@ -13,20 +13,17 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
-use eredu::{
-    api::LoadedModel,
-    runtime::media::input::{InputPart, ModelInput},
-};
+use eredu::api::LoadedModel;
 use eredu_backend_mlx::native::{
     memory,
     ops::indexing::{NewAxis, TryIndexOp},
-    transforms::async_eval_timed,
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
+use eredu_backend_mlx::{InputPart, MlxBackend, MlxModelInput, ModelInput};
 use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 use serde::Serialize;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const DEFAULT_PROMPT: &str = "The capital of France is";
 
 #[derive(Debug, Parser)]
@@ -163,13 +160,10 @@ struct TimingReport {
     warmup_runs: usize,
     warmup_wall_seconds: f64,
     prefill_wall_seconds: f64,
-    prefill_device_seconds: f64,
-    prefill_tokens_per_device_second: Option<f64>,
+    prefill_tokens_per_wall_second: Option<f64>,
     decode_wall_seconds: Vec<f64>,
-    decode_device_seconds: Vec<f64>,
     decode_total_wall_seconds: f64,
-    decode_total_device_seconds: f64,
-    decode_tokens_per_device_second: Option<f64>,
+    decode_tokens_per_wall_second: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -197,9 +191,7 @@ struct RunOutput {
     fed_token_ids: Vec<u32>,
     greedy_token_ids: Vec<u32>,
     prefill_wall: Duration,
-    prefill_device: Duration,
     decode_wall: Vec<Duration>,
-    decode_device: Vec<Duration>,
 }
 
 fn main() -> Result<()> {
@@ -227,12 +219,13 @@ fn main() -> Result<()> {
     let stream = context.stream();
     let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let weights_stream = weights_context.stream();
+    let backend = eredu_backend_mlx::native::backend(stream, weights_stream);
 
     memory::reset_peak_memory()?;
     let load_started = Instant::now();
-    let mut model = LoadedModel::load(&args.model, stream, weights_stream)
+    let mut model = LoadedModel::load(backend, &args.model, Default::default())
         .with_context(|| format!("failed to load checkpoint {}", args.model.display()))?;
-    stream.synchronize()?;
+    model.runtime().backend().synchronize()?;
     weights_stream.synchronize()?;
     let load_wall = load_started.elapsed();
     let after_load = memory_snapshot()?;
@@ -264,12 +257,11 @@ fn main() -> Result<()> {
     write_tensors(&tensor_path, &input_ids, &run)?;
 
     let decode_total_wall: Duration = run.decode_wall.iter().copied().sum();
-    let decode_total_device: Duration = run.decode_device.iter().copied().sum();
-    let prefill_tokens_per_device_second = (!run.prefill_device.is_zero())
-        .then(|| input_ids.len() as f64 / run.prefill_device.as_secs_f64());
-    let decode_tokens_per_device_second = (!run.fed_token_ids.is_empty()
-        && !decode_total_device.is_zero())
-    .then(|| run.fed_token_ids.len() as f64 / decode_total_device.as_secs_f64());
+    let prefill_tokens_per_wall_second = (!run.prefill_wall.is_zero())
+        .then(|| input_ids.len() as f64 / run.prefill_wall.as_secs_f64());
+    let decode_tokens_per_wall_second = (!run.fed_token_ids.is_empty()
+        && !decode_total_wall.is_zero())
+    .then(|| run.fed_token_ids.len() as f64 / decode_total_wall.as_secs_f64());
 
     let tensors = tensor_report(&input_ids, &run);
     // Under teacher forcing these are independent predictions conditioned on
@@ -283,7 +275,7 @@ fn main() -> Result<()> {
         model: ModelReport {
             checkpoint_path: args.model.display().to_string(),
             model_type: model.model_type().to_owned(),
-            model_id_for_template: model.model_id_for_template().to_owned(),
+            model_id_for_template: model.model_id().to_owned(),
         },
         runtime: RuntimeReport {
             crate_name: env!("CARGO_PKG_NAME"),
@@ -309,18 +301,15 @@ fn main() -> Result<()> {
             decoded_greedy_tokens,
         },
         timings: TimingReport {
-            scope: "wall timings cover graph construction and synchronized model evaluation; device timings cover the model graph and exclude logit readback/serialization",
+            scope: "wall timings cover graph construction and exact model-submission completion; logit readback and serialization are excluded",
             load_wall_seconds: load_wall.as_secs_f64(),
             warmup_runs: args.warmup_runs,
             warmup_wall_seconds: warmup_wall.as_secs_f64(),
             prefill_wall_seconds: run.prefill_wall.as_secs_f64(),
-            prefill_device_seconds: run.prefill_device.as_secs_f64(),
-            prefill_tokens_per_device_second,
+            prefill_tokens_per_wall_second,
             decode_wall_seconds: durations_as_seconds(&run.decode_wall),
-            decode_device_seconds: durations_as_seconds(&run.decode_device),
             decode_total_wall_seconds: decode_total_wall.as_secs_f64(),
-            decode_total_device_seconds: decode_total_device.as_secs_f64(),
-            decode_tokens_per_device_second,
+            decode_tokens_per_wall_second,
         },
         memory: MemoryReport {
             units: "bytes",
@@ -342,28 +331,29 @@ fn main() -> Result<()> {
 }
 
 fn run_probe(
-    model: &mut LoadedModel,
+    model: &mut LoadedModel<MlxBackend<'static>>,
     input_ids: &[u32],
     teacher_forced_ids: Option<&[u32]>,
     decode_steps: usize,
     stream: &Stream,
 ) -> Result<RunOutput> {
-    let mut cache = model.new_cache();
+    model.runtime_mut().session_mut().reset()?;
     let prompt_tokens = Array::from(input_ids).try_index_device(NewAxis, stream)?;
     let prompt_parts = [InputPart::text_token_ids(&prompt_tokens)];
 
     let prefill_started = Instant::now();
-    let prefill =
-        model.prefill_input_with_cache(ModelInput::new(&prompt_parts), &mut cache, stream)?;
-    let prefill_timed = async_eval_timed([&prefill], stream)?;
-    let prefill_device = prefill_timed.elapsed()?;
+    let prefill = model
+        .runtime_mut()
+        .prefill(MlxModelInput::from(ModelInput::new(&prompt_parts)))?
+        .wait()?
+        .into_logits()
+        .context("selected MLX rank does not own prefill logits")?;
     let prefill_wall = prefill_started.elapsed();
     let (prefill_logits, vocab_size) = copy_logits(&prefill, stream)?;
     let mut greedy_token_ids = vec![argmax(&prefill_logits)?];
     let mut fed_token_ids = Vec::with_capacity(decode_steps);
     let mut decode_logits = Vec::with_capacity(decode_steps.saturating_mul(vocab_size));
     let mut decode_wall = Vec::with_capacity(decode_steps);
-    let mut decode_device = Vec::with_capacity(decode_steps);
 
     for step in 0..decode_steps {
         let token_id = teacher_forced_ids
@@ -373,9 +363,12 @@ fn run_probe(
         let token = Array::from(&[token_id][..]).try_index_device(NewAxis, stream)?;
 
         let wall_started = Instant::now();
-        let logits = model.decode_text_with_cache(&token, &mut cache, stream)?;
-        let timed = async_eval_timed([&logits], stream)?;
-        let device_elapsed = timed.elapsed()?;
+        let logits = model
+            .runtime_mut()
+            .decode(token)?
+            .wait()?
+            .into_logits()
+            .context("selected MLX rank does not own decode logits")?;
         let wall_elapsed = wall_started.elapsed();
         let (values, step_vocab_size) = copy_logits(&logits, stream)?;
         ensure!(
@@ -385,7 +378,6 @@ fn run_probe(
         greedy_token_ids.push(argmax(&values)?);
         decode_logits.extend(values);
         decode_wall.push(wall_elapsed);
-        decode_device.push(device_elapsed);
     }
 
     Ok(RunOutput {
@@ -395,9 +387,7 @@ fn run_probe(
         fed_token_ids,
         greedy_token_ids,
         prefill_wall,
-        prefill_device,
         decode_wall,
-        decode_device,
     })
 }
 
@@ -630,9 +620,7 @@ mod tests {
             fed_token_ids: vec![2],
             greedy_token_ids: vec![2, 1],
             prefill_wall: Duration::ZERO,
-            prefill_device: Duration::ZERO,
             decode_wall: vec![Duration::ZERO],
-            decode_device: vec![Duration::ZERO],
         };
 
         write_tensors(&path, &[7, 8], &run).unwrap();

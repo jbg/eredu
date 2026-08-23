@@ -3,7 +3,8 @@
 The text-checkpoint path uses three artifacts:
 
 1. `checkpoint_probe` runs Eredu and writes JSON metadata plus F32 logits in
-   SafeTensors.
+   SafeTensors. Its timing report records end-to-end wall time through exact
+   backend completion; tensor readback and artifact serialization are excluded.
 2. `reference_runner.py` runs Transformers with the probe's exact prompt and
    cache-feed token IDs.
 3. `compare_checkpoints.py` checks input identity, finiteness, relative L2,

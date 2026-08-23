@@ -46,7 +46,7 @@ RUN --mount=type=bind,from=rust-toolchain,source=/usr/local/cargo/bin,target=/op
     cargo build --locked --release \
         -p eredu \
         --no-default-features \
-        --features cuda,fancy-regex \
+        --features cuda \
         --example checkpoint_probe; \
     cargo build --locked --release \
         -p safemlx \

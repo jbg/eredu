@@ -856,6 +856,7 @@ dependencies = [
  "eredu-text",
  "idna_adapter",
  "lazy_static",
+ "libc",
  "llguidance",
  "minijinja",
  "safetensors",
