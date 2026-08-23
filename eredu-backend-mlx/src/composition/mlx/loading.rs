@@ -267,31 +267,29 @@ pub fn materialize_model_plan(
 ) -> Result<MlxModel, Error> {
     validate_plan_options(&plan, options)?;
     let runtime_state_dtype_bytes = inspected_runtime_state_dtype_bytes(plan.inspection())?;
-    let (artifact, _policy, _route) = plan.into_parts();
     if let Some(topology) = options
         .parallel
         .filter(|topology| !topology.is_replicated())
     {
-        let path = match &artifact {
-            ModelArtifact::Gguf { path, .. } | ModelArtifact::SafeTensors { path, .. } => path,
-        };
-        let kind = match &artifact {
-            ModelArtifact::Gguf { configuration, .. }
-            | ModelArtifact::SafeTensors { configuration, .. } => {
-                ModelKind::resolve_family(&configuration.family)?
-            }
-        };
+        let kind = ModelKind::resolve_family(&plan.inspection().configuration().family)?;
         if requires_distributed_stage_loader(kind, topology) {
+            let processor_path = (plan.inspection().format()
+                == eredu_core::ArtifactFormat::SafeTensors)
+                .then(|| plan.inspection().path().to_owned());
             let model =
                 crate::composition::mlx::distributed::pipeline::load_pipeline_model_with_options(
-                    path,
+                    plan,
                     options,
                     stream,
                     weights_stream,
                 )
                 .map(|model| MlxModel::pipeline(model, runtime_state_dtype_bytes))?;
-            return attach_artifact_processor(model, &artifact);
+            return match processor_path {
+                Some(path) => attach_safetensors_processor(model, &path, kind),
+                None => Ok(model),
+            };
         }
+        let (artifact, _policy, _route) = plan.into_parts();
         if let ModelArtifact::SafeTensors {
             path,
             configuration,
@@ -308,7 +306,17 @@ pub fn materialize_model_plan(
             .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
             return attach_artifact_processor(model, &artifact);
         }
+        return match artifact {
+            artifact @ ModelArtifact::Gguf { .. } => {
+                materialize_gguf_artifact(artifact, options, stream, weights_stream)
+                    .map(|model| complete_gguf_model(model, runtime_state_dtype_bytes))
+            }
+            ModelArtifact::SafeTensors { .. } => {
+                unreachable!("non-pipeline distributed SafeTensors materialization returned above")
+            }
+        };
     }
+    let (artifact, _policy, _route) = plan.into_parts();
     match artifact {
         artifact @ ModelArtifact::Gguf { .. } => {
             materialize_gguf_artifact(artifact, options, stream, weights_stream)
@@ -319,15 +327,10 @@ pub fn materialize_model_plan(
             configuration,
             ..
         } => {
-            let model = materialize_safetensors(
-                ModelKind::resolve_family(&configuration.family)?,
-                &path,
-                options,
-                stream,
-                weights_stream,
-            )
-            .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
-            attach_safetensors_processor(model, &path)
+            let kind = ModelKind::resolve_family(&configuration.family)?;
+            let model = materialize_safetensors(kind, &path, options, stream, weights_stream)
+                .map(|model| MlxModel::complete(model, runtime_state_dtype_bytes))?;
+            attach_safetensors_processor(model, &path, kind)
         }
     }
 }
@@ -467,20 +470,33 @@ mod runtime_state_dtype_tests {
 }
 
 fn attach_artifact_processor(model: MlxModel, artifact: &ModelArtifact) -> Result<MlxModel, Error> {
-    if let ModelArtifact::SafeTensors { path, .. } = artifact {
-        return attach_safetensors_processor(model, path);
+    if let ModelArtifact::SafeTensors {
+        path,
+        configuration,
+        ..
+    } = artifact
+    {
+        return attach_safetensors_processor(
+            model,
+            path,
+            ModelKind::resolve_family(&configuration.family)?,
+        );
     }
     Ok(model)
 }
 
-fn attach_safetensors_processor(model: MlxModel, path: &Path) -> Result<MlxModel, Error> {
+fn attach_safetensors_processor(
+    model: MlxModel,
+    path: &Path,
+    kind: ModelKind,
+) -> Result<MlxModel, Error> {
     #[cfg(feature = "media")]
     {
-        Ok(model.with_processor(load_processor(path)?))
+        Ok(model.with_processor(load_processor(kind, path)?))
     }
     #[cfg(not(feature = "media"))]
     {
-        let _ = path;
+        let _ = (path, kind);
         Ok(model)
     }
 }
@@ -636,7 +652,7 @@ fn materialize_tensor_parallel(
     }
 }
 
-fn validate_plan_options(
+pub(super) fn validate_plan_options(
     plan: &ModelPreparationPlan,
     options: ModelLoadOptions,
 ) -> Result<(), Error> {

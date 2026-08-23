@@ -15,7 +15,9 @@ use eredu_architectures::{
     StaticParameterVisitorMut,
 };
 use eredu_checkpoint::WeightQuantization;
-use eredu_core::PreparedInputIdentity;
+use eredu_core::{
+    MaterializationRoute, ModelArtifact, ModelPreparationPlan, PreparedInputIdentity,
+};
 use eredu_nn::{Parameterized, RoutedNeuralBackend, TensorParallelExpertOutput};
 use eredu_runtime::{
     ArchitectureBoundary, DenseDiskStreamLoadOptions, LayerWeightResidency, LayeredArchitecture,
@@ -13983,19 +13985,18 @@ fn nested_qwen35_moe_capabilities_pass_cartesian_pipeline_preflight() {
 /// stage-local bounded packed overlay before parameter residency is selected;
 /// fully resident stages never fall back to eager complete-matrix conversion.
 pub fn load_pipeline_model_with_options(
-    model_dir: impl AsRef<Path>,
+    plan: ModelPreparationPlan,
     options: ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let model_dir = model_dir.as_ref();
+    crate::composition::mlx::loading::validate_plan_options(&plan, options)?;
     let topology = options.parallel.ok_or_else(|| {
         Error::Parallel("distributed stage loading requires ModelLoadOptions::parallel".into())
     })?;
     validate_distributed_stage_topology(topology)?;
     topology.validate_execution_stream(stream)?;
-    let expert_cache = options.weight_residency.expert_cache();
-    let dense_stream = match options.weight_residency.layers() {
+    let layer_residency = || match options.weight_residency.layers() {
         LayerWeightResidency::FullyResident => None,
         LayerWeightResidency::LayerwiseHost(options) => {
             Some(PipelineLayerLoadOptions::LayerwiseHost(options))
@@ -14004,275 +14005,82 @@ pub fn load_pipeline_model_with_options(
             Some(PipelineLayerLoadOptions::DenseDiskStream(options))
         }
     };
+    let (artifact, _policy, route) = plan.into_parts();
+    let (expert_cache, dense_stream) = match route {
+        MaterializationRoute::Resident => (None, None),
+        MaterializationRoute::Layerwise => {
+            let layers = layer_residency().ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "layerwise preparation plan requires non-resident layer options".into(),
+                )
+            })?;
+            (None, Some(layers))
+        }
+        MaterializationRoute::ExpertCache => {
+            let experts = options.weight_residency.expert_cache().ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "expert-cache preparation plan requires expert-cache options".into(),
+                )
+            })?;
+            (Some(experts), layer_residency())
+        }
+    };
     let max_mapped_shards = options.weight_residency.max_mapped_shards();
 
-    if model_dir
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-    {
-        let mut structural_options = options;
-        // The explicit distributed-stage loader has already validated its
-        // topology; complete-model structural policy must not reject a
-        // non-replicated coordinate.
-        structural_options.parallel = None;
-        // Stage-local residency and bounded materialization are validated by
-        // the pipeline planner below. Whole-model GGUF policy must therefore
-        // validate the artifact geometry without reapplying the standalone
-        // nonresident-loader restriction.
-        structural_options.weight_residency = WeightResidency::fully_resident();
-        let admitted =
-            crate::composition::mlx::structural::admit_gguf_path(model_dir, structural_options)?;
-        let architecture = admitted.architecture();
-        let checkpoint = admitted.checkpoint().clone();
-        let metadata = admitted.metadata().clone();
-        let capabilities =
-            eredu_architectures::preparation::gguf_capabilities(architecture, &checkpoint)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-        validate_distributed_stage_capabilities(
-            capabilities,
-            topology,
-            expert_cache.is_some(),
-            "GGUF",
-            architecture.metadata_name(),
-        )?;
-        return match architecture {
-            GgufArchitecture::DeepSeek4 => {
-                let args = eredu_architectures::deepseek::parse_v4_gguf(&metadata)
+    let (model_dir, configuration) = match artifact {
+        ModelArtifact::Gguf {
+            path: model_dir,
+            configuration,
+            checkpoint,
+            ..
+        } => {
+            let mut structural_options = options;
+            // The explicit distributed-stage loader has already validated its
+            // topology; complete-model structural policy must not reject a
+            // non-replicated coordinate.
+            structural_options.parallel = None;
+            // Stage-local residency and bounded materialization are validated by
+            // the pipeline planner below. Whole-model GGUF policy must therefore
+            // validate the artifact geometry without reapplying the standalone
+            // nonresident-loader restriction.
+            structural_options.weight_residency = WeightResidency::fully_resident();
+            let architecture = GgufArchitecture::resolve(&configuration.declared_model_type)?;
+            let checkpoint = GgufCheckpoint::from_portable(checkpoint);
+            let metadata =
+                crate::backend::mlx::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            let admitted = crate::composition::mlx::structural::admit_gguf(
+                architecture,
+                checkpoint,
+                metadata,
+                structural_options,
+            )?;
+            let architecture = admitted.architecture();
+            let checkpoint = admitted.checkpoint().clone();
+            let metadata = admitted.metadata().clone();
+            let capabilities =
+                eredu_architectures::preparation::gguf_capabilities(architecture, &checkpoint)
                     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-                let gguf_plan = eredu_architectures::deepseek::v4_gguf_plan(&args)
-                    .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
-                    checkpoint,
-                    &gguf_plan,
-                    eredu_architectures::deepseek::translate_v4_gguf_weight_name,
-                    max_mapped_shards,
-                )?);
-                load_neutral_deepseek_v4_pipeline(
-                    args,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )
-            }
-            GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-                let prepared = llama_checkpoint::prepare_llama_gguf_checkpoint(
-                    &admitted,
-                    None,
-                    weights_stream,
-                )?;
-                let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
-                    .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
-                    checkpoint,
-                    &gguf_plan,
-                    eredu_architectures::llama::translate_gguf_weight_name,
-                    max_mapped_shards,
-                )?);
-                load_llama_pipeline(
-                    prepared.args,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    stream,
-                    weights_stream,
-                )
-            }
-            GgufArchitecture::MuseGlimmer => {
-                let (args, store) = crate::composition::muse_glimmer::prepare_gguf_pipeline_source(
-                    &checkpoint,
-                    &metadata,
-                    max_mapped_shards,
-                )?;
-                load_muse_glimmer_pipeline(
-                    args,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )
-            }
-            GgufArchitecture::DeepSeek2 => {
-                let args = eredu_architectures::deepseek::parse_v3_gguf(
-                    &PipelineDeepSeekGgufCatalog(&checkpoint),
-                    &metadata,
-                )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-                let gguf_plan = eredu_architectures::deepseek::v3_gguf_plan(&args)
-                    .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
-                    checkpoint,
-                    &gguf_plan,
-                    eredu_architectures::deepseek::translate_v3_gguf_weight_name,
-                    max_mapped_shards,
-                )?);
-                load_neutral_deepseek_v3_pipeline(
-                    args,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )
-            }
-            GgufArchitecture::Gemma4 => {
-                let (store, args) = crate::composition::gemma4::open_pipeline_gguf_store(
-                    model_dir,
-                    &checkpoint,
-                    &metadata,
-                    max_mapped_shards,
-                )?;
-                load_neutral_gemma4_pipeline(
-                    args,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )
-            }
-            architecture @ (GgufArchitecture::Qwen2
-            | GgufArchitecture::Qwen3
-            | GgufArchitecture::Qwen3Moe) => {
-                let is_moe = architecture == GgufArchitecture::Qwen3Moe;
-                let prepared = crate::composition::qwen::prepare_qwen_gguf_checkpoint(&admitted)?;
-                let args = prepared.args;
-                let gguf_plan = eredu_architectures::qwen::gguf_plan(&args)
-                    .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
-                    checkpoint,
-                    &gguf_plan,
-                    move |name| eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe),
-                    max_mapped_shards,
-                )?);
-                load_qwen_pipeline(
-                    args,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )
-            }
-            GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-                let (args, store) = crate::composition::qwen::vl::prepare_gguf_pipeline(
-                    model_dir,
-                    &checkpoint,
-                    &metadata,
-                    max_mapped_shards,
-                )?;
-                load_neutral_qwen_vl_pipeline(
-                    args,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )
-            }
-            GgufArchitecture::GptOss => {
-                let prepared = neutral_gpt_oss::prepare_gpt_oss_gguf_checkpoint(&admitted)?;
-                let gguf_plan =
-                    gpt_oss::gguf_plan(&prepared.args).map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
-                    checkpoint,
-                    &gguf_plan,
-                    gpt_oss::translate_gguf_weight_name,
-                    max_mapped_shards,
-                )?);
-                load_gpt_oss_pipeline(
-                    prepared.args,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )
-            }
-            architecture @ (GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe) => {
-                let prepared = crate::composition::lfm2::prepare_gguf(&admitted)?;
-                let is_moe = architecture == GgufArchitecture::Lfm2Moe;
-                let gguf_plan = eredu_architectures::lfm2::gguf_plan(&prepared.args)
-                    .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
-                    checkpoint,
-                    &gguf_plan,
-                    move |name| eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe),
-                    max_mapped_shards,
-                )?);
-                load_lfm2_pipeline(
-                    prepared.args,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )
-            }
-            architecture @ (GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe) => {
-                let prepared = crate::composition::nemotron_h::prepare_gguf(&admitted)?;
-                let gguf_plan = eredu_architectures::nemotron_h::gguf_plan(&prepared.args)
-                    .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
-                    checkpoint,
-                    &gguf_plan,
-                    eredu_architectures::nemotron_h::translate_gguf_weight_name,
-                    max_mapped_shards,
-                )?);
-                let _ = architecture;
-                load_nemotron_h_pipeline(
-                    prepared.args,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )
-            }
-            GgufArchitecture::Qwen35
-            | GgufArchitecture::Qwen35Moe
-            | GgufArchitecture::Qwen3Next => {
-                let (parsed, store) = crate::composition::qwen::hybrid::prepare_gguf_pipeline(
-                    model_dir,
-                    &checkpoint,
-                    &metadata,
-                    max_mapped_shards,
-                )?;
-                if parsed.vision.is_some() {
-                    load_neutral_qwen_conditional_pipeline(
-                        parsed,
-                        store,
-                        topology,
-                        options.quantization,
-                        dense_stream,
-                        expert_cache,
-                        stream,
-                        weights_stream,
-                    )
-                } else {
-                    load_neutral_qwen_hybrid_pipeline(
-                        parsed.text,
+            validate_distributed_stage_capabilities(
+                capabilities,
+                topology,
+                expert_cache.is_some(),
+                "GGUF",
+                architecture.metadata_name(),
+            )?;
+            return match architecture {
+                GgufArchitecture::DeepSeek4 => {
+                    let args = eredu_architectures::deepseek::parse_v4_gguf(&metadata)
+                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    let gguf_plan = eredu_architectures::deepseek::v4_gguf_plan(&args)
+                        .map_err(Error::UnsupportedArchitecture)?;
+                    let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
+                        checkpoint,
+                        &gguf_plan,
+                        eredu_architectures::deepseek::translate_v4_gguf_weight_name,
+                        max_mapped_shards,
+                    )?);
+                    load_neutral_deepseek_v4_pipeline(
+                        args,
                         store,
                         topology,
                         options.quantization,
@@ -14282,73 +14090,310 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )
                 }
-            }
-            GgufArchitecture::KimiLinear => {
-                let prepared = crate::composition::kimi_linear::prepare_gguf(&admitted)?;
-                let gguf_plan = eredu_architectures::kimi_linear::gguf_plan(&prepared.args)
-                    .map_err(Error::UnsupportedArchitecture)?;
-                let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
-                    checkpoint,
-                    &gguf_plan,
-                    eredu_architectures::kimi_linear::translate_gguf_weight_name,
-                    max_mapped_shards,
-                )?);
-                load_kimi_linear_pipeline(
-                    prepared.args,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )
-            }
-            GgufArchitecture::Inkling => {
-                let (store, args) = crate::composition::inkling::prepare_gguf_pipeline_source(
-                    model_dir,
-                    &checkpoint,
-                    &metadata,
-                    max_mapped_shards,
-                )?;
-                load_neutral_inkling_pipeline(
-                    args,
-                    store,
-                    topology,
-                    options.quantization,
-                    dense_stream,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )
-            }
-        };
-    }
+                GgufArchitecture::Llama | GgufArchitecture::Mistral => {
+                    let prepared = llama_checkpoint::prepare_llama_gguf_checkpoint(
+                        &admitted,
+                        None,
+                        weights_stream,
+                    )?;
+                    let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
+                        .map_err(Error::UnsupportedArchitecture)?;
+                    let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
+                        checkpoint,
+                        &gguf_plan,
+                        eredu_architectures::llama::translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?);
+                    load_llama_pipeline(
+                        prepared.args,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        stream,
+                        weights_stream,
+                    )
+                }
+                GgufArchitecture::MuseGlimmer => {
+                    let (args, store) =
+                        crate::composition::muse_glimmer::prepare_gguf_pipeline_source(
+                            &checkpoint,
+                            &metadata,
+                            max_mapped_shards,
+                        )?;
+                    load_muse_glimmer_pipeline(
+                        args,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        expert_cache,
+                        stream,
+                        weights_stream,
+                    )
+                }
+                GgufArchitecture::DeepSeek2 => {
+                    let args = eredu_architectures::deepseek::parse_v3_gguf(
+                        &PipelineDeepSeekGgufCatalog(&checkpoint),
+                        &metadata,
+                    )
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    let gguf_plan = eredu_architectures::deepseek::v3_gguf_plan(&args)
+                        .map_err(Error::UnsupportedArchitecture)?;
+                    let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
+                        checkpoint,
+                        &gguf_plan,
+                        eredu_architectures::deepseek::translate_v3_gguf_weight_name,
+                        max_mapped_shards,
+                    )?);
+                    load_neutral_deepseek_v3_pipeline(
+                        args,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        expert_cache,
+                        stream,
+                        weights_stream,
+                    )
+                }
+                GgufArchitecture::Gemma4 => {
+                    let (store, args) = crate::composition::gemma4::open_pipeline_gguf_store(
+                        &model_dir,
+                        &checkpoint,
+                        &metadata,
+                        max_mapped_shards,
+                    )?;
+                    load_neutral_gemma4_pipeline(
+                        args,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        expert_cache,
+                        stream,
+                        weights_stream,
+                    )
+                }
+                architecture @ (GgufArchitecture::Qwen2
+                | GgufArchitecture::Qwen3
+                | GgufArchitecture::Qwen3Moe) => {
+                    let is_moe = architecture == GgufArchitecture::Qwen3Moe;
+                    let prepared =
+                        crate::composition::qwen::prepare_qwen_gguf_checkpoint(&admitted)?;
+                    let args = prepared.args;
+                    let gguf_plan = eredu_architectures::qwen::gguf_plan(&args)
+                        .map_err(Error::UnsupportedArchitecture)?;
+                    let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
+                        checkpoint,
+                        &gguf_plan,
+                        move |name| {
+                            eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe)
+                        },
+                        max_mapped_shards,
+                    )?);
+                    load_qwen_pipeline(
+                        args,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        expert_cache,
+                        stream,
+                        weights_stream,
+                    )
+                }
+                GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
+                    let (args, store) = crate::composition::qwen::vl::prepare_gguf_pipeline(
+                        &model_dir,
+                        &checkpoint,
+                        &metadata,
+                        max_mapped_shards,
+                    )?;
+                    load_neutral_qwen_vl_pipeline(
+                        args,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        expert_cache,
+                        stream,
+                        weights_stream,
+                    )
+                }
+                GgufArchitecture::GptOss => {
+                    let prepared = neutral_gpt_oss::prepare_gpt_oss_gguf_checkpoint(&admitted)?;
+                    let gguf_plan = gpt_oss::gguf_plan(&prepared.args)
+                        .map_err(Error::UnsupportedArchitecture)?;
+                    let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
+                        checkpoint,
+                        &gguf_plan,
+                        gpt_oss::translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?);
+                    load_gpt_oss_pipeline(
+                        prepared.args,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        expert_cache,
+                        stream,
+                        weights_stream,
+                    )
+                }
+                architecture @ (GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe) => {
+                    let prepared = crate::composition::lfm2::prepare_gguf(&admitted)?;
+                    let is_moe = architecture == GgufArchitecture::Lfm2Moe;
+                    let gguf_plan = eredu_architectures::lfm2::gguf_plan(&prepared.args)
+                        .map_err(Error::UnsupportedArchitecture)?;
+                    let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
+                        checkpoint,
+                        &gguf_plan,
+                        move |name| {
+                            eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe)
+                        },
+                        max_mapped_shards,
+                    )?);
+                    load_lfm2_pipeline(
+                        prepared.args,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        expert_cache,
+                        stream,
+                        weights_stream,
+                    )
+                }
+                architecture @ (GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe) => {
+                    let prepared = crate::composition::nemotron_h::prepare_gguf(&admitted)?;
+                    let gguf_plan = eredu_architectures::nemotron_h::gguf_plan(&prepared.args)
+                        .map_err(Error::UnsupportedArchitecture)?;
+                    let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
+                        checkpoint,
+                        &gguf_plan,
+                        eredu_architectures::nemotron_h::translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?);
+                    let _ = architecture;
+                    load_nemotron_h_pipeline(
+                        prepared.args,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        expert_cache,
+                        stream,
+                        weights_stream,
+                    )
+                }
+                GgufArchitecture::Qwen35
+                | GgufArchitecture::Qwen35Moe
+                | GgufArchitecture::Qwen3Next => {
+                    let (parsed, store) = crate::composition::qwen::hybrid::prepare_gguf_pipeline(
+                        &model_dir,
+                        &checkpoint,
+                        &metadata,
+                        max_mapped_shards,
+                    )?;
+                    if parsed.vision.is_some() {
+                        load_neutral_qwen_conditional_pipeline(
+                            parsed,
+                            store,
+                            topology,
+                            options.quantization,
+                            dense_stream,
+                            expert_cache,
+                            stream,
+                            weights_stream,
+                        )
+                    } else {
+                        load_neutral_qwen_hybrid_pipeline(
+                            parsed.text,
+                            store,
+                            topology,
+                            options.quantization,
+                            dense_stream,
+                            expert_cache,
+                            stream,
+                            weights_stream,
+                        )
+                    }
+                }
+                GgufArchitecture::KimiLinear => {
+                    let prepared = crate::composition::kimi_linear::prepare_gguf(&admitted)?;
+                    let gguf_plan = eredu_architectures::kimi_linear::gguf_plan(&prepared.args)
+                        .map_err(Error::UnsupportedArchitecture)?;
+                    let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
+                        checkpoint,
+                        &gguf_plan,
+                        eredu_architectures::kimi_linear::translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?);
+                    load_kimi_linear_pipeline(
+                        prepared.args,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        expert_cache,
+                        stream,
+                        weights_stream,
+                    )
+                }
+                GgufArchitecture::Inkling => {
+                    let (store, args) = crate::composition::inkling::prepare_gguf_pipeline_source(
+                        &model_dir,
+                        &checkpoint,
+                        &metadata,
+                        max_mapped_shards,
+                    )?;
+                    load_neutral_inkling_pipeline(
+                        args,
+                        store,
+                        topology,
+                        options.quantization,
+                        dense_stream,
+                        expert_cache,
+                        stream,
+                        weights_stream,
+                    )
+                }
+            };
+        }
+        ModelArtifact::SafeTensors {
+            path,
+            configuration,
+            ..
+        } => (path, configuration),
+    };
 
-    let config: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
-    let resolved = eredu_architectures::configuration::resolve_model_identity(&config)?;
-    if resolved.kind.loading_protocol() == eredu_core::LoadingProtocol::Realtime {
+    let config = configuration.json.as_ref().ok_or_else(|| {
+        Error::UnsupportedArchitecture(
+            "SafeTensors preparation plan omitted normalized JSON configuration".into(),
+        )
+    })?;
+    let kind = ModelKind::resolve_family(&configuration.family)?;
+    if configuration.loading_protocol == eredu_core::LoadingProtocol::Realtime {
         return Err(Error::UnsupportedArchitecture(
             "Moshi-family models use a realtime multi-stream temporal/depth contract, not the decoder pipeline"
                 .into(),
         ));
     }
-    let capabilities =
-        eredu_architectures::preparation::safetensors_capabilities(resolved.kind, &config)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let capabilities = eredu_architectures::preparation::safetensors_capabilities(kind, config)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     validate_distributed_stage_capabilities(
         capabilities,
         topology,
         expert_cache.is_some(),
         "SafeTensors",
-        &resolved.effective_model_type,
+        &configuration.effective_model_type,
     )?;
-    let store = open_safetensors_weight_store(model_dir, max_mapped_shards)?;
-    match resolved.kind {
+    let store = open_safetensors_weight_store(&model_dir, max_mapped_shards)?;
+    match kind {
         ModelKind::Llama => {
-            let config = std::fs::File::open(model_dir.join("config.json"))?;
-            let args = eredu_architectures::llama::model_args_from_config_reader(config)
+            let args = eredu_architectures::llama::model_args_from_config_value(config)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             load_llama_pipeline(
                 args,
@@ -14361,9 +14406,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         ModelKind::DeepSeekV3 => {
-            let value: serde_json::Value =
-                serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
-            let args = eredu_architectures::deepseek::parse_v3_config(&value)
+            let args = eredu_architectures::deepseek::parse_v3_config(config)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let plan = eredu_architectures::deepseek::v3_safetensors_plan(&args, true)
                 .map_err(Error::UnsupportedArchitecture)?;
@@ -14380,9 +14423,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         ModelKind::DeepSeekV4 => {
-            let value: serde_json::Value =
-                serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
-            let args = eredu_architectures::deepseek::parse_v4_config(&value)
+            let args = eredu_architectures::deepseek::parse_v4_config(config)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let plan = eredu_architectures::deepseek::v4_safetensors_plan(&args)
                 .map_err(Error::UnsupportedArchitecture)?;
@@ -14399,7 +14440,10 @@ pub fn load_pipeline_model_with_options(
             )
         }
         ModelKind::Gemma4 => {
-            let args = crate::composition::gemma4::load_pipeline_config(model_dir)?;
+            let args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
+                &serde_json::to_vec(config)?,
+            )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let store = crate::composition::gemma4::resolve_pipeline_store(store, &args)?;
             load_neutral_gemma4_pipeline(
                 args,
@@ -14413,7 +14457,8 @@ pub fn load_pipeline_model_with_options(
             )
         }
         ModelKind::Qwen2 | ModelKind::Qwen3 => {
-            let args = crate::composition::qwen::load_model_args(model_dir)?;
+            let args = eredu_architectures::qwen::model_args_from_config_value(config)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             load_qwen_pipeline(
                 args,
                 store,
@@ -14426,7 +14471,10 @@ pub fn load_pipeline_model_with_options(
             )
         }
         ModelKind::MuseGlimmer => {
-            let args = crate::composition::muse_glimmer::load_pipeline_config(model_dir)?;
+            let args = eredu_architectures::muse_glimmer::DecoderConfig::from_hf_json(
+                &serde_json::to_vec(config)?,
+            )
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             load_muse_glimmer_pipeline(
                 args,
                 store,
@@ -14439,9 +14487,7 @@ pub fn load_pipeline_model_with_options(
             )
         }
         ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
-            let value: serde_json::Value =
-                serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
-            let args = eredu_architectures::qwen::vl::model_args_from_config_value(&value)
+            let args = eredu_architectures::qwen::vl::model_args_from_config_value(config)
                 .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             load_neutral_qwen_vl_pipeline(
                 args,
@@ -14455,7 +14501,8 @@ pub fn load_pipeline_model_with_options(
             )
         }
         ModelKind::GptOss => load_gpt_oss_pipeline(
-            neutral_gpt_oss::load_model_args(model_dir)?,
+            eredu_architectures::gpt_oss::model_args_from_config_value(config)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
             store,
             topology,
             options.quantization,
@@ -14465,7 +14512,8 @@ pub fn load_pipeline_model_with_options(
             weights_stream,
         ),
         ModelKind::Lfm2 => load_lfm2_pipeline(
-            crate::composition::lfm2::load_model_args(model_dir)?,
+            eredu_architectures::lfm2::model_args_from_config_value(config)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
             store,
             topology,
             options.quantization,
@@ -14475,7 +14523,8 @@ pub fn load_pipeline_model_with_options(
             weights_stream,
         ),
         ModelKind::NemotronH => load_nemotron_h_pipeline(
-            crate::composition::nemotron_h::load_model_args(model_dir)?,
+            eredu_architectures::nemotron_h::model_args_from_config_value(config)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
             store,
             topology,
             options.quantization,
@@ -14485,7 +14534,8 @@ pub fn load_pipeline_model_with_options(
             weights_stream,
         ),
         ModelKind::Qwen3Next => {
-            let parsed = crate::composition::qwen::hybrid::load_parsed_config(model_dir)?;
+            let parsed = eredu_architectures::qwen::hybrid::model_args_from_config_value(config)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             load_neutral_qwen_hybrid_pipeline(
                 parsed.text,
                 store,
@@ -14498,7 +14548,8 @@ pub fn load_pipeline_model_with_options(
             )
         }
         ModelKind::Qwen35 => {
-            let parsed = crate::composition::qwen::hybrid::load_parsed_config(model_dir)?;
+            let parsed = eredu_architectures::qwen::hybrid::model_args_from_config_value(config)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             if parsed.vision.is_none() {
                 load_neutral_qwen_hybrid_pipeline(
                     parsed.text,
@@ -14524,10 +14575,8 @@ pub fn load_pipeline_model_with_options(
             }
         }
         ModelKind::KimiLinear => load_kimi_linear_pipeline(
-            eredu_architectures::kimi_linear::model_args_from_config_reader(std::fs::File::open(
-                model_dir.join("config.json"),
-            )?)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            eredu_architectures::kimi_linear::model_args_from_config_value(config)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
             store,
             topology,
             options.quantization,
@@ -14537,7 +14586,9 @@ pub fn load_pipeline_model_with_options(
             weights_stream,
         ),
         ModelKind::Inkling => {
-            let args = crate::composition::inkling::load_pipeline_config(model_dir)?;
+            let args =
+                eredu_architectures::inkling::ModelArgs::from_hf_json(&serde_json::to_vec(config)?)
+                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
             let store = crate::composition::inkling::resolve_pipeline_store(store, &args)?;
             load_neutral_inkling_pipeline(
                 args,

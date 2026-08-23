@@ -1587,11 +1587,6 @@ fn resolve_store(
     ))
 }
 
-pub fn load_pipeline_config(model_dir: &Path) -> Result<ModelArgs, Error> {
-    ModelArgs::from_hf_json(&std::fs::read(model_dir.join("config.json"))?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
 pub fn resolve_pipeline_store(
     store: SharedCheckpointSource,
     args: &ModelArgs,

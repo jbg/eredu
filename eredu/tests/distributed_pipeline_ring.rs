@@ -33,10 +33,11 @@ use eredu_backend_mlx::{
         media::{input::InputPayload, PreparedModelInput},
     },
     testing::backend::mlx::{
-        DeviceAssignment, MlxBackend, MlxDistributedSession, MlxParallelContext, ModelLoadOptions,
+        error::Error as MlxError, DeviceAssignment, MlxBackend, MlxDistributedSession,
+        MlxParallelContext, ModelLoadOptions,
     },
     testing::composition::mlx::distributed::pipeline::{
-        load_pipeline_model_with_options, PipelineLayerCache, PipelineStep,
+        load_pipeline_model_with_options, PipelineLayerCache, PipelineModel, PipelineStep,
     },
     testing::composition::{
         kimi_linear as neutral_kimi_linear, lfm2, nemotron_h as neutral_nemotron_h,
@@ -61,6 +62,53 @@ const OPAQUE_MUSE_IMAGE: &str = "EREDU_PIPELINE_OPAQUE_MUSE_IMAGE";
 const OPAQUE_INKLING_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MEDIA";
 const OPAQUE_INKLING_MTP: &str = "EREDU_PIPELINE_OPAQUE_INKLING_MTP";
 const OPAQUE_GEMMA4_MEDIA: &str = "EREDU_PIPELINE_OPAQUE_GEMMA4_MEDIA";
+
+fn load_prepared_pipeline_model(
+    checkpoint: &Path,
+    options: ModelLoadOptions,
+    stream: &Stream,
+) -> PipelineModel {
+    let inspection = eredu_architectures::configuration::inspect_artifact(checkpoint).unwrap();
+    let plan =
+        eredu::plan_model_preparation(inspection, options.preparation_policy().unwrap()).unwrap();
+    load_pipeline_model_with_options(plan, options, stream, stream).unwrap()
+}
+
+#[test]
+fn distributed_materialization_uses_the_planned_configuration() {
+    let checkpoint = tempfile::tempdir().unwrap();
+    write_deepseek_fixture(checkpoint.path(), 2);
+    let topology =
+        MlxParallelContext::for_rank(0, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+            .unwrap();
+    let mut layerwise = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
+    layerwise.strict_loading = false;
+    let options = ModelLoadOptions::with_parallel(topology)
+        .with_weight_residency(WeightResidency::layerwise_host(layerwise));
+    let inspection =
+        eredu_architectures::configuration::inspect_artifact(checkpoint.path()).unwrap();
+    let plan =
+        eredu::plan_model_preparation(inspection, options.preparation_policy().unwrap()).unwrap();
+
+    std::fs::remove_file(checkpoint.path().join("config.json")).unwrap();
+
+    let stream = Stream::new_with_device(&topology.device.device().unwrap());
+    let error = match load_pipeline_model_with_options(plan, options, &stream, &stream) {
+        Ok(model) => {
+            assert_eq!(model.stage_info().global_layer_range, 0..1);
+            return;
+        }
+        Err(error) => error,
+    };
+    // This compact fixture intentionally retains two tensors outside the
+    // stage contract. Reaching binding validation after config.json is gone
+    // proves the distributed loader consumed the plan-owned JSON instead of
+    // reopening the artifact configuration.
+    assert!(
+        matches!(error, MlxError::StrictLoadValidation { .. }),
+        "expected checkpoint binding validation after planned configuration parsing, got {error}"
+    );
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FixtureFamily {
@@ -735,36 +783,30 @@ fn pipeline_ring_worker() {
         } else {
             NonExpertWeightResidency::FullyResident
         };
-        load_pipeline_model_with_options(
+        load_prepared_pipeline_model(
             &checkpoint,
             base_options().with_weight_residency(WeightResidency::with_expert_cache(
                 non_experts,
                 ExpertCacheLoadOptions::default(),
             )),
             &stream,
-            &stream,
         )
-        .unwrap()
     } else if layerwise_host {
-        load_pipeline_model_with_options(
+        load_prepared_pipeline_model(
             &checkpoint,
             base_options()
                 .with_weight_residency(WeightResidency::layerwise_host(layerwise_options())),
             &stream,
-            &stream,
         )
-        .unwrap()
     } else if dense_stream {
         let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
-        load_pipeline_model_with_options(
+        load_prepared_pipeline_model(
             &checkpoint,
             base_options().with_weight_residency(WeightResidency::dense_disk_stream(dense)),
             &stream,
-            &stream,
         )
-        .unwrap()
     } else {
-        load_pipeline_model_with_options(&checkpoint, base_options(), &stream, &stream).unwrap()
+        load_prepared_pipeline_model(&checkpoint, base_options(), &stream)
     };
     let info = model.stage_info();
     let expected_range = family.stage_range(pipeline_rank);

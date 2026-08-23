@@ -1816,11 +1816,6 @@ fn open_gguf_store(
     Ok((store, args))
 }
 
-pub fn load_pipeline_config(model_dir: &Path) -> Result<DecoderConfig, Error> {
-    DecoderConfig::from_hf_json(&std::fs::read(model_dir.join("config.json"))?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
 pub fn prepare_gguf_pipeline_source(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,

@@ -1494,11 +1494,6 @@ pub fn resolve_pipeline_store(
     ))
 }
 
-pub fn load_pipeline_config(model_dir: &Path) -> Result<FamilyConfig, Error> {
-    FamilyConfig::from_hf_json(&std::fs::read(model_dir.join("config.json"))?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
 fn quantize_store(
     store: SharedCheckpointSource,
     source: &FamilyConfig,

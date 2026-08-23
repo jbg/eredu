@@ -2397,13 +2397,6 @@ fn load_conditional_store(
     })
 }
 
-pub fn load_parsed_config(model_dir: impl AsRef<Path>) -> Result<ParsedHybridConfig, Error> {
-    let value: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(model_dir.as_ref().join("config.json"))?)?;
-    hybrid::model_args_from_config_value(&value)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
-}
-
 fn load_store(
     store: Arc<dyn CheckpointSource>,
     parsed: ParsedHybridConfig,

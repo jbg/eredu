@@ -60,6 +60,14 @@ fn load_test_model(
     crate::load_model(&backend, path, options)
 }
 
+fn load_qwen_hybrid_config(
+    path: &std::path::Path,
+) -> eredu_architectures::qwen::hybrid::ParsedHybridConfig {
+    let config =
+        serde_json::from_reader(std::fs::File::open(path.join("config.json")).unwrap()).unwrap();
+    eredu_architectures::qwen::hybrid::model_args_from_config_value(&config).unwrap()
+}
+
 #[test]
 #[ignore = "requires MLX runtime execution and EREDU_INSPECTION_MODEL_DIR"]
 fn observer_forward_reports_attention_and_residual_hooks() {
@@ -1807,9 +1815,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 save_zero_qwen_checkpoint(&args, &dir, stream);
             }
             "qwen3_5" => {
-                let parsed =
-                    eredu_backend_mlx::testing::composition::qwen::hybrid::load_parsed_config(&dir)
-                        .unwrap();
+                let parsed = load_qwen_hybrid_config(&dir);
                 if parsed.vision.is_some() {
                     save_zero_neutral_checkpoint(
                         &eredu_backend_mlx::testing::composition::qwen::hybrid::QwenConditionalCheckpointTemplate::new(
@@ -2358,9 +2364,7 @@ fn tiny_hybrid_qwen_neutral_runtime_executes_recurrent_and_attention_layers() {
               "tie_word_embeddings":false
             }"#,
     );
-    let args = eredu_backend_mlx::testing::composition::qwen::hybrid::load_parsed_config(&dir)
-        .unwrap()
-        .text;
+    let args = load_qwen_hybrid_config(&dir).text;
     save_zero_neutral_checkpoint(
         &eredu_backend_mlx::testing::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
             args, stream,
@@ -3066,9 +3070,7 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
           }
         }"#;
     let dir = temp_model_dir(config);
-    let args = eredu_backend_mlx::testing::composition::qwen::hybrid::load_parsed_config(&dir)
-        .unwrap()
-        .text;
+    let args = load_qwen_hybrid_config(&dir).text;
     save_zero_neutral_checkpoint(
         &eredu_backend_mlx::testing::composition::qwen::hybrid::QwenHybridCheckpointTemplate::new(
             args, stream,

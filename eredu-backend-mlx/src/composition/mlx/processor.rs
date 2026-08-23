@@ -1,6 +1,6 @@
 //! Architecture selection for MLX media preprocessing.
 
-use std::{fs, path::Path};
+use std::path::Path;
 
 use eredu_core::{Media as PortableMedia, TokenizedMultimodalRequest, TokenizedMultimodalSegment};
 
@@ -258,11 +258,12 @@ impl ModelProcessor {
 }
 
 /// Loads a supported media processor without loading model weights.
-pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcessor>, Error> {
+pub fn load_processor(
+    kind: eredu_architectures::ModelKind,
+    model_dir: impl AsRef<Path>,
+) -> Result<Option<ModelProcessor>, Error> {
     let model_dir = model_dir.as_ref();
-    let config = serde_json::from_slice(&fs::read(model_dir.join("config.json"))?)?;
-    let configuration = eredu_architectures::configuration::resolve_model_identity(&config)?;
-    match configuration.kind {
+    match kind {
         eredu_architectures::ModelKind::Inkling => ModelProcessor::load_inkling(model_dir),
         eredu_architectures::ModelKind::Gemma4 => ModelProcessor::load_gemma4(model_dir),
         eredu_architectures::ModelKind::MuseGlimmer => {

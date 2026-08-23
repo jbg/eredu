@@ -274,6 +274,13 @@ family-specific structural admission. Backends may wrap the resulting portable
 checkpoint handle and add architecture or device compatibility checks, but do
 not repeat either portable admission layer.
 
+`ModelPreparationPlan` is the one-shot authority for stage 4. Materializers,
+including distributed stage loaders, consume its inspected configuration,
+checkpoint handle, and selected route directly. They must not reopen an
+artifact to rediscover configuration or checkpoint metadata after planning;
+payload stores may still map weight members during materialization, but those
+reads do not replace the plan's configuration, checkpoint metadata, or route.
+
 `ModelLoadingBackend` implements backend policy, architecture/backend
 capability intersection, and materialization.
 `Backend::create_session` consumes a `PreparedModel`, so an executable cannot
