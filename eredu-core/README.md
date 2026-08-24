@@ -23,8 +23,8 @@ eredu-core = "0.1"
   transactional request state machines.
 - Attention schedules, parallel topology, execution plans, admission reports,
   and telemetry schemas.
-- Weight and cache residency policy, accounting, eviction, transfer, and I/O
-  coordination.
+- Weight and cache residency policy, budgets, accounting schemas, eviction
+  rules, and transfer contracts.
 - Portable decoded media descriptions and ordered multimodal requests.
 
 Backend contracts operate on associated opaque types. Implementations retain

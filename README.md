@@ -72,7 +72,9 @@ portable components or implementation layers for specialized use.
 | --- | --- |
 | [`eredu`](eredu/) | Main model loading, generation, chat, multimodal, realtime, and planning API |
 | [`eredu-cli`](eredu-cli/) | Command-line model runner built on Eredu |
-| [`eredu-core`](eredu-core/) | Backend-neutral runtime contracts, scheduling, validation, residency, and portable schemas |
+| [`eredu-core`](eredu-core/) | Backend-neutral contracts, artifact inspection, planning, validation, and portable schemas |
+| [`eredu-runtime`](eredu-runtime/) | Backend-neutral execution, scheduling, cache I/O, and weight and cache residency orchestration |
+| [`eredu-architectures`](eredu-architectures/) | Model-family configuration, checkpoint schemas, parameter topology, and backend-neutral execution |
 | [`eredu-text`](eredu-text/) | Backend-neutral tokenization and chat-template utilities |
 | [`eredu-gguf`](eredu-gguf/) | Bounded, framework-independent GGUF reading, writing, and tensor conversion |
 | [`eredu-backend-mlx`](eredu-backend-mlx/) | Concrete MLX tensor, execution, checkpoint, composition, media, and codec integration |

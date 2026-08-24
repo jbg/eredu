@@ -466,8 +466,8 @@ configuration, checkpoint metadata, companion selection, or route.
 
 `ModelLoadingBackend` implements backend policy, architecture/backend
 capability intersection, and materialization.
-`Backend::create_session` consumes a `PreparedModel`, so an executable cannot
-be paired with a cache or session created by another backend.
+`BackendProvider::create_session` consumes a `PreparedModel`, so an executable
+cannot be paired with a cache or session created by another backend.
 
 `ModelRuntime<B>` owns the selected backend and its sole session. Applications
 normally use `eredu::api::LoadedModel<B>`, which combines that runtime
