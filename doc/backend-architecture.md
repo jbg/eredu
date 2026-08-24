@@ -316,6 +316,9 @@ Observed routed execution asks the neutral `RoutedLayeredArchitecture` for each
 unit's optional observation point. The architecture supplies both the semantic
 module path and expert cardinality; backend composition only adapts native
 tensors to the neutral observer and cannot invent family path segments.
+Activation observers likewise derive unit input, output, and nested operator
+names from the architecture's canonical `unit_path`; concrete composition must
+not reconstruct a family path from a group or layer index.
 
 Architecture capability estimates likewise own native and effective context,
 accepted modalities, cache ownership and sharing, attention windows,

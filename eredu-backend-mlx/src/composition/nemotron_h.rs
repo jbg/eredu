@@ -1408,7 +1408,10 @@ impl NemotronHModel {
              state: &mut MlxHybridState,
              forward: &mut eredu_architectures::nemotron_h::ForwardContext<crate::MlxTensor>,
              context: &Stream| {
-                let path = format!("model.layers.{index}");
+                let path = <NeutralArchitecture as LayeredArchitecture<
+                    MlxNeuralBackend,
+                    MlxHybridState,
+                >>::unit_path(architecture, group, index)?;
                 observer.observe(&format!("{path}.input"), hidden)?;
                 let output = architecture.forward_unit_observed_with_provider(
                     group, index, block, hidden, state, forward, observer, provider, context,

@@ -886,11 +886,11 @@ impl<B: RoutedNeuralBackend> LayeredModel<B> {
         P: RoutedExpertProvider<B>,
         P::Error: std::fmt::Display,
     {
-        self.unit_path_inner(group, index)?;
+        let path = self.unit_path_inner(group, index)?;
         let state_index = self.state_index(group, index)?;
         match unit {
             Unit::Target(block) if group == 0 => block.forward_observed_with_provider(
-                &format!("model.layers.{index}"),
+                &path,
                 self.args.n_routed_experts,
                 hidden,
                 forward.mask.as_ref(),
