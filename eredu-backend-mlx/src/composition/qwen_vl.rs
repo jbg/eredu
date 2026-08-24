@@ -940,12 +940,8 @@ fn quantize_store(
     ),
     Error,
 > {
-    let mut target = source.clone();
-    target.text.quantization = Some(quantization);
-    target.text.quantization_config = None;
-    target.text.quantized_weights = None;
-    target.text.quantized_weight_configs = None;
-    target.vision.apply_load_time_quantization(quantization);
+    let target = vl::load_time_quantization(source, quantization)
+        .map_err(Error::ArchitectureModel)?;
     let source_architecture = Architecture::new(source.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = Architecture::new(target.clone(), stream)

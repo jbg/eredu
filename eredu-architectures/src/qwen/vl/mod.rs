@@ -7,7 +7,7 @@ mod parallel;
 mod positions;
 
 pub use checkpoint::{
-    normalize_text_weight_formats, safetensors_plan, static_recipes,
+    load_time_quantization, normalize_text_weight_formats, safetensors_plan, static_recipes,
     translate_text_gguf_weight_name, translate_vision_gguf_weight_name, unit_recipes,
 };
 pub use config::{

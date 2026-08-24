@@ -135,7 +135,7 @@ impl VisionConfig {
 
     /// Applies an explicit in-memory quantization policy to aligned vision
     /// projections. This changes storage intent only; it performs no I/O.
-    pub fn apply_load_time_quantization(&mut self, quantization: WeightQuantization) {
+    pub(crate) fn apply_load_time_quantization(&mut self, quantization: WeightQuantization) {
         let aligned =
             |input: i32| input > 0 && input % quantization.group_size() == 0 && input % 32 == 0;
         self.linear_formats.clear();

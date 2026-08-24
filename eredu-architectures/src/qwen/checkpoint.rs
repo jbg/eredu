@@ -20,6 +20,22 @@ use eredu_checkpoint::{
 
 use super::{ModelArgs, QwenVariant};
 
+/// Derives a Qwen configuration whose physical matrix formats reflect
+/// load-time quantization.
+pub fn load_time_quantization(
+    args: &ModelArgs,
+    quantization: WeightQuantization,
+) -> Result<ModelArgs, String> {
+    quantization.validate().map_err(|error| error.to_string())?;
+    let mut target = args.clone();
+    target.quantization = Some(quantization);
+    target.quantization_config = None;
+    target.quantized_weights = None;
+    target.quantized_weight_configs = None;
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
 /// Builds the canonical Qwen SafeTensors catalog plan.
 pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
     safetensors_plan_with_root(args, &args.parameter_root, true)
@@ -902,6 +918,30 @@ mod tests {
             .common_tensors
             .iter()
             .any(|tensor| tensor.key == "lm_head.weight"));
+    }
+
+    #[test]
+    fn load_time_quantization_replaces_checkpoint_format_policy() {
+        let mut source = args("qwen3", false);
+        source.quantization_config = Some(WeightQuantization::MxFp4);
+        source.quantized_weights = Some(["model.layers.0.self_attn.q_proj.weight".into()].into());
+        source.quantized_weight_configs = Some(HashMap::from([(
+            "model.layers.0.self_attn.q_proj.weight".into(),
+            WeightQuantization::MxFp4,
+        )]));
+        let quantization =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+
+        let target = load_time_quantization(&source, quantization).unwrap();
+
+        assert_eq!(target.quantization, Some(quantization));
+        assert_eq!(target.quantization_config, None);
+        assert_eq!(target.quantized_weights, None);
+        assert_eq!(target.quantized_weight_configs, None);
+        target.validate().unwrap();
+        assert_eq!(source.quantization_config, Some(WeightQuantization::MxFp4));
+        assert!(source.quantized_weights.is_some());
+        assert!(source.quantized_weight_configs.is_some());
     }
 
     #[test]

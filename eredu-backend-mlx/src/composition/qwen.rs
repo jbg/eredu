@@ -397,11 +397,8 @@ pub fn quantize_neutral_qwen_store(
     ),
     Error,
 > {
-    let mut target_args = source_args.clone();
-    target_args.quantization = Some(quantization);
-    target_args.quantization_config = None;
-    target_args.quantized_weights = None;
-    target_args.quantized_weight_configs = None;
+    let target_args = eredu_architectures::qwen::load_time_quantization(source_args, quantization)
+        .map_err(Error::ArchitectureModel)?;
     let source = NeutralArchitecture::new(source_args.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target = NeutralArchitecture::new(target_args.clone(), stream)

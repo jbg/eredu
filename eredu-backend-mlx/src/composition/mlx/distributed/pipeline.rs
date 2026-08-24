@@ -14798,12 +14798,13 @@ fn load_qwen_pipeline(
         })
         .transpose()?
         .flatten();
-    let mut target_args = source_args.clone();
-    if let Some(quantization) = quantize_on_load {
-        target_args.quantization = Some(quantization);
-        target_args.quantization_config = None;
-        target_args.quantized_weight_configs = None;
-    }
+    let target_args = quantize_on_load.map_or_else(
+        || Ok(source_args.clone()),
+        |quantization| {
+            eredu_architectures::qwen::load_time_quantization(&source_args, quantization)
+                .map_err(Error::ArchitectureModel)
+        },
+    )?;
     let expert_quantization = quantize_on_load;
     let range = topology.layer_range(source_args.attention_schedule.len())?;
     let mut stage = QwenPipelinePartition::new(
@@ -15592,16 +15593,13 @@ fn load_neutral_qwen_vl_pipeline(
         })
         .transpose()?
         .flatten();
-    let mut target_args = source_args.clone();
-    if let Some(quantization) = quantize_on_load {
-        target_args.text.quantization = Some(quantization);
-        target_args.text.quantization_config = None;
-        target_args.text.quantized_weights = None;
-        target_args.text.quantized_weight_configs = None;
-        target_args
-            .vision
-            .apply_load_time_quantization(quantization);
-    }
+    let target_args = quantize_on_load.map_or_else(
+        || Ok(source_args.clone()),
+        |quantization| {
+            eredu_architectures::qwen::vl::load_time_quantization(&source_args, quantization)
+                .map_err(Error::ArchitectureModel)
+        },
+    )?;
     let target_adapter = if external_experts {
         QwenVlPipelineBindings::new_external_experts()
     } else {
@@ -19808,12 +19806,13 @@ fn load_neutral_qwen_hybrid_pipeline(
         })
         .transpose()?
         .flatten();
-    let mut target_args = source_args.clone();
-    if let Some(quantization) = quantize_on_load {
-        target_args.quantization = Some(quantization);
-        target_args.fp8 = None;
-        target_args.linear_formats.clear();
-    }
+    let target_args = quantize_on_load.map_or_else(
+        || Ok(source_args.clone()),
+        |quantization| {
+            eredu_architectures::qwen::hybrid::load_time_quantization(&source_args, quantization)
+                .map_err(Error::ArchitectureModel)
+        },
+    )?;
     let target_binding_adapter = if external_experts {
         QwenHybridPipelineBindings::new_external_experts()
     } else {
@@ -20293,17 +20292,16 @@ fn load_neutral_qwen_conditional_pipeline(
         })
         .transpose()?
         .flatten();
-    let mut target = source.clone();
-    if let Some(quantization) = quantize_on_load {
-        target.text.quantization = Some(quantization);
-        target.text.fp8 = None;
-        target.text.linear_formats.clear();
-        target
-            .vision
-            .as_mut()
-            .expect("validated conditional vision")
-            .apply_load_time_quantization(quantization);
-    }
+    let target = quantize_on_load.map_or_else(
+        || Ok(source.clone()),
+        |quantization| {
+            eredu_architectures::qwen::hybrid::conditional_load_time_quantization(
+                &source,
+                quantization,
+            )
+            .map_err(Error::ArchitectureModel)
+        },
+    )?;
     let target_adapter = if external_experts {
         QwenConditionalPipelineBindings::new_external_experts()
     } else {

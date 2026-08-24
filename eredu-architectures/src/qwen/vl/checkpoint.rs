@@ -6,10 +6,27 @@ use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeCatalog},
     schema::SafetensorsCheckpointPlan,
     store::TensorSelection,
+    WeightQuantization,
 };
 
 use super::ModelArgs;
 use crate::qwen::{self, vision};
+
+/// Derives a Qwen3-VL configuration whose text and aligned vision matrix
+/// formats reflect load-time quantization.
+pub fn load_time_quantization(
+    args: &ModelArgs,
+    quantization: WeightQuantization,
+) -> Result<ModelArgs, String> {
+    let mut target = args.clone();
+    target.text = qwen::load_time_quantization(&args.text, quantization)?;
+    target.vision.apply_load_time_quantization(quantization);
+    target
+        .vision
+        .validate(vision::VisionMode::DeepStack)
+        .map_err(|error| error.to_string())?;
+    Ok(target)
+}
 
 /// Builds one strict catalog for the ordinary Qwen decoder plus shared vision tower.
 pub fn safetensors_plan(args: &ModelArgs) -> Result<SafetensorsCheckpointPlan, String> {
@@ -165,6 +182,35 @@ mod tests {
             .common_tensors
             .iter()
             .any(|tensor| tensor.key.starts_with("patch_embed.")));
+    }
+
+    #[test]
+    fn load_time_quantization_normalizes_text_and_vision_formats() {
+        let args = crate::qwen::vl::model_args_from_config_value(&json!({
+            "model_type":"qwen3_vl", "image_token_id":61, "video_token_id":62,
+            "text_config": {"model_type":"qwen3_vl_text", "hidden_size":32,
+                "num_hidden_layers":1, "intermediate_size":64, "num_attention_heads":4,
+                "num_key_value_heads":2, "head_dim":8, "rms_norm_eps":0.000001,
+                "vocab_size":64, "max_position_embeddings":128, "tie_word_embeddings":true,
+                "rope_scaling":{"mrope_section":[2,1,1]}},
+            "vision_config":{"depth":1,"hidden_size":32,"intermediate_size":64,
+                "num_heads":4,"num_position_embeddings":16,"in_channels":3,"patch_size":2,
+                "spatial_merge_size":2,"temporal_patch_size":2,"out_hidden_size":32,
+                "deepstack_visual_indexes":[0]}
+        }))
+        .unwrap();
+        let quantization =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+
+        let target = load_time_quantization(&args, quantization).unwrap();
+
+        assert_eq!(target.text.quantization, Some(quantization));
+        assert!(!target.vision.linear_formats.is_empty());
+        target.text.validate().unwrap();
+        target
+            .vision
+            .validate(vision::VisionMode::DeepStack)
+            .unwrap();
     }
 
     #[test]

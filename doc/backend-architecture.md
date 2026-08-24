@@ -204,8 +204,11 @@ targets by substring or suffix.
 They also normalize physical checkpoint format metadata onto canonical runtime
 parameters, including fused expert projections, so each backend consumes the
 same family-specific quantization identities. Load-time quantization derives
-its complete target format map, including target and prediction-unit roots,
-from architecture checkpoint APIs. Pipeline telemetry likewise resolves
+its complete validated target configuration and format map, including mixed
+checkpoint-policy replacement, aligned vision projections, and target and
+prediction-unit roots, from architecture checkpoint APIs. Resident, bounded,
+and distributed backend paths consume those same derived configurations rather
+than rewriting family quantization fields. Pipeline telemetry likewise resolves
 checkpoint ownership from architecture-declared execution-unit paths rather
 than synthesizing family layer prefixes. Catalog policies declare any
 admitted checkpoint-only names by exact key, prefix, or suffix, and composite

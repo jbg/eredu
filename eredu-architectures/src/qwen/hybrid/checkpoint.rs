@@ -11,7 +11,40 @@ use eredu_checkpoint::{
         TensorOperation,
     },
     store::{CheckpointSource, TensorSelection, WeightStoreBackend},
+    WeightQuantization,
 };
+
+/// Derives a hybrid text configuration whose physical matrix formats reflect
+/// load-time quantization.
+pub fn load_time_quantization(
+    config: &HybridConfig,
+    quantization: WeightQuantization,
+) -> Result<HybridConfig, String> {
+    quantization.validate().map_err(|error| error.to_string())?;
+    let mut target = config.clone();
+    target.fp8 = None;
+    target.quantization = Some(quantization);
+    target.linear_formats.clear();
+    target.validate().map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
+/// Derives a conditional hybrid configuration whose text and aligned vision
+/// matrix formats reflect load-time quantization.
+pub fn conditional_load_time_quantization(
+    config: &ParsedHybridConfig,
+    quantization: WeightQuantization,
+) -> Result<ParsedHybridConfig, String> {
+    let mut target = config.clone();
+    target.text = load_time_quantization(&config.text, quantization)?;
+    if let Some(vision) = target.vision.as_mut() {
+        vision.apply_load_time_quantization(quantization);
+        vision
+            .validate(crate::qwen::vision::VisionMode::WindowScheduled)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(target)
+}
 
 /// Returns all derived recipes owned by Qwen hybrid static modules.
 pub fn static_recipes(
@@ -580,6 +613,7 @@ fn qwen35_value_head_recipe(
 
 use super::{
     fp8_block_row_widths, fused_projection_widths, HybridConfig, HybridLayerPolicy, HybridVariant,
+    ParsedHybridConfig,
 };
 
 /// Translates one hybrid projector GGUF name, including split patch weights.
@@ -1495,6 +1529,80 @@ mod tests {
         }))
         .unwrap()
         .text
+    }
+
+    #[test]
+    fn load_time_quantization_replaces_hybrid_checkpoint_formats() {
+        let mut source = config();
+        source.fp8 = Some(super::super::QwenFp8QuantizationConfig {
+            quant_method: "fp8".into(),
+            fmt: "e4m3".into(),
+            activation_scheme: "dynamic".into(),
+            weight_block_size: Some(vec![128, 128]),
+            modules_to_not_convert: Vec::new(),
+        });
+        source.linear_formats.insert(
+            "model.layers.0.self_attn.q_proj.weight".into(),
+            eredu_checkpoint::LinearFormat::Dense,
+        );
+        let quantization =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+
+        let target = load_time_quantization(&source, quantization).unwrap();
+
+        assert!(target.fp8.is_none());
+        assert_eq!(target.quantization, Some(quantization));
+        assert!(target.linear_formats.is_empty());
+        target.validate().unwrap();
+        assert!(source.fp8.is_some());
+        assert!(!source.linear_formats.is_empty());
+    }
+
+    #[test]
+    fn conditional_load_time_quantization_derives_aligned_vision_formats() {
+        let source = model_args_from_config_value(&json!({
+            "model_type": "qwen3_5",
+            "image_token_id": 60,
+            "video_token_id": 61,
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "vocab_size": 64,
+                "hidden_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "max_position_embeddings": 128,
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "intermediate_size": 64,
+                "layer_types": ["linear_attention", "full_attention"]
+            },
+            "vision_config": {
+                "depth": 2,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_heads": 4,
+                "num_position_embeddings": 16,
+                "in_channels": 3,
+                "patch_size": 2,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2,
+                "out_hidden_size": 32
+            }
+        }))
+        .unwrap();
+        let quantization =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+
+        let target = conditional_load_time_quantization(&source, quantization).unwrap();
+
+        assert_eq!(target.text.quantization, Some(quantization));
+        assert!(!target.vision.unwrap().linear_formats.is_empty());
+        assert!(source.vision.unwrap().linear_formats.is_empty());
     }
 
     fn moe_config() -> HybridConfig {

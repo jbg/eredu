@@ -1950,10 +1950,8 @@ fn quantize_store(
     ),
     Error,
 > {
-    let mut target = source.clone();
-    target.fp8 = None;
-    target.quantization = Some(quantization);
-    target.linear_formats.clear();
+    let target = hybrid::load_time_quantization(source, quantization)
+        .map_err(Error::ArchitectureModel)?;
     let source_architecture = Architecture::new(source.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = Architecture::new(target.clone(), stream)
@@ -2021,10 +2019,8 @@ fn quantize_conditional_store(
     ),
     Error,
 > {
-    let mut target = source.clone();
-    target.text.fp8 = None;
-    target.text.quantization = Some(quantization);
-    target.text.linear_formats.clear();
+    let target = hybrid::conditional_load_time_quantization(source, quantization)
+        .map_err(Error::ArchitectureModel)?;
     let source_architecture = ConditionalArchitecture::new(source.clone(), stream)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = ConditionalArchitecture::new(target.clone(), stream)
