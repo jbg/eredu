@@ -141,6 +141,18 @@ impl ModelArgs {
         validate_model_args(self)
     }
 
+    /// Returns the canonical routed observation point for one decoder layer.
+    pub fn routed_observation_point(
+        &self,
+        unit_path: &str,
+        _layer: usize,
+    ) -> eredu_runtime::RoutedObservationPoint {
+        eredu_runtime::RoutedObservationPoint::new(
+            format!("{unit_path}.mlp"),
+            self.num_local_experts,
+        )
+    }
+
     /// Returns the physical encoding for one ordinary canonical parameter.
     pub fn weight_quantization_for(&self, name: &str) -> Option<WeightQuantization> {
         self.quantized_weight_configs
@@ -172,6 +184,14 @@ impl Config for ModelArgs {
 
     fn parameter_root(&self) -> &str {
         &self.parameter_root
+    }
+
+    fn routed_observation_point(
+        &self,
+        unit_path: &str,
+        layer: usize,
+    ) -> Option<eredu_runtime::RoutedObservationPoint> {
+        Some(ModelArgs::routed_observation_point(self, unit_path, layer))
     }
 
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
@@ -1237,6 +1257,9 @@ mod tests {
             prompt_cache_architecture_fingerprint(&hf),
             prompt_cache_architecture_fingerprint(&gguf)
         );
+        let point = hf.routed_observation_point("model.layers.3", 3);
+        assert_eq!(point.path(), "model.layers.3.mlp");
+        assert_eq!(point.expert_count(), 32);
     }
 
     #[test]

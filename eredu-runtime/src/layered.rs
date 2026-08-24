@@ -536,6 +536,19 @@ where
     B: eredu_nn::RoutedNeuralBackend,
     S: RuntimeState<B>,
 {
+    /// Returns the architecture-owned routing observation point for one unit.
+    ///
+    /// Architectures without observable routed work in the selected unit return
+    /// `None`. Concrete backends must not reconstruct semantic paths or expert
+    /// cardinality.
+    fn routed_observation_point(
+        &self,
+        _group: usize,
+        _index: usize,
+    ) -> Result<Option<RoutedObservationPoint>, Self::Error> {
+        Ok(None)
+    }
+
     /// Executes one unit through a runtime-supplied routed-expert provider.
     #[allow(clippy::too_many_arguments)]
     fn forward_unit_with_provider<P>(
@@ -1108,7 +1121,7 @@ where
     /// shape handling, routing, and provider dispatch therefore remain shared
     /// with ordinary execution.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_with_routed_observer<'a, Provider, Observer, Point>(
+    pub fn forward_with_routed_observer<'a, Provider, Observer>(
         &mut self,
         input: A::Input<'a>,
         state: &mut S,
@@ -1116,7 +1129,6 @@ where
         provider: &mut Provider,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
         observer: &mut Observer,
-        mut observation_point: Point,
     ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>>
     where
         B: eredu_nn::RoutedNeuralBackend,
@@ -1125,7 +1137,6 @@ where
         Provider: RoutedExpertProvider<B>,
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
-        Point: FnMut(&str, usize, usize) -> Option<RoutedObservationPoint>,
     {
         self.forward_with_unit_executor(
             input,
@@ -1134,7 +1145,7 @@ where
             |architecture, group, index, unit, hidden, state, forward, context| {
                 let path = architecture.unit_path(group, index)?;
                 let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
-                let output = match observation_point(&path, group, index) {
+                let output = match architecture.routed_observation_point(group, index)? {
                     Some(point) => {
                         let mut observed = ObservedExpertProvider::new(provider, observer, point);
                         architecture.forward_unit_with_provider(

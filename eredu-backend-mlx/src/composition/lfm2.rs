@@ -1061,7 +1061,6 @@ impl Lfm2Model {
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let expert_count = self.args.num_experts;
         match &mut self.execution {
             Lfm2Execution::Resident(runtime) => runtime.forward_with_routed_observer(
                 eredu_architectures::decoder::LayeredInput {
@@ -1073,12 +1072,6 @@ impl Lfm2Model {
                 provider,
                 stream,
                 observer,
-                |path, _, _| {
-                    Some(eredu_runtime::RoutedObservationPoint::new(
-                        format!("{path}.feed_forward"),
-                        expert_count,
-                    ))
-                },
             ),
             Lfm2Execution::Layerwise(runtime) => runtime.forward_with_routed_observer(
                 eredu_architectures::decoder::LayeredInput {
@@ -1090,12 +1083,6 @@ impl Lfm2Model {
                 provider,
                 stream,
                 observer,
-                |path, _, _| {
-                    Some(eredu_runtime::RoutedObservationPoint::new(
-                        format!("{path}.feed_forward"),
-                        expert_count,
-                    ))
-                },
             ),
             _ => {
                 return Err(Error::Parallel(

@@ -1310,7 +1310,6 @@ impl GptOssModel {
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let expert_count = self.args.num_local_experts;
         let output = match &mut self.execution {
             GptOssExecution::Resident(runtime) => runtime
                 .forward_with_routed_observer(
@@ -1323,12 +1322,6 @@ impl GptOssModel {
                     provider,
                     stream,
                     observer,
-                    |path, _, _| {
-                        Some(eredu_runtime::RoutedObservationPoint::new(
-                            format!("{path}.mlp"),
-                            expert_count,
-                        ))
-                    },
                 )
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             GptOssExecution::Layerwise(runtime) => runtime
@@ -1342,12 +1335,6 @@ impl GptOssModel {
                     provider,
                     stream,
                     observer,
-                    |path, _, _| {
-                        Some(eredu_runtime::RoutedObservationPoint::new(
-                            format!("{path}.mlp"),
-                            expert_count,
-                        ))
-                    },
                 )
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             GptOssExecution::TensorParallelResident(_)

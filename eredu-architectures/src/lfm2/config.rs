@@ -392,6 +392,20 @@ impl ModelArgs {
         self.layer_schedule.get(layer)
     }
 
+    /// Returns the canonical routed observation point for one sparse layer.
+    pub fn routed_observation_point(
+        &self,
+        unit_path: &str,
+        layer: usize,
+    ) -> Option<eredu_runtime::RoutedObservationPoint> {
+        (self.layer_policy(layer)?.feed_forward == FeedForwardPolicy::SparseMoe).then(|| {
+            eredu_runtime::RoutedObservationPoint::new(
+                format!("{unit_path}.feed_forward"),
+                self.num_experts,
+            )
+        })
+    }
+
     /// Returns whether any layer contains routed experts.
     pub fn has_sparse_moe_layers(&self) -> bool {
         self.layer_schedule
@@ -917,6 +931,10 @@ mod tests {
         let args = model_args_from_config_value(&fixture).unwrap();
         assert_eq!(args.layer_schedule_fingerprint(), "cd,cd,afe,ce");
         assert!(args.use_expert_bias);
+        assert!(args.routed_observation_point("model.layers.0", 0).is_none());
+        let point = args.routed_observation_point("model.layers.2", 2).unwrap();
+        assert_eq!(point.path(), "model.layers.2.feed_forward");
+        assert_eq!(point.expert_count(), 4);
     }
 
     #[test]

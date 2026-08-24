@@ -746,7 +746,6 @@ impl QwenModel {
         P: eredu_runtime::RoutedExpertProvider<MlxNeuralBackend>,
         P::Error: std::fmt::Display,
     {
-        let expert_count = self.args.num_experts;
         let inputs = crate::MlxTensor::from_array(inputs.clone());
         let mask = mask.cloned().map(crate::MlxTensor::from_array);
         let output = match &mut self.execution {
@@ -760,12 +759,6 @@ impl QwenModel {
                 provider,
                 stream,
                 observer,
-                |path, _, _| {
-                    Some(eredu_runtime::RoutedObservationPoint::new(
-                        format!("{path}.mlp"),
-                        expert_count,
-                    ))
-                },
             ),
             QwenExecution::Layerwise(runtime) => runtime.forward_with_routed_observer(
                 eredu_architectures::qwen::LayeredInput {
@@ -777,12 +770,6 @@ impl QwenModel {
                 provider,
                 stream,
                 observer,
-                |path, _, _| {
-                    Some(eredu_runtime::RoutedObservationPoint::new(
-                        format!("{path}.mlp"),
-                        expert_count,
-                    ))
-                },
             ),
             QwenExecution::TensorParallelResident(_)
             | QwenExecution::TensorParallelLayerwise(_) => {

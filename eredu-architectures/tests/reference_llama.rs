@@ -2908,18 +2908,13 @@ fn qwen_routed_execution_uses_the_runtime_provider_and_observer_contract() {
     );
 
     let mut observer = ProbeObserver::default();
+    let point = args.routed_observation_point("model.layers.0", 0).unwrap();
+    let mut observed_provider =
+        eredu_runtime::ObservedExpertProvider::new(&mut provider, &mut observer, point);
     let output = policy
-        .forward_observed_with_provider(
-            "model.layers.0.mlp",
-            0,
-            ExpertPass::Decode,
-            args.num_experts,
-            &input,
-            &(),
-            &mut observer,
-            &mut provider,
-        )
+        .forward_with_provider(0, ExpertPass::Decode, &input, &(), &mut observed_provider)
         .unwrap();
+    drop(observed_provider);
     assert_eq!(output.shape(), input.shape());
     assert_eq!(observer.route_shapes, vec![(vec![3, 2], vec![3, 2], 4)]);
     assert_eq!(provider.calls[1].1, ExpertPass::Decode);

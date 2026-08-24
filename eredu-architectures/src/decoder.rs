@@ -124,6 +124,14 @@ pub trait Config: 'static {
     fn block_parameter_fields(&self) -> BlockParameterFields<'_> {
         BlockParameterFields::default()
     }
+    /// Returns the canonical routed-observation point for one decoder layer.
+    fn routed_observation_point(
+        &self,
+        _unit_path: &str,
+        _layer: usize,
+    ) -> Option<eredu_runtime::RoutedObservationPoint> {
+        None
+    }
     /// Validates architecture-owned configuration policy.
     fn validate_config(&self) -> Result<(), Error>;
     /// Transformer hidden size.
@@ -3404,6 +3412,15 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn routed_observation_point(
+        &self,
+        group: usize,
+        index: usize,
+    ) -> Result<Option<eredu_runtime::RoutedObservationPoint>, Self::Error> {
+        let unit_path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
+        Ok(self.args.routed_observation_point(&unit_path, index))
+    }
+
     fn forward_unit_with_provider<R>(
         &mut self,
         _group: usize,

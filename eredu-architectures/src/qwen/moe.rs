@@ -5,8 +5,7 @@ use eredu_nn::{
     RoutedNeuralBackend, RoutingOperator, RoutingScoring, Tensor, TopKRouterSpec, TopKRoutingSpec,
 };
 use eredu_runtime::{
-    ActivationObserver, ExpertPass, ObservedExpertProvider, ResidentExpertProvider,
-    RoutedExpertProvider, RoutedExpertRequest, RoutedObservationPoint,
+    ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
 };
 
 use crate::{
@@ -269,50 +268,6 @@ impl<B: RoutedNeuralBackend> FeedForward<B> {
             Self::Routed(moe) => {
                 let routes = moe.router.route(input, context)?;
                 provider
-                    .forward_routed(
-                        &mut moe.experts,
-                        RoutedExpertRequest {
-                            layer,
-                            input,
-                            routes: &routes,
-                            pass,
-                        },
-                        context,
-                    )
-                    .map_err(Error::backend)
-            }
-        }
-    }
-
-    /// Executes through a runtime-owned provider while reporting canonical
-    /// routed-expert observations around the same forward path.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_observed_with_provider<O, P>(
-        &mut self,
-        path: &str,
-        layer: usize,
-        pass: ExpertPass,
-        expert_count: i32,
-        input: &B::Tensor,
-        context: &<B::Tensor as Tensor>::Context,
-        observer: &mut O,
-        provider: &mut P,
-    ) -> Result<B::Tensor, Error>
-    where
-        O: ActivationObserver<B::Tensor, Error>,
-        P: RoutedExpertProvider<B>,
-        P::Error: std::fmt::Display,
-    {
-        match self {
-            Self::Dense(mlp) => mlp.forward_feed_forward(input, context),
-            Self::Routed(moe) => {
-                let routes = moe.router.route(input, context)?;
-                let mut observed = ObservedExpertProvider::new(
-                    provider,
-                    observer,
-                    RoutedObservationPoint::new(path, expert_count),
-                );
-                observed
                     .forward_routed(
                         &mut moe.experts,
                         RoutedExpertRequest {

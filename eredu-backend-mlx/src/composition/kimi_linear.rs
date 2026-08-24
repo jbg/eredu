@@ -1042,7 +1042,6 @@ impl KimiLinearModel {
         } else {
             eredu_runtime::ExpertPass::Decode
         };
-        let expert_count = self.args.num_experts;
         match &mut self.execution {
             KimiLinearExecution::Resident(runtime) => runtime.forward_with_routed_observer(
                 eredu_architectures::decoder::LayeredInput {
@@ -1054,12 +1053,6 @@ impl KimiLinearModel {
                 provider,
                 stream,
                 observer,
-                |path, _, _| {
-                    Some(eredu_runtime::RoutedObservationPoint::new(
-                        format!("{path}.mlp"),
-                        expert_count,
-                    ))
-                },
             ),
             KimiLinearExecution::Layerwise(runtime) => runtime.forward_with_routed_observer(
                 eredu_architectures::decoder::LayeredInput {
@@ -1071,12 +1064,6 @@ impl KimiLinearModel {
                 provider,
                 stream,
                 observer,
-                |path, _, _| {
-                    Some(eredu_runtime::RoutedObservationPoint::new(
-                        format!("{path}.mlp"),
-                        expert_count,
-                    ))
-                },
             ),
             _ => {
                 return Err(Error::Parallel(

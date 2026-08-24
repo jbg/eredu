@@ -171,6 +171,17 @@ impl ModelArgs {
         matches!(self.variant, QwenVariant::Qwen3Moe)
     }
 
+    /// Returns the canonical routed observation point for one decoder layer.
+    pub fn routed_observation_point(
+        &self,
+        unit_path: &str,
+        _layer: usize,
+    ) -> Option<eredu_runtime::RoutedObservationPoint> {
+        self.is_moe().then(|| {
+            eredu_runtime::RoutedObservationPoint::new(format!("{unit_path}.mlp"), self.num_experts)
+        })
+    }
+
     /// Returns the model-wide physical encoding, if any.
     pub fn weight_quantization(&self) -> Option<WeightQuantization> {
         self.quantization
@@ -202,6 +213,13 @@ impl Config for ModelArgs {
     }
     fn parameter_root(&self) -> &str {
         &self.parameter_root
+    }
+    fn routed_observation_point(
+        &self,
+        unit_path: &str,
+        layer: usize,
+    ) -> Option<eredu_runtime::RoutedObservationPoint> {
+        ModelArgs::routed_observation_point(self, unit_path, layer)
     }
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
         self.validate().map_err(eredu_nn::Error::backend)
@@ -1112,5 +1130,12 @@ mod tests {
         value["norm_topk_prob"] = Value::Bool(true);
         let args = model_args_from_config_value(&value).unwrap();
         assert!(args.is_moe());
+        let point = args.routed_observation_point("model.layers.2", 2).unwrap();
+        assert_eq!(point.path(), "model.layers.2.mlp");
+        assert_eq!(point.expert_count(), 4);
+        assert!(model_args_from_config_value(&base("qwen3"))
+            .unwrap()
+            .routed_observation_point("model.layers.2", 2)
+            .is_none());
     }
 }

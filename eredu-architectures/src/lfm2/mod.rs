@@ -709,6 +709,15 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn routed_observation_point(
+        &self,
+        group: usize,
+        index: usize,
+    ) -> Result<Option<eredu_runtime::RoutedObservationPoint>, Self::Error> {
+        let unit_path = self.decoder.unit_path(group, index)?;
+        Ok(self.args.routed_observation_point(&unit_path, index))
+    }
+
     fn forward_unit_with_provider<P>(
         &mut self,
         group: usize,
