@@ -106,7 +106,12 @@ impl<B: BlockwiseAttentionBackend> Attention<B> {
                 query_width,
             )?)
         };
-        let rope_scaling = args.rope_scaling.as_ref().map(|yarn| yarn.rope_scaling());
+        let rotary_algorithm = args
+            .rope_scaling
+            .as_ref()
+            .map_or(eredu_nn::RotaryAlgorithm::Default, |yarn| {
+                yarn.rotary_algorithm()
+            });
         let scale = ((args.qk_nope_head_dim + args.qk_rope_head_dim) as f32)
             .sqrt()
             .recip()
@@ -150,8 +155,7 @@ impl<B: BlockwiseAttentionBackend> Attention<B> {
                     dimensions: args.qk_rope_head_dim,
                     base: args.rope_theta,
                     traditional: false,
-                    max_positions: args.max_position_embeddings,
-                    scaling: rope_scaling.as_ref(),
+                    algorithm: rotary_algorithm,
                 },
                 context,
             )?,

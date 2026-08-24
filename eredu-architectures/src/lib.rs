@@ -33,6 +33,8 @@ pub mod operator_requirements;
 pub mod preparation;
 /// Backend-neutral family preprocessing and framing plans.
 pub mod processor_plan;
+/// Architecture-owned external rotary configuration values.
+pub mod rotary;
 /// Architecture-owned static roles, parameter modules, and checkpoint rewrites.
 pub mod static_parameters;
 pub use static_parameters::{

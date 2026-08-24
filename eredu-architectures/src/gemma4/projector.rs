@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
+use crate::rotary::RopeValue;
 use eredu_gguf::MetadataValue;
-use eredu_nn::RopeValue;
 
 use super::{AudioConfig, FamilyConfig, FamilyConfigError, ModelArgs, VisionConfig};
 

@@ -268,7 +268,7 @@ impl NeuralBackend for FakeBackend {
     fn rms_norm(_: NormalizationSpec, _: &()) -> Result<Self::Normalization, Error> {
         Ok(FakeOperator)
     }
-    fn rotary(_: RotarySpec<'_>, _: &()) -> Result<Self::Rotary, Error> {
+    fn rotary(_: RotarySpec, _: &()) -> Result<Self::Rotary, Error> {
         Ok(FakeOperator)
     }
     fn silu(input: Self::Tensor, _: &()) -> Result<Self::Tensor, Error> {

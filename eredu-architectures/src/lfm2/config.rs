@@ -5,6 +5,7 @@ use std::{
     io::Read,
 };
 
+use crate::rotary::RopeValue;
 use eredu_checkpoint::WeightQuantization;
 use eredu_core::{
     cache::{
@@ -14,7 +15,6 @@ use eredu_core::{
     AttentionPolicy, LayerSchedule,
 };
 use eredu_gguf::MetadataValue;
-use eredu_nn::RopeValue;
 use eredu_runtime::StateLayout;
 use serde::Deserialize;
 use serde_json::Value;

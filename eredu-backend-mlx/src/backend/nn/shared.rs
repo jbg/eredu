@@ -21,9 +21,9 @@ use eredu_nn::{
     NeuralBackend, NormalizationConstructionSpec, NormalizationOperator, NormalizationScale,
     NormalizationSpec, ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut,
     Parameterized, PooledAttentionInput, PooledPositionInput, RelativeAttentionInput,
-    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RopeValue, RotaryOperator, RotaryPosition,
-    RotarySpec, RoutedNeuralBackend, RoutingOperator, RoutingResult, RoutingScoring,
-    SegmentedAttentionInput, SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
+    Relu2ExpertBankOperator, Relu2ExpertBankSpec, RotaryOperator, RotaryPosition, RotarySpec,
+    RoutedNeuralBackend, RoutingOperator, RoutingResult, RoutingScoring, SegmentedAttentionInput,
+    SelectiveStateSpaceScanInput, SelectiveStateSpaceScanOutput, Tensor,
     TensorParallelExpertOutput, TopKRouterSpec, VocabularyParallelRange,
 };
 use eredu_runtime::{ParameterBackend, SubmissionBackend, TransferBackend};
@@ -1787,26 +1787,12 @@ impl NeuralBackend for MlxNeuralBackend {
         })
     }
 
-    fn rotary(spec: RotarySpec<'_>, context: &Stream) -> Result<MlxRotary, ComputeError> {
-        let scaling = spec.scaling.map(|values| {
-            values
-                .iter()
-                .map(|(key, value)| {
-                    let value = match value {
-                        RopeValue::Float(value) => RopeValue::Float(*value),
-                        RopeValue::String(value) => RopeValue::String(value.clone()),
-                        RopeValue::Bool(value) => RopeValue::Bool(*value),
-                    };
-                    (key.clone(), value)
-                })
-                .collect()
-        });
+    fn rotary(spec: RotarySpec, context: &Stream) -> Result<MlxRotary, ComputeError> {
         compute(crate::backend::nn::tensor::rope::initialize_rope(
             spec.dimensions,
             spec.base,
             spec.traditional,
-            &scaling,
-            spec.max_positions,
+            spec.algorithm,
             context,
         ))
         .map(MlxRotary)

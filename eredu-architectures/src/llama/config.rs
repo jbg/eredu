@@ -5,11 +5,12 @@ use eredu_checkpoint::WeightQuantization;
 use eredu_core::cache::derive_prompt_cache_architecture_fingerprint;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_gguf::MetadataValue;
-use eredu_nn::{RopeValue, RotarySpec};
+use eredu_nn::RotarySpec;
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::Config;
+use crate::rotary::RopeValue;
 
 /// Invalid Llama/Mistral model configuration.
 #[derive(Debug, thiserror::Error)]
@@ -55,7 +56,7 @@ pub struct ModelArgs {
     pub attention_bias: bool,
     /// Whether MLP projections own biases.
     pub mlp_bias: bool,
-    /// Optional normalized RoPE scaling metadata.
+    /// External RoPE scaling metadata retained for identity and plan emission.
     pub rope_scaling: Option<HashMap<String, RopeValue>>,
     /// Exact ordered attention policy for every decoder layer.
     pub attention_schedule: LayerSchedule<AttentionPolicy>,
@@ -180,13 +181,13 @@ impl Config for ModelArgs {
     fn weight_quantization(&self, name: &str) -> Option<WeightQuantization> {
         self.weight_quantization_for(name)
     }
-    fn rotary_spec(&self, dimensions: i32) -> RotarySpec<'_> {
+    fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
         RotarySpec {
             dimensions,
             base: self.rope_theta,
             traditional: self.rope_traditional,
-            max_positions: self.max_position_embeddings,
-            scaling: self.rope_scaling.as_ref(),
+            algorithm: crate::rotary::normalize_algorithm(self.rope_scaling.as_ref())
+                .expect("validated Llama RoPE algorithm"),
         }
     }
 }
@@ -532,23 +533,9 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
 }
 
 fn validate_rope_scaling(config: &HashMap<String, RopeValue>) -> Result<(), ConfigError> {
-    let Some(value) = config.get("type").or_else(|| config.get("rope_type")) else {
-        return Ok(());
-    };
-    let RopeValue::String(kind) = value else {
-        return Err(invalid(
-            "RoPE scaling field type or rope_type must be a string",
-        ));
-    };
-    match kind.as_str() {
-        "default" | "linear" | "llama3" | "proportional" | "yarn" => Ok(()),
-        "longrope" => Err(invalid(
-            "RoPE scaling type \"longrope\" is unsupported; LongRoPE is not implemented",
-        )),
-        other => Err(invalid(format!(
-            "RoPE scaling type {other:?} is unsupported"
-        ))),
-    }
+    crate::rotary::normalize_algorithm(Some(config))
+        .map(|_| ())
+        .map_err(invalid)
 }
 
 /// Returns the stable cache-compatibility fingerprint for this configuration.

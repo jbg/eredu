@@ -6,7 +6,7 @@ use std::{
 use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat, WeightQuantization};
 use eredu_core::LayerSchedule;
 use eredu_gguf::{MetadataArray, MetadataValue};
-use eredu_nn::RopeValue;
+use eredu_nn::RotaryAlgorithm;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -84,23 +84,17 @@ pub struct YarnConfig {
 }
 
 impl YarnConfig {
-    /// Converts normalized YaRN values to the general rotary contract.
-    pub fn rope_scaling(&self) -> HashMap<String, RopeValue> {
-        HashMap::from([
-            ("type".into(), RopeValue::String(self.r#type.clone())),
-            ("factor".into(), RopeValue::Float(self.factor)),
-            (
-                "original_max_position_embeddings".into(),
-                RopeValue::Float(self.original_max_position_embeddings as f32),
-            ),
-            ("beta_fast".into(), RopeValue::Float(self.beta_fast)),
-            ("beta_slow".into(), RopeValue::Float(self.beta_slow)),
-            ("mscale".into(), RopeValue::Float(self.mscale)),
-            (
-                "mscale_all_dim".into(),
-                RopeValue::Float(self.mscale_all_dim),
-            ),
-        ])
+    /// Returns the complete backend-neutral rotary algorithm.
+    pub fn rotary_algorithm(&self) -> RotaryAlgorithm {
+        RotaryAlgorithm::Yarn {
+            factor: self.factor,
+            original_max_positions: self.original_max_position_embeddings,
+            beta_fast: self.beta_fast,
+            beta_slow: self.beta_slow,
+            concentration: self.mscale,
+            attention_factor: self.mscale_all_dim,
+            truncate: true,
+        }
     }
 
     /// Returns DeepSeek's YaRN attention-score multiplier.
@@ -439,10 +433,7 @@ impl V3Args {
             ));
         }
         if let Some(yarn) = &self.rope_scaling {
-            if yarn.r#type != "yarn"
-                || yarn.factor <= 0.0
-                || yarn.original_max_position_embeddings <= 0
-            {
+            if yarn.r#type != "yarn" || yarn.rotary_algorithm().validate().is_err() {
                 return Err(invalid("invalid YaRN configuration"));
             }
         }
@@ -875,10 +866,7 @@ impl V4Args {
             ));
         }
         if let Some(yarn) = &self.rope_scaling {
-            if yarn.r#type != "yarn"
-                || yarn.factor <= 0.0
-                || yarn.original_max_position_embeddings <= 0
-            {
+            if yarn.r#type != "yarn" || yarn.rotary_algorithm().validate().is_err() {
                 return Err(invalid_v4("invalid YaRN configuration"));
             }
         }

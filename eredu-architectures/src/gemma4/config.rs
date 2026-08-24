@@ -6,12 +6,13 @@ use std::{
     ops::Range,
 };
 
+use crate::rotary::RopeValue;
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::{
     cache::derive_prompt_cache_architecture_fingerprint, AttentionPolicy, LayerSchedule,
 };
 use eredu_gguf::{MetadataArray, MetadataValue};
-use eredu_nn::{AttentionStateSource, AttentionValueSource, RopeValue};
+use eredu_nn::{AttentionStateSource, AttentionValueSource};
 use serde::Deserialize;
 
 /// Invalid or unsupported Gemma 4 configuration.
@@ -667,6 +668,12 @@ fn normalize(source: ModelArgsSource) -> Result<ModelArgs, ConfigError> {
         source.enable_moe_block,
     )?;
     validate_moe(&source)?;
+    crate::rotary::normalize_algorithm(source.rope_scaling.as_ref()).map_err(invalid)?;
+    if let Some(parameters) = &source.rope_parameters {
+        for values in parameters.values() {
+            crate::rotary::normalize_algorithm(Some(values)).map_err(invalid)?;
+        }
+    }
     Ok(ModelArgs {
         model_type: source.model_type,
         hidden_size: source.hidden_size,

@@ -1,8 +1,6 @@
 //! Rotary position embedding initialization and variants.
 
-use std::collections::HashMap;
-
-use eredu_nn::{RopeValue, FREQUENCY_SCALED_ROPE_TYPE};
+use eredu_nn::RotaryAlgorithm;
 use safemlx::macros::ModuleParameters;
 use safemlx::{
     builder::Builder,
@@ -16,78 +14,6 @@ use safemlx::{
     },
     Array, Stream,
 };
-
-use crate::backend::error::Error;
-
-#[derive(Debug, Clone, PartialEq)]
-/// Borrowed scalar value from a RoPE scaling config.
-pub enum FloatOrStr<'a> {
-    /// Numeric floating-point value.
-    Float(f32),
-    /// Borrowed string value.
-    Str(&'a str),
-    /// Boolean option used by scaling schemes such as YaRN `truncate`.
-    Bool(bool),
-}
-
-fn borrowed(value: &RopeValue) -> FloatOrStr<'_> {
-    match value {
-        RopeValue::Float(f) => FloatOrStr::Float(*f),
-        RopeValue::String(s) => FloatOrStr::Str(s),
-        RopeValue::Bool(value) => FloatOrStr::Bool(*value),
-    }
-}
-
-/// Get a numeric float value from a scaling config by key.
-///
-/// Note: str variants in the config are not always floats — values like "default" or "linear"
-/// are also valid for non-numeric fields. This function should only be called for keys that
-/// are expected to hold numeric values.
-fn get_numeric_from_config(
-    config: &HashMap<String, RopeValue>,
-    key: &str,
-) -> Result<f32, Exception> {
-    match config.get(key).map(borrowed).ok_or_else(|| {
-        Exception::custom(format!(r#"key "{key}" is not found in scaling config"#))
-    })? {
-        FloatOrStr::Float(f) => Ok(f),
-        FloatOrStr::Str(s) => s
-            .parse::<f32>()
-            .map_err(|_| Exception::custom(format!(r#"key "{key}" is not a valid number"#))),
-        FloatOrStr::Bool(_) => Err(Exception::custom(format!(r#"key "{key}" is not numeric"#))),
-    }
-}
-
-/// Rejects RoPE scaling modes that the shared MLX initializer cannot execute.
-///
-/// Model configuration paths call this before allocating model state so an
-/// unsupported mode is reported as an architecture error rather than reaching
-/// backend construction.
-pub fn validate_rope_scaling_config(
-    scaling_config: &Option<HashMap<String, RopeValue>>,
-) -> Result<(), Error> {
-    let Some(config) = scaling_config else {
-        return Ok(());
-    };
-    let Some(rope_type) = config.get("type").or_else(|| config.get("rope_type")) else {
-        return Ok(());
-    };
-    let RopeValue::String(rope_type) = rope_type else {
-        return Err(Error::UnsupportedArchitecture(
-            "RoPE scaling field type or rope_type must be a string".into(),
-        ));
-    };
-    match rope_type.as_str() {
-        "default" | "linear" | "proportional" | "yarn" => Ok(()),
-        FREQUENCY_SCALED_ROPE_TYPE => Ok(()),
-        "longrope" => Err(Error::UnsupportedArchitecture(
-            "RoPE scaling type \"longrope\" is unsupported; LongRoPE is not implemented".into(),
-        )),
-        other => Err(Error::UnsupportedArchitecture(format!(
-            "RoPE scaling type {other:?} is unsupported"
-        ))),
-    }
-}
 
 /// Piecewise wavelength-based RoPE frequency scaling.
 ///
@@ -565,156 +491,77 @@ pub fn initialize_rope(
     dims: i32,
     base: f32, // rope_theta
     traditional: bool,
-    scaling_config: &Option<HashMap<String, RopeValue>>,
-    _max_position_embeddings: i32,
+    algorithm: RotaryAlgorithm,
     stream: &Stream,
 ) -> Result<RopeVariant, Exception> {
-    validate_rope_scaling_config(scaling_config)
-        .map_err(|error| Exception::custom(error.to_string()))?;
-    let rope_type = scaling_config
-        .as_ref()
-        .and_then(|config| {
-            config
-                .get("type")
-                .or_else(|| config.get("rope_type"))
-                .map(borrowed)
-        })
-        .unwrap_or(FloatOrStr::Str("default"));
-
-    if rope_type == FloatOrStr::Str("default") || rope_type == FloatOrStr::Str("linear") {
-        let scale = if rope_type == FloatOrStr::Str("linear") {
-            let den = get_numeric_from_config(scaling_config.as_ref().unwrap(), "factor")?;
-            1.0 / den
-        } else {
-            1.0
-        };
-
-        let rope = nn::RopeBuilder::new(dims)
-            .traditional(traditional)
-            .base(base)
-            .scale(scale)
-            .build()
-            .expect("Infallible");
-        return Ok(RopeVariant::Default(rope));
-    } else if rope_type == FloatOrStr::Str(FREQUENCY_SCALED_ROPE_TYPE) {
-        let config = scaling_config
-            .as_ref()
-            .ok_or_else(|| Exception::custom("scaling_config is required for scaled RoPE"))?;
-
-        let factor = get_numeric_from_config(config, "factor")?;
-        let low_freq_factor = get_numeric_from_config(config, "low_freq_factor")?;
-        let high_freq_factor = get_numeric_from_config(config, "high_freq_factor")?;
-        let original_max_position_embeddings =
-            get_numeric_from_config(config, "original_max_position_embeddings")? as i32;
-
-        let rope = FrequencyScaledRope::new(
+    match algorithm {
+        RotaryAlgorithm::Default | RotaryAlgorithm::Linear { .. } => {
+            let scale = match algorithm {
+                RotaryAlgorithm::Linear { factor } => factor.recip(),
+                RotaryAlgorithm::Default => 1.0,
+                _ => unreachable!(),
+            };
+            Ok(RopeVariant::Default(
+                nn::RopeBuilder::new(dims)
+                    .traditional(traditional)
+                    .base(base)
+                    .scale(scale)
+                    .build()
+                    .expect("infallible MLX RoPE construction"),
+            ))
+        }
+        RotaryAlgorithm::Llama3 {
+            factor,
+            low_frequency_factor,
+            high_frequency_factor,
+            original_max_positions,
+        } => Ok(RopeVariant::FrequencyScaled(FrequencyScaledRope::new(
             dims,
             traditional,
-            original_max_position_embeddings,
+            original_max_positions,
             base,
             factor,
-            low_freq_factor,
-            high_freq_factor,
+            low_frequency_factor,
+            high_frequency_factor,
             stream,
-        )?;
-        return Ok(RopeVariant::FrequencyScaled(rope));
-    } else if rope_type == FloatOrStr::Str("proportional") {
-        let config = scaling_config
-            .as_ref()
-            .ok_or_else(|| Exception::custom("scaling_config is required for proportional RoPE"))?;
-        let factor = config
-            .get("factor")
-            .map(|_| get_numeric_from_config(config, "factor"))
-            .transpose()?
-            .unwrap_or(1.0);
-        let proportion = config
-            .get("partial_rotary_factor")
-            .map(|_| get_numeric_from_config(config, "partial_rotary_factor"))
-            .transpose()?
-            .unwrap_or(1.0);
-        return Ok(RopeVariant::Proportional(ProportionalRope::new(
+        )?)),
+        RotaryAlgorithm::Proportional {
+            factor,
+            rotary_fraction,
+        } => Ok(RopeVariant::Proportional(ProportionalRope::new(
             dims,
             traditional,
             base,
             factor,
-            proportion,
+            rotary_fraction,
             stream,
-        )?));
-    } else if rope_type == FloatOrStr::Str("yarn") {
-        let config = scaling_config
-            .as_ref()
-            .ok_or_else(|| Exception::custom("scaling_config is required for YaRN RoPE"))?;
-        let value_or = |key: &str, default: f32| {
-            config
-                .get(key)
-                .map(|_| get_numeric_from_config(config, key))
-                .transpose()
-                .map(|value| value.unwrap_or(default))
-        };
-        let truncate = match config.get("truncate") {
-            Some(RopeValue::Bool(value)) => *value,
-            Some(_) => {
-                return Err(Exception::custom(
-                    "YaRN truncate must be a boolean when provided",
-                ))
-            }
-            None => true,
-        };
-        return Ok(RopeVariant::Yarn(YarnRope::new(
-            dims,
-            traditional,
-            base,
-            get_numeric_from_config(config, "factor")?,
-            get_numeric_from_config(config, "original_max_position_embeddings")?,
-            value_or("beta_fast", 32.0)?,
-            value_or("beta_slow", 1.0)?,
-            value_or("mscale", 1.0)?,
-            value_or("mscale_all_dim", 0.0)?,
+        )?)),
+        RotaryAlgorithm::Yarn {
+            factor,
+            original_max_positions,
+            beta_fast,
+            beta_slow,
+            concentration,
+            attention_factor,
             truncate,
-        )));
+        } => Ok(RopeVariant::Yarn(YarnRope::new(
+            dims,
+            traditional,
+            base,
+            factor,
+            original_max_positions as f32,
+            beta_fast,
+            beta_slow,
+            concentration,
+            attention_factor,
+            truncate,
+        ))),
     }
-
-    Err(Exception::custom(format!(
-        "Unsupported RoPE type {rope_type:?}"
-    )))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use safemlx::{Device, DeviceType, Stream};
-
-    use super::{
-        initialize_rope, proportional_frequency_values, proportional_rotary_dims,
-        validate_rope_scaling_config, yarn_frequency_values, RopeValue,
-    };
-    use crate::backend::error::Error;
-
-    fn longrope_config() -> Option<HashMap<String, RopeValue>> {
-        Some(HashMap::from([(
-            "rope_type".into(),
-            RopeValue::String("longrope".into()),
-        )]))
-    }
-
-    #[test]
-    fn longrope_is_a_structured_unsupported_architecture_error() {
-        let error = validate_rope_scaling_config(&longrope_config()).unwrap_err();
-        assert!(matches!(
-            error,
-            Error::UnsupportedArchitecture(detail)
-                if detail == "RoPE scaling type \"longrope\" is unsupported; LongRoPE is not implemented"
-        ));
-    }
-
-    #[test]
-    fn longrope_initializer_returns_instead_of_panicking() {
-        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let error =
-            initialize_rope(64, 10_000.0, false, &longrope_config(), 4096, &stream).unwrap_err();
-        assert!(error.to_string().contains("LongRoPE is not implemented"));
-    }
+    use super::{proportional_frequency_values, proportional_rotary_dims, yarn_frequency_values};
 
     #[test]
     fn proportional_rope_uses_full_half_head_frequency_layout() {

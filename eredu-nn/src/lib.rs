@@ -1052,34 +1052,116 @@ impl From<NormalizationSpec> for NormalizationConstructionSpec {
     }
 }
 
-/// One backend-neutral RoPE configuration value.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-#[serde(untagged)]
-pub enum RopeValue {
-    /// Floating-point metadata.
-    Float(f32),
-    /// String metadata.
-    String(String),
-    /// Boolean metadata.
-    Bool(bool),
+/// Fully normalized rotary-position algorithm selected by an architecture.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RotaryAlgorithm {
+    /// Unscaled rotary embeddings.
+    Default,
+    /// Uniform position interpolation by an extension factor.
+    Linear {
+        /// Context extension factor.
+        factor: f32,
+    },
+    /// Llama 3 piecewise wavelength scaling.
+    Llama3 {
+        /// Context extension factor.
+        factor: f32,
+        /// Low-frequency wavelength boundary.
+        low_frequency_factor: f32,
+        /// High-frequency wavelength boundary.
+        high_frequency_factor: f32,
+        /// Context length used during training.
+        original_max_positions: i32,
+    },
+    /// Rotary embeddings over a configurable prefix of each head.
+    Proportional {
+        /// Frequency scaling factor.
+        factor: f32,
+        /// Fraction of the head covered by rotary embeddings.
+        rotary_fraction: f32,
+    },
+    /// YaRN frequency interpolation and attention concentration.
+    Yarn {
+        /// Context extension factor.
+        factor: f32,
+        /// Context length used during training.
+        original_max_positions: i32,
+        /// Fast correction rotation count.
+        beta_fast: f32,
+        /// Slow correction rotation count.
+        beta_slow: f32,
+        /// Rotary concentration coefficient.
+        concentration: f32,
+        /// All-dimension attention-scale coefficient.
+        attention_factor: f32,
+        /// Whether correction boundaries are rounded to integer frequency slots.
+        truncate: bool,
+    },
 }
 
-/// Canonical metadata tag for piecewise wavelength-based rotary scaling.
-pub const FREQUENCY_SCALED_ROPE_TYPE: &str = "llama3";
+impl RotaryAlgorithm {
+    /// Validates the complete scalar geometry of this normalized algorithm.
+    pub fn validate(self) -> Result<(), Error> {
+        let positive = |value: f32| value.is_finite() && value > 0.0;
+        let valid = match self {
+            Self::Default => true,
+            Self::Linear { factor } => positive(factor),
+            Self::Llama3 {
+                factor,
+                low_frequency_factor,
+                high_frequency_factor,
+                original_max_positions,
+            } => {
+                positive(factor)
+                    && positive(low_frequency_factor)
+                    && positive(high_frequency_factor)
+                    && high_frequency_factor > low_frequency_factor
+                    && original_max_positions > 0
+            }
+            Self::Proportional {
+                factor,
+                rotary_fraction,
+            } => positive(factor) && positive(rotary_fraction) && rotary_fraction <= 1.0,
+            Self::Yarn {
+                factor,
+                original_max_positions,
+                beta_fast,
+                beta_slow,
+                concentration,
+                attention_factor,
+                ..
+            } => {
+                positive(factor)
+                    && original_max_positions > 0
+                    && positive(beta_fast)
+                    && positive(beta_slow)
+                    && beta_fast > beta_slow
+                    && positive(concentration)
+                    && attention_factor.is_finite()
+                    && attention_factor >= 0.0
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::backend(format!(
+                "invalid normalized rotary algorithm: {self:?}"
+            )))
+        }
+    }
+}
 
 /// Complete backend-neutral rotary-position construction specification.
 #[derive(Debug, Clone, Copy)]
-pub struct RotarySpec<'a> {
+pub struct RotarySpec {
     /// Rotated head dimensions.
     pub dimensions: i32,
     /// Base frequency.
     pub base: f32,
     /// Whether adjacent pairs are rotated instead of split halves.
     pub traditional: bool,
-    /// Maximum configured position count.
-    pub max_positions: i32,
-    /// Optional normalized scaling metadata.
-    pub scaling: Option<&'a std::collections::HashMap<String, RopeValue>>,
+    /// Fully normalized algorithm and scalar policy.
+    pub algorithm: RotaryAlgorithm,
 }
 
 /// Backend-native affine projection used by shared architectures.
@@ -2772,7 +2854,7 @@ pub trait NeuralBackend: Sized + 'static {
     }
     /// Builds the model's rotary-position operator.
     fn rotary(
-        spec: RotarySpec<'_>,
+        spec: RotarySpec,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Rotary, Error>;
     /// Applies SiLU using a backend-native implementation.

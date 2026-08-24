@@ -2,13 +2,14 @@
 
 use std::{collections::HashMap, io::Read};
 
+use crate::rotary::RopeValue;
 use eredu_checkpoint::WeightQuantization;
 use eredu_core::{
     cache::{derive_prompt_cache_architecture_fingerprint, PromptCacheTopology},
     AttentionPolicy, LayerSchedule,
 };
 use eredu_gguf::MetadataValue;
-use eredu_nn::{GatedProductActivation, GatedProductPolicy, RopeValue, RotarySpec};
+use eredu_nn::{GatedProductActivation, GatedProductPolicy, RotarySpec};
 use eredu_runtime::{ModelStateIdentity, StateLayout};
 use serde::Deserialize;
 use serde_json::Value;
@@ -237,13 +238,13 @@ impl Config for ModelArgs {
         self.weight_quantization_for(name)
     }
 
-    fn rotary_spec(&self, dimensions: i32) -> RotarySpec<'_> {
+    fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
         RotarySpec {
             dimensions,
             base: self.rope_theta,
             traditional: false,
-            max_positions: self.max_position_embeddings,
-            scaling: self.rope_scaling.as_ref(),
+            algorithm: crate::rotary::normalize_algorithm(self.rope_scaling.as_ref())
+                .expect("validated GPT-OSS RoPE algorithm"),
         }
     }
 }
@@ -739,9 +740,12 @@ fn validate_normalized_rope_scaling(
         required_rope_number(scaling, "mscale_all_dim")?,
         max_positions,
     )?;
-    match scaling.get("truncate") {
-        Some(RopeValue::Bool(_)) => Ok(()),
-        _ => Err(invalid("normalized GPT-OSS YaRN truncate must be boolean")),
+    if !matches!(scaling.get("truncate"), Some(RopeValue::Bool(_))) {
+        return Err(invalid("normalized GPT-OSS YaRN truncate must be boolean"));
+    }
+    match crate::rotary::normalize_algorithm(Some(scaling)).map_err(invalid)? {
+        eredu_nn::RotaryAlgorithm::Yarn { .. } => Ok(()),
+        _ => Err(invalid("normalized GPT-OSS RoPE scaling must be YaRN")),
     }
 }
 

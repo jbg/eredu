@@ -511,8 +511,8 @@ fn new_attention<B: RoutedNeuralBackend>(
                 dimensions: config.rope_dimensions(),
                 base: config.rope_theta(),
                 traditional: false,
-                max_positions: config.max_position_embeddings,
-                scaling: rope_config.as_ref(),
+                algorithm: crate::rotary::normalize_algorithm(rope_config.as_ref())
+                    .expect("validated Qwen hybrid RoPE algorithm"),
             },
             context,
         )?),

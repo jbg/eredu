@@ -95,6 +95,13 @@ plans, and the complete embedding/layer/output lifecycle. Architecture code is
 generic over `NeuralBackend` and passes backend-native tensor handles through
 unchanged.
 
+External RoPE maps and their family aliases are architecture configuration
+input, not a backend contract. Architectures normalize them into the closed
+`RotaryAlgorithm` carried by `RotarySpec`, including all defaults and validated
+scalar geometry. A concrete backend only lowers that typed algorithm to its
+native rotary operator; it must not parse configuration keys, choose defaults,
+or decide which model-family scaling names are supported.
+
 The architecture configuration registry is the sole owner of Hugging Face
 family aliases, GGUF `general.architecture` spellings, nested-wrapper
 normalization, and the exhaustive dispatch to family parsers. Its external

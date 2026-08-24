@@ -173,7 +173,7 @@ pub trait Config: 'static {
     /// Physical encoding selected for one canonical checkpoint parameter.
     fn weight_quantization(&self, name: &str) -> Option<WeightQuantization>;
     /// Complete rotary-position construction specification.
-    fn rotary_spec(&self, dimensions: i32) -> RotarySpec<'_>;
+    fn rotary_spec(&self, dimensions: i32) -> RotarySpec;
     /// Whether this decoder stack applies rotary position encoding.
     fn rotary_enabled(&self) -> bool {
         true

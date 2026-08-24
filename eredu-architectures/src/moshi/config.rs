@@ -484,13 +484,12 @@ impl DecoderConfig for MoshiTransformerConfig {
         self.native_quantization
     }
 
-    fn rotary_spec(&self, dimensions: i32) -> RotarySpec<'_> {
+    fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
         RotarySpec {
             dimensions,
             base: self.rope_base,
             traditional: true,
-            max_positions: self.context,
-            scaling: None,
+            algorithm: eredu_nn::RotaryAlgorithm::Default,
         }
     }
 

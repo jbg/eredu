@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use crate::rotary::RopeValue;
 use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat, WeightQuantization};
 use eredu_core::{
     attention::{AttentionPolicy, LayerSchedule},
@@ -11,7 +12,6 @@ use eredu_core::{
     },
 };
 use eredu_gguf::MetadataValue;
-use eredu_nn::RopeValue;
 use eredu_runtime::{StateLayout, StateSegmentLifetime, StateSegmentSpec};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -238,7 +238,7 @@ impl HybridConfig {
         }
     }
 
-    /// Backend-neutral RoPE values admitted by the general rotary contract.
+    /// Converts the selected external RoPE policy into architecture-owned scalar values.
     pub fn rope_config(&self) -> Option<HashMap<String, RopeValue>> {
         rope_config_value(
             self.rope_parameters
@@ -249,6 +249,8 @@ impl HybridConfig {
 
     /// Validates all hybrid geometry and selected physical formats.
     pub fn validate(&self) -> Result<(), HybridConfigError> {
+        let rope_config = self.rope_config();
+        crate::rotary::normalize_algorithm(rope_config.as_ref()).map_err(invalid)?;
         for (name, value) in [
             ("vocab_size", self.vocab_size),
             ("hidden_size", self.hidden_size),

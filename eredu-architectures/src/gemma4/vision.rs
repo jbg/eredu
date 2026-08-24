@@ -2,13 +2,14 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::rotary::RopeValue;
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_nn::{
     multimodal::{
         multi_axis_rotary_embeddings, MultiAxisRotaryLayout, MultiAxisRotarySpec, RotaryAxisSpec,
     },
     Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationOperator,
-    NormalizationSpec, Parameter, ParameterSpec, Parameterized, RopeValue, Tensor,
+    NormalizationSpec, Parameter, ParameterSpec, Parameterized, Tensor,
 };
 use serde::Deserialize;
 

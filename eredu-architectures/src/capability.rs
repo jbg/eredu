@@ -6,11 +6,11 @@
 
 use std::collections::BTreeMap;
 
+use crate::rotary::RopeValue;
 use eredu_core::{
     CacheStateStrategy, CapabilityError, EstimationCompleteness, GrowingState, InputModalities,
     ModelCapabilities, ObservationKind, Observed, SlidingWindowLayerCount, StateLayout,
 };
-use eredu_nn::RopeValue;
 
 use crate::{
     gemma4, gpt_oss, kimi_linear, lfm2,

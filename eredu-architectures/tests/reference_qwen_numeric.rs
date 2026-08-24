@@ -2820,7 +2820,7 @@ impl NeuralBackend for NumericBackend {
         })
     }
 
-    fn rotary(spec: RotarySpec<'_>, _: &NumericContext) -> Result<Self::Rotary, Error> {
+    fn rotary(spec: RotarySpec, _: &NumericContext) -> Result<Self::Rotary, Error> {
         Ok(NumericRotary {
             dimensions: spec.dimensions,
             traditional: spec.traditional,
@@ -6417,7 +6417,7 @@ impl decoder::Config for SinkDecoderConfig {
     fn weight_quantization(&self, name: &str) -> Option<eredu_checkpoint::WeightQuantization> {
         decoder::Config::weight_quantization(&self.0, name)
     }
-    fn rotary_spec(&self, dimensions: i32) -> RotarySpec<'_> {
+    fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
         decoder::Config::rotary_spec(&self.0, dimensions)
     }
 }

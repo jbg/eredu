@@ -155,8 +155,10 @@ impl<B: NeuralBackend> Attention<B> {
                     dimensions: partial_dimensions,
                     base: args.rope_theta_for(policy.attention),
                     traditional: false,
-                    max_positions: args.max_position_embeddings,
-                    scaling: args.rope_scaling_for(policy.attention),
+                    algorithm: crate::rotary::normalize_algorithm(
+                        args.rope_scaling_for(policy.attention),
+                    )
+                    .expect("validated Gemma 4 RoPE algorithm"),
                 },
                 context,
             )?,
@@ -278,20 +280,20 @@ impl<B: NeuralBackend> Attention<B> {
 
 fn partial_rotary_dimensions(
     head_dim: i32,
-    scaling: Option<&std::collections::HashMap<String, eredu_nn::RopeValue>>,
+    scaling: Option<&std::collections::HashMap<String, crate::rotary::RopeValue>>,
 ) -> i32 {
     if matches!(
         scaling.and_then(|scaling| scaling.get("rope_type")),
-        Some(eredu_nn::RopeValue::String(kind)) if kind == "proportional"
+        Some(crate::rotary::RopeValue::String(kind)) if kind == "proportional"
     ) {
         return head_dim;
     }
     let factor = scaling
         .and_then(|scaling| scaling.get("partial_rotary_factor"))
         .and_then(|value| match value {
-            eredu_nn::RopeValue::Float(value) => Some(*value),
-            eredu_nn::RopeValue::String(value) => value.parse().ok(),
-            eredu_nn::RopeValue::Bool(_) => None,
+            crate::rotary::RopeValue::Float(value) => Some(*value),
+            crate::rotary::RopeValue::String(value) => value.parse().ok(),
+            crate::rotary::RopeValue::Bool(_) => None,
         })
         .unwrap_or(1.0);
     ((head_dim as f32 * factor).round() as i32).clamp(2, head_dim) & !1

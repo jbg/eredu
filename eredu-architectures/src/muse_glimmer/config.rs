@@ -2,10 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::rotary::RopeValue;
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_gguf::{MetadataArray, MetadataValue};
-use eredu_nn::RopeValue;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -1062,7 +1062,9 @@ fn validate_rope_scaling(scaling: Option<&HashMap<String, RopeValue>>) -> Result
             "YaRN requires positive original_max_position_embeddings",
         ));
     }
-    Ok(())
+    crate::rotary::normalize_algorithm(Some(scaling))
+        .map(|_| ())
+        .map_err(invalid)
 }
 
 fn positive_i32(value: &Value, name: &str) -> Result<i32, ConfigError> {

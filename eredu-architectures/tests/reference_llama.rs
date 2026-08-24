@@ -533,7 +533,7 @@ impl NeuralBackend for ReferenceBackend {
             metadata: ParameterMetadata::from_spec(&spec.weight, spec.weight.trainable),
         })
     }
-    fn rotary(_: RotarySpec<'_>, _: &()) -> Result<Self::Rotary, Error> {
+    fn rotary(_: RotarySpec, _: &()) -> Result<Self::Rotary, Error> {
         Ok(ReferenceRotary)
     }
     fn silu(input: Self::Tensor, _: &()) -> Result<Self::Tensor, Error> {
@@ -1560,13 +1560,12 @@ impl decoder::Config for ProjectionLayoutConfig {
         None
     }
 
-    fn rotary_spec(&self, dimensions: i32) -> RotarySpec<'_> {
+    fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
         RotarySpec {
             dimensions,
             base: self.args.rope_theta,
             traditional: self.args.rope_traditional,
-            max_positions: self.args.max_position_embeddings,
-            scaling: None,
+            algorithm: eredu_nn::RotaryAlgorithm::Default,
         }
     }
 }

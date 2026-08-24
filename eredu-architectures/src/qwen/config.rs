@@ -5,12 +5,13 @@ use eredu_checkpoint::WeightQuantization;
 use eredu_core::cache::derive_prompt_cache_architecture_fingerprint;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_gguf::{MetadataArray, MetadataValue};
-use eredu_nn::{RopeValue, RotarySpec};
+use eredu_nn::RotarySpec;
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
     decoder::{AttentionProjection, Config},
+    rotary::RopeValue,
     GgufArchitecture,
 };
 
@@ -93,7 +94,7 @@ pub struct ModelArgs {
     pub rope_theta: f32,
     /// Whether the output projection shares the token embedding table.
     pub tie_word_embeddings: bool,
-    /// Optional normalized RoPE scaling metadata.
+    /// External RoPE scaling metadata retained for identity and plan emission.
     pub rope_scaling: Option<HashMap<String, RopeValue>>,
     /// Exact ordered attention policy for every layer.
     pub attention_schedule: LayerSchedule<AttentionPolicy>,
@@ -249,13 +250,13 @@ impl Config for ModelArgs {
     fn weight_quantization(&self, name: &str) -> Option<WeightQuantization> {
         self.weight_quantization_for(name)
     }
-    fn rotary_spec(&self, dimensions: i32) -> RotarySpec<'_> {
+    fn rotary_spec(&self, dimensions: i32) -> RotarySpec {
         RotarySpec {
             dimensions,
             base: self.rope_theta,
             traditional: false,
-            max_positions: self.max_position_embeddings,
-            scaling: self.rope_scaling.as_ref(),
+            algorithm: crate::rotary::normalize_algorithm(self.rope_scaling.as_ref())
+                .expect("validated Qwen RoPE algorithm"),
         }
     }
 }
@@ -819,7 +820,9 @@ fn validate_rope_scaling(scaling: Option<&HashMap<String, RopeValue>>) -> Result
             "YaRN requires positive original_max_position_embeddings",
         ));
     }
-    Ok(())
+    crate::rotary::normalize_algorithm(Some(scaling))
+        .map(|_| ())
+        .map_err(invalid)
 }
 
 fn rope_number(values: &HashMap<String, RopeValue>, key: &str) -> Option<f32> {

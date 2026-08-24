@@ -189,8 +189,8 @@ impl<B: RoutedNeuralBackend> Attention<B> {
                     dimensions: args.head_dim,
                     base: args.rope_theta,
                     traditional: args.weight_convention.uses_traditional_rope(),
-                    max_positions: args.max_position_embeddings,
-                    scaling: args.rope_scaling.as_ref(),
+                    algorithm: crate::rotary::normalize_algorithm(args.rope_scaling.as_ref())
+                        .expect("validated Muse-Glimmer RoPE algorithm"),
                 },
                 context,
             )?,
