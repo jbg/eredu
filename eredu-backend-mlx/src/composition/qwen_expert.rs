@@ -17,7 +17,7 @@ pub fn expert_catalog(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = eredu_architectures::qwen::expert_residency_catalog(store, args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     crate::composition::architecture_expert_units(catalog, store, None)
 }
 

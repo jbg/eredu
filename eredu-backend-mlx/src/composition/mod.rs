@@ -43,7 +43,7 @@ where
 {
     let recipes = architecture
         .static_parameter_recipes(store)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let mut visitor = StaticBindingVisitor {
         store,
         recipes,
@@ -51,7 +51,7 @@ where
     };
     architecture.visit_static_parameters(&mut visitor)?;
     if !visitor.recipes.is_empty() {
-        return Err(Error::UnsupportedArchitecture(format!(
+        return Err(Error::ArchitectureModel(format!(
             "architecture declared static recipes for unknown parameters {:?}",
             visitor.recipes.into_keys().collect::<Vec<_>>()
         )));
@@ -104,9 +104,7 @@ pub(crate) fn architecture_expert_units(
             }
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
                 total.checked_add(binding.expected_bytes()).ok_or_else(|| {
-                    Error::UnsupportedArchitecture(format!(
-                        "expert {identity:?} byte total overflowed"
-                    ))
+                    Error::ArchitectureModel(format!("expert {identity:?} byte total overflowed"))
                 })
             })?;
             Ok(ExpertCatalogEntry::new(

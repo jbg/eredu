@@ -71,17 +71,17 @@ pub fn validate_external_drafter(
             let _compatibility = assistant
                 .config
                 .prove_compatibility(target)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         }
         (Model::MuseGlimmer(_, target), MlxDrafterKind::MuseGlimmerDFlash) => {
             let assistant = drafter.muse_glimmer();
             let _compatibility = assistant
                 .config
                 .prove_compatibility(target.args())
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         }
         (model, kind) => {
-            return Err(Error::UnsupportedArchitecture(format!(
+            return Err(Error::ArchitectureModel(format!(
                 "drafter {kind:?} is incompatible with target {} ({:?})",
                 model.effective_model_type(),
                 model.mtp_capability()
@@ -259,7 +259,7 @@ impl<'runtime, 'world> MlxSpeculativeSession<'runtime, 'world> {
         drafter
             .tokenizer_compatibility()
             .validate_target(self.tokenizer_fingerprint)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(())
     }
 

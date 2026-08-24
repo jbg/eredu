@@ -18,7 +18,7 @@ pub fn v3_catalog(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = deepseek::v3_expert_residency_catalog(store, args, None)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     crate::composition::architecture_expert_units(catalog, store, None)
 }
 
@@ -32,7 +32,7 @@ pub fn v3_checkpoint_keys(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<BTreeSet<String>, Error> {
     let catalog = deepseek::v3_expert_residency_catalog(store, args, None)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     Ok(checkpoint_keys(&catalog))
 }
 
@@ -42,7 +42,7 @@ pub fn v3_parallel_catalog(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = deepseek::v3_expert_residency_catalog(store, args, Some(intermediate))
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     crate::composition::architecture_expert_units(catalog, store, None)
 }
 
@@ -51,7 +51,7 @@ pub fn v4_catalog(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = deepseek::v4_expert_residency_catalog(store, args, None)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     crate::composition::architecture_expert_units(catalog, store, None)
 }
 
@@ -61,7 +61,7 @@ pub fn v4_checkpoint_keys(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<BTreeSet<String>, Error> {
     let catalog = deepseek::v4_expert_residency_catalog(store, args, None)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     Ok(checkpoint_keys(&catalog))
 }
 
@@ -71,7 +71,7 @@ pub fn v4_parallel_catalog(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = deepseek::v4_expert_residency_catalog(store, args, Some(intermediate))
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     crate::composition::architecture_expert_units(catalog, store, None)
 }
 

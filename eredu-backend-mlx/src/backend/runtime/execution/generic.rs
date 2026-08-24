@@ -152,14 +152,14 @@ where
     A::Error: std::fmt::Display,
 {
     let address = layout.address(ordinal).ok_or_else(|| {
-        Error::UnsupportedArchitecture(format!(
+        Error::ArchitectureModel(format!(
             "architecture unit ordinal {ordinal} is outside 0..{}",
             layout.len()
         ))
     })?;
     architecture
         .build_unit(address.group(), address.index(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 impl<U, P> MlxLayerwisePolicy<U, P> {
@@ -362,7 +362,7 @@ impl<U, P> MlxLayerwisePolicy<U, P> {
             let mut unit = MlxModule::new(
                 architecture
                     .build_unit(address.group(), address.index(), stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             );
             self.populator.populate(&mut unit, lease)?;
             units.push(Some(unit));
@@ -593,16 +593,16 @@ where
 {
     let graph = architecture
         .execution_graph()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let counts = (0..graph.groups().len())
         .map(|group| {
             architecture
                 .group_unit_count(group)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 /// Builds a generic MLX layerwise policy from neutral parameter topologies.
@@ -725,10 +725,10 @@ where
             .expect("validated layout covers every flat unit");
         let path = architecture
             .unit_path(address.group(), address.index())
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let unit = architecture
             .build_unit(address.group(), address.index(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let bindings = unit_bindings(index, address, &path, unit, store.as_ref(), stream)?;
         let bytes = binding_bytes(&bindings)?;
         layer_parameter_bytes = layer_parameter_bytes

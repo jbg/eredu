@@ -108,7 +108,7 @@ where
         })?;
         let config = AffineQuantization::new(group_size, i32::from(bits))?;
         if configs.insert(weight_name.clone(), config).is_some() {
-            return Err(Error::UnsupportedArchitecture(format!(
+            return Err(Error::ArchitectureModel(format!(
                 "GGUF tensors collide after translating {weight_name:?}"
             )));
         }
@@ -137,7 +137,7 @@ where
                     .insert(weight_name.clone(), WeightQuantization::MxFp4)
                     .is_some()
                 {
-                    return Err(Error::UnsupportedArchitecture(format!(
+                    return Err(Error::ArchitectureModel(format!(
                         "GGUF tensors collide after translating {weight_name:?}"
                     )));
                 }
@@ -154,7 +154,7 @@ where
                 endian: shard.endian(),
             };
             if configs.insert(weight_name.clone(), config).is_some() {
-                return Err(Error::UnsupportedArchitecture(format!(
+                return Err(Error::ArchitectureModel(format!(
                     "GGUF tensors collide after translating {weight_name:?}"
                 )));
             }
@@ -877,23 +877,23 @@ fn pack_split_gated_product_expert_prefix(
         let parts = expert_parts
             .remove(&(prefix.to_string(), component, expert))
             .ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
+                Error::ArchitectureModel(format!(
                     "checkpoint is missing expert {expert} for '{prefix}'"
                 ))
             })?;
         let gate = parts.gate.ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "checkpoint is missing {prefix}.{expert}.w1 component {component:?}"
             ))
         })?;
         let up = parts.up.ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "checkpoint is missing {prefix}.{expert}.w3 component {component:?}"
             ))
         })?;
         gate_up.push(concatenate_axis(&[gate, up], 0, stream)?);
         down.push(parts.down.ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "checkpoint is missing {prefix}.{expert}.w2 component {component:?}"
             ))
         })?);
@@ -1057,17 +1057,17 @@ fn pack_split_relu2_expert_prefix(
         let parts = expert_parts
             .remove(&(prefix.to_string(), expert))
             .ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
+                Error::ArchitectureModel(format!(
                     "checkpoint is missing expert {expert} for '{prefix}'"
                 ))
             })?;
         up.push(parts.up.ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "checkpoint is missing {prefix}.{expert}.up_proj.weight"
             ))
         })?);
         down.push(parts.down.ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "checkpoint is missing {prefix}.{expert}.down_proj.weight"
             ))
         })?);

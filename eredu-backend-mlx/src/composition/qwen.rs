@@ -145,7 +145,7 @@ fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Re
     if transport.kind == eredu_runtime::ArchitectureGroupKind::Decoder {
         Ok(())
     } else {
-        Err(Error::UnsupportedArchitecture(format!(
+        Err(Error::ArchitectureModel(format!(
             "Qwen checkpoint bindings require the decoder execution group, got {group}"
         )))
     }
@@ -161,7 +161,7 @@ fn decoder_unit_path(
         MlxNeuralBackend,
         MlxKeyValueState,
     >>::unit_path(architecture, group, index)
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 type NeutralResidentRuntime = LayerwiseRuntime<
@@ -275,10 +275,10 @@ fn resolve_qwen_safetensors_store(
         return Ok(store);
     }
     let plan = eredu_architectures::qwen::safetensors_plan(args)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
         .map_err(|validation| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "{} checkpoint contract did not resolve: {validation:?}",
                 args.model_type
             ))
@@ -298,7 +298,7 @@ fn qwen_unit_recipes(
     }
     let resolved =
         eredu_architectures::qwen::expert_recipes(store, args, &args.parameter_root, layer)
-            .map_err(Error::UnsupportedArchitecture)?;
+            .map_err(Error::ArchitectureModel)?;
     Ok(BTreeMap::from([
         (resolved.target_gate_up, resolved.gate_up),
         (resolved.target_down, resolved.down),
@@ -315,7 +315,7 @@ fn load_neutral_qwen(
     external_experts: bool,
 ) -> Result<QwenModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         eredu_architectures::qwen::parameter_description(&architecture, stream)
             .map_err(|error| Error::Parallel(error.to_string()))?
@@ -374,7 +374,7 @@ fn load_neutral_qwen(
     };
     Ok(QwenModel {
         state_layout: eredu_architectures::qwen::state_layout(&args)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
         args,
         metadata,
         parallel_info: None,
@@ -403,11 +403,11 @@ pub fn quantize_neutral_qwen_store(
     target_args.quantized_weights = None;
     target_args.quantized_weight_configs = None;
     let source = NeutralArchitecture::new(source_args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target = NeutralArchitecture::new(target_args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let count = usize::try_from(source_args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Qwen layer count".into()))?;
+        .map_err(|_| Error::ArchitectureModel("invalid Qwen layer count".into()))?;
     let source_unit_args = source_args.clone();
     let target_unit_args = target_args.clone();
     let (store, report) = quantize_parameterized_store(
@@ -420,7 +420,7 @@ pub fn quantize_neutral_qwen_store(
                 index,
                 stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         move |index, stream| {
             eredu_architectures::qwen::new_block::<MlxNeuralBackend>(
@@ -428,7 +428,7 @@ pub fn quantize_neutral_qwen_store(
                 index,
                 stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         count,
         quantization,
@@ -669,10 +669,10 @@ impl QwenModel {
         let output = match &mut self.execution {
             QwenExecution::Resident(execution) => execution
                 .forward(input, cache, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+                .map_err(|error| Error::ArchitectureModel(error.to_string())),
             QwenExecution::Layerwise(execution) => execution
                 .forward(input, cache, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+                .map_err(|error| Error::ArchitectureModel(error.to_string())),
             QwenExecution::TensorParallelResident(_)
             | QwenExecution::TensorParallelLayerwise(_) => Err(Error::Parallel(
                 "tensor-parallel Qwen requires its collective execution context".into(),
@@ -794,7 +794,7 @@ impl QwenModel {
                 ))
             }
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(output.into_array())
     }
 
@@ -1074,7 +1074,7 @@ impl QwenModel {
                 crate::backend::cache::prompt_cache_topology(info.topology())
             });
         let identity = eredu_architectures::qwen::state_identity(self.args(), &layout, 0, topology)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         identity
             .prompt_cache_identity(&layout)
             .map_err(|error| Error::Parallel(error.to_string()))
@@ -1132,7 +1132,7 @@ pub fn load_qwen_safetensors_mlx(
     let expert_options = weight_residency.expert_cache();
     let execution_options = weight_residency.layers();
     let args = eredu_architectures::qwen::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Qwen", args.weight_quantization(), requested)
@@ -1181,7 +1181,7 @@ fn attach_qwen_expert_cache(
     weights_stream: &Stream,
 ) -> Result<(), Error> {
     if !model.args.is_moe() {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "independent expert caching requires Qwen3-MoE arguments".into(),
         ));
     }
@@ -1207,9 +1207,9 @@ fn load_neutral_qwen_parallel(
     external_experts: bool,
 ) -> Result<QwenModel, Error> {
     let layer_count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Qwen layer count".into()))?;
+        .map_err(|_| Error::ArchitectureModel("invalid Qwen layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         eredu_architectures::qwen::parameter_description(&global_architecture, stream)
             .map_err(|error| Error::Parallel(error.to_string()))?
@@ -1227,7 +1227,7 @@ fn load_neutral_qwen_parallel(
     }
     for index in 0..layer_count {
         let unit = eredu_architectures::qwen::new_block::<MlxNeuralBackend>(&args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         for group in eredu_architectures::qwen::layer_parallel_parameter_groups::<MlxNeuralBackend>(
             &unit, &args, index,
         )? {
@@ -1243,10 +1243,10 @@ fn load_neutral_qwen_parallel(
     let geometry = eredu_architectures::qwen::local_geometry(&args, &layout)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let global_static_bindings = build_module_bindings(
         &MlxModule::new(global_architecture.static_modules().clone()),
         "",
@@ -1255,7 +1255,7 @@ fn load_neutral_qwen_parallel(
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
     for index in 0..layer_count {
         let unit = eredu_architectures::qwen::new_block::<MlxNeuralBackend>(&args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let recipes = if external_experts {
             BTreeMap::new()
         } else {
@@ -1303,7 +1303,7 @@ fn load_neutral_qwen_parallel(
                 index,
                 stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let recipes = if external_experts {
                 BTreeMap::new()
             } else {
@@ -1383,7 +1383,7 @@ pub fn load_qwen_tensor_parallel_model(
 ) -> Result<QwenModel, Error> {
     let options = options.into();
     let args = eredu_architectures::qwen::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_qwen_safetensors_store(store, &args)?;
     load_neutral_qwen_parallel(store, args, options, build, stream, weights_stream, false)
@@ -1412,7 +1412,7 @@ pub(crate) fn prepare_qwen_gguf_checkpoint(
             | eredu_architectures::GgufArchitecture::Qwen3
             | eredu_architectures::GgufArchitecture::Qwen3Moe
     ) {
-        return Err(Error::UnsupportedArchitecture(format!(
+        return Err(Error::ArchitectureModel(format!(
             "Qwen GGUF loader received architecture {:?}",
             source.architecture()
         )));
@@ -1423,7 +1423,7 @@ pub(crate) fn prepare_qwen_gguf_checkpoint(
         &QwenGgufCatalog(checkpoint),
         metadata,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let is_moe = args.is_moe();
     let translate =
         |name: &str| eredu_architectures::qwen::translate_gguf_weight_name(name, is_moe);
@@ -1448,8 +1448,8 @@ pub(crate) fn load_qwen_gguf_tensor_parallel_model(
 ) -> Result<QwenModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_qwen_gguf_checkpoint(source)?;
-    let gguf_plan = eredu_architectures::qwen::gguf_plan(&prepared.args)
-        .map_err(Error::UnsupportedArchitecture)?;
+    let gguf_plan =
+        eredu_architectures::qwen::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
@@ -1481,8 +1481,8 @@ pub(crate) fn load_qwen_gguf_model(
 ) -> Result<QwenModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = prepare_qwen_gguf_checkpoint(source)?;
-    let gguf_plan = eredu_architectures::qwen::gguf_plan(&prepared.args)
-        .map_err(Error::UnsupportedArchitecture)?;
+    let gguf_plan =
+        eredu_architectures::qwen::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),

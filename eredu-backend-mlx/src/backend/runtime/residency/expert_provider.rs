@@ -53,7 +53,7 @@ where
         _request: RoutedExpertRequest<'_, MlxTensor>,
         _stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
-        Err(Error::UnsupportedArchitecture(
+        Err(Error::ArchitectureModel(
             "a ReLU2 expert cache cannot execute a gated-product expert bank".into(),
         ))
     }
@@ -139,7 +139,7 @@ impl RoutedExpertProvider<MlxNeuralBackend> for CachedGatedProductExpertProvider
         _request: RoutedExpertRequest<'_, MlxTensor>,
         _stream: &Stream,
     ) -> Result<MlxTensor, Self::Error> {
-        Err(Error::UnsupportedArchitecture(
+        Err(Error::ArchitectureModel(
             "a gated-product expert cache cannot execute a ReLU2 expert bank".into(),
         ))
     }
@@ -569,7 +569,7 @@ fn execute_cached_gated_product_inner(
 ) -> Result<Array, Error> {
     spec.validate()?;
     if spec.input_dimensions != spec.output_dimensions {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "MLX cached gated-product experts require equal input and output dimensions".into(),
         ));
     }
@@ -640,12 +640,12 @@ fn execute_cached_gated_product_inner(
     )?;
     let mut output_shape = original_shape;
     if partitions.is_some() {
-        let last = output_shape.last_mut().ok_or_else(|| {
-            Error::UnsupportedArchitecture("expert output has no hidden axis".into())
-        })?;
-        *last = last.checked_mul(2).ok_or_else(|| {
-            Error::UnsupportedArchitecture("expert output width overflowed".into())
-        })?;
+        let last = output_shape
+            .last_mut()
+            .ok_or_else(|| Error::ArchitectureModel("expert output has no hidden axis".into()))?;
+        *last = last
+            .checked_mul(2)
+            .ok_or_else(|| Error::ArchitectureModel("expert output width overflowed".into()))?;
     }
     Ok(output.reshape(&output_shape, stream)?)
 }
@@ -765,7 +765,7 @@ fn packed_gated_product_projections(
 > {
     match &spec.layout {
         GatedProductExpertLayout::Packed { gate_up, down } => Ok((gate_up, down)),
-        GatedProductExpertLayout::Independent(_) => Err(Error::UnsupportedArchitecture(
+        GatedProductExpertLayout::Independent(_) => Err(Error::ArchitectureModel(
             "MLX compact cached banks require a packed architecture expert specification".into(),
         )),
     }

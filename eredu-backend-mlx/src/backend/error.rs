@@ -119,10 +119,6 @@ pub enum Error {
     #[error("checkpoint quantization error: {0}")]
     Quantization(String),
 
-    /// The model family is recognized but this specific architecture is unsupported.
-    #[error("unsupported model architecture: {0}")]
-    UnsupportedArchitecture(String),
-
     /// Media processor configuration or input error.
     #[error("media processor error: {0}")]
     Processor(String),

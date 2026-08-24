@@ -22,7 +22,7 @@ pub fn module_recipes<M: ModuleParameters>(
 ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
     let parameters = module.parameters().flatten();
     let mut recipes = eredu_architectures::muse_glimmer::safetensors_recipes(args, store)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     recipes.retain(|name, _| parameters.contains_key(name.as_str()));
     Ok(recipes)
 }
@@ -32,7 +32,7 @@ pub fn expert_catalog(
     store: &dyn eredu_checkpoint::store::CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = eredu_architectures::muse_glimmer::expert_residency_catalog(store, args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     crate::composition::architecture_expert_units(catalog, store, None)
 }
 

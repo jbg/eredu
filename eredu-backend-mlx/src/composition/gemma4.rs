@@ -178,7 +178,7 @@ impl Gemma4Bindings {
                     MlxNeuralBackend,
                     MlxHybridState,
                 >>::unit_path(architecture, group, index)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 shard_layer_bindings(bindings, &root, store, layout)
             }
             _ => Ok(bindings),
@@ -248,7 +248,7 @@ impl Execution {
             architecture,
         )
         .map(|graph| graph.output())
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 }
 
@@ -329,7 +329,7 @@ impl Gemma4AssistantModel {
             .draft_step::<crate::backend::runtime::cache::kv::ConcatKeyValueCache>(
                 embedding, state, stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 }
 
@@ -342,7 +342,7 @@ pub fn load_assistant_safetensors(
     weights_stream: &Stream,
 ) -> Result<Gemma4AssistantModel, Error> {
     if !options.weight_residency.is_fully_resident() {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "Gemma 4 assistant loading supports fully resident weights only".into(),
         ));
     }
@@ -381,16 +381,16 @@ pub fn load_assistant_safetensors(
         open_safetensors_weight_store(model_dir, options.weight_residency.max_mapped_shards())?;
     let store = if let Some(requested) = requested {
         let source = NeutralAssistant::new(source_config, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let target = NeutralAssistant::new(config.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         quantize_parameterized_module_store(store, &source, &target, requested, stream)?.0
     } else {
         store
     };
     let mut module = MlxModule::new(
         NeutralAssistant::new(config.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
     );
     let bindings = build_module_bindings(&module, "", store.as_ref())?;
     let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
@@ -407,7 +407,7 @@ pub fn load_assistant_gguf(
     weights_stream: &Stream,
 ) -> Result<Gemma4AssistantModel, Error> {
     if !options.weight_residency.is_fully_resident() {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "Gemma 4 assistant loading supports fully resident weights only".into(),
         ));
     }
@@ -452,9 +452,9 @@ pub fn load_assistant_gguf(
         config.text_config.weight_quantization = Some(requested);
         config.text_config.quantized_weight_configs = None;
         let source = NeutralAssistant::new(source_config, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let target = NeutralAssistant::new(config.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         (
             quantize_parameterized_module_store(store, &source, &target, requested, stream)?.0,
             config,
@@ -464,7 +464,7 @@ pub fn load_assistant_gguf(
     };
     let mut module = MlxModule::new(
         NeutralAssistant::new(config.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
     );
     let bindings = build_module_bindings(&module, "", store.as_ref())?;
     let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
@@ -529,7 +529,7 @@ impl Gemma4Model {
                 crate::backend::cache::prompt_cache_topology(info.topology())
             });
         eredu_architectures::gemma4::state_identity(&self.args, &self.state_layout, 0, topology)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
             .prompt_cache_identity(&self.state_layout)
             .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -639,7 +639,7 @@ impl Gemma4Model {
             ));
         }
         if state.layout() != &self.state_layout {
-            return Err(Error::UnsupportedArchitecture(
+            return Err(Error::ArchitectureModel(
                 "Gemma 4 cache layout mismatch".into(),
             ));
         }
@@ -705,9 +705,9 @@ impl Gemma4Model {
             drop(provider);
             self.expert_cache = Some(expert_cache);
             let (logits, forward) =
-                result.map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let hidden = final_text_hidden.ok_or_else(|| {
-                Error::UnsupportedArchitecture("Gemma 4 text graph produced no activation".into())
+                Error::ArchitectureModel("Gemma 4 text graph produced no activation".into())
             })?;
             return Ok((logits, forward, hidden));
         }
@@ -742,9 +742,9 @@ impl Gemma4Model {
             ),
             Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let hidden = final_text_hidden.ok_or_else(|| {
-            Error::UnsupportedArchitecture("Gemma 4 text graph produced no activation".into())
+            Error::ArchitectureModel("Gemma 4 text graph produced no activation".into())
         })?;
         Ok((result.0, result.1, hidden))
     }
@@ -782,7 +782,7 @@ impl Gemma4Model {
             }
             Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn mtp_output(
@@ -1129,7 +1129,7 @@ impl PreparedParts {
                         .push(Some(crate::MlxTensor::from_array(embeddings.clone())));
                 }
                 (modality, _) => {
-                    return Err(Error::UnsupportedArchitecture(format!(
+                    return Err(Error::ArchitectureModel(format!(
                         "Gemma 4 does not accept this {} payload",
                         modality.as_str()
                     )))
@@ -1149,19 +1149,19 @@ impl PreparedParts {
         metadata: input::InputMetadata<'_>,
     ) -> Result<(), Error> {
         let positions = metadata.patch_positions.ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "Gemma 4 {} input requires patch positions",
                 modality.as_str()
             ))
         })?;
         metadata.patch_grid.ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "Gemma 4 {} input requires a prepared patch grid",
                 modality.as_str()
             ))
         })?;
         let [time, height, width] = metadata.patch_extent.ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "Gemma 4 {} input requires a host-known patch extent",
                 modality.as_str()
             ))
@@ -1169,9 +1169,9 @@ impl PreparedParts {
         let vision = args
             .vision
             .as_ref()
-            .ok_or_else(|| Error::UnsupportedArchitecture("Gemma 4 has no vision tower".into()))?;
+            .ok_or_else(|| Error::ArchitectureModel("Gemma 4 has no vision tower".into()))?;
         let plan = VisionIngressPartPlan::new(vision, [time, height, width], patches.dim(1))
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let token = modality_token(args, modality)?;
         self.tokens
             .push(crate::MlxTensor::from_array(Array::from_slice(
@@ -1200,7 +1200,7 @@ impl PreparedParts {
                 .map(|part| part.plan.clone())
                 .collect::<Vec<_>>(),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let max_patches = plan.padded_patches;
         let patches = self
             .vision_parts
@@ -1240,15 +1240,15 @@ impl PreparedParts {
         metadata: input::InputMetadata<'_>,
     ) -> Result<(), Error> {
         let mask = metadata.audio_mask.ok_or_else(|| {
-            Error::UnsupportedArchitecture("Gemma 4 audio input requires an audio mask".into())
+            Error::ArchitectureModel("Gemma 4 audio input requires an audio mask".into())
         })?;
         let valid_frames = metadata.audio_valid_frames.ok_or_else(|| {
-            Error::UnsupportedArchitecture(
+            Error::ArchitectureModel(
                 "Gemma 4 audio input requires a host-known valid-frame extent".into(),
             )
         })?;
         let plan = AudioIngressPartPlan::new(valid_frames, features.dim(1))
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let token = modality_token(args, input::Modality::Audio)?;
         self.tokens
             .push(crate::MlxTensor::from_array(Array::from_slice(
@@ -1277,7 +1277,7 @@ impl PreparedParts {
                 .map(|part| part.plan.clone())
                 .collect::<Vec<_>>(),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let max_frames = plan.padded_frames;
         let features = self
             .audio_parts
@@ -1364,7 +1364,7 @@ impl PreparedParts {
 fn pad_sequence(value: &Array, sequence: i32, fill: i32, stream: &Stream) -> Result<Array, Error> {
     let extra = sequence - value.dim(1);
     if extra < 0 {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "prepared media sequence exceeds its batch padding extent".into(),
         ));
     }
@@ -1389,7 +1389,7 @@ fn modality_token(args: &FamilyConfig, modality: input::Modality) -> Result<u32,
     }
     .and_then(|token| u32::try_from(token).ok())
     .ok_or_else(|| {
-        Error::UnsupportedArchitecture(format!(
+        Error::ArchitectureModel(format!(
             "Gemma 4 has no valid {} placeholder",
             modality.as_str()
         ))
@@ -1437,29 +1437,29 @@ fn execution_layout(architecture: &NeutralArchitecture) -> Result<ExecutionUnitL
         <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::execution_graph(
             architecture,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let counts = (0..graph.groups().len())
         .map(|group| {
             <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_unit_count(
                 architecture,
                 group,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 pub fn resolve_pipeline_store(
     store: SharedCheckpointSource,
     args: &FamilyConfig,
 ) -> Result<SharedCheckpointSource, Error> {
-    let plan = eredu_architectures::gemma4::safetensors_plan(args)
-        .map_err(Error::UnsupportedArchitecture)?;
+    let plan =
+        eredu_architectures::gemma4::safetensors_plan(args).map_err(Error::ArchitectureModel)?;
     let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
         .map_err(|error| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "Gemma 4 checkpoint contract did not resolve: {error:?}"
             ))
         })?;
@@ -1496,9 +1496,9 @@ fn quantize_store(
         audio.quantized_weight_configs = None;
     }
     let source_architecture = NeutralArchitecture::new(source.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = NeutralArchitecture::new(target.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let source_layout = execution_layout(&source_architecture)?;
     let target_layout = execution_layout(&target_architecture)?;
     if source_layout.len() != target_layout.len() {
@@ -1556,7 +1556,7 @@ fn load_store(
     external_experts: bool,
 ) -> Result<Gemma4Model, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         architecture
             .parameter_description(stream)
@@ -1574,7 +1574,7 @@ fn load_store(
             }
             let resolved =
                 eredu_architectures::gemma4::expert_recipes(store.as_ref(), &args.text, layer)
-                    .map_err(Error::UnsupportedArchitecture)?;
+                    .map_err(Error::ArchitectureModel)?;
             keys.extend(
                 resolved
                     .gate_up
@@ -1614,7 +1614,7 @@ fn load_store(
                 }) {
                     let resolved =
                         eredu_architectures::gemma4::expert_recipes(store, &binding_args, layer)
-                            .map_err(Error::UnsupportedArchitecture)?;
+                            .map_err(Error::ArchitectureModel)?;
                     BTreeMap::from([
                         (resolved.target_gate_up, resolved.gate_up),
                         (resolved.target_down, resolved.down),
@@ -1652,7 +1652,7 @@ fn load_store(
     };
     Ok(Gemma4Model {
         state_layout: eredu_architectures::gemma4::state_layout(&args.text)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
         args,
         metadata,
         execution,
@@ -1670,7 +1670,7 @@ fn gemma4_unit_recipes(
         policy.feed_forward == eredu_architectures::gemma4::FeedForwardPolicy::DenseWithSparseMoe
     }) {
         let resolved = eredu_architectures::gemma4::expert_recipes(store, args, layer)
-            .map_err(Error::UnsupportedArchitecture)?;
+            .map_err(Error::ArchitectureModel)?;
         Ok(BTreeMap::from([
             (resolved.target_gate_up, resolved.gate_up),
             (resolved.target_down, resolved.down),
@@ -1710,12 +1710,12 @@ fn load_parallel_store(
     );
     let mut architecture =
         NeutralArchitecture::new_parallel(args.clone(), geometry.as_ref().clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
         .runtime_state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let global_static = MlxModule::new(
         <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &global_architecture,
@@ -1798,7 +1798,7 @@ fn load_parallel_store(
                     layer,
                     stream,
                 )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             ));
             let recipes = gemma4_unit_recipes(&binding_family.text, layer, store)?;
             let bindings =
@@ -1864,7 +1864,7 @@ pub fn load_safetensors_tensor_parallel(
     weights_stream: &Stream,
 ) -> Result<Gemma4Model, Error> {
     let args = FamilyConfig::from_hf_json(&serde_json::to_vec(artifact.config()?)?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_pipeline_store(store, &args)?;
     load_parallel_store(store, args, residency, build, stream, weights_stream)
@@ -1917,7 +1917,7 @@ pub fn load_safetensors(
 ) -> Result<Gemma4Model, Error> {
     let expert_options = residency.expert_cache();
     let args = FamilyConfig::from_hf_json(&serde_json::to_vec(artifact.config()?)?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_pipeline_store(store, &args)?;
     let requested = quantization
@@ -1991,7 +1991,7 @@ pub fn open_pipeline_gguf_store(
         projector.map(crate::backend::runtime::checkpoint::load::gguf_metadata);
     if let Some(metadata) = projector_metadata.as_ref() {
         eredu_architectures::gemma4::validate_projector_identity(metadata)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     }
     let names = checkpoint
         .catalog()
@@ -2000,7 +2000,7 @@ pub fn open_pipeline_gguf_store(
         .map(|output| output.name.clone())
         .collect::<std::collections::BTreeSet<_>>();
     let mut text = eredu_architectures::gemma4::ModelArgs::from_gguf_metadata(&names, metadata)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     text.quantized_weight_configs = Some(gguf_quantization_configs(
         checkpoint,
         eredu_architectures::gemma4::translate_gguf_weight_name,
@@ -2010,14 +2010,14 @@ pub fn open_pipeline_gguf_store(
         metadata,
         projector_metadata.as_ref(),
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     if let Some(projector) = projector {
         let quantized = gguf_quantization_configs(
             projector,
             eredu_architectures::gemma4::translate_mmproj_weight_name,
         )?;
         if !quantized.is_empty() {
-            return Err(Error::UnsupportedArchitecture(
+            return Err(Error::ArchitectureModel(
                 "Gemma 4 projector GGUF admits only dense F16, BF16, or F32 tensors".into(),
             ));
         }
@@ -2045,10 +2045,10 @@ pub fn open_pipeline_gguf_store(
             tokens,
         )
         .validate()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     }
-    let plan = eredu_architectures::gemma4::gguf_plan(&args.text)
-        .map_err(Error::UnsupportedArchitecture)?;
+    let plan =
+        eredu_architectures::gemma4::gguf_plan(&args.text).map_err(Error::ArchitectureModel)?;
     let builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
         .max_cached_readers(max_cached_readers)?
         .add_checkpoint(checkpoint.catalog().clone(), &plan, |name| {
@@ -2056,7 +2056,7 @@ pub fn open_pipeline_gguf_store(
         })?;
     let builder = if let Some(projector) = projector.as_ref() {
         let plan = eredu_architectures::gemma4::mmproj_gguf_plan(&args)
-            .map_err(Error::UnsupportedArchitecture)?;
+            .map_err(Error::ArchitectureModel)?;
         builder.add_checkpoint(projector.catalog().clone(), &plan, |name| {
             eredu_architectures::gemma4::translate_mmproj_weight_name(name)
         })?

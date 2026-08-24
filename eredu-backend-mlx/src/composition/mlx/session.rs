@@ -765,7 +765,7 @@ impl<'a> MlxModelSession<'a> {
                 .forward_with_observer(input_tokens, mask, cache, stream, &mut observer),
             (Model::KimiLinear(_, model), ModelCache::Hybrid(cache)) => {
                 if mask.is_some() {
-                    return Err(Error::UnsupportedArchitecture(
+                    return Err(Error::ArchitectureModel(
                         "an explicit Kimi Linear observer mask is unsupported; the adapter constructs the causal mask from cache state".into(),
                     ));
                 }
@@ -782,7 +782,7 @@ impl<'a> MlxModelSession<'a> {
             }
             (Model::MuseGlimmer(_, model), ModelCache::MuseGlimmer(cache)) => {
                 if mask.is_some() {
-                    return Err(Error::UnsupportedArchitecture(
+                    return Err(Error::ArchitectureModel(
                         "explicit Muse-Glimmer observer masks are not bound yet".into(),
                     ));
                 }
@@ -794,7 +794,7 @@ impl<'a> MlxModelSession<'a> {
             (Model::Qwen3Next(_, model), ModelCache::Qwen3Next(cache))
             | (Model::Qwen35(_, model), ModelCache::Qwen35(cache)) => {
                 if mask.is_some() {
-                    return Err(Error::UnsupportedArchitecture(
+                    return Err(Error::ArchitectureModel(
                         "an explicit Qwen hybrid observer mask is unsupported; the adapter constructs the causal mask from cache state".into(),
                     ));
                 }
@@ -802,7 +802,7 @@ impl<'a> MlxModelSession<'a> {
             }
             (Model::Gemma4(_, model), ModelCache::Hybrid(cache)) => {
                 if mask.is_some() {
-                    return Err(Error::UnsupportedArchitecture(
+                    return Err(Error::ArchitectureModel(
                         "an explicit Gemma observer mask is unsupported; the adapter constructs its per-layer masks from cache state".into(),
                     ));
                 }
@@ -812,7 +812,7 @@ impl<'a> MlxModelSession<'a> {
                 Ok(output.into_array())
             }
             (model, _) => {
-                return Err(Error::UnsupportedArchitecture(format!(
+                return Err(Error::ArchitectureModel(format!(
                     "activation observation is unavailable for model type {} or the supplied cache does not match",
                     model.effective_model_type()
                 )))
@@ -836,7 +836,7 @@ impl<'a> MlxModelSession<'a> {
                 backend.stream(),
                 observer,
             ),
-            MlxSessionKind::Pipeline(_, _) => Err(Error::UnsupportedArchitecture(
+            MlxSessionKind::Pipeline(_, _) => Err(Error::ArchitectureModel(
                 "activation observation is unavailable for distributed MLX sessions".into(),
             )),
         }
@@ -1022,7 +1022,7 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         prompt_token_ids: Vec<u32>,
     ) -> Result<Self::Prompt, Error> {
         if prompt_token_ids.is_empty() {
-            return Err(Error::UnsupportedArchitecture(
+            return Err(Error::ArchitectureModel(
                 "text generation requires at least one prompt token".into(),
             ));
         }
@@ -1188,7 +1188,7 @@ fn prefill_model(
         (Model::Qwen3VlMoe(_, model), ModelCache::Qwen3VlMoe(cache)) => {
             prefill_pair(model, cache, input, stream)
         }
-        (model, _) => Err(Error::UnsupportedArchitecture(format!(
+        (model, _) => Err(Error::ArchitectureModel(format!(
             "MLX cache does not match model type {}",
             model.effective_model_type()
         ))),
@@ -1242,7 +1242,7 @@ fn decode_model(
         (Model::Qwen3VlMoe(_, model), ModelCache::Qwen3VlMoe(cache)) => {
             decode_pair(model, cache, input, stream)
         }
-        (model, _) => Err(Error::UnsupportedArchitecture(format!(
+        (model, _) => Err(Error::ArchitectureModel(format!(
             "MLX cache does not match model type {}",
             model.effective_model_type()
         ))),
@@ -1373,7 +1373,7 @@ fn forward_model_tensor_parallel(
         (Model::Qwen3VlMoe(_, model), ModelCache::Qwen3VlMoe(cache)) => {
             model.decode_tensor_parallel(input, cache, group, stream)
         }
-        (model, _) => Err(Error::UnsupportedArchitecture(format!(
+        (model, _) => Err(Error::ArchitectureModel(format!(
             "tensor-parallel MLX cache does not match model type {}",
             model.effective_model_type()
         ))),

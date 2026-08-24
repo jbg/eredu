@@ -46,7 +46,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::DeepSeek2 => {
             if options.quantization.is_some() {
-                return Err(Error::UnsupportedArchitecture(
+                return Err(Error::ArchitectureModel(
                     "load-time quantization is not yet supported by neutral DeepSeek GGUF composition".into(),
                 ));
             }
@@ -62,7 +62,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::DeepSeek4 => {
             if options.quantization.is_some() {
-                return Err(Error::UnsupportedArchitecture(
+                return Err(Error::ArchitectureModel(
                     "load-time quantization is not yet supported by neutral DeepSeek GGUF composition".into(),
                 ));
             }
@@ -88,7 +88,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Inkling => {
             if options.quantization.is_some() {
-                return Err(Error::UnsupportedArchitecture(
+                return Err(Error::ArchitectureModel(
                     "load-time Inkling quantization is not bound on the neutral loader".into(),
                 ));
             }
@@ -104,7 +104,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Gemma4 => {
             if options.quantization.is_some() {
-                return Err(Error::UnsupportedArchitecture(
+                return Err(Error::ArchitectureModel(
                     "load-time Gemma 4 quantization is not bound on the neutral loader".into(),
                 ));
             }
@@ -130,12 +130,12 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::MuseGlimmer => {
             let projector = projector.ok_or_else(|| {
-                Error::UnsupportedArchitecture(
+                Error::ArchitectureModel(
                     "Muse-Glimmer preparation omitted its required media projector".into(),
                 )
             })?;
             if options.quantization.is_some() {
-                return Err(Error::UnsupportedArchitecture(
+                return Err(Error::ArchitectureModel(
                     "load-time Muse-Glimmer quantization is not bound on the neutral loader".into(),
                 ));
             }
@@ -181,7 +181,7 @@ fn materialize_gguf_model(
         }
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             let projector = projector.ok_or_else(|| {
-                Error::UnsupportedArchitecture(
+                Error::ArchitectureModel(
                     "Qwen3-VL preparation omitted its required media projector".into(),
                 )
             })?;
@@ -239,17 +239,14 @@ pub fn materialize_model_plan(
             #[cfg(feature = "media")]
             let processor = match plan.inspection().format() {
                 eredu_core::ArtifactFormat::SafeTensors => {
-                    let config =
-                        plan.inspection()
-                            .configuration()
-                            .json
-                            .as_ref()
-                            .ok_or_else(|| {
-                                Error::UnsupportedArchitecture(
+                    let config = plan.inspection().configuration().json.as_ref().ok_or_else(
+                        || {
+                            Error::Artifact(eredu_core::artifact::ArtifactError::InvalidArtifact(
                                 "SafeTensors preparation plan omitted normalized JSON configuration"
                                     .into(),
-                            )
-                            })?;
+                            ))
+                        },
+                    )?;
                     load_processor(kind, plan.inspection().path(), config)?
                 }
                 eredu_core::ArtifactFormat::Gguf => {
@@ -349,7 +346,7 @@ fn inspected_runtime_state_dtype_bytes(
     }
     let configuration = inspection.configuration();
     let config = configuration.json.as_ref().ok_or_else(|| {
-        Error::UnsupportedArchitecture(
+        eredu_core::artifact::ArtifactError::InvalidArtifact(
             "SafeTensors inspection omitted normalized JSON configuration".into(),
         )
     })?;
@@ -358,9 +355,9 @@ fn inspected_runtime_state_dtype_bytes(
         config,
         inspection.tensors(),
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     mlx_runtime_state_dtype_bytes(source.dtype()).map_err(|dtype| {
-        Error::UnsupportedArchitecture(format!(
+        Error::ArchitectureModel(format!(
             "runtime-state dtype source {:?} has unsupported MLX activation dtype {dtype:?}",
             source.checkpoint_tensor()
         ))
@@ -602,7 +599,7 @@ fn load_inspected_gguf_processor(
     inspection: &eredu_core::ArtifactInspection,
 ) -> Result<Option<ModelProcessor>, Error> {
     let validated = inspection.validated_gguf().ok_or_else(|| {
-        Error::UnsupportedArchitecture(
+        eredu_core::artifact::ArtifactError::InvalidArtifact(
             "GGUF preparation plan omitted its validated checkpoint".into(),
         )
     })?;
@@ -746,16 +743,16 @@ fn materialize_tensor_parallel(
                 weights_stream,
             )?,
         )),
-        ModelKind::Qwen3Next => Err(Error::UnsupportedArchitecture(
+        ModelKind::Qwen3Next => Err(Error::ArchitectureModel(
             "neutral Qwen hybrid tensor-parallel binding is not initialized".into(),
         )),
-        ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => Err(Error::UnsupportedArchitecture(
+        ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => Err(Error::ArchitectureModel(
             "neutral Qwen3-VL tensor-parallel binding is not initialized".into(),
         )),
-        ModelKind::Qwen35 => Err(Error::UnsupportedArchitecture(
+        ModelKind::Qwen35 => Err(Error::ArchitectureModel(
             "neutral Qwen3.5 tensor-parallel binding is not initialized".into(),
         )),
-        ModelKind::Moshi => Err(Error::UnsupportedArchitecture(
+        ModelKind::Moshi => Err(Error::ArchitectureModel(
             "Moshi-family models do not use the text Model tensor-parallel session".into(),
         )),
     }
@@ -766,7 +763,7 @@ pub(super) fn validate_plan_options(
     options: ModelLoadOptions,
 ) -> Result<(), Error> {
     if plan.policy() != options.preparation_policy()? {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "MLX materialization options do not match the backend-neutral preparation plan".into(),
         ));
     }
@@ -788,7 +785,7 @@ fn materialize_gguf_artifact(
         ..
     } = artifact
     else {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "MLX GGUF materializer received a SafeTensors plan".into(),
         ));
     };
@@ -924,7 +921,7 @@ fn materialize_gguf_tensor_parallel(
         }
         GgufArchitecture::MuseGlimmer => {
             let projector = projector.ok_or_else(|| {
-                Error::UnsupportedArchitecture(
+                Error::ArchitectureModel(
                     "Muse-Glimmer preparation omitted its required media projector".into(),
                 )
             })?;
@@ -969,13 +966,11 @@ fn materialize_gguf_tensor_parallel(
             )?;
             Ok(Model::Qwen(kind, model))
         }
-        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
-            Err(Error::UnsupportedArchitecture(
-                "neutral Qwen3-VL GGUF tensor-parallel binding is not initialized".into(),
-            ))
-        }
+        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => Err(Error::ArchitectureModel(
+            "neutral Qwen3-VL GGUF tensor-parallel binding is not initialized".into(),
+        )),
         GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
-            Err(Error::UnsupportedArchitecture(
+            Err(Error::ArchitectureModel(
                 "neutral Qwen hybrid GGUF tensor-parallel binding is not initialized".into(),
             ))
         }
@@ -1132,7 +1127,7 @@ pub(super) fn materialize_safetensors(
                     weights_stream,
                 )?,
             )),
-            ModelKind::Qwen2 => Err(Error::UnsupportedArchitecture(
+            ModelKind::Qwen2 => Err(Error::ArchitectureModel(
                 "Qwen2 is dense and does not support sparse expert-cache residency".into(),
             )),
             ModelKind::Qwen3 => Ok(Model::Qwen(kind,
@@ -1180,7 +1175,7 @@ pub(super) fn materialize_safetensors(
                     weights_stream,
                 )?,
             )),
-            _ => Err(Error::UnsupportedArchitecture(format!(
+            _ => Err(Error::ArchitectureModel(format!(
                 "independent expert caching requires a supported safetensors MoE architecture, not {}",
                 kind.canonical_name()
             ))),
@@ -1331,7 +1326,7 @@ pub(super) fn materialize_safetensors(
                 weights_stream,
             )?,
         )),
-        ModelKind::Moshi => Err(Error::UnsupportedArchitecture(
+        ModelKind::Moshi => Err(Error::ArchitectureModel(
             "Moshi-family bounded layer residency is selected through the realtime loader".into(),
         )),
     }

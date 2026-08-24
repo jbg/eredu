@@ -104,7 +104,7 @@ pub struct QwenVlCheckpointTemplate {
 impl QwenVlCheckpointTemplate {
     pub fn new(args: vl::ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let architecture = Architecture::new(args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let static_modules =
             <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
                 &architecture,
@@ -335,7 +335,7 @@ impl QwenVlPipelineBindings {
             if group_kind(architecture, group) == eredu_runtime::ArchitectureGroupKind::Decoder {
                 let args = architecture.args();
                 vl::unit_recipes(store, args, args.vision.layer_count() + index)
-                    .map_err(Error::UnsupportedArchitecture)?
+                    .map_err(Error::ArchitectureModel)?
             } else {
                 BTreeMap::new()
             };
@@ -388,7 +388,7 @@ impl QwenVlPipelineBindings {
             group,
             index,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         match (&global_layer.inner, group_kind(architecture, group)) {
             (Unit::Vision(_), eredu_runtime::ArchitectureGroupKind::VisionEncoder) => {
                 let bindings =
@@ -408,7 +408,7 @@ impl QwenVlPipelineBindings {
                     BTreeMap::new()
                 } else {
                     vl::unit_recipes(store, args, args.vision.layer_count() + index)
-                        .map_err(Error::UnsupportedArchitecture)?
+                        .map_err(Error::ArchitectureModel)?
                 };
                 let mut bindings = build_module_bindings_with_recipes_excluding(
                     global_layer,
@@ -553,7 +553,7 @@ impl QwenVlModel {
             0,
             eredu_core::cache::PromptCacheTopology::default(),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&self.state_layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -662,7 +662,7 @@ impl QwenVlModel {
             Execution::Bounded(runtime) => runtime.forward(input, cache, stream),
         }
         .map(crate::MlxTensor::into_array)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn forward_with_provider<P>(
@@ -703,7 +703,7 @@ impl QwenVlModel {
             }
         }
         .map(crate::MlxTensor::into_array)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn prepared_forward(
@@ -896,28 +896,28 @@ fn unit_layout(architecture: &Architecture) -> Result<ExecutionUnitLayout, Error
     let graph = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::execution_graph(
         architecture,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let counts = (0..graph.groups().len())
         .map(|group| {
             <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_unit_count(
                 architecture,
                 group,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 fn resolve_store(
     store: Arc<dyn CheckpointSource>,
     args: &vl::ModelArgs,
 ) -> Result<Arc<dyn CheckpointSource>, Error> {
-    let plan = vl::safetensors_plan(args).map_err(Error::UnsupportedArchitecture)?;
+    let plan = vl::safetensors_plan(args).map_err(Error::ArchitectureModel)?;
     let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
         .map_err(|validation| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "{} checkpoint contract did not resolve: {validation:?}",
                 args.model_type
             ))
@@ -947,15 +947,15 @@ fn quantize_store(
     target.text.quantized_weight_configs = None;
     target.vision.apply_load_time_quantization(quantization);
     let source_architecture = Architecture::new(source.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = Architecture::new(target.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let source_vision = source.vision.layer_count();
     let total = source_vision
         .checked_add(usize::try_from(source.text.num_hidden_layers).map_err(|_| {
-            Error::UnsupportedArchitecture("invalid Qwen3-VL text layer count".into())
+            Error::ArchitectureModel("invalid Qwen3-VL text layer count".into())
         })?)
-        .ok_or_else(|| Error::UnsupportedArchitecture("Qwen3-VL unit count overflowed".into()))?;
+        .ok_or_else(|| Error::ArchitectureModel("Qwen3-VL unit count overflowed".into()))?;
     let source_layout = unit_layout(&source_architecture)?;
     let target_layout = unit_layout(&target_architecture)?;
     let source_static =
@@ -1005,13 +1005,13 @@ pub fn prepare_gguf_pipeline(
     max_mapped_shards: usize,
 ) -> Result<(vl::ModelArgs, Arc<dyn CheckpointSource>), Error> {
     let context = qwen::TextConfigContext::from_qwen3_vl_gguf_architecture(architecture)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut text = qwen::model_args_from_gguf_catalog_with_context(
         &TextGgufCatalog(checkpoint),
         metadata,
         context,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let is_moe = text.is_moe();
     let translate_text = |name: &str| vl::translate_text_gguf_weight_name(name, is_moe);
     checkpoint
@@ -1027,7 +1027,7 @@ pub fn prepare_gguf_pipeline(
         crate::backend::runtime::checkpoint::load::gguf_metadata(projector);
     let mut vision =
         vision::config_from_gguf_catalog(&VisionGgufCatalog(projector), &projector_metadata)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let deepstack = vision.deepstack_layers();
     let translate_vision = |name: &str| vl::translate_vision_gguf_weight_name(name, &deepstack);
     projector
@@ -1039,10 +1039,10 @@ pub fn prepare_gguf_pipeline(
         .map(|(name, format)| (name, format.into()))
         .collect();
     let args = vl::model_args_from_gguf_parts(text, metadata, vision)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let text_plan = qwen::gguf_plan(&args.text).map_err(Error::UnsupportedArchitecture)?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let text_plan = qwen::gguf_plan(&args.text).map_err(Error::ArchitectureModel)?;
     let vision_plan = vision::gguf_plan(&args.vision, args.text.hidden_size)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let text_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &text_plan,
@@ -1077,13 +1077,13 @@ pub fn load_gguf(
     weights_stream: &Stream,
 ) -> Result<QwenVlModel, Error> {
     let context = qwen::TextConfigContext::from_qwen3_vl_gguf_architecture(architecture)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut text = qwen::model_args_from_gguf_catalog_with_context(
         &TextGgufCatalog(checkpoint),
         metadata,
         context,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let is_moe = text.is_moe();
     let translate_text = |name: &str| vl::translate_text_gguf_weight_name(name, is_moe);
     checkpoint
@@ -1100,7 +1100,7 @@ pub fn load_gguf(
         crate::backend::runtime::checkpoint::load::gguf_metadata(projector);
     let mut vision =
         vision::config_from_gguf_catalog(&VisionGgufCatalog(projector), &projector_metadata)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let deepstack = vision.deepstack_layers();
     let translate_vision = |name: &str| vl::translate_vision_gguf_weight_name(name, &deepstack);
     projector
@@ -1112,12 +1112,12 @@ pub fn load_gguf(
         .map(|(name, format)| (name, format.into()))
         .collect();
     let mut args = vl::model_args_from_gguf_parts(text, metadata, vision)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_options = residency.expert_cache();
     let options = residency.layers();
-    let text_plan = qwen::gguf_plan(&args.text).map_err(Error::UnsupportedArchitecture)?;
+    let text_plan = qwen::gguf_plan(&args.text).map_err(Error::ArchitectureModel)?;
     let vision_plan = vision::gguf_plan(&args.vision, args.text.hidden_size)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let text_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &text_plan,
@@ -1188,7 +1188,7 @@ pub fn load_safetensors_with_residency(
     weights_stream: &Stream,
 ) -> Result<QwenVlModel, Error> {
     let mut args = vl::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Qwen3-VL", args.text.weight_quantization(), requested)
@@ -1256,7 +1256,7 @@ fn load_store(
     weights_stream: &Stream,
 ) -> Result<QwenVlModel, Error> {
     let mut architecture = Architecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         architecture
             .parameter_description(stream)
@@ -1301,7 +1301,7 @@ fn load_store(
                 "",
                 store,
                 vl::unit_recipes(store, &binding_args, flat)
-                    .map_err(Error::UnsupportedArchitecture)?,
+                    .map_err(Error::ArchitectureModel)?,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )
             .map_err(Into::into)
@@ -1323,7 +1323,7 @@ fn load_store(
         Execution::Bounded(Box::new(LayerwiseRuntime::new(architecture, policy)))
     };
     let state_layout = vl::state_layout(&args)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(QwenVlModel {
         args,
         state_layout,

@@ -2811,5 +2811,5 @@ fn runtime_error<A: std::fmt::Display, P: std::fmt::Display>(
 }
 
 fn unsupported(message: impl Into<String>) -> Error {
-    Error::UnsupportedArchitecture(message.into())
+    Error::ArchitectureModel(message.into())
 }

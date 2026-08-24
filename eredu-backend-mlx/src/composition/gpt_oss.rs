@@ -74,13 +74,13 @@ fn expert_parameter_targets(
         .targets_for_role(ParameterRole::ExpertIntermediate);
     targets.extend(
         eredu_architectures::gpt_oss::safetensors_expert_tensors(architecture.args())
-            .map_err(Error::UnsupportedArchitecture)?
+            .map_err(Error::ArchitectureModel)?
             .into_iter()
             .map(|tensor| tensor.key),
     );
     targets.extend(
         eredu_architectures::gpt_oss::gguf_expert_quantization_targets(architecture.args())
-            .map_err(Error::UnsupportedArchitecture)?,
+            .map_err(Error::ArchitectureModel)?,
     );
     Ok(targets)
 }
@@ -141,7 +141,7 @@ fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Re
     if transport.kind == eredu_runtime::ArchitectureGroupKind::Decoder {
         Ok(())
     } else {
-        Err(Error::UnsupportedArchitecture(format!(
+        Err(Error::ArchitectureModel(format!(
             "GPT-OSS checkpoint bindings require the decoder execution group, got {group}"
         )))
     }
@@ -157,7 +157,7 @@ fn decoder_unit_path(
         MlxNeuralBackend,
         MlxKeyValueState,
     >>::unit_path(architecture, group, index)
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 type ResidentRuntime = LayerwiseRuntime<
     NeutralArchitecture,
@@ -289,11 +289,11 @@ fn resolve_safetensors_store(
     {
         return Ok(store);
     }
-    let plan = eredu_architectures::gpt_oss::safetensors_plan(args)
-        .map_err(Error::UnsupportedArchitecture)?;
+    let plan =
+        eredu_architectures::gpt_oss::safetensors_plan(args).map_err(Error::ArchitectureModel)?;
     let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
         .map_err(|validation| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "GPT-OSS SafeTensors contract did not resolve: {validation:?}"
             ))
         })?;
@@ -309,7 +309,7 @@ fn unit_recipes(
 ) -> Result<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>, Error> {
     eredu_architectures::gpt_oss::expert_recipes(store, args, layer)
         .map(|family| family.into_outputs().into_outputs())
-        .map_err(Error::UnsupportedArchitecture)
+        .map_err(Error::ArchitectureModel)
 }
 
 /// Builds one neutral GPT-OSS runtime from an already opened checkpoint store.
@@ -324,7 +324,7 @@ pub fn load_neutral_with_store(
 ) -> Result<GptOssModel, Error> {
     let mut architecture =
         eredu_architectures::gpt_oss::new_layered_model::<MlxNeuralBackend>(args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(expert_parameter_targets(&architecture, stream)?);
     let factory = GptOssUnitPopulator {
         external_experts,
@@ -378,7 +378,7 @@ pub fn load_neutral_with_store(
         GptOssExecution::Layerwise(Box::new(LayerwiseRuntime::new(architecture, policy)))
     };
     let state_layout = eredu_architectures::gpt_oss::state_layout(&args)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(GptOssModel {
         args,
         state_layout,
@@ -402,9 +402,9 @@ fn load_neutral_parallel_with_store(
     external_experts: bool,
 ) -> Result<GptOssModel, Error> {
     let layer_count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid GPT-OSS layer count".into()))?;
+        .map_err(|_| Error::ArchitectureModel("invalid GPT-OSS layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(expert_parameter_targets(&global_architecture, stream)?);
     let mut planner = build.planner();
     for group in eredu_architectures::gpt_oss::static_parameter_groups::<MlxNeuralBackend>(
@@ -416,7 +416,7 @@ fn load_neutral_parallel_with_store(
     for layer in 0..layer_count {
         let block =
             eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(&args, layer, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         for group in eredu_architectures::gpt_oss::layer_parallel_parameter_groups::<
             MlxNeuralBackend,
         >(&block, &args, layer)?
@@ -433,10 +433,10 @@ fn load_neutral_parallel_with_store(
     let geometry = eredu_architectures::gpt_oss::local_geometry(&args, &layout)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let factory = GptOssParallelUnitPopulator {
         external_experts,
         expert_targets: Arc::clone(&expert_targets),
@@ -448,7 +448,7 @@ fn load_neutral_parallel_with_store(
     for layer in 0..layer_count {
         let block =
             eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(&args, layer, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let recipes = if external_experts {
             BTreeMap::new()
         } else {
@@ -494,7 +494,7 @@ fn load_neutral_parallel_with_store(
                 layer,
                 stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let recipes = if external_experts {
                 BTreeMap::new()
             } else {
@@ -590,16 +590,16 @@ pub fn quantize_neutral_store(
         source_args.clone(),
         stream,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target = eredu_architectures::gpt_oss::new_layered_model::<MlxNeuralBackend>(
         target_args.clone(),
         stream,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let source_expert_targets = Arc::new(expert_parameter_targets(&source, stream)?);
     let target_expert_targets = Arc::new(expert_parameter_targets(&target, stream)?);
     let count = usize::try_from(source_args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid GPT-OSS layer count".into()))?;
+        .map_err(|_| Error::ArchitectureModel("invalid GPT-OSS layer count".into()))?;
     let source_unit_args = source_args.clone();
     let target_unit_args = target_args.clone();
     let source_unit_expert_targets = Arc::clone(&source_expert_targets);
@@ -618,7 +618,7 @@ pub fn quantize_neutral_store(
                 block,
                 expert_targets: Arc::clone(&source_unit_expert_targets),
             })
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         move |index, stream| {
             eredu_architectures::gpt_oss::new_block::<MlxNeuralBackend>(
@@ -630,7 +630,7 @@ pub fn quantize_neutral_store(
                 block,
                 expert_targets: Arc::clone(&target_unit_expert_targets),
             })
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         count,
         quantization,
@@ -1068,10 +1068,10 @@ impl GptOssModel {
         let output = match &mut self.execution {
             GptOssExecution::Resident(execution) => execution
                 .forward(input, cache, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+                .map_err(|error| Error::ArchitectureModel(error.to_string())),
             GptOssExecution::Layerwise(execution) => execution
                 .forward(input, cache, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+                .map_err(|error| Error::ArchitectureModel(error.to_string())),
             GptOssExecution::TensorParallelResident(_)
             | GptOssExecution::TensorParallelLayerwise(_) => Err(Error::Parallel(
                 "tensor-parallel GPT-OSS execution requires a collective group".into(),
@@ -1131,10 +1131,10 @@ impl GptOssModel {
         let output = match &mut self.execution {
             GptOssExecution::Resident(runtime) => runtime
                 .forward_with_unit_executor(input, cache, stream, hook)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+                .map_err(|error| Error::ArchitectureModel(error.to_string())),
             GptOssExecution::Layerwise(runtime) => runtime
                 .forward_with_unit_executor(input, cache, stream, hook)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+                .map_err(|error| Error::ArchitectureModel(error.to_string())),
             GptOssExecution::TensorParallelResident(_)
             | GptOssExecution::TensorParallelLayerwise(_) => Err(Error::Parallel(
                 "tensor-parallel GPT-OSS expert execution requires a collective group".into(),
@@ -1330,7 +1330,7 @@ impl GptOssModel {
                         ))
                     },
                 )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             GptOssExecution::Layerwise(runtime) => runtime
                 .forward_with_routed_observer(
                     eredu_architectures::decoder::LayeredInput {
@@ -1349,7 +1349,7 @@ impl GptOssModel {
                         ))
                     },
                 )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             GptOssExecution::TensorParallelResident(_)
             | GptOssExecution::TensorParallelLayerwise(_) => {
                 return Err(Error::Parallel(
@@ -1408,7 +1408,7 @@ impl GptOssModel {
             0,
             self.prompt_cache_topology.clone(),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         identity
             .prompt_cache_identity(&self.state_layout)
             .map_err(|error| Error::Parallel(error.to_string()))
@@ -1485,7 +1485,7 @@ pub fn load_gpt_oss_safetensors_mlx(
     let expert_options = weight_residency.expert_cache();
     let execution_options = weight_residency.layers();
     let args = eredu_architectures::gpt_oss::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("GPT-OSS", args.quantization, requested)
@@ -1562,7 +1562,7 @@ pub fn load_gpt_oss_tensor_parallel_model(
 ) -> Result<GptOssModel, Error> {
     let options = options.into();
     let args = eredu_architectures::gpt_oss::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_safetensors_store(store, &args)?;
     load_neutral_parallel_with_store(store, args, options, build, stream, weights_stream, false)
@@ -1578,7 +1578,7 @@ pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
     source: &crate::composition::mlx::structural::AdmittedGguf,
 ) -> Result<PreparedGptOssGguf, Error> {
     if source.architecture() != eredu_architectures::GgufArchitecture::GptOss {
-        return Err(Error::UnsupportedArchitecture(format!(
+        return Err(Error::ArchitectureModel(format!(
             "GPT-OSS GGUF loader received architecture {:?}",
             source.architecture()
         )));
@@ -1586,11 +1586,11 @@ pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();
     let mut args = eredu_architectures::gpt_oss::model_args_from_gguf_catalog(metadata)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     match eredu_architectures::gpt_oss::validate_gguf(checkpoint, &args) {
         eredu_checkpoint::validation::CheckpointValidation::Exact => {}
         validation => {
-            return Err(Error::UnsupportedArchitecture(format!(
+            return Err(Error::ArchitectureModel(format!(
                 "GPT-OSS GGUF checkpoint contract did not resolve: {validation:?}"
             )))
         }
@@ -1602,14 +1602,14 @@ pub(crate) fn prepare_gpt_oss_gguf_checkpoint(
         .map_err(safemlx::error::IoError::from)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     let expert_targets = eredu_architectures::gpt_oss::gguf_expert_quantization_targets(&args)
-        .map_err(Error::UnsupportedArchitecture)?
+        .map_err(Error::ArchitectureModel)?
         .into_iter()
         .collect::<BTreeSet<_>>();
     configs.retain(|name, _| !expert_targets.contains(name));
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
     args.validate()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(PreparedGptOssGguf { args })
 }
 
@@ -1624,7 +1624,7 @@ pub(crate) fn load_gpt_oss_gguf_model(
     let checkpoint = source.checkpoint();
     let prepared = prepare_gpt_oss_gguf_checkpoint(source)?;
     let plan = eredu_architectures::gpt_oss::gguf_plan(&prepared.args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &plan,
@@ -1667,7 +1667,7 @@ pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
     let checkpoint = source.checkpoint();
     let prepared = prepare_gpt_oss_gguf_checkpoint(source)?;
     let plan = eredu_architectures::gpt_oss::gguf_plan(&prepared.args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &plan,

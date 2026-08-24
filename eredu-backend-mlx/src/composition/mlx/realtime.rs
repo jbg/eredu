@@ -346,7 +346,7 @@ fn materialize_realtime_model(
     weights_stream: &Stream,
 ) -> Result<MlxRealtimeModel, Error> {
     if options.weight_residency.expert_cache().is_some() {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "Moshi does not contain routed experts".into(),
         ));
     }

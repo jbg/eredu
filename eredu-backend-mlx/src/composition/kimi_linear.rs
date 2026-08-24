@@ -94,11 +94,11 @@ impl KimiLinearCheckpointTemplate {
     /// Builds one neutral full-parameter template for checkpoint tooling.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let architecture = NeutralArchitecture::new(args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let layers = (0..args.num_hidden_layers as usize)
             .map(|index| {
                 Block::new(&args, index, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -203,7 +203,7 @@ impl KimiLinearBindings {
             MlxNeuralBackend,
             MlxHybridState,
         >>::group_unit_count(architecture, group)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     pub fn layer_bindings(
@@ -275,7 +275,7 @@ impl KimiLinearBindings {
                     MlxNeuralBackend,
                     MlxHybridState,
                 >>::unit_path(architecture, group, index)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 shard_layer_bindings(bindings, &root, store, layout)
             }
             None => Ok(bindings),
@@ -333,10 +333,10 @@ fn resolve_store(
         return Ok(store);
     }
     let plan = eredu_architectures::kimi_linear::safetensors_plan(args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
         .map_err(|validation| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "Kimi Linear checkpoint contract did not resolve: {validation:?}"
             ))
         })?;
@@ -352,7 +352,7 @@ fn unit_recipes(
     include_experts: bool,
 ) -> Result<std::collections::BTreeMap<String, DerivedWeightRecipe>, Error> {
     eredu_architectures::kimi_linear::unit_recipes(store, args, layer, include_experts)
-        .map_err(Error::UnsupportedArchitecture)
+        .map_err(Error::ArchitectureModel)
 }
 
 pub fn expert_catalog(
@@ -360,7 +360,7 @@ pub fn expert_catalog(
     store: &dyn CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = eredu_architectures::kimi_linear::expert_residency_catalog(store, args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     crate::composition::architecture_expert_units(catalog, store, None)
 }
 
@@ -381,7 +381,7 @@ fn load_neutral(
     external_experts: bool,
 ) -> Result<KimiLinearModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         architecture
             .parameter_description(stream)
@@ -423,7 +423,7 @@ fn load_neutral(
     metadata.set_materialization(materialization);
     let state_layout = architecture
         .state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let execution = if options.is_fully_resident() {
         KimiLinearExecution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -459,7 +459,7 @@ fn load_neutral_parallel(
     let count = usize::try_from(args.num_hidden_layers)
         .map_err(|_| Error::Parallel("invalid Kimi Linear layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         global_architecture
             .parameter_description(stream)
@@ -475,7 +475,7 @@ fn load_neutral_parallel(
     }
     for layer in 0..count {
         let block = Block::<MlxNeuralBackend>::new(&args, layer, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         for group in
             eredu_architectures::kimi_linear::layer_parallel_parameter_groups(&block, &args, layer)?
         {
@@ -491,10 +491,10 @@ fn load_neutral_parallel(
     let geometry = eredu_architectures::kimi_linear::local_geometry(&args, &layout)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let factory = KimiLinearParallelUnitPopulator {
         external_experts,
         expert_targets: Arc::clone(&expert_targets),
@@ -505,7 +505,7 @@ fn load_neutral_parallel(
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
     for layer in 0..count {
         let block = Block::<MlxNeuralBackend>::new(&args, layer, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let bindings = build_module_bindings_with_recipes_excluding(
             &MlxModule::new(block),
             "",
@@ -544,7 +544,7 @@ fn load_neutral_parallel(
         move |_ordinal, address, path, _local, store, stream| {
             let layer = address.index();
             let global = Block::<MlxNeuralBackend>::new(&binding_args, layer, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(global),
                 "",
@@ -625,9 +625,9 @@ fn quantize_store(
     target.weight_quantization = Some(quantization);
     target.quantized_weight_configs = None;
     let source = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let destination = NeutralArchitecture::new(target.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let source_args = args.clone();
     let target_args = target.clone();
     let (store, report) = quantize_parameterized_store(
@@ -636,15 +636,14 @@ fn quantize_store(
         destination.static_modules(),
         move |index, stream| {
             Block::<MlxNeuralBackend>::new(&source_args, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         move |index, stream| {
             Block::<MlxNeuralBackend>::new(&target_args, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
-        usize::try_from(args.num_hidden_layers).map_err(|_| {
-            Error::UnsupportedArchitecture("invalid Kimi Linear layer count".into())
-        })?,
+        usize::try_from(args.num_hidden_layers)
+            .map_err(|_| Error::ArchitectureModel("invalid Kimi Linear layer count".into()))?,
         quantization,
         stream,
     )?;
@@ -794,7 +793,7 @@ impl KimiLinearModel {
                     crate::backend::cache::prompt_cache_topology(info.topology())
                 }),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&self.state_layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -915,7 +914,7 @@ impl KimiLinearModel {
                 ))
             }
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(output.into_array())
     }
 
@@ -1261,7 +1260,7 @@ pub fn load_kimi_linear_model(
     let expert_options = residency.expert_cache();
     let options = residency.layers();
     let args = eredu_architectures::kimi_linear::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let quantize = quantization
         .map(|requested| {
             should_quantize_on_load("Kimi Linear", args.weight_quantization, requested)
@@ -1330,7 +1329,7 @@ pub fn load_kimi_linear_tensor_parallel_model(
 ) -> Result<KimiLinearModel, Error> {
     let options = options.into();
     let args = eredu_architectures::kimi_linear::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_store(store, &args)?;
     load_neutral_parallel(store, args, options, build, stream, weights_stream, false)
@@ -1356,7 +1355,7 @@ pub(crate) fn prepare_gguf(
     source: &crate::composition::mlx::structural::AdmittedGguf,
 ) -> Result<PreparedGguf, Error> {
     if source.architecture() != eredu_architectures::GgufArchitecture::KimiLinear {
-        return Err(Error::UnsupportedArchitecture(format!(
+        return Err(Error::ArchitectureModel(format!(
             "Kimi Linear GGUF loader received architecture {:?}",
             source.architecture()
         )));
@@ -1367,7 +1366,7 @@ pub(crate) fn prepare_gguf(
         &GgufCatalog(checkpoint),
         metadata,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let translate = eredu_architectures::kimi_linear::translate_gguf_weight_name;
     checkpoint
         .catalog()
@@ -1378,7 +1377,7 @@ pub(crate) fn prepare_gguf(
     args.quantized_weight_configs = Some(configs);
     args.weight_quantization = None;
     args.validate()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(PreparedGguf { args })
 }
 
@@ -1394,7 +1393,7 @@ pub(crate) fn load_kimi_linear_gguf_model(
     let prepared = prepare_gguf(source)?;
     let expert_options = residency.expert_cache();
     let plan = eredu_architectures::kimi_linear::gguf_plan(&prepared.args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &plan,
@@ -1435,7 +1434,7 @@ pub(crate) fn load_kimi_linear_gguf_tensor_parallel_model(
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
     let plan = eredu_architectures::kimi_linear::gguf_plan(&prepared.args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &plan,

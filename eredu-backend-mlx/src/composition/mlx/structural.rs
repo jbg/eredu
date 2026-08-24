@@ -158,7 +158,7 @@ pub(crate) fn validate_safetensors_preparation(
         return Ok(());
     }
     let capabilities = eredu_architectures::preparation::safetensors_capabilities(kind, config)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     validate_preparation_capability_intersection(
         kind,
         eredu_core::ArtifactFormat::SafeTensors,
@@ -179,7 +179,7 @@ pub(crate) fn validate_gguf_preparation(
     }
     let capabilities =
         eredu_architectures::preparation::gguf_capabilities(architecture, checkpoint)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     validate_preparation_capability_intersection(
         architecture.model_kind(),
         eredu_core::ArtifactFormat::Gguf,
@@ -203,22 +203,22 @@ pub(crate) fn validate_inspected_preparation(
             eredu_architectures::preparation::safetensors_capabilities(
                 kind,
                 configuration.json.as_ref().ok_or_else(|| {
-                    Error::UnsupportedArchitecture(
+                    Error::Artifact(eredu_core::artifact::ArtifactError::InvalidArtifact(
                         "SafeTensors inspection omitted normalized JSON configuration".into(),
-                    )
+                    ))
                 })?,
             )
         }
         eredu_core::ArtifactFormat::Gguf => eredu_architectures::preparation::gguf_capabilities(
             GgufArchitecture::resolve(&configuration.declared_model_type)?,
             inspection.gguf_checkpoint().ok_or_else(|| {
-                Error::UnsupportedArchitecture(
+                Error::Artifact(eredu_core::artifact::ArtifactError::InvalidArtifact(
                     "GGUF inspection omitted portable checkpoint metadata".into(),
-                )
+                ))
             })?,
         ),
     }
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     validate_preparation_capability_intersection(kind, inspection.format(), policy, capabilities)
 }
 

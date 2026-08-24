@@ -62,9 +62,9 @@ impl PreparedSafetensorsArtifact {
 
     pub fn config(&self) -> Result<&serde_json::Value, Error> {
         self.configuration.json.as_ref().ok_or_else(|| {
-            Error::UnsupportedArchitecture(
+            Error::Artifact(eredu_core::artifact::ArtifactError::InvalidArtifact(
                 "SafeTensors preparation plan omitted normalized JSON configuration".into(),
-            )
+            ))
         })
     }
 
@@ -167,7 +167,7 @@ fn descriptor_matches(
 }
 
 fn changed_artifact(detail: impl Into<String>) -> Error {
-    Error::UnsupportedArchitecture(format!(
+    Error::ArchitectureModel(format!(
         "SafeTensors artifact changed after preparation: {}",
         detail.into()
     ))

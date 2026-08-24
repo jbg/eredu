@@ -103,7 +103,7 @@ pub struct QwenHybridCheckpointTemplate {
 impl QwenHybridCheckpointTemplate {
     pub fn new(config: HybridConfig, stream: &Stream) -> Result<Self, Error> {
         let architecture = Architecture::new(config.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let target_units = config.num_hidden_layers as usize;
         let total = target_units + config.mtp_num_hidden_layers as usize;
         let units = (0..total)
@@ -115,7 +115,7 @@ impl QwenHybridCheckpointTemplate {
                 };
                 architecture
                     .construct_unit(group, index, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -138,26 +138,26 @@ pub struct QwenConditionalCheckpointTemplate {
 impl QwenConditionalCheckpointTemplate {
     pub fn new(parsed: ParsedHybridConfig, stream: &Stream) -> Result<Self, Error> {
         let architecture = ConditionalArchitecture::new(parsed, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let graph = <ConditionalArchitecture as LayeredArchitecture<
             MlxNeuralBackend,
             MlxHybridState,
         >>::execution_graph(&architecture)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let mut units = Vec::new();
         for group in 0..graph.groups().len() {
             let count = <ConditionalArchitecture as LayeredArchitecture<
                 MlxNeuralBackend,
                 MlxHybridState,
             >>::group_unit_count(&architecture, group)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             for index in 0..count {
                 units.push(
                     <ConditionalArchitecture as LayeredArchitecture<
                         MlxNeuralBackend,
                         MlxHybridState,
                     >>::build_unit(&architecture, group, index, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
                 );
             }
         }
@@ -422,7 +422,7 @@ impl QwenConditionalPipelineBindings {
                 Error::Parallel("conditional Qwen text unit precedes its vision graph".into())
             })?;
             hybrid::unit_recipes(store, &architecture.parsed().text, flat)
-                .map_err(Error::UnsupportedArchitecture)?
+                .map_err(Error::ArchitectureModel)?
         };
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
             self.external_experts && parameter_name_in_targets(name, &expert_targets)
@@ -471,7 +471,7 @@ impl QwenConditionalPipelineBindings {
                 Error::Parallel("conditional Qwen text unit precedes its vision graph".into())
             })?;
             hybrid::unit_recipes(store, &architecture.parsed().text, flat)
-                .map_err(Error::UnsupportedArchitecture)?
+                .map_err(Error::ArchitectureModel)?
         };
         let bindings = build_module_bindings_with_recipes_excluding(
             global_layer,
@@ -486,7 +486,7 @@ impl QwenConditionalPipelineBindings {
                     MlxNeuralBackend,
                     MlxHybridState,
                 >>::unit_path(architecture, group, index)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 shard_layer_bindings(bindings, &root, store, layout)
             }
             None => Ok(bindings),
@@ -552,7 +552,7 @@ impl QwenHybridPipelineBindings {
             architecture,
             group,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn flat_index(
@@ -590,7 +590,7 @@ impl QwenHybridPipelineBindings {
             architecture.config(),
             self.flat_index(architecture, group, index)?,
         )
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
             self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
@@ -645,7 +645,7 @@ impl QwenHybridPipelineBindings {
                         group,
                         index,
                     )
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 shard_layer_bindings(bindings, &root, store, layout)
             }
             None => Ok(bindings),
@@ -661,7 +661,7 @@ pub fn expert_catalog_selected(
     owns_unit: impl FnMut(&eredu_runtime::ExecutionGroupId, usize) -> bool,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = hybrid::expert_residency_catalog(store, config)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let units = catalog.into_units_selected_by_owner(owns_unit);
     crate::composition::architecture_expert_units(units, store, layout)
 }
@@ -707,7 +707,7 @@ fn prepare_hybrid_gguf_store(
     max_mapped_shards: usize,
 ) -> Result<(ParsedHybridConfig, Arc<dyn CheckpointSource>), Error> {
     let mut parsed = hybrid::model_args_from_gguf_catalog(&HybridGgufCatalog(checkpoint), metadata)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     checkpoint
         .catalog()
         .translated_outputs(hybrid::translate_gguf_weight_name)
@@ -717,7 +717,7 @@ fn prepare_hybrid_gguf_store(
             .into_iter()
             .map(|(name, config)| (name, config.into()))
             .collect();
-    let text_plan = hybrid::gguf_plan(&parsed.text).map_err(Error::UnsupportedArchitecture)?;
+    let text_plan = hybrid::gguf_plan(&parsed.text).map_err(Error::ArchitectureModel)?;
     let text: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &text_plan,
@@ -734,7 +734,7 @@ fn prepare_hybrid_gguf_store(
         crate::backend::runtime::checkpoint::load::gguf_metadata(projector);
     let mut vision =
         vision::config_from_gguf_catalog(&HybridVisionGgufCatalog(projector), &projector_metadata)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let deepstack = vision.deepstack_layers();
     let translate = |name: &str| hybrid::translate_vision_gguf_weight_name(name, &deepstack);
     projector
@@ -746,7 +746,7 @@ fn prepare_hybrid_gguf_store(
         .map(|(name, format)| (name, format.into()))
         .collect();
     let vision_plan = vision::gguf_plan(&vision, parsed.text.hidden_size)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let vision_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         projector.clone(),
         &vision_plan,
@@ -754,7 +754,7 @@ fn prepare_hybrid_gguf_store(
         max_mapped_shards,
     )?);
     parsed = hybrid::with_gguf_vision_projector(parsed, metadata, vision)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok((
         parsed,
         Arc::new(CompositeCheckpointSource::new([text, vision_source])?),
@@ -786,7 +786,7 @@ pub(crate) fn load_gguf(
             | eredu_architectures::GgufArchitecture::Qwen35Moe
             | eredu_architectures::GgufArchitecture::Qwen3Next
     ) {
-        return Err(Error::UnsupportedArchitecture(format!(
+        return Err(Error::ArchitectureModel(format!(
             "Qwen hybrid GGUF loader received architecture {:?}",
             source.architecture()
         )));
@@ -1014,7 +1014,7 @@ impl QwenHybridModel {
             0,
             eredu_core::cache::PromptCacheTopology::default(),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&self.state_layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -1114,7 +1114,7 @@ impl QwenHybridModel {
                 _ => unreachable!("conditional policy uses conditional execution"),
             }
             .map(crate::MlxTensor::into_array)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()));
+            .map_err(|error| Error::ArchitectureModel(error.to_string()));
         }
         let input = EmbeddedInput::target(crate::composition::tensor_ref(tokens), None);
         match &mut self.execution {
@@ -1125,7 +1125,7 @@ impl QwenHybridModel {
             }
         }
         .map(crate::MlxTensor::into_array)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn forward_with_provider<P>(
@@ -1258,7 +1258,7 @@ impl QwenHybridModel {
                 _ => unreachable!("conditional policy uses conditional execution"),
             }
             .map(crate::MlxTensor::into_array)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()));
+            .map_err(|error| Error::ArchitectureModel(error.to_string()));
         }
         let input = EmbeddedInput::target(crate::composition::tensor_ref(tokens), None);
         match &mut self.execution {
@@ -1271,7 +1271,7 @@ impl QwenHybridModel {
             Execution::ConditionalResident(_) | Execution::ConditionalBounded(_) => unreachable!(),
         }
         .map(crate::MlxTensor::into_array)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     pub fn prefill_input_with_observer(
@@ -1885,18 +1885,18 @@ fn unit_layout(architecture: &Architecture) -> Result<ExecutionUnitLayout, Error
     let graph = <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::execution_graph(
         architecture,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let counts = (0..graph.groups().len())
         .map(|group| {
             <Architecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::group_unit_count(
                 architecture,
                 group,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 fn conditional_unit_layout(
@@ -1906,28 +1906,28 @@ fn conditional_unit_layout(
         MlxNeuralBackend,
         MlxHybridState,
     >>::execution_graph(architecture)
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let counts = (0..graph.groups().len())
         .map(|group| {
             <ConditionalArchitecture as LayeredArchitecture<
                 MlxNeuralBackend,
                 MlxHybridState,
             >>::group_unit_count(architecture, group)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 fn resolve_store(
     store: Arc<dyn CheckpointSource>,
     config: &HybridConfig,
 ) -> Result<Arc<dyn CheckpointSource>, Error> {
-    let plan = hybrid::safetensors_plan(config).map_err(Error::UnsupportedArchitecture)?;
+    let plan = hybrid::safetensors_plan(config).map_err(Error::ArchitectureModel)?;
     let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
         .map_err(|validation| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "{} checkpoint contract did not resolve: {validation:?}",
                 config.model_type
             ))
@@ -1955,17 +1955,17 @@ fn quantize_store(
     target.quantization = Some(quantization);
     target.linear_formats.clear();
     let source_architecture = Architecture::new(source.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = Architecture::new(target.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_layers = usize::try_from(source.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Qwen hybrid layer count".into()))?;
+        .map_err(|_| Error::ArchitectureModel("invalid Qwen hybrid layer count".into()))?;
     let total = target_layers
         .checked_add(usize::try_from(source.mtp_num_hidden_layers).map_err(|_| {
-            Error::UnsupportedArchitecture("invalid Qwen hybrid MTP layer count".into())
+            Error::ArchitectureModel("invalid Qwen hybrid MTP layer count".into())
         })?)
         .ok_or_else(|| {
-            Error::UnsupportedArchitecture("Qwen hybrid layer count overflowed".into())
+            Error::ArchitectureModel("Qwen hybrid layer count overflowed".into())
         })?;
     let source_layout = unit_layout(&source_architecture)?;
     let target_layout = unit_layout(&target_architecture)?;
@@ -2026,23 +2026,23 @@ fn quantize_conditional_store(
     target.text.quantization = Some(quantization);
     target.text.linear_formats.clear();
     let source_architecture = ConditionalArchitecture::new(source.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = ConditionalArchitecture::new(target.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let vision_layers = source
         .vision
         .as_ref()
         .expect("conditional configuration has vision")
         .layer_count();
     let target_layers = usize::try_from(source.text.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Qwen hybrid layer count".into()))?;
+        .map_err(|_| Error::ArchitectureModel("invalid Qwen hybrid layer count".into()))?;
     let prediction_layers = usize::try_from(source.text.mtp_num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Qwen hybrid MTP depth".into()))?;
+        .map_err(|_| Error::ArchitectureModel("invalid Qwen hybrid MTP depth".into()))?;
     let total = vision_layers
         .checked_add(target_layers)
         .and_then(|count| count.checked_add(prediction_layers))
         .ok_or_else(|| {
-            Error::UnsupportedArchitecture("conditional unit count overflowed".into())
+            Error::ArchitectureModel("conditional unit count overflowed".into())
         })?;
     let source_layout = conditional_unit_layout(&source_architecture)?;
     let target_layout = conditional_unit_layout(&target_architecture)?;
@@ -2110,7 +2110,7 @@ pub fn load_safetensors_with_residency(
     weights_stream: &Stream,
 ) -> Result<QwenHybridModel, Error> {
     let mut parsed = hybrid::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Qwen hybrid", parsed.text.quantization, requested)
@@ -2177,7 +2177,7 @@ fn load_conditional_store(
     weights_stream: &Stream,
 ) -> Result<QwenHybridModel, Error> {
     let mut architecture = ConditionalArchitecture::new(parsed.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         architecture
             .parameter_description(stream)
@@ -2207,7 +2207,7 @@ fn load_conditional_store(
                 &MlxModule::new(modules.clone()),
                 "",
                 store,
-                hybrid::static_recipes(store).map_err(Error::UnsupportedArchitecture)?,
+                hybrid::static_recipes(store).map_err(Error::ArchitectureModel)?,
             )
             .map_err(Into::into)
         },
@@ -2221,7 +2221,7 @@ fn load_conditional_store(
                     binding.num_hidden_layers as usize + address.group() - 2
                 };
                 hybrid::unit_recipes(store, &binding, flat)
-                    .map_err(Error::UnsupportedArchitecture)?
+                    .map_err(Error::ArchitectureModel)?
             };
             build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(unit),
@@ -2249,7 +2249,7 @@ fn load_conditional_store(
         Execution::ConditionalBounded(Box::new(LayerwiseRuntime::new(architecture, policy)))
     };
     let state_layout = hybrid::state_layout(&parsed.text)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(QwenHybridModel {
         parsed,
         state_layout,
@@ -2269,7 +2269,7 @@ fn load_store(
     weights_stream: &Stream,
 ) -> Result<QwenHybridModel, Error> {
     let mut architecture = Architecture::new(parsed.text.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         architecture
             .parameter_description(stream)
@@ -2296,7 +2296,7 @@ fn load_store(
         },
         |modules, store| {
             let recipes =
-                hybrid::static_recipes(store).map_err(Error::UnsupportedArchitecture)?;
+                hybrid::static_recipes(store).map_err(Error::ArchitectureModel)?;
             build_module_bindings_with_recipes(&MlxModule::new(modules.clone()), "", store, recipes)
                 .map_err(Into::into)
         },
@@ -2307,7 +2307,7 @@ fn load_store(
                 binding_config.num_hidden_layers as usize + address.group() - 1
             };
             let recipes = hybrid::unit_recipes(store, &binding_config, flat)
-                .map_err(Error::UnsupportedArchitecture)?;
+                .map_err(Error::ArchitectureModel)?;
             build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(unit),
                 "",
@@ -2334,7 +2334,7 @@ fn load_store(
         Execution::Bounded(Box::new(LayerwiseRuntime::new(architecture, policy)))
     };
     let state_layout = hybrid::state_layout(&parsed.text)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(QwenHybridModel {
         parsed,
         state_layout,

@@ -131,6 +131,11 @@ parser outputs, never a second raw `model_type` or `general.architecture`
 dispatch table. Unsupported family identities therefore remain architecture
 resolver errors transported through the backend-neutral artifact error;
 concrete backends do not declare a parallel model-type dispatch error.
+Architecture composition failures are reported as architecture-model errors,
+while artifact normalization failures retain the backend-neutral artifact error
+and facade-owned workflow validation retains a facade-owned error. Concrete
+backend errors do not use an unsupported-architecture string funnel for these
+unrelated ownership domains.
 Loaded backend models and sessions preserve these as two distinct identities:
 `model_family()` returns the canonical architecture-owned `ModelKind`, while
 `effective_model_type()` returns the parsed implementation or nested text-model

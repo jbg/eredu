@@ -89,10 +89,10 @@ fn resolve_llama_safetensors_store(
         return Ok(store);
     }
     let plan = eredu_architectures::llama::safetensors_plan(args)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
         .map_err(|validation| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "{} checkpoint contract did not resolve: {validation:?}",
                 args.model_type
             ))
@@ -111,7 +111,7 @@ fn load_neutral_llama(
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
 ) -> Result<LlamaModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let (policy, mut metadata) = prepare_layerwise_policy(
         store,
         &mut architecture,
@@ -139,7 +139,7 @@ fn load_neutral_llama(
     };
     Ok(LlamaModel {
         state_layout: eredu_architectures::llama::state_layout(&args)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
         args,
         metadata,
         parallel_info: None,
@@ -167,11 +167,11 @@ pub fn quantize_neutral_llama_store(
     target_args.quantized_weights = None;
     target_args.quantized_weight_configs = None;
     let source = NeutralArchitecture::new(source_args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target = NeutralArchitecture::new(target_args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let count = usize::try_from(source_args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Llama layer count".into()))?;
+        .map_err(|_| Error::ArchitectureModel("invalid Llama layer count".into()))?;
     let source_unit_args = source_args.clone();
     let target_unit_args = target_args.clone();
     let (store, report) = quantize_parameterized_store(
@@ -180,11 +180,11 @@ pub fn quantize_neutral_llama_store(
         target.static_modules(),
         move |index, stream| {
             NeutralBlock::new(&source_unit_args, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         move |index, stream| {
             NeutralBlock::new(&target_unit_args, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         count,
         quantization,
@@ -393,10 +393,10 @@ impl LlamaModel {
         let output = match &mut self.execution {
             LlamaExecution::Resident(execution) => execution
                 .forward(input, cache, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+                .map_err(|error| Error::ArchitectureModel(error.to_string())),
             LlamaExecution::Layerwise(execution) => execution
                 .forward(input, cache, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string())),
+                .map_err(|error| Error::ArchitectureModel(error.to_string())),
             LlamaExecution::TensorParallelResident(_)
             | LlamaExecution::TensorParallelLayerwise(_) => Err(Error::Parallel(
                 "tensor-parallel Llama requires its collective execution context".into(),
@@ -444,7 +444,7 @@ impl LlamaModel {
                                 .map_err(|error| eredu_nn::Error::backend(error.to_string()))
                         },
                     )
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 observer.observe("model.logits", output.as_array())?;
                 Ok(output.into_array())
             }
@@ -470,7 +470,7 @@ impl LlamaModel {
                                 .map_err(|error| eredu_nn::Error::backend(error.to_string()))
                         },
                     )
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 observer.observe("model.logits", output.as_array())?;
                 Ok(output.into_array())
             }
@@ -569,7 +569,7 @@ impl LlamaModel {
             });
         let identity =
             eredu_architectures::llama::state_identity(self.args(), &layout, 0, topology)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         identity
             .prompt_cache_identity(&layout)
             .map_err(|error| Error::Parallel(error.to_string()))
@@ -625,13 +625,13 @@ pub fn load_llama_safetensors_mlx(
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
     if weight_residency.expert_cache().is_some() {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "independent expert caching is not supported for Llama checkpoints".into(),
         ));
     }
     let execution_options = weight_residency.layers();
     let args = eredu_architectures::llama::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load("Llama", args.weight_quantization(), requested)
@@ -665,9 +665,9 @@ fn load_neutral_llama_parallel(
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
     let layer_count = usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("invalid Llama layer count".into()))?;
+        .map_err(|_| Error::ArchitectureModel("invalid Llama layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut planner = build.planner();
     let static_modules = global_architecture.static_modules();
     for group in eredu_architectures::llama::static_parallel_parameter_groups::<MlxNeuralBackend>(
@@ -680,7 +680,7 @@ fn load_neutral_llama_parallel(
     }
     for index in 0..layer_count {
         let unit = NeutralBlock::new(&args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         for group in eredu_architectures::llama::layer_parallel_parameter_groups::<MlxNeuralBackend>(
             &unit, &args, index,
         )? {
@@ -696,10 +696,10 @@ fn load_neutral_llama_parallel(
     let geometry = eredu_architectures::llama::local_geometry(&args, &layout)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let global_static_bindings = build_module_bindings(
         &MlxModule::new(global_architecture.static_modules().clone()),
         "",
@@ -708,7 +708,7 @@ fn load_neutral_llama_parallel(
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
     for index in 0..layer_count {
         let unit = NeutralBlock::new(&args, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let bytes = binding_bytes(&build_module_bindings(
             &MlxModule::new(unit),
             "",
@@ -739,7 +739,7 @@ fn load_neutral_llama_parallel(
         |_ordinal, address, path, _local, store, stream| {
             let index = address.index();
             let global = NeutralBlock::new(&binding_args, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = build_module_bindings(&MlxModule::new(global), "", store)?;
             shard_layer_bindings(bindings, path, store, &layout)
         },
@@ -807,7 +807,7 @@ pub fn load_llama_tensor_parallel_model(
 ) -> Result<LlamaModel, Error> {
     let options = options.into();
     let args = eredu_architectures::llama::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_llama_safetensors_store(store, &args)?;
     load_neutral_llama_parallel(store, args, options, build, stream, weights_stream)
@@ -822,8 +822,8 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
 ) -> Result<LlamaModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = checkpoint::prepare_llama_gguf_checkpoint(source, None, weights_stream)?;
-    let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
-        .map_err(Error::UnsupportedArchitecture)?;
+    let gguf_plan =
+        eredu_architectures::llama::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
@@ -846,8 +846,8 @@ pub(crate) fn load_llama_gguf_model(
 ) -> Result<LlamaModel, Error> {
     let checkpoint = source.checkpoint();
     let prepared = checkpoint::prepare_llama_gguf_checkpoint(source, None, weights_stream)?;
-    let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
-        .map_err(Error::UnsupportedArchitecture)?;
+    let gguf_plan =
+        eredu_architectures::llama::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> =
         Arc::new(open_gguf_checkpoint_source(
             checkpoint.clone(),
@@ -857,7 +857,7 @@ pub(crate) fn load_llama_gguf_model(
         )?);
     let args = prepared.args;
     if residency.expert_cache().is_some() {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "independent expert caching is not supported for Llama GGUF checkpoints".into(),
         ));
     }
@@ -900,7 +900,7 @@ impl LlamaPipelineBindings {
         let global = architecture
             .construct_unit(index, stream)
             .map(MlxModule::new)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let bindings = build_module_bindings(&global, "", store)?;
         match layout {
             Some(layout) => {
@@ -908,7 +908,7 @@ impl LlamaPipelineBindings {
                     MlxNeuralBackend,
                     MlxKeyValueState,
                 >>::unit_path(architecture, 0, index)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 shard_layer_bindings(bindings, &root, store, layout)
             }
             None => Ok(bindings),

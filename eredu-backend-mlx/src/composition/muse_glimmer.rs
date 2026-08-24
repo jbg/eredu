@@ -135,7 +135,7 @@ impl Execution {
             MlxKeyValueState,
         >>::execution_graph(architecture)
         .map(|graph| graph.output())
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 }
 
@@ -204,7 +204,7 @@ impl MuseGlimmerDFlashModel {
     ) -> Result<crate::MlxTensor, Error> {
         self.module
             .assemble_target_states(states, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     pub fn update_context(
@@ -216,7 +216,7 @@ impl MuseGlimmerDFlashModel {
     ) -> Result<eredu_architectures::muse_glimmer::DFlashContext<crate::MlxTensor>, Error> {
         self.module
             .update_context(previous, states, absolute_end, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     pub fn proposal_states(
@@ -228,7 +228,7 @@ impl MuseGlimmerDFlashModel {
     ) -> Result<crate::MlxTensor, Error> {
         self.module
             .proposal_states(embeddings, committed, absolute_end, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 }
 
@@ -240,7 +240,7 @@ pub fn load_dflash_safetensors(
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerDFlashModel, Error> {
     if !options.weight_residency.is_fully_resident() {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "Muse-Glimmer DFlash requires fully resident assistant weights".into(),
         ));
     }
@@ -268,16 +268,16 @@ pub fn load_dflash_safetensors(
         open_safetensors_weight_store(model_dir, options.weight_residency.max_mapped_shards())?;
     let store = if let Some(requested) = requested {
         let source = NeutralDFlash::new(source_config, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let target = NeutralDFlash::new(config.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         quantize_parameterized_module_store(store, &source, &target, requested, stream)?.0
     } else {
         store
     };
     let mut module = MlxModule::new(
         NeutralDFlash::new(config.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
     );
     let bindings = build_module_bindings(&module, "", store.as_ref())?;
     let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
@@ -294,7 +294,7 @@ pub fn load_dflash_gguf(
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerDFlashModel, Error> {
     if !options.weight_residency.is_fully_resident() {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "Muse-Glimmer DFlash requires fully resident assistant weights".into(),
         ));
     }
@@ -330,9 +330,9 @@ pub fn load_dflash_gguf(
         config.quantization = Some(requested);
         config.quantized_weights.clear();
         let source = NeutralDFlash::new(source_config, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let target = NeutralDFlash::new(config.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         (
             quantize_parameterized_module_store(store, &source, &target, requested, stream)?.0,
             config,
@@ -342,7 +342,7 @@ pub fn load_dflash_gguf(
     };
     let mut module = MlxModule::new(
         NeutralDFlash::new(config.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
     );
     let bindings = build_module_bindings(&module, "", store.as_ref())?;
     let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
@@ -441,7 +441,7 @@ impl MuseGlimmerPipelineBindings {
             MlxNeuralBackend,
             MlxKeyValueState,
         >>::group_unit_count(architecture, group)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     pub fn cartesian_layer_bindings(
@@ -476,7 +476,7 @@ impl MuseGlimmerPipelineBindings {
                     MlxNeuralBackend,
                     MlxKeyValueState,
                 >>::unit_path(architecture, group, index)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 shard_layer_bindings(bindings, &root, store, layout)
             }
             None => Ok(bindings),
@@ -531,9 +531,9 @@ pub fn prepare_muse_input(
                 let architecture_input =
                     input::prepared_media_input(part.modality, value, part.metadata)?;
                 let plan = media_plan::muse_glimmer_ingress(args, &architecture_input)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 let count = usize::try_from(plan.placeholder_count).map_err(|_| {
-                    Error::UnsupportedArchitecture(
+                    Error::ArchitectureModel(
                         "Muse-Glimmer placeholder span exceeds host capacity".into(),
                     )
                 })?;
@@ -546,7 +546,7 @@ pub fn prepare_muse_input(
                 grid.extend(plan.patch_grid);
             }
             (modality, _) => {
-                return Err(Error::UnsupportedArchitecture(format!(
+                return Err(Error::ArchitectureModel(format!(
                     "Muse-Glimmer does not accept this {} payload",
                     modality.as_str()
                 )))
@@ -626,7 +626,7 @@ impl MuseGlimmerModel {
             0,
             topology,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&self.state_layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -725,14 +725,14 @@ impl MuseGlimmerModel {
             ));
         }
         if state.layout() != &self.state_layout {
-            return Err(Error::UnsupportedArchitecture(
+            return Err(Error::ArchitectureModel(
                 "Muse-Glimmer cache layout mismatch".into(),
             ));
         }
         let mut capture = (!target_layers.is_empty())
             .then(|| eredu_runtime::TargetStateCapture::new(target_layers.iter().copied()))
             .transpose()
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let output_group = self.execution.output_group()?;
         if let Some(expert_cache) = self.expert_cache.take() {
             let args = self.args.clone();
@@ -812,11 +812,11 @@ impl MuseGlimmerModel {
             drop(provider);
             self.expert_cache = Some(expert_cache);
             let (logits, _) =
-                result.map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let target_states = capture
                 .map(eredu_runtime::TargetStateCapture::into_ordered)
                 .transpose()
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?
                 .unwrap_or_default();
             return Ok(MuseGlimmerMtpOutput {
                 logits,
@@ -872,11 +872,11 @@ impl MuseGlimmerModel {
             ),
             Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let target_states = capture
             .map(eredu_runtime::TargetStateCapture::into_ordered)
             .transpose()
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
             .unwrap_or_default();
         Ok(MuseGlimmerMtpOutput {
             logits: result.0,
@@ -916,7 +916,7 @@ impl MuseGlimmerModel {
             }
             Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     pub fn project_dflash_logits(
@@ -941,7 +941,7 @@ impl MuseGlimmerModel {
             }
             Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     pub fn forward_tokens(
@@ -1240,10 +1240,10 @@ fn resolve_store(
     args: &DecoderConfig,
 ) -> Result<SharedCheckpointSource, Error> {
     let plan = eredu_architectures::muse_glimmer::safetensors_plan(args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
         .map_err(|error| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "Muse-Glimmer checkpoint contract did not resolve: {error:?}"
             ))
         })?;
@@ -1273,9 +1273,9 @@ fn quantize_store(
     target.vision_config.weight_quantization = Some(quantization);
     target.vision_config.quantized_weight_configs.clear();
     let source_architecture = NeutralArchitecture::new(source.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = NeutralArchitecture::new(target.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let source_layout = architecture_execution_layout::<_, MlxKeyValueState>(&source_architecture)?;
     let target_layout = architecture_execution_layout::<_, MlxKeyValueState>(&target_architecture)?;
     if source_layout != target_layout {
@@ -1333,7 +1333,7 @@ fn load_store(
     external_experts: bool,
 ) -> Result<MuseGlimmerModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         architecture
             .parameter_description()
@@ -1394,7 +1394,7 @@ fn load_store(
     };
     Ok(MuseGlimmerModel {
         state_layout: eredu_architectures::muse_glimmer::state_layout(&args)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
         args,
         metadata,
         execution,
@@ -1412,7 +1412,7 @@ fn load_parallel_store(
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let global_execution =
         architecture_execution_layout::<_, MlxKeyValueState>(&global_architecture)?;
     let decoder_groups = (0..global_execution.group_count())
@@ -1448,7 +1448,7 @@ fn load_parallel_store(
     let geometry = eredu_architectures::muse_glimmer::local_geometry(&args, &layout)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
         .runtime_state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -1528,7 +1528,7 @@ fn load_parallel_store(
                         address.index(),
                         stream,
                     )
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
                 );
             let recipes = crate::composition::muse_glimmer_expert::module_recipes(
                 &global,
@@ -1604,7 +1604,7 @@ pub fn load_safetensors_tensor_parallel(
     weights_stream: &Stream,
 ) -> Result<MuseGlimmerModel, Error> {
     let args = DecoderConfig::from_hf_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_store(store, &args)?;
     load_parallel_store(store, args, residency, build, stream, weights_stream)
@@ -1657,7 +1657,7 @@ pub fn load_safetensors(
 ) -> Result<MuseGlimmerModel, Error> {
     let expert_options = residency.expert_cache();
     let args = DecoderConfig::from_hf_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_store(store, &args)?;
     let current = args.quantization.or(args.quantization_config);
@@ -1737,11 +1737,11 @@ fn open_gguf_store(
         .and_then(|args| {
             args.with_gguf_projector_metadata(&projector_metadata, projector_quantization)
         })
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-    let text_plan = eredu_architectures::muse_glimmer::gguf_plan(&args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let text_plan =
+        eredu_architectures::muse_glimmer::gguf_plan(&args).map_err(Error::ArchitectureModel)?;
     let projector_plan = eredu_architectures::muse_glimmer::projector_gguf_plan(&args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let store: SharedCheckpointSource = Arc::new(
         eredu_checkpoint::gguf_store::GgufWeightStore::builder()
             .max_cached_readers(max_cached_readers)?

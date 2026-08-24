@@ -178,6 +178,23 @@ pub struct LocalExpertCacheBenchmark {
     pub cached_decode: LocalExpertCacheBenchmarkSample,
 }
 
+/// Failure while running the facade-owned expert-cache benchmark workflow.
+#[derive(Debug, thiserror::Error)]
+pub enum LocalExpertCacheBenchmarkError {
+    /// The benchmark needs a non-empty prompt for prefill and cached decode.
+    #[error("expert-cache benchmark requires at least one prompt token")]
+    EmptyPrompt,
+    /// The selected model does not expose sparse expert-cache telemetry.
+    #[error("sparse expert-cache benchmark requires an expert-cache model")]
+    ExpertCacheUnavailable,
+    /// The local rank did not produce logits needed to complete a benchmark phase.
+    #[error("expert-cache benchmark requires logits on the local rank")]
+    LogitsUnavailable,
+    /// The selected backend failed while preparing or executing the benchmark.
+    #[error(transparent)]
+    Backend(#[from] LocalBackendError),
+}
+
 #[derive(Clone, Copy)]
 struct ExpertSnapshot {
     prefill: eredu_backend_mlx::ExpertPassStatistics,
@@ -190,12 +207,11 @@ struct ExpertSnapshot {
 
 fn expert_snapshot(
     runtime: &crate::ModelRuntime<LocalBackend<'static>>,
-) -> Result<ExpertSnapshot, LocalBackendError> {
-    let report = runtime.session().expert_cache_report()?.ok_or_else(|| {
-        LocalBackendError::UnsupportedArchitecture(
-            "sparse expert cache benchmark requires an expert-cache model".into(),
-        )
-    })?;
+) -> Result<ExpertSnapshot, LocalExpertCacheBenchmarkError> {
+    let report = runtime
+        .session()
+        .expert_cache_report()?
+        .ok_or(LocalExpertCacheBenchmarkError::ExpertCacheUnavailable)?;
     Ok(ExpertSnapshot {
         prefill: report.prefill,
         decode: report.decode,
@@ -243,16 +259,21 @@ fn benchmark_sample(
     }
 }
 
+fn validate_expert_cache_benchmark_prompt(
+    token_ids: &[u32],
+) -> Result<(), LocalExpertCacheBenchmarkError> {
+    if token_ids.is_empty() {
+        return Err(LocalExpertCacheBenchmarkError::EmptyPrompt);
+    }
+    Ok(())
+}
+
 /// Benchmarks selected-backend expert-cache reuse without exposing tensors or streams.
 pub fn benchmark_local_expert_cache(
     runtime: &mut crate::ModelRuntime<LocalBackend<'static>>,
     token_ids: &[u32],
-) -> Result<LocalExpertCacheBenchmark, LocalBackendError> {
-    if token_ids.is_empty() {
-        return Err(LocalBackendError::UnsupportedArchitecture(
-            "expert-cache benchmark requires at least one prompt token".into(),
-        ));
-    }
+) -> Result<LocalExpertCacheBenchmark, LocalExpertCacheBenchmarkError> {
+    validate_expert_cache_benchmark_prompt(token_ids)?;
     let prompt = <LocalBackend<'static> as crate::TextGenerationBackend>::prepare_text_prompt(
         runtime.backend(),
         token_ids.to_vec(),
@@ -265,11 +286,7 @@ pub fn benchmark_local_expert_cache(
         .prefill(prompt.clone())?
         .wait()?
         .into_logits()
-        .ok_or_else(|| {
-            LocalBackendError::Parallel(
-                "expert-cache benchmark requires logits on the local rank".into(),
-            )
-        })?;
+        .ok_or(LocalExpertCacheBenchmarkError::LogitsUnavailable)?;
     drop(logits);
     let after_cold = expert_snapshot(runtime)?;
     let cold_prefill = benchmark_sample(
@@ -285,11 +302,7 @@ pub fn benchmark_local_expert_cache(
         .prefill(prompt)?
         .wait()?
         .into_logits()
-        .ok_or_else(|| {
-            LocalBackendError::Parallel(
-                "expert-cache benchmark requires logits on the local rank".into(),
-            )
-        })?;
+        .ok_or(LocalExpertCacheBenchmarkError::LogitsUnavailable)?;
     drop(logits);
     let after_repeated = expert_snapshot(runtime)?;
     let repeated_prefill = benchmark_sample(
@@ -305,11 +318,9 @@ pub fn benchmark_local_expert_cache(
         session.submit_token_decode(backend, token_ids[token_ids.len() - 1])?
     }
     .wait()?;
-    let logits = output.into_logits().ok_or_else(|| {
-        LocalBackendError::Parallel(
-            "expert-cache benchmark requires logits on the local rank".into(),
-        )
-    })?;
+    let logits = output
+        .into_logits()
+        .ok_or(LocalExpertCacheBenchmarkError::LogitsUnavailable)?;
     drop(logits);
     let after_decode = expert_snapshot(runtime)?;
     let cached_decode = benchmark_sample(
@@ -324,4 +335,18 @@ pub fn benchmark_local_expert_cache(
         repeated_prefill,
         cached_decode,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_expert_cache_benchmark_prompt, LocalExpertCacheBenchmarkError};
+
+    #[test]
+    fn empty_benchmark_prompt_is_a_facade_input_error() {
+        assert!(matches!(
+            validate_expert_cache_benchmark_prompt(&[]),
+            Err(LocalExpertCacheBenchmarkError::EmptyPrompt)
+        ));
+        validate_expert_cache_benchmark_prompt(&[1]).unwrap();
+    }
 }

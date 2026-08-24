@@ -46,7 +46,7 @@ pub fn inspect_model(
         )
         .into());
     } else {
-        return Err(Error::UnsupportedArchitecture(format!(
+        return Err(Error::ArchitectureModel(format!(
             "model artifact must be a SafeTensors directory or .gguf file: {}",
             path.display()
         )));
@@ -928,7 +928,7 @@ fn reject_load_policy(report: &mut ModelInspectionReport, error: &Error) {
             InspectionIssueCode::UnsupportedResidencyPolicy,
             detail.clone(),
         ),
-        Error::UnsupportedArchitecture(detail)
+        Error::ArchitectureModel(detail)
             if detail.contains("residency")
                 || detail.contains("stream")
                 || detail.contains("expert cach") =>

@@ -68,7 +68,7 @@ fn require_decoder_group(architecture: &NeutralArchitecture, group: usize) -> Re
     if transport.kind == eredu_runtime::ArchitectureGroupKind::Decoder {
         Ok(())
     } else {
-        Err(Error::UnsupportedArchitecture(format!(
+        Err(Error::ArchitectureModel(format!(
             "LFM2 checkpoint bindings require the decoder execution group, got {group}"
         )))
     }
@@ -112,11 +112,11 @@ impl Lfm2CheckpointTemplate {
     /// Builds one neutral full-parameter template for checkpoint tooling.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let architecture = NeutralArchitecture::new(args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let layers = (0..args.num_hidden_layers as usize)
             .map(|index| {
                 Block::new(&args, index, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -221,7 +221,7 @@ impl Lfm2Bindings {
             MlxNeuralBackend,
             MlxHybridState,
         >>::group_unit_count(architecture, group)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     pub fn layer_bindings(
@@ -244,7 +244,7 @@ impl Lfm2Bindings {
         );
         let mut recipes =
             eredu_architectures::lfm2::unit_recipes(store, architecture.args(), index)
-                .map_err(Error::UnsupportedArchitecture)?;
+                .map_err(Error::ArchitectureModel)?;
         if self.external_experts {
             recipes.retain(|name, _| !parameter_name_in_targets(name, &expert_targets));
         }
@@ -300,7 +300,7 @@ impl Lfm2Bindings {
                     MlxNeuralBackend,
                     MlxHybridState,
                 >>::unit_path(architecture, group, index)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 shard_layer_bindings(bindings, &root, store, layout)
             }
             None => Ok(bindings),
@@ -358,10 +358,10 @@ fn resolve_store(
         return Ok(store);
     }
     let plan = eredu_architectures::lfm2::safetensors_plan(args, true)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
         .map_err(|validation| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "LFM2 checkpoint contract did not resolve: {validation:?}"
             ))
         })?;
@@ -375,7 +375,7 @@ pub fn expert_catalog(
     store: &dyn CheckpointSource,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = eredu_architectures::lfm2::expert_residency_catalog(store, args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     crate::composition::architecture_expert_units(catalog, store, None)
 }
 
@@ -396,7 +396,7 @@ fn load_neutral(
     external_experts: bool,
 ) -> Result<Lfm2Model, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         architecture
             .parameter_description(stream)
@@ -431,7 +431,7 @@ fn load_neutral(
                     BTreeMap::new()
                 } else {
                     eredu_architectures::lfm2::unit_recipes(store, &binding_args, index)
-                        .map_err(Error::UnsupportedArchitecture)?
+                        .map_err(Error::ArchitectureModel)?
                 },
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )
@@ -443,7 +443,7 @@ fn load_neutral(
     metadata.set_materialization(materialization);
     let state_layout = architecture
         .state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let execution = if options.is_fully_resident() {
         Lfm2Execution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -479,7 +479,7 @@ fn load_neutral_parallel(
     let count = usize::try_from(args.num_hidden_layers)
         .map_err(|_| Error::Parallel("invalid LFM2 layer count".into()))?;
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         global_architecture
             .parameter_description(stream)
@@ -494,7 +494,7 @@ fn load_neutral_parallel(
     }
     for layer in 0..count {
         let block = Block::<MlxNeuralBackend>::new(&args, layer, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         for group in
             eredu_architectures::lfm2::layer_parallel_parameter_groups(&block, &args, layer)?
         {
@@ -510,10 +510,10 @@ fn load_neutral_parallel(
     let geometry = eredu_architectures::lfm2::local_geometry(&args, &layout)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let factory = Lfm2ParallelUnitPopulator {
         external_experts,
         expert_targets: Arc::clone(&expert_targets),
@@ -524,7 +524,7 @@ fn load_neutral_parallel(
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
     for layer in 0..count {
         let block = Block::<MlxNeuralBackend>::new(&args, layer, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let bindings = build_module_bindings_with_recipes_excluding(
             &MlxModule::new(block),
             "",
@@ -533,7 +533,7 @@ fn load_neutral_parallel(
                 BTreeMap::new()
             } else {
                 eredu_architectures::lfm2::unit_recipes(store.as_ref(), &args, layer)
-                    .map_err(Error::UnsupportedArchitecture)?
+                    .map_err(Error::ArchitectureModel)?
             },
             |name| external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
@@ -566,7 +566,7 @@ fn load_neutral_parallel(
         move |_ordinal, address, path, _local, store, stream| {
             let layer = address.index();
             let global = Block::<MlxNeuralBackend>::new(&binding_args, layer, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(global),
                 "",
@@ -575,7 +575,7 @@ fn load_neutral_parallel(
                     BTreeMap::new()
                 } else {
                     eredu_architectures::lfm2::unit_recipes(store, &binding_args, layer)
-                        .map_err(Error::UnsupportedArchitecture)?
+                        .map_err(Error::ArchitectureModel)?
                 },
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
@@ -653,9 +653,9 @@ fn quantize_store(
     target.quantized_weights = None;
     target.quantized_weight_configs = None;
     let source = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let destination = NeutralArchitecture::new(target.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let source_args = args.clone();
     let target_args = target.clone();
     let (store, report) = quantize_parameterized_store(
@@ -664,14 +664,14 @@ fn quantize_store(
         destination.static_modules(),
         move |index, stream| {
             Block::<MlxNeuralBackend>::new(&source_args, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         move |index, stream| {
             Block::<MlxNeuralBackend>::new(&target_args, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         usize::try_from(args.num_hidden_layers)
-            .map_err(|_| Error::UnsupportedArchitecture("invalid LFM2 layer count".into()))?,
+            .map_err(|_| Error::ArchitectureModel("invalid LFM2 layer count".into()))?,
         quantization,
         stream,
     )?;
@@ -813,7 +813,7 @@ impl Lfm2Model {
                     crate::backend::cache::prompt_cache_topology(info.topology())
                 }),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&self.state_layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -934,7 +934,7 @@ impl Lfm2Model {
                 ))
             }
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(output.into_array())
     }
 
@@ -1275,7 +1275,7 @@ pub fn load_lfm2_model(
     let expert_options = residency.expert_cache();
     let options = residency.layers();
     let args = eredu_architectures::lfm2::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let quantize = quantization
         .map(|requested| {
             should_quantize_on_load("LFM2", args.weight_quantization, requested)
@@ -1344,7 +1344,7 @@ pub fn load_lfm2_tensor_parallel_model(
 ) -> Result<Lfm2Model, Error> {
     let options = options.into();
     let args = eredu_architectures::lfm2::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_store(store, &args)?;
     load_neutral_parallel(store, args, options, build, stream, weights_stream, false)
@@ -1375,7 +1375,7 @@ pub(crate) fn prepare_gguf(
         eredu_architectures::GgufArchitecture::Lfm2
             | eredu_architectures::GgufArchitecture::Lfm2Moe
     ) {
-        return Err(Error::UnsupportedArchitecture(format!(
+        return Err(Error::ArchitectureModel(format!(
             "LFM2 GGUF loader received architecture {:?}",
             source.architecture()
         )));
@@ -1384,7 +1384,7 @@ pub(crate) fn prepare_gguf(
     let metadata = source.metadata();
     let mut args =
         eredu_architectures::lfm2::model_args_from_gguf_catalog(&GgufCatalog(checkpoint), metadata)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let translate =
         |name: &str| eredu_architectures::lfm2::translate_gguf_weight_name(name, is_moe);
     checkpoint
@@ -1397,7 +1397,7 @@ pub(crate) fn prepare_gguf(
     args.quantized_weight_configs = Some(configs);
     args.weight_quantization = None;
     args.validate()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(PreparedGguf { args })
 }
 
@@ -1413,8 +1413,8 @@ pub(crate) fn load_lfm2_gguf_model(
     let prepared = prepare_gguf(source)?;
     let expert_options = residency.expert_cache();
     let is_moe = prepared.args.has_sparse_moe_layers();
-    let plan = eredu_architectures::lfm2::gguf_plan(&prepared.args)
-        .map_err(Error::UnsupportedArchitecture)?;
+    let plan =
+        eredu_architectures::lfm2::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &plan,
@@ -1455,8 +1455,8 @@ pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
     let is_moe = prepared.args.has_sparse_moe_layers();
-    let plan = eredu_architectures::lfm2::gguf_plan(&prepared.args)
-        .map_err(Error::UnsupportedArchitecture)?;
+    let plan =
+        eredu_architectures::lfm2::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &plan,

@@ -33,7 +33,7 @@ pub fn expert_catalog(
     layout: Option<&eredu_runtime::LocalModelLayout>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = eredu_architectures::gpt_oss::expert_residency_catalog(store, args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     crate::composition::architecture_expert_units(catalog, store, layout)
 }
 
@@ -300,7 +300,7 @@ impl RoutedExpertProvider<MlxNeuralBackend> for DistributedCachedProvider<'_> {
         _request: RoutedExpertRequest<'_, crate::MlxTensor>,
         _stream: &Stream,
     ) -> Result<crate::MlxTensor, Self::Error> {
-        Err(Error::UnsupportedArchitecture(
+        Err(Error::ArchitectureModel(
             "GPT-OSS cannot execute a ReLU2 expert bank".into(),
         ))
     }

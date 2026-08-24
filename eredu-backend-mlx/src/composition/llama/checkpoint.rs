@@ -110,7 +110,7 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
         eredu_architectures::GgufArchitecture::Llama
             | eredu_architectures::GgufArchitecture::Mistral
     ) {
-        return Err(Error::UnsupportedArchitecture(format!(
+        return Err(Error::ArchitectureModel(format!(
             "Llama GGUF loader received architecture {:?}",
             source.architecture()
         )));
@@ -159,5 +159,5 @@ pub fn model_args_from_gguf_catalog(
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> Result<ModelArgs, Error> {
     eredu_architectures::llama::model_args_from_gguf_catalog(&NeutralGgufCatalog(arrays), metadata)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }

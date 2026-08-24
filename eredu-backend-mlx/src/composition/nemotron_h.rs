@@ -96,7 +96,7 @@ impl NemotronHCheckpointTemplate {
     /// Builds one neutral full-parameter template for checkpoint tooling.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let architecture = NeutralArchitecture::new(args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let layout = architecture_execution_layout::<_, MlxHybridState>(&architecture)?;
         let layers = (0..layout.len())
             .map(|index| {
@@ -252,7 +252,7 @@ impl NemotronHBindings {
             index,
             !self.external_experts,
         )
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
             self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
@@ -304,7 +304,7 @@ impl NemotronHBindings {
                     MlxNeuralBackend,
                     MlxHybridState,
                 >>::unit_path(architecture, group, index)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 shard_layer_bindings(bindings, &root, store, layout)
             }
             None => Ok(bindings),
@@ -362,10 +362,10 @@ fn resolve_store(
         return Ok(store);
     }
     let plan = eredu_architectures::nemotron_h::safetensors_plan(args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
         .map_err(|validation| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "Nemotron-H checkpoint contract did not resolve: {validation:?}"
             ))
         })?;
@@ -387,7 +387,7 @@ pub fn expert_catalog_selected(
     mut include_layer: impl FnMut(usize) -> bool,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let catalog = eredu_architectures::nemotron_h::expert_residency_catalog(store, args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let units = catalog
         .into_units()
         .into_iter()
@@ -417,7 +417,7 @@ fn load_neutral(
     external_experts: bool,
 ) -> Result<NemotronHModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         architecture
             .parameter_description(stream)
@@ -446,7 +446,7 @@ fn load_neutral(
                 "",
                 store,
                 eredu_architectures::nemotron_h::static_recipes(store, &static_binding_args, None)
-                    .map_err(Error::UnsupportedArchitecture)?,
+                    .map_err(Error::ArchitectureModel)?,
             )
             .map_err(Into::into)
         },
@@ -462,7 +462,7 @@ fn load_neutral(
                     address.index(),
                     !external_experts,
                 )
-                .map_err(Error::UnsupportedArchitecture)?,
+                .map_err(Error::ArchitectureModel)?,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )
             .map_err(Into::into)
@@ -473,7 +473,7 @@ fn load_neutral(
     metadata.set_materialization(materialization);
     let state_layout = architecture
         .state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let execution = if options.is_fully_resident() {
         NemotronHExecution::Resident(Box::new(LayerwiseRuntime::new_policy_first(
             policy.into_resident(
@@ -507,7 +507,7 @@ fn load_neutral_parallel(
     external_experts: bool,
 ) -> Result<NemotronHModel, Error> {
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let global_execution =
         architecture_execution_layout::<_, MlxHybridState>(&global_architecture)?;
     let expert_targets = Arc::new(
@@ -546,10 +546,10 @@ fn load_neutral_parallel(
     let geometry = eredu_architectures::nemotron_h::local_geometry(&args, &layout)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let mut architecture = NeutralArchitecture::new_parallel(args.clone(), geometry, stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let factory = NemotronHParallelUnitPopulator {
         external_experts,
         expert_targets: Arc::clone(&expert_targets),
@@ -561,7 +561,7 @@ fn load_neutral_parallel(
         "",
         store.as_ref(),
         eredu_architectures::nemotron_h::static_recipes(store.as_ref(), &args, None)
-            .map_err(Error::UnsupportedArchitecture)?,
+            .map_err(Error::ArchitectureModel)?,
     )?;
     let mut global_parameter_bytes = binding_bytes(&global_static_bindings)?;
     for ordinal in 0..global_execution.len() {
@@ -586,7 +586,7 @@ fn load_neutral_parallel(
                 address.index(),
                 !external_experts,
             )
-            .map_err(Error::UnsupportedArchitecture)?,
+            .map_err(Error::ArchitectureModel)?,
             |name| external_experts && parameter_name_in_targets(name, &expert_targets),
         )?;
         global_parameter_bytes = global_parameter_bytes
@@ -621,7 +621,7 @@ fn load_neutral_parallel(
                 "",
                 store,
                 eredu_architectures::nemotron_h::static_recipes(store, &static_binding_args, None)
-                    .map_err(Error::UnsupportedArchitecture)?,
+                    .map_err(Error::ArchitectureModel)?,
             )?;
             shard_layer_bindings(bindings, "", store, &static_layout)
         },
@@ -635,7 +635,7 @@ fn load_neutral_parallel(
                 address.index(),
                 stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(global),
                 "",
@@ -647,7 +647,7 @@ fn load_neutral_parallel(
                     address.index(),
                     !external_experts,
                 )
-                .map_err(Error::UnsupportedArchitecture)?,
+                .map_err(Error::ArchitectureModel)?,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )?;
             shard_layer_bindings(bindings, path, store, &unit_layout)
@@ -724,9 +724,9 @@ fn quantize_store(
     target.quantized_weights = None;
     target.quantized_weight_configs = None;
     let source = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let destination = NeutralArchitecture::new(target.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let source_layout = architecture_execution_layout::<_, MlxHybridState>(&source)?;
     let target_layout = architecture_execution_layout::<_, MlxHybridState>(&destination)?;
     if source_layout != target_layout {
@@ -773,13 +773,13 @@ fn quantize_store(
                 "",
                 store,
                 eredu_architectures::nemotron_h::static_recipes(store, &static_binding_args, None)
-                    .map_err(Error::UnsupportedArchitecture)?,
+                    .map_err(Error::ArchitectureModel)?,
             )
             .map_err(Into::into)
         },
         move |index, unit, store| {
             let address = binding_layout.address(index).ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
+                Error::ArchitectureModel(format!(
                     "Nemotron-H has no execution unit at ordinal {index}"
                 ))
             })?;
@@ -794,7 +794,7 @@ fn quantize_store(
                     address.index(),
                     true,
                 )
-                .map_err(Error::UnsupportedArchitecture)?,
+                .map_err(Error::ArchitectureModel)?,
             )
             .map_err(Into::into)
         },
@@ -965,7 +965,7 @@ impl NemotronHModel {
                     crate::backend::cache::prompt_cache_topology(info.topology())
                 }),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&self.state_layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -1087,7 +1087,7 @@ impl NemotronHModel {
             }
         }
         .map(crate::MlxTensor::into_array)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn forward_with_provider<P>(
@@ -1951,7 +1951,7 @@ pub fn load_nemotron_h_model(
     let expert_options = residency.expert_cache();
     let options = residency.layers();
     let args = eredu_architectures::nemotron_h::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let quantize = quantization
         .map(|requested| {
             should_quantize_on_load("Nemotron-H", args.weight_quantization, requested)
@@ -2020,7 +2020,7 @@ pub fn load_nemotron_h_tensor_parallel_model(
 ) -> Result<NemotronHModel, Error> {
     let options = options.into();
     let args = eredu_architectures::nemotron_h::model_args_from_config_value(artifact.config()?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_store(store, &args)?;
     load_neutral_parallel(store, args, options, build, stream, weights_stream, false)
@@ -2050,7 +2050,7 @@ pub(crate) fn prepare_gguf(
         eredu_architectures::GgufArchitecture::NemotronH
             | eredu_architectures::GgufArchitecture::NemotronHMoe
     ) {
-        return Err(Error::UnsupportedArchitecture(format!(
+        return Err(Error::ArchitectureModel(format!(
             "Nemotron-H GGUF loader received architecture {:?}",
             source.architecture()
         )));
@@ -2061,7 +2061,7 @@ pub(crate) fn prepare_gguf(
         &GgufCatalog(checkpoint),
         metadata,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let translate = eredu_architectures::nemotron_h::translate_gguf_weight_name;
     checkpoint
         .catalog()
@@ -2072,7 +2072,7 @@ pub(crate) fn prepare_gguf(
     args.quantized_weight_configs = Some(configs);
     args.weight_quantization = None;
     args.validate()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(PreparedGguf { args })
 }
 
@@ -2088,7 +2088,7 @@ pub(crate) fn load_nemotron_h_gguf_model(
     let prepared = prepare_gguf(source)?;
     let expert_options = residency.expert_cache();
     let plan = eredu_architectures::nemotron_h::gguf_plan(&prepared.args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &plan,
@@ -2129,7 +2129,7 @@ pub(crate) fn load_nemotron_h_gguf_tensor_parallel_model(
     let checkpoint = source.checkpoint();
     let prepared = prepare_gguf(source)?;
     let plan = eredu_architectures::nemotron_h::gguf_plan(&prepared.args)
-        .map_err(Error::UnsupportedArchitecture)?;
+        .map_err(Error::ArchitectureModel)?;
     let store: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &plan,

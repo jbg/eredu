@@ -300,7 +300,7 @@ pub fn load(
         &checkpoint_plan,
     )
     .map_err(|validation| {
-        Error::UnsupportedArchitecture(format!(
+        Error::ArchitectureModel(format!(
             "prepared Moshi checkpoint contract no longer resolves: {validation:?}"
         ))
     })?;
@@ -329,7 +329,7 @@ pub fn load(
     let target_config = match quantize {
         Some(quantization) => source_config
             .with_native_quantization(Some(quantization))
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
         None => source_config.clone(),
     };
 
@@ -619,13 +619,13 @@ fn bindings(
         })?;
     for (local, logical, owner) in aliases {
         let owner_recipe = recipes.outputs.get(&owner).ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "Moshi logical alias {logical:?} names missing owner {owner:?}"
             ))
         })?;
         let expected_bytes = owner_recipe
             .infer(store)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
             .byte_len();
         bindings.push(
             eredu_runtime::WeightBinding::alias(local, owner, expected_bytes)?
@@ -650,7 +650,7 @@ fn execution_layout(architecture: &Architecture) -> Result<ExecutionUnitLayout, 
         })
         .collect::<Result<Vec<_>, _>>()?;
     ExecutionUnitLayout::new(&graph, counts)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
 fn build_unit(
@@ -660,7 +660,7 @@ fn build_unit(
     stream: &Stream,
 ) -> Result<MoshiUnit, Error> {
     let address = layout.address(ordinal).ok_or_else(|| {
-        Error::UnsupportedArchitecture(format!(
+        Error::ArchitectureModel(format!(
             "Moshi execution ordinal {ordinal} is outside 0..{}",
             layout.len()
         ))

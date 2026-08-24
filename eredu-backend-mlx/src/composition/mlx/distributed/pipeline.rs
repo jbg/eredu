@@ -285,7 +285,7 @@ macro_rules! impl_pipeline_architecture_bindings {
                     stream,
                 )
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
             }
 
             fn layer_bindings(
@@ -607,7 +607,7 @@ impl InklingPipelinePartition {
             MlxHybridState,
         >>::build_unit(&self.architecture, group, index, stream)
         .map(MlxModule::new)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn begin_ingress(
@@ -664,7 +664,7 @@ impl InklingPipelinePartition {
                 MlxHybridState,
             >>::begin_forward(&mut self.architecture, input, &mut state, stream),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(InklingIngressState { forward, state })
     }
 
@@ -736,7 +736,7 @@ impl InklingPipelinePartition {
                 stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(())
     }
 
@@ -776,7 +776,7 @@ impl InklingPipelinePartition {
                     stream,
                 ),
             }
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         }
         Ok(state.forward.hidden.into_array())
     }
@@ -800,7 +800,7 @@ impl InklingPipelinePartition {
                 execution.and_then(ParallelExecutionContext::group),
                 stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(EmbeddedMtpOutput {
             logits: output.logits,
             hidden: output.hidden,
@@ -1552,7 +1552,7 @@ impl Gemma4PipelinePartition {
             MlxHybridState,
         >>::build_unit(&self.architecture, group, index, stream)
         .map(MlxModule::new)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn ingress_kind(&self, id: &str) -> Result<eredu_runtime::ArchitectureGroupKind, Error> {
@@ -1570,7 +1570,7 @@ impl Gemma4PipelinePartition {
             MlxNeuralBackend,
             MlxHybridState,
         >>::execution_graph(&self.architecture)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn group_kind(&self, group: usize) -> eredu_runtime::ArchitectureGroupKind {
@@ -1687,7 +1687,7 @@ impl Gemma4PipelinePartition {
                 MlxHybridState,
             >>::begin_forward(&mut self.architecture, input, &mut state, stream),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let graph = self.canonical_graph()?;
         let media_group = |kind| {
             graph
@@ -1734,7 +1734,7 @@ impl Gemma4PipelinePartition {
                     stream,
                 ),
             }
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             Ok(Some(hidden))
         };
         let vision_hidden = begin_group(vision_group)?;
@@ -1763,11 +1763,9 @@ impl Gemma4PipelinePartition {
                 self.static_modules()
                     .vision
                     .as_ref()
-                    .ok_or_else(|| {
-                        Error::UnsupportedArchitecture("Gemma 4 has no vision tower".into())
-                    })?
+                    .ok_or_else(|| Error::ArchitectureModel("Gemma 4 has no vision tower".into()))?
                     .prepare_state(input, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             })
             .transpose()?;
         let audio_hidden = prepared.audio_input().map(|input| input.features.clone());
@@ -1831,7 +1829,7 @@ impl Gemma4PipelinePartition {
                     stream,
                 ),
             }
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         } else {
             self.architecture
                 .forward_partition_media_continuation(
@@ -1841,7 +1839,7 @@ impl Gemma4PipelinePartition {
                     state.audio_valid.as_deref(),
                     stream,
                 )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         };
         match kind {
             eredu_runtime::ArchitectureGroupKind::VisionEncoder => {
@@ -1872,7 +1870,7 @@ impl Gemma4PipelinePartition {
                 execution.and_then(ParallelExecutionContext::group),
                 stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         if let Some(inputs) = &per_layer_inputs {
             let range = self.partition.local_geometry().per_layer_range().clone();
             per_layer_inputs = Some(crate::MlxTensor::from_array(
@@ -1935,7 +1933,7 @@ impl Gemma4PipelinePartition {
                 S,
             >>::begin_forward(&mut self.architecture, input, state, stream),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         forward.hidden = match execution.and_then(ParallelExecutionContext::group) {
             Some(parallel) => <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::ParallelLayeredArchitecture<
                 MlxNeuralBackend,
@@ -1963,7 +1961,7 @@ impl Gemma4PipelinePartition {
                 stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(forward)
     }
 }
@@ -2553,7 +2551,7 @@ fn construct_qwen_partition_unit(
     let mut unit = architecture
         .construct_unit(index, stream)
         .map(MlxModule::new)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     bindings.prepare_unit_expert_residency(
         architecture,
         index,
@@ -2579,7 +2577,7 @@ fn construct_gpt_oss_partition_unit(
     let mut unit = architecture
         .construct_unit(index, stream)
         .map(MlxModule::new)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     bindings.prepare_unit_expert_residency(
         architecture,
         index,
@@ -3137,7 +3135,7 @@ impl dyn PipelineArchitecture {
     ) -> Result<PipelineStageOutput, Error> {
         self.placed_ingress_mut()
             .ok_or_else(|| {
-                Error::UnsupportedArchitecture(
+                Error::ArchitectureModel(
                     "pipeline stage does not accept typed multimodal ingress".into(),
                 )
             })?
@@ -3156,7 +3154,7 @@ impl dyn PipelineArchitecture {
         stream: &Stream,
     ) -> Result<EmbeddedMtpOutput, Error> {
         self.embedded_mtp_mut()
-            .ok_or_else(|| Error::UnsupportedArchitecture("stage has no embedded MTP".into()))?
+            .ok_or_else(|| Error::ArchitectureModel("stage has no embedded MTP".into()))?
             .forward_embedded_mtp_draft(
                 hidden,
                 tokens,
@@ -3176,7 +3174,7 @@ impl dyn PipelineArchitecture {
         stream: &Stream,
     ) -> Result<bool, Error> {
         self.embedded_mtp_mut()
-            .ok_or_else(|| Error::UnsupportedArchitecture("stage has no embedded MTP".into()))?
+            .ok_or_else(|| Error::ArchitectureModel("stage has no embedded MTP".into()))?
             .prefill_embedded_mtp_cache(output, tokens, cache, stream)
     }
 
@@ -3191,7 +3189,7 @@ impl dyn PipelineArchitecture {
         stream: &Stream,
     ) -> Result<Option<Array>, Error> {
         self.embedded_mtp_mut()
-            .ok_or_else(|| Error::UnsupportedArchitecture("stage has no embedded MTP".into()))?
+            .ok_or_else(|| Error::ArchitectureModel("stage has no embedded MTP".into()))?
             .fused_embedded_mtp_logits(
                 hidden,
                 last_token,
@@ -3210,7 +3208,7 @@ impl dyn PipelineArchitecture {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.embedded_mtp_mut()
-            .ok_or_else(|| Error::UnsupportedArchitecture("stage has no embedded MTP".into()))?
+            .ok_or_else(|| Error::ArchitectureModel("stage has no embedded MTP".into()))?
             .adjust_fused_embedded_mtp_logits(logits, last_token, stream)
     }
 
@@ -3222,7 +3220,7 @@ impl dyn PipelineArchitecture {
         stream: &Stream,
     ) -> Result<bool, Error> {
         self.embedded_mtp_mut()
-            .ok_or_else(|| Error::UnsupportedArchitecture("stage has no embedded MTP".into()))?
+            .ok_or_else(|| Error::ArchitectureModel("stage has no embedded MTP".into()))?
             .advance_embedded_mtp_cache(hidden, tokens, cache, stream)
     }
 }
@@ -3810,7 +3808,7 @@ where
                 PipelineRangeState<'_>,
             >>::build_unit(owner.architecture, owner.group_index, global_layer, stream)
             .map(MlxModule::new)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         |owner, global_layer, layer, hidden, cache, stream| {
             let mut state = PipelineRangeState::new(
@@ -3847,7 +3845,7 @@ where
                     stream,
                 ),
             }
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             drop(state);
             PipelineHybridLayerState(cache).synchronize_attention_fixed_offsets();
             let retained = <A as eredu_runtime::LayeredArchitecture<
@@ -3970,7 +3968,7 @@ where
                 PipelineRangeState<'_>,
             >>::build_unit(owner.architecture, owner.group_index, global_layer, stream)
             .map(MlxModule::new)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         },
         |owner, global_layer, layer, hidden, cache, stream| {
             let mut state = PipelineRangeState::new(
@@ -4011,7 +4009,7 @@ where
                     stream,
                 ),
             }
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             drop(state);
             PipelineHybridLayerState(cache).synchronize_attention_fixed_offsets();
             let retained = <A as eredu_runtime::LayeredArchitecture<
@@ -4042,7 +4040,7 @@ where
 {
     let graph = architecture
         .execution_graph()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     (0..graph.groups().len())
         .find(|&group| {
             let transport = architecture.group_transport(group);
@@ -4063,7 +4061,7 @@ where
 {
     let graph = architecture
         .execution_graph()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut matches =
         (0..graph.groups().len()).filter(|&group| architecture.group_transport(group).kind == kind);
     let group = matches
@@ -4089,7 +4087,7 @@ where
 {
     let graph = architecture
         .execution_graph()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let id = graph
         .groups()
         .get(group)
@@ -4114,7 +4112,7 @@ where
     let group = architecture_group_by_kind::<A, S>(architecture, kind)?;
     let graph = architecture
         .execution_graph()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(graph.groups()[group].id().to_owned())
 }
 
@@ -4154,7 +4152,7 @@ where
 {
     let graph = architecture
         .execution_graph()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     (0..graph.groups().len())
         .filter(|&group| {
             let transport = architecture.group_transport(group);
@@ -4177,7 +4175,7 @@ where
 {
     let graph = architecture
         .execution_graph()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok((0..graph.groups().len())
         .filter(|&group| {
             let transport = architecture.group_transport(group);
@@ -4265,12 +4263,12 @@ where
             )
         }
     }
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let graph =
         <A as eredu_runtime::LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::execution_graph(
             architecture,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let dependencies = graph.dependencies(group).ok_or_else(|| {
         Error::Parallel(format!(
             "neutral output group {group} is outside the architecture graph"
@@ -4287,7 +4285,7 @@ where
             architecture,
             group,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
     {
         return Err(Error::Parallel(format!(
             "neutral output group {group} resident unit count does not match its architecture"
@@ -4328,7 +4326,7 @@ where
             stream,
         ),
     }
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     for (index, unit) in units.iter_mut().enumerate() {
         hidden = match parallel {
             Some(parallel) => <A as eredu_runtime::ParallelRoutedLayeredArchitecture<
@@ -4363,7 +4361,7 @@ where
                 stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     }
     hidden = match parallel {
         Some(parallel) => <A as eredu_runtime::ParallelLayeredArchitecture<
@@ -4387,7 +4385,7 @@ where
             stream,
         ),
     }
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let logits = match parallel {
         Some(parallel) => <A as eredu_runtime::ParallelLayeredArchitecture<
             MlxNeuralBackend,
@@ -4410,7 +4408,7 @@ where
             )
         }
     }
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok((logits, hidden))
 }
 
@@ -4525,7 +4523,7 @@ where
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         forward.hidden = match parallel {
             Some(parallel) => <eredu_architectures::decoder::LayeredModel<
                 MlxNeuralBackend,
@@ -4561,7 +4559,7 @@ where
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         forward
     };
 
@@ -4612,7 +4610,7 @@ where
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(PipelineStageOutput::Logits(logits.into_array()))
     } else {
         Ok(PipelineStageOutput::Hidden(PipelinePayload {
@@ -4726,7 +4724,7 @@ where
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         forward.hidden = match parallel {
             Some(parallel) => <eredu_architectures::decoder::LayeredModel<
                 MlxNeuralBackend,
@@ -4762,7 +4760,7 @@ where
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         forward
     };
     let hidden = execute_neutral_routed_partition_group(
@@ -4813,7 +4811,7 @@ where
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(PipelineStageOutput::Logits(logits.into_array()))
     } else {
         Ok(PipelineStageOutput::Hidden(PipelinePayload {
@@ -4908,7 +4906,7 @@ fn execute_neutral_lfm2_partition(
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         forward.hidden = match parallel {
             Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
                 MlxNeuralBackend,
@@ -4936,7 +4934,7 @@ fn execute_neutral_lfm2_partition(
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         forward
     };
     let hidden = execute_neutral_partition_group(
@@ -4977,7 +4975,7 @@ fn execute_neutral_lfm2_partition(
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(PipelineStageOutput::Logits(logits.into_array()))
     } else {
         Ok(PipelineStageOutput::Hidden(PipelinePayload {
@@ -5066,7 +5064,7 @@ where
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         forward.hidden = match parallel {
             Some(parallel) => <eredu_architectures::lfm2::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
                 MlxNeuralBackend,
@@ -5094,7 +5092,7 @@ where
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         forward
     };
     let hidden = execute_neutral_routed_partition_group(
@@ -5137,7 +5135,7 @@ where
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(PipelineStageOutput::Logits(logits.into_array()))
     } else {
         Ok(PipelineStageOutput::Hidden(PipelinePayload {
@@ -5227,7 +5225,7 @@ where
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         forward.hidden = match parallel {
             Some(parallel) => <eredu_architectures::kimi_linear::LayeredModel<MlxNeuralBackend> as ParallelLayeredArchitecture<
                 MlxNeuralBackend,
@@ -5255,7 +5253,7 @@ where
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         forward
     };
     let hidden = execute_neutral_routed_partition_group(
@@ -5298,7 +5296,7 @@ where
                 execution_stream,
             ),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(PipelineStageOutput::Logits(logits.into_array()))
     } else {
         Ok(PipelineStageOutput::Hidden(PipelinePayload {
@@ -5329,7 +5327,7 @@ fn qwen_hybrid_pipeline_prompt_cache_identity(
         range.start,
         crate::backend::cache::prompt_cache_topology(topology),
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?
     .prompt_cache_identity(&layout)
     .map_err(|error| Error::Parallel(error.to_string()))
 }
@@ -5408,7 +5406,7 @@ fn gemma4_pipeline_prompt_cache_identity(
         range.start,
         crate::backend::cache::prompt_cache_topology(topology),
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?
     .prompt_cache_identity(layout)
     .map_err(|error| Error::Parallel(error.to_string()))
 }
@@ -5791,7 +5789,7 @@ impl PipelinePartitionMetadata for LlamaPipelinePartition {
             range.start,
             crate::backend::cache::prompt_cache_topology(topology),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -6104,7 +6102,7 @@ impl PipelinePartitionMetadata for DeepSeekV3PipelinePartition {
             self.range().start,
             crate::backend::cache::prompt_cache_topology(topology),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -6591,7 +6589,7 @@ impl PipelinePartitionMetadata for DeepSeekV4PipelinePartition {
             self.range().start,
             crate::backend::cache::prompt_cache_topology(topology),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -7309,7 +7307,7 @@ impl PipelinePartitionMetadata for QwenPipelinePartition {
             range.start,
             crate::backend::cache::prompt_cache_topology(topology),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -7457,7 +7455,7 @@ impl PipelinePartitionMetadata for MuseGlimmerPipelinePartition {
             self.range().start,
             crate::backend::cache::prompt_cache_topology(topology),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -7585,7 +7583,7 @@ impl PipelinePlacedIngress for MuseGlimmerPipelinePartition {
                     &mut state.forward.context,
                     stream,
                 )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         }
         let hidden = state.forward.hidden;
         Ok(PipelinePayload {
@@ -7628,7 +7626,7 @@ impl PipelinePlacedIngress for MuseGlimmerPipelinePartition {
                     &mut ingress.forward.context,
                     stream,
                 )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         }
         let payload = PipelinePayload {
             hidden: ingress.forward.hidden.into_array(),
@@ -7913,9 +7911,7 @@ impl PipelineEmbeddedMtp for InklingPipelinePartition {
         let layout = eredu_architectures::inkling::mtp_state_layout(self.args())
             .map_err(|error| Error::Parallel(error.to_string()))?
             .ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "Inkling checkpoint has no embedded MTP predictor".into(),
-                )
+                Error::ArchitectureModel("Inkling checkpoint has no embedded MTP predictor".into())
             })?;
         let global_layer_start = self.args().text_config.num_hidden_layers as usize;
         let state = match paged {
@@ -8180,7 +8176,7 @@ impl QwenVlPipelinePartition {
                     .architecture
                     .construct_unit(vision_group, index, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 populate_module_from_lease(
                     &mut layer,
                     transfer
@@ -8483,7 +8479,7 @@ impl PipelinePartitionMetadata for QwenVlPipelinePartition {
             range.start,
             crate::backend::cache::prompt_cache_topology(topology),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&local)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -8809,7 +8805,7 @@ impl QwenConditionalPipelinePartition {
                     .architecture
                     .construct_unit(vision_group, index, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 populate_module_from_lease(
                     &mut layer,
                     transfer
@@ -9554,7 +9550,7 @@ impl PipelinePartitionMetadata for GptOssPipelinePartition {
             range.start,
             crate::backend::cache::prompt_cache_topology(topology),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -9696,7 +9692,7 @@ impl PipelinePartitionMetadata for Lfm2PipelinePartition {
             range.start,
             crate::backend::cache::prompt_cache_topology(topology),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -10085,7 +10081,7 @@ impl PipelinePartitionMetadata for KimiLinearPipelinePartition {
             range.start,
             crate::backend::cache::prompt_cache_topology(topology),
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .prompt_cache_identity(&layout)
         .map_err(|error| Error::Parallel(error.to_string()))
     }
@@ -12314,12 +12310,12 @@ where
 {
     let graph = architecture
         .execution_graph()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut requests = Vec::with_capacity(graph.groups().len());
     for (group, spec) in graph.groups().iter().enumerate() {
         let count = architecture
             .group_unit_count(group)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let transport = architecture.group_transport(group);
         let rank_path = match transport.placement {
             eredu_runtime::ArchitectureGroupPlacement::Pipeline => (0..pipeline_stages).collect(),
@@ -12385,9 +12381,9 @@ where
 {
     let graph = architecture
         .execution_graph()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     if graph.groups().len() != 1 {
-        return Err(Error::UnsupportedArchitecture(format!(
+        return Err(Error::ArchitectureModel(format!(
             "decoder transport requires one canonical execution group, got {}",
             graph.groups().len()
         )));
@@ -13488,7 +13484,7 @@ where
         .map(|index| {
             architecture
                 .unit_path(group, index)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let keys = store.source_keys();
@@ -13878,7 +13874,7 @@ pub fn load_pipeline_model_with_options(
         MaterializationRoute::Resident => (None, None),
         MaterializationRoute::Layerwise => {
             let layers = layer_residency().ok_or_else(|| {
-                Error::UnsupportedArchitecture(
+                Error::ArchitectureModel(
                     "layerwise preparation plan requires non-resident layer options".into(),
                 )
             })?;
@@ -13886,7 +13882,7 @@ pub fn load_pipeline_model_with_options(
         }
         MaterializationRoute::ExpertCache => {
             let experts = options.weight_residency.expert_cache().ok_or_else(|| {
-                Error::UnsupportedArchitecture(
+                Error::ArchitectureModel(
                     "expert-cache preparation plan requires expert-cache options".into(),
                 )
             })?;
@@ -13930,7 +13926,7 @@ pub fn load_pipeline_model_with_options(
             let metadata = admitted.metadata().clone();
             let capabilities =
                 eredu_architectures::preparation::gguf_capabilities(architecture, &checkpoint)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             validate_distributed_stage_capabilities(
                 capabilities,
                 topology,
@@ -13941,9 +13937,9 @@ pub fn load_pipeline_model_with_options(
             return match architecture {
                 GgufArchitecture::DeepSeek4 => {
                     let args = eredu_architectures::deepseek::parse_v4_gguf(&metadata)
-                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                     let gguf_plan = eredu_architectures::deepseek::v4_gguf_plan(&args)
-                        .map_err(Error::UnsupportedArchitecture)?;
+                        .map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         &gguf_plan,
@@ -13968,7 +13964,7 @@ pub fn load_pipeline_model_with_options(
                         weights_stream,
                     )?;
                     let gguf_plan = eredu_architectures::llama::gguf_plan(&prepared.args)
-                        .map_err(Error::UnsupportedArchitecture)?;
+                        .map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         &gguf_plan,
@@ -13990,7 +13986,7 @@ pub fn load_pipeline_model_with_options(
                         crate::composition::muse_glimmer::prepare_gguf_pipeline_source(
                             &checkpoint,
                             projector.as_ref().ok_or_else(|| {
-                                Error::UnsupportedArchitecture(
+                                Error::ArchitectureModel(
                                     "Muse-Glimmer preparation omitted its required media projector"
                                         .into(),
                                 )
@@ -14014,9 +14010,9 @@ pub fn load_pipeline_model_with_options(
                         &PipelineDeepSeekGgufCatalog(&checkpoint),
                         &metadata,
                     )
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                     let gguf_plan = eredu_architectures::deepseek::v3_gguf_plan(&args)
-                        .map_err(Error::UnsupportedArchitecture)?;
+                        .map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         &gguf_plan,
@@ -14060,7 +14056,7 @@ pub fn load_pipeline_model_with_options(
                         crate::composition::qwen::prepare_qwen_gguf_checkpoint(&admitted)?;
                     let args = prepared.args;
                     let gguf_plan = eredu_architectures::qwen::gguf_plan(&args)
-                        .map_err(Error::UnsupportedArchitecture)?;
+                        .map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         &gguf_plan,
@@ -14085,7 +14081,7 @@ pub fn load_pipeline_model_with_options(
                         architecture,
                         &checkpoint,
                         projector.as_ref().ok_or_else(|| {
-                            Error::UnsupportedArchitecture(
+                            Error::ArchitectureModel(
                                 "Qwen3-VL preparation omitted its required media projector".into(),
                             )
                         })?,
@@ -14105,8 +14101,8 @@ pub fn load_pipeline_model_with_options(
                 }
                 GgufArchitecture::GptOss => {
                     let prepared = neutral_gpt_oss::prepare_gpt_oss_gguf_checkpoint(&admitted)?;
-                    let gguf_plan = gpt_oss::gguf_plan(&prepared.args)
-                        .map_err(Error::UnsupportedArchitecture)?;
+                    let gguf_plan =
+                        gpt_oss::gguf_plan(&prepared.args).map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         &gguf_plan,
@@ -14128,7 +14124,7 @@ pub fn load_pipeline_model_with_options(
                     let prepared = crate::composition::lfm2::prepare_gguf(&admitted)?;
                     let is_moe = architecture == GgufArchitecture::Lfm2Moe;
                     let gguf_plan = eredu_architectures::lfm2::gguf_plan(&prepared.args)
-                        .map_err(Error::UnsupportedArchitecture)?;
+                        .map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         &gguf_plan,
@@ -14151,7 +14147,7 @@ pub fn load_pipeline_model_with_options(
                 architecture @ (GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe) => {
                     let prepared = crate::composition::nemotron_h::prepare_gguf(&admitted)?;
                     let gguf_plan = eredu_architectures::nemotron_h::gguf_plan(&prepared.args)
-                        .map_err(Error::UnsupportedArchitecture)?;
+                        .map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         &gguf_plan,
@@ -14206,7 +14202,7 @@ pub fn load_pipeline_model_with_options(
                 GgufArchitecture::KimiLinear => {
                     let prepared = crate::composition::kimi_linear::prepare_gguf(&admitted)?;
                     let gguf_plan = eredu_architectures::kimi_linear::gguf_plan(&prepared.args)
-                        .map_err(Error::UnsupportedArchitecture)?;
+                        .map_err(Error::ArchitectureModel)?;
                     let store: SharedCheckpointSource = Arc::new(open_gguf_checkpoint_source(
                         checkpoint,
                         &gguf_plan,
@@ -14260,13 +14256,13 @@ pub fn load_pipeline_model_with_options(
     let config = artifact.config()?;
     let kind = ModelKind::resolve_family(&configuration.family)?;
     if configuration.loading_protocol == eredu_core::LoadingProtocol::Realtime {
-        return Err(Error::UnsupportedArchitecture(
+        return Err(Error::ArchitectureModel(
             "Moshi-family models use a realtime multi-stream temporal/depth contract, not the decoder pipeline"
                 .into(),
         ));
     }
     let capabilities = eredu_architectures::preparation::safetensors_capabilities(kind, config)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     validate_distributed_stage_capabilities(
         capabilities,
         topology,
@@ -14278,7 +14274,7 @@ pub fn load_pipeline_model_with_options(
     match kind {
         ModelKind::Llama => {
             let args = eredu_architectures::llama::model_args_from_config_value(config)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             load_llama_pipeline(
                 args,
                 store,
@@ -14291,9 +14287,9 @@ pub fn load_pipeline_model_with_options(
         }
         ModelKind::DeepSeekV3 => {
             let args = eredu_architectures::deepseek::parse_v3_config(config)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let plan = eredu_architectures::deepseek::v3_safetensors_plan(&args, true)
-                .map_err(Error::UnsupportedArchitecture)?;
+                .map_err(Error::ArchitectureModel)?;
             let store = resolve_pipeline_safetensors_store(store, &plan, &args.model_type)?;
             load_neutral_deepseek_v3_pipeline(
                 args,
@@ -14308,9 +14304,9 @@ pub fn load_pipeline_model_with_options(
         }
         ModelKind::DeepSeekV4 => {
             let args = eredu_architectures::deepseek::parse_v4_config(config)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let plan = eredu_architectures::deepseek::v4_safetensors_plan(&args)
-                .map_err(Error::UnsupportedArchitecture)?;
+                .map_err(Error::ArchitectureModel)?;
             let store = resolve_pipeline_safetensors_store(store, &plan, &args.model_type)?;
             load_neutral_deepseek_v4_pipeline(
                 args,
@@ -14327,7 +14323,7 @@ pub fn load_pipeline_model_with_options(
             let args = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
                 &serde_json::to_vec(config)?,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let store = crate::composition::gemma4::resolve_pipeline_store(store, &args)?;
             load_neutral_gemma4_pipeline(
                 args,
@@ -14342,7 +14338,7 @@ pub fn load_pipeline_model_with_options(
         }
         ModelKind::Qwen2 | ModelKind::Qwen3 => {
             let args = eredu_architectures::qwen::model_args_from_config_value(config)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             load_qwen_pipeline(
                 args,
                 store,
@@ -14358,7 +14354,7 @@ pub fn load_pipeline_model_with_options(
             let args = eredu_architectures::muse_glimmer::DecoderConfig::from_hf_json(
                 &serde_json::to_vec(config)?,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             load_muse_glimmer_pipeline(
                 args,
                 store,
@@ -14372,7 +14368,7 @@ pub fn load_pipeline_model_with_options(
         }
         ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
             let args = eredu_architectures::qwen::vl::model_args_from_config_value(config)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             load_neutral_qwen_vl_pipeline(
                 args,
                 store,
@@ -14386,7 +14382,7 @@ pub fn load_pipeline_model_with_options(
         }
         ModelKind::GptOss => load_gpt_oss_pipeline(
             eredu_architectures::gpt_oss::model_args_from_config_value(config)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             store,
             topology,
             options.quantization,
@@ -14397,7 +14393,7 @@ pub fn load_pipeline_model_with_options(
         ),
         ModelKind::Lfm2 => load_lfm2_pipeline(
             eredu_architectures::lfm2::model_args_from_config_value(config)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             store,
             topology,
             options.quantization,
@@ -14408,7 +14404,7 @@ pub fn load_pipeline_model_with_options(
         ),
         ModelKind::NemotronH => load_nemotron_h_pipeline(
             eredu_architectures::nemotron_h::model_args_from_config_value(config)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             store,
             topology,
             options.quantization,
@@ -14419,7 +14415,7 @@ pub fn load_pipeline_model_with_options(
         ),
         ModelKind::Qwen3Next => {
             let parsed = eredu_architectures::qwen::hybrid::model_args_from_config_value(config)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             load_neutral_qwen_hybrid_pipeline(
                 parsed.text,
                 store,
@@ -14433,7 +14429,7 @@ pub fn load_pipeline_model_with_options(
         }
         ModelKind::Qwen35 => {
             let parsed = eredu_architectures::qwen::hybrid::model_args_from_config_value(config)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             if parsed.vision.is_none() {
                 load_neutral_qwen_hybrid_pipeline(
                     parsed.text,
@@ -14460,7 +14456,7 @@ pub fn load_pipeline_model_with_options(
         }
         ModelKind::KimiLinear => load_kimi_linear_pipeline(
             eredu_architectures::kimi_linear::model_args_from_config_value(config)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             store,
             topology,
             options.quantization,
@@ -14472,7 +14468,7 @@ pub fn load_pipeline_model_with_options(
         ModelKind::Inkling => {
             let args =
                 eredu_architectures::inkling::ModelArgs::from_hf_json(&serde_json::to_vec(config)?)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let store = crate::composition::inkling::resolve_pipeline_store(store, &args)?;
             load_neutral_inkling_pipeline(
                 args,
@@ -14485,7 +14481,7 @@ pub fn load_pipeline_model_with_options(
                 weights_stream,
             )
         }
-        ModelKind::Moshi => Err(Error::UnsupportedArchitecture(
+        ModelKind::Moshi => Err(Error::ArchitectureModel(
             "Moshi-family models do not use the decoder pipeline".into(),
         )),
     }
@@ -14530,7 +14526,7 @@ fn load_llama_pipeline(
         target_args.clone(),
         stream,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut parameter_groups =
         eredu_architectures::llama::static_parallel_parameter_groups::<MlxNeuralBackend>(
             &seed_architecture.static_modules().embeddings,
@@ -14544,7 +14540,7 @@ fn load_llama_pipeline(
             layer,
             stream,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         parameter_groups.extend(
             eredu_architectures::llama::layer_parallel_parameter_groups::<MlxNeuralBackend>(
                 &block,
@@ -14568,7 +14564,7 @@ fn load_llama_pipeline(
                 geometry,
                 stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         (architecture, Some(layout))
     } else {
         (seed_architecture, None)
@@ -14586,7 +14582,7 @@ fn load_llama_pipeline(
     );
     let complete_state = architecture
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info
@@ -14620,7 +14616,7 @@ fn load_llama_pipeline(
             architecture
                 .construct_unit(global_layer, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut stage = LlamaPipelinePartition {
@@ -14700,7 +14696,7 @@ fn load_llama_pipeline(
                 streamed_architecture
                     .construct_unit(global_layer, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
             |global_layer, _layer, store| {
                 stage.bindings.cartesian_layer_bindings(
@@ -14834,7 +14830,7 @@ fn load_qwen_pipeline(
     for layer in 0..target_args.num_hidden_layers as usize {
         let block =
             eredu_architectures::qwen::new_block::<MlxNeuralBackend>(&target_args, layer, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         parameter_groups.extend(
             eredu_architectures::qwen::layer_parallel_parameter_groups::<MlxNeuralBackend>(
                 &block,
@@ -14858,7 +14854,7 @@ fn load_qwen_pipeline(
                 geometry,
                 stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
         );
         Some(layout)
     } else {
@@ -14888,7 +14884,7 @@ fn load_qwen_pipeline(
         .as_ref()
         .unwrap()
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = stage
         .architecture
@@ -14951,7 +14947,7 @@ fn load_qwen_pipeline(
                     stream,
                 ),
             }
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let source_quantization =
                 BoundPipelineBindings::new(&binding_adapter, &source_architecture);
             let target_quantization =
@@ -15107,7 +15103,7 @@ fn load_qwen_pipeline(
     if let Some(options) = expert_cache_options {
         let catalog =
             eredu_architectures::qwen::expert_residency_catalog(store.as_ref(), &source_args)
-                .map_err(Error::UnsupportedArchitecture)?;
+                .map_err(Error::ArchitectureModel)?;
         let units = catalog
             .into_iter()
             .filter(|unit| range.contains(&unit.owner_unit()))
@@ -15200,7 +15196,7 @@ fn load_muse_glimmer_pipeline(
     }
     let seed_architecture =
         muse_glimmer::LayeredModel::<MlxNeuralBackend>::new(target_args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let (architecture, parallel_layout) = if topology.tensor_parallel_size > 1 {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
         let mut planner = build.planner();
@@ -15215,7 +15211,7 @@ fn load_muse_glimmer_pipeline(
             geometry,
             stream,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         (architecture, Some(layout))
     } else {
         (seed_architecture, None)
@@ -15233,7 +15229,7 @@ fn load_muse_glimmer_pipeline(
     );
     let complete_state = architecture
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info
@@ -15284,7 +15280,7 @@ fn load_muse_glimmer_pipeline(
                 MlxKeyValueState,
             >>::build_unit(&architecture, vision_group, index, stream)
             .map(MlxModule::new)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let layers = decoder_range
@@ -15294,7 +15290,7 @@ fn load_muse_glimmer_pipeline(
                 MlxKeyValueState,
             >>::build_unit(&architecture, decoder_group, index, stream)
             .map(MlxModule::new)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut stage = MuseGlimmerPipelinePartition {
@@ -15335,7 +15331,7 @@ fn load_muse_glimmer_pipeline(
                     muse_glimmer::LayeredModel::<MlxNeuralBackend>::new(source_args.clone(), stream)
                 }
             }
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let source_quantization =
                 BoundPipelineBindings::new(&binding_adapter, &source_architecture);
             let target_quantization =
@@ -15475,7 +15471,7 @@ fn load_muse_glimmer_pipeline(
                     MlxKeyValueState,
                 >>::build_unit(architecture, group, index, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
             |ordinal, layer, store| {
                 if ordinal < vision_count {
@@ -15623,10 +15619,10 @@ fn load_neutral_qwen_vl_pipeline(
     };
     let binding_architecture =
         eredu_architectures::qwen::vl::LayeredModel::new(target_args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut architecture =
         eredu_architectures::qwen::vl::LayeredModel::new(target_args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let static_modules =
         <eredu_architectures::qwen::vl::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
             MlxNeuralBackend,
@@ -15654,7 +15650,7 @@ fn load_neutral_qwen_vl_pipeline(
     for index in 0..target_args.vision.layer_count() {
         let unit = binding_architecture
             .construct_unit(vision_group, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let eredu_architectures::qwen::vl::Unit::Vision(block) = unit else {
             unreachable!()
         };
@@ -15670,7 +15666,7 @@ fn load_neutral_qwen_vl_pipeline(
     for index in 0..target_args.text.num_hidden_layers as usize {
         let unit = binding_architecture
             .construct_unit(decoder_group, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let eredu_architectures::qwen::vl::Unit::Text(block) = unit else {
             unreachable!()
         };
@@ -15696,7 +15692,7 @@ fn load_neutral_qwen_vl_pipeline(
             geometry,
             stream,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Some(layout)
     } else {
         None
@@ -15719,7 +15715,7 @@ fn load_neutral_qwen_vl_pipeline(
     }
     let complete_state = architecture
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let ownership_probe = info
         .placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
@@ -15755,7 +15751,7 @@ fn load_neutral_qwen_vl_pipeline(
                 .architecture
                 .construct_unit(vision_group, index, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     stage.layers = stage
@@ -15765,7 +15761,7 @@ fn load_neutral_qwen_vl_pipeline(
                 .architecture
                 .construct_unit(decoder_group, index, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let static_roles = parameter_description.select_static_roles(&stage.partition);
@@ -15775,7 +15771,7 @@ fn load_neutral_qwen_vl_pipeline(
                 let source_architecture = eredu_architectures::qwen::vl::LayeredModel::<
                     MlxNeuralBackend,
                 >::new(source_args.clone(), stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 let source_quantization =
                     BoundPipelineBindings::new(&binding_adapter, &source_architecture);
                 let target_quantization =
@@ -15831,7 +15827,7 @@ fn load_neutral_qwen_vl_pipeline(
             let binding_layer = binding_architecture
                 .construct_unit(vision_group, index, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
                 &binding_architecture,
                 vision_group,
@@ -15859,7 +15855,7 @@ fn load_neutral_qwen_vl_pipeline(
             let binding_layer = binding_architecture
                 .construct_unit(decoder_group, index, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
                 &binding_architecture,
                 decoder_group,
@@ -15934,14 +15930,14 @@ fn load_neutral_qwen_vl_pipeline(
                 architecture
                     .construct_unit(group, index, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
             |ordinal, _layer, store| {
                 if ordinal < vision_count {
                     let binding_layer = binding_architecture
                         .construct_unit(vision_group, vision_start + ordinal, stream)
                         .map(MlxModule::new)
-                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                     adapter.cartesian_layer_bindings(
                         &binding_architecture,
                         vision_group,
@@ -15956,7 +15952,7 @@ fn load_neutral_qwen_vl_pipeline(
                     let binding_layer = binding_architecture
                         .construct_unit(decoder_group, index, stream)
                         .map(MlxModule::new)
-                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                     adapter.cartesian_layer_bindings(
                         &binding_architecture,
                         decoder_group,
@@ -15988,7 +15984,7 @@ fn load_neutral_qwen_vl_pipeline(
     if let Some(options) = expert_cache_options {
         let catalog =
             eredu_architectures::qwen::expert_residency_catalog(store.as_ref(), &source_args.text)
-                .map_err(Error::UnsupportedArchitecture)?;
+                .map_err(Error::ArchitectureModel)?;
         let units = catalog
             .into_iter()
             .filter(|unit| stage.range().contains(&unit.owner_unit()))
@@ -16067,14 +16063,14 @@ impl QwenPipelinePartition {
         };
         let architecture =
             eredu_architectures::qwen::LayeredModel::<MlxNeuralBackend>::new(args.clone(), stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let layers = range
             .clone()
             .map(|layer| {
                 architecture
                     .construct_unit(layer, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DecoderPipelineBuilder {
@@ -16154,7 +16150,7 @@ impl MuseGlimmerPipelinePartition {
                 MlxKeyValueState,
             >>::begin_forward(&mut self.architecture, model_input, &mut state, stream)
         };
-        let forward = forward.map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let forward = forward.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(MuseGlimmerPlacedState::new(forward, state))
     }
 
@@ -16198,7 +16194,7 @@ impl MuseGlimmerPipelinePartition {
                     >>::build_unit(
                         &self.architecture, vision_group, index, stream
                     )
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
                 );
                 populate_module_from_lease(
                     &mut layer,
@@ -16242,7 +16238,7 @@ impl MuseGlimmerPipelinePartition {
                         stream,
                     )
                 }
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 state.forward.hidden = hidden;
                 synchronize_outputs([state.hidden().as_array()])?;
                 drop(transfer);
@@ -16296,7 +16292,7 @@ impl MuseGlimmerPipelinePartition {
                         stream,
                     )
                 }
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 state.forward.hidden = hidden;
             }
         }
@@ -16347,7 +16343,7 @@ impl MuseGlimmerPipelinePartition {
                 tensor_group,
                 stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let args = self.architecture.args().clone();
         let assignment = self.expert_assignment.clone();
         let expert_cache = self.expert_storage.cache();
@@ -16444,11 +16440,11 @@ impl MuseGlimmerPipelinePartition {
                             group,
                             execution.stream(),
                         )
-                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
                 } else {
                     self.architecture
                         .finish_partition_text(crate::composition::tensor_ref(&hidden), stream)
-                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?
                 };
             Ok(PipelineStageOutput::Logits(logits.into_array()))
         } else {
@@ -16629,7 +16625,7 @@ impl Gemma4PipelinePartition {
                         per_layer,
                         &mut state,
                     )
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?
             }
         };
         forward
@@ -16728,12 +16724,12 @@ impl Gemma4PipelinePartition {
                         parallel,
                         stream,
                     )
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?
                 }
                 None => self
                     .architecture
                     .project_pipeline_logits(&forward.hidden, stream)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             };
             Ok(PipelineStageOutput::Logits(logits.into_array()))
         } else {
@@ -16875,7 +16871,7 @@ impl InklingPipelinePartition {
         let mut forward = self
             .architecture
             .begin_routed_text_partition(partition_input, tensor_group, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let args = self.args().clone();
         let assignment = self.expert_assignment.clone();
         let expert_cache = self.expert_storage.cache();
@@ -16968,7 +16964,7 @@ impl InklingPipelinePartition {
                         .architecture
                         .project_target_logits(crate::composition::tensor_ref(&hidden), stream),
                 }
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?
                 .into_array(),
                 hidden,
             })
@@ -17566,7 +17562,7 @@ fn load_gpt_oss_pipeline(
     )?;
     for layer in 0..target_args.num_hidden_layers as usize {
         let block = gpt_oss::new_block::<MlxNeuralBackend>(&target_args, layer, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         parameter_groups.extend(
             gpt_oss::layer_parallel_parameter_groups::<MlxNeuralBackend>(
                 &block,
@@ -17590,7 +17586,7 @@ fn load_gpt_oss_pipeline(
                 geometry,
                 stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
         );
         Some(layout)
     } else {
@@ -17620,7 +17616,7 @@ fn load_gpt_oss_pipeline(
         .as_ref()
         .unwrap()
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = stage
         .architecture
@@ -17992,14 +17988,14 @@ impl GptOssPipelinePartition {
             neutral_gpt_oss::GptOssPipelineBindings::new()
         };
         let architecture = gpt_oss::LayeredModel::<MlxNeuralBackend>::new(args.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let layers = range
             .clone()
             .map(|layer| {
                 architecture
                     .construct_unit(layer, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DecoderPipelineBuilder {
@@ -18066,7 +18062,7 @@ fn load_lfm2_pipeline(
         target_args.clone(),
         stream,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut parameter_groups = eredu_architectures::lfm2::static_parallel_parameter_groups::<
         MlxNeuralBackend,
     >(global_architecture.static_modules())?;
@@ -18075,7 +18071,7 @@ fn load_lfm2_pipeline(
     for index in 0..target_args.num_hidden_layers as usize {
         let block = global_architecture
             .construct_unit(global_decoder_group, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         parameter_groups.extend(eredu_architectures::lfm2::layer_parallel_parameter_groups(
             &block,
             &target_args,
@@ -18097,7 +18093,7 @@ fn load_lfm2_pipeline(
         (*geometry).clone(),
         stream,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let placement = Arc::new(decoder_architecture_transport::<_, MlxHybridState>(
         &architecture,
         topology.pipeline_parallel_size,
@@ -18280,7 +18276,7 @@ fn load_lfm2_pipeline(
                 architecture
                     .construct_unit(decoder_group, global_layer, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
             |global_layer, layer, store| {
                 binding_adapter.cartesian_layer_bindings(
@@ -18512,7 +18508,7 @@ impl Lfm2PipelinePartition {
         self.architecture
             .construct_unit(group, index, stream)
             .map(MlxModule::new)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 }
 
@@ -18567,7 +18563,7 @@ fn load_nemotron_h_pipeline(
             target_args.clone(),
             stream,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut parameter_groups = eredu_architectures::nemotron_h::static_parallel_parameter_groups::<
         MlxNeuralBackend,
     >(global_architecture.static_modules())?;
@@ -18587,7 +18583,7 @@ fn load_nemotron_h_pipeline(
     for index in 0..target_units {
         let unit = global_architecture
             .construct_unit(decoder_group, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         parameter_groups.extend(
             eredu_architectures::nemotron_h::unit_parallel_parameter_groups(
                 &unit,
@@ -18600,7 +18596,7 @@ fn load_nemotron_h_pipeline(
         for index in 0..prediction_pattern {
             let unit = global_architecture
                 .construct_unit(prediction_group, index, stream)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let flat = target_units + depth * prediction_pattern + index;
             parameter_groups.extend(
                 eredu_architectures::nemotron_h::unit_parallel_parameter_groups(
@@ -18627,7 +18623,7 @@ fn load_nemotron_h_pipeline(
             (*geometry).clone(),
             stream,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let runtime_state = architecture
         .runtime_state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -18872,7 +18868,7 @@ fn load_nemotron_h_pipeline(
                 architecture
                     .construct_unit(decoder_group, global_layer, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
             |global_layer, layer, store| {
                 binding_adapter.cartesian_layer_bindings(
@@ -19005,7 +19001,7 @@ impl NemotronHPipelinePartition {
         self.architecture
             .construct_unit(group, index, stream)
             .map(MlxModule::new)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     fn forward_target(
@@ -19094,7 +19090,7 @@ impl NemotronHPipelinePartition {
                 ),
             }
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let mut forward = forward;
         let auxiliary = PipelineAuxiliaryState::new(
             self.partition
@@ -19230,8 +19226,7 @@ impl NemotronHPipelinePartition {
                     .architecture
                     .finish_partition_target(crate::composition::tensor_ref(&hidden), stream),
             };
-            let logits =
-                logits.map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            let logits = logits.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             Ok(PipelineStageOutput::EmbeddedMtpLogits {
                 logits: logits.into_array(),
                 hidden: mtp_hidden,
@@ -19841,13 +19836,13 @@ fn load_neutral_qwen_hybrid_pipeline(
             target_args.clone(),
             stream,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut architecture =
         eredu_architectures::qwen::hybrid::LayeredModel::<MlxNeuralBackend>::new(
             target_args.clone(),
             stream,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut parameter_groups =
         eredu_architectures::decoder::static_parallel_parameter_groups::<MlxNeuralBackend>(
             &binding_architecture.static_modules().embeddings,
@@ -19862,7 +19857,7 @@ fn load_neutral_qwen_hybrid_pipeline(
                 MlxNeuralBackend,
                 MlxHybridState,
             >>::build_unit(&binding_architecture, decoder_group, layer, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         parameter_groups.extend(
             eredu_architectures::qwen::hybrid::unit_parallel_parameter_groups(
                 &unit,
@@ -19880,7 +19875,7 @@ fn load_neutral_qwen_hybrid_pipeline(
                 MlxNeuralBackend,
                 MlxHybridState,
             >>::build_unit(&binding_architecture, prediction_group, 0, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         parameter_groups.extend(
             eredu_architectures::qwen::hybrid::unit_parallel_parameter_groups(
                 &unit,
@@ -19905,7 +19900,7 @@ fn load_neutral_qwen_hybrid_pipeline(
                 geometry,
                 stream,
             )
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Some(layout)
     } else {
         None
@@ -19928,7 +19923,7 @@ fn load_neutral_qwen_hybrid_pipeline(
     }
     let complete_state = architecture
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let local_state = decoder_partition_state_layout(&complete_state, range.clone())?;
     let geometry = architecture.shared_parallel_geometry();
     let ownership_probe = info
@@ -19969,7 +19964,7 @@ fn load_neutral_qwen_hybrid_pipeline(
                 .architecture
                 .construct_unit(decoder_group, global_layer, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let owns_mtp = info.is_last && stage.bindings.embedded_mtp_len(&stage.architecture) > 0;
@@ -19986,7 +19981,7 @@ fn load_neutral_qwen_hybrid_pipeline(
                 MlxHybridState,
             >>::build_unit(&stage.architecture, group, 0, stream)
             .map(MlxModule::new)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             stage.prediction_layers.push(vec![unit]);
         }
     }
@@ -20055,7 +20050,7 @@ fn load_neutral_qwen_hybrid_pipeline(
             let binding_layer = binding_architecture
                 .construct_unit(decoder_group, global_layer, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
                 &binding_architecture,
                 decoder_group,
@@ -20105,7 +20100,7 @@ fn load_neutral_qwen_hybrid_pipeline(
             let binding_layer = binding_architecture
                 .construct_unit(prediction_group, 0, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
                 &binding_architecture,
                 prediction_group,
@@ -20171,13 +20166,13 @@ fn load_neutral_qwen_hybrid_pipeline(
                 streamed_architecture
                     .construct_unit(decoder_group, global_layer, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
             |global_layer, _layer, store| {
                 let binding_layer = binding_architecture
                     .construct_unit(decoder_group, global_layer, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 binding_adapter.cartesian_layer_bindings(
                     &binding_architecture,
                     decoder_group,
@@ -20322,10 +20317,10 @@ fn load_neutral_qwen_conditional_pipeline(
     let range = topology.layer_range(source.text.num_hidden_layers as usize)?;
     let binding_architecture =
         eredu_architectures::qwen::hybrid::ConditionalLayeredModel::new(target.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut architecture =
         eredu_architectures::qwen::hybrid::ConditionalLayeredModel::new(target.clone(), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let static_modules = <eredu_architectures::qwen::hybrid::ConditionalLayeredModel<
         MlxNeuralBackend,
     > as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
@@ -20357,7 +20352,7 @@ fn load_neutral_qwen_conditional_pipeline(
     for index in 0..vision.layer_count() {
         let unit = binding_architecture
             .construct_unit(vision_group, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let eredu_architectures::qwen::hybrid::ConditionalUnit::Vision(block) = unit else {
             unreachable!()
         };
@@ -20373,7 +20368,7 @@ fn load_neutral_qwen_conditional_pipeline(
     for index in 0..target.text.num_hidden_layers as usize {
         let unit = binding_architecture
             .construct_unit(decoder_group, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let eredu_architectures::qwen::hybrid::ConditionalUnit::Target(block) = unit else {
             unreachable!()
         };
@@ -20391,7 +20386,7 @@ fn load_neutral_qwen_conditional_pipeline(
             architecture_prediction_group::<_, MlxHybridState>(&binding_architecture, depth)?;
         let unit = binding_architecture
             .construct_unit(prediction_group, 0, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let eredu_architectures::qwen::hybrid::ConditionalUnit::Prediction(unit) = unit else {
             unreachable!()
         };
@@ -20416,7 +20411,7 @@ fn load_neutral_qwen_conditional_pipeline(
         architecture = eredu_architectures::qwen::hybrid::ConditionalLayeredModel::<
                 MlxNeuralBackend,
             >::new_parallel(target.clone(), geometry, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Some(layout)
     } else {
         None
@@ -20439,7 +20434,7 @@ fn load_neutral_qwen_conditional_pipeline(
     }
     let complete_state = architecture
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let ownership_probe = info
         .placement
         .realize_architecture_partition::<MlxNeuralBackend, MlxHybridState, _, _, _>(
@@ -20485,7 +20480,7 @@ fn load_neutral_qwen_conditional_pipeline(
                 .architecture
                 .construct_unit(vision_group, index, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     stage.layers = stage
@@ -20495,7 +20490,7 @@ fn load_neutral_qwen_conditional_pipeline(
                 .architecture
                 .construct_unit(decoder_group, index, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let owns_mtp =
@@ -20514,7 +20509,7 @@ fn load_neutral_qwen_conditional_pipeline(
                 .architecture
                 .construct_unit(prediction_group, 0, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             stage.prediction_layers.push(vec![unit]);
         }
     }
@@ -20588,7 +20583,7 @@ fn load_neutral_qwen_conditional_pipeline(
             let binding_layer = binding_architecture
                 .construct_unit(vision_group, index, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
                 &binding_architecture,
                 vision_group,
@@ -20615,7 +20610,7 @@ fn load_neutral_qwen_conditional_pipeline(
             let binding_layer = binding_architecture
                 .construct_unit(decoder_group, index, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
                 &binding_architecture,
                 decoder_group,
@@ -20665,7 +20660,7 @@ fn load_neutral_qwen_conditional_pipeline(
             let binding_layer = binding_architecture
                 .construct_unit(prediction_group, 0, stream)
                 .map(MlxModule::new)
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let bindings = binding_adapter.cartesian_layer_bindings(
                 &binding_architecture,
                 prediction_group,
@@ -20738,7 +20733,7 @@ fn load_neutral_qwen_conditional_pipeline(
                 streamed_architecture
                     .construct_unit(group, index, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
             |ordinal, _layer, store| {
                 let (group, index) = if ordinal < vision_count {
@@ -20749,7 +20744,7 @@ fn load_neutral_qwen_conditional_pipeline(
                 let binding_layer = binding_architecture
                     .construct_unit(group, index, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                 adapter.cartesian_layer_bindings(
                     &binding_architecture,
                     group,
@@ -20891,7 +20886,7 @@ fn load_kimi_linear_pipeline(
             target_args.clone(),
             stream,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mut parameter_groups = eredu_architectures::kimi_linear::static_parallel_parameter_groups::<
         MlxNeuralBackend,
     >(global_architecture.static_modules())?;
@@ -20900,7 +20895,7 @@ fn load_kimi_linear_pipeline(
     for index in 0..target_args.num_hidden_layers as usize {
         let block = global_architecture
             .construct_unit(global_decoder_group, index, stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         parameter_groups.extend(
             eredu_architectures::kimi_linear::layer_parallel_parameter_groups(
                 &block,
@@ -20925,7 +20920,7 @@ fn load_kimi_linear_pipeline(
             (*geometry).clone(),
             stream,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let placement = Arc::new(decoder_architecture_transport::<_, MlxHybridState>(
         &architecture,
         topology.pipeline_parallel_size,
@@ -21110,7 +21105,7 @@ fn load_kimi_linear_pipeline(
                 architecture
                     .construct_unit(decoder_group, global_layer, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
             },
             |global_layer, layer, store| {
                 binding_adapter.cartesian_layer_bindings(
@@ -21344,7 +21339,7 @@ impl KimiLinearPipelinePartition {
         self.architecture
             .construct_unit(group, index, stream)
             .map(MlxModule::new)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 }
 
@@ -21431,7 +21426,7 @@ fn load_neutral_inkling_pipeline(
             Arc::clone(&geometry),
             stream,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let runtime_state = architecture
         .runtime_state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -21644,7 +21639,7 @@ fn load_neutral_inkling_pipeline(
                         MlxHybridState,
                     >>::build_unit(architecture, vision_group, vision_start + ordinal, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
                 } else {
                     <eredu_architectures::inkling::LayeredModel<MlxNeuralBackend> as LayeredArchitecture<
                         MlxNeuralBackend,
@@ -21656,7 +21651,7 @@ fn load_neutral_inkling_pipeline(
                         stream,
                     )
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
                 }
             },
             |ordinal, layer, store| {
@@ -21705,7 +21700,7 @@ fn load_neutral_inkling_pipeline(
             .expect("Inkling assignment");
         let catalog =
             eredu_architectures::inkling::expert_residency_catalog(&source_args, store.as_ref())
-                .map_err(Error::UnsupportedArchitecture)?;
+                .map_err(Error::ArchitectureModel)?;
         let units = catalog
             .into_iter()
             .filter(|unit| stage.range().contains(&unit.owner_unit()))
@@ -21848,7 +21843,7 @@ fn load_neutral_gemma4_pipeline(
         (*geometry).clone(),
         stream,
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let runtime_state = architecture
         .runtime_state_layout()
         .map_err(|error| Error::Parallel(error.to_string()))?;
@@ -21951,7 +21946,7 @@ fn load_neutral_gemma4_pipeline(
                     (*geometry).clone(),
                     stream,
                 )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             let source_quantization =
                 BoundPipelineBindings::new(&binding_adapter, &source_architecture);
             let target_quantization =
@@ -22114,7 +22109,7 @@ fn load_neutral_gemma4_pipeline(
                         MlxHybridState,
                     >>::build_unit(architecture, vision_group, vision_start + ordinal, stream)
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
                 } else if ordinal < media_count {
                     <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
                         MlxNeuralBackend,
@@ -22126,7 +22121,7 @@ fn load_neutral_gemma4_pipeline(
                         stream,
                     )
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
                 } else {
                     <eredu_architectures::gemma4::LayeredModel<MlxNeuralBackend> as eredu_runtime::LayeredArchitecture<
                         MlxNeuralBackend,
@@ -22138,7 +22133,7 @@ fn load_neutral_gemma4_pipeline(
                         stream,
                     )
                     .map(MlxModule::new)
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))
                 }
             },
             |ordinal, layer, store| {
@@ -22243,7 +22238,7 @@ fn resolve_pipeline_safetensors_store(
 ) -> Result<SharedCheckpointSource, Error> {
     let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), plan)
         .map_err(|validation| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "{identity} pipeline checkpoint contract did not resolve: {validation:?}"
             ))
         })?;

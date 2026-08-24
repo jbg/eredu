@@ -173,7 +173,7 @@ impl InklingBindings {
             MlxNeuralBackend,
             MlxHybridState,
         >>::group_unit_count(architecture, group)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     pub fn layer_bindings(
@@ -218,7 +218,7 @@ impl InklingBindings {
                 MlxNeuralBackend,
                 MlxHybridState,
             >>::unit_path(architecture, group, index)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             shard_layer_bindings(bindings, &root, store, layout)
         } else {
             Ok(bindings)
@@ -284,7 +284,7 @@ impl Execution {
             MlxHybridState,
         >>::execution_graph(architecture)
         .map(|graph| graph.output())
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 }
 
@@ -336,7 +336,7 @@ fn forward_mtp_draft_parallel_architecture(
 ) -> Result<crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput, Error> {
     let embeddings = architecture
         .mtp_token_embeddings_parallel(tokens, group, stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let output = architecture
         .forward_mtp_step(
             hidden,
@@ -346,10 +346,10 @@ fn forward_mtp_draft_parallel_architecture(
             state.layers_mut(),
             stream,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let logits = architecture
         .project_mtp_logits_parallel(&output.hidden, group, stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(
         crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
             logits,
@@ -416,7 +416,7 @@ impl InklingModel {
             0,
             topology,
         )
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))
     }
 
     pub fn prompt_cache_layer_prefix_offsets(&self) -> Result<Vec<i32>, Error> {
@@ -643,7 +643,7 @@ impl InklingModel {
             ));
         }
         if state.target.layout() != &self.state_layout {
-            return Err(Error::UnsupportedArchitecture(
+            return Err(Error::ArchitectureModel(
                 "Inkling cache layout mismatch".into(),
             ));
         }
@@ -712,17 +712,17 @@ impl InklingModel {
             drop(provider);
             self.expert_cache = Some(expert_cache);
             let (logits, _) =
-                result.map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                result.map_err(|error| Error::ArchitectureModel(error.to_string()))?;
             return Ok(
                 crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
                     logits,
                     hidden: final_text_hidden.ok_or_else(|| {
-                        Error::UnsupportedArchitecture(
+                        Error::ArchitectureModel(
                             "Inkling text graph produced no target activation".into(),
                         )
                     })?,
                     tokens: ordered_tokens.ok_or_else(|| {
-                        Error::UnsupportedArchitecture(
+                        Error::ArchitectureModel(
                             "Inkling text graph retained no ordered token identity".into(),
                         )
                     })?,
@@ -762,17 +762,17 @@ impl InklingModel {
             ),
             Execution::ParallelResident(_) | Execution::ParallelBounded(_) => unreachable!(),
         }
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         Ok(
             crate::composition::mlx::speculative::embedded::EmbeddedMtpOutput {
                 logits: result.0,
                 hidden: final_text_hidden.ok_or_else(|| {
-                    Error::UnsupportedArchitecture(
+                    Error::ArchitectureModel(
                         "Inkling text graph produced no target activation".into(),
                     )
                 })?,
                 tokens: ordered_tokens.ok_or_else(|| {
-                    Error::UnsupportedArchitecture(
+                    Error::ArchitectureModel(
                         "Inkling text graph retained no ordered token identity".into(),
                     )
                 })?,
@@ -1195,9 +1195,9 @@ impl PreparedInklingInput {
                     let architecture_input =
                         input::prepared_media_input(part.modality, value, part.metadata)?;
                     let plan = media_plan::inkling_ingress(args, &architecture_input)
-                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                     let count = usize::try_from(plan.placeholder_count).map_err(|_| {
-                        Error::UnsupportedArchitecture(
+                        Error::ArchitectureModel(
                             "Inkling image placeholder span exceeds host capacity".into(),
                         )
                     })?;
@@ -1213,14 +1213,14 @@ impl PreparedInklingInput {
                     let architecture_input =
                         input::prepared_media_input(part.modality, value, part.metadata)?;
                     let plan = media_plan::inkling_ingress(args, &architecture_input)
-                        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
                     let count = usize::try_from(plan.placeholder_count).map_err(|_| {
-                        Error::UnsupportedArchitecture(
+                        Error::ArchitectureModel(
                             "Inkling audio placeholder span exceeds host capacity".into(),
                         )
                     })?;
                     let retained_frames = i32::try_from(plan.placeholder_count).map_err(|_| {
-                        Error::UnsupportedArchitecture(
+                        Error::ArchitectureModel(
                             "Inkling audio placeholder span exceeds tensor capacity".into(),
                         )
                     })?;
@@ -1250,7 +1250,7 @@ impl PreparedInklingInput {
                     projected.push(Some(crate::MlxTensor::from_array(value.clone())));
                 }
                 (modality, _) => {
-                    return Err(Error::UnsupportedArchitecture(format!(
+                    return Err(Error::ArchitectureModel(format!(
                         "Inkling does not accept this {} payload",
                         modality.as_str()
                     )))
@@ -1562,11 +1562,11 @@ fn resolve_store(
     store: SharedCheckpointSource,
     args: &ModelArgs,
 ) -> Result<SharedCheckpointSource, Error> {
-    let plan = eredu_architectures::inkling::safetensors_plan(args)
-        .map_err(Error::UnsupportedArchitecture)?;
+    let plan =
+        eredu_architectures::inkling::safetensors_plan(args).map_err(Error::ArchitectureModel)?;
     let resolved = eredu_checkpoint::validation::resolve_safetensors_plan(store.as_ref(), &plan)
         .map_err(|error| {
-            Error::UnsupportedArchitecture(format!(
+            Error::ArchitectureModel(format!(
                 "Inkling checkpoint contract did not resolve: {error:?}"
             ))
         })?;
@@ -1608,9 +1608,9 @@ fn quantize_store(
     target.text_config.weight_quantization = Some(quantization);
     target.text_config.quantized_weight_configs = None;
     let source_architecture = NeutralArchitecture::new(source.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let target_architecture = NeutralArchitecture::new(target.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let source_layout = architecture_execution_layout::<_, MlxHybridState>(&source_architecture)?;
     let target_layout = architecture_execution_layout::<_, MlxHybridState>(&target_architecture)?;
     if source_layout != target_layout {
@@ -1686,7 +1686,7 @@ fn load_store(
     external_experts: bool,
 ) -> Result<InklingModel, Error> {
     let mut architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let expert_targets = Arc::new(
         architecture
             .parameter_description(stream)
@@ -1742,14 +1742,14 @@ fn load_store(
         Execution::Bounded(LayerwiseRuntime::new(architecture, policy))
     };
     let state_layout = eredu_architectures::inkling::state_layout(&args)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let mtp_state_layout = eredu_architectures::inkling::mtp_state_layout(&args)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let prompt_state_layout = eredu_architectures::inkling::composite_state_layout(
         &state_layout,
         mtp_state_layout.as_ref(),
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(InklingModel {
         state_layout,
         mtp_state_layout,
@@ -1771,7 +1771,7 @@ fn load_parallel_store(
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
     let global_architecture = NeutralArchitecture::new(args.clone(), stream)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let global_execution =
         architecture_execution_layout::<_, MlxHybridState>(&global_architecture)?;
     let decoder_groups = (0..global_execution.group_count())
@@ -1813,10 +1813,10 @@ fn load_parallel_store(
     );
     let mut architecture =
         NeutralArchitecture::new_parallel(args.clone(), Arc::clone(&geometry), stream)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let state_layout = architecture
         .runtime_state_layout()
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let global_static = MlxModule::new(
         <NeutralArchitecture as LayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::static_modules(
             &global_architecture,
@@ -1888,7 +1888,7 @@ fn load_parallel_store(
                         address.index(),
                         stream,
                     )
-                    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                    .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
                 );
             let recipes =
                 crate::composition::inkling_expert::module_recipes(&global, &binding_args, store)?;
@@ -1938,12 +1938,12 @@ fn load_parallel_store(
         Execution::ParallelBounded(Box::new(LayerwiseRuntime::new(architecture, policy)))
     };
     let mtp_state_layout = eredu_architectures::inkling::mtp_state_layout(&args)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let prompt_state_layout = eredu_architectures::inkling::composite_state_layout(
         &state_layout,
         mtp_state_layout.as_ref(),
     )
-    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok(InklingModel {
         args,
         state_layout,
@@ -1965,7 +1965,7 @@ pub fn load_safetensors_tensor_parallel(
     weights_stream: &Stream,
 ) -> Result<InklingModel, Error> {
     let args = ModelArgs::from_hf_json(&serde_json::to_vec(artifact.config()?)?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_store(store, &args)?;
     load_parallel_store(store, args, layer_policy, build, stream, weights_stream)
@@ -2018,7 +2018,7 @@ pub fn load_safetensors(
 ) -> Result<InklingModel, Error> {
     let expert_options = residency.expert_cache();
     let args = ModelArgs::from_hf_json(&serde_json::to_vec(artifact.config()?)?)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let store = artifact.store();
     let store = resolve_store(store, &args)?;
     let requested = quantization
@@ -2089,7 +2089,7 @@ fn open_gguf_store(
     max_cached_readers: usize,
 ) -> Result<(SharedCheckpointSource, ModelArgs), Error> {
     let mut args = ModelArgs::from_gguf_metadata(metadata)
-        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let translation_args = args.clone();
     let mut text_formats = gguf_quantization_configs(checkpoint, |name| {
         eredu_architectures::inkling::translate_gguf_weight_name_for_model(name, &translation_args)
@@ -2105,10 +2105,10 @@ fn open_gguf_store(
         )?;
         args = args
             .with_gguf_projector_metadata(metadata, projector_metadata, formats)
-            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     }
     let text_plan =
-        eredu_architectures::inkling::gguf_plan(&args).map_err(Error::UnsupportedArchitecture)?;
+        eredu_architectures::inkling::gguf_plan(&args).map_err(Error::ArchitectureModel)?;
     let translation_args = args.clone();
     let mut builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
         .max_cached_readers(max_cached_readers)?
@@ -2120,7 +2120,7 @@ fn open_gguf_store(
         })?;
     if let Some(projector) = projector {
         let plan = eredu_architectures::inkling::mmproj_gguf_plan(&args)
-            .map_err(Error::UnsupportedArchitecture)?;
+            .map_err(Error::ArchitectureModel)?;
         builder = builder.add_checkpoint(projector.catalog().clone(), &plan, |name| {
             eredu_architectures::inkling::translate_mmproj_weight_name(name)
         })?;
