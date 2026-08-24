@@ -11,7 +11,7 @@ on:
       - "safemlx/**"
       - "safemlx-sys/**"
       - "eredu/**"
-      - "eredu-text/**"
+      - "eredu-*/**"
       - "safemlx-macros/**"
       - "safemlx-internal-macros/**"
       - "validation/**"

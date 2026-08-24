@@ -83,7 +83,7 @@ plus two execution units.
 Build and run the current candidate with:
 
 ```sh
-cargo build -p eredu --release --example llama_residency
+cargo build -p eredu-backend-mlx --release --example llama_residency
 target/release/examples/llama_residency "$MODEL_DIR" \
   --fully-resident --prompt-tokens "$PROMPT_TOKENS" \
   --decode-tokens 32 --mapped-shards 1

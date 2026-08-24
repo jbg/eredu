@@ -7,15 +7,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
-      - "eredu-gguf/**"
       - "safemlx/**"
       - "safemlx-sys/**"
       - "eredu/**"
-      - "eredu-text/**"
-      - "eredu-codec/**"
-      - "eredu-nn/**"
+      - "eredu-*/**"
       - "safemlx-tests/**"
-      - "eredu-cli/**"
   push:
     branches: [main]
   workflow_dispatch:
@@ -141,7 +137,9 @@ jobs:
       - name: Build the linked eredu CLI
         run: cargo build -j 1 -p eredu-cli --features cuda
       - name: Compile CUDA codec and integration tests
-        run: cargo test -j 1 -p eredu-codec -p safemlx-tests --features cuda --no-run
+        run: |
+          cargo test -j 1 -p eredu-backend-mlx --features "cuda,codec" --test mimi_codec --no-run
+          cargo test -j 1 -p safemlx-tests --features cuda --no-run
 
   cuda-gpu-runtime:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_windows_gpu }}
@@ -161,5 +159,5 @@ jobs:
         run: cargo test -p safemlx --features cuda --lib --no-default-features
       - name: Run CUDA device and numerical smoke test
         run: cargo run --release -p safemlx --features cuda --example cuda_smoke --no-default-features
-      - name: Run eredu CUDA tests
-        run: cargo test -p eredu --features cuda
+      - name: Run Eredu MLX integration tests on CUDA
+        run: cargo test -p eredu-mlx-tests --features cuda

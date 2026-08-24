@@ -44,7 +44,7 @@ RUN --mount=type=bind,from=rust-toolchain,source=/usr/local/cargo/bin,target=/op
     cd /src; \
     rustc --version | grep -F 'rustc 1.89.0'; \
     cargo build --locked --release \
-        -p eredu \
+        -p eredu-backend-mlx \
         --no-default-features \
         --features cuda \
         --example checkpoint_probe; \
