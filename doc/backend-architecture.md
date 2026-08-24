@@ -245,6 +245,11 @@ the normalized configuration. In particular, Qwen3-VL DeepStack and Qwen3.5
 window-scheduled position, attention, and merger semantics are selected while
 parsing the projector and consumed unchanged by inspection, checkpoint
 planning, and execution.
+Qwen projector admission also produces its GGUF checkpoint plan from the
+admitted family composite. Family eligibility, required vision mode, and
+decoder/projector width compatibility are architecture policy; MLX structural
+validation and materialization consume that composite plan without rebuilding
+those rules from independently parsed text and projector configurations.
 Packed recipes expose format semantics rather than a concrete accelerator's
 storage units. In particular, canonical MXFP4 expert recipes describe logical
 F4 values regardless of whether a source stores byte blocks or integer words;

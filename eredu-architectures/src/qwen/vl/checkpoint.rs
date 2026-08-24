@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeCatalog},
-    schema::SafetensorsCheckpointPlan,
+    schema::{GgufCheckpointPlan, SafetensorsCheckpointPlan},
     store::TensorSelection,
     WeightQuantization,
 };
@@ -26,6 +26,23 @@ pub fn load_time_quantization(
         .validate_for(vision::VisionMode::DeepStack)
         .map_err(|error| error.to_string())?;
     Ok(target)
+}
+
+/// Builds the projector checkpoint contract from an admitted Qwen3-VL composite.
+///
+/// Family mode and decoder/projector width compatibility are revalidated here
+/// so a backend cannot construct a projector plan from unrelated parts.
+pub fn projector_gguf_plan(args: &ModelArgs) -> Result<GgufCheckpointPlan, String> {
+    args.vision
+        .validate_for(vision::VisionMode::DeepStack)
+        .map_err(|error| error.to_string())?;
+    if args.vision.out_hidden_size != args.text.hidden_size {
+        return Err(format!(
+            "Qwen3-VL projector output {} does not match text hidden size {}",
+            args.vision.out_hidden_size, args.text.hidden_size
+        ));
+    }
+    vision::gguf_plan(&args.vision, args.text.hidden_size)
 }
 
 /// Builds one strict catalog for the ordinary Qwen decoder plus shared vision tower.
@@ -156,9 +173,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn composite_plan_contains_one_text_and_one_shared_vision_namespace() {
-        let args = crate::qwen::vl::model_args_from_config_value(&json!({
+    fn model_args() -> ModelArgs {
+        crate::qwen::vl::model_args_from_config_value(&json!({
             "model_type":"qwen3_vl", "image_token_id":61, "video_token_id":62,
             "text_config": {"model_type":"qwen3_vl_text", "hidden_size":32,
                 "num_hidden_layers":1, "intermediate_size":64, "num_attention_heads":4,
@@ -170,7 +186,12 @@ mod tests {
                 "spatial_merge_size":2,"temporal_patch_size":2,"out_hidden_size":32,
                 "deepstack_visual_indexes":[0]}
         }))
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn composite_plan_contains_one_text_and_one_shared_vision_namespace() {
+        let args = model_args();
         let plan = safetensors_plan(&args).unwrap();
         assert!(plan
             .common_tensors
@@ -184,6 +205,24 @@ mod tests {
             .common_tensors
             .iter()
             .any(|tensor| tensor.key.starts_with("patch_embed.")));
+    }
+
+    #[test]
+    fn projector_plan_owns_family_mode_and_width_compatibility() {
+        let admitted = model_args();
+        assert!(projector_gguf_plan(&admitted).is_ok());
+
+        let mut wrong_width = admitted.clone();
+        wrong_width.vision.out_hidden_size = 16;
+        assert!(projector_gguf_plan(&wrong_width)
+            .unwrap_err()
+            .contains("does not match text hidden size"));
+
+        let mut wrong_mode = admitted;
+        wrong_mode.vision.mode = vision::VisionMode::WindowScheduled;
+        assert!(projector_gguf_plan(&wrong_mode)
+            .unwrap_err()
+            .contains("does not match required"));
     }
 
     #[test]

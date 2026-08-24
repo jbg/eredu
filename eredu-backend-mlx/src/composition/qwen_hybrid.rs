@@ -681,7 +681,9 @@ fn prepare_hybrid_gguf_store(
         .into_iter()
         .map(|(name, format)| (name, format.into()))
         .collect();
-    let vision_plan = vision::gguf_plan(&vision, parsed.text.hidden_size)
+    parsed = hybrid::with_gguf_vision_projector(parsed, metadata, vision)
+        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let vision_plan = hybrid::conditional_projector_gguf_plan(&parsed)
         .map_err(Error::ArchitectureModel)?;
     let vision_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         projector.clone(),
@@ -689,8 +691,6 @@ fn prepare_hybrid_gguf_store(
         translate,
         max_mapped_shards,
     )?);
-    parsed = hybrid::with_gguf_vision_projector(parsed, metadata, vision)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     Ok((
         parsed,
         Arc::new(CompositeCheckpointSource::new([text, vision_source])?),

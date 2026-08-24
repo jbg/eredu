@@ -46,6 +46,34 @@ pub fn conditional_load_time_quantization(
     Ok(target)
 }
 
+/// Builds the projector checkpoint contract from an admitted conditional
+/// Qwen3.5 composite.
+///
+/// Qwen3-Next, vision-mode, and decoder/projector width compatibility remain
+/// architecture policy even when callers possess the normalized component
+/// configurations independently.
+pub fn conditional_projector_gguf_plan(
+    config: &ParsedHybridConfig,
+) -> Result<GgufCheckpointPlan, String> {
+    if config.text.variant == HybridVariant::Qwen3Next {
+        return Err("Qwen3-Next GGUF cannot attach a vision projector".into());
+    }
+    let vision = config
+        .vision
+        .as_ref()
+        .ok_or_else(|| "conditional Qwen3.5 projector plan requires vision config".to_string())?;
+    vision
+        .validate_for(crate::qwen::vision::VisionMode::WindowScheduled)
+        .map_err(|error| error.to_string())?;
+    if vision.out_hidden_size != config.text.hidden_size {
+        return Err(format!(
+            "Qwen3.5 projector output {} does not match text hidden size {}",
+            vision.out_hidden_size, config.text.hidden_size
+        ));
+    }
+    crate::qwen::vision::gguf_plan(vision, config.text.hidden_size)
+}
+
 /// Returns all derived recipes owned by Qwen hybrid static modules.
 pub fn static_recipes(
     store: &dyn CheckpointSource,
@@ -1565,36 +1593,8 @@ mod tests {
         .text
     }
 
-    #[test]
-    fn load_time_quantization_replaces_hybrid_checkpoint_formats() {
-        let mut source = config();
-        source.fp8 = Some(super::super::QwenFp8QuantizationConfig {
-            quant_method: "fp8".into(),
-            fmt: "e4m3".into(),
-            activation_scheme: "dynamic".into(),
-            weight_block_size: Some(vec![128, 128]),
-            modules_to_not_convert: Vec::new(),
-        });
-        source.linear_formats.insert(
-            "model.layers.0.self_attn.q_proj.weight".into(),
-            eredu_checkpoint::LinearFormat::Dense,
-        );
-        let quantization =
-            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
-
-        let target = load_time_quantization(&source, quantization).unwrap();
-
-        assert!(target.fp8.is_none());
-        assert_eq!(target.quantization, Some(quantization));
-        assert!(target.linear_formats.is_empty());
-        target.validate().unwrap();
-        assert!(source.fp8.is_some());
-        assert!(!source.linear_formats.is_empty());
-    }
-
-    #[test]
-    fn conditional_load_time_quantization_derives_aligned_vision_formats() {
-        let source = model_args_from_config_value(&json!({
+    fn conditional_config() -> ParsedHybridConfig {
+        model_args_from_config_value(&json!({
             "model_type": "qwen3_5",
             "image_token_id": 60,
             "video_token_id": 61,
@@ -1628,7 +1628,39 @@ mod tests {
                 "out_hidden_size": 32
             }
         }))
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn load_time_quantization_replaces_hybrid_checkpoint_formats() {
+        let mut source = config();
+        source.fp8 = Some(super::super::QwenFp8QuantizationConfig {
+            quant_method: "fp8".into(),
+            fmt: "e4m3".into(),
+            activation_scheme: "dynamic".into(),
+            weight_block_size: Some(vec![128, 128]),
+            modules_to_not_convert: Vec::new(),
+        });
+        source.linear_formats.insert(
+            "model.layers.0.self_attn.q_proj.weight".into(),
+            eredu_checkpoint::LinearFormat::Dense,
+        );
+        let quantization =
+            WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
+
+        let target = load_time_quantization(&source, quantization).unwrap();
+
+        assert!(target.fp8.is_none());
+        assert_eq!(target.quantization, Some(quantization));
+        assert!(target.linear_formats.is_empty());
+        target.validate().unwrap();
+        assert!(source.fp8.is_some());
+        assert!(!source.linear_formats.is_empty());
+    }
+
+    #[test]
+    fn conditional_load_time_quantization_derives_aligned_vision_formats() {
+        let source = conditional_config();
         let quantization =
             WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap());
 
@@ -1637,6 +1669,25 @@ mod tests {
         assert_eq!(target.text.quantization, Some(quantization));
         assert!(!target.vision.unwrap().linear_formats.is_empty());
         assert!(source.vision.unwrap().linear_formats.is_empty());
+    }
+
+    #[test]
+    fn conditional_projector_plan_owns_family_mode_and_width_compatibility() {
+        let admitted = conditional_config();
+        assert!(conditional_projector_gguf_plan(&admitted).is_ok());
+
+        let mut wrong_width = admitted.clone();
+        wrong_width.vision.as_mut().unwrap().out_hidden_size = 16;
+        assert!(conditional_projector_gguf_plan(&wrong_width)
+            .unwrap_err()
+            .contains("does not match text hidden size"));
+
+        let mut wrong_family = admitted;
+        wrong_family.text = config();
+        assert_eq!(
+            conditional_projector_gguf_plan(&wrong_family).unwrap_err(),
+            "Qwen3-Next GGUF cannot attach a vision projector"
+        );
     }
 
     fn moe_config() -> HybridConfig {

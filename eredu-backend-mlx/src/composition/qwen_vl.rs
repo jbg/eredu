@@ -1041,8 +1041,7 @@ pub fn prepare_gguf_pipeline(
     let args = vl::model_args_from_gguf_parts(text, metadata, vision)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
     let text_plan = qwen::gguf_plan(&args.text).map_err(Error::ArchitectureModel)?;
-    let vision_plan = vision::gguf_plan(&args.vision, args.text.hidden_size)
-        .map_err(Error::ArchitectureModel)?;
+    let vision_plan = vl::projector_gguf_plan(&args).map_err(Error::ArchitectureModel)?;
     let text_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &text_plan,
@@ -1116,8 +1115,7 @@ pub fn load_gguf(
     let expert_options = residency.expert_cache();
     let options = residency.layers();
     let text_plan = qwen::gguf_plan(&args.text).map_err(Error::ArchitectureModel)?;
-    let vision_plan = vision::gguf_plan(&args.vision, args.text.hidden_size)
-        .map_err(Error::ArchitectureModel)?;
+    let vision_plan = vl::projector_gguf_plan(&args).map_err(Error::ArchitectureModel)?;
     let text_source: Arc<dyn CheckpointSource> = Arc::new(open_gguf_checkpoint_source(
         checkpoint.clone(),
         &text_plan,

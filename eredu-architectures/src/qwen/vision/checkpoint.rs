@@ -176,7 +176,7 @@ pub fn translate_gguf_weight_name(name: &str, deepstack_layers: &[i32]) -> Strin
 }
 
 /// Builds the split Qwen3-VL/Qwen3.5 projector GGUF contract.
-pub fn gguf_plan(
+pub(crate) fn gguf_plan(
     vision: &VisionConfig,
     text_hidden_size: i32,
 ) -> Result<GgufCheckpointPlan, String> {

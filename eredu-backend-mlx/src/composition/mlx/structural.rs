@@ -1121,7 +1121,19 @@ pub fn validate_qwen3_vl_projector_gguf(
         Ok(vision) => vision,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    validate_neutral_qwen_projector(checkpoint, vision, text.hidden_size)
+    let composite = match eredu_architectures::qwen::vl::model_args_from_gguf_parts(
+        text,
+        model_metadata,
+        vision,
+    ) {
+        Ok(composite) => composite,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::qwen::vl::projector_gguf_plan(&composite) {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    validate_neutral_qwen_projector(checkpoint, &composite.vision, &plan)
 }
 
 pub fn validate_qwen35_projector_gguf(
@@ -1130,11 +1142,11 @@ pub fn validate_qwen35_projector_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    let text = match eredu_architectures::qwen::hybrid::model_args_from_gguf_catalog(
+    let parsed = match eredu_architectures::qwen::hybrid::model_args_from_gguf_catalog(
         &NeutralQwenGgufCatalog(model_checkpoint),
         model_metadata,
     ) {
-        Ok(parsed) => parsed.text,
+        Ok(parsed) => parsed,
         Err(error) => return invalid_geometry(error.to_string()),
     };
     let vision = match eredu_architectures::qwen::hybrid::vision_config_from_gguf_catalog(
@@ -1144,7 +1156,27 @@ pub fn validate_qwen35_projector_gguf(
         Ok(vision) => vision,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    validate_neutral_qwen_projector(checkpoint, vision, text.hidden_size)
+    let composite = match eredu_architectures::qwen::hybrid::with_gguf_vision_projector(
+        parsed,
+        model_metadata,
+        vision,
+    ) {
+        Ok(composite) => composite,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let plan = match eredu_architectures::qwen::hybrid::conditional_projector_gguf_plan(&composite)
+    {
+        Ok(plan) => plan,
+        Err(error) => return invalid_geometry(error),
+    };
+    validate_neutral_qwen_projector(
+        checkpoint,
+        composite
+            .vision
+            .as_ref()
+            .expect("admitted Qwen3.5 projector has vision config"),
+        &plan,
+    )
 }
 
 struct NeutralQwenVisionGgufCatalog<'a>(&'a GgufCheckpoint);
@@ -1168,26 +1200,16 @@ impl eredu_architectures::qwen::vision::VisionGgufCatalog for NeutralQwenVisionG
 
 fn validate_neutral_qwen_projector(
     checkpoint: &GgufCheckpoint,
-    vision: eredu_architectures::qwen::vision::VisionConfig,
-    text_hidden: i32,
+    vision: &eredu_architectures::qwen::vision::VisionConfig,
+    plan: &eredu_checkpoint::schema::GgufCheckpointPlan,
 ) -> StructuralValidation {
-    if vision.out_hidden_size != text_hidden {
-        return invalid_geometry(format!(
-            "Qwen projector output {} does not match language hidden size {text_hidden}",
-            vision.out_hidden_size
-        ));
-    }
     let deepstack = vision.deepstack_layers();
     if let Err(error) = checkpoint.catalog().translated_outputs(|name| {
         eredu_architectures::qwen::vision::translate_gguf_weight_name(name, &deepstack)
     }) {
         return invalid_geometry(error.to_string());
     }
-    let plan = match eredu_architectures::qwen::vision::gguf_plan(&vision, text_hidden) {
-        Ok(plan) => plan,
-        Err(error) => return invalid_geometry(error),
-    };
-    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
+    eredu_checkpoint::validation::validate_gguf_plan(checkpoint, plan)
 }
 fn invalid_geometry(detail: String) -> StructuralValidation {
     StructuralValidation::Invalid(vec![StructuralIssue {
