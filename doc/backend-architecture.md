@@ -200,6 +200,13 @@ Architecture implementations also provide any released-checkpoint rewrite
 recipes for their static modules, so alias and fused-layout handling does not
 reintroduce checkpoint roots into a backend.
 
+Architecture parallel plans explicitly select every encoded linear parameter
+and declare the exact scale and affine-bias companion targets. Neutral runtime
+code derives packed shapes and remaps declared sharding geometry from that
+typed declaration; it does not decide that a parameter is quantizable or
+construct companion identities from weight, projection, scale, or bias name
+suffixes.
+
 Routed expert banks retain and expose their architecture-owned construction
 specification. Resident, cached, distributed, and future backend execution
 paths all consume that same geometry, projection encoding, bias layout, and

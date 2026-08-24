@@ -18,6 +18,7 @@ pub mod capability;
 /// Authoritative model-family identity and Hugging Face/GGUF configuration parsing.
 pub mod configuration;
 pub use configuration::{GgufArchitecture, ModelKind};
+mod linear_format;
 /// Backend-neutral prepared-media admission and workspace plans.
 pub mod media_plan;
 /// Optional backend operators required by each architecture family.

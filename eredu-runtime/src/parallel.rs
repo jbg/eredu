@@ -164,6 +164,62 @@ pub struct ParameterMemberSpec {
     sharding: MemberSharding,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum LinearFormatCompanions {
+    None,
+    Scaled { scale: String, bias: Option<String> },
+}
+
+/// Architecture declaration of a linear matrix's physical checkpoint format.
+///
+/// Runtime uses this declaration only for format geometry. Architectures own
+/// eligibility and the exact identities of every physical companion.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LinearFormatParameter {
+    format: LinearFormat,
+    companions: LinearFormatCompanions,
+}
+
+impl LinearFormatParameter {
+    /// Declares an encoding with no separate physical companions.
+    pub const fn unscaled(format: LinearFormat) -> Self {
+        Self {
+            format,
+            companions: LinearFormatCompanions::None,
+        }
+    }
+
+    /// Declares an encoding with an exact scale target.
+    pub fn scaled(format: LinearFormat, scale: impl Into<String>) -> Self {
+        Self {
+            format,
+            companions: LinearFormatCompanions::Scaled {
+                scale: scale.into(),
+                bias: None,
+            },
+        }
+    }
+
+    /// Declares an encoding with exact scale and affine-bias targets.
+    pub fn affine(format: LinearFormat, scale: impl Into<String>, bias: impl Into<String>) -> Self {
+        Self {
+            format,
+            companions: LinearFormatCompanions::Scaled {
+                scale: scale.into(),
+                bias: Some(bias.into()),
+            },
+        }
+    }
+
+    const fn format(&self) -> LinearFormat {
+        self.format
+    }
+
+    const fn companions(&self) -> &LinearFormatCompanions {
+        &self.companions
+    }
+}
+
 impl ParameterMemberSpec {
     /// Creates a member with an exact pre-selection checkpoint shape.
     pub fn new(
@@ -637,17 +693,17 @@ pub fn aligned_partition_units(
 /// in the same atomic parameter group.
 pub fn expand_linear_format_parameter_groups(
     groups: Vec<ParameterGroupSpec>,
-    format: impl Fn(&str) -> LinearFormat,
+    declaration: impl Fn(&ParameterMemberSpec) -> Option<LinearFormatParameter>,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
     groups
         .into_iter()
         .map(|group| {
             let mut members = Vec::new();
             for source in group.members() {
-                members.extend(expand_linear_format_member(
-                    source,
-                    format(source.target()),
-                )?);
+                members.extend(match declaration(source) {
+                    Some(declaration) => expand_linear_format_member(source, &declaration)?,
+                    None => vec![source.clone()],
+                });
             }
             match group.partition_units() {
                 Some(mut units) => {
@@ -719,24 +775,36 @@ fn remap_linear_segments(
 
 fn expand_linear_format_member(
     source: &ParameterMemberSpec,
-    format: LinearFormat,
+    declaration: &LinearFormatParameter,
 ) -> Result<Vec<ParameterMemberSpec>, ParallelPlanError> {
     let name = source.target();
     let shape = source.global_shape();
-    let expert_bank = name.ends_with(".gate_up_proj") || name.ends_with(".down_proj");
-    if (!name.ends_with(".weight") && !expert_bank)
-        || shape.len() < 2
-        || format == LinearFormat::Dense
-    {
-        return Ok(vec![source.clone()]);
+    let format = declaration.format();
+    if format == LinearFormat::Dense {
+        return match declaration.companions() {
+            LinearFormatCompanions::None => Ok(vec![source.clone()]),
+            LinearFormatCompanions::Scaled { .. } => Err(ParallelPlanError::InvalidGroup(format!(
+                "dense linear parameter {name} declares physical companions"
+            ))),
+        };
+    }
+    if shape.len() < 2 {
+        return Err(ParallelPlanError::InvalidTensor(format!(
+            "encoded linear parameter {name} must have at least two dimensions"
+        )));
     }
     let row_axis = shape.len() - 2;
     let column_axis = shape.len() - 1;
-    let prefix = name.strip_suffix(".weight").unwrap_or(name);
     let invalid = |detail: String| ParallelPlanError::InvalidTensor(detail);
     match format {
         LinearFormat::Dense => unreachable!(),
         LinearFormat::E4M3BlockFp8(fp8) => {
+            let LinearFormatCompanions::Scaled { scale, bias: None } = declaration.companions()
+            else {
+                return Err(ParallelPlanError::InvalidGroup(format!(
+                    "block-FP8 linear parameter {name} must declare exactly one scale companion"
+                )));
+            };
             fp8.validate().map_err(|error| invalid(error.to_string()))?;
             let rows = usize::try_from(fp8.block_rows)
                 .map_err(|_| invalid(format!("invalid block rows for {name}")))?;
@@ -749,18 +817,15 @@ fn expand_linear_format_member(
                 .and_then(|value| remap_linear_segments(&value, column_axis, columns, name))?;
             Ok(vec![
                 source.clone(),
-                ParameterMemberSpec::new(
-                    if expert_bank {
-                        format!("{prefix}_scales")
-                    } else {
-                        format!("{prefix}.weight_scale_inv")
-                    },
-                    scale_shape,
-                    scale_sharding,
-                ),
+                ParameterMemberSpec::new(scale, scale_shape, scale_sharding),
             ])
         }
         LinearFormat::GgufIQuant { ggml_type, .. } => {
+            if declaration.companions() != &LinearFormatCompanions::None {
+                return Err(ParallelPlanError::InvalidGroup(format!(
+                    "GGUF linear parameter {name} must not declare companion tensors"
+                )));
+            }
             let (block_values, block_bytes) = ggml_type
                 .block_and_bytes()
                 .map_err(|error| invalid(error.to_string()))?;
@@ -784,6 +849,16 @@ fn expand_linear_format_member(
         }
         LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
             let quantization = format.weight_quantization().expect("packed format");
+            let LinearFormatCompanions::Scaled { scale, bias } = declaration.companions() else {
+                return Err(ParallelPlanError::InvalidGroup(format!(
+                    "packed linear parameter {name} must declare a scale companion"
+                )));
+            };
+            if quantization.has_biases() != bias.is_some() {
+                return Err(ParallelPlanError::InvalidGroup(format!(
+                    "packed linear parameter {name} declares companions inconsistent with its format"
+                )));
+            }
             let bits = usize::try_from(quantization.bits())
                 .map_err(|_| invalid(format!("packed bit width for {name} exceeds usize")))?;
             let group = usize::try_from(quantization.group_size())
@@ -809,21 +884,13 @@ fn expand_linear_format_member(
             let companion_sharding =
                 remap_linear_segments(source.sharding(), column_axis, group, name)?;
             members.push(ParameterMemberSpec::new(
-                if expert_bank {
-                    format!("{prefix}_scales")
-                } else {
-                    format!("{prefix}.scales")
-                },
+                scale,
                 companion.clone(),
                 companion_sharding.clone(),
             ));
-            if quantization.has_biases() {
+            if let Some(bias) = bias {
                 members.push(ParameterMemberSpec::new(
-                    if expert_bank {
-                        format!("{prefix}_biases")
-                    } else {
-                        format!("{prefix}.biases")
-                    },
+                    bias,
                     companion,
                     companion_sharding,
                 ));
@@ -1082,13 +1149,13 @@ mod tests {
     }
 
     #[test]
-    fn fp8_expansion_publishes_inverse_scale_with_the_weight_atomically() {
+    fn fp8_expansion_uses_architecture_declared_companion_identity() {
         let groups = vec![ParameterGroupSpec::partitioned(
             "query",
             ParameterRole::AttentionHeads,
             8,
             [ParameterMemberSpec::new(
-                "layers.0.q_proj.weight",
+                "opaque_matrix",
                 [256, 256],
                 MemberSharding::Partitioned { axis: 0 },
             )],
@@ -1098,7 +1165,10 @@ mod tests {
             BlockFp8Format::new(128, 128, BlockFp8ScaleEncoding::Ue8m0).unwrap(),
         );
 
-        let expanded = expand_linear_format_parameter_groups(groups, |_| format).unwrap();
+        let expanded = expand_linear_format_parameter_groups(groups, |_| {
+            Some(LinearFormatParameter::scaled(format, "opaque_scale"))
+        })
+        .unwrap();
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].partition_units(), Some(2));
         assert_eq!(expanded[0].members().len(), 2);
@@ -1108,7 +1178,7 @@ mod tests {
                 .iter()
                 .map(ParameterMemberSpec::target)
                 .collect::<Vec<_>>(),
-            ["layers.0.q_proj.weight", "layers.0.q_proj.weight_scale_inv"]
+            ["opaque_matrix", "opaque_scale"]
         );
         assert_eq!(expanded[0].members()[1].global_shape(), [2, 2]);
         assert_eq!(

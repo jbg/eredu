@@ -7,6 +7,8 @@ use eredu_runtime::{
     ParameterGroupSpec, ParameterMemberSpec, ParameterRole, StateLayout, TensorPlacement,
 };
 
+use crate::linear_format::standard_linear_format_parameter;
+
 use super::DecoderConfig;
 
 /// Complete planner-derived construction and mutable-state geometry for one rank.
@@ -293,7 +295,9 @@ pub fn static_parameter_groups(
             )],
         )?);
     }
-    expand_linear_format_parameter_groups(groups, |name| args.linear_format_for(name))
+    expand_linear_format_parameter_groups(groups, |member| {
+        standard_linear_format_parameter(member, args.linear_format_for(member.target()))
+    })
 }
 
 /// Declares one decoder block's head, dense/expert, and replicated groups.
@@ -427,7 +431,9 @@ pub fn layer_parameter_groups(
             ),
         ],
     )?);
-    expand_linear_format_parameter_groups(groups, |name| args.linear_format_for(name))
+    expand_linear_format_parameter_groups(groups, |member| {
+        standard_linear_format_parameter(member, args.linear_format_for(member.target()))
+    })
 }
 
 /// Declares the patch/position roots, vision blocks, merge adapter, and projection.
@@ -583,7 +589,12 @@ pub fn vision_parameter_groups(
             ("model.vision_tower.ln_post.bias", vec![hidden]),
         ],
     )?);
-    expand_linear_format_parameter_groups(groups, |name| args.vision_config.linear_format_for(name))
+    expand_linear_format_parameter_groups(groups, |member| {
+        standard_linear_format_parameter(
+            member,
+            args.vision_config.linear_format_for(member.target()),
+        )
+    })
 }
 
 /// Declares only the pinned patch/position, merge, projection, and norm groups.

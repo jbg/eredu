@@ -9,6 +9,8 @@ use eredu_runtime::{
     StateLayout, TensorPlacement,
 };
 
+use crate::linear_format::standard_linear_format_parameter;
+
 use super::{
     state_layout, AudioLayer, AudioStatic, FamilyConfig, FeedForwardPolicy, ModalityProjector,
     ModelArgs, VisionLayer, VisionStatic,
@@ -514,7 +516,9 @@ pub fn static_parameter_groups(
             )],
         )?);
     }
-    expand_linear_format_parameter_groups(groups, |name| args.linear_format_for(name))
+    expand_linear_format_parameter_groups(groups, |member| {
+        standard_linear_format_parameter(member, args.linear_format_for(member.target()))
+    })
 }
 
 /// Declares one decoder layer's head, MLP, expert, media, and replicated groups.
@@ -732,7 +736,9 @@ pub fn layer_parameter_groups(
         format!("{root}.replicated"),
         replicated_members,
     )?);
-    expand_linear_format_parameter_groups(groups, |name| args.linear_format_for(name))
+    expand_linear_format_parameter_groups(groups, |member| {
+        standard_linear_format_parameter(member, args.linear_format_for(member.target()))
+    })
 }
 
 fn group(

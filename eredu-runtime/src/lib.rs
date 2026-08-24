@@ -109,9 +109,9 @@ pub use layered::{
 pub use parallel::{
     aligned_partition_units, expand_linear_format_parameter_groups, module_parameter_group,
     partitioned_module_parameter_group, partitioned_projection_group, projection_parameter_group,
-    segmented_projection_group, LocalModelLayout, LocalTensorLayout, MemberSharding,
-    ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-    ProjectionSharding, ShardingPolicy, TensorPlacement,
+    segmented_projection_group, LinearFormatParameter, LocalModelLayout, LocalTensorLayout,
+    MemberSharding, ParallelModelInfo, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, ProjectionSharding, ShardingPolicy, TensorPlacement,
 };
 pub use parameter::{
     bind_materialized_unit, bindings_from_recipe_set, materialize_bindings, MaterializedUnit,

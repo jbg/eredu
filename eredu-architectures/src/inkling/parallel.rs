@@ -2,12 +2,15 @@
 
 use std::collections::BTreeMap;
 
+use eredu_checkpoint::LinearFormat;
 use eredu_nn::{NeuralBackend, VocabularyParallelRange};
 use eredu_runtime::{
     expand_linear_format_parameter_groups, module_parameter_group, LocalModelLayout,
     MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
     StateLayout, TensorPlacement,
 };
+
+use crate::linear_format::standard_linear_format_parameter;
 
 use super::{FeedForwardPolicy, ModelArgs};
 
@@ -319,16 +322,16 @@ pub fn static_parameter_groups(
             [("visual.final_norm.weight", vec![hidden])],
         )?);
     }
-    expand_linear_format_parameter_groups(groups, |name| {
-        if name.starts_with("visual.") {
+    expand_linear_format_parameter_groups(groups, |member| {
+        let name = member.target();
+        let format = if name.starts_with("visual.") {
             args.vision_config
                 .as_ref()
-                .map_or(eredu_checkpoint::LinearFormat::Dense, |config| {
-                    config.linear_format_for(name)
-                })
+                .map_or(LinearFormat::Dense, |config| config.linear_format_for(name))
         } else {
             args.text_config.linear_format_for(name)
-        }
+        };
+        standard_linear_format_parameter(member, format)
     })
 }
 
@@ -403,8 +406,11 @@ pub fn mtp_parameter_groups(
             "Inkling checkpoint declares MTP depths but no MTP parameters",
         ));
     }
-    expand_linear_format_parameter_groups(vec![replicated("model.mtp", members)?], |name| {
-        args.text_config.linear_format_for(name)
+    expand_linear_format_parameter_groups(vec![replicated("model.mtp", members)?], |member| {
+        standard_linear_format_parameter(
+            member,
+            args.text_config.linear_format_for(member.target()),
+        )
     })
 }
 
@@ -596,7 +602,12 @@ pub fn layer_parameter_groups(
         format!("{root}.replicated"),
         replicated_members,
     )?);
-    expand_linear_format_parameter_groups(groups, |name| args.text_config.linear_format_for(name))
+    expand_linear_format_parameter_groups(groups, |member| {
+        standard_linear_format_parameter(
+            member,
+            args.text_config.linear_format_for(member.target()),
+        )
+    })
 }
 
 fn group(
