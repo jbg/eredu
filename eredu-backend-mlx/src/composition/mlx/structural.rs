@@ -582,13 +582,21 @@ fn validate_neutral_inkling_gguf(
     eredu_checkpoint::validation::validate_gguf_plan(checkpoint, &plan)
 }
 
+struct NeutralMuseGlimmerGgufCatalog<'a>(&'a GgufCheckpoint);
+
+impl eredu_architectures::muse_glimmer::GgufTensorCatalog for NeutralMuseGlimmerGgufCatalog<'_> {
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains_gguf_tensor(name)
+    }
+}
+
 fn validate_neutral_muse_glimmer_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    let args = match eredu_architectures::muse_glimmer::DecoderConfig::from_gguf_metadata(
+    let args = match eredu_architectures::muse_glimmer::DecoderConfig::from_gguf_catalog(
+        &NeutralMuseGlimmerGgufCatalog(checkpoint),
         metadata,
-        checkpoint.contains_gguf_tensor("output.weight"),
     ) {
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
@@ -1064,9 +1072,9 @@ pub fn validate_muse_glimmer_projector_gguf(
         Ok(formats) => formats,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    let args = match eredu_architectures::muse_glimmer::DecoderConfig::from_gguf_metadata(
+    let args = match eredu_architectures::muse_glimmer::DecoderConfig::from_gguf_catalog(
+        &NeutralMuseGlimmerGgufCatalog(model_checkpoint),
         model_metadata,
-        model_checkpoint.contains_gguf_tensor("output.weight"),
     )
     .and_then(|args| args.with_gguf_projector_metadata(metadata, formats))
     {

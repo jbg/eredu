@@ -203,6 +203,10 @@ than synthesizing family layer prefixes. Catalog policies declare any
 admitted checkpoint-only names by exact key, prefix, or suffix, and composite
 checkpoint schemas partition canonical projector formats by architecture-owned
 component identity; backend composition does not repeat those naming rules.
+Catalog-dependent configuration normalization likewise receives a neutral
+physical tensor-name catalog: the architecture owns exact-name probes and the
+semantic configuration choices they control, while concrete backends only
+adapt their native catalogs to that contract.
 Packed recipes expose format semantics rather than a concrete accelerator's
 storage units. In particular, canonical MXFP4 expert recipes describe logical
 F4 values regardless of whether a source stores byte blocks or integer words;

@@ -19,7 +19,8 @@ pub use checkpoint::{
     translate_projector_gguf_name, translate_text_gguf_name, ArtifactConfig,
 };
 pub use config::{
-    ConfigError, DecoderConfig, VisionAttentionPolicy, VisionConfig, WeightConvention,
+    ConfigError, DecoderConfig, GgufTensorCatalog, VisionAttentionPolicy, VisionConfig,
+    WeightConvention,
 };
 pub use graph::{component_graph, state_layout};
 pub use model::{

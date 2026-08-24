@@ -1732,8 +1732,7 @@ fn open_gguf_store(
         projector,
         eredu_architectures::muse_glimmer::translate_projector_gguf_name,
     )?;
-    let output_head_present = checkpoint.contains_gguf_tensor("output.weight");
-    let args = DecoderConfig::from_gguf_metadata(metadata, output_head_present)
+    let args = DecoderConfig::from_gguf_catalog(&GgufCatalog(checkpoint), metadata)
         .and_then(|args| {
             args.with_gguf_projector_metadata(&projector_metadata, projector_quantization)
         })
@@ -1754,6 +1753,14 @@ fn open_gguf_store(
             .build()?,
     );
     Ok((store, args))
+}
+
+struct GgufCatalog<'a>(&'a GgufCheckpoint);
+
+impl eredu_architectures::muse_glimmer::GgufTensorCatalog for GgufCatalog<'_> {
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains_gguf_tensor(name)
+    }
 }
 
 pub fn prepare_gguf_pipeline_source(

@@ -646,9 +646,17 @@ pub fn safetensors_capabilities(
     ))
 }
 
-struct GemmaCatalog<'a>(&'a GgufCheckpoint);
+struct ExactGgufCatalog<'a>(&'a GgufCheckpoint);
 
-impl crate::gemma4::GgufTensorCatalog for GemmaCatalog<'_> {
+impl crate::gemma4::GgufTensorCatalog for ExactGgufCatalog<'_> {
+    fn contains(&self, name: &str) -> bool {
+        self.0
+            .tensors()
+            .any(|tensor| tensor.descriptor().name == name)
+    }
+}
+
+impl crate::muse_glimmer::GgufTensorCatalog for ExactGgufCatalog<'_> {
     fn contains(&self, name: &str) -> bool {
         self.0
             .tensors()
@@ -668,11 +676,13 @@ pub fn gguf_capabilities(
         .collect();
     let (parallel, independently_addressable_experts) = match architecture {
         GgufArchitecture::Gemma4 => {
-            let routed =
-                crate::gemma4::ModelArgs::from_gguf_metadata(&GemmaCatalog(checkpoint), &metadata)
-                    .map_err(invalid)?
-                    .num_experts
-                    .is_some();
+            let routed = crate::gemma4::ModelArgs::from_gguf_metadata(
+                &ExactGgufCatalog(checkpoint),
+                &metadata,
+            )
+            .map_err(invalid)?
+            .num_experts
+            .is_some();
             (
                 if routed {
                     ParallelCapabilityPlan::TENSOR_PIPELINE_EXPERT
@@ -683,11 +693,9 @@ pub fn gguf_capabilities(
             )
         }
         GgufArchitecture::MuseGlimmer => {
-            let routed = crate::muse_glimmer::DecoderConfig::from_gguf_metadata(
+            let routed = crate::muse_glimmer::DecoderConfig::from_gguf_catalog(
+                &ExactGgufCatalog(checkpoint),
                 &metadata,
-                checkpoint
-                    .tensors()
-                    .any(|tensor| tensor.descriptor().name == "output.weight"),
             )
             .map_err(invalid)?
             .is_moe();

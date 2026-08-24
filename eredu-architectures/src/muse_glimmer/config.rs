@@ -24,6 +24,12 @@ fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
 }
 
+/// Minimal physical tensor-name catalog required by the portable GGUF parser.
+pub trait GgufTensorCatalog {
+    /// Whether one exact physical tensor exists.
+    fn contains(&self, name: &str) -> bool;
+}
+
 /// Checkpoint-specific norm and rotary convention.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum WeightConvention {
@@ -389,11 +395,12 @@ impl DecoderConfig {
         Ok(config)
     }
 
-    /// Parses the released text GGUF metadata without depending on a backend
-    /// checkpoint type. Projector metadata is admitted independently.
-    pub fn from_gguf_metadata(
+    /// Parses the released text GGUF metadata and architecture-owned physical
+    /// tensor semantics without depending on a backend checkpoint type.
+    /// Projector metadata is admitted independently.
+    pub fn from_gguf_catalog<C: GgufTensorCatalog + ?Sized>(
+        catalog: &C,
         metadata: &HashMap<String, MetadataValue>,
-        output_head_present: bool,
     ) -> Result<Self, ConfigError> {
         let architecture = gguf_string(metadata, "general.architecture")?;
         if architecture != "muse-glimmer" {
@@ -465,7 +472,7 @@ impl DecoderConfig {
             rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?.unwrap_or(1_000_000.0),
             layer_uses_rope,
             head_dim,
-            tie_word_embeddings: !output_head_present,
+            tie_word_embeddings: !catalog.contains("output.weight"),
             rope_scaling: gguf_rope_scaling(metadata)?,
             hidden_act: "silu".into(),
             attention_dropout: 0.0,
@@ -1232,7 +1239,17 @@ mod tests {
             "muse-glimmer.attention.sliding_window_pattern".into(),
             MetadataValue::Array(MetadataArray::Bool(vec![true, false])),
         );
-        let config = DecoderConfig::from_gguf_metadata(&metadata, true).unwrap();
+        struct Catalog(bool);
+
+        impl GgufTensorCatalog for Catalog {
+            fn contains(&self, name: &str) -> bool {
+                self.0 && name == "output.weight"
+            }
+        }
+
+        let tied = DecoderConfig::from_gguf_catalog(&Catalog(false), &metadata).unwrap();
+        assert!(tied.tie_word_embeddings);
+        let config = DecoderConfig::from_gguf_catalog(&Catalog(true), &metadata).unwrap();
         assert_eq!(config.weight_convention, WeightConvention::Gguf);
         assert!(config.attention_schedule.get(0).unwrap().window().is_some());
         assert_eq!(
