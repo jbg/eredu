@@ -1029,6 +1029,14 @@ mod tests {
 
         for (architecture, expected) in [
             (
+                GgufArchitecture::Inkling,
+                vec![
+                    ArtifactModality::Text,
+                    ArtifactModality::Image,
+                    ArtifactModality::Audio,
+                ],
+            ),
+            (
                 GgufArchitecture::Qwen35,
                 vec![
                     ArtifactModality::Text,
@@ -1049,8 +1057,13 @@ mod tests {
                 vec![ArtifactModality::Text, ArtifactModality::Image],
             ),
         ] {
-            let modalities = gguf_composite_artifact_plan(architecture)
-                .input_modalities(GgufArtifactComposition::ValidatedMediaProjector);
+            let plan = gguf_composite_artifact_plan(architecture);
+            assert_eq!(
+                artifact_modalities(plan.input_modalities(GgufArtifactComposition::ModelOnly)),
+                [ArtifactModality::Text]
+            );
+            let modalities =
+                plan.input_modalities(GgufArtifactComposition::ValidatedMediaProjector);
             assert_eq!(artifact_modalities(modalities), expected);
         }
     }

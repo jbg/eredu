@@ -123,15 +123,15 @@ pub const fn gguf_composite_artifact_plan(
     architecture: GgufArchitecture,
 ) -> GgufCompositeArtifactPlan {
     let (model_modalities, projector_modalities) = match architecture {
-        GgufArchitecture::Inkling => {
-            let modalities = InputModalities {
+        GgufArchitecture::Inkling => (
+            InputModalities::TEXT,
+            Some(InputModalities {
                 text: true,
                 image: true,
                 audio: true,
                 video: false,
-            };
-            (modalities, Some(modalities))
-        }
+            }),
+        ),
         GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
             let modalities = InputModalities {
                 text: true,
@@ -908,6 +908,15 @@ mod tests {
     #[test]
     fn validated_optional_projectors_expand_gguf_modalities() {
         for (architecture, expected) in [
+            (
+                GgufArchitecture::Inkling,
+                InputModalities {
+                    text: true,
+                    image: true,
+                    audio: true,
+                    video: false,
+                },
+            ),
             (
                 GgufArchitecture::Qwen35,
                 InputModalities {
