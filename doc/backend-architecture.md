@@ -230,7 +230,10 @@ declared static or execution-unit owner, and obtain sharding prefixes from the
 architecture's canonical unit path. Checkpoint-only physical companions or
 source-layout projections are exposed explicitly by the architecture
 checkpoint contract. Loading, residency, and quantization code must not infer
-any of those facts from substrings in checkpoint names.
+any of those facts from substrings in checkpoint names. External-expert
+tensor-parallel loaders validate the description against the neutral
+architecture and register its owned groups directly; they do not reconstruct
+target/prediction unit counts or enumerate family layer groups themselves.
 
 Pinned parameters additionally expose an architecture-owned bindable static
 module interface. The parameter description selects the roles owned by a

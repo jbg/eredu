@@ -569,24 +569,15 @@ impl DeepSeekModel {
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
-        let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
-            .map_err(|_| unsupported("invalid V3 unit count"))?;
-        let mut planner = build.planner();
-        for group in deepseek::parallel::v3_static_parameter_groups(&args)? {
-            planner.register(group)?;
-        }
-        for layer in 0..total {
-            for group in deepseek::parallel::v3_layer_parameter_groups(&args, layer)? {
-                planner.register(group)?;
-            }
-        }
-        let (_, layout) = planner.finish()?;
-        let geometry = deepseek::parallel::v3_local_geometry(&args, &layout)?;
+        let parameter_description = deepseek::parallel::v3_parameter_description(&args)?;
         let global = V3Architecture::new(args.clone(), stream).map_err(neutral_error)?;
-        let expert_targets = Arc::new(
-            deepseek::parallel::v3_parameter_description(&args)?
-                .targets_for_role(ParameterRole::ExpertIntermediate),
-        );
+        parameter_description
+            .validate_architecture::<MlxNeuralBackend, V3State, _>(&global)
+            .map_err(|error| unsupported(error.to_string()))?;
+        let layout = parallel_layout_from_description(build, &parameter_description)?;
+        let geometry = deepseek::parallel::v3_local_geometry(&args, &layout)?;
+        let expert_targets =
+            Arc::new(parameter_description.targets_for_role(ParameterRole::ExpertIntermediate));
         let global_static = global.static_modules().clone();
         let mut architecture =
             V3Architecture::new_parallel(args.clone(), geometry, stream).map_err(neutral_error)?;
@@ -649,24 +640,15 @@ impl DeepSeekModel {
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
-        let total = usize::try_from(args.num_hidden_layers + args.num_nextn_predict_layers)
-            .map_err(|_| unsupported("invalid V4 unit count"))?;
-        let mut planner = build.planner();
-        for group in deepseek::parallel::v4_static_parameter_groups(&args)? {
-            planner.register(group)?;
-        }
-        for layer in 0..total {
-            for group in deepseek::parallel::v4_layer_parameter_groups(&args, layer)? {
-                planner.register(group)?;
-            }
-        }
-        let (_, layout) = planner.finish()?;
-        let geometry = deepseek::parallel::v4_local_geometry(&args, &layout)?;
+        let parameter_description = deepseek::parallel::v4_parameter_description(&args)?;
         let global = V4Architecture::new(args.clone(), stream).map_err(neutral_error)?;
-        let expert_targets = Arc::new(
-            deepseek::parallel::v4_parameter_description(&args)?
-                .targets_for_role(ParameterRole::ExpertIntermediate),
-        );
+        parameter_description
+            .validate_architecture::<MlxNeuralBackend, V4State, _>(&global)
+            .map_err(|error| unsupported(error.to_string()))?;
+        let layout = parallel_layout_from_description(build, &parameter_description)?;
+        let geometry = deepseek::parallel::v4_local_geometry(&args, &layout)?;
+        let expert_targets =
+            Arc::new(parameter_description.targets_for_role(ParameterRole::ExpertIntermediate));
         let global_static = global.static_modules().clone();
         let mut architecture =
             V4Architecture::new_parallel(args.clone(), geometry, stream).map_err(neutral_error)?;
@@ -2711,6 +2693,17 @@ where
         .map(|group| architecture.group_unit_count(group).map_err(neutral_error))
         .collect::<Result<Vec<_>, _>>()?;
     ExecutionUnitLayout::new(&graph, counts).map_err(|error| unsupported(error.to_string()))
+}
+
+fn parallel_layout_from_description(
+    build: ParallelBuildContext,
+    description: &eredu_runtime::ArchitectureParameterDescription,
+) -> Result<eredu_runtime::LocalModelLayout, Error> {
+    let mut planner = build.planner();
+    for group in description.groups() {
+        planner.register(group.group().clone())?;
+    }
+    planner.finish().map(|(_, layout)| layout)
 }
 
 fn v3_unit_recipes(
