@@ -33,6 +33,7 @@ fn materialize_gguf_model(
     let checkpoint = source.checkpoint();
     let metadata = source.metadata();
     let kind = source.architecture().model_kind();
+    structural::validate_complete_gguf_quantization(kind, options.quantization.is_some())?;
     let model = match source.architecture() {
         GgufArchitecture::KimiLinear => {
             let loaded = crate::composition::kimi_linear::load_kimi_linear_gguf_model(
@@ -45,11 +46,6 @@ fn materialize_gguf_model(
             Model::KimiLinear(kind, loaded)
         }
         GgufArchitecture::DeepSeek2 => {
-            if options.quantization.is_some() {
-                return Err(Error::ArchitectureModel(
-                    "load-time quantization is not yet supported by neutral DeepSeek GGUF composition".into(),
-                ));
-            }
             let loaded = crate::composition::deepseek::load_gguf(
                 checkpoint,
                 metadata,
@@ -61,11 +57,6 @@ fn materialize_gguf_model(
             Model::DeepSeek(kind, Box::new(loaded))
         }
         GgufArchitecture::DeepSeek4 => {
-            if options.quantization.is_some() {
-                return Err(Error::ArchitectureModel(
-                    "load-time quantization is not yet supported by neutral DeepSeek GGUF composition".into(),
-                ));
-            }
             let loaded = crate::composition::deepseek::load_gguf(
                 checkpoint,
                 metadata,
@@ -87,11 +78,6 @@ fn materialize_gguf_model(
             Model::GptOss(kind, loaded)
         }
         GgufArchitecture::Inkling => {
-            if options.quantization.is_some() {
-                return Err(Error::ArchitectureModel(
-                    "load-time Inkling quantization is not bound on the neutral loader".into(),
-                ));
-            }
             let loaded = crate::composition::inkling::load_gguf(
                 checkpoint,
                 projector,
@@ -103,11 +89,6 @@ fn materialize_gguf_model(
             Model::Inkling(kind, loaded)
         }
         GgufArchitecture::Gemma4 => {
-            if options.quantization.is_some() {
-                return Err(Error::ArchitectureModel(
-                    "load-time Gemma 4 quantization is not bound on the neutral loader".into(),
-                ));
-            }
             let loaded = crate::composition::gemma4::load_gguf(
                 checkpoint,
                 projector,
@@ -134,11 +115,6 @@ fn materialize_gguf_model(
                     "Muse-Glimmer preparation omitted its required media projector".into(),
                 )
             })?;
-            if options.quantization.is_some() {
-                return Err(Error::ArchitectureModel(
-                    "load-time Muse-Glimmer quantization is not bound on the neutral loader".into(),
-                ));
-            }
             let loaded = crate::composition::muse_glimmer::load_gguf(
                 checkpoint,
                 projector,
@@ -235,7 +211,7 @@ pub fn materialize_model_plan(
         .filter(|topology| !topology.is_replicated())
     {
         let kind = ModelKind::resolve_family(&plan.inspection().configuration().family)?;
-        if requires_distributed_stage_loader(kind, topology) {
+        if structural::requires_distributed_stage_loader(kind, topology.topology()) {
             #[cfg(feature = "media")]
             let processor = match plan.inspection().format() {
                 eredu_core::ArtifactFormat::SafeTensors => {
@@ -319,23 +295,6 @@ pub fn materialize_model_plan(
     }
 }
 
-fn requires_distributed_stage_loader(
-    kind: ModelKind,
-    topology: crate::backend::MlxParallelContext,
-) -> bool {
-    topology.pipeline_parallel_size > 1
-        || topology.expert_parallel_size > 1
-        || matches!(
-            kind,
-            ModelKind::DeepSeekV3
-                | ModelKind::DeepSeekV4
-                | ModelKind::Qwen3Next
-                | ModelKind::Qwen35
-                | ModelKind::Qwen3Vl
-                | ModelKind::Qwen3VlMoe
-        )
-}
-
 fn inspected_runtime_state_dtype_bytes(
     inspection: &eredu_core::ArtifactInspection,
 ) -> Result<std::num::NonZeroU8, Error> {
@@ -387,10 +346,7 @@ fn mlx_runtime_state_dtype_bytes(
 mod runtime_state_dtype_tests {
     #[cfg(feature = "image")]
     use super::load_gguf_processor;
-    use super::{
-        mlx_runtime_state_dtype_bytes, reject_complete_tensor_parallel_quantization,
-        requires_distributed_stage_loader,
-    };
+    use super::{mlx_runtime_state_dtype_bytes, reject_complete_tensor_parallel_quantization};
     use crate::backend::{DeviceAssignment, MlxParallelContext};
     #[cfg(feature = "image")]
     use eredu_architectures::GgufArchitecture;
@@ -405,7 +361,10 @@ mod runtime_state_dtype_tests {
             MlxParallelContext::for_rank(0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
         for kind in [ModelKind::DeepSeekV3, ModelKind::DeepSeekV4] {
-            assert!(requires_distributed_stage_loader(kind, topology));
+            assert!(super::structural::requires_distributed_stage_loader(
+                kind,
+                topology.topology()
+            ));
         }
     }
 
@@ -435,11 +394,14 @@ mod runtime_state_dtype_tests {
             ModelKind::Qwen3Vl,
             ModelKind::Qwen3VlMoe,
         ] {
-            assert!(requires_distributed_stage_loader(kind, topology));
+            assert!(super::structural::requires_distributed_stage_loader(
+                kind,
+                topology.topology()
+            ));
         }
-        assert!(!requires_distributed_stage_loader(
+        assert!(!super::structural::requires_distributed_stage_loader(
             ModelKind::Qwen3,
-            topology
+            topology.topology()
         ));
     }
 
@@ -448,9 +410,9 @@ mod runtime_state_dtype_tests {
         let topology =
             MlxParallelContext::for_rank(0, 1, 1, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
                 .unwrap();
-        assert!(requires_distributed_stage_loader(
+        assert!(super::structural::requires_distributed_stage_loader(
             ModelKind::Llama,
-            topology
+            topology.topology()
         ));
     }
 

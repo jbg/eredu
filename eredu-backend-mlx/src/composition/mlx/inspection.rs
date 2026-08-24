@@ -1080,6 +1080,33 @@ mod tests {
     }
 
     #[test]
+    fn gguf_inspection_rejects_quantization_before_complete_tensor_parallel_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.gguf");
+        write_minimal_llama_gguf(&path, true, None);
+        let topology = crate::backend::MlxParallelContext::for_rank(
+            0,
+            2,
+            1,
+            1,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        )
+        .unwrap();
+        let options = MlxInspectionOptions {
+            load: ModelLoadOptions::with_quantization(eredu_checkpoint::WeightQuantization::MxFp4)
+                .with_parallel_topology(topology),
+        };
+
+        let report = inspect_model(&path, options).unwrap();
+
+        assert_eq!(report.requested_load, InspectionReadiness::Unsupported);
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == InspectionIssueCode::UnsupportedQuantizationRequest
+                && issue.detail.contains("complete tensor-parallel")
+        }));
+    }
+
+    #[test]
     fn gguf_inspection_ignores_facade_owned_tokenizer_metadata() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("model.gguf");

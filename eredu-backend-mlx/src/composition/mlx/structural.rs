@@ -75,7 +75,7 @@ const fn mlx_supports_expert_cache(kind: ModelKind) -> bool {
     )
 }
 
-const fn mlx_supports_nonresident_safetensors_quantization(kind: ModelKind) -> bool {
+const fn mlx_supports_safetensors_quantization(kind: ModelKind) -> bool {
     matches!(
         kind,
         ModelKind::DeepSeekV3
@@ -95,6 +95,93 @@ const fn mlx_supports_nonresident_safetensors_quantization(kind: ModelKind) -> b
             | ModelKind::Qwen3VlMoe
             | ModelKind::Qwen35
     )
+}
+
+const fn mlx_supports_complete_gguf_quantization(kind: ModelKind) -> bool {
+    matches!(
+        kind,
+        ModelKind::GptOss
+            | ModelKind::KimiLinear
+            | ModelKind::Lfm2
+            | ModelKind::Llama
+            | ModelKind::NemotronH
+            | ModelKind::Qwen2
+            | ModelKind::Qwen3
+            | ModelKind::Qwen3Next
+            | ModelKind::Qwen3Vl
+            | ModelKind::Qwen3VlMoe
+            | ModelKind::Qwen35
+    )
+}
+
+pub(crate) fn validate_complete_gguf_quantization(
+    kind: ModelKind,
+    requested: bool,
+) -> Result<(), Error> {
+    if !requested || mlx_supports_complete_gguf_quantization(kind) {
+        return Ok(());
+    }
+    Err(Error::Artifact(
+        eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(format!(
+            "load-time quantization is unavailable for complete GGUF {} materialization on MLX",
+            kind.canonical_name()
+        )),
+    ))
+}
+
+pub(crate) fn requires_distributed_stage_loader(
+    kind: ModelKind,
+    topology: eredu_core::ParallelTopology,
+) -> bool {
+    topology.is_axis_active(eredu_core::ParallelAxis::Pipeline)
+        || topology.is_axis_active(eredu_core::ParallelAxis::Expert)
+        || matches!(
+            kind,
+            ModelKind::DeepSeekV3
+                | ModelKind::DeepSeekV4
+                | ModelKind::Qwen3Next
+                | ModelKind::Qwen35
+                | ModelKind::Qwen3Vl
+                | ModelKind::Qwen3VlMoe
+        )
+}
+
+fn validate_quantization_capability(
+    kind: ModelKind,
+    format: eredu_core::ArtifactFormat,
+    policy: eredu_core::PreparationPolicy,
+    capabilities: eredu_architectures::preparation::ArchitectureCapabilities,
+) -> Result<(), Error> {
+    if policy.quantization.is_none() {
+        return Ok(());
+    }
+    if let Some(topology) = policy.topology.filter(|topology| !topology.is_replicated()) {
+        if requires_distributed_stage_loader(kind, topology) {
+            return Ok(());
+        }
+        return Err(Error::Artifact(
+            eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(format!(
+                "load-time quantization is unavailable for complete tensor-parallel {} materialization on MLX",
+                kind.canonical_name()
+            )),
+        ));
+    }
+    if format == eredu_core::ArtifactFormat::Gguf {
+        return validate_complete_gguf_quantization(kind, true);
+    }
+    let supported = mlx_supports_safetensors_quantization(kind)
+        && (policy.residency == eredu_core::ResidencyRequest::FullyResident
+            || capabilities.nonresident_safetensors_quantization());
+    if supported {
+        return Ok(());
+    }
+    Err(Error::Artifact(
+        eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(format!(
+            "load-time quantization is unavailable for the normalized {} architecture from SafeTensors with {:?} weights on MLX",
+            kind.canonical_name(),
+            policy.residency,
+        )),
+    ))
 }
 
 fn validate_expert_cache_capability(
@@ -129,36 +216,19 @@ fn validate_preparation_capability_intersection(
             kind.canonical_name(),
         )?;
     }
-    if format == eredu_core::ArtifactFormat::SafeTensors
-        && policy.quantization.is_some()
-        && policy.residency != eredu_core::ResidencyRequest::FullyResident
-        && !(capabilities.nonresident_safetensors_quantization()
-            && mlx_supports_nonresident_safetensors_quantization(kind))
-    {
-        return Err(Error::Artifact(
-            eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(format!(
-                "load-time quantization is unavailable for the normalized {} architecture with nonresident weights on MLX",
-                kind.canonical_name()
-            )),
-        ));
-    }
+    validate_quantization_capability(kind, format, policy, capabilities)?;
     if policy.residency == eredu_core::ResidencyRequest::ExpertCache {
         validate_expert_cache_capability(kind, capabilities)?;
     }
     Ok(())
 }
 
-fn requires_architecture_capabilities(
-    format: eredu_core::ArtifactFormat,
-    policy: eredu_core::PreparationPolicy,
-) -> bool {
+fn requires_architecture_capabilities(policy: eredu_core::PreparationPolicy) -> bool {
     policy
         .topology
         .is_some_and(|topology| !topology.is_replicated())
         || policy.residency == eredu_core::ResidencyRequest::ExpertCache
-        || (format == eredu_core::ArtifactFormat::SafeTensors
-            && policy.quantization.is_some()
-            && policy.residency != eredu_core::ResidencyRequest::FullyResident)
+        || policy.quantization.is_some()
 }
 
 pub(crate) fn validate_parallel_capabilities(
@@ -192,7 +262,7 @@ pub(crate) fn validate_safetensors_preparation(
 ) -> Result<(), Error> {
     let policy = options.preparation_policy()?;
     eredu_core::validate_preparation_policy(kind.loading_protocol(), policy)?;
-    if !requires_architecture_capabilities(eredu_core::ArtifactFormat::SafeTensors, policy) {
+    if !requires_architecture_capabilities(policy) {
         return Ok(());
     }
     let capabilities = eredu_architectures::preparation::safetensors_capabilities(kind, config)
@@ -212,7 +282,7 @@ pub(crate) fn validate_gguf_preparation(
 ) -> Result<(), Error> {
     let policy = options.preparation_policy()?;
     eredu_core::validate_preparation_policy(architecture.model_kind().loading_protocol(), policy)?;
-    if !requires_architecture_capabilities(eredu_core::ArtifactFormat::Gguf, policy) {
+    if !requires_architecture_capabilities(policy) {
         return Ok(());
     }
     let capabilities =
@@ -231,7 +301,7 @@ pub(crate) fn validate_inspected_preparation(
     policy: eredu_core::PreparationPolicy,
 ) -> Result<(), Error> {
     eredu_core::validate_preparation_policy(inspection.configuration().loading_protocol, policy)?;
-    if !requires_architecture_capabilities(inspection.format(), policy) {
+    if !requires_architecture_capabilities(policy) {
         return Ok(());
     }
     let configuration = inspection.configuration();
@@ -1235,6 +1305,80 @@ mod admission_policy_tests {
                 ));
         validate_safetensors_preparation(ModelKind::KimiLinear, &kimi_linear_config(), options)
             .unwrap();
+    }
+
+    #[test]
+    fn complete_tensor_parallel_quantization_is_rejected_during_preflight() {
+        let topology = crate::backend::MlxParallelContext::for_rank(
+            0,
+            2,
+            1,
+            1,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        )
+        .unwrap();
+        let options =
+            ModelLoadOptions::with_quantization(eredu_checkpoint::WeightQuantization::MxFp4)
+                .with_parallel_topology(topology);
+
+        let error =
+            validate_safetensors_preparation(ModelKind::Qwen3, &dense_qwen3_config(), options)
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Artifact(
+                eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(message)
+            ) if message.contains("complete tensor-parallel")
+        ));
+    }
+
+    #[test]
+    fn distributed_stage_quantization_is_admitted_during_preflight() {
+        let topology = crate::backend::MlxParallelContext::for_rank(
+            0,
+            1,
+            2,
+            1,
+            crate::backend::DeviceAssignment::new(safemlx::DeviceType::Cpu, 0),
+        )
+        .unwrap();
+        let options =
+            ModelLoadOptions::with_quantization(eredu_checkpoint::WeightQuantization::MxFp4)
+                .with_parallel_topology(topology);
+
+        validate_safetensors_preparation(ModelKind::Qwen3, &dense_qwen3_config(), options).unwrap();
+    }
+
+    #[test]
+    fn replicated_gguf_quantization_requires_a_bound_complete_loader() {
+        let policy = eredu_core::PreparationPolicy {
+            quantization: Some(eredu_core::QuantizationRequest::MxFp4),
+            ..eredu_core::PreparationPolicy::default()
+        };
+        let capabilities = eredu_architectures::preparation::ArchitectureCapabilities::default();
+
+        validate_quantization_capability(
+            ModelKind::Qwen3,
+            eredu_core::ArtifactFormat::Gguf,
+            policy,
+            capabilities,
+        )
+        .unwrap();
+        let error = validate_quantization_capability(
+            ModelKind::DeepSeekV3,
+            eredu_core::ArtifactFormat::Gguf,
+            policy,
+            capabilities,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Artifact(
+                eredu_core::artifact::ArtifactError::UnsupportedQuantizationPolicy(message)
+            ) if message.contains("deepseek_v3") && message.contains("GGUF")
+        ));
     }
 
     #[test]

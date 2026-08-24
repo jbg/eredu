@@ -65,7 +65,13 @@ impl ModelLoadOptions {
                 })?,
             }),
             Some(WeightQuantization::MxFp4) => Some(QuantizationRequest::MxFp4),
-            Some(WeightQuantization::GgufIQuant { .. }) | None => None,
+            Some(WeightQuantization::GgufIQuant { .. }) => {
+                return Err(Error::Quantization(
+                    "checkpoint-native GGML blocks describe GGUF storage and cannot be requested as a load-time quantization transform"
+                        .into(),
+                ));
+            }
+            None => None,
         };
         let residency = if self.weight_residency.expert_cache().is_some() {
             ResidencyRequest::ExpertCache
@@ -100,6 +106,7 @@ pub fn ensure_replicated_load_options(options: ModelLoadOptions) -> Result<(), E
 #[cfg(test)]
 mod tests {
     use eredu_checkpoint::WeightQuantization;
+    use eredu_gguf::{Endian, GgmlType};
     use eredu_runtime::LayerwiseLoadOptions;
 
     use super::{MlxParallelContext, ModelLoadOptions};
@@ -121,6 +128,22 @@ mod tests {
             policy.residency,
             eredu_core::ResidencyRequest::LayerwiseHost
         );
+    }
+
+    #[test]
+    fn preparation_policy_rejects_checkpoint_native_gguf_encoding_as_a_transform() {
+        let error = ModelLoadOptions::with_quantization(WeightQuantization::GgufIQuant {
+            ggml_type: GgmlType::Q4_0,
+            endian: Endian::Little,
+        })
+        .preparation_policy()
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::backend::error::Error::Quantization(message)
+                if message.contains("checkpoint-native GGML blocks")
+        ));
     }
 
     #[test]
