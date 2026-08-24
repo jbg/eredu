@@ -1,4 +1,4 @@
-//! Backend-neutral text model architectures.
+//! Backend-neutral text, multimodal, and realtime model architectures.
 //!
 //! Architecture code is monomorphized over an [`eredu_nn::NeuralBackend`]. Concrete
 //! backends retain their native tensors, packed weights, lazy graphs, fused

@@ -1,6 +1,6 @@
-//! Backend-neutral language-model loading and generation facade.
+//! Backend-neutral model loading, generation, and realtime facade.
 //!
-//! [`api`] and [`core`] remain available without an execution backend. The
+//! [`api`] and [`runtime`] remain available without an execution backend. The
 //! default `mlx` feature adds the MLX model implementations and runtime.
 
 #![warn(missing_docs)]
