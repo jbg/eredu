@@ -1,6 +1,6 @@
 //! Composite artifact policy for Gemma 4 checkpoints.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eredu_checkpoint::composite::{
     ArtifactComponentSchema, ArtifactRole, ComponentId, ComponentParameterCatalog,
@@ -12,7 +12,7 @@ use eredu_checkpoint::{
         resolve_gated_product_expert_recipes, GatedProductExpertLayoutNames,
         GatedProductExpertRecipes,
     },
-    recipe::RecipeCatalog,
+    recipe::{DerivedWeightRecipe, RecipeCatalog},
     schema::{
         matrix_for_linear_format, AlternativeLayoutGroup, CatalogPolicy, GgufCheckpointPlan,
         GgufTensorConstraint, GgufTypeConstraint, LayoutVariant, SafetensorsCheckpointPlan,
@@ -1122,6 +1122,50 @@ pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     resolve_gated_product_expert_recipes(catalog, &names).map_err(|error| error.to_string())
 }
 
+/// Returns the derived-weight catalog for one canonical Gemma execution ordinal.
+///
+/// The family graph places optional vision and audio units before the decoder.
+/// Recipe callers pass the architecture-flat ordinal unchanged so this neutral
+/// catalog remains the sole owner of that topology-to-decoder translation.
+pub fn unit_recipes<C: RecipeCatalog + ?Sized>(
+    catalog: &C,
+    family: &FamilyConfig,
+    ordinal: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let vision_layers = family.vision.as_ref().map_or(Ok(0), |config| {
+        usize::try_from(config.num_hidden_layers)
+            .map_err(|_| "invalid Gemma 4 vision layer count".to_string())
+    })?;
+    let audio_layers = family.audio.as_ref().map_or(Ok(0), |config| {
+        usize::try_from(config.num_hidden_layers)
+            .map_err(|_| "invalid Gemma 4 audio layer count".to_string())
+    })?;
+    let decoder_start = vision_layers
+        .checked_add(audio_layers)
+        .ok_or_else(|| "Gemma 4 media unit count overflowed".to_string())?;
+    if ordinal < decoder_start {
+        return Ok(BTreeMap::new());
+    }
+    let layer = ordinal - decoder_start;
+    if layer >= family.text.num_hidden_layers() {
+        return Err(format!(
+            "Gemma 4 execution ordinal {ordinal} is outside its architecture layout"
+        ));
+    }
+    if family
+        .text
+        .layer_policy(layer)
+        .is_none_or(|policy| policy.feed_forward != FeedForwardPolicy::DenseWithSparseMoe)
+    {
+        return Ok(BTreeMap::new());
+    }
+    let resolved = expert_recipes(catalog, &family.text, layer)?;
+    Ok(BTreeMap::from([
+        (resolved.target_gate_up, resolved.gate_up),
+        (resolved.target_down, resolved.down),
+    ]))
+}
+
 /// Builds the complete architecture-owned schedule for independently resident experts.
 pub fn expert_residency_catalog<C: RecipeCatalog + ?Sized>(
     catalog: &C,
@@ -1423,5 +1467,28 @@ mod tests {
             translate_gguf_weight_name("blk.0.ffn_gate_up_exps.weight"),
             "model.layers.0.experts.switch_glu.gate_up_proj.weight"
         );
+    }
+
+    #[test]
+    fn unit_recipes_use_the_composite_architecture_ordinal() {
+        let family = sparse_family();
+        let root = "model.language_model.layers.0.experts.switch_glu";
+        let catalog = Catalog(BTreeMap::from([
+            (
+                format!("{root}.gate_up_proj"),
+                metadata(&format!("{root}.gate_up_proj"), vec![4, 64, 32]),
+            ),
+            (
+                format!("{root}.down_proj"),
+                metadata(&format!("{root}.down_proj"), vec![4, 32, 32]),
+            ),
+        ]));
+
+        assert!(unit_recipes(&catalog, &family, 0).unwrap().is_empty());
+        assert!(unit_recipes(&catalog, &family, 1).unwrap().is_empty());
+        let decoder = unit_recipes(&catalog, &family, 2).unwrap();
+        assert!(decoder.contains_key(&format!("{root}.gate_up_proj")));
+        assert!(decoder.contains_key(&format!("{root}.down_proj")));
+        assert!(unit_recipes(&catalog, &family, 3).is_err());
     }
 }

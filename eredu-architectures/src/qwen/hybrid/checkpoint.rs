@@ -179,6 +179,40 @@ pub fn unit_recipes(
     Ok(recipes)
 }
 
+/// Returns the derived-weight catalog for one canonical conditional-graph ordinal.
+///
+/// Conditional Qwen prepends its vision units to the target/MTP schedule. Keeping
+/// that translation here makes the architecture's flat execution layout, rather
+/// than a backend's reconstruction of group numbers, authoritative for recipes.
+pub fn conditional_unit_recipes(
+    store: &dyn CheckpointSource,
+    config: &ParsedHybridConfig,
+    ordinal: usize,
+) -> Result<BTreeMap<String, DerivedWeightRecipe>, String> {
+    let vision_layers = config
+        .vision
+        .as_ref()
+        .ok_or_else(|| "conditional Qwen recipe selection requires vision config".to_string())?
+        .layer_count();
+    if ordinal < vision_layers {
+        return Ok(BTreeMap::new());
+    }
+    let decoder_ordinal = ordinal - vision_layers;
+    let decoder_units = usize::try_from(config.text.num_hidden_layers)
+        .map_err(|_| "invalid Qwen hybrid layer count".to_string())?
+        .checked_add(
+            usize::try_from(config.text.mtp_num_hidden_layers)
+                .map_err(|_| "invalid Qwen hybrid MTP layer count".to_string())?,
+        )
+        .ok_or_else(|| "Qwen hybrid unit count overflowed".to_string())?;
+    if decoder_ordinal >= decoder_units {
+        return Err(format!(
+            "conditional Qwen execution ordinal {ordinal} is outside its architecture layout"
+        ));
+    }
+    unit_recipes(store, &config.text, decoder_ordinal)
+}
+
 /// Returns canonical lazy-loading recipes for one routed target or MTP expert.
 pub fn expert_recipes<C: RecipeCatalog + ?Sized>(
     catalog: &C,

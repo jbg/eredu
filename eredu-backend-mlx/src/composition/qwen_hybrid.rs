@@ -1,10 +1,6 @@
 // MLX artifact and residency binding for the neutral Qwen hybrid graph.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 use eredu_architectures::qwen::{
     hybrid::{
@@ -391,39 +387,9 @@ impl QwenConditionalPipelineBindings {
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let expert_targets = conditional_expert_targets(architecture, group, index, layer)?;
-        let is_vision = <ConditionalArchitecture as LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::group_transport(architecture, group)
-        .kind
-            == eredu_runtime::ArchitectureGroupKind::VisionEncoder;
-        let recipes = if is_vision {
-            BTreeMap::new()
-        } else {
-            let layout = conditional_unit_layout(architecture)?;
-            let ordinal = layout.ordinal(group, index).ok_or_else(|| {
-                Error::Parallel(format!(
-                    "conditional Qwen has no unit {index} in group {group}"
-                ))
-            })?;
-            let vision_units = (0..layout.group_count())
-                .filter(|&slot| {
-                    <ConditionalArchitecture as LayeredArchitecture<
-                        MlxNeuralBackend,
-                        MlxHybridState,
-                    >>::group_transport(architecture, slot)
-                    .kind
-                        == eredu_runtime::ArchitectureGroupKind::VisionEncoder
-                })
-                .filter_map(|slot| layout.group_range(slot))
-                .map(|range| range.len())
-                .sum::<usize>();
-            let flat = ordinal.checked_sub(vision_units).ok_or_else(|| {
-                Error::Parallel("conditional Qwen text unit precedes its vision graph".into())
-            })?;
-            hybrid::unit_recipes(store, &architecture.parsed().text, flat)
-                .map_err(Error::ArchitectureModel)?
-        };
+        let ordinal = conditional_unit_ordinal(architecture, group, index)?;
+        let recipes = hybrid::conditional_unit_recipes(store, architecture.parsed(), ordinal)
+            .map_err(Error::ArchitectureModel)?;
         build_module_bindings_with_recipes_excluding(layer, "", store, recipes, |name| {
             self.external_experts && parameter_name_in_targets(name, &expert_targets)
         })
@@ -440,39 +406,9 @@ impl QwenConditionalPipelineBindings {
         layout: Option<&eredu_runtime::LocalModelLayout>,
     ) -> Result<Vec<WeightBinding>, Error> {
         let expert_targets = conditional_expert_targets(architecture, group, index, global_layer)?;
-        let is_vision = <ConditionalArchitecture as LayeredArchitecture<
-            MlxNeuralBackend,
-            MlxHybridState,
-        >>::group_transport(architecture, group)
-        .kind
-            == eredu_runtime::ArchitectureGroupKind::VisionEncoder;
-        let recipes = if is_vision {
-            BTreeMap::new()
-        } else {
-            let layout = conditional_unit_layout(architecture)?;
-            let ordinal = layout.ordinal(group, index).ok_or_else(|| {
-                Error::Parallel(format!(
-                    "conditional Qwen has no unit {index} in group {group}"
-                ))
-            })?;
-            let vision_units = (0..layout.group_count())
-                .filter(|&slot| {
-                    <ConditionalArchitecture as LayeredArchitecture<
-                        MlxNeuralBackend,
-                        MlxHybridState,
-                    >>::group_transport(architecture, slot)
-                    .kind
-                        == eredu_runtime::ArchitectureGroupKind::VisionEncoder
-                })
-                .filter_map(|slot| layout.group_range(slot))
-                .map(|range| range.len())
-                .sum::<usize>();
-            let flat = ordinal.checked_sub(vision_units).ok_or_else(|| {
-                Error::Parallel("conditional Qwen text unit precedes its vision graph".into())
-            })?;
-            hybrid::unit_recipes(store, &architecture.parsed().text, flat)
-                .map_err(Error::ArchitectureModel)?
-        };
+        let ordinal = conditional_unit_ordinal(architecture, group, index)?;
+        let recipes = hybrid::conditional_unit_recipes(store, architecture.parsed(), ordinal)
+            .map_err(Error::ArchitectureModel)?;
         let bindings = build_module_bindings_with_recipes_excluding(
             global_layer,
             "",
@@ -1922,6 +1858,20 @@ fn conditional_unit_layout(
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
+fn conditional_unit_ordinal(
+    architecture: &ConditionalArchitecture,
+    group: usize,
+    index: usize,
+) -> Result<usize, Error> {
+    conditional_unit_layout(architecture)?
+        .ordinal(group, index)
+        .ok_or_else(|| {
+            Error::Parallel(format!(
+                "conditional Qwen has no unit {index} in group {group}"
+            ))
+        })
+}
+
 fn resolve_store(
     store: Arc<dyn CheckpointSource>,
     config: &HybridConfig,
@@ -2186,7 +2136,7 @@ fn load_conditional_store(
         external_experts,
         expert_targets: Arc::clone(&expert_targets),
     };
-    let binding = parsed.text.clone();
+    let binding = parsed.clone();
     let excluded_expert_targets = Arc::clone(&expert_targets);
     let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
@@ -2209,18 +2159,9 @@ fn load_conditional_store(
             )
             .map_err(Into::into)
         },
-        move |_ordinal, address, _path, unit, store, _| {
-            let recipes = if address.group() == 0 {
-                BTreeMap::new()
-            } else {
-                let flat = if address.group() == 1 {
-                    address.index()
-                } else {
-                    binding.num_hidden_layers as usize + address.group() - 2
-                };
-                hybrid::unit_recipes(store, &binding, flat)
-                    .map_err(Error::ArchitectureModel)?
-            };
+        move |ordinal, _address, _path, unit, store, _| {
+            let recipes = hybrid::conditional_unit_recipes(store, &binding, ordinal)
+                .map_err(Error::ArchitectureModel)?;
             build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(unit),
                 "",
@@ -2298,13 +2239,8 @@ fn load_store(
             build_module_bindings_with_recipes(&MlxModule::new(modules.clone()), "", store, recipes)
                 .map_err(Into::into)
         },
-        move |_ordinal, address, _path, unit, store, _| {
-            let flat = if address.group() == 0 {
-                address.index()
-            } else {
-                binding_config.num_hidden_layers as usize + address.group() - 1
-            };
-            let recipes = hybrid::unit_recipes(store, &binding_config, flat)
+        move |ordinal, _address, _path, unit, store, _| {
+            let recipes = hybrid::unit_recipes(store, &binding_config, ordinal)
                 .map_err(Error::ArchitectureModel)?;
             build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(unit),

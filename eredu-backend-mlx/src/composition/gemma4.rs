@@ -127,8 +127,13 @@ impl Gemma4Bindings {
         } else {
             Default::default()
         };
-        let recipes = if is_decoder && !self.external_experts {
-            gemma4_unit_recipes(&architecture.args().text, index, store)?
+        let recipes = if !self.external_experts {
+            eredu_architectures::gemma4::unit_recipes(
+                store,
+                architecture.args(),
+                execution_ordinal(architecture, group, index)?,
+            )
+            .map_err(Error::ArchitectureModel)?
         } else {
             BTreeMap::new()
         };
@@ -160,8 +165,13 @@ impl Gemma4Bindings {
         } else {
             Default::default()
         };
-        let recipes = if is_decoder && !self.external_experts {
-            gemma4_unit_recipes(&architecture.args().text, index, store)?
+        let recipes = if !self.external_experts {
+            eredu_architectures::gemma4::unit_recipes(
+                store,
+                architecture.args(),
+                execution_ordinal(architecture, group, index)?,
+            )
+            .map_err(Error::ArchitectureModel)?
         } else {
             BTreeMap::new()
         };
@@ -1451,6 +1461,16 @@ fn execution_layout(architecture: &NeutralArchitecture) -> Result<ExecutionUnitL
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
+fn execution_ordinal(
+    architecture: &NeutralArchitecture,
+    group: usize,
+    index: usize,
+) -> Result<usize, Error> {
+    execution_layout(architecture)?
+        .ordinal(group, index)
+        .ok_or_else(|| Error::Parallel(format!("Gemma 4 has no unit {index} in group {group}")))
+}
+
 pub fn resolve_pipeline_store(
     store: SharedCheckpointSource,
     args: &FamilyConfig,
@@ -1588,7 +1608,7 @@ fn load_store(
     } else {
         BTreeSet::new()
     };
-    let binding_args = args.text.clone();
+    let binding_args = args.clone();
     let binding_expert_targets = Arc::clone(&expert_targets);
     let (policy, mut metadata) = prepare_layerwise_policy_with_bindings(
         store,
@@ -1605,25 +1625,12 @@ fn load_store(
         |modules, store| {
             build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
         },
-        move |_ordinal, address, _path, unit, store, _stream| {
-            let recipes = if !external_experts && address.group() == 2 {
-                let layer = address.index();
-                if binding_args.layer_policy(layer).is_some_and(|policy| {
-                    policy.feed_forward
-                        == eredu_architectures::gemma4::FeedForwardPolicy::DenseWithSparseMoe
-                }) {
-                    let resolved =
-                        eredu_architectures::gemma4::expert_recipes(store, &binding_args, layer)
-                            .map_err(Error::ArchitectureModel)?;
-                    BTreeMap::from([
-                        (resolved.target_gate_up, resolved.gate_up),
-                        (resolved.target_down, resolved.down),
-                    ])
-                } else {
-                    BTreeMap::new()
-                }
-            } else {
+        move |ordinal, _address, _path, unit, store, _stream| {
+            let recipes = if external_experts {
                 BTreeMap::new()
+            } else {
+                eredu_architectures::gemma4::unit_recipes(store, &binding_args, ordinal)
+                    .map_err(Error::ArchitectureModel)?
             };
             build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(unit),
@@ -1659,25 +1666,6 @@ fn load_store(
         expert_cache: None,
         parallel_info: None,
     })
-}
-
-fn gemma4_unit_recipes(
-    args: &eredu_architectures::gemma4::ModelArgs,
-    layer: usize,
-    store: &dyn eredu_checkpoint::store::CheckpointSource,
-) -> Result<BTreeMap<String, eredu_checkpoint::recipe::DerivedWeightRecipe>, Error> {
-    if args.layer_policy(layer).is_some_and(|policy| {
-        policy.feed_forward == eredu_architectures::gemma4::FeedForwardPolicy::DenseWithSparseMoe
-    }) {
-        let resolved = eredu_architectures::gemma4::expert_recipes(store, args, layer)
-            .map_err(Error::ArchitectureModel)?;
-        Ok(BTreeMap::from([
-            (resolved.target_gate_up, resolved.gate_up),
-            (resolved.target_down, resolved.down),
-        ]))
-    } else {
-        Ok(BTreeMap::new())
-    }
 }
 
 fn load_parallel_store(
@@ -1737,11 +1725,6 @@ fn load_parallel_store(
     };
     let decoder_group = *decoder_group;
     for ordinal in 0..global_layout.len() {
-        let address = global_layout.address(ordinal).ok_or_else(|| {
-            Error::Parallel(format!(
-                "Gemma 4 execution ordinal {ordinal} is outside its architecture layout"
-            ))
-        })?;
         let unit = MlxModule::new(construct_architecture_unit(
             &global_architecture,
             &global_layout,
@@ -1749,11 +1732,8 @@ fn load_parallel_store(
             stream,
             std::marker::PhantomData::<MlxHybridState>,
         )?);
-        let recipes = if address.group() == decoder_group {
-            gemma4_unit_recipes(&args.text, address.index(), store.as_ref())?
-        } else {
-            BTreeMap::new()
-        };
+        let recipes = eredu_architectures::gemma4::unit_recipes(store.as_ref(), &args, ordinal)
+            .map_err(Error::ArchitectureModel)?;
         global_parameter_bytes = global_parameter_bytes
             .checked_add(binding_bytes(
                 &build_module_bindings_with_recipes_excluding(
@@ -1786,7 +1766,7 @@ fn load_parallel_store(
         move |_modules, store| {
             shard_layer_bindings(global_static_bindings, "", store, &static_layout)
         },
-        move |_ordinal, address, path, local, store, stream| {
+        move |ordinal, address, path, local, store, stream| {
             if address.group() != decoder_group {
                 return build_module_bindings(&MlxModule::new(local.clone()), "", store)
                     .map_err(Into::into);
@@ -1800,7 +1780,9 @@ fn load_parallel_store(
                 )
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))?,
             ));
-            let recipes = gemma4_unit_recipes(&binding_family.text, layer, store)?;
+            let recipes =
+                eredu_architectures::gemma4::unit_recipes(store, &binding_family, ordinal)
+                    .map_err(Error::ArchitectureModel)?;
             let bindings =
                 build_module_bindings_with_recipes_excluding(&global, "", store, recipes, |_| {
                     false

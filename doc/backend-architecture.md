@@ -725,9 +725,11 @@ composition:
   checkpoint units; composition cannot supply or reconstruct that layout.
   Unit-binding adapters receive the validated architecture-flat ordinal,
   group-local address, and canonical `unit_path`. Composite-family recipe
-  selection uses the flat ordinal instead of mistaking a group-local index for
-  a model-wide layer index, while group ownership and parameter roots remain
-  authoritative in the address and path; and
+  selection accepts that flat ordinal unchanged; architecture-owned recipe
+  catalogs translate optional media and prediction units into checkpoint-local
+  identities instead of backend binders reconstructing group order or layer
+  counts. Group ownership and parameter roots remain authoritative in the
+  address and path; and
 - MLX events provide exact completion while retaining arrays and source
   resources required by submitted work.
 

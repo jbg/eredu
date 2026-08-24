@@ -331,14 +331,9 @@ impl QwenVlPipelineBindings {
         store: &dyn CheckpointSource,
     ) -> Result<Vec<WeightBinding>, Error> {
         let expert_targets = unit_expert_targets(architecture, index, layer)?;
-        let recipes =
-            if group_kind(architecture, group) == eredu_runtime::ArchitectureGroupKind::Decoder {
-                let args = architecture.args();
-                vl::unit_recipes(store, args, args.vision.layer_count() + index)
-                    .map_err(Error::ArchitectureModel)?
-            } else {
-                BTreeMap::new()
-            };
+        let ordinal = unit_ordinal(architecture, group, index)?;
+        let recipes = vl::unit_recipes(store, architecture.args(), ordinal)
+            .map_err(Error::ArchitectureModel)?;
         Ok(build_module_bindings_with_recipes_excluding(
             layer,
             "",
@@ -402,12 +397,15 @@ impl QwenVlPipelineBindings {
                 }
             }
             (Unit::Text(_), eredu_runtime::ArchitectureGroupKind::Decoder) => {
-                let args = architecture.args();
                 let expert_targets = unit_expert_targets(architecture, index, global_layer)?;
                 let recipes = if self.external_experts {
                     BTreeMap::new()
                 } else {
-                    vl::unit_recipes(store, args, args.vision.layer_count() + index)
+                    vl::unit_recipes(
+                        store,
+                        architecture.args(),
+                        unit_ordinal(architecture, group, index)?,
+                    )
                         .map_err(Error::ArchitectureModel)?
                 };
                 let mut bindings = build_module_bindings_with_recipes_excluding(
@@ -910,6 +908,12 @@ fn unit_layout(architecture: &Architecture) -> Result<ExecutionUnitLayout, Error
         .map_err(|error| Error::ArchitectureModel(error.to_string()))
 }
 
+fn unit_ordinal(architecture: &Architecture, group: usize, index: usize) -> Result<usize, Error> {
+    unit_layout(architecture)?
+        .ordinal(group, index)
+        .ok_or_else(|| Error::Parallel(format!("Qwen3-VL has no unit {index} in group {group}")))
+}
+
 fn resolve_store(
     store: Arc<dyn CheckpointSource>,
     args: &vl::ModelArgs,
@@ -1286,17 +1290,12 @@ fn load_store(
             )
             .map_err(Into::into)
         },
-        move |_ordinal, address, _path, unit, store, _| {
-            let flat = if address.group() == 0 {
-                address.index()
-            } else {
-                binding_args.vision.layer_count() + address.index()
-            };
+        move |ordinal, _address, _path, unit, store, _| {
             build_module_bindings_with_recipes_excluding(
                 &MlxModule::new(unit),
                 "",
                 store,
-                vl::unit_recipes(store, &binding_args, flat)
+                vl::unit_recipes(store, &binding_args, ordinal)
                     .map_err(Error::ArchitectureModel)?,
                 |name| external_experts && parameter_name_in_targets(name, &binding_expert_targets),
             )

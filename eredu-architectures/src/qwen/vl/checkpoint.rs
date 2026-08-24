@@ -233,4 +233,38 @@ mod tests {
             Some(DerivedWeightRecipe::Stack { axis: 2, inputs }) if inputs.len() == 2
         ));
     }
+
+    #[test]
+    fn unit_recipes_use_the_composite_architecture_ordinal() {
+        let args = crate::qwen::vl::model_args_from_config_value(&json!({
+            "model_type":"qwen3_vl_moe", "image_token_id":61, "video_token_id":62,
+            "text_config": {"model_type":"qwen3_vl_moe_text", "hidden_size":32,
+                "num_hidden_layers":1, "intermediate_size":0, "moe_intermediate_size":16,
+                "num_experts":4, "num_experts_per_tok":2, "num_attention_heads":4,
+                "num_key_value_heads":2, "head_dim":8, "rms_norm_eps":0.000001,
+                "vocab_size":64, "max_position_embeddings":128, "tie_word_embeddings":true,
+                "rope_scaling":{"mrope_section":[2,1,1]}},
+            "vision_config":{"depth":1,"hidden_size":16,"intermediate_size":24,
+                "num_heads":4,"num_position_embeddings":16,"in_channels":3,"patch_size":2,
+                "spatial_merge_size":2,"temporal_patch_size":2,"out_hidden_size":32,
+                "deepstack_visual_indexes":[0]}
+        }))
+        .unwrap();
+        let root = "model.language_model.layers.0.mlp.experts";
+        let catalog = Catalog(BTreeMap::from([
+            (
+                format!("{root}.gate_up_proj"),
+                metadata(&format!("{root}.gate_up_proj"), vec![4, 32, 32]),
+            ),
+            (
+                format!("{root}.down_proj"),
+                metadata(&format!("{root}.down_proj"), vec![4, 32, 16]),
+            ),
+        ]));
+
+        assert!(unit_recipes(&catalog, &args, 0).unwrap().is_empty());
+        let decoder = unit_recipes(&catalog, &args, 1).unwrap();
+        assert!(decoder.contains_key(&format!("{root}.gate_up_proj")));
+        assert!(decoder.contains_key(&format!("{root}.down_proj")));
+    }
 }
