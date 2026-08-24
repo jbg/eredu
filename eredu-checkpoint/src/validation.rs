@@ -207,19 +207,6 @@ impl ResolvedCheckpointPlan {
     pub fn unclaimed_keys(&self) -> &BTreeSet<String> {
         &self.unclaimed_keys
     }
-
-    /// Creates a resolved plan for store contract tests.
-    #[doc(hidden)]
-    pub fn for_test(
-        identity: impl Into<String>,
-        source_keys: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        Self {
-            identity: identity.into(),
-            source_keys: source_keys.into_iter().map(Into::into).collect(),
-            unclaimed_keys: BTreeSet::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

@@ -887,6 +887,10 @@ mod tests {
 
     use super::*;
     use crate::recipe::DerivedWeightRecipe;
+    use crate::schema::{
+        CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
+        TensorOperation,
+    };
 
     fn write_tensor(path: &Path, name: &str, dimensions: &[u64], ty: GgmlType, data: &[u8]) {
         Writer::default()
@@ -903,11 +907,42 @@ mod tests {
             .unwrap();
     }
 
-    fn test_store(path: &Path, key: &str) -> GgufWeightStore {
+    fn test_plan(checkpoint: &Checkpoint) -> GgufCheckpointPlan {
+        let constraints = checkpoint
+            .tensors()
+            .map(|tensor| {
+                let descriptor = tensor.descriptor();
+                let operation = match descriptor.ggml_type {
+                    GgmlType::I32 => TensorOperation::I32,
+                    GgmlType::MxFp4 => TensorOperation::MxFp4Matrix,
+                    GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => TensorOperation::Dense,
+                    _ => TensorOperation::Matrix,
+                };
+                GgufTensorConstraint::required(
+                    descriptor.name.clone(),
+                    descriptor
+                        .row_major_shape()
+                        .into_iter()
+                        .map(|dimension| usize::try_from(dimension).unwrap())
+                        .collect::<Vec<_>>(),
+                    GgufTypeConstraint::OperationClass(operation),
+                )
+            })
+            .collect();
+        GgufCheckpointPlan::new(
+            "test GGUF catalog",
+            constraints,
+            Vec::new(),
+            CatalogPolicy::strict(),
+        )
+        .unwrap()
+    }
+
+    fn test_store(path: &Path) -> GgufWeightStore {
         let checkpoint = Checkpoint::open(path).unwrap();
-        let resolved = ResolvedCheckpointPlan::for_test("test", [key]);
+        let plan = test_plan(&checkpoint);
         GgufWeightStore::builder()
-            .add_resolved_checkpoint(checkpoint, &resolved, str::to_owned)
+            .add_checkpoint(checkpoint, &plan, str::to_owned)
             .unwrap()
             .build()
             .unwrap()
@@ -921,7 +956,7 @@ mod tests {
             .flat_map(|value| (value as f32).to_le_bytes())
             .collect::<Vec<_>>();
         write_tensor(&path, "matrix.weight", &[4, 2], GgmlType::F32, &values);
-        let store = test_store(&path, "matrix.weight");
+        let store = test_store(&path);
 
         assert_eq!(store.keys(), ["matrix.weight"]);
         assert_eq!(
@@ -959,7 +994,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("native.gguf");
         write_tensor(&path, "matrix.weight", &[32], GgmlType::Q8_0, &[0; 34]);
-        let store = test_store(&path, "matrix.weight");
+        let store = test_store(&path);
         let lease = store
             .acquire(TensorReadRequest {
                 key: "matrix.weight".into(),
@@ -1010,16 +1045,9 @@ mod tests {
             )
             .unwrap();
         let checkpoint = Checkpoint::open(&path).unwrap();
-        let resolved = ResolvedCheckpointPlan::for_test(
-            "test",
-            [
-                "experts.gate.weight",
-                "experts.up.weight",
-                "experts.down.weight",
-            ],
-        );
+        let plan = test_plan(&checkpoint);
         let store = GgufWeightStore::builder()
-            .add_resolved_checkpoint(checkpoint, &resolved, str::to_owned)
+            .add_checkpoint(checkpoint, &plan, str::to_owned)
             .unwrap()
             .build()
             .unwrap();

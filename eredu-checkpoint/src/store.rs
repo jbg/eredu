@@ -1659,6 +1659,13 @@ fn fs_error(path: &Path, error: std::io::Error) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        schema::{
+            CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+            StoredDtypeConstraint,
+        },
+        validation::resolve_safetensors_plan,
+    };
     use safetensors::tensor::{serialize_to_file, TensorView};
 
     struct Lease {
@@ -1821,8 +1828,18 @@ mod tests {
         .unwrap();
         let source: Arc<dyn CheckpointSource> =
             Arc::new(SafetensorsWeightStore::open(&file).unwrap());
-        let contract =
-            crate::validation::ResolvedCheckpointPlan::for_test("test architecture", ["selected"]);
+        let plan = SafetensorsCheckpointPlan::new(
+            "test architecture",
+            vec![SafetensorsTensorConstraint::required(
+                "selected",
+                vec![2],
+                StoredDtypeConstraint::Exact(StoredDtype::F32),
+            )],
+            Vec::new(),
+            CatalogPolicy::non_strict(),
+        )
+        .unwrap();
+        let contract = resolve_safetensors_plan(source.as_ref(), &plan).unwrap();
         let source = ResolvedCheckpointSource::new(source, contract);
 
         assert_eq!(source.source_keys(), ["selected"]);

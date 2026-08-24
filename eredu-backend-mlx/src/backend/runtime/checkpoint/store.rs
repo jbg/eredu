@@ -305,6 +305,46 @@ where
 }
 
 #[cfg(test)]
+fn gguf_test_plan(
+    checkpoint: &eredu_gguf::Checkpoint,
+) -> eredu_checkpoint::schema::GgufCheckpointPlan {
+    use eredu_checkpoint::schema::{
+        CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
+        TensorOperation,
+    };
+    use eredu_gguf::GgmlType;
+
+    let constraints = checkpoint
+        .tensors()
+        .map(|tensor| {
+            let descriptor = tensor.descriptor();
+            let operation = match descriptor.ggml_type {
+                GgmlType::I32 => TensorOperation::I32,
+                GgmlType::MxFp4 => TensorOperation::MxFp4Matrix,
+                GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16 => TensorOperation::Dense,
+                _ => TensorOperation::Matrix,
+            };
+            GgufTensorConstraint::required(
+                descriptor.name.clone(),
+                descriptor
+                    .row_major_shape()
+                    .into_iter()
+                    .map(|dimension| usize::try_from(dimension).unwrap())
+                    .collect::<Vec<_>>(),
+                GgufTypeConstraint::OperationClass(operation),
+            )
+        })
+        .collect();
+    GgufCheckpointPlan::new(
+        "test GGUF catalog",
+        constraints,
+        Vec::new(),
+        CatalogPolicy::strict(),
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
 pub fn open_gguf_checkpoint_source_for_test<F>(
     checkpoint: GgufCheckpoint,
     translate: F,
@@ -312,15 +352,9 @@ pub fn open_gguf_checkpoint_source_for_test<F>(
 where
     F: FnMut(&str) -> String,
 {
-    let resolved = eredu_checkpoint::validation::ResolvedCheckpointPlan::for_test(
-        "test GGUF catalog",
-        checkpoint
-            .catalog()
-            .tensors()
-            .map(|tensor| tensor.descriptor().name.clone()),
-    );
+    let plan = gguf_test_plan(checkpoint.catalog());
     NeutralGgufWeightStoreBuilder::default()
-        .add_resolved_checkpoint(checkpoint.catalog().clone(), &resolved, translate)
+        .add_checkpoint(checkpoint.catalog().clone(), &plan, translate)
         .map_err(neutral_store_error)?
         .build()
         .map_err(neutral_store_error)
@@ -1497,20 +1531,19 @@ mod tests {
         write_dense_gguf(&first, "text.weight", 1.0);
         write_dense_gguf(&second, "vision.weight", 2.0);
         let first = GgufCheckpoint::open(first).unwrap();
-        let first_plan = eredu_checkpoint::validation::ResolvedCheckpointPlan::for_test(
-            "first test catalog",
-            ["text.weight"],
-        );
+        let first_plan = gguf_test_plan(first.catalog());
+        let first_plan =
+            eredu_checkpoint::validation::resolve_gguf_plan(first.catalog(), &first_plan).unwrap();
         let builder = eredu_checkpoint::gguf_store::GgufWeightStore::builder()
             .add_resolved_checkpoint(first.catalog().clone(), &first_plan, |_| {
                 "shared.weight".into()
             })
             .unwrap();
         let second = GgufCheckpoint::open(second).unwrap();
-        let second_plan = eredu_checkpoint::validation::ResolvedCheckpointPlan::for_test(
-            "second test catalog",
-            ["vision.weight"],
-        );
+        let second_plan = gguf_test_plan(second.catalog());
+        let second_plan =
+            eredu_checkpoint::validation::resolve_gguf_plan(second.catalog(), &second_plan)
+                .unwrap();
         let error = builder
             .add_resolved_checkpoint(second.catalog().clone(), &second_plan, |_| {
                 "shared.weight".into()
