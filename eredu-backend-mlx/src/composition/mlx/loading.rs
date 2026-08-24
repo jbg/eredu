@@ -423,9 +423,13 @@ fn mlx_runtime_state_dtype_bytes(
 
 #[cfg(test)]
 mod runtime_state_dtype_tests {
-    use super::{mlx_runtime_state_dtype_bytes, requires_distributed_stage_loader};
+    use super::{
+        mlx_runtime_state_dtype_bytes, reject_complete_tensor_parallel_quantization,
+        requires_distributed_stage_loader,
+    };
     use crate::backend::{DeviceAssignment, MlxParallelContext};
     use eredu_architectures::ModelKind;
+    use eredu_checkpoint::WeightQuantization;
     use eredu_core::checkpoint::TensorDtype;
     use safemlx::DeviceType;
 
@@ -437,6 +441,21 @@ mod runtime_state_dtype_tests {
         for kind in [ModelKind::DeepSeekV3, ModelKind::DeepSeekV4] {
             assert!(requires_distributed_stage_loader(kind, topology));
         }
+    }
+
+    #[test]
+    fn complete_tensor_parallel_loader_rejects_unbound_quantization() {
+        reject_complete_tensor_parallel_quantization(None, "deepseek4").unwrap();
+        let error = reject_complete_tensor_parallel_quantization(
+            Some(WeightQuantization::MxFp4),
+            "deepseek4",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::backend::error::Error::Quantization(message)
+                if message.contains("deepseek4")
+        ));
     }
 
     #[test]
@@ -556,12 +575,7 @@ fn materialize_tensor_parallel(
                 .into(),
         ));
     }
-    if options.quantization.is_some() && kind != ModelKind::DeepSeekV4 {
-        return Err(Error::Quantization(format!(
-            "load-time quantization is not implemented for tensor-parallel {} materialization",
-            kind.canonical_name()
-        )));
-    }
+    reject_complete_tensor_parallel_quantization(options.quantization, kind.canonical_name())?;
     let execution = options.weight_residency.layers();
     let build = crate::backend::runtime::distributed::parallel::ParallelBuildContext::new(
         topology,
@@ -785,12 +799,10 @@ fn materialize_gguf_tensor_parallel(
     let topology = options.parallel.ok_or_else(|| {
         Error::Parallel("tensor-parallel GGUF materialization requires a topology".into())
     })?;
-    if options.quantization.is_some() && architecture != GgufArchitecture::DeepSeek4 {
-        return Err(Error::Quantization(format!(
-            "load-time quantization is not implemented for tensor-parallel {} GGUF materialization",
-            architecture.metadata_name()
-        )));
-    }
+    reject_complete_tensor_parallel_quantization(
+        options.quantization,
+        architecture.metadata_name(),
+    )?;
     let residency = options.weight_residency.layers();
     let build = crate::backend::runtime::distributed::parallel::ParallelBuildContext::new(
         topology,
@@ -915,6 +927,18 @@ fn materialize_gguf_tensor_parallel(
             ))
         }
     }
+}
+
+fn reject_complete_tensor_parallel_quantization(
+    quantization: Option<WeightQuantization>,
+    architecture: &str,
+) -> Result<(), Error> {
+    if quantization.is_some() {
+        return Err(Error::Quantization(format!(
+            "load-time quantization is not implemented for complete tensor-parallel {architecture} materialization"
+        )));
+    }
+    Ok(())
 }
 
 pub fn validate_gguf_quantization_source<
