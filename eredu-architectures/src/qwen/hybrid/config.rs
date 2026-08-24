@@ -234,7 +234,8 @@ impl HybridConfig {
             self.head_dim
         } else {
             ((self.head_dim as f32 * self.partial_rotary_factor()).round() as i32)
-                .clamp(2, self.head_dim)
+                .max(2)
+                .min(self.head_dim)
         }
     }
 
@@ -270,6 +271,12 @@ impl HybridConfig {
                     "hybrid {name} must be positive, got {value}"
                 )));
             }
+        }
+        if self.head_dim < 2 {
+            return Err(invalid(format!(
+                "hybrid head_dim must be at least 2, got {}",
+                self.head_dim
+            )));
         }
         if self.mtp_num_hidden_layers < 0 {
             return Err(invalid("mtp_num_hidden_layers must be non-negative"));
@@ -1393,6 +1400,19 @@ mod tests {
 
         assert_eq!(parsed.text.variant, HybridVariant::Qwen35Moe);
         assert!(parsed.text.is_moe());
+    }
+
+    #[test]
+    fn rejects_head_width_without_a_rotary_pair() {
+        let mut value = text_config("qwen3_next");
+        value["head_dim"] = json!(1);
+
+        let error = model_args_from_config_value(&value).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "hybrid head_dim must be at least 2, got 1"
+        );
     }
 
     #[test]

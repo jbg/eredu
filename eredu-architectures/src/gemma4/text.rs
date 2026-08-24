@@ -296,7 +296,10 @@ fn partial_rotary_dimensions(
             crate::rotary::RopeValue::Bool(_) => None,
         })
         .unwrap_or(1.0);
-    ((head_dim as f32 * factor).round() as i32).clamp(2, head_dim) & !1
+    ((head_dim as f32 * factor).round() as i32)
+        .max(2)
+        .min(head_dim)
+        & !1
 }
 
 /// Dense GELU-gated feed-forward branch.

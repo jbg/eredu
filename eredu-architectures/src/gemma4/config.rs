@@ -791,6 +791,17 @@ fn layer_schedule(
             .and_then(NonZeroU32::new)
             .ok_or_else(|| invalid(format!("Gemma 4 layer {layer} {name} must be positive")))
     };
+    let head_dimension = |layer: usize, value: i32| {
+        u32::try_from(value)
+            .ok()
+            .filter(|value| *value >= 2)
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "Gemma 4 layer {layer} head dimension must be at least 2"
+                ))
+            })
+    };
     let policies = (0..layers)
         .map(|layer| {
             let attention = *attention
@@ -798,7 +809,7 @@ fn layer_schedule(
                 .expect("validated Gemma 4 layer schedule");
             Ok(LayerPolicy {
                 attention,
-                head_dim: positive("head dimension", layer, head_dims[layer])?,
+                head_dim: head_dimension(layer, head_dims[layer])?,
                 num_key_value_heads: positive("KV heads", layer, kv_heads[layer])?,
                 key_value: if layer >= first_shared {
                     AttentionStateSource::Shared
@@ -1054,6 +1065,25 @@ mod tests {
         value["top_k_experts"] = serde_json::json!(5);
         value["moe_intermediate_size"] = serde_json::json!(16);
         assert!(ModelArgs::from_hf_json(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn rejects_head_widths_without_a_rotary_pair() {
+        let mut local = fixture();
+        local["head_dim"] = serde_json::json!(1);
+        let error = ModelArgs::from_hf_json(&serde_json::to_vec(&local).unwrap()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Gemma 4 layer 0 head dimension must be at least 2"
+        );
+
+        let mut global = fixture();
+        global["global_head_dim"] = serde_json::json!(1);
+        let error = ModelArgs::from_hf_json(&serde_json::to_vec(&global).unwrap()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Gemma 4 layer 1 head dimension must be at least 2"
+        );
     }
 
     #[test]
