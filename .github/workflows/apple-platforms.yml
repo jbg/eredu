@@ -14,6 +14,7 @@ on:
       - "safemlx-tests/**"
       - "eredu/**"
       - "eredu-*/**"
+      - "examples/eredu-ios/**"
   push:
     branches: [main]
 
@@ -78,7 +79,13 @@ jobs:
             exit 0
           fi
           xcodebuild -downloadComponent MetalToolchain
-      - name: Cross-build safemlx
-        run: cargo build --release -p safemlx --target "${{ matrix.target }}"
+      - name: Cross-build the MLX stack and facade
+        run: |
+          cargo build --locked --release -p safemlx --target "${{ matrix.target }}"
+          cargo build --locked --release -p eredu-backend-mlx --target "${{ matrix.target }}"
+          cargo build --locked --release -p eredu --no-default-features --features mlx --target "${{ matrix.target }}"
+      - name: Cross-build the iOS example
+        if: startsWith(matrix.target, 'aarch64-apple-ios')
+        run: cargo build --locked --release -p eredu-ios --target "${{ matrix.target }}"
       - name: Verify Metal resource
         run: test -s "target/${{ matrix.target }}/release/safemlx-resources/mlx.metallib"

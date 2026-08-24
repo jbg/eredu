@@ -49,6 +49,10 @@ jobs:
         run: cargo test -p safemlx --test events --no-default-features
       - name: Check the Linux workspace
         run: cargo check --workspace
+      - name: Test the portable facade without default features
+        run: |
+          cargo test --locked -p eredu --no-default-features --test portable_facade
+          cargo test --locked -p eredu --no-default-features --test backend_conformance
       - name: Test CPU-safe native tool calling
         run: |
           cargo test --locked -p eredu --lib api::tests::production_
